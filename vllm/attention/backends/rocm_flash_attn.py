@@ -147,25 +147,25 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {suppored_head_sizes}.")
 
-        self.use_naive_attn = torch.cuda.get_device_capability()[0] != 9
-        # NOTE: Allow for switching between Triton and CK. Defaulting to triton.
         self.use_triton_flash_attn = (os.environ.get(
             "VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in ("true", "1"))
+        self.use_naive_attn = 0 if self.use_triton_flash_attn else 1
+        # NOTE: Allow for switching between Triton and CK. Defaulting to triton.
         if self.use_naive_attn:
             # AMD Radeon 7900 series (gfx1100) currently does not support
             # xFormers nor FlashAttention. As a temporary workaround, we use
             # naive PyTorch implementation of attention.
-            self.attn_fuc = _naive_attention()
-            logger.debug("Using naive attention in ROCmBackend")
+            self.attn_fuc = _naive_attention
+            logger.info("Using naive attention in ROCmBackend")
         elif self.use_triton_flash_attn:
             from vllm.attention.ops.triton_flash_attention import (  # noqa: F401
                 triton_attention)
             self.attn_func = triton_attention
-            logger.debug("Using Triton FA in ROCmBackend")
+            logger.info("Using Triton FA in ROCmBackend")
         else:
             from flash_attn import flash_attn_varlen_func  # noqa: F401
             self.attn_func = flash_attn_varlen_func
-            logger.debug("Using CK FA in ROCmBackend")
+            logger.info("Using CK FA in ROCmBackend")
 
     def repeat_kv(self, x: torch.Tensor, n_rep: int) -> torch.Tensor:
         """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
@@ -224,32 +224,34 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 # triton attention
                 # When block_tables are not filled, it means q and k are the
                 # prompt, and they have the same length.
-                if self.use_naive_attn or self.use_triton_flash_attn:
+                if self.use_triton_flash_attn:
+                    output, _ = self.attn_func(
+                        query,
+                        key,
+                        value,
+                        None,
+                        attn_metadata.seq_start_loc,
+                        attn_metadata.seq_start_loc,
+                        attn_metadata.max_prompt_len,
+                        attn_metadata.max_prompt_len,
+                        True,
+                        self.scale,
+                    )
+                elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
                         # Interleave for MQA workaround.
                         key = self.repeat_kv(key, self.num_queries_per_kv)
                         value = self.repeat_kv(value, self.num_queries_per_kv)
-                    if self.use_naive_attn:
-                        output = self.attn_fuc(
+                    output = self.attn_fuc(
                             query,
                             key,
                             value,
                             attn_metadata.prompt_lens,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_size,
                             self.scale,
-                        )
-                    else:
-                        output, _ = self.attn_func(
-                            query,
-                            key,
-                            value,
-                            None,
-                            attn_metadata.seq_start_loc,
-                            attn_metadata.seq_start_loc,
-                            attn_metadata.max_prompt_len,
-                            attn_metadata.max_prompt_len,
-                            True,
-                            self.scale,
-                        )
+                    )
                 else:
                     output = self.attn_func(
                         q=query,
@@ -303,17 +305,28 @@ def _naive_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     prompt_lens: List[int],
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
     scale: float,
 ) -> torch.Tensor:
+    query = query.reshape(-1, num_heads, head_size)
+    #key = key.view(-1, num_kv_heads, head_size)
+    #value = value.view(-1, num_kv_heads, head_size)
+    key = key.reshape(-1, num_heads, head_size)
+    value = value.reshape(-1, num_heads, head_size)
     num_tokens = query.shape[0]
     output = torch.empty_like(query)
     start = 0
     for _, prompt_len in enumerate(prompt_lens):
         end = start + prompt_len
         out = _naive_masked_attention(
-            query[None, start:end],
-            key[None, start:end],
-            value[None, start:end],
+            #query[None, start:end],
+            #key[None, start:end],
+            #value[None, start:end],
+            query[start:end],
+            key[start:end],
+            value[start:end],
             scale,
         )
         # TODO(woosuk): Unnecessary copy. Optimize.
@@ -333,6 +346,7 @@ def _naive_masked_attention(
     value: torch.Tensor,
     scale: float,
 ) -> torch.Tensor:
+
     seq_len, _, _ = query.shape
     attn_mask = torch.triu(torch.ones(seq_len,
                                       seq_len,

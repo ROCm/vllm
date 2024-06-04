@@ -1,0 +1,54 @@
+# CONTEXT {'gpu_vendor': 'AMD', 'guest_os': 'UBUNTU'}
+ARG BASE_IMAGE=rocm/pytorch:rocm6.1_ubuntu22.04_py3.10_pytorch_2.1.2
+FROM $BASE_IMAGE
+USER root
+
+RUN echo "Base image is $BASE_IMAGE"
+
+# env
+ENV WORKSPACE_DIR=/workspace
+ENV PYTORCH_ROCM_ARCH="gfx90a;gfx942"
+ENV VLLM_USE_FLASH_ATTN_TRITON=1
+# azure_vm striction, turn-on when available
+ENV HIP_FORCE_DEV_KERNARG=0 
+ENV OPTIMIZE_EPILOGUE=1
+
+# tunableOps
+ENV PYTORCH_TUNABLEOP_ENABLED=1
+ENV PYTORCH_TUNABLEOP_FILENAME="/workspace/tunableop_results.csv"
+ENV PYTORCH_TUNABLEOP_MAX_TUNING_DURATION_MS=30
+ENV PYTORCH_TUNABLEOP_MAX_TUNING_ITERATIONS=10
+ENV TORCH_BLAS_PREFER_HIPBLASLT=0
+
+WORKDIR $WORKSPACE_DIR
+
+# torch
+RUN pip install --upgrade pip
+
+# rocm6.1-based torch 
+RUN pip uninstall torch torchaudio torchvision -y && pip install --pre torch torchvision torchaudio https://download.pytorch.org/whl/nightly/rocm6.1/torch-2.4.0.dev20240510%2Brocm6.1-cp310-cp310-linux_x86_64.whl --no-deps
+
+# triton
+RUN pip uninstall pytorch-triton-rocm triton -y
+RUN git clone https://github.com/ROCm/triton.git -b triton-mlir &&\
+    cd triton/python &&\
+    python setup.py install
+
+# vllm
+RUN git clone https://github.com/ROCm/vllm.git -b perf_benchmark &&\
+    cd vllm &&\
+    pip install -U -r requirements-rocm.txt &&\
+    python3 setup.py install 
+
+# gradlib
+RUN cd vllm/gradlib \
+    && pip install .
+
+RUN pip install pandas
+RUN pip uninstall filelock -y
+RUN pip install filelock==3.13.3
+# workaround for torch pre
+RUN pip install outlines==0.0.34 --no-deps 
+
+# record configuration for posterity
+RUN pip list
