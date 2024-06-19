@@ -6,7 +6,8 @@ import torch
 import torch.nn as nn
 
 from vllm.distributed import tensor_model_parallel_gather
-from vllm.model_executor.layers.tuned_gemm import tgemm
+if (torch.version.hip is not None):
+    from vllm.model_executor.layers.tuned_gemm import tgemm
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 
 
@@ -63,7 +64,11 @@ class LogitsProcessor(nn.Module):
     def _get_logits(self, hidden_states: torch.Tensor, embedding: torch.Tensor,
                     embedding_bias: Optional[torch.Tensor]) -> torch.Tensor:
         # Get the logits for the next tokens.
-        logits = tgemm.mm(hidden_states, embedding)
+        logits = None
+        if (torch.version.hip is not None):
+            logits = tgemm.mm(hidden_states, embedding)
+        else:
+            logits = F.linear(hidden_states, embedding)
         if embedding_bias is not None:
             logits += embedding_bias
         logits = tensor_model_parallel_gather(logits)

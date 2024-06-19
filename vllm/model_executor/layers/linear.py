@@ -13,7 +13,8 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
-from vllm.model_executor.layers.tuned_gemm import tgemm
+if (torch.version.hip is not None):
+    from vllm.model_executor.layers.tuned_gemm import tgemm
 from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
@@ -90,13 +91,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         weight = layer.weight
+        mm_result = None
+        if (torch.version.hip is not None):
+            mm_result = tgemm.mm(x, weight)
+        else:
+            mm_result = F.linear(x, weight)
         if self.separate_bias_add:
             if bias is not None:
-                return tgemm.mm(x, weight) + bias
-            return tgemm.mm(x, weight)
+                return mm_result + bias
+            return mm_result
         elif bias is not None:
             return F.linear(x, weight, bias)
-        return tgemm.mm(x, weight)
+        return mm_result
 
 
 class LinearBase(torch.nn.Module):
