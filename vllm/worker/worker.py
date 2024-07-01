@@ -1,6 +1,7 @@
 """A GPU worker class."""
 import gc
 import os
+import vllm.envs as envs
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -226,6 +227,8 @@ class Worker(WorkerBase):
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None
     ) -> List[Union[SamplerOutput, PoolerOutput]]:
+        if self.parallel_config.distributed_executor_backend == "torchrun":
+            torch.cuda.set_device(f"cuda:{envs.LOCAL_RANK}")
         if not self.is_driver_worker:
             self._execute_model_non_driver()
             return []

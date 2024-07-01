@@ -4,9 +4,11 @@ import inspect
 import re
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Optional, Set
+import threading
+from typing import List, Optional, Set
 
 import fastapi
+import requests
 import uvicorn
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
@@ -39,6 +41,7 @@ openai_serving_embedding: OpenAIServingEmbedding
 logger = init_logger(__name__)
 
 _running_tasks: Set[asyncio.Task] = set()
+_aux_ports: List[int] = []
 
 
 @asynccontextmanager
@@ -78,6 +81,23 @@ async def validation_exception_handler(_, exc):
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 
+def send_aux_request(request, uri, port):
+    try:
+        res = requests.post(f"http://localhost:{port}/{uri}", json=request)
+        if res.status_code != 200:
+            print(f"Failed to reroute request to {port}")
+            exit(1)
+    except Exception as e:
+        print(f"Failed to reroute request to {port}: {e}")
+
+
+def reroute(request, uri):
+    global _aux_ports
+    for port in _aux_ports:
+        threading.Thread(target=send_aux_request,
+                         args=(request, uri, port)).start()
+
+
 @app.get("/health")
 async def health() -> Response:
     """Health check."""
@@ -100,6 +120,9 @@ async def show_version():
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest,
                                  raw_request: Request):
+    if envs.LOCAL_RANK == 0:
+        reroute(await raw_request.json(), raw_request.url.path[1:])
+
     generator = await openai_serving_chat.create_chat_completion(
         request, raw_request)
     if isinstance(generator, ErrorResponse):
@@ -115,6 +138,9 @@ async def create_chat_completion(request: ChatCompletionRequest,
 
 @app.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    if envs.LOCAL_RANK == 0:
+        reroute(await raw_request.json(), raw_request.url.path[1:])
+
     generator = await openai_serving_completion.create_completion(
         request, raw_request)
     if isinstance(generator, ErrorResponse):
@@ -129,6 +155,9 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
 @app.post("/v1/embeddings")
 async def create_embedding(request: EmbeddingRequest, raw_request: Request):
+    if envs.LOCAL_RANK == 0:
+        reroute(await raw_request.json(), raw_request.url.path[1:])
+
     generator = await openai_serving_embedding.create_embedding(
         request, raw_request)
     if isinstance(generator, ErrorResponse):
@@ -210,9 +239,20 @@ if __name__ == "__main__":
     openai_serving_embedding = OpenAIServingEmbedding(engine, model_config,
                                                       served_model_names)
     app.root_path = args.root_path
+    port = args.port
+    if (engine.engine.parallel_config.distributed_executor_backend
+            == "torchrun" and args.tensor_parallel_size > 1):
+        if envs.LOCAL_RANK != 0:
+            port = envs.AUX_PORT_START + envs.LOCAL_RANK - 1
+        else:
+            _aux_ports = [
+                x for x in range(
+                    envs.AUX_PORT_START, envs.AUX_PORT_START +
+                    args.tensor_parallel_size - 1)
+            ]
     uvicorn.run(app,
                 host=args.host,
-                port=args.port,
+                port=port,
                 log_level=args.uvicorn_log_level,
                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
                 ssl_keyfile=args.ssl_keyfile,
