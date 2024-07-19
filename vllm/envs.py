@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     VLLM_INSTALL_PUNICA_KERNELS: bool = False
     CMAKE_BUILD_TYPE: Optional[str] = None
     VERBOSE: bool = False
+    AUX_PORT_START: int = 7400
 
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
@@ -84,6 +85,10 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # If set, vllm will print verbose logs during installation
     "VERBOSE":
     lambda: bool(int(os.getenv('VERBOSE', '0'))),
+
+    # The start of auxillary port range to use for torchrun server mode
+    "AUX_PORT_START":
+    lambda: int(os.getenv("AUX_PORT_START", "7400")),
 
     # Root directory for VLLM configuration files
     # Note that this not only affects how vllm finds its configuration files
