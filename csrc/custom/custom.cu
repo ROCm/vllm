@@ -92,7 +92,7 @@ void paged_attention_custom(torch::Tensor& out, torch::Tensor& exp_sums,
   torch::Tensor& softmax_out,
 #endif
                             const c10::optional<torch::Tensor>& alibi_slopes,
-                            const std::string& kv_cache_dtype);
+                            const std::string& kv_cache_dtype,float kv_scale);
 
 // declare the extension module with the AddGPU function:
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

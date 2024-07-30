@@ -15,7 +15,7 @@ if custom_attn_available:
 
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE_V1V2 = 512
-_PARTITION_SIZE_CUSTOM = 256
+_PARTITION_SIZE_CUSTOM = 512
 
 
 @dataclass
@@ -119,7 +119,6 @@ class PagedAttention:
         gqa_ratio = num_heads // num_kv_heads
         use_custom = (custom_attn_available and query.dtype == torch.half
                       and head_size == 128 and block_size == 16
-                      and kv_cache_dtype == "auto"
                       and (gqa_ratio >= 1 and gqa_ratio <= 16)
                       and max_seq_len <= 32768)
         if not use_custom:
@@ -215,6 +214,7 @@ class PagedAttention:
                     max_seq_len,
                     alibi_slopes,
                     kv_cache_dtype,
+                    kv_scale
                 )
         return output
 
