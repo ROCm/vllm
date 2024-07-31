@@ -11,7 +11,7 @@ from transformers import (AutoModelForCausalLM, AutoProcessor, AutoTokenizer,
 
 from vllm import LLM, SamplingParams
 from vllm.config import TokenizerPoolConfig, VisionLanguageConfig
-from vllm.distributed import destroy_model_parallel
+from vllm.distributed import destroy_model_parallel, destroy_shm_broadcaster
 from vllm.inputs import PromptInputs
 from vllm.logger import init_logger
 from vllm.sequence import MultiModalData
@@ -51,6 +51,7 @@ def _read_prompts(filename: str) -> List[str]:
 
 def cleanup():
     destroy_model_parallel()
+    destroy_shm_broadcaster()
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()

@@ -1,11 +1,15 @@
+import atexit
 from collections import namedtuple
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from multiprocessing import shared_memory
 from typing import Any, Dict, List, Optional, Tuple, Union
+from unittest.mock import patch
 
 import torch
 from torch.distributed import ProcessGroup
 
+from vllm.distributed.device_communicators.shm_broadcast import ShmRingBufferIO
 from vllm.utils import is_hip
 
 from .parallel_state import (get_cpu_world_group, get_pp_pynccl_communicator,
@@ -14,6 +18,17 @@ from .parallel_state import (get_cpu_world_group, get_pp_pynccl_communicator,
                              get_tensor_model_parallel_world_size,
                              get_tp_ca_communicator,
                              get_tp_pynccl_communicator)
+
+shm_broadcaster: Optional[ShmRingBufferIO] = None
+
+
+def init_shm_broadcaster(group):
+    global shm_broadcaster
+    world_size = get_tensor_model_parallel_world_size()
+
+    if world_size > 1 and is_in_the_same_node(group):
+        shm_broadcaster = ShmRingBufferIO.create_from_process_group(
+            group, 1 << 20, 6)
 
 
 @dataclass
@@ -191,6 +206,32 @@ def broadcast(input_: torch.Tensor,
     return input_
 
 
+def broadcast_object(obj: Optional[Any] = None, src: int = 0):
+    """Broadcast the input object.
+    NOTE: `src` is the local rank of the source rank.
+    """
+    world_size = get_tensor_model_parallel_world_size()
+    assert src < world_size, f"Invalid src rank ({src})"
+    group = get_cpu_world_group()
+    global shm_broadcaster
+
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return obj
+    if shm_broadcaster is None:
+        init_shm_broadcaster(group)
+    if shm_broadcaster is not None:
+        assert src == 0, "Shared memory broadcaster only supports src=0"
+        return shm_broadcaster.broadcast_object(obj)
+    if torch.distributed.get_rank() == src:
+        torch.distributed.broadcast_object_list([obj], src=src, group=group)
+        return obj
+    else:
+        recv = [None]
+        torch.distributed.broadcast_object_list(recv, src=src, group=group)
+        return recv[0]
+
+
 def broadcast_object_list(obj_list: List[Any],
                           src: int = 0,
                           group: Optional[ProcessGroup] = None):
@@ -270,9 +311,7 @@ def broadcast_tensor_dict(
         # `metadata_list` lives in CPU memory.
         # `broadcast_object_list` involves serialization and deserialization,
         # all happening on CPU. Therefore, we can use the CPU group.
-        torch.distributed.broadcast_object_list([metadata_list],
-                                                src=src,
-                                                group=metadata_group)
+        broadcast_object(metadata_list, src=src)
         async_handles = []
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -295,14 +334,10 @@ def broadcast_tensor_dict(
             async_handle.wait()
 
     else:
-        recv_metadata_list = [None]
-        torch.distributed.broadcast_object_list(recv_metadata_list,
-                                                src=src,
-                                                group=metadata_group)
-        assert recv_metadata_list[0] is not None
+        metadata_list = broadcast_object(None, src=src)
         tensor_dict = {}
         async_handles = []
-        for key, value in recv_metadata_list[0]:
+        for key, value in metadata_list:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size,
                                      dtype=value.dtype,
@@ -330,3 +365,76 @@ def broadcast_tensor_dict(
         for async_handle in async_handles:
             async_handle.wait()
     return tensor_dict
+
+
+def is_in_the_same_node(pg: ProcessGroup):
+    """
+    This is a collective operation that checks if all processes in the group
+    are in the same node. It tests if all processes are attached to the same
+    memory system (shared access to shared memory).
+    """
+    assert torch.distributed.get_backend(
+        pg) != torch.distributed.Backend.NCCL, (
+            "is_in_the_same_node should be tested with a non-NCCL group.")
+    # local rank inside the group
+    rank = torch.distributed.get_rank(group=pg)
+    world_size = torch.distributed.get_world_size(group=pg)
+
+    # local tensor in each process to store the result
+    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
+
+    # global ranks of the processes in the group
+    ranks = torch.distributed.get_process_group_ranks(pg)
+
+    magic_message = b"magic_message"
+    shm = None
+
+    try:
+        with suppress(OSError):
+            if rank == 0:
+                # create a shared memory segment
+                shm = shared_memory.SharedMemory(create=True, size=128)
+                shm.buf[:len(magic_message)] = magic_message
+                torch.distributed.broadcast_object_list([shm.name],
+                                                        src=ranks[0],
+                                                        group=pg)
+                is_in_the_same_node[0] = 1
+            else:
+                # try to open the shared memory segment
+                recv = [None]
+                torch.distributed.broadcast_object_list(recv,
+                                                        src=ranks[0],
+                                                        group=pg)
+                name = recv[0]
+                # fix to https://stackoverflow.com/q/62748654/9191338
+                # Python incorrectly tracks shared memory even if it is not
+                # created by the process. The following patch is a workaround.
+                with patch("multiprocessing.resource_tracker.register",
+                           lambda *args, **kwargs: None):
+                    shm = shared_memory.SharedMemory(name=name)
+                if shm.buf[:len(magic_message)] == magic_message:
+                    is_in_the_same_node[rank] = 1
+    except Exception as e:
+        print("Error ignored in is_in_the_same_node: %s", e)
+        #logger.error("Error ignored in is_in_the_same_node: %s", e)
+    finally:
+        if shm:
+            shm.close()
+
+    torch.distributed.barrier(group=pg)
+
+    # clean up the shared memory segment
+    with suppress(OSError):
+        if rank == 0 and shm:
+            shm.unlink()
+    torch.distributed.all_reduce(is_in_the_same_node, group=pg)
+
+    return is_in_the_same_node.sum().item() == world_size
+
+
+def destroy_shm_broadcaster():
+    global shm_broadcaster
+    shm_broadcaster = None
+
+
+atexit.register(destroy_shm_broadcaster)
