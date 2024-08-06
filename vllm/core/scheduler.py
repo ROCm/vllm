@@ -24,6 +24,9 @@ ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
 
 
+VLLM_SCHED_PREFILL_KVC_FREEPCT = float(
+    os.getenv("VLLM_SCHED_PREFILL_KVC_FREEPCT", 0.0))  # noqa
+
 class PreemptionMode(enum.Enum):
     """Preemption modes.
 
@@ -644,7 +647,15 @@ class Scheduler:
         waiting_queue = deque([s for s in waiting_queue])
 
         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
-        while self._passed_delay(time.time()) and waiting_queue:
+        pct_blocks_free = 100.0
+        #only calculate pct_blocks_free if VLLM_SCHED_PREFILL_KVC_FREEPCT feature is enabled
+        if VLLM_SCHED_PREFILL_KVC_FREEPCT>0.0:
+            num_free_blocks = self.block_manager.gpu_allocator.get_num_free_blocks()
+            total_blocks = self.block_manager.num_total_gpu_blocks
+            pct_blocks_free = 100*num_free_blocks/total_blocks
+            #print('>>> Num free blocks',num_free_blocks,'Pct Free',pct_blocks_free,flush=True)
+
+        while pct_blocks_free>VLLM_SCHED_PREFILL_KVC_FREEPCT and self._passed_delay(time.time()) and waiting_queue:
             seq_group = waiting_queue[0]
 
             waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
