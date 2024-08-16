@@ -13,6 +13,8 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.logger import init_logger
 
+from vllm import _custom_C
+
 logger = init_logger(__name__)
 padding_size = 128 if envs.VLLM_MOE_PADDING else 0
 
@@ -229,6 +231,42 @@ def moe_align_block_size(
     )
     return sorted_ids, expert_ids, num_tokens_post_pad
 
+def invoke_mega_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
+                            topk_weights: torch.Tensor, topk_ids: torch.Tensor,
+                            sorted_token_ids: torch.Tensor,
+                            expert_ids: torch.Tensor,
+                            num_tokens_post_padded: torch.Tensor,
+                            m_blck_sz: int, mul_routed_weight: bool, top_k: int,
+                            use_fp8: bool) -> None:
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    #print("\nm=",A.shape[0],"n=",B.shape[1],"k=",B.shape[2],"e=", B.shape[0], "ml_rt:",mul_routed_weight,"tpk",top_k, "\n")
+    _custom_C.wvSpltK_fsdMoe(#A, B, C, B.shape[1], 80)
+        A,
+        B,
+        C,
+        topk_weights,
+        topk_ids,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        A.shape[0],
+        B.shape[1],
+        B.shape[2],
+        B.shape[0],
+        topk_ids.numel(),
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(2),
+        B.stride(1),
+        C.stride(1),
+        C.stride(2),
+        m_blck_sz,
+        mul_routed_weight,
+        top_k,
+        80)
 
 def invoke_fused_moe_kernel(A: torch.Tensor, B: torch.Tensor, C: torch.Tensor,
                             A_scale: Optional[torch.Tensor],
@@ -367,8 +405,9 @@ def fused_experts(hidden_states: torch.Tensor,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None):
     # Check constraints.
-    assert hidden_states.shape[
-        1] == w1.shape[2] - padding_size, "Hidden size mismatch"
+    #print("hidenSize:", hidden_states.shape)
+    # print("hidenSize:", w1.shape[2])
+    assert hidden_states.shape[1] == w1.shape[2] - padding_size, "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -407,7 +446,7 @@ def fused_experts(hidden_states: torch.Tensor,
                     "BLOCK_SIZE_K": 64,
                     "GROUP_SIZE_M": 1,
                 }
-
+    
     intermediate_cache1 = torch.empty(
         (M, topk_ids.shape[1], N),
         device=hidden_states.device,
@@ -424,12 +463,87 @@ def fused_experts(hidden_states: torch.Tensor,
         dtype=hidden_states.dtype,
     )
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, config['BLOCK_SIZE_M'], E)
     compute_type = (tl.bfloat16
                     if hidden_states.dtype == torch.bfloat16 else tl.float16)
+    #print(hidden_states.shape) 
+    #print(intermediate_cache2.shape) 
+    #print("M1:", hidden_states.shape[0], "M2:", intermediate_cache2.shape[0])
+    #if hidden_states.shape[0] <= 256 and hidden_states.shape[1] % 8 == 0 and intermediate_cache2.shape[0] <= 256 and not use_fp8 :
+    
+    #WVSPLTK_M_THRSHLD = 64 
+    #if hidden_states.shape[0] <= WVSPLTK_M_THRSHLD \
+    #        and hidden_states.shape[1] % 8 == 0 \
+    #        and intermediate_cache2.shape[0] <= WVSPLTK_M_THRSHLD \
+    #        and intermediate_cache2.shape[1] % 8 == 0 \
+    #        and not use_fp8 :
+    if envs.VLLM_MOE_MFMASWIZZLE and M<=envs.VLLM_MOE_MFMASWIZZLE_M_THRSHLD:
+        assert(compute_type == tl.float16, "Only fp16 supported for wvSplitK_mfma16x16 for now")
+        #m_blck_sz = -(-(M*topk_ids.shape[1]*3)//E) # target 75%  of expert distribution for this M size
+        #if (m_blck_sz >= 12):
+        #    m_blck_sz = 16
 
-    invoke_fused_moe_kernel(hidden_states,
+        # all calls go to wvSplitK_mfma16x16
+        m_blck_sz = 16  # TODO: this is for decode stage, need another for prefill
+        #print("M:", M, " M_BLOCK PICKED:", m_blck_sz)
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, m_blck_sz, E) # target 75% of expert distribution for this M size
+            #topk_ids, config2['BLOCK_SIZE_M'],E)
+        #print("\nsrtd_tkn:", sorted_token_ids)
+        #print("w1Shape:",w1.shape)
+        
+        #env VLLM_MOE_MFMASWIZZLE does this swizzle on init
+        w1_ = w1
+        w2_ = w2
+        if not envs.VLLM_MOE_MFMASWIZZLE : # for debug only
+          if m_blck_sz >= 16 :
+            w1_ = torch.clone(w1)
+            w1_ = w1_.view(w1.shape[0], w1.shape[1]//16, 16, w1.shape[2]//128, 16, 8);
+            w1_ = w1_.permute(0, 1, 4, 3, 2, 5)
+            w1_ = w1_.contiguous()
+            w1_ = w1_.view(w1.shape[0],w1.shape[1],w1.shape[2]);
+            w2_ = torch.clone(w2)
+            w2_ = w2_.view(w2.shape[0], w2.shape[1]//16, 16, w2.shape[2]//128, 16, 8);
+            w2_ = w2_.permute(0, 1, 4, 3, 2, 5)
+            w2_ = w2_.contiguous()
+            w2_ = w2_.view(w2.shape[0],w2.shape[1],w2.shape[2]);
+       
+        #print(w1_)
+
+        invoke_mega_fused_moe_kernel(hidden_states,
+                            w1_,
+                            intermediate_cache1,
+                            topk_weights,
+                            topk_ids,
+                            sorted_token_ids,
+                            expert_ids,
+                            num_tokens_post_padded,
+                            m_blck_sz,
+                            False,
+                            topk_ids.shape[1],
+                            use_fp8=use_fp8)
+        #print("shdr_invk1:",intermediate_cache1.view(-1, N))
+        ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        #print("shdr_silu:",intermediate_cache2)
+        #print("shdr_silu_shape:", intermediate_cache2.shape)
+        #print("-----------------------------")
+           
+        invoke_mega_fused_moe_kernel(intermediate_cache2,
+                            w2_,
+                            intermediate_cache3,
+                            topk_weights,
+                            topk_ids,
+                            sorted_token_ids,
+                            expert_ids,
+                            num_tokens_post_padded,
+                            m_blck_sz,
+                            True,
+                            1,
+                            use_fp8=use_fp8)
+
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+           topk_ids, config['BLOCK_SIZE_M'], E)
+        invoke_fused_moe_kernel(hidden_states,
                             w1,
                             intermediate_cache1,
                             a1_scale,
@@ -445,9 +559,9 @@ def fused_experts(hidden_states: torch.Tensor,
                             compute_type=compute_type,
                             use_fp8=use_fp8)
 
-    ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
 
-    invoke_fused_moe_kernel(intermediate_cache2,
+        invoke_fused_moe_kernel(intermediate_cache2,
                             w2,
                             intermediate_cache3,
                             a2_scale,

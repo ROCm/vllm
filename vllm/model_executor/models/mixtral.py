@@ -181,8 +181,29 @@ class MixtralMoE(nn.Module):
             param_data[expert_id] = loaded_weight
 
     def process_weights_after_loading(self):
-        # Fp8 is the only case where we need to process after loading.
         if not self.use_fp8:
+            if envs.VLLM_MOE_MFMASWIZZLE: 
+                #w1_ = torch.clone(w1)
+                b,n,k = self.w13_weight.shape
+                w1_ = self.w13_weight
+                w1_ = w1_.view(b, n//16, 16, k//128, 16, 8);
+                w1_ = w1_.transpose(2,4)
+                w1_ = w1_.contiguous()
+                w1_ = w1_.view(b,n,k)
+                w1_ = w1_.contiguous()
+                self.w13_weight = nn.Parameter(w1_, requires_grad=False)
+
+                #w2_ = torch.clone(w2)
+                b,n,k = self.w2_weight.shape
+                w2_ = self.w2_weight
+                w2_ = w2_.view(b, n//16, 16, k//128, 16, 8);
+                w2_ = w2_.transpose(2,4)
+                #w2_ = w2_.permute(0, 1, 4, 3, 2, 5)
+                w2_ = w2_.contiguous()
+                w2_ = w2_.view(b,n,k)
+                w2_ = w2_.contiguous()
+                self.w2_weight = nn.Parameter(w2_, requires_grad=False)
+                return
             if envs.VLLM_MOE_PADDING:
                 self.w13_weight = nn.Parameter(F.pad(self.w13_weight.data,
                                                      (0, 128), "constant", 0),
