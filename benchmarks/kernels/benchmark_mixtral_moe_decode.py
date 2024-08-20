@@ -7,19 +7,20 @@ import torch
 import torch.nn.functional as F
 import triton
 from tqdm import tqdm
-
-from vllm.model_executor.layers.fused_moe import (fused_moe,
-                                                  get_config_file_name)
 from vllm import envs
 from torch import nn
+from vllm.model_executor.layers.fused_moe import (fused_moe,
+                                                  get_config_file_name)
+
 
 def main(model, tp_size, gpu, dtype: str):
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
     method = fused_moe
-    for bs in [
-            1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536,
-            2048, 3072, 4096
-    ]:
+    # for bs in [
+    #         1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 512, 1024, 1536,
+    #         2048, 3072, 4096
+    # ]:
+    for bs in [8, 16, 32, 64, 96, 112, 120, 128]:
         run_grid(bs,
                  model=model,
                  method=method,
@@ -69,7 +70,8 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
 
     print(f'{tp_size=} {bs=}')
 
-    for config in tqdm(configs):
+    # for config in tqdm(configs):
+    if 1:
         # warmup
         try:
             for _ in range(num_warmup_trials):
@@ -82,11 +84,12 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
                     tp_size=tp_size,
                     model_intermediate_size=model_intermediate_size,
                     method=method,
-                    config=config,
+                    config=None,
                     dtype=dtype,
                 )
         except triton.runtime.autotuner.OutOfResources:
-            continue
+            #continue
+            pass
 
         # trial
         for _ in range(num_trials):
@@ -99,7 +102,7 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
                 tp_size=tp_size,
                 model_intermediate_size=model_intermediate_size,
                 method=method,
-                config=config,
+                config=None,
                 dtype=dtype,
             )
 
@@ -107,9 +110,8 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
             model_dur_ms = kernel_dur_ms * num_layers
 
             if kernel_dur_us < best_time_us:
-                best_config = config
+                # best_config = config
                 best_time_us = kernel_dur_us
-
                 tqdm.write(
                     f'{kernel_dur_us=:.1f} {model_dur_ms=:.1f}'
                     f' {bs=} {tp_size=} {top_k=} {num_total_experts=} '
@@ -119,18 +121,18 @@ def run_grid(bs, model, method, gpu, tp_size, dtype: str):
     print("best_config", best_config)
 
     # holds Dict[str, Dict[str, int]]
-    filename = get_config_file_name(num_total_experts,
-                                    model_intermediate_size // tp_size,
-                                    "float8" if dtype == "float8" else None)
-    print(f"writing config to file {filename}")
-    existing_content = {}
-    if os.path.exists(filename):
-        with open(filename, "r") as f:
-            existing_content = json.load(f)
-    existing_content[str(bs)] = best_config
-    with open(filename, "w") as f:
-        json.dump(existing_content, f, indent=4)
-        f.write("\n")
+    # filename = get_config_file_name(num_total_experts,
+    #                                 model_intermediate_size // tp_size,
+    #                                 "float8" if dtype == "float8" else None)
+    # print(f"writing config to file {filename}")
+    # existing_content = {}
+    # if os.path.exists(filename):
+    #     with open(filename, "r") as f:
+    #         existing_content = json.load(f)
+    # existing_content[str(bs)] = best_config
+    # with open(filename, "w") as f:
+    #     json.dump(existing_content, f, indent=4)
+    #     f.write("\n")
 
 
 def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,
@@ -155,14 +157,15 @@ def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+
     if envs.VLLM_MOE_PADDING:
         w1 = nn.Parameter(F.pad(w1.data,
-                        (0, 128), "constant", 0),
-                        requires_grad=False)
+                                                (0, 128), "constant", 0),
+                                        requires_grad=False)
         torch.cuda.empty_cache()
-        w2 = nn.Parameter(F.pad(w2,
-                        (0, 128), "constant", 0),
-                        requires_grad=False)
+        w2 = nn.Parameter(F.pad(w2.data,
+                                            (0, 128), "constant", 0),
+                                        requires_grad=False)
         torch.cuda.empty_cache()
 
     w1_scale = None
@@ -215,6 +218,9 @@ def run_timing(num_calls: int, bs: int, d_model: int, num_total_experts: int,
         )
     end_event.record()
     end_event.synchronize()
+
+
+    # torch_output = torch_moe(a, w1, w2, score, topk)
 
     dur_ms = start_event.elapsed_time(end_event) / num_calls
     return dur_ms

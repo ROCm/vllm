@@ -183,15 +183,17 @@ class MixtralMoE(nn.Module):
     def process_weights_after_loading(self):
         # Fp8 is the only case where we need to process after loading.
         if not self.use_fp8:
+            w13_ = permute_weight(self.w13_weight.data)
+            w2_ = permute_weight(self.w2_weight.data)
             if envs.VLLM_MOE_PADDING:
-                self.w13_weight = nn.Parameter(F.pad(self.w13_weight.data,
-                                                     (0, 128), "constant", 0),
-                                               requires_grad=False)
+                w13_ = F.pad(w13_, (0, 128), "constant", 0)
                 torch.cuda.empty_cache()
-                self.w2_weight = nn.Parameter(F.pad(self.w2_weight.data,
-                                                    (0, 128), "constant", 0),
-                                              requires_grad=False)
+                w2_ = F.pad(w2_, (0, 128), "constant", 0)
                 torch.cuda.empty_cache()
+            self.w13_weight = nn.Parameter(w13_, requires_grad=False)
+            torch.cuda.empty_cache()
+            self.w2_weight = nn.Parameter(w2_, requires_grad=False)
+            torch.cuda.empty_cache()
             return
 
         # If checkpoint is fp16, quantize here.
@@ -603,3 +605,21 @@ class MixtralForCausalLM(nn.Module):
 def all_close_1d(x: torch.Tensor) -> bool:
     assert len(x.shape) == 1
     return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))
+
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    x_ = x
+    if envs.VLLM_MOE_SHUFFLE:
+        x_ = x_.view(x.shape[0],
+                         x.shape[1]//16, 16,
+                         x.shape[2]//32, 4, 8)
+        x_ = x_.permute(0,1,3,4,2,5)
+        x_ = x_.contiguous()
+        x_ = x_.view(x.shape[0], x.shape[1], x.shape[2]);
+    elif envs.VLLM_MOE_MFMASWIZZLE: # hashem's swizzle
+        x_ = x_.view(x.shape[0],
+                         x.shape[1]//16, 16,
+                         x.shape[2]//128, 16, 8)
+        x_ = x_.permute(0,1,4,3,2,5)
+        x_ = x_.contiguous()
+        x_ = x_.view(x.shape[0], x.shape[1], x.shape[2]);
+    return x_

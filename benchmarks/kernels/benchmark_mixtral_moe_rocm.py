@@ -17,30 +17,11 @@ from vllm.model_executor.layers.fused_moe import (get_config_file_name,
 
 
 def main(args):
-    os.environ["HIP_VISIBLE_DEVICES"] = args.GPUID
     os.environ["HIP_FORCE_DEV_KERNARG"] = "1"
     os.environ["DEBUG_CLR_GRAPH_PACKET_CAPTURE"] = "1"
-    os.environ["OPTIMIZE_EPILOGUE"] = "1"
 
     for bs in [
-            1,
-            2,
-            4,
-            8,
-            16,
-            24,
-            32,
-            48,
             64,
-            96,
-            128,
-            256,
-            512,
-            1024,
-            1536,
-            2048,
-            3072,
-            4096,
     ]:
         run_grid(bs, model=args.model, TP=args.TP)
 
@@ -49,21 +30,22 @@ def main(args):
 def get_full_tuning_space():
     configs = []
 
-    block_mn_range = [16, 32, 64, 128, 256]
-    block_k_range = [16, 32, 64, 128, 256]
+    block_m_range = [32]
+    block_n_range = [128]
+    block_k_range = [128]
     # split_k_range = [1] #, 2, 4, 5, 6, 8, 10, 12, 16, 18, 24]
-    num_warps_range = [1, 2, 4, 8]
-    group_m_range = [1, 4, 8, 16, 32]
+    num_warps_range = [8]
+    group_m_range = [1]
     # For now we see better perf with num_stages=0 for all gemm configs we care
     # But keep this explicit so that we do not forget we may need to set it to
     # other values in the future
     num_stage_range = [0]
     waves_per_eu_range = [0]
-    matrix_instr_nonkdim_range = [16, 32]
-    kpack_range = [1, 2]
+    matrix_instr_nonkdim_range = [16]
+    kpack_range = [2]
 
-    for block_m in block_mn_range:
-        for block_n in block_mn_range:
+    for block_m in block_m_range:
+        for block_n in block_n_range:
             for block_k in block_k_range:
                 for num_warps in num_warps_range:
                     for group_m in group_m_range:
@@ -91,77 +73,8 @@ def get_full_tuning_space():
 
 ## Utilize method from rocm/Triton tuning script
 def prune_configs(M, N, K, configs):
-    pruned_configs = []
-    elemBytes_a = 2  # [DV Note] Hard-coded for float16 (2 bytes)
-    elemBytes_b = 2  # [DV Note] Hard-coded for float16 (2 bytes)
 
-    mfma = 16 if M < 32 or N < 32 else 32
-
-    # TODO (zhanglx): figure out the boundary between large and small gemms
-    large_gemm = False
-    if M >= 2048 and N >= 2048:
-        large_gemm = True
-
-    for config in configs:
-        BLOCK_SIZE_M = config.get("BLOCK_SIZE_M")
-        BLOCK_SIZE_N = config.get("BLOCK_SIZE_N")
-        BLOCK_SIZE_K = config.get("BLOCK_SIZE_K")
-        num_warps = config.get("num_warps")
-        matrix_instr_nonkdim = config.get("matrix_instr_nonkdim")
-        # kpack = config.get("kpack")
-        if matrix_instr_nonkdim > mfma:
-            continue
-        if mfma == 4 and BLOCK_SIZE_K < 64:
-            continue
-        # some layouts could not work properly in case
-        # number elements per thread is less 1
-        if BLOCK_SIZE_M * BLOCK_SIZE_N < 64:
-            continue
-        SPLIT_K = 1  # config.get("SPLIT_K")
-        GROUP_M = config.get("GROUP_SIZE_M")
-        if (matrix_instr_nonkdim > BLOCK_SIZE_M
-                or matrix_instr_nonkdim > BLOCK_SIZE_N):
-            continue
-        if matrix_instr_nonkdim >= M and matrix_instr_nonkdim != BLOCK_SIZE_M:
-            continue
-        if matrix_instr_nonkdim >= N and matrix_instr_nonkdim != BLOCK_SIZE_N:
-            continue
-        # Skip BLOCK_SIZE that is too large compare to M/N
-        # unless BLOCK_SIZE is already small enough
-        if M * 2 < BLOCK_SIZE_M and BLOCK_SIZE_M != 16:
-            continue
-        if N * 2 < BLOCK_SIZE_N and BLOCK_SIZE_N != 16:
-            continue
-        # skip large split_k when not necessary
-        if SPLIT_K != 1 and not need_split_k(M, N, K):
-            continue
-        # skip split_k that leads to EVEN_K = false
-        leap = SPLIT_K * BLOCK_SIZE_K
-        modv = K % leap
-        if modv != 0:
-            continue
-        # skip large GROUP_M
-        if GROUP_M * BLOCK_SIZE_M > M and GROUP_M != 1:
-            continue
-        # out of shared memory resource
-        # TODO (zhanglx): This does not consider the LDS usage in the epilogue
-        LDS = (BLOCK_SIZE_K * BLOCK_SIZE_M * elemBytes_a +
-               BLOCK_SIZE_K * BLOCK_SIZE_N * elemBytes_b)
-        if LDS > 65536:
-            continue
-        # Skip small block sizes and num_warps for large gemm
-        # For fp16 and f8, we want to only use BLOCK_SIZE >= 64
-        if large_gemm:
-            if BLOCK_SIZE_M < 64 or BLOCK_SIZE_N < 64:
-                continue
-            if BLOCK_SIZE_K < 64:
-                continue
-            if num_warps < 4:
-                continue
-
-        pruned_configs.append(config)
-
-    return pruned_configs
+    return configs
 
 
 def union_of_list_of_dicts(l1, l2):
@@ -195,7 +108,7 @@ def run_grid(bs, model, TP):
     num_calls = 100
 
     num_warmup_trials = 1
-    num_trials = 1
+    num_trials = 10
 
     full_configs = get_full_tuning_space()
     M1 = bs * 2
@@ -293,7 +206,7 @@ def run_timing(
     )
 
     w1 = torch.rand(
-        (num_total_experts, 2 * shard_intermediate_size, d_model),
+        (num_total_experts, 2 * shard_intermediate_size, d_model+128),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -318,7 +231,7 @@ def run_timing(
 
     assert (hidden_states.shape[0] == gating_output.shape[0]
             ), "Number of tokens mismatch"
-    assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
+    assert hidden_states.shape[1] == w1.shape[2] - 128, "Hidden size mismatch"
     assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
@@ -393,32 +306,40 @@ def run_timing(
             config,
             compute_type=(tl.bfloat16 if hidden_states.dtype == torch.bfloat16
                           else tl.float16),
-            use_fp8=False,
+            use_fp8=False
         )
 
-        ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
+        # ops.silu_and_mul(intermediate_cache2, intermediate_cache1.view(-1, N))
 
-        invoke_fused_moe_kernel(
-            intermediate_cache2,
-            w2,
-            intermediate_cache3,
-            None,  # a2_scale
-            None,  # w2_scale
-            topk_weights,
-            topk_ids,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            True,
-            1,
-            config,
-            compute_type=(tl.bfloat16 if hidden_states.dtype == torch.bfloat16
-                          else tl.float16),
-            use_fp8=False,
-        )
+        # invoke_fused_moe_kernel(
+        #     intermediate_cache2,
+        #     w2,
+        #     intermediate_cache3,
+        #     None,  # a2_scale
+        #     None,  # w2_scale
+        #     topk_weights,
+        #     topk_ids,
+        #     sorted_token_ids,
+        #     expert_ids,
+        #     num_tokens_post_padded,
+        #     True,
+        #     1,
+        #     config,
+        #     compute_type=(tl.bfloat16 if hidden_states.dtype == torch.bfloat16
+        #                   else tl.float16),
+        #     use_fp8=False,
+        # )
 
     end_event.record()
     end_event.synchronize()
+    # print(f"intermediate 0 shape = {intermediate_cache1.shape}")
+    # print(f"intermediate 1 shape = {intermediate_cache2.shape}")
+    # print(f"intermediate 2 shape = {intermediate_cache3.shape}")
+    # print(f"config = {config}")
+    # print(f"sorted token ids = {sorted_token_ids}")
+    # print(f"sorted token ids shape = {sorted_token_ids.shape}")
+    # print(f"expert ids = {expert_ids}")
+    # print(f"num_tokens_post_padded = {num_tokens_post_padded}")
 
     dur_ms = start_event.elapsed_time(end_event) / num_calls
     return dur_ms

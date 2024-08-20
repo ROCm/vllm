@@ -13,7 +13,17 @@ from vllm import envs
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.models.mixtral import MixtralMoE
+from vllm import envs
 
+def permute_weight(x: torch.Tensor) -> torch.Tensor:
+    x_ = x.clone()
+    x_ = x_.view(x.shape[0],
+                     x.shape[1]//16, 16,
+                     x.shape[2]//32, 4, 8)
+    x_ = x_.permute(0,1,3,4,2,5)
+    x_ = x_.contiguous()
+    x_ = x_.view(x.shape[0], x.shape[1], x.shape[2]);
+    return x_
 
 def torch_moe(a, w1, w2, score, topk):
     B, D = a.shape
@@ -62,6 +72,62 @@ def test_fused_moe(
     triton_output = fused_moe(a, w1, w2, score, topk, renormalize=False)
     assert torch.allclose(triton_output, torch_output, atol=1e-2, rtol=0)
 
+@pytest.mark.parametrize("m", [1, 64, 96, 1000, 237])
+@pytest.mark.parametrize("n", [14336])
+@pytest.mark.parametrize("k", [4096])
+@pytest.mark.parametrize("e", [8])
+@pytest.mark.parametrize("topk", [2])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_amd_moe_1(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    topk: int,
+    dtype: torch.dtype,
+):
+    if n == k:
+        pytest.skip()
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device='cuda', dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device='cuda', dtype=dtype) / 10
+    if envs.VLLM_MOE_SHUFFLE:
+        w1_shuffled = permute_weight(w1.data)
+        w2_shuffled = permute_weight(w2.data)
+
+    score = torch.randn((m, e), device='cuda', dtype=dtype)
+    triton_output = fused_moe(a, w1_shuffled, w2_shuffled, score, topk, renormalize=False)
+    torch_output = torch_moe(a, w1, w2, score, topk)
+    assert torch.allclose(triton_output, torch_output, atol=2e-2, rtol=0)
+
+
+@pytest.mark.parametrize("m", [1, 64, 96, 1000, 237])
+@pytest.mark.parametrize("n", [4096])
+@pytest.mark.parametrize("k", [14336])
+@pytest.mark.parametrize("e", [8])
+@pytest.mark.parametrize("topk", [2])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_amd_moe_2(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    topk: int,
+    dtype: torch.dtype,
+):
+    if n == k:
+        pytest.skip()
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device='cuda', dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device='cuda', dtype=dtype) / 10
+    if envs.VLLM_MOE_SHUFFLE:
+        w1_shuffled = permute_weight(w1.data)
+        w2_shuffled = permute_weight(w2.data)
+
+    score = torch.randn((m, e), device='cuda', dtype=dtype)
+    triton_output = fused_moe(a, w1_shuffled, w2_shuffled, score, topk, renormalize=False)
+    torch_output = torch_moe(a, w1, w2, score, topk)
+    assert torch.allclose(triton_output, torch_output, atol=2e-1, rtol=0)
 
 @pytest.mark.parametrize("dtype",
                          [torch.float32, torch.float16, torch.bfloat16])
