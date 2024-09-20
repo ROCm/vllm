@@ -30,7 +30,7 @@ steps:
 ##### fast check tests  #####
 
 - label: Documentation Build # 2min
-  working_dir: "/vllm-workspace/test_docs/docs"
+  working_dir: "/vllm/test_docs/docs"
   fast_check: true
   no_gpu: True
   commands:
@@ -80,7 +80,7 @@ steps:
   - pytest -v -s core
 
 - label: Entrypoints Test # 20min
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   fast_check: true
   #mirror_hardwares: [amd]
   source_file_dependencies:
@@ -95,7 +95,7 @@ steps:
   - pytest -v -s entrypoints/offline_mode # Needs to avoid interference with other tests
 
 - label: Distributed Tests (4 GPUs) # 10min
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 4
   fast_check: true
   source_file_dependencies:
@@ -132,7 +132,7 @@ steps:
   - vllm/
   - tests/test_regression
   command: pytest -v -s test_regression.py
-  working_dir: "/vllm-workspace/tests" # optional
+  #working_dir: "/vllm-workspace/tests" # optional
 
 - label: Engine Test # 10min
   mirror_hardwares: [amd]
@@ -146,7 +146,7 @@ steps:
   - pytest -v -s tokenization
 
 - label: Examples Test # 12min
-  working_dir: "/vllm-workspace/examples"
+  #working_dir: "/vllm-workspace/examples"
   #mirror_hardwares: [amd]
   source_file_dependencies:
   - vllm/entrypoints
@@ -234,7 +234,7 @@ steps:
     - pytest -v -s tensorizer_loader
 
 - label: Benchmarks # 9min
-  working_dir: "/vllm-workspace/.buildkite"
+  working_dir: "/vllm/.buildkite"
   mirror_hardwares: [amd]
   source_file_dependencies:
   - benchmarks/
@@ -250,7 +250,7 @@ steps:
   command: pytest -v -s quantization
 
 - label: LM Eval Small Models # 53min
-  working_dir: "/vllm-workspace/.buildkite/lm-eval-harness"
+  working_dir: "/vllm/.buildkite/lm-eval-harness"
   source_file_dependencies:
   - csrc/
   - vllm/model_executor/layers/quantization
@@ -311,7 +311,7 @@ steps:
 #####  multi gpus test  #####
 
 - label: Distributed Comm Ops Test # 7min
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 2
   source_file_dependencies:
   - vllm/distributed
@@ -321,7 +321,7 @@ steps:
   - pytest -v -s distributed/test_shm_broadcast.py
 
 - label: 2 Node Tests (4 GPUs in total) # 16min
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 2
   num_nodes: 2
   source_file_dependencies:
@@ -340,7 +340,7 @@ steps:
 
 - label: Distributed Tests (2 GPUs) # 28min
   #mirror_hardwares: [amd]
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 2
   source_file_dependencies:
   - vllm/distributed/
@@ -360,7 +360,7 @@ steps:
   - CUDA_VISIBLE_DEVICES=0,1 pytest -v -s distributed/test_utils.py
 
 - label: Multi-step Tests (4 GPUs) # 21min
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 4
   source_file_dependencies:
   - vllm/model_executor/layers/sampler.py
@@ -378,7 +378,7 @@ steps:
   - pytest -v -s multi_step/test_correctness_llm.py
 
 - label: Pipeline Parallelism Test # 23min
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 4
   source_file_dependencies:
   - vllm/distributed/
@@ -404,7 +404,7 @@ steps:
     - pytest -v -s -x lora/test_long_context.py
 
 - label: Weight Loading Multiple GPU Test
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 2
   source_file_dependencies:
   - vllm/
@@ -413,7 +413,7 @@ steps:
     - bash weight_loading/run_model_weight_loading_test.sh -c weight_loading/models.txt
 
 - label: Weight Loading Multiple GPU Test - Large Models # optional
-  working_dir: "/vllm-workspace/tests"
+  #working_dir: "/vllm-workspace/tests"
   num_gpus: 2
   gpu: a100
   optional: true
@@ -442,7 +442,7 @@ steps:
 - label: LM Eval Large Models # optional
   gpu: a100
   num_gpus: 4
-  working_dir: "/vllm-workspace/.buildkite/lm-eval-harness"
+  working_dir: "/vllm/.buildkite/lm-eval-harness"
   source_file_dependencies:
   - csrc/
   - vllm/model_executor/layers/quantization

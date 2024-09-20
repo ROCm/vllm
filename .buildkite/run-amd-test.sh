@@ -5,7 +5,7 @@ set -o pipefail
 echo "--- Confirming Clean Initial State"
 while true; do
         sleep 3
-        if grep -q clean ${BUILDKITE_META_DATA_RESET_TARGET}; then
+        if grep -q clean ${BUILDKITE_AGENT_META_DATA_RESET_TARGET}; then
                 echo "GPUs state is \"clean\""
                 break
         fi
@@ -44,11 +44,11 @@ cleanup_docker
 
 echo "--- Resetting GPUs"
 
-echo "reset" > ${BUILDKITE_META_DATA_RESET_TARGET}
+echo "reset" > ${BUILDKITE_AGENT_META_DATA_RESET_TARGET}
 
 while true; do
         sleep 3
-	if grep -q clean ${BUILDKITE_META_DATA_RESET_TARGET}; then
+	if grep -q clean ${BUILDKITE_AGENT_META_DATA_RESET_TARGET}; then
                 echo "GPUs state is \"clean\""
                 break
         fi
@@ -93,16 +93,18 @@ if [[ $commands == *" kernels "* ]]; then
   --ignore=kernels/test_sampler.py"
 fi
 
-PARALLEL_JOB_COUNT=8
-# check if the command contains shard flag, we will run all shards in parallel because the host have 8 GPUs. 
+# check if the command contains shard flag, we will run all shards in parallel because the host has N GPUs. 
 if [[ $commands == *"--shard-id="* ]]; then
-  for GPU in $(seq 0 $(($PARALLEL_JOB_COUNT-1))); do
+  PARALLEL_JOB_COUNT=$(echo $BUILDKITE_AGENT_META_DATA_USED_GPUS | wc -w)
+  SHARD_ID=0
+  for GPU in $(echo $BUILDKITE_AGENT_META_DATA_USED_GPUS); do
     #replace shard arguments
-    commands=${commands//"--shard-id= "/"--shard-id=${GPU} "}
+    commands=${commands//"--shard-id= "/"--shard-id=${SHARD_ID} "}
     commands=${commands//"--num-shards= "/"--num-shards=${PARALLEL_JOB_COUNT} "}
-    echo "Shard ${GPU} commands:$commands"
+    SHARD_ID=$((SHARD_ID+1))
+    echo "GPU ${GPU} commands:$commands"
     docker run \
-        --device /dev/kfd --device /dev/dri \
+        --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
         --network host \
         --shm-size=16gb \
         --rm \
@@ -110,10 +112,10 @@ if [[ $commands == *"--shard-id="* ]]; then
         -e HF_TOKEN \
         -v ${HF_CACHE}:${HF_MOUNT} \
         -e HF_HOME=${HF_MOUNT} \
-        --name ${container_name}_${GPU}  \
+        --name ${container_name}_${SHARD_ID}  \
         ${image_name} \
         /bin/bash -c "${commands}" \
-        |& while read -r line; do echo ">>Shard $GPU: $line"; done &
+        |& while read -r line; do echo ">>Shard $SHARD_ID: $line"; done &
     PIDS+=($!)
   done
   #wait for all processes to finish and collect exit codes
