@@ -6,25 +6,6 @@ import zoneinfo
 
 app = Flask(__name__)
 
-# Example callback: Fetch local data and return it
-def fetch_data():
-    # Replace this with logic to access your data source
-    data = {"timestamp": ['2024-12-16 08:10:36.164014','2024-12-16 08:10:36.164027', '2024-12-16 08:10:36.164030'], 
-            "machine_label": ["machine1", "machine12", "machine3"], 
-            'operation_result':['success', 'failure', 'success']}
-    return data
-
-@app.route("/data", methods=["GET"])
-def get_data():
-    """API endpoint to fetch data."""
-    try:
-        data = fetch_data()
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-
 
 @app.route("/upload", methods=["POST"])
 def upload_data():
