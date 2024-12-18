@@ -1,0 +1,12 @@
+FROM python:3
+
+WORKDIR /container_workspace
+
+COPY requirements-bkdb.txt ./
+RUN apt-get update && apt-get install python3-pip moreutils -y
+RUN pip install --no-cache-dir -r requirements-bkdb.txt
+
+COPY . .
+
+#CMD ["/bin/bash"]
+CMD python3 ./file_based_db.py 2>&1 | ts '[%Y-%m-%d %H:%M:%S]' >> /mnt/home/vllm_fresh/.buildkite_monitor/db_demo/logfile.log
