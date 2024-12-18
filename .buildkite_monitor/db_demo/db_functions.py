@@ -124,7 +124,8 @@ def fetch_logs_for_df(df, token, org_slug, pipe_slug):
 def reconstruct_log(df):
     full_log = ''
     for log in df['log']:
-        full_log += log + '\n'
+        if log != '':
+         full_log += log# + '\n'
     return full_log.strip()
 
 def compute_diff(old_log, new_log):
@@ -261,7 +262,7 @@ def bronze_jobs_logs(df, token, org_slug, pipe_slug, testing):
                #print('jobs with updated log:', existing_jobs[mask.log==True].id.unique())
                for idx in existing_jobs[mask.log==True].id:
                   #print('id', idx)
-                  reconstructed_log = reconstruct_log(bronze[bronze.id==idx])
+                  reconstructed_log = reconstruct_log(bronze[bronze.id==idx].sort_values('timestamp'))
                   #print(reconstructed_log)
                   new_log = updated_rows[updated_rows.id==idx].log.values[0]
                   #print(new_log)

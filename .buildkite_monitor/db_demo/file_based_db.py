@@ -47,6 +47,10 @@ params = {
 }
 
 raw = fetch_data(params, BUILDKITE_API_TOKEN, ORGANIZATION_SLUG, PIPELINE_SLUG)
+if raw.empty:
+    print('No data to process')
+    raise SystemExit
+
 now_utc = pd.Timestamp.now(tz='UTC')
 raw['timestamp'] = now_utc
 
