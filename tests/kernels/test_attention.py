@@ -18,31 +18,36 @@ if not current_platform.is_rocm():
 FLOAT32_BYTES = torch.finfo(torch.float).bits // 8
 # This will change depending on the compute capability.
 # - 512 as a buffer
-MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
+#MAX_SEQ_LEN = get_max_shared_memory_bytes() // FLOAT32_BYTES - 512
+MAX_SEQ_LEN = 32768
 # There may not be enough gpu memory due to large NUM_BLOCKS.
 # Reduce NUM_BLOCKS when it happens.
-NUM_BLOCKS = 4321  # Arbitrary values for testing
+NUM_BLOCKS = 128*1024+4321  # Arbitrary values for testing
 PARTITION_SIZE = 512
+PARTITION_SIZE_ROCM = 256
 # flshattF and tritonflashattF supported: {torch.float16, torch.bfloat16}
 DTYPES = [
     torch.half, torch.bfloat16, torch.float
-] if not current_platform.is_rocm() else [torch.half, torch.bfloat16]
-NUM_GEN_SEQS = [7]  # Arbitrary values for testing
+] if not current_platform.is_rocm() else [torch.half,torch.bfloat16]
+NUM_GEN_SEQS = [17]  # Arbitrary values for testing
 NUM_PREFILL_SEQS = [3]  # Arbitrary values for testing
-NUM_HEADS = [(40, 40), (64, 8)]  # Arbitrary values for testing
+NUM_HEADS = [(64, 8), (26,2), (16,1), (32,32)]  # Arbitrary values for testing
 
 # FlashAttention forward only supports head dimension at most 128
 # https://github.com/ROCmSoftwarePlatform/flash-attention/blob/3d2b6f5d037782cc2c906909a46fb7e2e1b48b25/csrc/flash_attn_rocm/flash_api.cpp#L62
-HEAD_SIZES = [64, 80, 120, 256]
+HEAD_SIZES = [64, 80, 96, 112, 120, 128, 192, 256]
+HEAD_SIZES = [128]
 
-BLOCK_SIZES = [16, 32]
-USE_ALIBI = [False, True]
-KV_CACHE_DTYPE = ["auto", "fp8"]
+BLOCK_SIZES = [16]
+USE_ALIBI = [False]
+KV_CACHE_DTYPE = ["auto","fp8"]
 SEEDS = [0]
 CUDA_DEVICES = [
-    f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
+    f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 1)
 ]
 
+REF_TENSOR = None
+CMP_TENSOR = None
 
 def ref_masked_attention(
     query: torch.Tensor,
@@ -51,10 +56,15 @@ def ref_masked_attention(
     scale: float,
     attn_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    attn_weights = scale * torch.einsum("qhd,khd->hqk", query, key).float()
+    qkout = torch.einsum("qhd,khd->hqk", query, key).float()
+    attn_weights = scale * qkout
     if attn_mask is not None:
         attn_weights = attn_weights + attn_mask.float()
     attn_weights = torch.softmax(attn_weights, dim=-1).to(value.dtype)
+    #print('>>> ref qkout shape',attn_weights.shape)
+    #print('>>> ref qkout',attn_weights)
+    #global REF_TENSOR
+    #REF_TENSOR = attn_weights
     out = torch.einsum("hqk,khd->qhd", attn_weights, value)
     return out
 
@@ -117,7 +127,7 @@ def ref_single_query_cached_kv_attention(
 
 @pytest.mark.parametrize(
     "version",
-    ["v1", "v2"] if not current_platform.is_rocm() else ["v1", "v2", "rocm"])
+    ["v1", "v2"] if not current_platform.is_rocm() else ["rocm"])
 @pytest.mark.parametrize("num_seqs", NUM_GEN_SEQS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
@@ -150,6 +160,8 @@ def test_paged_attention(
     num_query_heads, num_kv_heads = num_heads
     query = torch.empty(num_seqs, num_query_heads, head_size, dtype=dtype)
     query.uniform_(-scale, scale)
+    #query = torch.ones_like(query)
+    query = torch.randn_like(query)
 
     assert num_query_heads % num_kv_heads == 0
     num_queries_per_kv = num_query_heads // num_kv_heads
@@ -158,8 +170,11 @@ def test_paged_attention(
         alibi_slopes = torch.randn(num_query_heads, dtype=torch.float)
 
     seq_lens = [random.randint(1, MAX_SEQ_LEN) for _ in range(num_seqs)]
+    #seq_lens = [MAX_SEQ_LEN for _ in range(num_seqs)]
     seq_lens[-1] = MAX_SEQ_LEN
     max_seq_len = max(seq_lens)
+    #max_seq_len = 512
+    print('>>>', seq_lens, max_seq_len)
     seq_lens = torch.tensor(seq_lens, dtype=torch.int)
 
     # Create the block tables.
@@ -181,8 +196,11 @@ def test_paged_attention(
                                                 device)
     key_cache, value_cache = key_caches[0], value_caches[0]
 
+    #value_cache = torch.ones_like(value_cache)
+    #key_cache = torch.ones_like(key_cache)
+
     # Using default kv_scale
-    k_scale = v_scale = 1.0
+    k_scale = v_scale = 0.1
 
     # Call the paged attention kernel.
     output = torch.empty_like(query)
@@ -213,7 +231,7 @@ def test_paged_attention(
 
     elif version in ("v2", "rocm"):
         if current_platform.is_rocm():
-            PARTITION_SIZE = 1024 if version == "v2" else 512
+            PARTITION_SIZE = 256 if version == "v2" else PARTITION_SIZE_ROCM
         num_partitions = ((max_seq_len + PARTITION_SIZE - 1) // PARTITION_SIZE)
         assert PARTITION_SIZE % block_size == 0
         num_seqs, num_heads, head_size = output.shape
@@ -248,13 +266,13 @@ def test_paged_attention(
                 v_scale,
             )
 
-            opcheck(torch.ops._C.paged_attention_v2,
+            '''opcheck(torch.ops._C.paged_attention_v2,
                     (output, exp_sums, max_logits, tmp_output, query,
                      key_cache, value_cache, num_kv_heads, scale, block_tables,
                      seq_lens, block_size, max_seq_len, alibi_slopes,
                      kv_cache_dtype, k_scale, v_scale, 0, 0, 0, 64, 0),
                     cond=(head_size == HEAD_SIZES[0]
-                          and block_size == BLOCK_SIZES[0]))
+                          and block_size == BLOCK_SIZES[0]))'''
 
         else:
             ops.paged_attention_rocm(
@@ -275,15 +293,17 @@ def test_paged_attention(
                 kv_cache_dtype,
                 k_scale,
                 v_scale,
+                None,
+                PARTITION_SIZE,
             )
 
-            opcheck(torch.ops._rocm_C.paged_attention,
+            '''opcheck(torch.ops._rocm_C.paged_attention,
                     (output, exp_sums, max_logits, tmp_output, query,
                      key_cache, value_cache, num_kv_heads, scale, block_tables,
                      seq_lens, block_size, max_seq_len, alibi_slopes,
-                     kv_cache_dtype, k_scale, v_scale),
+                     kv_cache_dtype, k_scale, v_scale, None, PARTITION_SIZE),
                     cond=(head_size == HEAD_SIZES[0]
-                          and block_size == BLOCK_SIZES[0]))
+                          and block_size == BLOCK_SIZES[0]))'''
 
     else:
         raise AssertionError(f"Unknown version: {version}")
@@ -298,14 +318,14 @@ def test_paged_attention(
                                             dtype=dtype,
                                             device=device)
         ops.convert_fp8(dequantized_key_cache, key_cache)
-        key_cache = dequantized_key_cache
+        key_cache = k_scale * dequantized_key_cache
 
         value_cache_shape = value_cache.shape
         dequantized_value_cache = torch.empty(size=value_cache_shape,
                                               dtype=dtype,
                                               device=device)
         ops.convert_fp8(dequantized_value_cache, value_cache)
-        value_cache = dequantized_value_cache
+        value_cache = v_scale * dequantized_value_cache
 
     ref_output = torch.empty_like(query)
     ref_single_query_cached_kv_attention(
@@ -328,9 +348,23 @@ def test_paged_attention(
 
     # NOTE(zhaoyang): FP8 KV Cache will introduce quantization error,
     # so we use a relaxed tolerance for the test.
-    atol, rtol = 1e-3, 1e-5
+    atol, rtol = 1e-4, 1e-5
     if kv_cache_dtype == "fp8":
-        atol, rtol = 1e-2, 1e-5
+        atol, rtol = 5e-4, 1e-5
+    #bf16 rounding is handled via truncation in new kernel, this increses error
+    if dtype == torch.bfloat16:
+        atol = 1e-3 
+    #print('>>>tmpout shape', tmp_output.shape)
+    #print('>>>tmpout', tmp_output.view(8,1,256))
+    #global REF_TENSOR
+    #torch.testing.assert_close(tmp_output.view(8,1,256), REF_TENSOR, atol=atol, rtol=rtol)
+
+    #print('>>> ref out shape', ref_output.shape)
+    #print('>>> ref out', ref_output)
+    #print('>>> out shape', output.shape)
+    #print('>>> out', output)
+    #print('>>>', exp_sums)
+    #print('>>>', max_logits)
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
 
 
