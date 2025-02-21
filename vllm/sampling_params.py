@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Sampling parameters for text generation."""
 import copy
 from dataclasses import dataclass
@@ -182,7 +183,7 @@ class SamplingParams(
     min_p: float = 0.0
     ppl_measurement: bool = False
     future_context: Optional[List[int]] = None
-    cntr: Optional[int] = None
+    cntr: Optional[List[int]] = None
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stop_token_ids: Optional[List[int]] = None
@@ -251,8 +252,10 @@ class SamplingParams(
         allowed_token_ids: Optional[List[int]] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
+            # Convert token_id to integer
+            # Clamp the bias between -100 and 100 per OpenAI API spec
             logit_bias = {
-                int(token): bias
+                int(token): min(100.0, max(-100.0, bias))
                 for token, bias in logit_bias.items()
             }
 

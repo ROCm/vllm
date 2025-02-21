@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """A layer that samples the next tokens from the model's outputs."""
 import itertools
 import warnings
@@ -756,9 +757,10 @@ def _sample_with_torch(
       tensors required for Pythonization
     '''
 
-    categorized_seq_group_ids: Dict[SamplingType,
-                                    List[int]] = {t: []
-                                                  for t in SamplingType}
+    categorized_seq_group_ids: Dict[SamplingType, List[int]] = {
+        t: []
+        for t in SamplingType
+    }
     categorized_sample_indices = sampling_metadata.categorized_sample_indices
     for i, seq_group in enumerate(sampling_metadata.seq_groups):
         sampling_params = seq_group.sampling_params
@@ -797,7 +799,6 @@ def _sample_with_torch(
         if sampling_type == SamplingType.GREEDY:
             greedy_samples = torch.argmax(logprobs[long_sample_indices],
                                           dim=-1)
-
             if sampled_token_ids_tensor is not None:
                 # Store sampled tokens in output tensor.
                 sampled_token_ids_tensor[
@@ -840,17 +841,23 @@ def _sample_with_torch(
                 sampled_token_ids_tensor[long_sample_indices] = \
                     multinomial_samples[sampling_type].to(torch.long)
         elif sampling_type == SamplingType.FORCED:
-            if (seq_groups[0].sampling_params.future_context is not None):
-                forced_samples = torch.tensor([
-                    seq_groups[0].sampling_params.future_context[0][min(
-                        len(sampling_metadata.seq_groups[0].seq_data[
-                            sampling_params.cntr].output_token_ids),
-                        len(seq_groups[0].sampling_params.future_context[0]) -
-                        1)]
-                ])
-            else:
-                forced_samples = torch.argmax(logprobs[long_sample_indices],
-                                              dim=-1)
+            forced_samples = torch.tensor([], dtype=torch.int32)
+            for sgidx in range(len(seq_groups)):
+                if (seq_groups[sgidx].sampling_params.future_context
+                        is not None):
+                    forced_sample = torch.tensor([
+                        seq_groups[sgidx].sampling_params.future_context[sgidx]
+                        [min(
+                            len(sampling_metadata.seq_groups[sgidx].seq_data[
+                                sampling_params.cntr[sgidx]].output_token_ids),
+                            len(seq_groups[sgidx].sampling_params.
+                                future_context[sgidx]) - 1)]
+                    ])
+                else:
+                    forced_sample = torch.argmax(logprobs[long_sample_indices],
+                                                 dim=-1)
+                forced_samples = torch.cat([forced_samples, forced_sample])
+
         elif sampling_type == SamplingType.BEAM:
             beam_search_logprobs = logprobs[sample_indices]
         else:
@@ -1011,7 +1018,9 @@ def get_logprobs(
     if len(query_indices) == 0:
         empty_sampled_logprob: SampleLogprobs = []
         empty_prompt_logprob: Optional[PromptLogprobs] = None
-        return [empty_prompt_logprob], [empty_sampled_logprob]
+        num_seq_groups = len(sampling_metadata.seq_groups)
+        return [empty_prompt_logprob
+                ] * num_seq_groups, [empty_sampled_logprob] * num_seq_groups
 
     selected_logprobs, ranks = None, None
     top_logprobs, top_token_ids = None, None
@@ -1278,6 +1287,10 @@ def _build_sampler_output(
         assert sample_logprobs is not None
         assert not isinstance(maybe_deferred_sample_results,
                               SampleResultArgsType)
+        assert len(sampling_metadata.seq_groups) \
+            == len(maybe_deferred_sample_results) \
+            == len(prompt_logprobs) \
+            == len(sample_logprobs)
         deferred_sample_results_args = None
 
         for (seq_group, sample_result, group_prompt_logprobs,

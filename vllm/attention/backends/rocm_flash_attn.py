@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Attention layer ROCm GPUs."""
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
@@ -30,8 +31,7 @@ logger = init_logger(__name__)
 _PARTITION_SIZE_ROCM = 256
 _GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
 _ON_NAVI = "gfx1" in _GPU_ARCH
-_ON_MI250_MI300 = any(arch in _GPU_ARCH
-                      for arch in ["gfx90a", "gfx940", "gfx941", "gfx942"])
+_ON_MI250_MI300 = any(arch in _GPU_ARCH for arch in ["gfx90a", "gfx942"])
 
 
 class ROCmFlashAttentionBackend(AttentionBackend):
@@ -832,9 +832,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     out=out)
                 return output.view(-1, self.num_heads * self.head_size)
             if use_custom:
-                max_seq_len = (decode_meta.max_decode_seq_len if
-                               self.attn_type != AttentionType.ENCODER_DECODER
-                               else decode_meta.max_encoder_seq_len)
+                max_seq_len = (decode_meta.max_decode_seq_len if self.attn_type
+                               != AttentionType.ENCODER_DECODER else
+                               decode_meta.max_encoder_seq_len)
                 assert max_seq_len is not None
                 max_num_partitions = (
                     (max_seq_len + _PARTITION_SIZE_ROCM - 1) //

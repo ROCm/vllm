@@ -1,5 +1,5 @@
-import json
-import math
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 from typing import Dict, List
 
@@ -34,56 +34,6 @@ DEVICES = ([
 ] if current_platform.is_cuda_alike() else ["cpu"])
 
 
-def test_peft_helper(sql_lora_files):
-    lora_config_path = os.path.join(sql_lora_files, "adapter_config.json")
-    with open(lora_config_path) as f:
-        config = json.load(f)
-    peft_helper = PEFTHelper.from_dict(config)
-    assert peft_helper.r == 8
-    assert peft_helper.lora_alpha == 16
-    assert peft_helper.target_modules == [
-        "q_proj",
-        "v_proj",
-        "k_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-        "embed_tokens",
-        "lm_head",
-    ]
-    scaling = peft_helper.lora_alpha / peft_helper.r
-    assert abs(peft_helper.vllm_lora_scaling_factor - scaling) < 1e-3
-
-    # test RSLoRA
-    config = dict(r=8,
-                  lora_alpha=16,
-                  target_modules=["gate_proj"],
-                  use_rslora=True)
-    peft_helper = PEFTHelper.from_dict(config)
-
-    scaling = peft_helper.lora_alpha / math.sqrt(peft_helper.r)
-    assert abs(peft_helper.vllm_lora_scaling_factor - scaling) < 1e-3
-
-    expected_error = "vLLM only supports modules_to_save being None."
-    with pytest.raises(ValueError, match=expected_error):
-        config = dict(
-            r=8,
-            lora_alpha=16,
-            target_modules=["gate_proj"],
-            modules_to_save=["lm_head"],
-        )
-        PEFTHelper.from_dict(config)
-
-    expected_error = "vLLM does not yet support DoRA."
-    with pytest.raises(ValueError, match=expected_error):
-        config = dict(r=8,
-                      lora_alpha=16,
-                      target_modules=["gate_proj"],
-                      use_dora=True)
-        PEFTHelper.from_dict(config)
-
-
 @pytest.mark.parametrize("device", DEVICES)
 def test_from_lora_tensors(sql_lora_files, device):
     tensors = load_file(
@@ -91,11 +41,8 @@ def test_from_lora_tensors(sql_lora_files, device):
     new_embeddings = load_file(
         os.path.join(sql_lora_files, "new_embeddings.safetensors"))
 
-    lora_config_path = os.path.join(sql_lora_files, "adapter_config.json")
-    with open(lora_config_path) as f:
-        config = json.load(f)
-
-    peft_helper = PEFTHelper.from_dict(config)
+    peft_helper = PEFTHelper.from_local_dir(sql_lora_files,
+                                            max_position_embeddings=4096)
     lora_model = LoRAModel.from_lora_tensors(
         1,
         tensors,
@@ -659,20 +606,26 @@ def test_packed_loras(dist_init, dummy_model_gate_up, device):
 
     assert isinstance(model.get_submodule("gate_up_proj"),
                       MergedColumnParallelLinearWithLoRA)
+    # Verify packed lora is correct
+    model_lora_clone = model_lora.clone(1)
+    model_lora_clone1 = model_lora1.clone(1)
     assert manager.add_adapter(model_lora)
     assert manager.add_adapter(model_lora1)
 
+    assert model_lora.get_lora("gate_proj") is None
+    assert model_lora.get_lora("up_proj") is None
+    assert model_lora1.get_lora("up_proj") is None
     packed_lora = model_lora.get_lora("gate_up_proj")
     assert packed_lora and isinstance(packed_lora, PackedLoRALayerWeights)
 
     torch.testing.assert_close(packed_lora.lora_a[0],
-                               model_lora.get_lora("gate_proj").lora_a)
+                               model_lora_clone.get_lora("gate_proj").lora_a)
     torch.testing.assert_close(packed_lora.lora_b[0],
-                               model_lora.get_lora("gate_proj").lora_b)
+                               model_lora_clone.get_lora("gate_proj").lora_b)
     torch.testing.assert_close(packed_lora.lora_a[1],
-                               model_lora.get_lora("up_proj").lora_a)
+                               model_lora_clone.get_lora("up_proj").lora_a)
     torch.testing.assert_close(packed_lora.lora_b[1],
-                               model_lora.get_lora("up_proj").lora_b)
+                               model_lora_clone.get_lora("up_proj").lora_b)
 
     packed_lora1 = model_lora1.get_lora("gate_up_proj")
     assert packed_lora1 and isinstance(packed_lora1, PackedLoRALayerWeights)
@@ -680,6 +633,6 @@ def test_packed_loras(dist_init, dummy_model_gate_up, device):
     assert packed_lora1.lora_a[0] is None
     assert packed_lora1.lora_b[0] is None
     torch.testing.assert_close(packed_lora1.lora_a[1],
-                               model_lora1.get_lora("up_proj").lora_a)
+                               model_lora_clone1.get_lora("up_proj").lora_a)
     torch.testing.assert_close(packed_lora1.lora_b[1],
-                               model_lora1.get_lora("up_proj").lora_b)
+                               model_lora_clone1.get_lora("up_proj").lora_b)
