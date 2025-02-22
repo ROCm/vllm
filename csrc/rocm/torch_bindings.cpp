@@ -36,7 +36,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? alibi_slopes,"
       "                str kv_cache_dtype,"
       "                Tensor k_scale, Tensor v_scale,"
-      "                Tensor? fp8_out_scale) -> ()");
+      "                Tensor? fp8_out_scale,"
+      "                bool is_navi) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
   rocm_ops.def(
       "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"

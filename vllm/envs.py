@@ -277,7 +277,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.getenv("VLLM_USE_ROCM_SKINNY_GEMM", "True").lower() in
              ("true", "1")),
 
-    # custom paged attention implemented for MI3* cards
+    # custom paged attention implemented for MI3*/Navi3* cards
     "VLLM_USE_ROCM_CUSTOM_PAGED_ATTN":
     lambda: (os.getenv("VLLM_USE_ROCM_CUSTOM_PAGED_ATTN", "True").lower() in
              ("true", "1")),
