@@ -128,7 +128,7 @@ RUN cd aiter \
     && git checkout ${AITER_BRANCH} \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt \
-    && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py bdist_wheel --dist-dir=dist
+    && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py bdist_wheel --dist-dir=dist && pip show aiter
 RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 FROM base AS final
