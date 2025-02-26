@@ -22,6 +22,7 @@
 #include "cuda_compat.h"
 
 #include <algorithm>
+
 #include "../attention/dtype_fp8.cuh"
 #include "../quantization/fp8/amd/quant_utils.cuh"
 
