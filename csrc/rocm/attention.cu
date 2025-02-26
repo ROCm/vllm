@@ -2324,16 +2324,9 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
 
   const float inv_global_exp_sum =
       __fdividef(1.0f, shared_global_exp_sum + 1e-6f);
-  const float out_scale =
-      (fp8_out_scale_ptr != nullptr) ? 1.0f / (*fp8_out_scale_ptr) : 1.0f;
   acc *= inv_global_exp_sum;
-  acc *= out_scale;
   OUTT* out_ptr = out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
-  if constexpr (std::is_same<OUTT, bit8_t>::value) {
-    out_ptr[threadIdx.x] = hip_fp8(acc).data;
-  } else {
-    out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
-  }
+  out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
 }
 
 #else
