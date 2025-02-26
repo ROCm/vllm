@@ -26,4 +26,4 @@ void paged_attention(torch::Tensor& out, torch::Tensor& exp_sums,
                      const std::string& kv_cache_dtype, torch::Tensor& k_scale,
                      torch::Tensor& v_scale,
                      const c10::optional<torch::Tensor>& fp8_out_scale,
-                     int64_t partition_size);
+                     int64_t partition_size, bool is_navi);
