@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 import multiprocessing as mp
 from queue import Empty
 from typing import Union
@@ -85,8 +86,8 @@ class FastSyncLLM:
         try:
             while True:
                 poll_interval -= 1
-                if (self.input_queue.qsize() >=
-                        envs.VLLM_SYNC_SERVER_ACCUM_REQUESTS
+                if (self.input_queue.qsize()
+                        >= envs.VLLM_SYNC_SERVER_ACCUM_REQUESTS
                         or poll_interval <= 0
                         or not self.llm_engine.has_unfinished_requests()):
                     self._poll_requests()
