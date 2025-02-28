@@ -499,9 +499,28 @@ def get_gaudi_sw_version():
 
 
 def get_vllm_version() -> str:
-    version = get_version(
+    # Get the version from setuptools_scm but override the base version
+    base_version = os.environ.get('SETUPTOOLS_SCM_PRETEND_VERSION', '0.7.3')
+
+    # Get the full version with git information
+    full_version = get_version(
         write_to="vllm/_version.py",  # TODO: move this to pyproject.toml
     )
+
+    # Extract git information if available
+    if '+' in full_version:
+        # Extract the dev and git parts (e.g., from 0.x.y.devN+gHASH)
+        git_parts = full_version.split('+', 1)[1]
+        # Combine with our base version
+        version = f"{base_version}.{full_version.split('+')[0].split('.')[-1]}+{git_parts}"  # noqa: E501
+    elif '.dev' in full_version:
+        # Handle case where dev number is present but no git hash
+        dev_part = full_version.split('.dev')[1]
+        version = f"{base_version}.dev{dev_part}"
+    else:
+        # No git info available, just use the base version
+        version = base_version
+
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
