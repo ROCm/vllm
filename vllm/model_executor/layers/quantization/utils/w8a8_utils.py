@@ -10,7 +10,7 @@ from vllm.platforms import current_platform
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
-TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
+TORCH_DEVICE_IDENTITY = None
 
 # The condition to determine if it is on a platform that supports
 # torch._scaled_mm rowwise feature.
@@ -114,6 +114,13 @@ def requantize_with_max_scale(
     return max_w_scale, weight
 
 
+def maybe_create_device_identity():
+    # Allocate dummy ones tensor for torch._scaled_mm
+    global TORCH_DEVICE_IDENTITY
+    if TORCH_DEVICE_IDENTITY is None:
+        TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32)
+
+
 def apply_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -163,7 +170,7 @@ def apply_fp8_linear(
             qinput, x_scale = ops.scaled_fp8_quant(
                 input_2d,
                 input_scale,
-                num_token_padding=17,
+                num_token_padding=17 if current_platform.is_cuda() else None,
                 use_per_token_if_dynamic=use_per_token_if_dynamic)
         else:
             qinput, x_scale = input_2d, input_scale
@@ -222,11 +229,6 @@ def apply_fp8_linear(
             #
             # For the scaled_mm fallback case, we break this down, since it
             # does not support s_w being a vector.
-
-            # Making sure the dummy tensor is on the same device as the weight
-            global TORCH_DEVICE_IDENTITY
-            if TORCH_DEVICE_IDENTITY.device != weight.device:
-                TORCH_DEVICE_IDENTITY = TORCH_DEVICE_IDENTITY.to(weight.device)
 
             # GEMM
             # This computes C = (X * W).
