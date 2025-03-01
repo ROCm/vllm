@@ -240,4 +240,4 @@ class RocmPlatform(Platform):
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
         # only device 0 is checked, this (safely) assumes MI300 platforms are homogeneous
-        'gfx94' in torch.cuda.get_device_properties(0).gcnArchName
+        return 'gfx94' in torch.cuda.get_device_properties(0).gcnArchName
