@@ -146,6 +146,11 @@ def test_paged_attention(
             or (version == "rocm" and head_size not in (64, 128))):
         pytest.skip()
 
+    if (version == "rocm" and is_navi()
+            and (kv_cache_dtype == "fp8" or head_size != 128
+                 or block_size != 16 or use_alibi)):
+        pytest.skip()
+
     current_platform.seed_everything(seed)
     torch.set_default_device(device)
     scale = float(1.0 / (head_size**0.5))
@@ -219,7 +224,10 @@ def test_paged_attention(
 
     elif version in ("v2", "rocm"):
         if current_platform.is_rocm():
-            PARTITION_SIZE = 1024 if version == "v2" else 256
+            if is_navi():
+                PARTITION_SIZE = 512 if version == "v2" else 256
+            else:
+                PARTITION_SIZE = 1024 if version == "v2" else 256
         num_partitions = ((max_seq_len + PARTITION_SIZE - 1) // PARTITION_SIZE)
         assert PARTITION_SIZE % block_size == 0
         num_seqs, num_heads, head_size = output.shape
@@ -284,15 +292,17 @@ def test_paged_attention(
                 v_scale,
                 None,
                 PARTITION_SIZE,
+                is_navi(),
             )
 
-            opcheck(torch.ops._rocm_C.paged_attention,
-                    (output, exp_sums, max_logits, tmp_output, query,
-                     key_cache, value_cache, num_kv_heads, scale, block_tables,
-                     seq_lens, block_size, max_seq_len, alibi_slopes,
-                     kv_cache_dtype, k_scale, v_scale, None, PARTITION_SIZE),
-                    cond=(head_size == HEAD_SIZES[0]
-                          and block_size == BLOCK_SIZES[0]))
+            opcheck(
+                torch.ops._rocm_C.paged_attention,
+                (output, exp_sums, max_logits, tmp_output, query, key_cache,
+                 value_cache, num_kv_heads, scale, block_tables, seq_lens,
+                 block_size, max_seq_len, alibi_slopes, kv_cache_dtype,
+                 k_scale, v_scale, None, PARTITION_SIZE, is_navi()),
+                cond=(head_size == HEAD_SIZES[0]
+                      and block_size == BLOCK_SIZES[0]))
 
     else:
         raise AssertionError(f"Unknown version: {version}")
