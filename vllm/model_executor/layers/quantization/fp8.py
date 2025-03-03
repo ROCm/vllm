@@ -36,6 +36,8 @@ from vllm.utils import is_navi
 
 if envs.VLLM_USE_AITER_MOE:
     from aiter.fused_moe_bf16_asm import asm_moe
+    if envs.VLLM_USE_AITER_CK_FUSED_MOE
+        from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -753,6 +755,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         if envs.VLLM_USE_AITER_MOE:
+            if envs.VLLM_USE_AITER_CK_FUSED_MOE:
+                return ck_moe_2stages(x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    layer.w13_weight_scale,
+                    layer.w2_weight_scale)
+
             return asm_moe(
                 hidden_states=x,
                 w1=layer.w13_weight,
