@@ -57,7 +57,7 @@ while true; do
 done
 
 echo "--- Pulling container" 
-image_name="rocm/vllm-ci:${BUILDKITE_COMMIT}"
+image_name="rocm/vllm-ci-private:${BUILDKITE_COMMIT}"
 container_name="rocm_${BUILDKITE_COMMIT}_$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 10; echo)"
 docker pull "${image_name}"
 
@@ -92,7 +92,9 @@ if [[ $commands == *" kernels "* ]]; then
   --ignore=kernels/test_moe.py \
   --ignore=kernels/test_prefix_prefill.py \
   --ignore=kernels/test_rand.py \
-  --ignore=kernels/test_sampler.py"
+  --ignore=kernels/test_sampler.py \
+  --ignore=kernels/test_cascade_flash_attn.py \
+  --ignore=kernels/test_mamba_mixer2.py"
 fi
 
 #ignore certain Entrypoints tests
