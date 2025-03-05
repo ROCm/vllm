@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _PARTITION_SIZE_ROCM = 256
-<<<<<<< HEAD
 
 
 @cache
