@@ -148,7 +148,7 @@ def test_paged_attention(
             or (version == "rocm" and head_size not in (64, 128))):
         pytest.skip()
 
-    is_rocm_navi = is_navi();
+    is_rocm_navi = is_navi()
     if (version == "rocm" and is_rocm_navi
             and (kv_cache_dtype == "fp8" or head_size != 128
                  or block_size != 16 or use_alibi)):
