@@ -716,10 +716,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     start += shard_size
 
             if envs.VLLM_USE_AITER_MOE:
-                max_w13_scales = max_w13_scales.unsqueeze(-1).unsqueeze(
-                    -1).expand((-1, layer.w13_weight.shape[1], -1))
-                w2_scales = layer.w2_weight_scale.data.unsqueeze(-1).unsqueeze(
-                    -1).expand((-1, layer.w2_weight.shape[1], -1))
+                if envs.VLLM_USE_AITER_CK_FUSED_MOE:
+                    max_w13_scales = max_w13_scales.unsqueeze(-1)
+                    w2_scales = layer.w2_weight_scale.data.unsqueeze(-1)
+                else:
+                    max_w13_scales = max_w13_scales.unsqueeze(-1).unsqueeze(
+                        -1).expand((-1, layer.w13_weight.shape[1], -1))
+                    w2_scales = layer.w2_weight_scale.data.unsqueeze(-1).unsqueeze(
+                        -1).expand((-1, layer.w2_weight.shape[1], -1))
+
                 layer.w2_weight_scale = torch.nn.Parameter(
                     w2_scales.contiguous(), requires_grad=False)
                 if envs.VLLM_USE_AITER_CK_FUSED_MOE:
