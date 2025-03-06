@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     VLLM_USE_ROCM_FP8_FLASH_ATTN: bool = False
     VLLM_USE_AITER: bool = False
     VLLM_USE_AITER_MOE: bool = True
-    VLLM_USE_AITER_CK_FUSED_MOE: bool = True
+    VLLM_USE_AITER_2STAGE_MOE: bool = True
     VLLM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_USE_AITER_LINEAR: bool = True
     VLLM_USE_AITER_NORM: bool = True
@@ -303,8 +303,8 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     lambda: (os.getenv("VLLM_USE_AITER_MOE", "True").lower() in ("true", "1")),
 
     # use ater ck fused moe op if ater ops are enabled
-    "VLLM_USE_AITER_CK_FUSED_MOE":
-    lambda: (os.getenv("VLLM_USE_AITER_CK_FUSED_MOE", "True").lower() in ("true", "1")),
+    "VLLM_USE_AITER_2STAGE_MOE":
+    lambda: (os.getenv("VLLM_USE_AITER_2STAGE_MOE", "True").lower() in ("true", "1")),
 
     # use ater paged attn op if ater ops are enabled
     "VLLM_USE_AITER_PAGED_ATTN":
