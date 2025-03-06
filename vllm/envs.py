@@ -304,8 +304,7 @@ environment_variables: Dict[str, Callable[[], Any]] = {
 
     # use ater ck fused moe op if ater ops are enabled
     "VLLM_USE_AITER_2STAGE_MOE":
-    lambda: (os.getenv("VLLM_USE_AITER_2STAGE_MOE", "True").lower() in
-             ("true", "1")),
+    lambda: (os.getenv("VLLM_USE_AITER_2STAGE_MOE", "True").lower() in ("true", "1")),
 
     # use ater paged attn op if ater ops are enabled
     "VLLM_USE_AITER_PAGED_ATTN":

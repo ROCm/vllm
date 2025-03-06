@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from vllm import envs
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               split_tensor_along_last_dim,
@@ -15,9 +16,8 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
-from vllm.utils import aiter_linear_enabled
 
-if aiter_linear_enabled():
+if envs.VLLM_USE_AITER_LINEAR:
     from aiter.tuned_gemm import tgemm
 else:
     from vllm.model_executor.layers.tuned_gemm import tgemm
@@ -256,7 +256,7 @@ class ReplicatedLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         if type(self.quant_method
-                ) is UnquantizedLinearMethod and aiter_linear_enabled():
+                ) is UnquantizedLinearMethod and envs.VLLM_USE_AITER_LINEAR:
             output = tgemm.mm(x, self.weight, bias, self.out_dtype)
         else:
             output = self.quant_method.apply(self, x, bias)
