@@ -32,11 +32,11 @@ from vllm.model_executor.parameter import (BlockQuantScaleParameter,
                                            PerTensorScaleParameter)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.utils import is_navi
+from vllm.utils import aiter_2stage_moe_enabled, aiter_moe_enabled, is_navi
 
-if envs.VLLM_USE_AITER_MOE:
+if aiter_moe_enabled():
     from aiter.fused_moe_bf16_asm import asm_moe
-    if envs.VLLM_USE_AITER_2STAGE_MOE:
+    if aiter_2stage_moe_enabled():
         from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
@@ -621,7 +621,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                                   requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight,
                                                  requires_grad=False)
-            if envs.VLLM_USE_AITER_MOE:
+            if aiter_moe_enabled():
                 w13_scales = layer.w13_weight_scale.data.unsqueeze(
                     -1).unsqueeze(-1).expand(
                         (-1, layer.w13_weight.shape[1], -1))
@@ -632,13 +632,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale = torch.nn.Parameter(
                     w13_scales.contiguous(), requires_grad=False)
 
-                if envs.VLLM_USE_AITER_2STAGE_MOE:
-                    layer.w13_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w13_weight, layout=(32, 32)),
-                                                        requires_grad=False)
-                    layer.w2_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w2_weight, layout=(32, 32)),
-                                                        requires_grad=False)
+                if aiter_2stage_moe_enabled():
+                    layer.w13_weight = torch.nn.Parameter(shuffle_weight(
+                        layer.w13_weight, layout=(32, 32)),
+                                                          requires_grad=False)
+                    layer.w2_weight = torch.nn.Parameter(shuffle_weight(
+                        layer.w2_weight, layout=(32, 32)),
+                                                         requires_grad=False)
                 else:
                     layer.w13_weight = torch.nn.Parameter(shuffle_weight(
                         layer.w13_weight),
@@ -715,32 +715,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             dq_weight, max_w13_scales[expert_id])
                     start += shard_size
 
-            if envs.VLLM_USE_AITER_MOE:
-                if envs.VLLM_USE_AITER_2STAGE_MOE:
+            if aiter_moe_enabled():
+                if aiter_2stage_moe_enabled():
                     max_w13_scales = max_w13_scales.unsqueeze(-1)
                     w2_scales = layer.w2_weight_scale.data.unsqueeze(-1)
+                    layer.w13_weight = torch.nn.Parameter(shuffle_weight(
+                        layer.w13_weight, layout=(32, 32)),
+                                                          requires_grad=False)
+                    layer.w2_weight = torch.nn.Parameter(shuffle_weight(
+                        layer.w2_weight, layout=(32, 32)),
+                                                         requires_grad=False)
                 else:
                     max_w13_scales = max_w13_scales.unsqueeze(-1).unsqueeze(
                         -1).expand((-1, layer.w13_weight.shape[1], -1))
-                    w2_scales = layer.w2_weight_scale.data.unsqueeze(-1).unsqueeze(
-                        -1).expand((-1, layer.w2_weight.shape[1], -1))
-
-                layer.w2_weight_scale = torch.nn.Parameter(
-                    w2_scales.contiguous(), requires_grad=False)
-                if envs.VLLM_USE_AITER_2STAGE_MOE:
-                    layer.w13_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w13_weight, layout=(32, 32)),
-                                                        requires_grad=False)
-                    layer.w2_weight = torch.nn.Parameter(
-                        shuffle_weight(layer.w2_weight, layout=(32, 32)),
-                                                        requires_grad=False)
-                else:
+                    w2_scales = layer.w2_weight_scale.data.unsqueeze(
+                        -1).unsqueeze(-1).expand(
+                            (-1, layer.w2_weight.shape[1], -1))
                     layer.w13_weight = torch.nn.Parameter(shuffle_weight(
                         layer.w13_weight),
                                                           requires_grad=False)
                     layer.w2_weight = torch.nn.Parameter(shuffle_weight(
                         layer.w2_weight),
                                                          requires_grad=False)
+
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    w2_scales.contiguous(), requires_grad=False)
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales.contiguous(), requires_grad=False)
             return
@@ -776,15 +775,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        if envs.VLLM_USE_AITER_MOE:
-            if envs.VLLM_USE_AITER_2STAGE_MOE:
+        if aiter_moe_enabled():
+            if aiter_2stage_moe_enabled():
                 return ck_moe_2stages(a1=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_weight=topk_weights,
-                    topk_ids=topk_ids,
-                    fc1_scale=layer.w13_weight_scale,
-                    fc2_scale=layer.w2_weight_scale)
+                                      w1=layer.w13_weight,
+                                      w2=layer.w2_weight,
+                                      topk_weight=topk_weights,
+                                      topk_ids=topk_ids,
+                                      fc1_scale=layer.w13_weight_scale,
+                                      fc2_scale=layer.w2_weight_scale)
 
             return asm_moe(
                 hidden_states=x,
