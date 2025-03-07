@@ -35,7 +35,8 @@ from vllm.platforms import current_platform
 from vllm.utils import is_navi
 
 if envs.VLLM_USE_AITER_MOE:
-    from aiter.fused_moe_bf16_asm import asm_moe
+    import aiter
+    from aiter.fused_moe_bf16_asm import asm_moe, moe_sorting_ck
     from aiter.ops.shuffle import shuffle_weight
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -608,6 +609,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight, requires_grad=False)
             layer.w2_weight_scale_inv = Parameter(w2_weight_scale_inv,
                                                   requires_grad=False)
+            if envs.VLLM_USE_AITER_FP8_BLOCK_SCALED_MOE:
+                layer.w13_weight = torch.nn.Parameter(shuffle_weight(
+                    layer.w13_weight.data),
+                                                      requires_grad=False)
+                layer.w2_weight = torch.nn.Parameter(shuffle_weight(
+                    layer.w2_weight.data),
+                                                     requires_grad=False)
+
             return
 
         # If checkpoint is fp16, quantize in place.
@@ -798,6 +807,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.fused_moe import fused_experts
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            per_token_group_quant_fp8)
 
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -811,6 +822,52 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
         )
+
+        if envs.VLLM_USE_AITER_FP8_BLOCK_SCALED_MOE:
+            w1 = layer.w13_weight
+            w2 = layer.w2_weight
+            w1_scale = (layer.w13_weight_scale_inv
+                        if self.block_quant else layer.w13_weight_scale)
+            w2_scale = (layer.w2_weight_scale_inv
+                        if self.block_quant else layer.w2_weight_scale)
+
+            block_shape = self.quant_config.weight_block_size
+            # The default block sizes are 128 in AITER.
+            if block_shape is None:
+                block_shape = [128, 128]
+
+            local_E = E = w1.shape[0]
+            topk = topk_ids.shape[1]
+            model_dim = w1.shape[-1]
+            dtype = x.dtype
+            scale_blk_k = block_shape[1]
+
+            (
+                sorted_token_ids,
+                sorted_weight_buf,
+                sorted_expert_ids,
+                num_valid_ids,
+                out_asm,
+            ) = moe_sorting_ck(topk_ids, topk_weights, E, model_dim, dtype)
+            a1, a1_scale = per_token_group_quant_fp8(x, scale_blk_k)
+            aiter.fmoe_fp8_blockscale_g1u1(
+                out_asm,
+                a1,
+                w1,
+                w2,
+                sorted_token_ids,
+                sorted_weight_buf,
+                sorted_expert_ids,
+                num_valid_ids,
+                topk,
+                w1_scale.view(local_E, -1),
+                w2_scale.view(local_E, -1),
+                a1_scale.t().contiguous(),
+                block_shape[0],
+                block_shape[1],
+                None,
+            )
+            return out_asm
 
         if envs.VLLM_USE_AITER_MOE:
             return asm_moe(hidden_states=x,

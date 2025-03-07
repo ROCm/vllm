@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     VLLM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_USE_AITER_LINEAR: bool = False
     VLLM_USE_AITER_NORM: bool = False
+    VLLM_USE_AITER_FP8_BLOCK_SCALED_MOE: bool = False
+    VLLM_USE_AITER_W8A8_BLOCK_GEMM: bool = False
     RANK: int = 0
     VLLM_FLASH_ATTN_VERSION: Optional[int] = None
     LOCAL_RANK: int = 0
@@ -321,6 +323,18 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     (os.getenv("VLLM_USE_AITER", "False").lower() in
      ("true", "1") and os.getenv("VLLM_USE_AITER_NORM", "True").lower() in
      ("true", "1")),
+
+    # use ater fp8 block scaled moe kernel op if ater ops are enabled.
+    "VLLM_USE_AITER_FP8_BLOCK_SCALED_MOE":
+    lambda: (os.getenv("VLLM_USE_AITER", "False").lower() in
+             ("true", "1") and os.getenv("VLLM_USE_AITER_FP8_BLOCK_SCALED_MOE",
+                                         "False").lower() in ("true", "1")),
+
+    # use ater w8a8 block gemm kernel op if ater ops are enabled.
+    "VLLM_USE_AITER_W8A8_BLOCK_GEMM":
+    lambda: (os.getenv("VLLM_USE_AITER", "False").lower() in
+             ("true", "1") and os.getenv("VLLM_USE_AITER_W8A8_BLOCK_GEMM",
+                                         "False").lower() in ("true", "1")),
 
     # rank of the process in the distributed setting, used to determine
     # the driver worker

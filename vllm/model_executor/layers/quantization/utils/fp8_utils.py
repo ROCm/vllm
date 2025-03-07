@@ -10,6 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -71,12 +72,22 @@ def apply_w8a8_block_fp8_linear(
         q_input, x_scale = per_token_group_quant_fp8(input_2d,
                                                      block_size[1],
                                                      column_major_scales=False)
-        output = w8a8_block_fp8_matmul(q_input,
-                                       weight,
-                                       x_scale,
-                                       weight_scale,
-                                       block_size,
-                                       output_dtype=input.dtype)
+        if envs.VLLM_USE_AITER_W8A8_BLOCK_GEMM:
+            import aiter
+            output = torch.zeros(
+                [q_input.shape[0], weight.shape[0]],
+                dtype=input.dtype,
+                device=q_input.device,
+            )
+            aiter.gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale,
+                                       output)
+        else:
+            output = w8a8_block_fp8_matmul(q_input,
+                                           weight,
+                                           x_scale,
+                                           weight_scale,
+                                           block_size,
+                                           output_dtype=input.dtype)
     if bias is not None:
         output = output + bias
     return output.to(dtype=input.dtype).view(*output_shape)
