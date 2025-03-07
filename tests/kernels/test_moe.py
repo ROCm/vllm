@@ -54,14 +54,6 @@ def test_fused_moe(
     w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
 
     score = torch.randn((m, e), device="cuda", dtype=dtype)
-
-    # Pad the input if use padding
-    if envs.VLLM_MOE_PADDING:
-        w1 = F.pad(w1, (0, 128), "constant", 0)
-        torch.cuda.empty_cache()
-        w2 = F.pad(w2, (0, 128), "constant", 0)
-        torch.cuda.empty_cache()
-
     if ep_size > 1:
         local_e = e // ep_size
         e_ids = torch.randint(0,
@@ -75,16 +67,7 @@ def test_fused_moe(
     else:
         e_map = None
 
-    triton_output = fused_moe(a,
-                              w1,
-                              w2,
-                              score,
-                              topk,
-                              global_num_experts=e,
-                              expert_map=e_map,
-                              renormalize=False)
     torch_output = torch_moe(a, w1, w2, score, topk, e_map)
-    torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
     iterative_output = iterative_moe(a,
                                      w1,
                                      w2,
@@ -93,6 +76,23 @@ def test_fused_moe(
                                      global_num_experts=e,
                                      expert_map=e_map,
                                      renormalize=False)
+    # Pad the input if use padding
+    if envs.VLLM_MOE_PADDING:
+        w1 = F.pad(w1, (0, 128), "constant", 0)
+        torch.cuda.empty_cache()
+        w2 = F.pad(w2, (0, 128), "constant", 0)
+        torch.cuda.empty_cache()
+
+    triton_output = fused_moe(a,
+                              w1,
+                              w2,
+                              score,
+                              topk,
+                              global_num_experts=e,
+                              expert_map=e_map,
+                              renormalize=False)
+
+    torch.testing.assert_close(triton_output, torch_output, atol=2e-2, rtol=0)
     torch.testing.assert_close(iterative_output,
                                torch_output,
                                atol=1e-2,
