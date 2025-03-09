@@ -523,6 +523,7 @@ def get_vllm_version() -> str:
 
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
+    # Add platform-specific suffix
     if _no_device():
         if envs.VLLM_TARGET_DEVICE == "empty":
             version += f"{sep}empty"
@@ -564,6 +565,39 @@ def get_vllm_version() -> str:
         version += f"{sep}xpu"
     else:
         raise RuntimeError("Unknown runtime environment")
+
+    # Update the _version.py file with our modified version
+    version_file_path = os.path.join(ROOT_DIR, "vllm", "_version.py")
+    if os.path.exists(version_file_path):
+        with open(version_file_path) as f:
+            content = f.read()
+
+        # Replace the version in the file
+        content = re.sub(r"__version__ = version = '.*?'",
+                         f"__version__ = version = '{version}'", content)
+
+        # Update version tuple if needed
+        if '+' in version:
+            base, extra = version.split('+', 1)
+            parts = base.split('.')
+            if 'dev' in parts[-1]:
+                # Handle dev versions
+                dev_part = parts[-1]
+                parts = parts[:-1] + [dev_part, extra]
+            else:
+                parts.append(extra)
+
+            # Format the tuple representation
+            tuple_str = ', '.join(
+                [f"'{p}'" if not p.isdigit() else p for p in parts])
+            tuple_repr = f"({tuple_str})"
+
+            content = re.sub(
+                r"__version_tuple__ = version_tuple = .*",
+                f"__version_tuple__ = version_tuple = {tuple_repr}", content)
+
+        with open(version_file_path, "w") as f:
+            f.write(content)
 
     return version
 
