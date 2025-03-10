@@ -11,7 +11,7 @@ This documentation includes information for running the popular Llama 3.1 series
 The pre-built image includes:
 
 - ROCm™ 6.3.1
-- vLLM 0.6.6
+- vLLM 0.7.3
 - PyTorch 2.7dev (nightly)
 
 ## Pull latest Docker Image
@@ -20,18 +20,25 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-nightly_fixed_aiter_integration_final_20250305:
-- Performance improvement
+20250305_aiter:
+- vllm 0.7.3
+- HipblasLT 0.13
+- AITER improvements
+- Support for FP8 skinny GEMM
+
 20250207_aiter:
 - More performant AITER
 - Bug fixes
+
 20250205_aiter:
 - [AITER](https://github.com/ROCm/aiter) support
 - Performance improvement for custom paged attention
 - Reduced memory overhead bug fix
+
 20250124:
 - Fix accuracy issue with 405B FP8 Triton FA
 - Fixed accuracy issue with TP8
+
 20250117:
 - [Experimental DeepSeek-V3 and DeepSeek-R1 support](#running-deepseek-v3-and-deepseek-r1)
 
@@ -359,7 +366,7 @@ docker run -it --rm --ipc=host --network=host --group-add render \
     --cap-add=CAP_SYS_ADMIN --cap-add=SYS_PTRACE \
     --device=/dev/kfd --device=/dev/dri --device=/dev/mem \
     -e VLLM_USE_TRITON_FLASH_ATTN=0 \
-    -e VLLM_FP8_PADDING=0 \
+    -e  VLLM_MLA_DISABLE=1 \
     rocm/vllm-dev:main
 # Online serving
 vllm serve deepseek-ai/DeepSeek-V3 \
