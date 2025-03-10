@@ -20,6 +20,8 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
+nightly_fixed_aiter_integration_final_20250305:
+- Performance improvement
 20250207_aiter:
 - More performant AITER
 - Bug fixes
@@ -483,7 +485,7 @@ To reproduce the release docker:
     git clone https://github.com/ROCm/vllm.git
     cd vllm
     git checkout c0dd5adf68dd997d7d2c3f04da785d7ef9415e36
-    docker build -f Dockerfile.rocm -t <your_tag> --build-arg BUILD_HIPBLASLT=1 --build-arg USE_CYTHON=1 .
+    docker build -f Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
 ### AITER
