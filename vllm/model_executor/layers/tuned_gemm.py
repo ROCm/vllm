@@ -14,7 +14,7 @@ from vllm.platforms import current_platform
 from vllm.utils import is_mi250, is_navi
 
 support_tuned_gemms = False
-if current_platform.is_rocm() and not envs.VLLM_USE_V1:
+if current_platform.is_rocm():
     import vllm._gradlib_C  # noqa: F401
     support_tuned_gemms = True
 
@@ -69,6 +69,8 @@ class TunedGemm:
         self.solids = solds
 
     def query_sol(self, m, n, k, bias, dtype):
+        if envs.VLLM_USE_V1:
+            return 0, 0
         return self.solids.get((m, n, k, bias, str(dtype)), (0, 0))
 
     def apply_skinny(self, m, n, k, inp_view, weights):
