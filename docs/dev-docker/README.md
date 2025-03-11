@@ -507,5 +507,5 @@ Use AITER release candidate branch instead:
     git clone https://github.com/ROCm/vllm.git
     cd vllm
     git checkout aiter_integration_final
-    docker build -f Dockerfile.rocm -t <your_tag> --build-arg --build-arg USE_CYTHON=1 .
+    docker build -f Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
