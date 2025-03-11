@@ -502,7 +502,7 @@ To reproduce the release docker:
 
 ### Building AITER Image
 
-Use Aiter release candidate branch instead:
+Use AITER release candidate branch instead:
 
 ```bash
     git clone https://github.com/ROCm/vllm.git
