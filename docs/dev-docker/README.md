@@ -450,17 +450,17 @@ python /app/vllm/benchmarks/benchmark_latency.py --model amd/Llama-3.1-405B-Inst
 
 You should see some performance improvement about the e2e latency.
 
-### AITER
+### AITER use cases 
 
-To get [AITER](https://github.com/ROCm/aiter) kernels support, follow the [Docker build steps](#Docker-manifest) using the [aiter_intergration_final](https://github.com/ROCm/vllm/tree/aiter_intergration_final) branch  
-There is a published release candidate image at `rocm/vllm-dev:nightly_aiter_intergration_final_20250130`
+`rocm/vllm-dev:main` image has experimental [AITER](https://github.com/ROCm/aiter) support, and can yield siginficant performance increase for some model/input/output/batch size configurations. To enable the feature make sure the following environment is set: `VLLM_USE_AITER=1`, the default value is `0`. When building your own image follow the [Docker build steps](#Docker-manifest) using the [aiter_intergration_final](https://github.com/ROCm/vllm/tree/aiter_intergration_final) branch.
 
-To enable the feature make sure the following environment is set: `VLLM_USE_AITER=1`.  
-The default value is `0` in vLLM, but is set to `1` in the aiter docker.
+Some use cases include:
+- amd/Mixtral-8x7B-Instruct-v0.1-FP8-KV
+- amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV
 
 ```bash
 export VLLM_USE_AITER=1
-python3 /app/vllm/benchmarks/benchmark_latency.py --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 128 --input-len 1024 --output-len 128
+python3 /app/vllm/benchmarks/benchmark_latency.py --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 256 --input-len 1024 --output-len 128
 ```
 
 ## MMLU_PRO_Biology Accuracy Evaluation
@@ -500,13 +500,13 @@ To reproduce the release docker:
     docker build -f Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
-### AITER
+### Building AITER Image
 
 Use Aiter release candidate branch instead:
 
 ```bash
     git clone https://github.com/ROCm/vllm.git
     cd vllm
-    git checkout aiter_intergration_final
-    docker build -f Dockerfile.rocm -t <your_tag> --build-arg BUILD_HIPBLASLT=1 --build-arg USE_CYTHON=1 .
+    git checkout aiter_integration_final
+    docker build -f Dockerfile.rocm -t <your_tag> --build-arg --build-arg USE_CYTHON=1 .
 ```
