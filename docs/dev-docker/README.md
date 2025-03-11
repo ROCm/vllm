@@ -458,6 +458,11 @@ There is a published release candidate image at `rocm/vllm-dev:nightly_aiter_int
 To enable the feature make sure the following environment is set: `VLLM_USE_AITER=1`.  
 The default value is `0` in vLLM, but is set to `1` in the aiter docker.
 
+```bash
+export VLLM_USE_AITER=1
+python3 /appl/vllm/benchmarks/benchmark_latency.py --model amd/Mixtral-8x22B --max-model-len 26720 -tp 8 --batch-size 1 --input-len 1024 --output-len 128
+```
+
 ## MMLU_PRO_Biology Accuracy Evaluation
 
 ### FP16
