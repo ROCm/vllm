@@ -11,6 +11,7 @@ This documentation includes information for running the popular Llama 3.1 series
 The pre-built image includes:
 
 - ROCm™ 6.3.1
+- HipblasLT 0.13
 - vLLM 0.7.3
 - PyTorch 2.7dev (nightly)
 
@@ -21,8 +22,6 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 ## What is New
 
 20250305_aiter:
-- vllm 0.7.3
-- HipblasLT 0.13
 - AITER improvements
 - Support for FP8 skinny GEMM
 
