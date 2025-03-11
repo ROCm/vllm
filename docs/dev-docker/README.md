@@ -62,7 +62,7 @@ The table below shows performance data where a local inference client is fed req
 
 *TP stands for Tensor Parallelism.*
 
-## Latency Measurements
+### Latency Measurements
 
 The table below shows latency measurement, which typically involves assessing the time from when the system receives an input to when the model produces a result.
 
@@ -102,6 +102,8 @@ The table below shows latency measurement, which typically involves assessing th
 | | | | 128 | 2048 | 2048 | 162.503 |
 
 *TP stands for Tensor Parallelism.*
+
+Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 Processors, 2.25 TiB RAM, 8x AMD Instinct MI300X (192GiB, 750W) GPUs, Ubuntu 22.04, and amdgpu driver 6.8.5
 
 ## Reproducing Benchmarked Results
 
