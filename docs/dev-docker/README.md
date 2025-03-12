@@ -461,7 +461,7 @@ Some use cases include:
 
 ```bash
 export VLLM_USE_AITER=1
-python3 /app/vllm/benchmarks/benchmark_latency.py --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 256 --input-len 1024 --output-len 128
+python3 /app/vllm/benchmarks/benchmark_latency.py --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 256 --input-len 128 --output-len 2048
 ```
 
 ## MMLU_PRO_Biology Accuracy Evaluation
