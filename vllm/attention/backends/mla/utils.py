@@ -14,6 +14,7 @@ from vllm.attention.backends.abstract import (AttentionLayer,
                                               AttentionMetadata,
                                               MLAAttentionImpl, T)
 from vllm.attention.backends.utils import get_flash_attn_version
+from vllm.attention.ops.triton_flash_attention import triton_attention
 from vllm.distributed import (get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -163,6 +164,11 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         kv_b_proj: ColumnParallelLinear,
         o_proj: RowParallelLinear,
     ) -> None:
+        if envs.VLLM_USE_TRITON_FLASH_ATTN:
+            assert not alibi_slopes, "Triton MLA doesn't support alibi now!"
+            assert not envs.VLLM_USE_ROCM_FP8_FLASH_ATTN, (
+                "Triton MLA doesn't support FP8 flash attention now!")
+
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -498,17 +504,34 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         v_padded = torch.nn.functional.pad(v, [0, q.shape[-1] - v.shape[-1]],
                                            value=0)
 
-        attn_output = self.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v_padded,
-            cu_seqlens_q=seq_start_loc,
-            cu_seqlens_k=seq_start_loc,
-            max_seqlen_q=max_prefill_seq_len,
-            max_seqlen_k=max_prefill_seq_len,
-            softmax_scale=self.scale,
-            causal=True,
-        )
+        if envs.VLLM_USE_TRITON_FLASH_ATTN:
+            attn_output, _ = triton_attention(
+                q,
+                k,
+                v_padded,
+                None,
+                seq_start_loc,
+                seq_start_loc,
+                max_prefill_seq_len,
+                max_prefill_seq_len,
+                True,
+                self.scale,
+                None,  # attn_mask is None unless applying ALiBi mask
+                None,  # fp8 scales need additional work to integrate
+            )
+        else:
+            attn_output = self.flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v_padded,
+                cu_seqlens_q=seq_start_loc,
+                cu_seqlens_k=seq_start_loc,
+                max_seqlen_q=max_prefill_seq_len,
+                max_seqlen_k=max_prefill_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+
         attn_output = attn_output\
             .view(-1, self.num_heads, q.shape[-1])[..., :v.shape[-1]]\
                 .reshape(-1, self.num_heads * v.shape[-1])
