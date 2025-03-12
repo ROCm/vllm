@@ -21,25 +21,11 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-20250305_aiter:
-- AITER improvements
-- Support for FP8 skinny GEMM
-
-20250207_aiter:
-- More performant AITER
-- Bug fixes
-
-20250205_aiter:
-- [AITER](https://github.com/ROCm/aiter) support
-- Performance improvement for custom paged attention
-- Reduced memory overhead bug fix
-
-20250124:
-- Fix accuracy issue with 405B FP8 Triton FA
-- Fixed accuracy issue with TP8
-
-20250117:
+- [Experimental AITER support](#aiter-use-cases)
 - [Experimental DeepSeek-V3 and DeepSeek-R1 support](#running-deepseek-v3-and-deepseek-r1)
+- Performance improvement for custom paged attention
+- Support for FP8 skinny GEMM
+- Bug fixes
 
 ## Performance Results
 
@@ -511,3 +497,25 @@ Use AITER release candidate branch instead:
     git checkout aiter_integration_final
     docker build -f Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
+
+## Changelog
+
+20250305_aiter:
+- AITER improvements
+- Support for FP8 skinny GEMM
+
+20250207_aiter:
+- More performant AITER
+- Bug fixes
+
+20250205_aiter:
+- [AITER](https://github.com/ROCm/aiter) support
+- Performance improvement for custom paged attention
+- Reduced memory overhead bug fix
+
+20250124:
+- Fix accuracy issue with 405B FP8 Triton FA
+- Fixed accuracy issue with TP8
+
+20250117:
+- [Experimental DeepSeek-V3 and DeepSeek-R1 support](#running-deepseek-v3-and-deepseek-r1)
