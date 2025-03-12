@@ -783,7 +783,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                                       topk_weight=topk_weights,
                                       topk_ids=topk_ids,
                                       fc1_scale=layer.w13_weight_scale,
-                                      fc2_scale=layer.w2_weight_scale)
+                                      fc2_scale=layer.w2_weight_scale,
+                                      a1_scale=layer.w13_input_scale,
+                                      a2_scale=layer.w2_input_scale)
 
             return asm_moe(
                 hidden_states=x,
