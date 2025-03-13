@@ -125,6 +125,19 @@ class TritonMLAState(AttentionState):
             self, batch_size: int, is_encoder_decoder_model: bool = False):
         assert self._is_graph_capturing
 
+        paged_kv_indptr_tensor_host = torch.arange(0,
+                                                   batch_size + 1,
+                                                   dtype=torch.int32,
+                                                   device=self.runner.device)
+        paged_kv_indices_tensor_host = torch.arange(0,
+                                                    batch_size,
+                                                    dtype=torch.int32,
+                                                    device=self.runner.device)
+        paged_kv_last_page_len_tensor_host = torch.full((batch_size, ),
+                                                        self.runner.block_size,
+                                                        dtype=torch.int32,
+                                                        device=self.runner.device)
+
         attn_metadata = self.runner.attn_backend.make_metadata(
             num_prefills=0,
             num_prefill_tokens=0,
@@ -144,7 +157,11 @@ class TritonMLAState(AttentionState):
             block_tables=self._graph_block_tables[:batch_size],
             use_cuda_graph=True,
             input_positions=self._positions[:batch_size],
-            head_dim=self.runner.model_config.get_head_size())
+            head_dim=self.runner.model_config.get_head_size(),
+            paged_kv_indptr=paged_kv_indptr_tensor_host,
+            paged_kv_indices=paged_kv_indices_tensor_host,
+            paged_kv_last_page_len=paged_kv_last_page_len_tensor_host,
+        )
 
         if is_encoder_decoder_model:
             raise NotImplementedError(
@@ -233,23 +250,22 @@ class TritonMLAMetadata(MLACommonMetadata):
     # Whether or not if cuda graph is enabled.
     # Cuda-graph is currently enabled for decoding only.
     # TODO(woosuk): Move `use_cuda_graph` out since it's unrelated to attention.
-
     use_cuda_graph: bool
+
+    # (batch_size + 1,). The cumulative subquery lengths of the sequences in
+    # the batch, used to index into subquery. E.g., if the subquery length
+    # is [4, 6], it is [0, 4, 10].
+    query_start_loc: Optional[torch.Tensor]
+    # (batch_size + 1,). The cumulative sequence lengths of the sequences in
+    # the batch, used to index into sequence. E.g., if the sequence length is
+    # [4, 6], it is [0, 4, 10].
+    seq_start_loc: Optional[torch.Tensor]
 
     # Maximum query length in the batch.
     max_query_len: Optional[int] = None
 
     # Max number of query tokens among request in the batch.
     max_decode_query_len: Optional[int] = None
-
-    # (batch_size + 1,). The cumulative subquery lengths of the sequences in
-    # the batch, used to index into subquery. E.g., if the subquery length
-    # is [4, 6], it is [0, 4, 10].
-    query_start_loc: Optional[torch.Tensor] = None
-    # (batch_size + 1,). The cumulative sequence lengths of the sequences in
-    # the batch, used to index into sequence. E.g., if the sequence length is
-    # [4, 6], it is [0, 4, 10].
-    seq_start_loc: Optional[torch.Tensor] = None
 
     _cached_prefill_metadata: Optional["TritonMLAMetadata"] = None
     _cached_decode_metadata: Optional["TritonMLAMetadata"] = None
@@ -262,6 +278,16 @@ class TritonMLAMetadata(MLACommonMetadata):
 
     # The dimension of the attention heads
     head_dim: Optional[int] = None
+
+    # The following 4 tensors are for current version of AITER MLA
+    block_table_bound: Optional[torch.Tensor] = None
+    # The indptr of the paged kv cache, shape: [batch_size + 1]
+    paged_kv_indptr: Optional[torch.Tensor] = None
+    # The page indices of the paged kv cache
+    paged_kv_indices: Optional[torch.Tensor] = None
+    # The number of entries in the last page of each request in
+    # the paged kv cache, shape: [batch_size]
+    paged_kv_last_page_len: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         supported_head_sizes = TritonMLABackend.get_supported_head_sizes()
@@ -320,7 +346,13 @@ class TritonMLAMetadata(MLACommonMetadata):
             context_lens_tensor=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=False,
-            head_dim=self.head_dim)
+            head_dim=self.head_dim,
+            paged_kv_indptr=self.paged_kv_indptr,
+            paged_kv_indices=self.paged_kv_indices,
+            paged_kv_last_page_len=self.paged_kv_last_page_len,
+            block_table_bound=self.block_table_bound,
+
+        )
         return self._cached_prefill_metadata
 
     @property
@@ -367,7 +399,12 @@ class TritonMLAMetadata(MLACommonMetadata):
             block_tables=block_tables,
             use_cuda_graph=self.use_cuda_graph,
             input_positions=input_positions,
-            head_dim=self.head_dim)
+            head_dim=self.head_dim,
+            paged_kv_indptr=self.paged_kv_indptr,
+            paged_kv_indices=self.paged_kv_indices,
+            paged_kv_last_page_len=self.paged_kv_last_page_len,
+            block_table_bound=self.block_table_bound,
+        )
         return self._cached_decode_metadata
 
     def advance_step(self,
@@ -433,16 +470,30 @@ class TritonMLAMetadata(MLACommonMetadata):
             self.seq_lens[i] += 1
         self.max_decode_seq_len = max(self.seq_lens)
 
-        ops.advance_step_flashattn(num_seqs=num_seqs,
-                                   num_queries=num_queries,
-                                   block_size=block_size,
-                                   input_tokens=model_input.input_tokens,
-                                   sampled_token_ids=sampled_token_ids,
-                                   input_positions=model_input.input_positions,
-                                   seq_lens=self.seq_lens_tensor,
-                                   slot_mapping=self.slot_mapping,
-                                   block_tables=self.block_tables)
-
+        #ops.advance_step_flashattn(num_seqs=num_seqs,
+                                   #num_queries=num_queries,
+                                   #block_size=block_size,
+                                   #input_tokens=model_input.input_tokens,
+                                   #sampled_token_ids=sampled_token_ids,
+                                   #input_positions=model_input.input_positions,
+                                   #seq_lens=self.seq_lens_tensor,
+                                   #slot_mapping=self.slot_mapping,
+                                   #block_tables=self.block_tables)
+        ops.advance_step_flashinfer(
+            num_seqs=num_seqs,
+            num_queries=num_queries,
+            block_size=block_size,
+            input_tokens=model_input.input_tokens,
+            sampled_token_ids=sampled_token_ids,
+            input_positions=model_input.input_positions,
+            seq_lens=self.seq_lens_tensor,
+            slot_mapping=self.slot_mapping,
+            block_tables=self.block_tables,
+            paged_kv_indices=self.paged_kv_indices,
+            paged_kv_indptr=self.paged_kv_indptr,
+            paged_kv_last_page_len=self.paged_kv_last_page_len,
+            block_table_bound=self.block_table_bound
+        )
 
 class TritonMLAMetadataBuilder(AttentionMetadataBuilder[TritonMLAMetadata]):
 
@@ -466,6 +517,12 @@ class TritonMLAMetadataBuilder(AttentionMetadataBuilder[TritonMLAMetadata]):
         self.num_prefill_tokens = 0
         self.num_decode_tokens = 0
         self.has_prefix_cache_hit = False
+
+        # For current version of AITER MLA
+        self.paged_kv_indices: List[int] = []
+        self.paged_kv_indptr: List[int] = [0]
+        self.paged_kv_last_page_len: List[int] = []
+        self.total_blocks = 0
 
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
@@ -527,6 +584,29 @@ class TritonMLAMetadataBuilder(AttentionMetadataBuilder[TritonMLAMetadata]):
             compute_slot_mapping(is_profile_run, self.slot_mapping, seq_id,
                                  seq_len, context_len, start_idx,
                                  self.block_size, inter_data.block_tables)
+            if is_profile_run:
+                return
+            # Update paged_kv_* tensors only for non-profile run
+            self._update_paged_kv_tensors(block_table, seq_len)
+
+    def _update_paged_kv_tensors(self, block_table: List[int], seq_len: int):
+        # Get the number of valid blocks based on sequence length.
+        # If seq_len = 16, block_size = 16,
+        # block_table_bound is 1 with 1 valid block.
+        # If seq_len = 15, block_size = 16,
+        # block_table_bound is 0 + 1 with 1 valid block.
+        self.total_blocks += len(block_table)
+        block_table_bound = seq_len // self.block_size + 1 \
+                            if seq_len % self.block_size != 0 \
+                            else seq_len // self.block_size
+        self.paged_kv_indices.extend(block_table[:block_table_bound])
+        self.paged_kv_indptr.append(self.paged_kv_indptr[-1] +
+                                    block_table_bound)
+
+        last_page_len = seq_len % self.block_size
+        if last_page_len == 0:
+            last_page_len = self.block_size
+        self.paged_kv_last_page_len.append(last_page_len)
 
     def _get_graph_runner_block_tables(
             self, num_seqs: int,
@@ -594,6 +674,12 @@ class TritonMLAMetadataBuilder(AttentionMetadataBuilder[TritonMLAMetadata]):
             num_decode_tokens = batch_size - self.num_prefill_tokens
             block_tables = self._get_graph_runner_block_tables(
                 num_seqs, self.block_tables)
+
+            # For current version of AITER MLA
+            last_paged_kv_indptr = self.paged_kv_indptr[-1]
+            self.paged_kv_indptr.extend([last_paged_kv_indptr] *
+                                        cuda_graph_pad_size)
+            self.paged_kv_last_page_len.extend([0] * cuda_graph_pad_size)
         else:
             block_tables = make_tensor_with_pad(
                 self.block_tables,
@@ -623,6 +709,30 @@ class TritonMLAMetadataBuilder(AttentionMetadataBuilder[TritonMLAMetadata]):
             self.multimodal_placeholder_maps.items()
         }
 
+        # For current version of AITER MLA
+        if len(self.paged_kv_indptr) > 0:
+            # extend to the maximum number of blocks as returned by the
+            # scheduler
+            self.paged_kv_indices.extend(
+                [0] * (self.total_blocks - len(self.paged_kv_indices)))
+            paged_kv_indices_tensor = torch.tensor(self.paged_kv_indices,
+                                                   device=device,
+                                                   dtype=torch.int)
+            paged_kv_indptr_tensor = torch.tensor(self.paged_kv_indptr,
+                                                  device=device,
+                                                  dtype=torch.int)
+            paged_kv_last_page_len_tensor = torch.tensor(
+                self.paged_kv_last_page_len, device=device, dtype=torch.int)
+            block_table_bound_tensor = torch.zeros(len(self.paged_kv_indptr) -
+                                                   1,
+                                                   device=device,
+                                                   dtype=torch.int)
+        else:
+            paged_kv_indices_tensor = None
+            paged_kv_indptr_tensor = None
+            paged_kv_last_page_len_tensor = None
+            block_table_bound_tensor = None
+
         return TritonMLAMetadata(
             num_prefills=self.num_prefills,
             slot_mapping=slot_mapping_tensor,
@@ -644,6 +754,10 @@ class TritonMLAMetadataBuilder(AttentionMetadataBuilder[TritonMLAMetadata]):
             use_cuda_graph=use_captured_graph,
             num_kv_splits=4,  # TODO(lucas) add heuristic
             head_dim=self.runner.model_config.get_head_size(),
+            paged_kv_indptr=paged_kv_indptr_tensor,
+            paged_kv_indices=paged_kv_indices_tensor,
+            paged_kv_last_page_len=paged_kv_last_page_len_tensor,
+            block_table_bound=block_table_bound_tensor,
         )
 
 
@@ -739,7 +853,11 @@ class TritonMLAImpl(MLACommonImpl[TritonMLAMetadata]):
         # Run MQA
         decode_attention_fwd(q, kv_c_and_k_pe_cache, kv_c_cache, o,
                              decode_meta.block_tables,
-                             decode_meta.seq_lens_tensor, attn_logits,
+                             decode_meta.seq_lens_tensor,
+                             decode_meta.paged_kv_indptr,
+                             decode_meta.paged_kv_indices,
+                             decode_meta.paged_kv_last_page_len,
+                             attn_logits,
                              attn_metadata.num_kv_splits, self.scale,
                              PAGE_SIZE)
 

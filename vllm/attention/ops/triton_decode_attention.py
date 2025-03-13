@@ -640,6 +640,9 @@ def decode_attention_fwd(
     o,
     req_to_token,
     b_seq_len,
+    kv_indptr1,
+    kv_indices1,
+    kv_last_page_lens1,
     attn_logits,
     num_kv_splits,
     sm_scale,
@@ -649,23 +652,36 @@ def decode_attention_fwd(
     assert num_kv_splits == attn_logits.shape[2]
     kv_group_num = q.shape[1] // v_buffer.shape[-2]
 
+    import torch.distributed as dist
+    rank = dist.get_rank()
+
     if is_hip_ and envs.VLLM_USE_AITER_MLA:
         from aiter.mla import mla_decode_fwd
         import torch
-        kv_indptr = torch.empty(b_seq_len.shape[0]+1, dtype=b_seq_len.dtype, device=b_seq_len.device)
+        kv_indptr = torch.zeros(b_seq_len.shape[0]+1, dtype=b_seq_len.dtype, device=b_seq_len.device)
         kv_indptr[0] = 0
-        for i in range(len(b_seq_len)):
-            kv_indptr[i+1] = kv_indptr[i] + b_seq_len[i]
-        kv_indices = req_to_token.flatten().to(b_seq_len.device)
-        attn_logits = torch.ones(b_seq_len.shape[0], dtype=torch.int, device=b_seq_len.device)
+        kv_indptr[1:] = torch.cumsum(b_seq_len, dim=0)
+        kv_indices = req_to_token.flatten()
+        kv_last_page_lens = torch.ones(b_seq_len.shape[0], dtype=torch.int, device=b_seq_len.device)
 
+        #assert kv_indptr.shape == kv_indptr1.shape, f"kv_indptr.shape: {kv_indptr.shape}, kv_indptr1.shape: {kv_indptr1.shape}"
+        #print(f"kv_indptr.shape: {kv_indptr.shape}, kv_indptr1.shape: {kv_indptr1.shape}")
+        #print(f"==== kv_indptr: {kv_indptr[0:]}, kv_indptr1: {kv_indptr1[0:]}")
+#
+        #print(f"====== b_seq_len.shape: {b_seq_len.shape}, b_seq_len[0]: {b_seq_len[0]}\n")
+        #print(f"====== req_to_token.shape: {req_to_token.shape}, req_to_token[0:20]: {req_to_token[0, 0:20]} \n")
+        #print(f"====== kv_indptr.shape: {kv_indptr.shape}, kv_indptr[0:2]: {kv_indptr[0:2]} \n")
+        ##print(f"====== kv_indices.shape: {kv_indices.shape}, kv_indices[0:9]: {kv_indices[0:9]} \n")
+        ##print(f"====== kv_indices1.shape: {kv_indices1.shape}, kv_indices1[0:9]: {kv_indices1[0:9]} \n")
+        #print(f"====== kv_last_page_lens.shape: {kv_last_page_lens.shape} \n")
+#
         mla_decode_fwd(
             q,
             k_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            kv_indptr,
-            kv_indices,
-            attn_logits,
+            kv_indptr1,
+            kv_indices1,
+            kv_last_page_lens1,
             sm_scale,
             logit_cap
         )
