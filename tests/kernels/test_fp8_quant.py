@@ -101,7 +101,7 @@ def test_dynamic_per_tensor_fp8_quant(num_tokens: int, hidden_size: int,
 # represent the number of elements.
 @torch.inference_mode()
 @pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.skipif(current_platform.is_rocm() and not is_mi250(), 
+@pytest.mark.skipif(current_platform.is_rocm() and is_mi250(), 
                     reason="MI250 doesn't support quantization")
 def test_fp8_quant_large(seed: int) -> None:
     current_platform.seed_everything(seed)
