@@ -1,4 +1,4 @@
-![image](https://github.com/user-attachments/assets/36f87cd3-403b-429b-936a-93bcab0ab28f)![image](https://github.com/user-attachments/assets/32933e6d-e217-4aef-b3a2-84c3ad9bd864)# vllm FP8 Latency and Throughput benchmarks with vLLM on the AMD Instinct™ MI300X accelerator
+# vllm FP8 Latency and Throughput benchmarks with vLLM on the AMD Instinct™ MI300X accelerator
 
 Documentation for Inferencing with vLLM on AMD Instinct™ MI300X platforms.
 
