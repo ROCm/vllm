@@ -166,7 +166,7 @@ else
   echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
   docker run \
           --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
-          --network host \
+	  --network=host \
           --shm-size=16gb \
           --rm \
           -e HIP_VISIBLE_DEVICES=0 \
