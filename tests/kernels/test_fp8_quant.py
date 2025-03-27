@@ -9,6 +9,7 @@ from tests.kernels.quant_utils import (FP8_DTYPE,
                                        ref_dynamic_per_token_quant)
 from tests.kernels.utils import opcheck
 from vllm.platforms import current_platform
+from vllm.utils import is_mi250
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 HIDDEN_SIZES = [1, 2, 3, 4, 16, 67, 768, 2048, 5120, 5137, 8192,
@@ -44,6 +45,8 @@ def opcheck_fp8_quant(output,
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("scale_ub", SCALE_UBS)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.skipif(current_platform.is_rocm() and is_mi250(), 
+                    reason="MI250 doesn't support quantization")
 @torch.inference_mode()
 def test_dynamic_per_token_fp8_quant(num_tokens: int, hidden_size: int,
                                      dtype: torch.dtype, scale_ub: bool,
@@ -75,6 +78,8 @@ def test_dynamic_per_token_fp8_quant(num_tokens: int, hidden_size: int,
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.skipif(current_platform.is_rocm() and is_mi250(), 
+                    reason="MI250 doesn't support quantization")
 @torch.inference_mode()
 def test_dynamic_per_tensor_fp8_quant(num_tokens: int, hidden_size: int,
                                       dtype: torch.dtype, seed: int) -> None:
@@ -96,6 +101,8 @@ def test_dynamic_per_tensor_fp8_quant(num_tokens: int, hidden_size: int,
 # represent the number of elements.
 @torch.inference_mode()
 @pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.skipif(current_platform.is_rocm() and is_mi250(), 
+                    reason="MI250 doesn't support quantization")
 def test_fp8_quant_large(seed: int) -> None:
     current_platform.seed_everything(seed)
 
