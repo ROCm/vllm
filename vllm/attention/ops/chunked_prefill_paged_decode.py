@@ -329,7 +329,6 @@ def chunked_prefill_paged_decode(
             v_scale=v_scale,
             fp8_out_scale=fp8_out_scale,
         )
-        assert output.dtype == torch.float8_e4m3fnuz
     else:
         kernel_paged_attention_2d[(
             num_seqs,
