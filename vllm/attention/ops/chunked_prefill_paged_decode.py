@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from vllm import _custom_ops as ops
+from vllm.platforms import current_platform
 from vllm.platforms.rocm import use_rocm_custom_paged_attention
 
 from .prefix_prefill import context_attention_fwd
@@ -222,6 +223,7 @@ def chunked_prefill_paged_decode(
     alibi_slopes=None,
     sliding_window=None,
     sm_scale=None,
+    fp8_out_scale=None,
 ):
 
     if sm_scale is None:
@@ -231,6 +233,10 @@ def chunked_prefill_paged_decode(
 
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
+
+    output_dtype = output.dtype
+    if fp8_out_scale is not None:
+        output = torch.empty_like(output, dtype=current_platform.fp8_dtype())
 
     if max_query_len > 1:
         context_attention_fwd(
@@ -252,6 +258,7 @@ def chunked_prefill_paged_decode(
             sliding_window=sliding_window,
             sm_scale=sm_scale,
             skip_decode=True,
+            fp8_out_scale=fp8_out_scale,
         )
 
     block_size = value_cache.shape[3]
@@ -293,7 +300,7 @@ def chunked_prefill_paged_decode(
         tmp_output = torch.empty(
             size=(total_num_seq, num_query_heads, max_num_partitions,
                   head_size),
-            dtype=output.dtype,
+            dtype=output_dtype,
             device=output.device,
         )
         exp_sums = torch.empty(
@@ -322,7 +329,7 @@ def chunked_prefill_paged_decode(
             kv_cache_dtype=kv_cache_dtype,
             k_scale=k_scale,
             v_scale=v_scale,
-            fp8_out_scale=None,
+            fp8_out_scale=fp8_out_scale,
         )
     else:
         kernel_paged_attention_2d[(
