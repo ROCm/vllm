@@ -1,6 +1,6 @@
 ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:6.3.1-complete
 ARG HIPBLASLT_BRANCH="db8e93b4"
-ARG HIPBLAS_COMMON_BRANCH="7c1566b"
+ARG HIPBLAS_COMMON_BRANCH="9b80ba8e"
 ARG LEGACY_HIPBLASLT_OPTION=
 ARG RCCL_BRANCH="648a58d"
 ARG RCCL_REPO="https://github.com/ROCm/rccl"
@@ -50,6 +50,7 @@ ARG HIPBLAS_COMMON_BRANCH
 # Set to "--legacy_hipblas_direct" for ROCm<=6.2
 ARG LEGACY_HIPBLASLT_OPTION
 RUN git clone https://github.com/ROCm/hipBLAS-common.git
+RUN apt-get remove -y hipblaslt && apt-get autoremove -y && apt-get autoclean -y
 RUN cd hipBLAS-common \
     && git checkout ${HIPBLAS_COMMON_BRANCH} \
     && mkdir build \
