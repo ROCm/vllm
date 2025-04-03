@@ -266,7 +266,7 @@ if triton.__version__ >= "2.1.0":
             cur_head * stride_oh + offs_d[None, :] * stride_od)
         out_ptrs = Out + off_o
         if USE_FP8:
-            acc = acc * tl.load(out_scale)
+            acc = acc / tl.load(out_scale)
         tl.store(out_ptrs,
                  acc,
                  mask=dim_mask[None, :] &
