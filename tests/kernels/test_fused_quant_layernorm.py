@@ -8,6 +8,8 @@ import torch
 import vllm._custom_ops as ops
 from tests.kernels.utils import opcheck
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.platforms import current_platform
+from vllm.utils import is_mi250
 
 DTYPES = [torch.bfloat16, torch.float]
 QUANT_DTYPES = [torch.int8, torch.float8_e4m3fn]
@@ -114,6 +116,8 @@ def ops_impl(weight: torch.Tensor,
 @pytest.mark.parametrize("quant_dtype", QUANT_DTYPES)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.skipif(current_platform.is_rocm() and is_mi250(), 
+                    reason="MI250 doesn't support quantization")
 @torch.inference_mode()
 def test_rms_norm(
     num_tokens: int,
