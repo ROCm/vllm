@@ -1417,7 +1417,7 @@ def LLMM_Silu(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor,
 
 
 def wvSpltK(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor, N: int,
-             Itp: int, cu_count: int) -> None:
+            Itp: int, cu_count: int) -> None:
     torch.ops._rocm_C.wvSpltK(a, b, out, N, Itp, cu_count)
 
 
