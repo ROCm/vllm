@@ -444,8 +444,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         for (uint32_t m = 0; m < M; m++) {
           for (int i = 0; i < A_CHUNK * 2; i += 8) {
             for (uint32_t y = 0; y < YTILE; y++) 
-              sum[m][0] = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(
-                bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][0], 0, 0, 0);
+              sum[m][y] = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(
+                bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][y], 0, 0, 0);
           }
         }
       }
@@ -617,7 +617,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           for (int i = 0; i < A_CHUNK * 2; i += 8) {
             for (int y = 0; y < YTILE; y++) 
               sum[m][y] = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(
-                bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][0], 0, 0, 0);
+                bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][y], 0, 0, 0);
           }
         }
       }
