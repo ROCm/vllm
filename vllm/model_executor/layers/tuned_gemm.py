@@ -76,7 +76,7 @@ class TunedGemm:
     def apply_skinny(self, m, n, k, inp_view, weights):
         if not self.use_skinny:
             return None
-        if (inp_view.dtype != torch.float16) and (inp_view.dtype != torch.bfloat16)) or k % 8 != 0:
+        if ((inp_view.dtype != torch.float16) and (inp_view.dtype != torch.bfloat16)) or k % 8 != 0:
             return None
         if m > 8 and 0 < n <= 4:
             out = torch.empty(inp_view.shape[0],
