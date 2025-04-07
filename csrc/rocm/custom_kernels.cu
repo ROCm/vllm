@@ -329,7 +329,6 @@ void LLGemmZZ(void* in_a, void* in_b, void* out_c, const int M, const int K,
 
 /////////////////////////////////////////////
 
-
 /*__device__ __forceinline__ int mindiv(int N, int div1, int div2) {
   int nPrRnd = div1 * div2;
   int rnds0 = N / nPrRnd;
@@ -360,7 +359,8 @@ void LLGemmZZ(void* in_a, void* in_b, void* out_c, const int M, const int K,
 }*/
 
 #if defined(__HIP__MI300__)  // TODO: Add NAVI support
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSpltKQ_hf_sml_(const int K, const int Kp, const int N, const DTYPE* B,
                      const DTYPE* __restrict__ A, DTYPE* C,
@@ -416,7 +416,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K / 2) break;
         const half* B_ = &B[(n + 0) * (Kp / 2) + k_];
-	for (int y=0; y< YTILE; y++)
+        for (int y = 0; y < YTILE; y++)
           bigB[y][k2].h8 = (loadnt((half8*)(&B_[y * Kp / 2])));
       }
 
@@ -443,9 +443,10 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
         for (uint32_t m = 0; m < M; m++) {
           for (int i = 0; i < A_CHUNK * 2; i += 8) {
-            for (uint32_t y = 0; y < YTILE; y++) 
+            for (uint32_t y = 0; y < YTILE; y++)
               sum[m][y] = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(
-                bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][y], 0, 0, 0);
+                  bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][y], 0, 0,
+                  0);
           }
         }
       }
@@ -520,7 +521,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   }
 }
 #else   // !defined(__HIP__MI300__) TODO: Add NAVI support
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void wvSpltKQ_hf_sml_(const int K, const int Kp, const int N,
                                  const DTYPE* B, const DTYPE* __restrict__ A,
                                  DTYPE* C, const float* __restrict__ s_A,
@@ -532,7 +534,8 @@ __global__ void wvSpltKQ_hf_sml_(const int K, const int Kp, const int N,
 #endif  // defined(__HIP__MI300__) TODO: Add NAVI support
 
 #if defined(__HIP__MI300__)  // TODO: Add NAVI support
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSpltKQ_hf_(const int K, const int Kp, const int N, const DTYPE* B,
                  const DTYPE* __restrict__ A, DTYPE* C,
@@ -588,7 +591,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         if (k_ >= K / 2) break;
 
         const half* B_ = &B[(n + 0) * (Kp / 2) + k_];
-        for (uint32_t y = 0; y < YTILE; y++) 
+        for (uint32_t y = 0; y < YTILE; y++)
           bigB[y][k2].h8 = (loadnt((half8*)(&B_[y * Kp / 2])));
       }
 
@@ -615,9 +618,10 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
         for (uint32_t m = 0; m < M; m++) {
           for (int i = 0; i < A_CHUNK * 2; i += 8) {
-            for (int y = 0; y < YTILE; y++) 
+            for (int y = 0; y < YTILE; y++)
               sum[m][y] = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8(
-                bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][y], 0, 0, 0);
+                  bigA[m][k2].l[i / 8], bigB[y][k2].l[i / 8], sum[m][y], 0, 0,
+                  0);
           }
         }
       }
@@ -692,7 +696,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   }
 }
 #else   // !defined(__HIP__MI300__) TODO: Add NAVI support
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void wvSpltKQ_hf_(const int K, const int Kp, const int N,
                              const DTYPE* B, const DTYPE* __restrict__ A,
                              DTYPE* C, const float* __restrict__ s_A,
@@ -704,7 +709,8 @@ __global__ void wvSpltKQ_hf_(const int K, const int Kp, const int N,
 
 #if defined(__HIP__MI300_MI250__)  // TODO: Add NAVI support
 // This version targets cases where A[] fits LDS capacity
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSpltK_hf_sml_(const int K, const int N, const DTYPE* B,
                     const DTYPE* __restrict__ A, DTYPE* C, const int _WvPrGrp,
@@ -779,7 +785,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         if (k_ >= K) break;
 
         const DTYPE* B_ = &B[(n + 0) * K + k_];
-        for (uint32_t y = 0; y < YTILE; y++) 
+        for (uint32_t y = 0; y < YTILE; y++)
           bigB[y][k2].h8 = (loadnt((half8*)(&B_[y * K])));
       }
 
@@ -805,27 +811,28 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
         uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K) break;
-        // Do the matrix multiplication of activation and weight matrix
-        // - Remember the accumulation is happening for K-split of 64!
+          // Do the matrix multiplication of activation and weight matrix
+          // - Remember the accumulation is happening for K-split of 64!
   #pragma unroll
         for (uint32_t m = 0; m < M; m++) {
   #pragma unroll
-	 for (uint32_t y = 0; y < YTILE; y++) {
-          if constexpr (std::is_same_v<DTYPE, half>) 
- #pragma unroll
-           for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-            asm("v_dot2c_f32_f16 %0, %2, %3"
-                : "=v"(sum[m][y])
-                : "0"(sum[m][y]), "v"(bigA[m][k2].f[b]), "v"(bigB[y][k2].f[b]));
+          for (uint32_t y = 0; y < YTILE; y++) {
+            if constexpr (std::is_same_v<DTYPE, half>)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                asm("v_dot2c_f32_f16 %0, %2, %3"
+                    : "=v"(sum[m][y])
+                    : "0"(sum[m][y]), "v"(bigA[m][k2].f[b]),
+                      "v"(bigB[y][k2].f[b]));
+              }
+            if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
+                    : "=v"(sum4[m][y])
+                    : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]),
+                      "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
           }
-          if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>) 
- #pragma unroll
-           for (uint32_t b = 0; b < A_CHUNK / 4; b++) 
-            asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
-                : "=v"(sum4[m][y])
-                : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]), "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
-
-	 }
         }
       }
     }
@@ -833,75 +840,75 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     //----------------------------------------------------
     // Final reduction step using shuffle
     //----------------------------------------------------
-    if constexpr (std::is_same_v<DTYPE, half>) { 
-     for (int m = 0; m < M; m++) {
-      for (int y = 0; y < YTILE; y++) {
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-      }
-     }
-     if (threadIdx.x == 63) {
+    if constexpr (std::is_same_v<DTYPE, half>) {
       for (int m = 0; m < M; m++) {
-        for (int i = 0; i < YTILE; i++) {
-          // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
-          C[n + i + m * N] = __float2half(sum[m][i]);
+        for (int y = 0; y < YTILE; y++) {
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
         }
       }
-     }
+      if (threadIdx.x == 63) {
+        for (int m = 0; m < M; m++) {
+          for (int i = 0; i < YTILE; i++) {
+            // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
+            C[n + i + m * N] = __float2half(sum[m][i]);
+          }
+        }
+      }
     }
     if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>) {
   #pragma unroll
-     for (int m = 0; m < M; m++) {
-  #pragma unroll
-      for (int y = 0; y < YTILE; y++) {
-        float accm = sum4[m][y][0];
-	//for (int i=0; i<64; i++)
-	//  accm += __shfl(sum[m][y][i%4], i);
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:2 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][2]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:3 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][3]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:4 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(accm), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(accm), "v"(accm));
-	accm += __shfl_down(accm, 32);
-	accm += __shfl_down(accm, 16);
-
-        sum4[m][y][0] = accm;
-      }
-     }
-     if (threadIdx.x == 0) {
       for (int m = 0; m < M; m++) {
-        for (int i = 0; i < YTILE; i++) {
-          // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
-          C[n + i + m * N] = __float2bfloat16(sum4[m][i][0]);
+  #pragma unroll
+        for (int y = 0; y < YTILE; y++) {
+          float accm = sum4[m][y][0];
+          // for (int i=0; i<64; i++)
+          //   accm += __shfl(sum[m][y][i%4], i);
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:2 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][2]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:3 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][3]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:4 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          accm += __shfl_down(accm, 32);
+          accm += __shfl_down(accm, 16);
+
+          sum4[m][y][0] = accm;
         }
       }
-     }
+      if (threadIdx.x == 0) {
+        for (int m = 0; m < M; m++) {
+          for (int i = 0; i < YTILE; i++) {
+            // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
+            C[n + i + m * N] = __float2bfloat16(sum4[m][i][0]);
+          }
+        }
+      }
     }
 
     n += CuCount * _WvPrGrp * YTILE;
@@ -918,7 +925,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   }
 }
 #else   // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void wvSpltK_hf_sml_(const int K, const int N, const DTYPE* B,
                                 const DTYPE* __restrict__ A, DTYPE* C,
                                 const int _WvPrGrp, const int CuCount) {
@@ -928,7 +936,8 @@ __global__ void wvSpltK_hf_sml_(const int K, const int N, const DTYPE* B,
 
 #if defined(__HIP__MI300_MI250__)  // TODO: Add NAVI support
 // This version targets cases where A[] marginally exceeds LDS capacity
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSpltK_hf_(const int K, const int N, const DTYPE* B,
                 const DTYPE* __restrict__ A, DTYPE* C, const int _WvPrGrp,
@@ -1015,10 +1024,10 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   while (n < N) {
     for (int i = 0; i < YTILE; i++)
       for (int m = 0; m < M; m++)
-        if constexpr (std::is_same_v<DTYPE, half>) 
+        if constexpr (std::is_same_v<DTYPE, half>)
           sum[m][i] = 0;
-	else
-	  sum4[m][i] = {0};
+        else
+          sum4[m][i] = {0};
 
     bigType bigA[M][UNRL];
     bigType bigB[YTILE][UNRL];
@@ -1031,7 +1040,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         if (k_ >= K) break;
 
         const DTYPE* B_ = &B[(n + 0) * K + k_];
-        for (uint32_t y = 0; y < YTILE; y++) 
+        for (uint32_t y = 0; y < YTILE; y++)
           bigB[y][k2].h8 = (loadnt((half8*)(&B_[y * K])));
       }
 
@@ -1057,27 +1066,28 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
         uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K) break;
-        // Do the matrix multiplication of activation and weight matrix
-        // - Remember the accumulation is happening for K-split of 64!
+          // Do the matrix multiplication of activation and weight matrix
+          // - Remember the accumulation is happening for K-split of 64!
   #pragma unroll
         for (uint32_t m = 0; m < M; m++) {
   #pragma unroll
-	 for (uint32_t y = 0; y < YTILE; y++) {
-          if constexpr (std::is_same_v<DTYPE, half>) 
- #pragma unroll
-           for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-            asm("v_dot2c_f32_f16 %0, %2, %3"
-                : "=v"(sum[m][y])
-                : "0"(sum[m][y]), "v"(bigA[m][k2].f[b]), "v"(bigB[y][k2].f[b]));
+          for (uint32_t y = 0; y < YTILE; y++) {
+            if constexpr (std::is_same_v<DTYPE, half>)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                asm("v_dot2c_f32_f16 %0, %2, %3"
+                    : "=v"(sum[m][y])
+                    : "0"(sum[m][y]), "v"(bigA[m][k2].f[b]),
+                      "v"(bigB[y][k2].f[b]));
+              }
+            if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
+                    : "=v"(sum4[m][y])
+                    : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]),
+                      "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
           }
-          if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>) 
- #pragma unroll
-           for (uint32_t b = 0; b < A_CHUNK / 4; b++) 
-            asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
-                : "=v"(sum4[m][y])
-                : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]), "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
-
-	 }
         }
       }
     }
@@ -1085,75 +1095,75 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     //----------------------------------------------------
     // Final reduction step using shuffle
     //----------------------------------------------------
-    if constexpr (std::is_same_v<DTYPE, half>) { 
-     for (int m = 0; m < M; m++) {
-      for (int y = 0; y < YTILE; y++) {
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-      }
-     }
-     if (threadIdx.x == 63) {
+    if constexpr (std::is_same_v<DTYPE, half>) {
       for (int m = 0; m < M; m++) {
-        for (int i = 0; i < YTILE; i++) {
-          // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
-          C[n + i + m * N] = __float2half(sum[m][i]);
+        for (int y = 0; y < YTILE; y++) {
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
         }
       }
-     }
+      if (threadIdx.x == 63) {
+        for (int m = 0; m < M; m++) {
+          for (int i = 0; i < YTILE; i++) {
+            // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
+            C[n + i + m * N] = __float2half(sum[m][i]);
+          }
+        }
+      }
     }
     if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>) {
   #pragma unroll
-     for (int m = 0; m < M; m++) {
-  #pragma unroll
-      for (int y = 0; y < YTILE; y++) {
-        float accm = sum4[m][y][0];
-	//for (int i=0; i<64; i++)
-	//  accm += __shfl(sum[m][y][i%4], i);
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:2 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][2]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:3 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][3]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:4 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(accm), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(accm), "v"(accm));
-	accm += __shfl_down(accm, 32);
-	accm += __shfl_down(accm, 16);
-
-        sum4[m][y][0] = accm;
-      }
-     }
-     if (threadIdx.x == 0) {
       for (int m = 0; m < M; m++) {
-        for (int i = 0; i < YTILE; i++) {
-          // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
-          C[n + i + m * N] = __float2bfloat16(sum4[m][i][0]);
+  #pragma unroll
+        for (int y = 0; y < YTILE; y++) {
+          float accm = sum4[m][y][0];
+          // for (int i=0; i<64; i++)
+          //   accm += __shfl(sum[m][y][i%4], i);
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:2 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][2]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:3 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][3]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:4 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          accm += __shfl_down(accm, 32);
+          accm += __shfl_down(accm, 16);
+
+          sum4[m][y][0] = accm;
         }
       }
-     }
+      if (threadIdx.x == 0) {
+        for (int m = 0; m < M; m++) {
+          for (int i = 0; i < YTILE; i++) {
+            // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
+            C[n + i + m * N] = __float2bfloat16(sum4[m][i][0]);
+          }
+        }
+      }
     }
 
     n += CuCount * _WvPrGrp * YTILE;
@@ -1171,7 +1181,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 }
 
 #else   // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void wvSpltK_hf_(const int K, const int N, const DTYPE* B,
                             const DTYPE* __restrict__ A, DTYPE* C,
                             const int _WvPrGrp, const int CuCount) {
@@ -1181,7 +1192,8 @@ __global__ void wvSpltK_hf_(const int K, const int N, const DTYPE* B,
 
 #if defined(__HIP__MI300_MI250__)  // TODO: Add NAVI support
 // This version targets big A[] cases, where it is much larger than LDS capacity
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSpltK_hf_big_(const int K, const int N, const DTYPE* B,
                     const DTYPE* __restrict__ A, DTYPE* C, const int _WvPrGrp,
@@ -1252,11 +1264,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   while (n < N) {
   #endif
     for (int i = 0; i < YTILE; i++)
-      for (int m = 0; m < M; m++) 
-          if constexpr (std::is_same_v<DTYPE, half>) 
-	      sum[m][i] = 0;
-	  else
-	      sum4[m][i] = {0};
+      for (int m = 0; m < M; m++)
+        if constexpr (std::is_same_v<DTYPE, half>)
+          sum[m][i] = 0;
+        else
+          sum4[m][i] = {0};
 
     bigType bigA[M][UNRL];
     bigType bigB[YTILE][UNRL];
@@ -1280,7 +1292,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       if (n >= N) continue;
   #endif
 
-      // Fetch the weight matrix from memory!
+        // Fetch the weight matrix from memory!
   #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
@@ -1319,27 +1331,28 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
         uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K) break;
-        // Do the matrix multiplication of activation and weight matrix
-        // - Remember the accumulation is happening for K-split of 64!
+          // Do the matrix multiplication of activation and weight matrix
+          // - Remember the accumulation is happening for K-split of 64!
   #pragma unroll
         for (uint32_t m = 0; m < M; m++) {
   #pragma unroll
-	 for (uint32_t y = 0; y < YTILE; y++) {
-          if constexpr (std::is_same_v<DTYPE, half>) 
- #pragma unroll
-           for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-            asm("v_dot2c_f32_f16 %0, %2, %3"
-                : "=v"(sum[m][y])
-                : "0"(sum[m][y]), "v"(bigA[m][k2].f[b]), "v"(bigB[y][k2].f[b]));
+          for (uint32_t y = 0; y < YTILE; y++) {
+            if constexpr (std::is_same_v<DTYPE, half>)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                asm("v_dot2c_f32_f16 %0, %2, %3"
+                    : "=v"(sum[m][y])
+                    : "0"(sum[m][y]), "v"(bigA[m][k2].f[b]),
+                      "v"(bigB[y][k2].f[b]));
+              }
+            if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
+                    : "=v"(sum4[m][y])
+                    : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]),
+                      "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
           }
-          if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>) 
- #pragma unroll
-           for (uint32_t b = 0; b < A_CHUNK / 4; b++) 
-            asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
-                : "=v"(sum4[m][y])
-                : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]), "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
-
-	 }
         }
       }
     }
@@ -1355,75 +1368,75 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     //----------------------------------------------------
     // Final reduction step using shuffle
     //----------------------------------------------------
-    if constexpr (std::is_same_v<DTYPE, half>) { 
-     for (int m = 0; m < M; m++) {
-      for (int y = 0; y < YTILE; y++) {
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
-            : "=v"(sum[m][y])
-            : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
-      }
-     }
-     if (threadIdx.x == 63) {
+    if constexpr (std::is_same_v<DTYPE, half>) {
       for (int m = 0; m < M; m++) {
-        for (int i = 0; i < YTILE; i++) {
-          // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
-          C[n + i + m * N] = __float2half(sum[m][i]);
+        for (int y = 0; y < YTILE; y++) {
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
+              : "=v"(sum[m][y])
+              : "0"(sum[m][y]), "v"(sum[m][y]), "v"(sum[m][y]));
         }
       }
-     }
+      if (threadIdx.x == 63) {
+        for (int m = 0; m < M; m++) {
+          for (int i = 0; i < YTILE; i++) {
+            // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
+            C[n + i + m * N] = __float2half(sum[m][i]);
+          }
+        }
+      }
     }
     if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>) {
   #pragma unroll
-     for (int m = 0; m < M; m++) {
-  #pragma unroll
-      for (int y = 0; y < YTILE; y++) {
-        float accm = sum4[m][y][0];
-	//for (int i=0; i<64; i++)
-	//  accm += __shfl(sum[m][y][i%4], i);
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:2 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][2]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:3 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(sum4[m][y][3]), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:4 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(accm), "v"(accm));
-        asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
-            : "=v"(accm)
-            : "0"(accm), "v"(accm), "v"(accm));
-	accm += __shfl_down(accm, 32);
-	accm += __shfl_down(accm, 16);
-
-        sum4[m][y][0] = accm;
-      }
-     }
-     if (threadIdx.x == 0) {
       for (int m = 0; m < M; m++) {
-        for (int i = 0; i < YTILE; i++) {
-          // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
-          C[n + i + m * N] = __float2bfloat16(sum4[m][i][0]);
+  #pragma unroll
+        for (int y = 0; y < YTILE; y++) {
+          float accm = sum4[m][y][0];
+          // for (int i=0; i<64; i++)
+          //   accm += __shfl(sum[m][y][i%4], i);
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:2 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][2]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:3 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(sum4[m][y][3]), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:4 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          accm += __shfl_down(accm, 32);
+          accm += __shfl_down(accm, 16);
+
+          sum4[m][y][0] = accm;
         }
       }
-     }
+      if (threadIdx.x == 0) {
+        for (int m = 0; m < M; m++) {
+          for (int i = 0; i < YTILE; i++) {
+            // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
+            C[n + i + m * N] = __float2bfloat16(sum4[m][i][0]);
+          }
+        }
+      }
     }
 
     n += CuCount * _WvPrGrp * YTILE;
@@ -1441,7 +1454,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   }
 }
 #else   // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
-template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK, int UNRL, int M>
+template <typename DTYPE, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int M>
 __global__ void wvSpltK_hf_big_(const int K, const int N, const DTYPE* B,
                                 const DTYPE* __restrict__ A, DTYPE* C,
                                 const int _WvPrGrp, const int CuCount) {
@@ -1479,78 +1493,77 @@ int mindiv(int N, int div1, int div2) {
 }
 
 void wvSpltK_(void* in_a, void* in_b, void* out_c, const int M_in,
-              const int K_in, const int N_in, const int Itp_in, 
-	      cudaStream_t stream, const int CuCount = 0) {
+              const int K_in, const int N_in, const int Itp_in,
+              cudaStream_t stream, const int CuCount = 0) {
   dim3 grid(CuCount);
-#define WVSPLTK(_DTYPE, _WvPrGrp, _YTILEs, _YTILEm, _YTILEb, _UNRLs, _UNRLm, _UNRLb, \
-                _N)                                                          \
+#define WVSPLTK(_DTYPE, _WvPrGrp, _YTILEs, _YTILEm, _YTILEb, _UNRLs, _UNRLm, \
+                _UNRLb, _N)                                                  \
   {                                                                          \
     dim3 block(64, _WvPrGrp);                                                \
     if ((K_in * N_in <= 32 * 1024) && (M_in % _YTILEs == 0)) {               \
       int __wvPrGrp = mindiv(M_in, CuCount * _YTILEs, _WvPrGrp);             \
-      wvSpltK_hf_sml_<_DTYPE, 64, _YTILEs, _WvPrGrp, 8, _UNRLs, _N>                  \
+      wvSpltK_hf_sml_<_DTYPE, 64, _YTILEs, _WvPrGrp, 8, _UNRLs, _N>          \
           <<<grid, block, 0, stream>>>(K_in, M_in, af4, bf4, c, __wvPrGrp,   \
                                        CuCount);                             \
     } else if (K_in * N_in <= 32 * 1024 * 1.2) {                             \
       int __wvPrGrp = mindiv(M_in, CuCount * _YTILEm, _WvPrGrp);             \
-      wvSpltK_hf_<_DTYPE, 64, _YTILEm, _WvPrGrp, 8, _UNRLm, _N>                      \
+      wvSpltK_hf_<_DTYPE, 64, _YTILEm, _WvPrGrp, 8, _UNRLm, _N>              \
           <<<grid, block, 0, stream>>>(K_in, M_in, af4, bf4, c, __wvPrGrp,   \
                                        CuCount);                             \
     } else {                                                                 \
       int __wvPrGrp = mindiv(M_in, CuCount * _YTILEb, _WvPrGrp);             \
-      wvSpltK_hf_big_<_DTYPE, 64, _YTILEb, _WvPrGrp, 8, _UNRLb, _N>                  \
+      wvSpltK_hf_big_<_DTYPE, 64, _YTILEb, _WvPrGrp, 8, _UNRLb, _N>          \
           <<<grid, block, 0, stream>>>(K_in, M_in, af4, bf4, c, __wvPrGrp,   \
                                        CuCount);                             \
     }                                                                        \
   }
 
-  if (Itp_in == 0) { // fp16
-   half* af4 = reinterpret_cast<half*>(in_a);
-   const half* bf4 = reinterpret_cast<const half*>(in_b);
-   auto* c = reinterpret_cast<half*>(out_c);
+  if (Itp_in == 0) {  // fp16
+    half* af4 = reinterpret_cast<half*>(in_a);
+    const half* bf4 = reinterpret_cast<const half*>(in_b);
+    auto* c = reinterpret_cast<half*>(out_c);
 
-   switch (N_in) {
-    case 1:
-      WVSPLTK(half, 16, 2, 2, 2, 2, 2, 2, 1) 
-      break;
-    case 2:
-      WVSPLTK(half, 16, 2, 2, 2, 2, 2, 2, 2)
-      break;
-    case 3:
-      WVSPLTK(half, 16, 4, 7, 7, 1, 1, 1, 3)
-      break;
-    case 4:
-      WVSPLTK(half, 16, 4, 7, 7, 1, 1, 1, 4)
-      break;
-    default:
-      throw std::runtime_error("Unsupported N value: " + std::to_string(M_in) +
-                               "," + std::to_string(K_in) + "," +
-                               std::to_string(N_in));
-   }
-  }
-  else if (Itp_in == 1) {// bf16
-   __hip_bfloat16* af4 = reinterpret_cast<__hip_bfloat16*>(in_a);
-   const __hip_bfloat16* bf4 = reinterpret_cast<const __hip_bfloat16*>(in_b);
-   auto* c = reinterpret_cast<__hip_bfloat16*>(out_c);
+    switch (N_in) {
+      case 1:
+        WVSPLTK(half, 16, 2, 2, 2, 2, 2, 2, 1)
+        break;
+      case 2:
+        WVSPLTK(half, 16, 2, 2, 2, 2, 2, 2, 2)
+        break;
+      case 3:
+        WVSPLTK(half, 16, 4, 7, 7, 1, 1, 1, 3)
+        break;
+      case 4:
+        WVSPLTK(half, 16, 4, 7, 7, 1, 1, 1, 4)
+        break;
+      default:
+        throw std::runtime_error(
+            "Unsupported N value: " + std::to_string(M_in) + "," +
+            std::to_string(K_in) + "," + std::to_string(N_in));
+    }
+  } else if (Itp_in == 1) {  // bf16
+    __hip_bfloat16* af4 = reinterpret_cast<__hip_bfloat16*>(in_a);
+    const __hip_bfloat16* bf4 = reinterpret_cast<const __hip_bfloat16*>(in_b);
+    auto* c = reinterpret_cast<__hip_bfloat16*>(out_c);
 
-   switch (N_in) {
-    case 1:
-      WVSPLTK(__hip_bfloat16, 16, 2, 2, 2, 2, 2, 2, 1) 
-      break;
-    case 2:
-      WVSPLTK(__hip_bfloat16, 16, 2, 2, 2, 2, 2, 2, 2)
-      break;
-    case 3:
-      WVSPLTK(__hip_bfloat16, 16, 4, 7, 7, 1, 1, 1, 3)
-      break;
-    case 4:
-      WVSPLTK(__hip_bfloat16, 16, 4, 7, 7, 1, 1, 1, 4)
-      break;
-    default:
-      throw std::runtime_error("Unsupported N value: " + std::to_string(M_in) +
-                               "," + std::to_string(K_in) + "," +
-                               std::to_string(N_in));
-   }
+    switch (N_in) {
+      case 1:
+        WVSPLTK(__hip_bfloat16, 16, 2, 2, 2, 2, 2, 2, 1)
+        break;
+      case 2:
+        WVSPLTK(__hip_bfloat16, 16, 2, 2, 2, 2, 2, 2, 2)
+        break;
+      case 3:
+        WVSPLTK(__hip_bfloat16, 16, 4, 7, 7, 1, 1, 1, 3)
+        break;
+      case 4:
+        WVSPLTK(__hip_bfloat16, 16, 4, 7, 7, 1, 1, 1, 4)
+        break;
+      default:
+        throw std::runtime_error(
+            "Unsupported N value: " + std::to_string(M_in) + "," +
+            std::to_string(K_in) + "," + std::to_string(N_in));
+    }
   }
 
   cudaError_t err = cudaGetLastError();
@@ -1576,12 +1589,12 @@ void wvSpltKQ_(void* in_a, void* in_b, void* out_c, void* scale_a,
     dim3 block(64, _WvPrGrp);                                                 \
     if ((K_in * N_in <= 32 * 1024) && (M_in % _YTILEs == 0)) {                \
       int __wvPrGrp = mindiv(M_in, CuCount * _YTILEs, _WvPrGrp);              \
-      wvSpltKQ_hf_sml_<half, 64, _YTILEs, _WvPrGrp, 8, _UNRLs, _N>                  \
+      wvSpltKQ_hf_sml_<half, 64, _YTILEs, _WvPrGrp, 8, _UNRLs, _N>            \
           <<<grid, block, 0, stream>>>(K_in, Kp_in, M_in, af4, bf4, c, s_a,   \
                                        s_b, __wvPrGrp, Otp_in, CuCount);      \
     } else {                                                                  \
       int __wvPrGrp = mindiv(M_in, CuCount * _YTILEm, _WvPrGrp);              \
-      wvSpltKQ_hf_<half, 64, _YTILEm, _WvPrGrp, 8, _UNRLm, _N>                      \
+      wvSpltKQ_hf_<half, 64, _YTILEm, _WvPrGrp, 8, _UNRLm, _N>                \
           <<<grid, block, 0, stream>>>(K_in, Kp_in, M_in, af4, bf4, c, s_a,   \
                                        s_b, __wvPrGrp, Otp_in, CuCount);      \
     }                                                                         \

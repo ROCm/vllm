@@ -37,7 +37,8 @@ void LLMM1(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c,
 }
 
 void wvSpltK_(void* in_a, void* in_b, void* out_c, const int M, const int K,
-              const int N, const int Itp_in, cudaStream_t stream, const int CuCount);
+              const int N, const int Itp_in, cudaStream_t stream,
+              const int CuCount);
 
 void wvSpltK(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c,
              const int64_t N_in, const int64_t Itp_in, const int64_t CuCount) {
