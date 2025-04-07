@@ -85,7 +85,7 @@ class TunedGemm:
                               dtype=inp_view.dtype,
                               device='cuda')
             Itp = 1  #default bfloat16
-            if out_dtype == torch.float16:
+            if inp_view.dtype == torch.float16:
                 Itp = 0
             ops.wvSpltK(weights, inp_view, out, n, Itp, self.cu_count)
             return out
