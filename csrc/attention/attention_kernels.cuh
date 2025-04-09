@@ -36,7 +36,7 @@ typedef __hip_bfloat16 __nv_bfloat16;
 #ifndef USE_ROCM
   #define WARP_SIZE 32
 #else
-  #define WARP_SIZE warpSize
+  #define WARP_SIZE 32
 #endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))

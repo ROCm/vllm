@@ -22,7 +22,7 @@
 #ifndef USE_ROCM
   #define WARP_SIZE 32
 #else
-  #define WARP_SIZE warpSize
+  #define WARP_SIZE 32
 #endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
