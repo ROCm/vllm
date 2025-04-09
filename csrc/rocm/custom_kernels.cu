@@ -772,7 +772,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
   while (n < N) {
     for (int i = 0; i < YTILE; i++)
-      for (int m = 0; m < M; m++) sum[m][i] = 0;
+      for (int m = 0; m < M; m++)
+        if constexpr (std::is_same_v<DTYPE, half>)
+          sum[m][i] = 0;
+        else
+          sum4[m][i] = {0};
 
     bigType bigA[M][UNRL];
     bigType bigB[YTILE][UNRL];
