@@ -89,7 +89,8 @@ class TunedGemm:
                 Itp = 0
             ops.wvSpltK(weights, inp_view, out, n, Itp, self.cu_count)
             return out
-        elif m % 4 == 0 and n == 1 and k <= 8192 and (inp_view.dtype == torch.float16):
+        elif m % 4 == 0 and n == 1 and k <= 8192 and (inp_view.dtype
+                                                      == torch.float16):
             out = torch.empty(inp_view.shape[0],
                               weights.shape[0],
                               dtype=inp_view.dtype,
