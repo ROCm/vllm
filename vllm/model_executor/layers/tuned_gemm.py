@@ -109,7 +109,7 @@ class TunedGemm:
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
         n = inp.shape[0]
-        if (not VLLM_USE_ROCM_SKINNY_GEMM or n != 1
+        if (not VLLM_USE_ROCM_SKINNY_GEMM or n > 4
                 or not current_platform.is_rocm() or is_mi250() or is_navi()):
             return torch._scaled_mm(inp,
                                     weight,
