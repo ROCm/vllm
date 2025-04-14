@@ -306,7 +306,24 @@ def _detect_content_format(
         return "openai"
 
 
-def _resolve_hf_chat_template(
+def resolve_mistral_chat_template(
+    chat_template: Optional[str],
+    **kwargs: Any,
+) -> Optional[str]:
+    if chat_template is not None:
+        logger.warning_once(
+            "'chat_template' cannot be overridden for mistral tokenizer.")
+    if "add_generation_prompt" in kwargs:
+        logger.warning_once(
+            "'add_generation_prompt' is not supported for mistral tokenizer, "
+            "so it will be ignored.")
+    if "continue_final_message" in kwargs:
+        logger.warning_once(
+            "'continue_final_message' is not supported for mistral tokenizer, "
+            "so it will be ignored.")
+    return None
+
+def resolve_hf_chat_template(
     tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
     chat_template: Optional[str],
     tools: Optional[list[dict[str, Any]]],
@@ -352,7 +369,7 @@ def _resolve_chat_template_content_format(
     trust_remote_code: bool,
 ) -> _ChatTemplateContentFormat:
     if isinstance(tokenizer, (PreTrainedTokenizer, PreTrainedTokenizerFast)):
-        hf_chat_template = _resolve_hf_chat_template(
+        hf_chat_template = resolve_hf_chat_template(
             tokenizer,
             chat_template=chat_template,
             trust_remote_code=trust_remote_code,
@@ -470,7 +487,8 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
                 return "<|endoftext10|>"  # 200010 (see vocab.json in hf model)
             if model_type in ("minicpmo", "minicpmv"):
                 return "(<image>./</image>)"
-            if model_type in ("blip-2", "fuyu", "paligemma", "pixtral"):
+            if model_type in ("blip-2", "florence2", "fuyu", "paligemma",
+                              "pixtral", "mistral3"):
                 # These models do not use image tokens in the prompt
                 return None
             if model_type == "qwen":
@@ -478,17 +496,16 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
             if model_type.startswith("llava"):
                 return self._cached_token_str(self._tokenizer,
                                               hf_config.image_token_index)
-            if model_type in ("chameleon", "deepseek_vl_v2", "internvl_chat",
-                              "NVLM_D", "h2ovl_chat"):
+            if model_type in ("aya_vision", "chameleon", "deepseek_vl_v2",
+                              "internvl_chat", "skywork_chat", "NVLM_D",
+                              "h2ovl_chat", "idefics3"):
                 return "<image>"
-            if model_type == "mllama":
+            if model_type in ("mllama", "llama4"):
                 return "<|image|>"
             if model_type in ("qwen2_vl", "qwen2_5_vl"):
                 return "<|vision_start|><|image_pad|><|vision_end|>"
             if model_type == "molmo":
                 return ""
-            if model_type == "idefics3":
-                return "<image>"
             if model_type == "aria":
                 return "<|fim_prefix|><|img|><|fim_suffix|>"
             if model_type == "gemma3":
@@ -556,11 +573,11 @@ class MultiModalItemTracker(BaseMultiModalItemTracker[object]):
                 raise ValueError(\
                     "Only one message can have {'type': 'image_embeds'}")
             mm_inputs["image"] = image_embeds_lst[0]
-        elif "image" in items_by_modality:
+        if "image" in items_by_modality:
             mm_inputs["image"] = items_by_modality["image"] # A list of images
-        elif "audio" in items_by_modality:
+        if "audio" in items_by_modality:
             mm_inputs["audio"] = items_by_modality["audio"] # A list of audios
-        elif "video" in items_by_modality:
+        if "video" in items_by_modality:
             mm_inputs["video"] = items_by_modality["video"] # A list of videos
         return mm_inputs
 
@@ -589,11 +606,11 @@ class AsyncMultiModalItemTracker(BaseMultiModalItemTracker[Awaitable[object]]):
                 raise ValueError(
                     "Only one message can have {'type': 'image_embeds'}")
             mm_inputs["image"] = image_embeds_lst[0]
-        elif "image" in items_by_modality:
+        if "image" in items_by_modality:
             mm_inputs["image"] = items_by_modality["image"] # A list of images
-        elif "audio" in items_by_modality:
+        if "audio" in items_by_modality:
             mm_inputs["audio"] = items_by_modality["audio"] # A list of audios
-        elif "video" in items_by_modality:
+        if "video" in items_by_modality:
             mm_inputs["video"] = items_by_modality["video"] # A list of videos
         return mm_inputs
 
@@ -1140,7 +1157,7 @@ def apply_hf_chat_template(
     tokenize: bool = False,  # Different from HF's default
     **kwargs: Any,
 ) -> str:
-    hf_chat_template = _resolve_hf_chat_template(
+    hf_chat_template = resolve_hf_chat_template(
         tokenizer,
         chat_template=chat_template,
         tools=tools,
@@ -1169,17 +1186,12 @@ def apply_mistral_chat_template(
     tools: Optional[list[dict[str, Any]]],
     **kwargs: Any,
 ) -> list[int]:
-    if chat_template is not None:
-        logger.warning_once(
-            "'chat_template' cannot be overridden for mistral tokenizer.")
-    if "add_generation_prompt" in kwargs:
-        logger.warning_once(
-            "'add_generation_prompt' is not supported for mistral tokenizer, "
-            "so it will be ignored.")
-    if "continue_final_message" in kwargs:
-        logger.warning_once(
-            "'continue_final_message' is not supported for mistral tokenizer, "
-            "so it will be ignored.")
+    # The return value of resolve_mistral_chat_template is always None,
+    # and we won't use it.
+    resolve_mistral_chat_template(
+        chat_template=chat_template,
+        **kwargs,
+    )
 
     return tokenizer.apply_chat_template(
         messages=messages,
