@@ -11,7 +11,6 @@ from amdsmi import (AmdSmiException, amdsmi_get_gpu_asic_info,
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.utils import aiter_mla_enabled
 
 from .interface import DeviceCapability, Platform, PlatformEnum, _Backend
 

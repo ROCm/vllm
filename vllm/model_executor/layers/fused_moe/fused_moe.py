@@ -18,10 +18,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size)
 from vllm.model_executor.layers.fused_moe.utils import _fp8_quantize
 from vllm.platforms import current_platform
-from vllm.utils import aiter_moe_enabled, direct_register_custom_op
-
-from .rocm_aiter_fused_moe import (rocm_aiter_fused_experts,
-                                   rocm_aiter_topk_softmax)
+from vllm.utils import direct_register_custom_op
 
 from .rocm_aiter_fused_moe import (is_rocm_aiter_moe_enabled,
                                    rocm_aiter_fused_experts,

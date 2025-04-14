@@ -1858,11 +1858,6 @@ def aiter_paged_attn_enabled() -> bool:
 
 
 @cache
-def aiter_mla_enabled() -> bool:
-    return aiter_enabled() and envs.VLLM_ROCM_USE_AITER_MLA
-
-
-@cache
 def aiter_linear_enabled() -> bool:
     return aiter_enabled() and envs.VLLM_ROCM_USE_AITER_LINEAR
 

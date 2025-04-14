@@ -1221,7 +1221,8 @@ class CacheConfig:
                 "GPU memory utilization must be less than 1.0. Got "
                 f"{self.gpu_memory_utilization}.")
 
-        if aiter_mla_enabled() and not self.block_size == 1:
+        from vllm.attention.backends.rocm_aiter_mla import is_aiter_mla_enabled
+        if is_aiter_mla_enabled() and not self.block_size == 1:
             raise ValueError("AITER MLA currently requires --block-size=1, "
                              f"but got '{self.block_size}'")
 

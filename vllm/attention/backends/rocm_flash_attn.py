@@ -830,7 +830,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             use_custom = use_rocm_custom_paged_attention(
                 decode_query.dtype, head_size, block_size, gqa_ratio,
                 decode_meta.max_decode_seq_len, self.sliding_window)
-            
+
             if aiter_paged_attn_enabled():
                 out = output[num_prefill_tokens:]
                 PagedAttention.forward_decode(
@@ -854,7 +854,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     layer._v_scale,
                     out=out)
                 return output.view(-1, self.num_heads * self.head_size)
-                
+
             if use_custom:
                 max_seq_len = (decode_meta.max_decode_seq_len if self.attn_type
                                != AttentionType.ENCODER_DECODER else

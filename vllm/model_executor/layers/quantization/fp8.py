@@ -35,8 +35,6 @@ from vllm.model_executor.parameter import (BlockQuantScaleParameter,
                                            PerTensorScaleParameter)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.utils import (aiter_2stage_moe_enabled, aiter_fp8_block_moe_enabled,
-                        aiter_moe_enabled)
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -587,9 +585,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Lazy import to avoid importing triton too early.
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-            expand_weights, is_rocm_aiter_2stage_moe_enabled,
-            is_rocm_aiter_block_scaled_moe_enabled, is_rocm_aiter_moe_enabled,
-            shuffle_weights)
+            is_rocm_aiter_2stage_moe_enabled,
+            is_rocm_aiter_block_scaled_moe_enabled, is_rocm_aiter_moe_enabled)
 
         # TODO (rob): refactor block quant into separate class.
         if self.block_quant:

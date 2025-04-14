@@ -22,10 +22,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
-from vllm.utils import (aiter_2stage_moe_enabled, aiter_moe_enabled,
-                        direct_register_custom_op)
-
-from .rocm_aiter_fused_moe import shuffle_weights
+from vllm.utils import aiter_moe_enabled, direct_register_custom_op
 
 if current_platform.is_cuda_alike():
     from .fused_moe import fused_experts
