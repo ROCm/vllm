@@ -505,7 +505,8 @@ Use AITER release candidate branch instead:
 ## Changelog
 
 20250410_aiter:
-- To be added
+- 2-stage MoE
+- MLA from AITER
 
 20250325_aiter:
 - Improved DeepSeek-V3/R1 performance
