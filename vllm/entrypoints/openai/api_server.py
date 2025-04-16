@@ -754,10 +754,15 @@ async def invocations(raw_request: Request):
     return await handler(request, raw_request)
 
 
-if envs.VLLM_TORCH_PROFILER_DIR:
-    logger.warning(
-        "Torch Profiler is enabled in the API server. This should ONLY be "
-        "used for local development!")
+if envs.VLLM_TORCH_PROFILER_DIR or envs.VLLM_RPD_PROFILER_DIR:
+    if envs.VLLM_TORCH_PROFILER_DIR:
+        logger.warning(
+            "Torch Profiler is enabled in the API server. This should ONLY be "
+            "used for local development!")
+    elif envs.VLLM_RPD_PROFILER_DIR:
+        logger.warning(
+            "RPD Profiler is enabled in the API server. This should ONLY be "
+            "used for local development!")
 
     @router.post("/start_profile")
     async def start_profile(raw_request: Request):
