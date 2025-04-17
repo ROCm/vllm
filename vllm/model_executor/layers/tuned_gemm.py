@@ -76,16 +76,21 @@ class TunedGemm:
     def apply_skinny(self, m, n, k, inp_view, weights):
         if not self.use_skinny:
             return None
-        if inp_view.dtype != torch.float16 or k % 8 != 0:
+        if ((inp_view.dtype != torch.float16) and
+            (inp_view.dtype != torch.bfloat16)) or k % 8 != 0:
             return None
-        if m > 8 and 0 < n <= 4:
+        if m >= 8 and 0 < n <= 4:
             out = torch.empty(inp_view.shape[0],
                               weights.shape[0],
                               dtype=inp_view.dtype,
                               device='cuda')
-            ops.wvSpltK(weights, inp_view, out, n, self.cu_count)
+            Itp = 1  #default bfloat16
+            if inp_view.dtype == torch.float16:
+                Itp = 0
+            ops.wvSpltK(weights, inp_view, out, n, Itp, self.cu_count)
             return out
-        elif m % 4 == 0 and n == 1 and k <= 8192:
+        elif m % 4 == 0 and n == 1 and k <= 8192 and (inp_view.dtype
+                                                      == torch.float16):
             out = torch.empty(inp_view.shape[0],
                               weights.shape[0],
                               dtype=inp_view.dtype,
@@ -105,7 +110,7 @@ class TunedGemm:
         bias: Optional[torch.Tensor],
     ) -> torch.Tensor:
         n = inp.shape[0]
-        if (not VLLM_USE_ROCM_SKINNY_GEMM or n != 1
+        if (not VLLM_USE_ROCM_SKINNY_GEMM or n > 4
                 or not current_platform.is_rocm() or is_mi250() or is_navi()):
             return torch._scaled_mm(inp,
                                     weight,
