@@ -33,6 +33,7 @@ class _Backend(enum.Enum):
     TRITON_ATTN_VLLM_V1 = enum.auto()
     XFORMERS = enum.auto()
     ROCM_FLASH = enum.auto()
+    ROCM_AITER_MLA = enum.auto()
     TORCH_SDPA = enum.auto()
     FLASHINFER = enum.auto()
     TRITON_MLA = enum.auto()  # Supported by V1
@@ -376,6 +377,20 @@ class Platform:
     def supports_v1(cls, model_config: ModelConfig) -> bool:
         """Returns whether the current platform can support v1 for the supplied
         model configuration.
+        """
+        return False
+
+    @classmethod
+    def supports_structured_output(cls) -> bool:
+        """
+        Returns whether the current platform can support structured output.
+        """
+        return False
+
+    @classmethod
+    def use_custom_allreduce(cls) -> bool:
+        """
+        Returns if custom allreduce is supported on the current platform
         """
         return False
 

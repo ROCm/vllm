@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     VLLM_FUSED_MOE_CHUNK_SIZE: int = 64 * 1024
     VLLM_USE_RAY_SPMD_WORKER: bool = False
     VLLM_USE_RAY_COMPILED_DAG: bool = False
-    VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL: bool = True
+    VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: str = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
@@ -84,8 +84,11 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
+    VLLM_ROCM_USE_AITER_2STAGE_MOE: bool = True
     VLLM_ROCM_USE_AITER_FP8_BLOCK_SCALED_MOE: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
+    VLLM_ROCM_USE_AITER_FA: bool = True
+    VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
@@ -112,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_V0_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_DISABLE_TOPK_TOPP_OPTIMIZATION: bool = False
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
+    VLLM_USE_DEEP_GEMM: bool = False
 
 
 def get_default_cache_root():
@@ -418,15 +422,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (previously known as ADAG) API which optimizes the
     # control plane overhead.
     # Run vLLM with VLLM_USE_RAY_COMPILED_DAG=1 to enable it.
+    # Note that this variable is set to 1 in V1 by default
+    # when ray distributed executor is used.
     "VLLM_USE_RAY_COMPILED_DAG":
     lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG", "0"))),
 
-    # If the env var is set, it uses NCCL for communication in
-    # Ray's Compiled Graph. This flag is ignored if
-    # VLLM_USE_RAY_COMPILED_DAG is not set.
-    "VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL":
-    lambda: bool(int(os.getenv("VLLM_USE_RAY_COMPILED_DAG_NCCL_CHANNEL", "1"))
-                 ),
+    # If the env var is set, Ray Compiled Graph uses the specified
+    # channel type to communicate between workers belonging to
+    # different pipeline-parallel stages.
+    # Available options:
+    # - "auto": use the default channel type
+    # - "nccl": use NCCL for communication
+    # - "shm": use shared memory and gRPC for communication
+    # This flag is ignored if VLLM_USE_RAY_COMPILED_DAG is not set.
+    "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE":
+    lambda: os.getenv("VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE", "auto"),
 
     # If the env var is set, it enables GPU communication overlap
     # (experimental feature) in Ray's Compiled Graph. This flag is ignored if
@@ -582,6 +592,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in
              ("true", "1")),
 
+    # use aiter ck fused moe op if ater ops are enabled
+    "VLLM_ROCM_USE_AITER_2STAGE_MOE":
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_2STAGE_MOE", "True").lower() in
+             ("true", "1")),
+
     # Whether to use aiter block scaled moe kernel.
     # By default this is disabled.
     "VLLM_ROCM_USE_AITER_FP8_BLOCK_SCALED_MOE":
@@ -592,6 +607,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter fa ops in aiter mla.
+    # By default is enabled.
+    "VLLM_ROCM_USE_AITER_FA":
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_FA", "True").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter mla ops.
+    # By default is enabled.
+    "VLLM_ROCM_USE_AITER_MLA":
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_MLA", "True").lower() in
              ("true", "1")),
 
     # Pad the fp8 weights to 256 bytes for ROCm
@@ -705,6 +732,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_CI_USE_S3", "0") == "1",
 
     # Use model_redirect to redirect the model name to a local folder.
+    # `model_redirect` can be a json file mapping the model between
+    # repo_id and local folder:
+    # {"meta-llama/Llama-3.2-1B": "/tmp/Llama-3.2-1B"}
+    # or a space separated values table file:
+    # meta-llama/Llama-3.2-1B   /tmp/Llama-3.2-1B
     "VLLM_MODEL_REDIRECT_PATH":
     lambda: os.environ.get("VLLM_MODEL_REDIRECT_PATH", None),
 
@@ -728,6 +760,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_BUCKET_PADDING_GAP":
     lambda: int(os.environ["VLLM_TPU_BUCKET_PADDING_GAP"])
     if "VLLM_TPU_BUCKET_PADDING_GAP" in os.environ else 0,
+
+    # Allow use of DeepGemm kernels for fused moe ops.
+    "VLLM_USE_DEEP_GEMM":
+    lambda: bool(int(os.getenv("VLLM_USE_DEEP_GEMM", "0"))),
 }
 
 # end-env-vars-definition
