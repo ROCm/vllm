@@ -24,6 +24,80 @@ if TYPE_CHECKING:
 
 if current_platform.is_cuda():
     from vllm.vllm_flash_attn import flash_attn_varlen_func
+if current_platform.is_rocm():
+    import aiter
+    @torch.library.custom_op("aiter::flash_attn_varlen_func", mutates_args={}, device_types="cuda")
+    def flash_attn_varlen_func(
+        device: torch.device,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale:float,
+        window_size: Optional[list[int]],  # -1 means infinite context window
+        alibi_slopes: Optional[list[float]],
+        block_table: torch.Tensor
+    ) -> torch.Tensor:
+        output, _, _ = aiter.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_k=None,
+            seqlens_k=seqlens_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=alibi_slopes,
+            window_size=tuple(window_size),
+            block_table=block_table,
+            return_lse=True,
+            return_attn_probs=True,
+        )
+        return output
+    
+    @flash_attn_varlen_func.register_fake
+    def _(device: torch.device,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqlens_k: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        softmax_scale:float,
+        window_size: Optional[list[int]],  # -1 means infinite context window
+        alibi_slopes: Optional[list[float]],
+        block_table: torch.Tensor) -> torch.Tensor:
+        output = torch.empty(q.shape[0], q.shape[1], v.shape[2])
+        return output
+    
+    @torch.library.custom_op("aiter::reshape_and_cache_flash", mutates_args={"key_cache", "value_cache"}, device_types="cuda")
+    def reshape_and_cache_flash(
+        device: torch.device,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: float,
+        v_scale: float,
+    ) -> None:   
+        aiter.reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+        )
 
 logger = init_logger(__name__)
 
@@ -419,6 +493,7 @@ class FlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: FlashAttentionMetadata,
+        fp8_out_scale: Optional[torch.Tensor],
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
@@ -457,16 +532,30 @@ class FlashAttentionImpl(AttentionImpl):
         # value[:num_actual_tokens] because the reshape_and_cache_flash op uses
         # the slot_mapping's shape to determine the number of actual tokens.
         key_cache, value_cache = kv_cache.unbind(0)
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key,
-            value,
-            key_cache,
-            value_cache,
-            attn_metadata.slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
+
+        if current_platform.is_rocm():
+            reshape_and_cache_flash(
+                torch.device("cuda"),
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
+        else:
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                attn_metadata.slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
 
         if self.kv_cache_dtype.startswith("fp8"):
             key_cache = key_cache.view(torch.float8_e4m3fn)
@@ -497,29 +586,44 @@ class FlashAttentionImpl(AttentionImpl):
                 max_seqlen_q = attn_metadata.max_query_len
                 max_seqlen_k = attn_metadata.max_seq_len
                 block_table = attn_metadata.block_table
-
-            descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
-
-            flash_attn_varlen_func(
-                q=query[:num_actual_tokens],
-                k=key_cache,
-                v=value_cache,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=seqused_k,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                block_table=block_table,
-                softcap=self.logits_soft_cap,
-                fa_version=self.vllm_flash_attn_version,
-                q_descale=layer._q_scale.expand(descale_shape),
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-            )
+            
+            if current_platform.is_rocm():
+                output[:num_actual_tokens] = flash_attn_varlen_func(
+                    torch.device("cuda"),
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqlens_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=list(self.sliding_window),
+                    block_table=block_table,
+                )
+            else:
+                descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
+                flash_attn_varlen_func(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=layer._q_scale.expand(descale_shape),
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                )
             return output
 
         assert not use_local_attn, (
