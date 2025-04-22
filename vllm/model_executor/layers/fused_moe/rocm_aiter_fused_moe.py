@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import List, Optional
+from functools import cache
 
 import torch
 
@@ -7,18 +8,19 @@ import vllm.envs as envs
 from vllm.platforms import current_platform
 
 
+@cache
 def is_rocm_aiter_moe_enabled() -> bool:
     return current_platform.is_rocm() \
         and envs.VLLM_ROCM_USE_AITER_MOE \
         and envs.VLLM_ROCM_USE_AITER \
 
-
+@cache
 def is_rocm_aiter_2stage_moe_enabled() -> bool:
     return current_platform.is_rocm() \
         and envs.VLLM_ROCM_USE_AITER_2STAGE_MOE \
         and envs.VLLM_ROCM_USE_AITER
 
-
+@cache
 def is_rocm_aiter_block_scaled_moe_enabled() -> bool:
     return is_rocm_aiter_moe_enabled() and \
         envs.VLLM_ROCM_USE_AITER_FP8_BLOCK_SCALED_MOE

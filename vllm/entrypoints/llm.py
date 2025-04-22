@@ -177,7 +177,7 @@ class LLM:
         swap_space: float = 4,
         cpu_offload_gb: float = 0,
         enforce_eager: Optional[bool] = None,
-        max_seq_len_to_capture: int = 8192,
+        max_seq_len_to_capture: int = 32768,
         disable_custom_all_reduce: bool = False,
         disable_async_output_proc: bool = False,
         hf_token: Optional[Union[bool, str]] = None,
