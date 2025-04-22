@@ -135,8 +135,9 @@ RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 FROM base AS final
 RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
     dpkg -i /install/*deb \
-    && perl -p -i -e 's/, hipblaslt-dev \([^)]*?\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
-    && perl -p -i -e 's/, hipblaslt \([^)]*?\), hipfft/, hipfft/g' /var/lib/dpkg/status
+    && perl -p -i -e 's/, hipblas-common-dev \([^)]*?\), /, /g' /var/lib/dpkg/status \
+    && perl -p -i -e 's/, hipblaslt-dev \([^)]*?\), /, /g' /var/lib/dpkg/status \
+    && perl -p -i -e 's/, hipblaslt \([^)]*?\), /, /g' /var/lib/dpkg/status
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
