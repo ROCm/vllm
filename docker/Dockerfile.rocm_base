@@ -1,9 +1,7 @@
 ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:6.4-complete
-ARG HIPBLASLT_BRANCH="db8e93b4"
+ARG HIPBLASLT_BRANCH="0f5d6c6d"
 ARG HIPBLAS_COMMON_BRANCH="9b80ba8e"
 ARG LEGACY_HIPBLASLT_OPTION=
-ARG RCCL_BRANCH="7b86f83d"
-ARG RCCL_REPO="https://github.com/ROCm/rccl"
 ARG TRITON_BRANCH="981e987e"
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG PYTORCH_BRANCH="295f2ed4"
@@ -67,15 +65,6 @@ RUN cd hipBLASLt \
     && make package
 RUN mkdir -p /app/install && cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
 
-FROM base AS build_rccl
-ARG RCCL_BRANCH
-ARG RCCL_REPO
-RUN git clone ${RCCL_REPO}
-RUN cd rccl \
-    && git checkout ${RCCL_BRANCH} \
-    && ./install.sh -p --amdgpu_targets ${PYTORCH_ROCM_ARCH}
-RUN mkdir -p /app/install && cp /app/rccl/build/release/*.deb /app/install
-
 FROM base AS build_triton
 ARG TRITON_BRANCH
 ARG TRITON_REPO
@@ -134,8 +123,6 @@ FROM base AS debs
 RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
     cp /install/*.deb /app/debs
-RUN --mount=type=bind,from=build_rccl,src=/app/install/,target=/install \
-    cp /install/*.deb /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
@@ -148,12 +135,8 @@ RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 FROM base AS final
 RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
     dpkg -i /install/*deb \
-    && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
-    && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status
-RUN --mount=type=bind,from=build_rccl,src=/app/install/,target=/install \
-    dpkg -i /install/*deb \
-    && sed -i 's/, rccl-dev \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status \
-    && sed -i 's/, rccl \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status
+    && perl -p -i -e 's/, hipblaslt-dev \([^)]*?\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
+    && perl -p -i -e 's/, hipblaslt \([^)]*?\), hipfft/, hipfft/g' /var/lib/dpkg/status
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
@@ -167,8 +150,6 @@ ARG BASE_IMAGE
 ARG HIPBLAS_COMMON_BRANCH
 ARG HIPBLASLT_BRANCH
 ARG LEGACY_HIPBLASLT_OPTION
-ARG RCCL_BRANCH
-ARG RCCL_REPO
 ARG TRITON_BRANCH
 ARG TRITON_REPO
 ARG PYTORCH_BRANCH
@@ -183,8 +164,6 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "HIPBLAS_COMMON_BRANCH: ${HIPBLAS_COMMON_BRANCH}" >> /app/versions.txt \
     && echo "HIPBLASLT_BRANCH: ${HIPBLASLT_BRANCH}" >> /app/versions.txt \
     && echo "LEGACY_HIPBLASLT_OPTION: ${LEGACY_HIPBLASLT_OPTION}" >> /app/versions.txt \
-    && echo "RCCL_BRANCH: ${RCCL_BRANCH}" >> /app/versions.txt \
-    && echo "RCCL_REPO: ${RCCL_REPO}" >> /app/versions.txt \
     && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /app/versions.txt \
     && echo "TRITON_REPO: ${TRITON_REPO}" >> /app/versions.txt \
     && echo "PYTORCH_BRANCH: ${PYTORCH_BRANCH}" >> /app/versions.txt \
