@@ -776,7 +776,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         if constexpr (std::is_same_v<DTYPE, half>)
           sum[m][i] = 0;
         else
-          sum4[m][i] = {0};
+          sum4[m][i] = {0,0,0,0};
 
     bigType bigA[M][UNRL];
     bigType bigB[YTILE][UNRL];
@@ -832,10 +832,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
             if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>)
   #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK / 4; b++)
-                asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
-                    : "=v"(sum4[m][y])
-                    : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]),
-                      "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
+                sum4[m][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(bigA[m][k2].h4[b], bigB[y][k2].h4[b], sum4[m][y], 0, 0, 0);
           }
         }
       }
@@ -881,9 +878,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       for (int m = 0; m < M; m++) {
   #pragma unroll
         for (int y = 0; y < YTILE; y++) {
+          //float accm1 = 0;
+          //for (int i=0; i<64; i++)
+          //   accm1 += __shfl(sum4[m][y][i%4], i);
+
           float accm = sum4[m][y][0];
-          // for (int i=0; i<64; i++)
-          //   accm += __shfl(sum[m][y][i%4], i);
           asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
               : "=v"(accm)
               : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
@@ -899,13 +898,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
               : "=v"(accm)
               : "0"(accm), "v"(accm), "v"(accm));
-          accm += __shfl_down(accm, 32);
-          accm += __shfl_down(accm, 16);
+          asm("s_nop 0\n\tv_mov_b32 %0, %2 row_shr:15 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
 
           sum4[m][y][0] = accm;
         }
       }
-      if (threadIdx.x == 0) {
+      if (threadIdx.x == 63) {
         for (int m = 0; m < M; m++) {
           for (int i = 0; i < YTILE; i++) {
             // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
@@ -1087,10 +1093,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
             if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>)
   #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK / 4; b++)
-                asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
-                    : "=v"(sum4[m][y])
-                    : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]),
-                      "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
+                sum4[m][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(bigA[m][k2].h4[b], bigB[y][k2].h4[b], sum4[m][y], 0, 0, 0);
           }
         }
       }
@@ -1137,8 +1140,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   #pragma unroll
         for (int y = 0; y < YTILE; y++) {
           float accm = sum4[m][y][0];
-          // for (int i=0; i<64; i++)
-          //   accm += __shfl(sum[m][y][i%4], i);
           asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
               : "=v"(accm)
               : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
@@ -1154,13 +1155,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
               : "=v"(accm)
               : "0"(accm), "v"(accm), "v"(accm));
-          accm += __shfl_down(accm, 32);
-          accm += __shfl_down(accm, 16);
+          asm("s_nop 0\n\tv_mov_b32 %0, %2 row_shr:15 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
 
           sum4[m][y][0] = accm;
         }
       }
-      if (threadIdx.x == 0) {
+      if (threadIdx.x == 63) {
         for (int m = 0; m < M; m++) {
           for (int i = 0; i < YTILE; i++) {
             // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
@@ -1352,10 +1360,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
             if constexpr (std::is_same_v<DTYPE, __hip_bfloat16>)
   #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK / 4; b++)
-                asm("V_MFMA_F32_4X4X4_16B_BF16 %0, %2, %3, %4"
-                    : "=v"(sum4[m][y])
-                    : "0"(sum4[m][y]), "v"(bigA[m][k2].h4[b]),
-                      "v"(bigB[y][k2].h4[b]), "v"(sum4[m][y]));
+                sum4[m][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(bigA[m][k2].h4[b], bigB[y][k2].h4[b], sum4[m][y], 0, 0, 0);
           }
         }
       }
@@ -1410,8 +1415,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   #pragma unroll
         for (int y = 0; y < YTILE; y++) {
           float accm = sum4[m][y][0];
-          // for (int i=0; i<64; i++)
-          //   accm += __shfl(sum[m][y][i%4], i);
           asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:1 bound_ctrl:0 "
               : "=v"(accm)
               : "0"(accm), "v"(sum4[m][y][1]), "v"(accm));
@@ -1427,13 +1430,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_shl:8 bound_ctrl:0 "
               : "=v"(accm)
               : "0"(accm), "v"(accm), "v"(accm));
-          accm += __shfl_down(accm, 32);
-          accm += __shfl_down(accm, 16);
+          asm("s_nop 0\n\tv_mov_b32 %0, %2 row_shr:15 bound_ctrl:0 "
+              : "=v"(accm)
+              : "0"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
+          asm("s_nop 0\n\tv_add_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
+              : "=v"(accm)
+              : "0"(accm), "v"(accm), "v"(accm));
 
           sum4[m][y][0] = accm;
         }
       }
-      if (threadIdx.x == 0) {
+      if (threadIdx.x == 63) {
         for (int m = 0; m < M; m++) {
           for (int i = 0; i < YTILE; i++) {
             // if (commitColumn[i]) C[n + i + m * N] = __float2half(sum[m][i]);
