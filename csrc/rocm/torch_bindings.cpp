@@ -42,7 +42,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
   rocm_ops.def(
       "wvSpltK(Tensor in_a, Tensor in_b, Tensor! out_c, int N_in,"
-      "        int CuCount) -> ()");
+      "        int Itp_in, int CuCount) -> ()");
   rocm_ops.impl("wvSpltK", torch::kCUDA, &wvSpltK);
   rocm_ops.def(
       "wvSpltKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, "
