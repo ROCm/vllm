@@ -497,7 +497,7 @@ To reproduce the release docker:
 ## Changelog
 
 20250415:
-- To be added
+- Updated hipBLASt version to 0.15
   
 20250410_aiter:
 - 2-stage MoE
