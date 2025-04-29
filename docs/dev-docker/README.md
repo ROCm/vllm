@@ -496,7 +496,7 @@ To reproduce the release docker:
 
 ## Changelog
 
-20250415_aiter:
+20250415:
 - To be added
   
 20250410_aiter:
