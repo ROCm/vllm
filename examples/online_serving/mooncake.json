@@ -1,0 +1,7 @@
+{
+	"local_hostname": "10.67.155.132",
+	"metadata_server": "10.67.155.132:2379",
+	"protocol": "tcp",
+	"device_name": "",
+	"master_server_address":"10.67.155.132:5001"
+}

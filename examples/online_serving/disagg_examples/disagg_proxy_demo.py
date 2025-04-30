@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from abc import ABC, abstractmethod
 from typing import Callable, Optional
 
@@ -36,6 +37,9 @@ logging.basicConfig(level=logging.INFO)
 
 
 class SchedulingPolicy(ABC):
+
+    def __init__(self):
+        self.lock = threading.Lock()
 
     @abstractmethod
     def schedule(self, cycler: itertools.cycle):
@@ -170,20 +174,23 @@ class Proxy:
                                     detail="Instance validation failed.")
 
             if instance_type == "prefill":
-                if instance not in self.prefill_instances:
-                    self.prefill_instances.append(instance)
-                    self.prefill_cycler = itertools.cycle(
-                        self.prefill_instances)
-                else:
-                    raise HTTPException(status_code=400,
-                                        detail="Instance already exists.")
+                with self.scheduling_policy.lock:
+                    if instance not in self.prefill_instances:
+                        self.prefill_instances.append(instance)
+                        self.prefill_cycler = itertools.cycle(
+                            self.prefill_instances)
+                    else:
+                        raise HTTPException(status_code=400,
+                                            detail="Instance already exists.")
             else:
-                if instance not in self.decode_instances:
-                    self.decode_instances.append(instance)
-                    self.decode_cycler = itertools.cycle(self.decode_instances)
-                else:
-                    raise HTTPException(status_code=400,
-                                        detail="Instance already exists.")
+                with self.scheduling_policy.lock:
+                    if instance not in self.decode_instances:
+                        self.decode_instances.append(instance)
+                        self.decode_cycler = itertools.cycle(
+                            self.decode_instances)
+                    else:
+                        raise HTTPException(status_code=400,
+                                            detail="Instance already exists.")
 
             return JSONResponse(content={
                 "message":
@@ -322,12 +329,15 @@ class Proxy:
                                      media_type="text/event-stream")
 
     def remove_instance_endpoint(self, instance_type, instance):
-        if (instance_type == "decode" and instance in self.decode_instances):
-            self.decode_instances.remove(instance)
-            self.decode_cycler = itertools.cycle(self.decode_instances)
-        if (instance_type == "prefill" and instance in self.decode_instances):
-            self.prefill_instances.remove(instance)
-            self.prefill_cycler = itertools.cycle(self.decode_instances)
+        with self.scheduling_policy.lock:
+            if (instance_type == "decode"
+                    and instance in self.decode_instances):
+                self.decode_instances.remove(instance)
+                self.decode_cycler = itertools.cycle(self.decode_instances)
+            if (instance_type == "prefill"
+                    and instance in self.decode_instances):
+                self.prefill_instances.remove(instance)
+                self.prefill_cycler = itertools.cycle(self.decode_instances)
 
 
 class RoundRobinSchedulingPolicy(SchedulingPolicy):
@@ -335,8 +345,12 @@ class RoundRobinSchedulingPolicy(SchedulingPolicy):
     def __init__(self):
         super().__init__()
 
+    def safe_next(self, cycler: itertools.cycle):
+        with self.lock:
+            return next(cycler)
+
     def schedule(self, cycler: itertools.cycle) -> str:
-        return next(cycler)
+        return self.safe_next(cycler)
 
 
 class ProxyServer:

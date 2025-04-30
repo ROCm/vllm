@@ -8,7 +8,7 @@ from this remote lookup buffer.
 import json
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from safetensors.torch import load as safetensors_load
@@ -70,7 +70,8 @@ class MooncakeStore(KVStoreBufferBase):
     ):
 
         try:
-            from mooncake.store import MooncakeDistributedStore
+            # from mooncake.store import MooncakeDistributedStore
+            from mooncake_vllm_adaptor import MooncakeDistributedStore
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
@@ -96,6 +97,28 @@ class MooncakeStore(KVStoreBufferBase):
             logger.error(
                 "An error occurred while loading the configuration: %s", exc)
             raise
+
+    def insert(self, input_tokens: torch.Tensor, roi: torch.Tensor,
+               key: torch.Tensor, value: torch.Tensor,
+               hidden: torch.Tensor) -> None:
+        # This interface has not been implemented since it is incompatible with
+        # the future layer-by-layer communication implementation of
+        # MooncakeStoreConnector. MooncakeStoreConnector will send the key
+        # cache, value cache, and hidden states separately and asynchronously
+        # and use a message queue to notify their transfer states for the
+        # decode instances and the proxy.
+        raise NotImplementedError
+
+    def drop_select(
+            self, input_tokens: Optional[torch.Tensor],
+            roi: Optional[torch.Tensor]) -> List[Optional[torch.Tensor]]:
+        # This interface has not been implemented since it is incompatible with
+        # the future layer-by-layer communication implementation of
+        # MooncakeStoreConnector. MooncakeStoreConnector will send the key
+        # cache, value cache, and hidden states separately and asynchronously
+        # and use a message queue to notify their transfer states for the
+        # decode instances and the proxy.
+        raise NotImplementedError
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so
