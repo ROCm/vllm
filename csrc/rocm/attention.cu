@@ -1662,7 +1662,8 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
                                    // head_size]
     OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ fp8_out_scale_ptr) {
   // clang-format on
   constexpr int NWARPS = NUM_THREADS / WARP_SIZE;  // 8 warps on gfx11
   const int warpid = threadIdx.x / WARP_SIZE;
@@ -2435,7 +2436,8 @@ __launch_bounds__(NUM_THREADS, 3) void paged_attention_ll4mi_QKV_mfma16_kernel(
     scalar_t* __restrict__ out,    // [num_seqs, num_heads, max_num_partitions,
                                    // head_size]
     OUTT* __restrict__ final_out,  // [num_seqs, num_heads, head_size]
-    int max_ctx_blocks, const float* k_scale, const float* v_scale) {
+    int max_ctx_blocks, const float* k_scale, const float* v_scale,
+    const float* __restrict__ fp8_out_scale_ptr) {
   // clang-format on
   constexpr int NWARPS = NUM_THREADS / WARP_SIZE;  // 8 warps on gfx11
   const int warpid = threadIdx.x / WARP_SIZE;
