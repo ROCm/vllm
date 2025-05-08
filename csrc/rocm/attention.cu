@@ -3370,7 +3370,7 @@ void paged_attention_custom_launcher_navi(
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  if (alibi_slopes || fp8_out_scale) {
+  if (alibi_slopes || fp8_out_scale_ptr) {
     TORCH_CHECK(false, "alibi slopes and fp8 out scale unsupported for Navi");
   }
 
