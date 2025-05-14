@@ -12,8 +12,8 @@ The pre-built image includes:
 
 - ROCm™ 6.3.1
 - HipblasLT 0.15
-- vLLM 0.8.3
-- PyTorch 2.7dev (nightly)
+- vLLM 0.8.5
+- PyTorch 2.7
 
 ## Pull latest Docker Image
 
@@ -21,13 +21,12 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- [Improved DeepSeek-V3 and DeepSeek-R1 support](#running-deepseek-v3-and-deepseek-r1)
-- Initial Gemma-3 enablement
-- Detokenizer disablement
-- Torch.compile support
+- OOM bug fix
+- PyTorch fixes
+- Tunable ops fixes
 
 ## Known Issues and Workarounds
-- Mem fault encountered when running the model meta 405 fp8. To workaround this issue, set PYTORCH_TUNABLEOP_ENABLED=0
+- None
 
 ## Performance Results
 
@@ -92,7 +91,7 @@ The table below shows latency measurement, which typically involves assessing th
 
 *TP stands for Tensor Parallelism.*
 
-Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 Processors, 2.25 TiB RAM, 8x AMD Instinct MI300X (192GiB, 750W) GPUs, Ubuntu 22.04, and amdgpu driver 6.8.5
+Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9575F Processors, 2.25 TiB RAM, 8x AMD Instinct MI300X (192GiB, 750W) GPUs, Ubuntu 22.04, and amdgpu driver 6.8.5
 
 ## Reproducing Benchmarked Results
 
@@ -490,7 +489,7 @@ To reproduce the release docker:
 ```bash
     git clone https://github.com/ROCm/vllm.git
     cd vllm
-    git checkout b8498bc4a1c2aae1e25cfc780db0eadbc4716c67
+    git checkout d60b5a337a552b6f74f511462d4ba67ea0ac4402
     docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
@@ -505,7 +504,12 @@ Use AITER release candidate branch instead:
     docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
-## Changelog
+## Changelog 
+
+20250513_aiter:
+- OOM bug fix
+- PyTorch fixes
+- Tunable ops fixes
 
 20250410_aiter:
 - 2-stage MoE
