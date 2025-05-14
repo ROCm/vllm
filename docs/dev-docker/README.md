@@ -21,7 +21,7 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- OOM bug fix
+- Out of memory bug fix
 - PyTorch fixes
 - Tunable ops fixes
 
@@ -507,7 +507,7 @@ Use AITER release candidate branch instead:
 ## Changelog 
 
 20250513_aiter:
-- OOM bug fix
+- Out of memory bug fix
 - PyTorch fixes
 - Tunable ops fixes
 
