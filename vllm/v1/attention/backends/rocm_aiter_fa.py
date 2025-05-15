@@ -9,7 +9,6 @@ from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
                                               is_quantized_kv_cache)
-from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_attn import (
@@ -26,8 +25,39 @@ if TYPE_CHECKING:
 if current_platform.is_rocm():
     import aiter
 
+    from vllm.attention.ops.triton_unified_attention import unified_attention
     from vllm.triton_utils import tl, triton
     from vllm.utils import direct_register_custom_op
+
+    def convert_block_table(
+        block_table: torch.Tensor,
+        block_size: int,
+        cu_seqlens_k: torch.Tensor,
+    ) -> torch.Tensor:
+
+        batches, pages = block_table.shape
+        kv_page_indices = torch.empty([cu_seqlens_k[-1]], dtype=torch.int32, device="cuda")
+
+        cur_pos = 0
+        for b_idx in range(batches):
+            for p_idx in range(pages):
+                if cur_pos >= cu_seqlens_k[b_idx + 1]:
+                    break
+
+                start = cur_pos
+                end = min(cur_pos + block_size, cu_seqlens_k[b_idx + 1])
+
+                block_start_pos = block_table[b_idx, p_idx] * block_size
+                block_end_pos = block_start_pos + end - start
+                kv_page_indices[start:end] = torch.arange(
+                    block_start_pos,
+                    block_end_pos,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+
+                cur_pos = end
+        return kv_page_indices
 
     @triton.jit
     def _vllm_layout_trans_kernel(
@@ -38,9 +68,7 @@ if current_platform.is_rocm():
         b_seq_lens_loc,
         block_table,
         block_table_stride_0,
-        X: tl.constexpr,
-        H_KV: tl.constexpr,
-        D: tl.constexpr,
+        E_DIM: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         batch_idx = tl.program_id(0)
@@ -49,51 +77,35 @@ if current_platform.is_rocm():
                                       tl.arange(0, 2))
         batch_token_start, batch_token_end = tl.split(batch_token_indexes)
         seq_len = batch_token_end - batch_token_start
-
-        DIM0: tl.constexpr = H_KV * D // X
-        DIM1: tl.constexpr = X * BLOCK_SIZE
-        E_DIM: tl.constexpr = H_KV * D
         if block_idx * BLOCK_SIZE < seq_len:
-            # print("block_idx", block_idx)
-            k_block_mask = (block_idx * BLOCK_SIZE +
-                            tl.arange(0, BLOCK_SIZE)[None, :, None]) < seq_len
-            v_block_mask = (block_idx * BLOCK_SIZE +
-                            tl.arange(0, BLOCK_SIZE)[None, :]) < seq_len
+            block_mask = (block_idx * BLOCK_SIZE +
+                          tl.arange(0, BLOCK_SIZE)[:, None]) < seq_len
 
             kv_idx = tl.load(block_table + batch_idx * block_table_stride_0 +
                              block_idx)
 
-            k_buffer_off = kv_idx * BLOCK_SIZE * E_DIM + tl.arange(
-                0, DIM0)[:, None, None] * DIM1 + tl.arange(
-                    0, BLOCK_SIZE)[None, :, None] * X + tl.arange(
-                        0, X)[None, None, :]
-            v_buffer_off = kv_idx * BLOCK_SIZE * E_DIM + tl.arange(
-                0, E_DIM)[:, None] * BLOCK_SIZE + tl.arange(
-                    0, BLOCK_SIZE)[None, :]
-            k_vals = tl.load(k_buffer_ptr + k_buffer_off,
-                             mask=k_block_mask,
+            kv_buffer_off = kv_idx * BLOCK_SIZE * E_DIM + tl.arange(
+                0, BLOCK_SIZE)[:, None] * E_DIM + tl.arange(0, E_DIM)[None, :]
+            k_vals = tl.load(k_buffer_ptr + kv_buffer_off,
+                             mask=block_mask,
                              other=0.0)
-            v_vals = tl.load(v_buffer_ptr + v_buffer_off,
-                             mask=v_block_mask,
+            v_vals = tl.load(v_buffer_ptr + kv_buffer_off,
+                             mask=block_mask,
                              other=0.0)
-            k_vals = k_vals.trans(0, 2, 1).view(E_DIM, BLOCK_SIZE)
-            block_mask = (block_idx * BLOCK_SIZE +
-                          tl.arange(0, BLOCK_SIZE)[:, None]) < seq_len
 
             kv_values_off = batch_token_start * E_DIM + \
-                block_idx * BLOCK_SIZE * E_DIM + tl.arange(
-                0, BLOCK_SIZE)[:, None] * E_DIM + tl.arange(0, E_DIM)[None, :]
-            tl.store(k_values_ptr + kv_values_off, k_vals.T, mask=block_mask)
-            tl.store(v_values_ptr + kv_values_off, v_vals.T, mask=block_mask)
+                block_idx * BLOCK_SIZE * E_DIM + \
+                tl.arange(0, BLOCK_SIZE)[:, None] * E_DIM + \
+                tl.arange(0, E_DIM)[None, :]
+            tl.store(k_values_ptr + kv_values_off, k_vals, mask=block_mask)
+            tl.store(v_values_ptr + kv_values_off, v_vals, mask=block_mask)
 
     def vllm_layout_trans(b_seq_lens_loc, block_table, k_buffer, v_buffer,
-                          max_seqlen, total_tokens):
-        H_KV = v_buffer.shape[1]
-        D = v_buffer.shape[2]
-        BLOCK_SIZE = v_buffer.shape[3]
-        X = k_buffer.shape[-1]
+                          max_seq_len, total_tokens):
+        H_KV = v_buffer.shape[2]
+        D = v_buffer.shape[3]
+        BLOCK_SIZE = v_buffer.shape[1]
         dtype = k_buffer.dtype
-
         k_values = torch.empty((total_tokens, H_KV, D),
                                dtype=dtype,
                                device="cuda")
@@ -102,23 +114,17 @@ if current_platform.is_rocm():
                                device="cuda")
 
         grid = (block_table.shape[0],
-                (max_seqlen + BLOCK_SIZE - 1) // BLOCK_SIZE)
+                (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
 
-        _vllm_layout_trans_kernel[grid](
-            k_buffer,
-            v_buffer,
-            k_values,
-            v_values,
-            b_seq_lens_loc,
-            block_table,
-            block_table.stride(0),
-            X=X,
-            H_KV=H_KV,
-            D=D,
-            BLOCK_SIZE=BLOCK_SIZE,
-            num_stages=1,
-            num_warps=4,
-        )
+        _vllm_layout_trans_kernel[grid](k_buffer,
+                                        v_buffer,
+                                        k_values,
+                                        v_values,
+                                        b_seq_lens_loc,
+                                        block_table,
+                                        block_table.stride(0),
+                                        E_DIM=H_KV * D,
+                                        BLOCK_SIZE=BLOCK_SIZE)
 
         return k_values, v_values
 
@@ -136,16 +142,37 @@ if current_platform.is_rocm():
         window_size: Optional[list[int]],  # -1 means infinite context window
         alibi_slopes: Optional[list[float]],
         block_table: torch.Tensor,
+        # kv_indptr: torch.Tensor,
+        kv_page_indices: torch.Tensor,
     ) -> torch.Tensor:
-        k, v = vllm_layout_trans(cu_seqlens_k, block_table, k_cache, v_cache,
-                                 max_seqlen_k, total_tokens)
-        output = aiter.flash_attn_varlen_func(
+
+        # k, v = vllm_layout_trans(cu_seqlens_k, block_table, k_cache, v_cache,
+        #                          max_seqlen_k, total_tokens)
+        # output = aiter.flash_attn_varlen_func(
+        #     q=q,
+        #     k=k,
+        #     v=v,
+        #     cu_seqlens_q=cu_seqlens_q,
+        #     max_seqlen_q=max_seqlen_q,
+        #     cu_seqlens_k=cu_seqlens_k,
+        #     max_seqlen_k=max_seqlen_k,
+        #     softmax_scale=softmax_scale,
+        #     causal=True,
+        #     alibi_slopes=alibi_slopes,
+        #     window_size=window_size,
+        #     out=out,
+        # )
+
+        H_KV = v_cache.shape[2]
+        D = v_cache.shape[3]
+        output = aiter.mha_batch_prefill_func(
             q=q,
-            k=k,
-            v=v,
+            k=k_cache.reshape(-1, H_KV, D),
+            v=v_cache.reshape(-1, H_KV, D),
             cu_seqlens_q=cu_seqlens_q,
+            kv_indptr=cu_seqlens_k,
+            kv_page_indices=kv_page_indices,
             max_seqlen_q=max_seqlen_q,
-            cu_seqlens_k=cu_seqlens_k,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
             causal=True,
@@ -153,6 +180,7 @@ if current_platform.is_rocm():
             window_size=window_size,
             out=out,
         )
+
         return output
 
     def flash_attn_varlen_func_fake(
@@ -169,6 +197,8 @@ if current_platform.is_rocm():
         window_size: Optional[list[int]],  # -1 means infinite context window
         alibi_slopes: Optional[list[float]],
         block_table: torch.Tensor,
+        # kv_indptr: torch.Tensor,
+        kv_page_indices: torch.Tensor,
     ) -> torch.Tensor:
         return torch.empty(q.shape[0],
                            q.shape[1],
@@ -317,6 +347,13 @@ class AiterFlashAttentionMetadataBuilder:
                                           max_seq_len=max_seq_len,
                                           causal=True)
 
+        # kv_indptr, kv_page_indices = \
+        kv_page_indices = convert_block_table(
+            block_table_tensor,
+            self.block_size,
+            cu_seq_lens,
+        )
+
         attn_metadata = AiterFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -333,6 +370,8 @@ class AiterFlashAttentionMetadataBuilder:
             cu_prefix_query_lens=cu_prefix_query_lens,
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
+            # kv_indptr=kv_indptr,
+            kv_page_indices=kv_page_indices,
             local_attn_metadata=local_attn_metadata,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
         )
@@ -396,6 +435,8 @@ class AiterFlashAttentionMetadata:
     cu_seq_lens: torch.Tensor
     total_tokens: int
     block_table: torch.Tensor
+    # kv_indptr: torch.Tensor
+    kv_page_indices: torch.Tensor
     slot_mapping: torch.Tensor
 
     # For cascade attention.
@@ -524,10 +565,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
         # not padded. However, we don't need to do key[:num_actual_tokens] and
         # value[:num_actual_tokens] because the reshape_and_cache_flash op uses
         # the slot_mapping's shape to determine the number of actual tokens.
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache, self.num_kv_heads, self.head_size)
-
-        PagedAttention.write_to_paged_cache(
+        key_cache, value_cache = kv_cache.unbind(0)
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
             key_cache,
@@ -568,52 +607,29 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 max_seqlen_k = attn_metadata.max_seq_len
                 block_table = attn_metadata.block_table
 
+            descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
+
             cu_seq_lens = attn_metadata.cu_seq_lens
             total_tokens = attn_metadata.total_tokens
             if max_seqlen_q <= 1:
-                block_size = value_cache.shape[3]
-                num_query_heads = query.shape[1]
-                num_kv_heads = key.shape[1]
-                head_size = query.shape[2]
-
-                _PARTITION_SIZE_ROCM = 256
-                max_num_partitions = (
-                    (max_seqlen_k + _PARTITION_SIZE_ROCM - 1) //
-                    _PARTITION_SIZE_ROCM)
-                assert _PARTITION_SIZE_ROCM % block_size == 0
-                total_num_seq = query.shape[0]
-                tmp_output = torch.empty(
-                    size=(total_num_seq, num_query_heads, max_num_partitions,
-                          head_size),
-                    dtype=query.dtype,
-                    device=output.device,
-                )
-                exp_sums = torch.empty(
-                    size=(total_num_seq, num_query_heads, max_num_partitions),
-                    dtype=torch.float32,
-                    device=output.device,
-                )
-                max_logits = torch.empty_like(exp_sums)
-
-                ops.paged_attention_rocm(
-                    output,
-                    exp_sums,
-                    max_logits,
-                    tmp_output,
-                    query,
-                    key_cache,
-                    value_cache,
-                    num_kv_heads,
-                    scale=self.scale,
-                    block_tables=block_table,
-                    seq_lens=seqused_k,
-                    query_start_loc=cu_seqlens_q,
-                    block_size=block_size,
-                    max_seq_len=max_seqlen_k,
+                unified_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=self.scale,
+                    causal=True,
                     alibi_slopes=self.alibi_slopes,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    k_scale=layer._k_scale,
-                    v_scale=layer._v_scale,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,  # Not supported
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
                 )
             else:
                 flash_attn_varlen_func(
@@ -630,6 +646,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     window_size=list(self.sliding_window),
                     block_table=block_table,
                     cu_seqlens_k=cu_seq_lens,
+                    # kv_indptr=attn_metadata.kv_indptr,
+                    kv_page_indices=attn_metadata.kv_page_indices,
                 )
             return output
         else:
