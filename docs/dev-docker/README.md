@@ -504,7 +504,7 @@ Use AITER release candidate branch instead:
     docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
-## Changelog 
+## Changelog
 
 20250513_aiter:
 - Out of memory bug fix
