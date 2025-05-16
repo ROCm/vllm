@@ -30,10 +30,7 @@ class DummyInputLayerNorm(nn.Module):
         self.bias = nn.Parameter(bias) if bias is not None else None
 
     def forward(self, x, residual=None, scale=None):
-        if residual is None:
-            return x
-        else:
-            return x, residual
+        return x
 
 
 class DummyOutputNorm(nn.Module):
