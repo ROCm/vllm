@@ -89,7 +89,7 @@ def initialize_model(
 
 def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                   target_device: torch.device) -> None:
-    for _, module in model.named_modules():
+    for name, module in model.named_modules():
         if isinstance(module, QKVCrossParallelLinear):
             # NOTE(Isotr0py): special case for cross QKV layer because
             # q and kv proj aren't registered as submodules intentionally
@@ -114,6 +114,12 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
+
+    if hasattr(model, "process_weights_after_loading"):
+        # This is for models that have their own process_weights_after_loading
+        # method, like Mixtral.
+        with device_loading_context(model, target_device):
+            model.process_weights_after_loading()
 
 
 @contextmanager

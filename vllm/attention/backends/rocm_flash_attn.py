@@ -597,7 +597,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: ROCmFlashAttentionMetadata,
-        fp8_out_scale: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention and PagedAttention.
@@ -769,8 +768,9 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             make_attn_mask=causal_mask)  # type: ignore
                     full_scales = (
                         layer._q_scale.item(), layer._k_scale.item(),
-                        layer._v_scale.item(), layer._prob_scale.item()) if (
-                            fp8_out_scale and layer._q_scale
+                        layer._v_scale.item(), layer._prob_scale.item(),
+                        layer._out_scale) if (
+                            layer._out_scale and layer._q_scale
                             and layer._prob_scale
                             and envs.VLLM_USE_ROCM_FP8_FLASH_ATTN) else None
                     self.triton_attn_func(
@@ -787,7 +787,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         attn_masks[0][None]
                         if attn_masks is not None else None,
                         full_scales,
-                        fp8_out_scale,
                     )
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
@@ -910,7 +909,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     self.kv_cache_dtype,
                     layer._k_scale,
                     layer._v_scale,
-                    fp8_out_scale,
+                    layer._o_scale,
                 )
             else:
                 output[num_prefill_tokens:] = paged_attn.forward_decode(
