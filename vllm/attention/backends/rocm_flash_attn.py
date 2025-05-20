@@ -768,8 +768,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             make_attn_mask=causal_mask)  # type: ignore
                     full_scales = (
                         layer._q_scale.item(), layer._k_scale.item(),
-                        layer._v_scale.item(), layer._prob_scale.item(),
-                        layer._out_scale) if (
+                        layer._v_scale.item(), layer._prob_scale.item()) if (
                             layer._out_scale and layer._q_scale
                             and layer._prob_scale
                             and envs.VLLM_USE_ROCM_FP8_FLASH_ATTN) else None
@@ -787,6 +786,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         attn_masks[0][None]
                         if attn_masks is not None else None,
                         full_scales,
+                        layer._out_scale,
                     )
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
@@ -909,7 +909,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     self.kv_cache_dtype,
                     layer._k_scale,
                     layer._v_scale,
-                    layer._o_scale,
+                    layer._out_scale,
                 )
             else:
                 output[num_prefill_tokens:] = paged_attn.forward_decode(

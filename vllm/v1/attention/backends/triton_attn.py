@@ -277,7 +277,6 @@ class TritonAttentionImpl(AttentionImpl):
                 q_descale=None,  # Not supported
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
-                fp8_out_scale=layer._out_scale,
             )
 
         return output
