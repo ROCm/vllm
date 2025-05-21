@@ -123,7 +123,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.logits_soft_cap = logits_soft_cap
         if head_size % 128 != 0:
-            raise NotImplementedError("Head size must be a multiple of 128.")
+            raise NotImplementedError(
+                f"Head size must be a multiple of 128, found {head_size}.")
         if alibi_slopes is not None:
             raise NotImplementedError("Alibi slopes is not supported.")
         if sliding_window is not None:
@@ -166,7 +167,6 @@ class PallasAttentionBackendImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: Tuple[torch.Tensor, torch.Tensor],
         attn_metadata: PallasMetadata,
-        fp8_out_scale: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with Pallas attention.

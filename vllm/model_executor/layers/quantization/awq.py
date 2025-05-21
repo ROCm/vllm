@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import torch
 
-import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
@@ -26,7 +25,7 @@ class AWQConfig(QuantizationConfig):
         weight_bits: int,
         group_size: int,
         zero_point: bool,
-        modules_to_not_convert: Optional[List[str]] = None,
+        modules_to_not_convert: Optional[list[str]] = None,
     ) -> None:
         super().__init__()
         self.weight_bits = weight_bits
@@ -49,7 +48,7 @@ class AWQConfig(QuantizationConfig):
     def get_name(self) -> QuantizationMethods:
         return "awq"
 
-    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+    def get_supported_act_dtypes(self) -> list[torch.dtype]:
         return [torch.half]
 
     @classmethod
@@ -58,7 +57,7 @@ class AWQConfig(QuantizationConfig):
         return 75
 
     @staticmethod
-    def get_config_filenames() -> List[str]:
+    def get_config_filenames() -> list[str]:
         return [
             "quant_config.json",  # E.g., casperhansen/vicuna-7b-v1.5-awq
             # E.g., abhinavkulkarni/mosaicml-mpt-7b-instruct-w4-g128-awq
@@ -66,7 +65,7 @@ class AWQConfig(QuantizationConfig):
         ]
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "AWQConfig":
+    def from_config(cls, config: dict[str, Any]) -> "AWQConfig":
         weight_bits = cls.get_from_keys(config, ["w_bit", "bits"])
         group_size = cls.get_from_keys(config, ["q_group_size", "group_size"])
         zero_point = cls.get_from_keys(config, ["zero_point"])
@@ -83,7 +82,7 @@ class AWQConfig(QuantizationConfig):
         return None
 
 
-def is_layer_skipped_awq(prefix: str, modules_to_not_convert: List[str]):
+def is_layer_skipped_awq(prefix: str, modules_to_not_convert: list[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
 
 
@@ -99,7 +98,7 @@ class AWQLinearMethod(LinearMethodBase):
 
     def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,
-                       output_partition_sizes: List[int], input_size: int,
+                       output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
         if input_size_per_partition % self.quant_config.group_size != 0:
@@ -175,15 +174,8 @@ class AWQLinearMethod(LinearMethodBase):
         # num_tokens >= threshold
         FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
 
-        prefer_torch = envs.VLLM_ROCM_PREFER_TORCH
-        prefer_triton = envs.VLLM_ROCM_PREFER_TRITON
-
-        if (FP16_MATMUL_HEURISTIC_CONDITION
-                or (prefer_torch and not prefer_triton)):
-            if prefer_triton:
-                out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
-            else:
-                out = torch_awq_dequantize(qweight, scales, qzeros)
+        if FP16_MATMUL_HEURISTIC_CONDITION:
+            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
             out = torch.matmul(reshaped_x, out)
         else:
             out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros,
@@ -191,44 +183,3 @@ class AWQLinearMethod(LinearMethodBase):
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)
-
-
-def torch_awq_dequantize(qweights: torch.Tensor, scales: torch.Tensor,
-                         qzeros: torch.Tensor) -> torch.Tensor:
-    reverse_awq_func_desc = torch.tensor([0, 16, 4, 20, 8, 24, 12, 28],
-                                         dtype=torch.int32,
-                                         device=qweights.device)
-    if qzeros is None:
-        qzeros = torch.zeros_like(qweights)
-
-    while qweights.dim() < 2:
-        qweights = torch.unsqueeze(qweights, 0)
-    while qzeros.dim() < 2:
-        qzeros = torch.unsqueeze(qzeros, 0)
-    while scales.dim() < 2:
-        scales = torch.unsqueeze(scales, 0)
-
-    rows = qweights.size(-2)
-    group_size_zeros = rows // qzeros.size(-2)
-    group_size_scales = rows // scales.size(-2)
-
-    qweights_shape = list(qweights.shape)
-    qweights_shape[-1] *= 8
-    qzeros_shape = list(qzeros.shape)
-    qzeros_shape[-1] *= 8
-
-    qweights = torch.unsqueeze(qweights, -1)
-    qzeros = torch.unsqueeze(qzeros, -1)
-
-    unpacked_weights = torch.bitwise_right_shift(qweights,
-                                                 reverse_awq_func_desc)
-    unpacked_weights = torch.bitwise_and(unpacked_weights, 0xf)
-    unpacked_weights = unpacked_weights.to(torch.int8).view(qweights_shape)
-
-    unpacked_zeros = torch.bitwise_right_shift(qzeros, reverse_awq_func_desc)
-    unpacked_zeros = torch.bitwise_and(unpacked_zeros, 0xf)
-    unpacked_zeros = unpacked_zeros.to(torch.int8).view(qzeros_shape)
-    unpacked_zeros = unpacked_zeros.repeat_interleave(group_size_zeros, dim=-2)
-
-    functional_scales = scales.repeat_interleave(group_size_scales, dim=-2)
-    return (unpacked_weights - unpacked_zeros) * functional_scales

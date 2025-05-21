@@ -52,8 +52,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors, SequenceGroupMetadata
 from vllm.utils import (DeviceMemoryProfiler, GiB_bytes, PyObjectCache,
                         async_tensor_h2d, flatten_2d_lists,
-                        is_pin_memory_available, rpd_mark, rpd_user_marker,
-                        supports_dynamo, weak_ref_tensor)
+                        is_pin_memory_available, supports_dynamo,
+                        weak_ref_tensor)
 from vllm.worker.model_runner_base import (
     InputProcessingError, ModelRunnerBase, ModelRunnerInputBase,
     ModelRunnerInputBuilderBase, _add_attn_metadata_broadcastable_dict,
@@ -204,6 +204,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.mrope_input_positions = None  # type: ignore
             self.seq_lens[0] = 0  # type: ignore
             self.orig_seq_lens[0] = 0  # type: ignore
+            self.prompt_lens[0] = 0  # type: ignore
             self.query_lens[0] = 0  # type: ignore
             self.context_lens[0] = 0  # type: ignore
             self.curr_sliding_window_blocks[0] = 0  # type: ignore
@@ -236,6 +237,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             # The original sequence length (before applying sliding window).
             # This is used to compute slot mapping.
             orig_seq_lens: Optional[List[int]] = None,
+            # This is used in the dual-chunk flash attention backend.
+            prompt_lens: Optional[List[int]] = None,
             # The query length.
             query_lens: Optional[List[int]] = None,
             # The number of tokens that are already computed.
@@ -316,6 +319,12 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                         for seq_id in range(len(self.seq_ids)):
                             self.orig_seq_lens[seq_id] = 0
 
+                    if prompt_lens:
+                        self.prompt_lens = prompt_lens
+                    else:
+                        for seq_id in range(len(self.seq_ids)):
+                            self.prompt_lens[seq_id] = 0
+
                     if query_lens:
                         self.query_lens = query_lens
                     else:
@@ -370,6 +379,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 self.mrope_input_positions = mrope_input_positions or None
                 self.seq_lens = seq_lens or []
                 self.orig_seq_lens = orig_seq_lens or []
+                self.prompt_lens = prompt_lens or []
                 self.query_lens = query_lens or []
                 self.context_lens = context_lens or []
                 self.curr_sliding_window_blocks = \
@@ -403,6 +413,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
             self.mrope_input_positions = None
             self.seq_lens = [0] * self.n_seqs
             self.orig_seq_lens = [0] * self.n_seqs
+            self.prompt_lens = [0] * self.n_seqs
             self.query_lens = [0] * self.n_seqs
             self.context_lens = [0] * self.n_seqs
             self.curr_sliding_window_blocks = [0] * self.n_seqs
@@ -552,6 +563,7 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
 
         inter_data.seq_lens[seq_idx] = seq_len
         inter_data.orig_seq_lens[seq_idx] = seq_len
+        inter_data.prompt_lens[seq_idx] = seq_data.get_prompt_len()
         inter_data.context_lens[seq_idx] = context_len
         inter_data.input_tokens[seq_idx].extend(tokens)
         inter_data.inputs_embeds = prompt_embeds
@@ -1220,7 +1232,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         pattern: Optional[str] = None,
         max_size: Optional[int] = None,
     ) -> None:
-        from vllm.model_executor.model_loader.loader import ShardedStateLoader
+        from vllm.model_executor.model_loader import ShardedStateLoader
         ShardedStateLoader.save_model(
             self.model,
             path,
@@ -1232,7 +1244,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self,
         tensorizer_config: TensorizerConfig,
     ) -> None:
-        from vllm.model_executor.model_loader.loader import TensorizerLoader
+        from vllm.model_executor.model_loader import TensorizerLoader
         TensorizerLoader.save_model(
             self.model,
             tensorizer_config=tensorizer_config,
@@ -1742,7 +1754,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                    is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
 
-    @rpd_mark()
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1774,12 +1785,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         assert model_input.attn_metadata is not None
         prefill_meta = model_input.attn_metadata.prefill_metadata
         decode_meta = model_input.attn_metadata.decode_metadata
-        if prefill_meta:
-            marker_instance = rpd_user_marker(name="Prefill")
-        else:
-            marker_instance = rpd_user_marker(name="Decode")
-
-        marker_instance.start()
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
@@ -1948,7 +1953,6 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
             output.hidden_states = hidden_states
 
-        marker_instance.end()
         return [output]
 
     def need_recv_kv(self, model_input, kv_caches) -> bool:
