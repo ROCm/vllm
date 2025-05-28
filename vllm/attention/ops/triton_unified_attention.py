@@ -64,8 +64,9 @@ def kernel_unified_attention_2d(
     query_start_len_ptr,  # [num_seqs+1]
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
+    only_one: tl.constexpr,  # bool
 ):
-
+    
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
@@ -90,7 +91,10 @@ def kernel_unified_attention_2d(
 
     cur_batch_query_len = cur_batch_in_all_stop_index \
         - cur_batch_in_all_start_index
-
+    
+    if only_one and cur_batch_query_len > 1:
+        return
+    
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
 
@@ -264,6 +268,7 @@ def unified_attention(
     k_descale,
     v_descale,
     alibi_slopes=None,
+    only_one=False,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -334,4 +339,5 @@ def unified_attention(
         query_start_len_ptr=cu_seqlens_q,
         BLOCK_Q=BLOCK_Q,
         num_seqs=num_seqs,
+        only_one=only_one,
     )
