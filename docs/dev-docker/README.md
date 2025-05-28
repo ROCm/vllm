@@ -20,10 +20,7 @@ The pre-built image includes:
 Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main`
 
 ## What is New
-
-- Out of memory bug fix
-- PyTorch fixes
-- Tunable ops fixes
+- AITER V1 engine performance improvement
 
 ## Known Issues and Workarounds
 - None
@@ -507,6 +504,7 @@ Use AITER release candidate branch instead:
 ## Changelog
 
 20250521_aiter:
+- AITER V1 engine performance improvement
 
 20250513_aiter:
 - Out of memory bug fix
