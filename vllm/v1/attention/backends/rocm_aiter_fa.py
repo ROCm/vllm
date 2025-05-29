@@ -9,6 +9,7 @@ from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
                                               is_quantized_kv_cache)
+from vllm.attention.ops.triton_unified_attention import unified_attention
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_attn import (
@@ -16,7 +17,6 @@ from vllm.v1.attention.backends.flash_attn import (
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
-from vllm.attention.ops.triton_unified_attention import unified_attention
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -586,6 +586,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 q_descale=None,  # Not supported
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
+                only_one=True,
             )
             # _, num_heads, head_size = query.shape
             # _PARTITION_SIZE_ROCM = 256
