@@ -2005,9 +2005,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                          and flash_attn_version == 3) and attn_backend_name
                         not in ["FlashMLABackend", "TritonAttentionBackend"]):
                     raise ValueError(
-                        f"Full CUDAGraph is only supported with FA3 or FlashMLA"
-                        f"or TritonAttn"
-                        f". Current attention backend is {attn_backend_name}, "
+                        f"Full CUDAGraph is only supported with "
+                        f"FA3, FlashMLA or TritonAttn. "
+                        f"Current attention backend is {attn_backend_name}, "
                         f"FlashAttention version is {flash_attn_version}.")
 
             block_table_i = self.input_batch.block_table[i]
