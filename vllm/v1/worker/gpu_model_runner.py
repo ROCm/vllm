@@ -2007,7 +2007,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         and attn_backend_name != "TritonAttentionBackend"):
                     raise ValueError(
                         f"Full CUDAGraph is only supported with FA3 or FlashMLA"
-                        f"or TritonAtten"
+                        f"or TritonAttn"
                         f". Current attention backend is {attn_backend_name}, "
                         f"FlashAttention version is {flash_attn_version}.")
 
