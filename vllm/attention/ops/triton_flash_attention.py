@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Fused Attention
 ===============
@@ -22,11 +23,10 @@ Not currently supported:
 """
 
 import torch
-import triton
-import triton.language as tl
 
 from vllm.platforms import current_platform
-from vllm.utils import is_navi
+from vllm.platforms.rocm import on_gfx1x
+from vllm.triton_utils import tl, triton
 
 torch_dtype: tl.constexpr = torch.float16
 
@@ -384,7 +384,7 @@ def get_rdna_autotune_configs():
 
 
 def get_autotune_configs():
-    if is_navi():
+    if on_gfx1x():
         return get_rdna_autotune_configs()
     else:
         return get_cdna_autotune_configs()
@@ -921,8 +921,8 @@ class _attention(torch.autograd.Function):
         o_descale = 1.0 / fp8_out_scale.item(
         ) if fp8_out_scale is not None else 1.0
 
-        arg_max_seqlens_q = 0 if is_navi() else max_seqlens_q
-        arg_max_seqlens_k = 0 if is_navi() else max_seqlens_k
+        arg_max_seqlens_q = 0 if on_gfx1x() else max_seqlens_q
+        arg_max_seqlens_k = 0 if on_gfx1x() else max_seqlens_k
 
         attn_fwd[grid](
             q,

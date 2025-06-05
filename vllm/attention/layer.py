@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer."""
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.platforms import _Backend, current_platform
 from vllm.utils import direct_register_custom_op
+from vllm.v1.attention.backends.utils import validate_kv_sharing_target
 
 
 class Attention(nn.Module):
@@ -49,6 +51,7 @@ class Attention(nn.Module):
         use_mla: bool = False,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -91,6 +94,7 @@ class Attention(nn.Module):
         # but requires q to be quantized as well.
         self._q_scale = torch.tensor(1.0, dtype=torch.float32)
         self._prob_scale = torch.tensor(1.0, dtype=torch.float32)
+        self._out_scale = None
 
         # We also keep the float32 versions of k/v_scale for attention
         # backends that don't support tensors (Flashinfer)
@@ -134,7 +138,7 @@ class Attention(nn.Module):
         self.impl = impl_cls(num_heads, head_size, scale, num_kv_heads,
                              alibi_slopes, sliding_window, kv_cache_dtype,
                              blocksparse_params, logits_soft_cap, attn_type,
-                             **extra_impl_args)
+                             kv_sharing_target_layer_name, **extra_impl_args)
         self.backend = backend_name_to_enum(attn_backend.get_name())
         self.dtype = dtype
 
@@ -152,6 +156,19 @@ class Attention(nn.Module):
         compilation_config.static_forward_context[prefix] = self
         self.layer_name = prefix
         self.attn_type = attn_type
+
+        if kv_sharing_target_layer_name is not None:
+            if not envs.VLLM_USE_V1:
+                raise NotImplementedError(
+                    "Cross-layer KV sharing is not supported in V0.")
+
+            validate_kv_sharing_target(
+                prefix,
+                kv_sharing_target_layer_name,
+                compilation_config.static_forward_context,
+            )
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+
         # use a placeholder kv cache tensor during init, which will be replaced
         # by bind_kv_cache
         # this variable will not be accessed if use_direct_call is True
@@ -169,7 +186,6 @@ class Attention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        fp8_out_scale: Optional[torch.Tensor] = None,
         # For some alternate attention backends like MLA the attention output
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
@@ -191,7 +207,7 @@ class Attention(nn.Module):
         if self.use_output:
             output_shape = (output_shape
                             if output_shape is not None else query.shape)
-            output_dtype = (query.dtype if fp8_out_scale is None else
+            output_dtype = (query.dtype if self._out_scale is None else
                             current_platform.fp8_dtype())
             output = torch.empty(output_shape,
                                  dtype=output_dtype,
@@ -222,11 +238,10 @@ class Attention(nn.Module):
                                   value,
                                   self_kv_cache,
                                   attn_metadata,
-                                  fp8_out_scale=fp8_out_scale,
                                   output=output)
             else:
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name, fp8_out_scale)
+                    query, key, value, output, self.layer_name)
             return output.view(-1, hidden_size)
         else:
             if self.use_direct_call:
@@ -236,11 +251,10 @@ class Attention(nn.Module):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
                 return self.impl.forward(self, query, key, value,
-                                         self_kv_cache, attn_metadata,
-                                         fp8_out_scale)
+                                         self_kv_cache, attn_metadata)
             else:
                 return torch.ops.vllm.unified_attention(
-                    query, key, value, self.layer_name, fp8_out_scale)
+                    query, key, value, self.layer_name)
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -379,7 +393,6 @@ def unified_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
-    fp8_out_scale: Optional[torch.Tensor],
 ) -> torch.Tensor:
     wait_for_kv_layer_from_connector(layer_name)
 
@@ -390,7 +403,7 @@ def unified_attention(
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
     output = self.impl.forward(self, query, key, value, kv_cache,
-                               attn_metadata, fp8_out_scale)
+                               attn_metadata)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
     return output
@@ -401,7 +414,6 @@ def unified_attention_fake(
     key: torch.Tensor,
     value: torch.Tensor,
     layer_name: str,
-    fp8_out_scale: Optional[torch.Tensor],
 ) -> torch.Tensor:
     return torch.empty_like(query).contiguous()
 
@@ -421,7 +433,6 @@ def unified_attention_with_output(
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
-    fp8_out_scale: Optional[torch.Tensor],
 ) -> None:
     wait_for_kv_layer_from_connector(layer_name)
     forward_context: ForwardContext = get_forward_context()
@@ -436,7 +447,6 @@ def unified_attention_with_output(
                       value,
                       kv_cache,
                       attn_metadata,
-                      fp8_out_scale,
                       output=output)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
@@ -448,7 +458,6 @@ def unified_attention_with_output_fake(
     value: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
-    fp8_out_scale: Optional[torch.Tensor],
 ) -> None:
     return
 

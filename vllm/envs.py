@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
 import os
@@ -14,9 +15,6 @@ if TYPE_CHECKING:
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: Optional[str] = None
     LD_LIBRARY_PATH: Optional[str] = None
-    VLLM_ROCM_PREFER_TORCH: bool = False
-    VLLM_ROCM_PREFER_TRITON: bool = True
-    VLLM_USE_SDPA_ATTENTION: bool = False
     VLLM_USE_TRITON_FLASH_ATTN: bool = True
     VLLM_USE_ROCM_CUSTOM_PAGED_ATTN_FP8_OUT: bool = True
     VLLM_USE_ROCM_FP8_FLASH_ATTN: bool = False
@@ -56,6 +54,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_COMPILED_DAG: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
+    VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: str = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
@@ -77,12 +76,11 @@ if TYPE_CHECKING:
     VLLM_PLUGINS: Optional[list[str]] = None
     VLLM_LORA_RESOLVER_CACHE_DIR: Optional[str] = None
     VLLM_TORCH_PROFILER_DIR: Optional[str] = None
-    VLLM_RPD_PROFILER_DIR: Optional[str] = None
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
-    VLLM_USE_V1: bool = False
+    VLLM_USE_V1: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -97,9 +95,9 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
-    Q_SCALE_CONSTANT: int = 20
-    K_SCALE_CONSTANT: int = 20
-    V_SCALE_CONSTANT: int = 10
+    Q_SCALE_CONSTANT: int = 200
+    K_SCALE_CONSTANT: int = 200
+    V_SCALE_CONSTANT: int = 100
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
@@ -124,6 +122,8 @@ if TYPE_CHECKING:
     VLLM_NIXL_SIDE_CHANNEL_HOST: str = "localhost"
     VLLM_NIXL_SIDE_CHANNEL_PORT: int = 5557
     VLLM_ALL2ALL_BACKEND: str = "naive"
+    VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
+    VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
 
 
 def get_default_cache_root():
@@ -148,10 +148,10 @@ def maybe_convert_int(value: Optional[str]) -> Optional[int]:
 
 def get_vllm_port() -> Optional[int]:
     """Get the port from VLLM_PORT environment variable.
-    
+
     Returns:
         The port number as an integer if VLLM_PORT is set, None otherwise.
-        
+
     Raises:
         ValueError: If VLLM_PORT is a URI, suggest k8s service discovery issue.
     """
@@ -164,17 +164,13 @@ def get_vllm_port() -> Optional[int]:
         return int(port)
     except ValueError as err:
         from urllib.parse import urlparse
-        try:
-            parsed = urlparse(port)
-            if parsed.scheme:
-                raise ValueError(
-                    f"VLLM_PORT '{port}' appears to be a URI. "
-                    "This may be caused by a Kubernetes service discovery issue"
-                    "check the warning in: https://docs.vllm.ai/en/stable/serving/env_vars.html"
-                )
-        except Exception:
-            pass
-
+        parsed = urlparse(port)
+        if parsed.scheme:
+            raise ValueError(
+                f"VLLM_PORT '{port}' appears to be a URI. "
+                "This may be caused by a Kubernetes service discovery issue,"
+                "check the warning in: https://docs.vllm.ai/en/stable/serving/env_vars.html"
+            ) from None
         raise ValueError(
             f"VLLM_PORT '{port}' must be a valid integer") from err
 
@@ -182,7 +178,7 @@ def get_vllm_port() -> Optional[int]:
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
-# begin-env-vars-definition
+# --8<-- [start:env-vars-definition]
 
 environment_variables: dict[str, Callable[[], Any]] = {
 
@@ -291,25 +287,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LD_LIBRARY_PATH":
     lambda: os.environ.get("LD_LIBRARY_PATH", None),
 
-    # flag to tell vllm to prefer torch on ROCm
-    "VLLM_ROCM_PREFER_TORCH":
-    lambda: (os.environ.get("VLLM_ROCM_PREFER_TORCH", "False").lower() in
-             ("true", "1")),
-
-    # flag to tell vllm to prefer triton on ROCm
-    "VLLM_ROCM_PREFER_TRITON":
-    lambda: (os.environ.get("VLLM_ROCM_PREFER_TRITON", "True").lower() in
-             ("true", "1")),
-
-    # flag to control if vllm should use naive scaled dot-product attention
-    "VLLM_USE_SDPA_ATTENTION":
-    lambda: (os.environ.get("VLLM_USE_SDPA_ATTENTION", "False").lower() in
-             ("true", "1")),
-
     # flag to control if vllm should use triton flash attention
     "VLLM_USE_TRITON_FLASH_ATTN":
     lambda: (os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in
              ("true", "1")),
+
+    # Use separate prefill and decode kernels for V1 attention instead of
+    # the unified triton kernel.
+    "VLLM_V1_USE_PREFILL_DECODE_ATTENTION":
+    lambda:
+    (os.getenv("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", "False").lower() in
+     ("true", "1")),
 
     # Force vllm to use a specific flash-attention version (2 or 3), only valid
     # when using the flash-attention backend.
@@ -332,16 +320,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.getenv("VLLM_USE_ROCM_FP8_FLASH_ATTN", "False").lower() in
              ("true", "1")),
 
-    # Use separate prefill and decode kernels for V1 attention instead of
-    # the unified triton kernel.
-    "VLLM_V1_USE_PREFILL_DECODE_ATTENTION":
-    lambda:
-    (os.getenv("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", "False").lower() in
-     ("true", "1")),
-
-    # Internal flag to enable/disable Inductor standalone compile
-    "VLLM_TEST_STANDALONE_COMPILE":
-    lambda: os.environ.get("VLLM_TEST_STANDALONE_COMPILE", "0") != "0",
+    # Feature flag to enable/disable Inductor standalone compile.
+    # In torch <= 2.7 we ignore this flag; in torch >= 2.8 this is
+    # enabled by default.
+    "VLLM_USE_STANDALONE_COMPILE":
+    lambda: os.environ.get("VLLM_USE_STANDALONE_COMPILE", "1") == "1",
 
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
@@ -545,6 +528,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, assert on XLA recompilation after each execution step.
     "VLLM_XLA_CHECK_RECOMPILATION":
     lambda: bool(int(os.getenv("VLLM_XLA_CHECK_RECOMPILATION", "0"))),
+
+    # Enable SPMD mode for TPU backend.
+    "VLLM_XLA_USE_SPMD":
+    lambda: bool(int(os.getenv("VLLM_XLA_USE_SPMD", "0"))),
     "VLLM_FUSED_MOE_CHUNK_SIZE":
     lambda: int(os.getenv("VLLM_FUSED_MOE_CHUNK_SIZE", "65536")),
 
@@ -598,12 +585,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TORCH_PROFILER_DIR":
     lambda: (None if os.getenv("VLLM_TORCH_PROFILER_DIR", None) is None else os
              .path.expanduser(os.getenv("VLLM_TORCH_PROFILER_DIR", "."))),
-
-    # Enables rpd profiler if set. Path to the directory where torch profiler
-    # traces are saved. Note that it must be an absolute path.
-    "VLLM_RPD_PROFILER_DIR":
-    lambda: (None if os.getenv("VLLM_RPD_PROFILER_DIR", None) is None else os.
-             path.expanduser(os.getenv("VLLM_RPD_PROFILER_DIR", "."))),
 
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ":
@@ -697,17 +678,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
     "Q_SCALE_CONSTANT":
-    lambda: int(os.getenv("Q_SCALE_CONSTANT", "20")),
-
-    # Divisor for dynamic key scale factor calculation
-    # for FP8 KV Cache and attention
+    lambda: int(os.getenv("Q_SCALE_CONSTANT", "200")),
+    # Divisor for dynamic key scale factor calculation for FP8 KV Cache
     "K_SCALE_CONSTANT":
-    lambda: int(os.getenv("K_SCALE_CONSTANT", "20")),
-
-    # Divisor for dynamic value scale factor calculation
-    # for FP8 KV Cache and attention
+    lambda: int(os.getenv("K_SCALE_CONSTANT", "200")),
+    # Divisor for dynamic value scale factor calculation for FP8 KV Cache
     "V_SCALE_CONSTANT":
-    lambda: int(os.getenv("V_SCALE_CONSTANT", "10")),
+    lambda: int(os.getenv("V_SCALE_CONSTANT", "100")),
+
     # If set, enable multiprocessing in LLM for the V1 code path.
     "VLLM_ENABLE_V1_MULTIPROCESSING":
     lambda: bool(int(os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1"))),
@@ -858,11 +836,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("VLLM_NIXL_SIDE_CHANNEL_PORT", "5557")),
 
     # all2all backend for vllm's expert parallel communication
+    # Available options:
+    # - "naive": naive all2all implementation using all-reduce
+    # - "pplx": use pplx kernels
+    # - "deepep_high_throughput", use deepep high-throughput kernels
+    # - "deepep_low_latency", use deepep low-latency kernels
     "VLLM_ALL2ALL_BACKEND":
     lambda: os.getenv("VLLM_ALL2ALL_BACKEND", "naive"),
+
+    # Control the maximum number of tokens per expert supported by the
+    # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
+    # the blockscale tensor of activations NVFP4 Quantization.
+    # This is used to prevent the kernel from running out of memory.
+    "VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE":
+    lambda: int(os.getenv("VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE", "163840")),
+
+    # Regex timeout for use by the vLLM tool parsing plugins.
+    "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS":
+    lambda: int(os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")),
 }
 
-# end-env-vars-definition
+# --8<-- [end:env-vars-definition]
 
 
 def __getattr__(name: str):
@@ -922,7 +916,7 @@ def compute_hash() -> str:
         "VLLM_USE_TRITON_AWQ",
         "VLLM_DP_RANK",
         "VLLM_DP_SIZE",
-        "VLLM_TEST_STANDALONE_COMPILE",
+        "VLLM_USE_STANDALONE_COMPILE",
     ]
     for key in environment_variables_to_hash:
         if key in environment_variables:

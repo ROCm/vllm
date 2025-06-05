@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for selecting and loading models."""
 import contextlib
 import inspect
@@ -42,9 +43,11 @@ def initialize_model(
     *,
     prefix: str = "",
     model_class: Optional[type[nn.Module]] = None,
+    model_config: Optional[ModelConfig] = None,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
-    model_config = vllm_config.model_config
+    if model_config is None:
+        model_config = vllm_config.model_config
     if model_class is None:
         model_class, _ = get_model_architecture(model_config)
 
@@ -114,6 +117,10 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
+
+    if hasattr(model, "process_weights_after_loading"):
+        with device_loading_context(model, target_device):
+            model.process_weights_after_loading()
 
 
 @contextmanager
@@ -223,17 +230,16 @@ def get_model_architecture(
         "fp8", "compressed-tensors", "gptq_marlin", "awq_marlin", "quark"
     ]
 
-    if (model_config.quantization is not None
-            and model_config.quantization not in mixtral_supported
-            and "MixtralForCausalLM" in architectures):
-        architectures = ["QuantMixtralForCausalLM"]
-
     vllm_supported_archs = ModelRegistry.get_supported_archs()
     vllm_not_supported = not any(arch in vllm_supported_archs
                                  for arch in architectures)
     if (model_config.model_impl == ModelImpl.TRANSFORMERS or
             model_config.model_impl != ModelImpl.VLLM and vllm_not_supported):
         architectures = resolve_transformers_arch(model_config, architectures)
+    elif (model_config.quantization is not None
+          and model_config.quantization not in mixtral_supported
+          and "MixtralForCausalLM" in architectures):
+        architectures = ["QuantMixtralForCausalLM"]
 
     model_cls, arch = ModelRegistry.resolve_model_cls(architectures)
     if model_config.task == "embed":

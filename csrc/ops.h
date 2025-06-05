@@ -38,7 +38,7 @@ void paged_attention_v1(
     torch::Tensor& v_scale, const int64_t tp_rank,
     const int64_t blocksparse_local_blocks,
     const int64_t blocksparse_vert_stride, const int64_t blocksparse_block_size,
-    const int64_t blocksparse_head_sliding_step, const int64_t num_threads);
+    const int64_t blocksparse_head_sliding_step);
 
 void paged_attention_v2(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
@@ -50,7 +50,7 @@ void paged_attention_v2(
     torch::Tensor& v_scale, const int64_t tp_rank,
     const int64_t blocksparse_local_blocks,
     const int64_t blocksparse_vert_stride, const int64_t blocksparse_block_size,
-    const int64_t blocksparse_head_sliding_step, const int64_t num_threads);
+    const int64_t blocksparse_head_sliding_step);
 
 #ifndef USE_ROCM
 void merge_attn_states(torch::Tensor& output,
@@ -91,6 +91,11 @@ void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
 
 void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
                         torch::Tensor& weight, double epsilon);
+
+void apply_repetition_penalties_(torch::Tensor& logits,
+                                 const torch::Tensor& prompt_mask,
+                                 const torch::Tensor& output_mask,
+                                 const torch::Tensor& repetition_penalties);
 
 void rms_norm_static_fp8_quant(torch::Tensor& out, torch::Tensor& input,
                                torch::Tensor& weight, torch::Tensor& scale,

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer ROCm GPUs."""
 import itertools
 from dataclasses import dataclass
@@ -493,8 +494,11 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
         attn_type: str = AttentionType.DECODER,
+        kv_sharing_target_layer_name: Optional[str] = None,
         use_irope: bool = False,
     ) -> None:
+        if kv_sharing_target_layer_name is not None:
+            raise NotImplementedError("KV sharing is not supported in V0.")
         if use_irope:
             logger.warning_once(
                 "Using irope in ROCm Flash Attention is not supported yet, it "
@@ -535,7 +539,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {supported_head_sizes}.")
 
-        self.use_naive_attn = envs.VLLM_USE_SDPA_ATTENTION  # Default False
+        self.use_naive_attn = False
         # NOTE: Allow for switching between Triton and CK. Defaulting to triton.
         self.use_triton_flash_attn = envs.VLLM_USE_TRITON_FLASH_ATTN
         if self.use_triton_flash_attn:
@@ -597,7 +601,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: ROCmFlashAttentionMetadata,
-        fp8_out_scale: Optional[torch.Tensor] = None,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention and PagedAttention.
@@ -767,12 +770,13 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             query.dtype,
                             seq_lens,
                             make_attn_mask=causal_mask)  # type: ignore
+                    use_fp8_scales = (layer._q_scale and layer._k_scale
+                                      and layer._v_scale and layer._prob_scale
+                                      and envs.VLLM_USE_ROCM_FP8_FLASH_ATTN)
                     full_scales = (
                         layer._q_scale.item(), layer._k_scale.item(),
-                        layer._v_scale.item(), layer._prob_scale.item()) if (
-                            fp8_out_scale and layer._q_scale
-                            and layer._prob_scale
-                            and envs.VLLM_USE_ROCM_FP8_FLASH_ATTN) else None
+                        layer._v_scale.item(),
+                        layer._prob_scale.item()) if use_fp8_scales else None
                     self.triton_attn_func(
                         query,
                         key,
@@ -787,7 +791,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         attn_masks[0][None]
                         if attn_masks is not None else None,
                         full_scales,
-                        fp8_out_scale,
+                        layer._out_scale,
                     )
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
@@ -864,7 +868,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
             gqa_ratio = num_heads // self.num_kv_heads
             use_custom = use_rocm_custom_paged_attention(
                 decode_query.dtype, head_size, block_size, gqa_ratio,
-                decode_meta.max_decode_seq_len, self.sliding_window)
+                decode_meta.max_decode_seq_len, self.sliding_window,
+                self.kv_cache_dtype, self.alibi_slopes)
             if use_custom:
                 max_seq_len = (decode_meta.max_decode_seq_len if self.attn_type
                                != AttentionType.ENCODER_DECODER else
@@ -910,7 +915,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     self.kv_cache_dtype,
                     layer._k_scale,
                     layer._v_scale,
-                    fp8_out_scale,
+                    layer._out_scale,
                 )
             else:
                 output[num_prefill_tokens:] = paged_attn.forward_decode(

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
 import importlib
@@ -11,7 +12,6 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
-from vllm.utils import is_navi
 
 logger = init_logger(__name__)
 
@@ -64,9 +64,7 @@ def paged_attention_v1(
         seq_lens, block_size, max_seq_len, alibi_slopes, kv_cache_dtype,
         k_scale, v_scale, tp_rank, blocksparse_local_blocks,
         blocksparse_vert_stride, blocksparse_block_size,
-        blocksparse_head_sliding_step,
-        num_threads = 1024 if current_platform.is_rocm() \
-            and not is_navi() else 128)
+        blocksparse_head_sliding_step)
 
 
 def paged_attention_v2(
@@ -98,9 +96,7 @@ def paged_attention_v2(
         num_kv_heads, scale, block_tables, seq_lens, block_size, max_seq_len,
         alibi_slopes, kv_cache_dtype, k_scale, v_scale, tp_rank,
         blocksparse_local_blocks, blocksparse_vert_stride,
-        blocksparse_block_size, blocksparse_head_sliding_step,
-        num_threads = 1024 if current_platform.is_rocm() \
-            and not is_navi() else 128)
+        blocksparse_block_size, blocksparse_head_sliding_step)
 
 
 def paged_attention_rocm(
@@ -297,6 +293,45 @@ def scaled_fused_add_rms_norm(out: torch.Tensor, input: torch.Tensor,
                               scale: torch.Tensor, epsilon: float) -> None:
     torch.ops._C.fused_add_rms_norm_static_fp8_quant(out, input, residual,
                                                      weight, scale, epsilon)
+
+
+def apply_repetition_penalties_torch(
+        logits: torch.Tensor, prompt_mask: torch.Tensor,
+        output_mask: torch.Tensor, repetition_penalties: torch.Tensor) -> None:
+    repetition_penalties = repetition_penalties.unsqueeze(dim=1).repeat(
+        1, logits.size(1))
+    # If token appears in prompt or output, apply, otherwise use 1.0 for no-op.
+    penalties = torch.where(prompt_mask | output_mask, repetition_penalties,
+                            1.0)
+    # If logits are positive, divide by penalty, otherwise multiply by penalty.
+    scaling = torch.where(logits > 0, 1.0 / penalties, penalties)
+    logits *= scaling
+
+
+def apply_repetition_penalties_cuda(
+        logits: torch.Tensor, prompt_mask: torch.Tensor,
+        output_mask: torch.Tensor, repetition_penalties: torch.Tensor) -> None:
+    torch.ops._C.apply_repetition_penalties_(logits, prompt_mask, output_mask,
+                                             repetition_penalties)
+
+
+def apply_repetition_penalties(logits: torch.Tensor, prompt_mask: torch.Tensor,
+                               output_mask: torch.Tensor,
+                               repetition_penalties: torch.Tensor) -> None:
+    """Apply repetition penalties to logits in-place.
+
+    Args:
+        logits: The logits tensor of shape [num_seqs, vocab_size].
+        prompt_mask: A boolean tensor indicating which tokens appear in the prompt.
+        output_mask: A boolean tensor indicating which tokens appear in the output.
+        repetition_penalties: The repetition penalties of shape (num_seqs, ).
+    """
+    if current_platform.is_cuda() and logits.is_contiguous():
+        apply_repetition_penalties_cuda(logits, prompt_mask, output_mask,
+                                        repetition_penalties)
+    else:
+        apply_repetition_penalties_torch(logits, prompt_mask, output_mask,
+                                         repetition_penalties)
 
 
 def advance_step_flashattn(num_seqs: int, num_queries: int, block_size: int,
@@ -1103,7 +1138,6 @@ def scaled_fp4_experts_quant(
     blockscale_offsets: torch.Tensor,
     topk: int,
     expert_map: Optional[torch.Tensor] = None,
-    MAX_TOKENS_PER_EXPERT: int = 163840,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to FP4 and return quantized tensor and scale, for
@@ -1125,9 +1159,16 @@ def scaled_fp4_experts_quant(
     input_tensor = input_tensor[
         expert_map] if expert_map is not None else input_tensor
     m_numtopk, k = input_tensor.shape
+    # Control the maximum number of tokens per expert supported by the
+    # NVFP4 MoE Expert Quantization. This is used to prevent the kernel
+    # from running out of memory. This value can also be increased to support
+    # larger models.
+    MAX_TOKENS_PER_EXPERT = envs.VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE
     assert (m_numtopk <= MAX_TOKENS_PER_EXPERT * topk), (
-        f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT * topk for"
-        f" scaled_fp4_experts_quant kernel, observed m_numtopk = {m_numtopk}")
+        f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
+        f"{MAX_TOKENS_PER_EXPERT})"
+        f" for cutlass_moe_fp4, observed m_numtopk = {m_numtopk}. Use"
+        f" VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE to set this value.")
     scales_k = k // 16
     padded_k = (scales_k + (4 - 1)) // 4
 

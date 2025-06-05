@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
@@ -181,20 +182,9 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        is_neox_style = True
-        is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "llama":
-            is_neox_style = False
-
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=is_neox_style,
-            partial_rotary_factor=self.partial_rotary_factor,
-        )
+        self._init_rotary_emb(config,
+                              rope_scaling=rope_scaling,
+                              quant_config=quant_config)
 
         if hasattr(config, "interleaved_sliding_window"):
             interleaved_sliding_window = config.interleaved_sliding_window
@@ -214,7 +204,10 @@ class LlamaAttention(nn.Module):
             quant_config, Fp8Config) or (isinstance(quant_config, QuarkConfig)
                                          and quant_config.is_fp8_w8a8())
         self.attn_fp8_out = (envs.VLLM_USE_ROCM_CUSTOM_PAGED_ATTN_FP8_OUT
+                             and envs.VLLM_USE_TRITON_FLASH_ATTN
                              and current_platform.is_fp8_fnuz() and use_fp8)
+        if envs.VLLM_USE_V1 and not envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION:
+            self.attn_fp8_out = False
 
         self.attn = Attention(
             self.num_heads,
@@ -236,10 +229,27 @@ class LlamaAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(
-            q, k, v, self.o_proj.input_scale if self.attn_fp8_out else None)
+        attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _init_rotary_emb(self, config: LlamaConfig,
+                         rope_scaling: Optional[dict[str, Any]],
+                         quant_config: Optional[QuantizationConfig]) -> None:
+        is_neox_style = True
+        is_gguf = quant_config and quant_config.get_name() == "gguf"
+        if is_gguf and config.model_type == "llama":
+            is_neox_style = False
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            base=self.rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+            partial_rotary_factor=self.partial_rotary_factor,
+        )
 
 
 class LlamaDecoderLayer(nn.Module):
@@ -668,3 +678,10 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 name = name.replace(item, mapping[item])
 
         return name, loaded_weight
+
+    def process_weights_after_loading(self) -> None:
+        for layer in self.model.layers:
+            assert isinstance(layer, LlamaDecoderLayer)
+            if layer.self_attn.attn_fp8_out:
+                layer.self_attn.attn._out_scale = \
+                    layer.self_attn.o_proj.input_scale

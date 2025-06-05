@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import random
 import time
@@ -84,7 +85,10 @@ def main(
     if version == "v2":
         if current_platform.is_rocm():
             global PARTITION_SIZE
-            PARTITION_SIZE = 1024 if not args.custom_paged_attn else PARTITION_SIZE_ROCM
+            if not args.custom_paged_attn and not current_platform.is_navi():
+                PARTITION_SIZE = 1024
+            else:
+                PARTITION_SIZE = PARTITION_SIZE_ROCM
         num_partitions = (max_seq_len + PARTITION_SIZE - 1) // PARTITION_SIZE
         tmp_output = torch.empty(
             size=(num_seqs, num_query_heads, num_partitions, head_size),
@@ -159,13 +163,13 @@ def main(
                         scale,
                         block_tables,
                         seq_lens,
+                        None,
                         block_size,
                         max_seq_len,
                         alibi_slopes,
                         kv_cache_dtype,
                         k_scale,
                         v_scale,
-                        None,
                     )
             else:
                 raise ValueError(f"Invalid version: {version}")
@@ -179,13 +183,13 @@ def main(
     # Warmup.
     print("Warming up...")
     run_benchmark = run_cuda_benchmark
-    run_benchmark(num_iters=500, profile=False)
+    run_benchmark(num_iters=3, profile=False)
 
     # Benchmark.
     if do_profile:
         latency = run_benchmark(num_iters=1, profile=True)
     else:
-        latency = run_benchmark(num_iters=10000, profile=False)
+        latency = run_benchmark(num_iters=100, profile=False)
     print(f"Kernel running time: {latency * 1000000:.3f} us")
 
 
