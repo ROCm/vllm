@@ -491,7 +491,7 @@ To reproduce the release docker:
 ```bash
     git clone https://github.com/ROCm/vllm.git
     cd vllm
-    git checkout 91a56009841e11b84a2aeb9cc5aa305ab2808ede
+    git checkout 71faa188073d427c57862c45bf17745f3b54b1b1
     docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
