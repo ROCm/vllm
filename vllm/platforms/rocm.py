@@ -116,6 +116,7 @@ def not_mi350() -> bool:
     GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
     return "gfx950" not in GPU_ARCH
 
+
 @cache
 def on_gfx9() -> bool:
     GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
