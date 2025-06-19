@@ -3,7 +3,7 @@
 """Attention layer ROCm GPUs."""
 import itertools
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -456,6 +456,26 @@ def _get_seq_len_block_table_args(
         raise AttributeError(f"Invalid attention type {str(attn_type)}")
 
 
+@lru_cache(maxsize=1)
+def get_static_kvscale(
+    k_scale_float: float,
+    v_scale_float: float,
+    num_kv_heads: int,
+    num_blocks: int,
+    block_size: int,
+    device,
+):
+    k_scale = torch.empty((num_kv_heads, num_blocks * block_size),
+                          dtype=torch.float32,
+                          device=device)
+    v_scale = torch.empty((num_kv_heads, num_blocks * block_size),
+                          dtype=torch.float32,
+                          device=device)
+    k_scale.fill_(k_scale_float)
+    v_scale.fill_(v_scale_float)
+    return k_scale, v_scale
+
+
 class ROCmFlashAttentionImpl(AttentionImpl):
     """
     If the input tensors contain prompt tokens, the layout is as follows:
@@ -673,20 +693,26 @@ class ROCmFlashAttentionImpl(AttentionImpl):
         if (is_rocm_aiter_paged_attn_enabled() and kv_cache.dtype.itemsize == 1
                 and not self.aiter_kv_scales_initialized
                 and kv_cache.shape != torch.Size([0])):
+            from vllm.attention.ops.rocm_aiter_paged_attn import (
+                AITERPagedAttention)
+
             num_blocks = kv_cache.shape[1]
             block_size = kv_cache.shape[2] // (self.num_kv_heads *
                                                self.head_size)
-            k_scale = torch.empty((self.num_kv_heads, num_blocks * block_size),
-                                  dtype=torch.float32,
-                                  device=kv_cache.device)
-            v_scale = torch.empty((self.num_kv_heads, num_blocks * block_size),
-                                  dtype=torch.float32,
-                                  device=kv_cache.device)
+            AITERPagedAttention.is_asm_supported = (
+                self.head_size == 128
+                and self.num_heads // self.num_kv_heads <= 16
+                and self.kv_cache_dtype in ["int8", "fp8", "fp8_e4m3"])
+
             self.aiter_kv_scales_initialized = True
-            k_scale.fill_(layer._k_scale.item())
-            v_scale.fill_(layer._v_scale.item())
-            layer._k_scale = k_scale
-            layer._v_scale = v_scale
+            if AITERPagedAttention.is_asm_supported:
+                k_scale, v_scale = get_static_kvscale(layer._k_scale_float,
+                                                      layer._v_scale_float,
+                                                      self.num_kv_heads,
+                                                      num_blocks, block_size,
+                                                      kv_cache.device)
+                layer._k_scale = k_scale
+                layer._v_scale = v_scale
 
         # Only update KV cache for decoder self-attention
         # and encoder-decoder cross-attention
@@ -916,6 +942,28 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     layer._k_scale,
                     layer._v_scale,
                     layer._out_scale,
+                )
+            elif is_rocm_aiter_paged_attn_enabled():
+                paged_attn.forward_decode(
+                    decode_query,
+                    key_cache,
+                    value_cache,
+                    (decode_meta.block_tables
+                     if self.attn_type != AttentionType.ENCODER_DECODER else
+                     decode_meta.cross_block_tables),
+                    (decode_meta.seq_lens_tensor
+                     if self.attn_type != AttentionType.ENCODER_DECODER else
+                     decode_meta.encoder_seq_lens_tensor),
+                    (decode_meta.max_decode_seq_len
+                     if self.attn_type != AttentionType.ENCODER_DECODER else
+                     decode_meta.max_encoder_seq_len),
+                    self.kv_cache_dtype,
+                    self.num_kv_heads,
+                    self.scale,
+                    self.alibi_slopes,
+                    layer._k_scale,
+                    layer._v_scale,
+                    output=output[num_prefill_tokens:],
                 )
             else:
                 output[num_prefill_tokens:] = paged_attn.forward_decode(

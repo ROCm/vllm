@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom activation functions."""
 import math
+import os
 from typing import Optional
 
 import torch
@@ -14,6 +15,11 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
+
+VLLM_USE_AITER_TRITON_SILU_MUL = (os.environ.get(
+    "VLLM_USE_AITER_TRITON_SILU_MUL", "0") == "1")
+VLLM_TRITON_FP4_GEMM_USE_ASM = (os.environ.get("VLLM_TRITON_FP4_GEMM_USE_ASM",
+                                               "0") == "1")
 
 
 @CustomOp.register("fatrelu_and_mul")
@@ -66,7 +72,13 @@ class SiluAndMul(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike() or current_platform.is_cpu():
-            self.op = torch.ops._C.silu_and_mul
+            if VLLM_USE_AITER_TRITON_SILU_MUL:
+                import aiter.ops.triton.activation as ops
+                self.op = lambda x: ops.act_mul_and_mxfp4_quant(x, "silu")
+                self.op_shfl = lambda x: \
+                    ops.act_mul_and_mxfp4_quant_shuffle_scales(x, "silu")
+            else:
+                self.op = torch.ops._C.silu_and_mul
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
             self.op = ipex_ops.silu_and_mul
@@ -81,19 +93,25 @@ class SiluAndMul(CustomOp):
     def forward_cuda(self,
                      x: torch.Tensor,
                      scale: Optional[torch.Tensor] = None) -> torch.Tensor:
-
-        d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
-        if scale is None:
-            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            self.op(out, x)
+        if VLLM_USE_AITER_TRITON_SILU_MUL:
+            if VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32:
+                out, out_scales = self.op_shfl(x)
+            else:
+                out, out_scales = self.op(x)
+            return out, out_scales
         else:
-            # for scaled fp8 output
-            out = torch.empty(output_shape,
-                              dtype=torch.float8_e4m3fnuz,
-                              device=x.device)
-            torch.ops._C.scaled_silu_and_mul(out, x, scale)
-        return out
+            d = x.shape[-1] // 2
+            output_shape = (x.shape[:-1] + (d, ))
+            if scale is None:
+                out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+                self.op(out, x)
+            else:
+                # for scaled fp8 output
+                out = torch.empty(output_shape,
+                                  dtype=torch.float8_e4m3fnuz,
+                                  device=x.device)
+                torch.ops._C.scaled_silu_and_mul(out, x, scale)
+            return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
