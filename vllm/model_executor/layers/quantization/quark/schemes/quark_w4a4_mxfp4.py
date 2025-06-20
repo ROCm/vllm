@@ -174,7 +174,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
                                 device=x_q.device,
                                 dtype=self.out_dtype)
                 #asm_bias = torch.empty_like(y)
-                gemm_a4w4_asm(x_q, layer.weight, x_s, layer.weight_scale, y, y)
+                gemm_a4w4_asm(x_q, layer.weight, x_s, layer.weight_scale, y, y, bpreshuffle=False)
 
                 return y[:M]
             elif VLLM_TRITON_FP4_GEMM_USE_ASM:
