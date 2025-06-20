@@ -2,7 +2,7 @@ ARG BASE_IMAGE=compute-artifactory.amd.com:5000/rocm-plus-docker/framework/compu
 # ARG HIPBLASLT_BRANCH="aa0bda7b"
 # ARG HIPBLAS_COMMON_BRANCH="9b80ba8e"
 # ARG LEGACY_HIPBLASLT_OPTION=
-ARG TRITON_BRANCH="0e78e54a"
+ARG TRITON_BRANCH="916969a"
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 # ARG PYTORCH_BRANCH="37f92bb"
 # ARG PYTORCH_VISION_BRANCH="v0.21.0"
@@ -10,7 +10,7 @@ ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 # ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
 ARG FA_BRANCH="8ede036"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
-ARG AITER_BRANCH="38094440"
+ARG AITER_BRANCH="d765e80"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
 FROM ${BASE_IMAGE} AS base
