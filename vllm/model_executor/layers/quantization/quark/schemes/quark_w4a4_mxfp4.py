@@ -15,14 +15,10 @@ from vllm.model_executor.parameter import (GroupQuantScaleParameter,
 from vllm.platforms import current_platform
 
 try:
-    import os
-
     from aiter.ops.triton.gemm_afp4wfp4 import (
         gemm_afp4wfp4, gemm_afp4wfp4_preshuffled_scales)
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
-    VLLM_TRITON_FP4_GEMM_USE_ASM = (os.environ.get(
-        "VLLM_TRITON_FP4_GEMM_USE_ASM", "0") == "1")
-    if VLLM_TRITON_FP4_GEMM_USE_ASM:
+    if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
         from aiter import gemm_a4w4_asm
         from aiter.utility.fp4_utils import (
             dynamic_mxfp4_quant as dynamic_mxfp4_quant_asm)
@@ -96,7 +92,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
             # This call is necessary to release the scales memory.
             torch.cuda.empty_cache()
         else:
-            if VLLM_TRITON_FP4_GEMM_USE_ASM:
+            if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
                 weight_scale_shuffle = layer.weight_scale.data
                 sm, sn = weight_scale_shuffle.shape
                 weight_scale_shuffle = weight_scale_shuffle.view(
@@ -162,7 +158,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
             return F.linear(qdq_x, dq_w, bias)
         else:
             M = x.shape[0]
-            if VLLM_TRITON_FP4_GEMM_USE_ASM and M > 128:
+            if envs.VLLM_TRITON_FP4_GEMM_USE_ASM and M > 128:
                 if x_scales is None:
                     x_q, x_s = dynamic_mxfp4_quant_asm(x, shuffle=True)
                 else:
@@ -174,10 +170,16 @@ class QuarkW4A4MXFP4(QuarkScheme):
                                 device=x_q.device,
                                 dtype=self.out_dtype)
                 #asm_bias = torch.empty_like(y)
-                gemm_a4w4_asm(x_q, layer.weight, x_s, layer.weight_scale, y, y, bpreshuffle=False)
+                gemm_a4w4_asm(x_q,
+                              layer.weight,
+                              x_s,
+                              layer.weight_scale,
+                              y,
+                              y,
+                              bpreshuffle=False)
 
                 return y[:M]
-            elif VLLM_TRITON_FP4_GEMM_USE_ASM:
+            elif envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
                 if x_scales is None:
                     x_q, x_s = dynamic_mxfp4_quant_asm(x, shuffle=(M >= 32))
                     x_s = x_s.view(torch.uint8)
