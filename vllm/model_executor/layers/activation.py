@@ -2,24 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom activation functions."""
 import math
-import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
-
-VLLM_USE_AITER_TRITON_SILU_MUL = (os.environ.get(
-    "VLLM_USE_AITER_TRITON_SILU_MUL", "0") == "1")
-VLLM_TRITON_FP4_GEMM_USE_ASM = (os.environ.get("VLLM_TRITON_FP4_GEMM_USE_ASM",
-                                               "0") == "1")
 
 
 @CustomOp.register("fatrelu_and_mul")
@@ -72,7 +67,7 @@ class SiluAndMul(CustomOp):
     def __init__(self):
         super().__init__()
         if current_platform.is_cuda_alike() or current_platform.is_cpu():
-            if VLLM_USE_AITER_TRITON_SILU_MUL:
+            if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
                 import aiter.ops.triton.activation as ops
                 self.op = lambda x: ops.act_mul_and_mxfp4_quant(x, "silu")
                 self.op_shfl = self.op_shfl = lambda x: \
@@ -93,8 +88,8 @@ class SiluAndMul(CustomOp):
     def forward_cuda(self,
                      x: torch.Tensor,
                      scale: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if VLLM_USE_AITER_TRITON_SILU_MUL:
-            if VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32:
+        if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
+            if envs.VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32:
                 out, out_scales = self.op_shfl(x)
             else:
                 out, out_scales = self.op(x)

@@ -24,18 +24,15 @@
 # limitations under the License.
 """Rotary Positional Embeddings."""
 import math
-import os
 from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm import envs
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
-
-VLLM_USE_AITER_TRITON_ROPE = (os.environ.get("VLLM_USE_AITER_TRITON_ROPE",
-                                             "0") == "1")
 
 if current_platform.is_cuda():
     from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
@@ -188,7 +185,7 @@ class RotaryEmbedding(CustomOp):
                                                        dtype=query.dtype)
 
         num_tokens = positions.numel()
-        if VLLM_USE_AITER_TRITON_ROPE and num_tokens <= 128:
+        if envs.VLLM_USE_AITER_TRITON_ROPE and num_tokens <= 128:
             import aiter.ops.triton.rope as ops
             cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
             query_shape = query.shape

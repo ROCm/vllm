@@ -658,6 +658,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in
              ("true", "1")),
 
+    # Whether to use aiter silu mul.
+    # By default is disabled.
+    "VLLM_USE_AITER_TRITON_SILU_MUL":
+    lambda: (os.getenv("VLLM_USE_AITER_TRITON_SILU_MUL", "False").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter fp4 gemm asm.
+    # By default is disabled.
+    "VLLM_TRITON_FP4_GEMM_USE_ASM":
+    lambda: (os.getenv("VLLM_TRITON_FP4_GEMM_USE_ASM", "False").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter rope.
+    # By default is disabled.
+    "VLLM_USE_AITER_TRITON_ROPE":
+    lambda: (os.getenv("VLLM_USE_AITER_TRITON_ROPE", "False").lower() in
+             ("true", "1")),
+
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM":
     lambda: (os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in

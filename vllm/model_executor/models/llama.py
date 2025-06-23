@@ -23,7 +23,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-import os
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -60,9 +59,6 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
-
-VLLM_USE_AITER_TRITON_SILU_MUL = (os.environ.get(
-    "VLLM_USE_AITER_TRITON_SILU_MUL", "0") == "1")
 
 
 class LlamaMLP(nn.Module):
@@ -114,7 +110,7 @@ class LlamaMLP(nn.Module):
             x, _ = self.down_proj(x)
         else:
             x, _ = self.gate_up_proj(x)
-            if VLLM_USE_AITER_TRITON_SILU_MUL:
+            if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
                 x, x_scales = self.act_fn(x)
                 x, _ = self.down_proj(x, x_scales)
             else:
