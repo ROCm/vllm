@@ -187,6 +187,7 @@ class RotaryEmbedding(CustomOp):
         num_tokens = positions.numel()
         if envs.VLLM_USE_AITER_TRITON_ROPE and num_tokens <= 128:
             import aiter.ops.triton.rope as ops
+            assert key is not None
             cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
             query_shape = query.shape
             key_shape = key.shape

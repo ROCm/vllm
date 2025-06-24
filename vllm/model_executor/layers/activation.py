@@ -66,14 +66,14 @@ class SiluAndMul(CustomOp):
 
     def __init__(self):
         super().__init__()
-        if current_platform.is_cuda_alike() or current_platform.is_cpu():
-            if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
-                import aiter.ops.triton.activation as ops
-                self.op = lambda x: ops.act_mul_and_mxfp4_quant(x, "silu")
-                self.op_shfl = self.op_shfl = lambda x: \
-                    ops.act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
-            else:
-                self.op = torch.ops._C.silu_and_mul
+
+        if current_platform.is_rocm() and envs.VLLM_USE_AITER_TRITON_SILU_MUL:
+            import aiter.ops.triton.activation as ops
+            self.op = lambda x: ops.act_mul_and_mxfp4_quant(x, "silu")
+            self.op_shfl = lambda x: \
+                ops.act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
+        elif current_platform.is_cuda_alike() or current_platform.is_cpu():
+            self.op = torch.ops._C.silu_and_mul
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
             self.op = ipex_ops.silu_and_mul
