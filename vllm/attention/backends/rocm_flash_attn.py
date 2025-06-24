@@ -573,7 +573,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
             if self.kv_cache_dtype in ["int8", "fp8", "fp8_e4m3"]:
                 from vllm.attention.ops.triton_flash_attention import (  # noqa: F401
-                                                                triton_attention)
+                    triton_attention)
                 self.triton_attn_func = triton_attention
             else:
                 from aiter.ops.triton.mha import flash_attn_varlen_func
@@ -801,13 +801,16 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             seq_lens,
                             make_attn_mask=causal_mask)  # type: ignore
                     if self.kv_cache_dtype in ["int8", "fp8", "fp8_e4m3"]:
-                        use_fp8_scales = (layer._q_scale and layer._k_scale
-                                        and layer._v_scale and layer._prob_scale
-                                        and envs.VLLM_USE_ROCM_FP8_FLASH_ATTN)
-                        full_scales = (
-                            layer._q_scale.item(), layer._k_scale.item(),
-                            layer._v_scale.item(),
-                            layer._prob_scale.item()) if use_fp8_scales else None
+                        use_fp8_scales = (layer._q_scale is not None
+                                          and layer._k_scale is not None
+                                          and layer._v_scale is not None
+                                          and layer._prob_scale is not None and
+                                          envs.VLLM_USE_ROCM_FP8_FLASH_ATTN)
+                        full_scales = (layer._q_scale.item(),
+                                       layer._k_scale.item(),
+                                       layer._v_scale.item(),
+                                       layer._prob_scale.item()
+                                       ) if use_fp8_scales else None
                         self.triton_attn_func(
                             query,
                             key,

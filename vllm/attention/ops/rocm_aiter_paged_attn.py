@@ -138,8 +138,8 @@ class AITERPagedAttention(PagedAttention):
             block_tables,
             seq_lens,
             max_num_blocks_per_seq,
-            k_scale,
-            v_scale,
-            output,
+            K_QScale=k_scale,
+            V_QScale=v_scale,
+            out_=output,
         )
         return output
