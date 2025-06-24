@@ -69,9 +69,8 @@ class SiluAndMul(CustomOp):
 
         if current_platform.is_rocm() and envs.VLLM_USE_AITER_TRITON_SILU_MUL:
             import aiter.ops.triton.activation as ops
-            self.op = lambda x: ops.act_mul_and_mxfp4_quant(x, "silu")
-            self.op_shfl = lambda x: \
-                ops.act_mul_and_mxfp4_quant(x, "silu", shuffle=True)
+            self.op = lambda x, shuffle: \
+                ops.act_mul_and_mxfp4_quant(x, "silu", shuffle)
         elif current_platform.is_cuda_alike() or current_platform.is_cpu():
             self.op = torch.ops._C.silu_and_mul
         elif current_platform.is_xpu():
@@ -89,10 +88,8 @@ class SiluAndMul(CustomOp):
                      x: torch.Tensor,
                      scale: Optional[torch.Tensor] = None) -> torch.Tensor:
         if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
-            if envs.VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32:
-                out, out_scales = self.op_shfl(x)
-            else:
-                out, out_scales = self.op(x)
+            shuffle = envs.VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32
+            out, out_scales = self.op(x, shuffle)
             return out, out_scales
         else:
             d = x.shape[-1] // 2

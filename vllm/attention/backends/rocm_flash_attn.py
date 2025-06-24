@@ -571,12 +571,15 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     "FA backend instead by setting the env var "
                     "`VLLM_USE_TRITON_FLASH_ATTN=0`")
 
-            if self.kv_cache_dtype in ["int8", "fp8", "fp8_e4m3"]:
+            if self.kv_cache_dtype in ["int8", "fp8_e4m3"]:
                 from vllm.attention.ops.triton_flash_attention import (  # noqa: F401
                     triton_attention)
                 self.triton_attn_func = triton_attention
             else:
-                from aiter.ops.triton.mha import flash_attn_varlen_func
+                from aiter.ops.triton.mha import (flash_attn_varlen_func,
+                                                  set_triton_fa_strides)
+
+                set_triton_fa_strides(True)
                 self.triton_attn_func = flash_attn_varlen_func
             logger.debug("Using Triton FA in ROCmBackend")
             if self.sliding_window != (-1, -1):
@@ -800,7 +803,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             query.dtype,
                             seq_lens,
                             make_attn_mask=causal_mask)  # type: ignore
-                    if self.kv_cache_dtype in ["int8", "fp8", "fp8_e4m3"]:
+                    if self.kv_cache_dtype in ["int8", "fp8_e4m3"]:
                         use_fp8_scales = (layer._q_scale is not None
                                           and layer._k_scale is not None
                                           and layer._v_scale is not None
@@ -845,7 +848,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             return_lse=False,
                             return_attn_probs=False,
                             block_table=None,
-                        )[0]
+                        )
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
                         # Interleave for MQA workaround.

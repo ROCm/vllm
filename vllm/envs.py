@@ -88,6 +88,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_USE_AITER_TRITON_SILU_MUL: bool = False
+    VLLM_TRITON_FP4_GEMM_USE_ASM: bool = False
+    VLLM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
