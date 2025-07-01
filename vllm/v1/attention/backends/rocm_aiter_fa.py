@@ -309,13 +309,13 @@ class AiterFlashAttentionMetadataBuilder:
         prefix_kv_lens = None
         suffix_kv_lens = None
 
-        nbyes_per_qo_elem = torch.finfo(self.runner.dtype).bits // 8
+        nbytes_per_qo_elem = torch.finfo(self.runner.dtype).bits // 8
         max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM -
                               1) // _PARTITION_SIZE_ROCM
 
         workspace_buffer = torch.empty(
             (num_reqs * self.num_heads_q * max_num_partitions * self.headdim) *
-            nbyes_per_qo_elem + 2 *
+            nbytes_per_qo_elem + 2 *
             (num_reqs * self.num_heads_q * max_num_partitions) * 4,
             dtype=torch.uint8,
             device=self.runner.device,
