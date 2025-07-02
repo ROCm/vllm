@@ -41,8 +41,8 @@ The table below shows performance data where a local inference client is fed req
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 10939.6  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 9600.9               |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 10948.9  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 9489.2               |
 |       |           |         | 500   | 2000   | 2000        | 2000         | 9576.7               |
 |       |           |         | 2048  | 2048   | 1500        | 1500         | 6450.8                |
 | Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3329.1 |
@@ -233,8 +233,6 @@ TP=8
 
 python3 /app/vllm/benchmarks/benchmark_latency.py \
     --distributed-executor-backend mp \
-    --quantization fp8 \
-    --kv-cache-dtype fp8 \
     --dtype float16 \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
@@ -267,7 +265,7 @@ For additional information about the available parameters run:
 
 vLLM's benchmark_throughput.py script measures offline throughput.  It can either use an input dataset or random prompts with fixed input/output lengths.
 
-You can run latency tests for FP8 models with:
+You can run throughput tests for FP8 models with:
 
 ```bash
 export VLLM_USE_TRITON_FLASH_ATTN=0
@@ -280,7 +278,6 @@ MAX_NUM_SEQS=1500
 
 python3 /app/vllm/benchmarks/benchmark_throughput.py \
     --distributed-executor-backend mp \
-    --quantization fp8 \
     --kv-cache-dtype fp8 \
     --dtype float16 \
     --gpu-memory-utilization 0.9 \
@@ -298,6 +295,7 @@ python3 /app/vllm/benchmarks/benchmark_throughput.py \
     --max-num-seqs $MAX_NUM_SEQS \
     --output-json output.json
     --disable-custom-all-reduce
+    --disable-detokenize
     --compilation-config '{"full_cuda_graph": true,"custom_ops":["+silu_and_mul"],"pass_config":{"enable_noop":true,"enable_fusion":true}}’
 ```
 
