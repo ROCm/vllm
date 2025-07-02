@@ -591,7 +591,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     alibi_slopes=self.alibi_slopes,
                     window_size=self.sliding_window,
                     block_table=block_table,
-                    cu_seqlens_k=cu_seq_lens,
+                    cu_seqlens_k=(cu_seq_lens if not use_local_attn else
+                                  local_metadata.local_cu_seq_lens),
                     k_scale=layer._k_scale,
                     v_scale=layer._v_scale,
                 )
