@@ -561,7 +561,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
 
         self.use_naive_attn = False
         # NOTE: Allow for switching between Triton and CK. Defaulting to triton.
-        self.use_triton_flash_attn = envs.VLLM_USE_TRITON_FLASH_ATTN
+        self.use_triton_flash_attn = envs.VLLM_USE_TRITON_FLASH_ATTN and \
+                                        envs.VLLM_ROCM_USE_AITER
         if self.use_triton_flash_attn:
             if logits_soft_cap is not None:
                 raise ValueError(
@@ -571,16 +572,11 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     "FA backend instead by setting the env var "
                     "`VLLM_USE_TRITON_FLASH_ATTN=0`")
 
-            if self.kv_cache_dtype in ["int8", "fp8_e4m3"]:
-                from vllm.attention.ops.triton_flash_attention import (  # noqa: F401
-                    triton_attention)
-                self.triton_attn_func = triton_attention
-            else:
-                from aiter.ops.triton.mha import flash_attn_varlen_func
-                from aiter.ops.triton.mha import (
-                    mha_set_use_int64_strides as set_triton_fa_strides)
-                set_triton_fa_strides(True)
-                self.triton_attn_func = flash_attn_varlen_func
+            from aiter.ops.triton.mha import flash_attn_varlen_func
+            from aiter.ops.triton.mha import (mha_set_use_int64_strides as
+                                              set_triton_fa_strides)
+            set_triton_fa_strides(True)
+            self.triton_attn_func = flash_attn_varlen_func
             logger.debug("Using Triton FA in ROCmBackend")
             if self.sliding_window != (-1, -1):
                 logger.warning("ROCm Triton FA does not currently support "
@@ -803,52 +799,24 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                             query.dtype,
                             seq_lens,
                             make_attn_mask=causal_mask)  # type: ignore
-                    if self.kv_cache_dtype in ["int8", "fp8_e4m3"]:
-                        use_fp8_scales = (layer._q_scale is not None
-                                          and layer._k_scale is not None
-                                          and layer._v_scale is not None
-                                          and layer._prob_scale is not None and
-                                          envs.VLLM_USE_ROCM_FP8_FLASH_ATTN)
-                        full_scales = (layer._q_scale.item(),
-                                       layer._k_scale.item(),
-                                       layer._v_scale.item(),
-                                       layer._prob_scale.item()
-                                       ) if use_fp8_scales else None
-                        self.triton_attn_func(
-                            query,
-                            key,
-                            value,
-                            output[:num_prefill_tokens],
-                            query_seq_start_loc,
-                            key_seq_start_loc,
-                            query_max_seq_len,
-                            key_max_seq_len,
-                            causal_mask,
-                            self.scale,
-                            attn_masks[0][None]
-                            if attn_masks is not None else None,
-                            full_scales,
-                            layer._out_scale,
-                        )
-                    else:
-                        output[:num_prefill_tokens] = self.triton_attn_func(
-                            q=query,
-                            k=key,
-                            v=value,
-                            cu_seqlens_q=query_seq_start_loc,
-                            cu_seqlens_k=key_seq_start_loc,
-                            max_seqlen_q=query_max_seq_len,
-                            max_seqlen_k=key_max_seq_len,
-                            dropout_p=0.0,
-                            softmax_scale=self.scale,
-                            causal=causal_mask,
-                            window_size=self.sliding_window,
-                            alibi_slopes=self.alibi_slopes,
-                            deterministic=False,
-                            return_lse=False,
-                            return_attn_probs=False,
-                            block_table=None,
-                        )
+                    output[:num_prefill_tokens] = self.triton_attn_func(
+                        q=query,
+                        k=key,
+                        v=value,
+                        cu_seqlens_q=query_seq_start_loc,
+                        cu_seqlens_k=key_seq_start_loc,
+                        max_seqlen_q=query_max_seq_len,
+                        max_seqlen_k=key_max_seq_len,
+                        dropout_p=0.0,
+                        softmax_scale=self.scale,
+                        causal=causal_mask,
+                        window_size=self.sliding_window,
+                        alibi_slopes=self.alibi_slopes,
+                        deterministic=False,
+                        return_lse=False,
+                        return_attn_probs=False,
+                        block_table=None,
+                    )
                 elif self.use_naive_attn:
                     if self.num_kv_heads != self.num_heads:
                         # Interleave for MQA workaround.
