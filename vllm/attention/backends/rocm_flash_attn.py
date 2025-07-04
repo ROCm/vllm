@@ -913,7 +913,8 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                 )
                 max_logits = torch.empty_like(exp_sums)
 
-                torch.ops.aiter.paged_attention_rocm(
+                query_start_loc = None
+                ops.paged_attention_rocm(
                     output[num_prefill_tokens:],
                     exp_sums,
                     max_logits,
@@ -929,6 +930,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     decode_meta.seq_lens_tensor
                     if self.attn_type != AttentionType.ENCODER_DECODER else
                     decode_meta.encoder_seq_lens_tensor,
+                    query_start_loc,
                     block_size,
                     max_seq_len,
                     self.alibi_slopes,

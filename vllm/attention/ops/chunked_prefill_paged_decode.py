@@ -286,7 +286,7 @@ def chunked_prefill_paged_decode(
                                                  num_queries_per_kv,
                                                  max_seq_len, sliding_window,
                                                  kv_cache_dtype, alibi_slopes)
-    if use_custom and head_size <= 128 and num_queries_per_kv <= 16:
+    if use_custom:
         _PARTITION_SIZE_ROCM = 256
         max_num_partitions = ((max_seq_len + _PARTITION_SIZE_ROCM - 1) //
                               _PARTITION_SIZE_ROCM)
