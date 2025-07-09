@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 import torch
 
@@ -12,7 +12,8 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_attn import (
     make_local_attention_virtual_batches)
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
+                                              CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.block_table import BlockTable
 
@@ -199,7 +200,51 @@ if current_platform.is_rocm():
 logger = init_logger(__name__)
 
 
-class AiterFlashAttentionMetadataBuilder:
+@dataclass
+class AiterFlashAttentionMetadata:
+    # NOTE(sang): Definition of context_len, query_len, and seq_len.
+    # |---------- N-1 iteration --------|
+    # |---------------- N iteration ---------------------|
+    # |- tokenA -|......................|-- newTokens ---|
+    # |---------- context_len ----------|
+    # |-------------------- seq_len ---------------------|
+    #                                   |-- query_len ---|
+
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    cu_seq_lens: torch.Tensor
+    total_tokens: int
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+    workspace_buffer: torch.Tensor
+
+    # For cascade attention.
+    use_cascade: bool
+    common_prefix_len: int
+    cu_prefix_query_lens: Optional[torch.Tensor]
+    prefix_kv_lens: Optional[torch.Tensor]
+    suffix_kv_lens: Optional[torch.Tensor]
+
+    # for local attention
+    @dataclass
+    class LocalAttentionMetadata:
+        local_query_start_loc: torch.Tensor
+        local_seqused_k: torch.Tensor
+        local_block_table: torch.Tensor
+        local_max_query_len: int
+        local_max_seq_len: int
+        local_cu_seq_lens: torch.Tensor
+        local_scheduler_metadata: Optional[torch.Tensor]
+
+    local_attn_metadata: Optional[LocalAttentionMetadata] = None
+
+
+class AiterFlashAttentionMetadataBuilder(
+        AttentionMetadataBuilder[AiterFlashAttentionMetadata]):
+    full_cudagraph_supported: ClassVar[bool] = True
 
     def __init__(self, runner: "GPUModelRunner", kv_cache_spec: AttentionSpec,
                  block_table: BlockTable):
@@ -396,48 +441,6 @@ class AiterFlashAttentionBackend(AttentionBackend):
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         return (2, num_blocks, block_size, num_kv_heads, head_size)
-
-
-@dataclass
-class AiterFlashAttentionMetadata:
-    # NOTE(sang): Definition of context_len, query_len, and seq_len.
-    # |---------- N-1 iteration --------|
-    # |---------------- N iteration ---------------------|
-    # |- tokenA -|......................|-- newTokens ---|
-    # |---------- context_len ----------|
-    # |-------------------- seq_len ---------------------|
-    #                                   |-- query_len ---|
-
-    num_actual_tokens: int  # Number of tokens excluding padding.
-    max_query_len: int
-    query_start_loc: torch.Tensor
-    max_seq_len: int
-    seq_lens: torch.Tensor
-    cu_seq_lens: torch.Tensor
-    total_tokens: int
-    block_table: torch.Tensor
-    slot_mapping: torch.Tensor
-    workspace_buffer: torch.Tensor
-
-    # For cascade attention.
-    use_cascade: bool
-    common_prefix_len: int
-    cu_prefix_query_lens: Optional[torch.Tensor]
-    prefix_kv_lens: Optional[torch.Tensor]
-    suffix_kv_lens: Optional[torch.Tensor]
-
-    # for local attention
-    @dataclass
-    class LocalAttentionMetadata:
-        local_query_start_loc: torch.Tensor
-        local_seqused_k: torch.Tensor
-        local_block_table: torch.Tensor
-        local_max_query_len: int
-        local_max_seq_len: int
-        local_cu_seq_lens: torch.Tensor
-        local_scheduler_metadata: Optional[torch.Tensor]
-
-    local_attn_metadata: Optional[LocalAttentionMetadata] = None
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
