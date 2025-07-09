@@ -256,6 +256,44 @@ __device__ __forceinline__ _B16x8 convert_b8x8_custom(const _B8x8 input) {
   return ret;
 }
 
+typedef union u64_cvt {
+  half f16x4[4];
+  int16_t b16x4[4];
+  _B8x8 b8x8;
+  _B16x4 b64;
+} _T8x8;
+
+__device__ __forceinline__ _B8x8 convert_b16x8(const _B16x8& input, _T8x8& Mtemp)
+{
+
+_T8x8 Qtmp8x8;
+
+for (int i = 0; i < 2; i++) {
+floatx4 q_out = {0,0,0,0};
+q_out = gcn_mfma16x16x16_instr<_Float16, 0, 0, 0>(
+      Mtemp.b64,
+      input.xy[i], q_out);
+Qtmp8x8.b16x4[i*2    ] = __builtin_amdgcn_cvt_pk_fp8_f32(q_out[0], q_out[1],0,false);
+Qtmp8x8.b16x4[i*2 + 1] = __builtin_amdgcn_cvt_pk_fp8_f32(q_out[2], q_out[3],0,true);
+}
+return Qtmp8x8.b8x8;
+}
+
+#define hipWarpSize 64
+__device__ float warpReduceMax(float val) {
+for (int offset = hipWarpSize / 2; offset > 0; offset /= 2) {
+val = max(val, __shfl_down(val, offset, hipWarpSize)); // Using max() for reduction
+}
+return val;
+}
+
+__device__ float warpReduceMin(float val) {
+for (int offset = hipWarpSize / 2; offset > 0; offset /= 2) {
+val = min(val, __shfl_down(val, offset, hipWarpSize)); // Using max() for reduction
+}
+return val;
+}
+
 // grid (num_seqs, num_partitions,num_kv_heads)
 // block (256)
 // clang-format off
