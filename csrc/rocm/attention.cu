@@ -550,9 +550,12 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
   // calculate post qk mfma scale
   float scale2 = scale;
+  float q_sclae = 1.0;
   if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
+    float2 f2 = *reinterpret_cast<const float2*>(k_scale);
+    q_scale = f2.y;
     // multiply by k_scale if fp8 kv cache
-    scale2 *= *k_scale;
+    scale2 *= f2.x;//*k_scale;
   }
 
   floatx4 d_out[TLOOP];
@@ -572,13 +575,35 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
         auto Ktmp = Klocal[token_depth][qkhe_depth];
         _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
         for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
-          _B8x8 Ktmp8x8 = Ktmp8x16.xy[qkratio];
-          _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
-          for (int i = 0; i < 2; i++) {
-            d_out[token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
-                Klocaltmp.xy[i], Qlocal[qkhe_depth][qkratio].xy[i],
-                d_out[token_depth]);
+          if(q_scale <= 0)
+          {
+            _B8x8 Ktmp8x8 = Ktmp8x16.xy[qkratio];
+            _B16x8 Klocaltmp = convert_b8x8_custom<scalar_t>(Ktmp8x8);
+            for (int i = 0; i < 2; i++) {
+              d_out[token_depth] = gcn_mfma16x16x16_instr<scalar_t, 0, 0, 0>(
+                  Klocaltmp.xy[i], Qlocal[qkhe_depth][qkratio].xy[i],
+                  d_out[token_depth]);
+            }
           }
+          else
+          {
+            _T8x8 Ktmp8x8, Qtmp8x8;
+            Ktmp8x8.b8x8 = Ktmp8x16.xy[qkratio];
+
+            for(int n = 0; n < 2; n++)
+            {
+                Qtmp8x8.b16x4[n*2] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                              to_float<scalar_t>(Qlocal[qkhe_depth][qkratio].xy[n][0])*q_scale,
+                              to_float<scalar_t>(Qlocal[qkhe_depth][qkratio].xy[n][1])*q_scale, 0, false);
+                Qtmp8x8.b16x4[n*2+1] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                              to_float<_Float16>(Qlocal[qkhe_depth][qkratio].xy[n][2])*q_scale,
+                              to_float<_Float16>(Qlocal[qkhe_depth][qkratio].xy[n][3])*q_scale, 0, false);
+            }
+
+            d_out[token_depth] = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
+                  Ktmp8x8.i64, Qtmp8x8.i64,
+                  d_out[token_depth]);
+         }          
         }
       }
     }
