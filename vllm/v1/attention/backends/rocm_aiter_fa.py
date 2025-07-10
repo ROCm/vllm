@@ -94,17 +94,11 @@ if current_platform.is_rocm():
             tl.store(v_values_ptr + kv_values_off, v_vals, mask=block_mask)
 
     def vllm_layout_trans(b_query_lens_loc, b_seq_lens_loc, block_table,
-                          k_buffer, v_buffer, max_seq_len, total_tokens,
+                          k_cache, v_cache, k_values, v_values, max_seq_len,
                           k_scale, v_scale, output_dtype):
-        H_KV = v_buffer.shape[2]
-        D = v_buffer.shape[3]
-        BLOCK_SIZE = v_buffer.shape[1]
-        k_values = torch.empty((total_tokens, H_KV, D),
-                               dtype=output_dtype,
-                               device="cuda")
-        v_values = torch.empty((total_tokens, H_KV, D),
-                               dtype=output_dtype,
-                               device="cuda")
+        H_KV = v_cache.shape[2]
+        D = v_cache.shape[3]
+        BLOCK_SIZE = v_cache.shape[1]
 
         grid = (block_table.shape[0],
                 (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
@@ -116,8 +110,8 @@ if current_platform.is_rocm():
         else:
             raise ValueError(f"Unsupported output dtype: {output_dtype}")
 
-        _vllm_layout_trans_kernel[grid](k_buffer,
-                                        v_buffer,
+        _vllm_layout_trans_kernel[grid](k_cache,
+                                        v_cache,
                                         k_values,
                                         v_values,
                                         b_query_lens_loc,
@@ -136,10 +130,11 @@ if current_platform.is_rocm():
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        k_values: torch.Tensor,
+        v_values: torch.Tensor,
         out: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
-        total_tokens: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float,
@@ -150,8 +145,8 @@ if current_platform.is_rocm():
         v_scale: torch.Tensor,
     ) -> torch.Tensor:
         k, v = vllm_layout_trans(cu_seqlens_q, cu_seqlens_k, block_table,
-                                 k_cache, v_cache, max_seqlen_k, total_tokens,
-                                 k_scale, v_scale, q.dtype)
+                                 k_cache, v_cache, k_values, v_values,
+                                 max_seqlen_k, k_scale, v_scale, q.dtype)
         output = aiter.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -173,10 +168,11 @@ if current_platform.is_rocm():
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
+        k_values: torch.Tensor,
+        v_values: torch.Tensor,
         out: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
-        total_tokens: int,
         max_seqlen_q: int,
         max_seqlen_k: int,
         softmax_scale: float,
@@ -216,7 +212,6 @@ class AiterFlashAttentionMetadata:
     max_seq_len: int
     seq_lens: torch.Tensor
     cu_seq_lens: torch.Tensor
-    total_tokens: int
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     workspace_buffer: torch.Tensor
@@ -224,9 +219,8 @@ class AiterFlashAttentionMetadata:
     # For cascade attention.
     use_cascade: bool
     common_prefix_len: int
-    cu_prefix_query_lens: Optional[torch.Tensor]
-    prefix_kv_lens: Optional[torch.Tensor]
-    suffix_kv_lens: Optional[torch.Tensor]
+    k_buffer: torch.Tensor
+    v_buffer: torch.Tensor
 
     # for local attention
     @dataclass
@@ -351,10 +345,6 @@ class AiterFlashAttentionMetadataBuilder(
 
         use_cascade = common_prefix_len > 0
 
-        cu_prefix_query_lens = None
-        prefix_kv_lens = None
-        suffix_kv_lens = None
-
         nbytes_per_qo_elem = torch.finfo(self.runner.dtype).bits // 8
         max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM -
                               1) // _PARTITION_SIZE_ROCM
@@ -367,6 +357,16 @@ class AiterFlashAttentionMetadataBuilder(
             device=self.runner.device,
         )
 
+        k_buffer = torch.empty(
+            (total_tokens, self.num_heads_kv, self.headdim),
+            dtype=self.runner.dtype,
+            device=self.runner.device,
+        )
+        v_buffer = torch.empty(
+            (total_tokens, self.num_heads_kv, self.headdim),
+            dtype=self.runner.dtype,
+            device=self.runner.device,
+        )
         attn_metadata = AiterFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -374,16 +374,14 @@ class AiterFlashAttentionMetadataBuilder(
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
             cu_seq_lens=cu_seq_lens,
-            total_tokens=total_tokens,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
             workspace_buffer=workspace_buffer,
             common_prefix_len=common_prefix_len,
-            cu_prefix_query_lens=cu_prefix_query_lens,
-            prefix_kv_lens=prefix_kv_lens,
-            suffix_kv_lens=suffix_kv_lens,
             local_attn_metadata=local_attn_metadata,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
         )
         return attn_metadata
 
@@ -585,16 +583,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
 
             if max_seqlen_q > 1:
                 cu_seq_lens = attn_metadata.cu_seq_lens
-                total_tokens = attn_metadata.total_tokens
                 torch.ops.vllm.flash_attn_varlen_func(
                     query[:num_actual_tokens],
                     key_cache,
                     value_cache,
+                    attn_metadata.k_buffer,
+                    attn_metadata.v_buffer,
                     out=output[:num_actual_tokens],
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
                     max_seqlen_k=max_seqlen_k,
-                    total_tokens=total_tokens,
                     softmax_scale=self.scale,
                     alibi_slopes=self.alibi_slopes,
                     window_size=self.sliding_window,
