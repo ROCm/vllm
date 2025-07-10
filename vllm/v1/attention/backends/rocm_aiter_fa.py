@@ -276,6 +276,9 @@ class AiterFlashAttentionMetadataBuilder(
         block_table = self.block_table
         block_table_tensor = block_table.get_device_tensor()[:num_reqs]
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        # Make seq lens equal 0 when query lens equals 1.
+        # In vllm v1, rocm passed cases which query lens equals 1
+        # in prefill stage.
         masked_seq_lens = torch.where(query_lens > 1, seq_lens,
                                       torch.zeros_like(seq_lens))
         block_table.slot_mapping[:num_actual_tokens].copy_(
