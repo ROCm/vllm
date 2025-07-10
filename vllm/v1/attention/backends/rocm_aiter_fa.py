@@ -22,6 +22,103 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+import os
+import sys
+import json
+import numpy as np
+global_count = 0
+num_hidden_layers = 32
+selected_layer_id = [0, 31]
+# root_data_dir = "/data/heyanguang/code/vllm_fa_batch_prefill/aiter/log_run/flash_attn_varlen_func_impl_dump_data/Llama-3.1-8B-Instruct-FP8-KV/"
+root_data_dir = "/data/heyanguang/code/vllm_fa_batch_prefill/aiter/log_run/flash_attn_varlen_func_impl_dump_data/Llama-3.1-8B-Instruct-FP8-KV/v2_format_prompts_1000_part1/"
+
+
+def print_tensor_info(name, value):
+    print(f"{name}:")
+    print(f"  Shape: {tuple(value.shape)}")
+    print(f"  Dtype: {value.dtype}")
+    print(f"  Device: {value.device}")
+    print(f"  Is contiguous: {value.is_contiguous()}")
+    print(f"  Stride: {value.stride()}")
+
+
+def dump_function_inputs(dump_dir, skip_data_tensor_name_list, **kwargs):
+    """
+    """
+    os.makedirs(dump_dir, exist_ok=True)
+    metadata = {
+        'tensors': {},
+        'non_tensors': {}
+    }
+
+    log_file = os.path.join(dump_dir, 'params_info.txt')
+    with open(log_file, 'w') as log:
+        for name, value in kwargs.items():
+            log.write(f"Parameter: {name}\n")
+
+            if isinstance(value, torch.Tensor):
+                log.write(f"  Type: torch.Tensor\n")
+                log.write(f"  StorageDataPtr: {value.storage().data_ptr()}\n")
+                log.write(f"  DataPtr       : {value.data_ptr()}\n")
+                log.write(f"  Shape: {tuple(value.shape)}\n")
+                log.write(f"  Dtype: {value.dtype}\n")
+                log.write(f"  Device: {value.device}\n")
+                log.write(f"  Is contiguous: {value.is_contiguous()}\n")
+                log.write(f"  Stride: {value.stride()}\n")
+
+                tensor_np = None
+                if name not in skip_data_tensor_name_list:
+                    print(f"tensor {name} save meta info to txt and data to disk")
+                    file_path = os.path.join(dump_dir, f"{name}.npy")
+                    tensor_np = value.detach().cpu().numpy()
+                    np.save(file_path, tensor_np)
+                else:
+                    print(f"tensor {name} only save meta info to txt")
+
+                num_elements = value.numel()
+                log.write(f"  Num elements: {num_elements}\n")
+
+                if num_elements <= 10:
+                    log.write(f"  Data: {tensor_np.tolist()}\n")
+                else:
+                    if name not in skip_data_tensor_name_list:
+                        flat_data = tensor_np.ravel()
+                        head = flat_data[:5].tolist()
+                        tail = flat_data[-5:].tolist()
+                        log.write(f"  Data (partial): head={head}, tail={tail}\n")
+                        log.write(f"  Data range: min={np.min(tensor_np):.4f}, max={np.max(tensor_np):.4f}, mean={np.mean(tensor_np):.4f}\n")
+
+                metadata['tensors'][name] = {
+                    'shape': list(value.shape),
+                    'dtype': str(value.dtype),
+                    'device': str(value.device),
+                    'file': f"{name}.npy",
+                    'stride': value.stride(),
+                    'is_contiguous': value.is_contiguous()
+                }
+            else:
+                log.write(f"  Type: {type(value).__name__}\n")
+
+                if value is None:
+                    log.write(f"  Value: None\n")
+                    metadata['non_tensors'][name] = None
+                elif isinstance(value, tuple) or isinstance(value, list):
+                    log.write(f"  Value[0] type: {type(value[0]).__name__}\n")
+                    log.write(f"  Value: {value}\n")
+                    metadata['non_tensors'][name] = list(value)
+                else:
+                    log.write(f"  Value: {value}\n")
+                    metadata['non_tensors'][name] = value
+        log.flush()
+
+    with open(os.path.join(dump_dir, 'metadata.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"Parameter exported to: {dump_dir}")
+    print(f"Detailed information refer to: {log_file}")
+    sys.stdout.flush()
+
+
 if current_platform.is_rocm():
     import aiter
 
@@ -143,6 +240,41 @@ if current_platform.is_rocm():
         block_table: torch.Tensor,
         kv_page_indices: torch.Tensor,
     ) -> torch.Tensor:
+
+        # print(f"AAAA=flash_attn_varlen_func_impl")
+        # global global_count
+        # skip_data_tensor_name_list = ["q", "k", "v", "out"]
+        # request_id = global_count // num_hidden_layers
+        # layer_id = global_count % num_hidden_layers
+        # if layer_id in selected_layer_id:
+        #     print(f"global_count={global_count}", flush=True)
+        #     print(f"request_id={request_id}", flush=True)
+        #     print(f"layer_id={layer_id}", flush=True)
+
+        #     dump_dir = root_data_dir + "prompt_" + str(request_id) + "/layer_" + str(layer_id)
+        #     dump_function_inputs(
+        #         dump_dir,
+        #         skip_data_tensor_name_list,
+        #         q=q,
+        #         k=k_cache,
+        #         v=v_cache,
+        #         cu_seqlens_q=cu_seqlens_q,
+        #         kv_indptr=cu_seqlens_k,
+        #         kv_page_indices=block_table,
+        #         kv_page_indices_vllm=kv_page_indices,
+        #         total_tokens=total_tokens,
+        #         max_seqlen_q=max_seqlen_q,
+        #         max_seqlen_k=max_seqlen_k,
+        #         softmax_scale=softmax_scale,
+        #         causal=True,
+        #         is_chunked_prefill=True,
+        #         alibi_slopes=alibi_slopes,
+        #         window_size=window_size,
+        #         out=out,
+        #     )
+
+        # global_count += 1
+
 
         # k, v = vllm_layout_trans(cu_seqlens_k, block_table, k_cache, v_cache,
         #                          max_seqlen_k, total_tokens)
