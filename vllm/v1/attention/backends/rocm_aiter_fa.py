@@ -48,10 +48,6 @@ if current_platform.is_rocm():
     ):
         batch_idx = tl.program_id(0)
         block_idx = tl.program_id(1)
-        batch_token_indexes = tl.load(b_seq_lens_loc + batch_idx +
-                                      tl.arange(0, 2))
-        batch_token_start, batch_token_end = tl.split(batch_token_indexes)
-        seq_len = batch_token_end - batch_token_start
 
         batch_query_indexes = tl.load(b_query_lens_loc + batch_idx +
                                       tl.arange(0, 2))
@@ -59,6 +55,12 @@ if current_platform.is_rocm():
         query_len = batch_query_end - batch_query_start
         if query_len <= 1:
             return
+
+        batch_token_indexes = tl.load(b_seq_lens_loc + batch_idx +
+                                      tl.arange(0, 2))
+        batch_token_start, batch_token_end = tl.split(batch_token_indexes)
+        seq_len = batch_token_end - batch_token_start
+
         if block_idx * BLOCK_SIZE < seq_len:
             block_mask = (block_idx * BLOCK_SIZE +
                           tl.arange(0, BLOCK_SIZE)[:, None]) < seq_len
@@ -269,12 +271,13 @@ class AiterFlashAttentionMetadataBuilder(
         max_query_len = common_attn_metadata.max_query_len
 
         max_seq_len = int(self.runner.seq_lens_np[:num_reqs].max())
-        total_tokens = int(self.runner.seq_lens_np[:num_reqs].sum())
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table = self.block_table
         block_table_tensor = block_table.get_device_tensor()[:num_reqs]
-
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        masked_seq_lens = torch.where(query_lens > 1, seq_lens,
+                                      torch.zeros_like(seq_lens))
         block_table.slot_mapping[:num_actual_tokens].copy_(
             block_table.slot_mapping_cpu[:num_actual_tokens],
             non_blocking=True)
@@ -284,10 +287,10 @@ class AiterFlashAttentionMetadataBuilder(
 
         slot_mapping = block_table.slot_mapping[:num_actual_tokens]
 
-        cu_seq_lens = torch.zeros(seq_lens.shape[0] + 1,
+        cu_seq_lens = torch.zeros(masked_seq_lens.shape[0] + 1,
                                   dtype=torch.int32,
                                   device="cuda")
-        torch.cumsum(seq_lens,
+        torch.cumsum(masked_seq_lens,
                      dim=0,
                      dtype=cu_seq_lens.dtype,
                      out=cu_seq_lens[1:])
@@ -356,14 +359,14 @@ class AiterFlashAttentionMetadataBuilder(
             dtype=torch.uint8,
             device=self.runner.device,
         )
-
+        masked_total_tokens = cu_seq_lens[-1].item()
         k_buffer = torch.empty(
-            (total_tokens, self.num_heads_kv, self.headdim),
+            (masked_total_tokens, self.num_heads_kv, self.headdim),
             dtype=self.runner.dtype,
             device=self.runner.device,
         )
         v_buffer = torch.empty(
-            (total_tokens, self.num_heads_kv, self.headdim),
+            (masked_total_tokens, self.num_heads_kv, self.headdim),
             dtype=self.runner.dtype,
             device=self.runner.device,
         )
