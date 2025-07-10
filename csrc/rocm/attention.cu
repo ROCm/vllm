@@ -112,6 +112,21 @@ __device__ __forceinline__ floatx4 gcn_mfma16x16x16_instr(const _B16x4& inpA,
   }
 }
 
+template <typename T, int absz, int cbid, int blgp>
+__device__ __forceinline__ floatx4 gcn_mfma16x16x32_instr(const long& inpA,
+                                                          const long& inpB,
+                                                          const floatx4& inpC) {
+  if constexpr (std::is_same<T, __hip_fp8_e4m3>::value) {
+    return __builtin_amdgcn_mfma_f32_16x16x32_fp8_fp8(inpA, inpB, inpC, absz, cbid,
+                                                 blgp);
+  } else if constexpr (std::is_same<T, __hip_fp8_e5m2>::value) {
+    return __builtin_amdgcn_mfma_f32_16x16x32_bf8_bf8(inpA, inpB, inpC, absz,
+                                                     cbid, blgp);
+  } else {
+    static_assert(false, "unsupported 8b dtype");
+  }
+}
+
 template <typename T>
 __device__ __forceinline__ float to_float(const T& inp) {
   if constexpr (std::is_same<T, _Float16>::value) {
@@ -261,6 +276,7 @@ typedef union u64_cvt {
   int16_t b16x4[4];
   _B8x8 b8x8;
   _B16x4 b64;
+  int64_t i64;
 } _T8x8;
 
 __device__ __forceinline__ _B8x8 convert_b16x8(const _B16x8& input, _T8x8& Mtemp)
@@ -550,7 +566,7 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
   // calculate post qk mfma scale
   float scale2 = scale;
-  float q_sclae = 1.0;
+  float q_scale = 1.0;
   if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
     float2 f2 = *reinterpret_cast<const float2*>(k_scale);
     q_scale = f2.y;
