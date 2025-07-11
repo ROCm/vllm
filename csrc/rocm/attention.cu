@@ -472,7 +472,7 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
             shared_logits[qkhe_depth][rowid][lane16id % GQA_RATIO]
                          [2 * qkratio + i];
         for(int k = 0; k< 4; k++)
-           q_max = fmax(Qlocal[qkhe_depth][qkratio].xy[i][0], q_max);
+           q_max = fmax(Qlocal[qkhe_depth][qkratio].xy[i][k], q_max);
       }
     }
   }
@@ -625,7 +625,7 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
             d_out[token_depth] = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
                   Ktmp8x8.i64, Qtmp8x8.i64,
                   d_out[token_depth]);
-         }          
+         }
         }
       }
     }
