@@ -33,7 +33,7 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 ## Performance Results
 
 The data in the following tables is a reference point to help users validate observed performance. It should not be considered as the peak performance that can be delivered by AMD Instinct™ MI300X accelerator with vLLM. See the MLPerf section in this document for information about MLPerf 4.1 inference results. The performance numbers above were collected using the steps below.
-*Note Benchmarks were run with benchmark scripts from [v0.6.5](https://github.com/vllm-project/vllm/tree/v0.6.5/benchmarks)*
+*Note Benchmarks were run with benchmark scripts from [v0.8.5](https://github.com/vllm-project/vllm/tree/v0.8.5/benchmarks)*
 
 ### Throughput Measurements
 
@@ -242,14 +242,9 @@ python3 /app/vllm/benchmarks/benchmark_latency.py \
     --output-len $OUT \
     --tensor-parallel-size $TP \
     --num-iters-warmup 3 \
-    --num-iters 5 \
-    --output-json output.json
-    --disable-custom-all-reduce
-    --compilation-config '{"full_cuda_graph": true,"custom_ops":["+rms_norm","+silu_and_mul"],"pass_config":{"enable_noop":true,"enable_fusion":true}}’
+    --num-iters 5
 
 ```
-
-For FP16 models, remove `--quantization fp8 --kv-cache-dtype fp8`. For all other models, remove `--disable-custom-all-reduce`.
 
 When measuring models with long context lengths, performance may improve by setting `--max-model-len` to a smaller value.  It is important, however, to ensure that the `--max-model-len` is at least as large as the IN + OUT token counts.
 
@@ -283,7 +278,7 @@ python3 /app/vllm/benchmarks/benchmark_throughput.py \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
     --num-scheduler-steps 10 \
-    --enable-chunked-prefill False \
+    --no-enable-chunked-prefill \
     --model $MODEL \
     --max-model-len 8192 \
     --max-num-batched-tokens 131072 \
@@ -292,14 +287,8 @@ python3 /app/vllm/benchmarks/benchmark_throughput.py \
     --output-len $OUT \
     --tensor-parallel-size $TP \
     --num-prompts $PROMPTS \
-    --max-num-seqs $MAX_NUM_SEQS \
-    --output-json output.json
-    --disable-custom-all-reduce
-    --disable-detokenize
-    --compilation-config '{"full_cuda_graph": true,"custom_ops":["+silu_and_mul"],"pass_config":{"enable_noop":true,"enable_fusion":true}}’
+    --max-num-seqs $MAX_NUM_SEQS
 ```
-
-For FP16 models, remove `--quantization fp8 --kv-cache-dtype fp8`. For all other models, remove `--disable-custom-all-reduce`.
 
 When measuring models with long context lengths, performance may improve by setting `--max-model-len` to a smaller value (8192 in this example).  It is important, however, to ensure that the `--max-model-len` is at least as large as the IN + OUT token counts.
 
