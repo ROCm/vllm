@@ -572,10 +572,8 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
   q_max = warpReduceMax(q_max);
   float q_scale = q_max > 0 ? 224.0 / q_max : 1.0;
   if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
-    float2 f2 = *reinterpret_cast<const float2*>(k_scale);
-    q_scale = f2.y;
     // multiply by k_scale if fp8 kv cache
-    scale2 *= f2.x;//*k_scale;
+    scale2 *= *k_scale;
   }
 
   floatx4 d_out[TLOOP];
