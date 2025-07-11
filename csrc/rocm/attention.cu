@@ -464,12 +464,15 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
     }
   }
   __syncthreads();
+  float q_max = 0;
   for (int qkhe_depth = 0; qkhe_depth < QKHELOOP; qkhe_depth++) {
     for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
       for (int i = 0; i < 2; i++) {
         Qlocal[qkhe_depth][qkratio].xy[i] =
             shared_logits[qkhe_depth][rowid][lane16id % GQA_RATIO]
                          [2 * qkratio + i];
+        for(int k = 0; k< 4; k++)
+           q_max = fmax(Qlocal[qkhe_depth][qkratio].xy[i][0], q_max);
       }
     }
   }
@@ -566,7 +569,8 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
   // calculate post qk mfma scale
   float scale2 = scale;
-  float q_scale = 1.0;
+  q_max = warpReduceMax(q_max);
+  float q_scale = q_max > 0 ? 224.0 / q_max : 1.0;
   if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
     float2 f2 = *reinterpret_cast<const float2*>(k_scale);
     q_scale = f2.y;
@@ -591,6 +595,7 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
         auto Ktmp = Klocal[token_depth][qkhe_depth];
         _B8x16 Ktmp8x16 = *reinterpret_cast<_B8x16*>(&Ktmp);
         for (int qkratio = 0; qkratio < QK_SIZE_RATIO; qkratio++) {
+#if 0
           if(q_scale <= 0)
           {
             _B8x8 Ktmp8x8 = Ktmp8x16.xy[qkratio];
@@ -602,6 +607,7 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
             }
           }
           else
+#endif
           {
             _T8x8 Ktmp8x8, Qtmp8x8;
             Ktmp8x8.b8x8 = Ktmp8x16.xy[qkratio];
