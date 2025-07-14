@@ -471,8 +471,9 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
         Qlocal[qkhe_depth][qkratio].xy[i] =
             shared_logits[qkhe_depth][rowid][lane16id % GQA_RATIO]
                          [2 * qkratio + i];
-        for(int k = 0; k< 4; k++)
-           q_max = fmax(Qlocal[qkhe_depth][qkratio].xy[i][k], q_max);
+        scalar_t* qptr = reinterpret_cast<scalar_t*>(&Qlocal[qkhe_depth][qkratio].xy[i]);
+        for(int k = 0; k< 2; k++)
+            q_max = fmax(to_float<scalar_t>(qptr[k]), q_max);
       }
     }
   }
