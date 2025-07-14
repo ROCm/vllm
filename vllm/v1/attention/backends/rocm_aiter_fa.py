@@ -187,7 +187,7 @@ if current_platform.is_rocm():
         return torch.empty(q.shape[0],
                            q.shape[1],
                            v_cache.shape[-2],
-                           dtype=torch.float8_e4m3fnuz,
+                           dtype=q.dtype,
                            device="cuda")
 
     direct_register_custom_op("flash_attn_varlen_func",
