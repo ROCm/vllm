@@ -120,46 +120,7 @@ def main(
         k_scale = v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
         for _ in range(num_iters):
-            if version == "v1":
-                ops.paged_attention_v1(
-                    output,
-                    query,
-                    key_cache,
-                    value_cache,
-                    num_kv_heads,
-                    scale,
-                    block_tables,
-                    seq_lens,
-                    block_size,
-                    max_seq_len,
-                    alibi_slopes,
-                    kv_cache_dtype,
-                    k_scale,
-                    v_scale,
-                )
-            elif version == "v2":
-                if not args.custom_paged_attn:
-                    ops.paged_attention_v2(
-                        output,
-                        exp_sums,
-                        max_logits,
-                        tmp_output,
-                        query,
-                        key_cache,
-                        value_cache,
-                        num_kv_heads,
-                        scale,
-                        block_tables,
-                        seq_lens,
-                        block_size,
-                        max_seq_len,
-                        alibi_slopes,
-                        kv_cache_dtype,
-                        k_scale,
-                        v_scale,
-                    )
-                else:
-                    ops.paged_attention_rocm(
+            ops.paged_attention_rocm(
                         output,
                         exp_sums,
                         max_logits,
@@ -179,8 +140,6 @@ def main(
                         k_scale,
                         v_scale,
                     )
-            else:
-                raise ValueError(f"Invalid version: {version}")
         torch.cuda.synchronize()
 
         end_time = time.perf_counter()
@@ -218,7 +177,7 @@ if __name__ == "__main__":
     )
 
     parser = FlexibleArgumentParser(description="Benchmark the paged attention kernel.")
-    parser.add_argument("--version", type=str, choices=["v1", "v2"], default="v2")
+    #parser.add_argument("--version", type=str, choices=["v1", "v2"], default="v2")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--num-query-heads", type=int, default=64)
@@ -248,10 +207,10 @@ if __name__ == "__main__":
         "data type. CUDA 11.8+ supports fp8 (=fp8_e4m3) and fp8_e5m2. "
         "ROCm (AMD GPU) supports fp8 (=fp8_e4m3)",
     )
-    '''
     parser.add_argument(
         "--custom-paged-attn", action="store_true", help="Use custom paged attention"
     )
+    '''
     args = parser.parse_args()
     print(args)
 
