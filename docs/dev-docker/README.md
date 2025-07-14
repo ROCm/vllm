@@ -21,14 +21,15 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- V1 on by default (use VLLM_USE_V1=0 to override)
-- Fixed detokenizers issue
-- Fixed AITER MoE issues
-- vLLM v0.9.1
+- No need to specify the --compilation-config parameter, these options were turned on by default
+- Fixed llama3.1 405b CAR issue (no longer need --disable-custom-all-reduce)
+- Fixed +rms_norm custom kernel issue
+- Added quick reduce (set VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=FP to enable. Supported modes are FP, INT8, INT6, INT4)
+- Mitigated the commandr model causing GPU crash through a workaround until the driver issue is fixed
 
 ## Known Issues and Workarounds
 
-- --disable-custom-all-reduce required for Llama-3.1 405B
+- AITER does not support fp8 kv cache
 
 ## Performance Results
 
@@ -41,14 +42,14 @@ The table below shows performance data where a local inference client is fed req
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 10948.9  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 9489.2               |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 9576.7               |
-|       |           |         | 2048  | 2048   | 1500        | 1500         | 6450.8                |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3329.1 |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 2733.0                |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 2765.0                |
-|       |           |         | 2048  | 2048   | 500         | 500          | 2170.1                |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 12638.9  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 10756.8               |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 10691.7               |
+|       |           |         | 2048  | 2048   | 1500        | 1500         | 7354.9                |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3912.8 |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 3084.7                |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 2935.9                |
+|       |           |         | 2048  | 2048   | 500         | 500          | 2191.5                |
 
 *TP stands for Tensor Parallelism.*
 
@@ -95,7 +96,7 @@ The table below shows latency measurement, which typically involves assessing th
 
 *TP stands for Tensor Parallelism.*
 
-Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9575F Processors, 2.25 TiB RAM, 8x AMD Instinct MI300X (192GiB, 750W) GPUs, Ubuntu 22.04, and amdgpu driver 6.8.5
+Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 Processors, 2.25 TiB RAM, 8x AMD Instinct MI300X (192GiB, 750W) GPUs, Ubuntu 22.04, and amdgpu driver 6.8.5
 
 ## Reproducing Benchmarked Results
 
@@ -225,6 +226,7 @@ You can run latency tests for FP8 models with:
 
 ```bash
 export VLLM_USE_TRITON_FLASH_ATTN=0
+export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1
 MODEL=amd/Llama-3.1-405B-Instruct-FP8-KV
 BS=1
 IN=128
@@ -264,6 +266,7 @@ You can run throughput tests for FP8 models with:
 
 ```bash
 export VLLM_USE_TRITON_FLASH_ATTN=0
+export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1
 MODEL=amd/Llama-3.1-405B-Instruct-FP8-KV
 IN=128
 OUT=2048
@@ -275,10 +278,9 @@ python3 /app/vllm/benchmarks/benchmark_throughput.py \
     --distributed-executor-backend mp \
     --kv-cache-dtype fp8 \
     --dtype float16 \
+    --disable-detokenize \
     --gpu-memory-utilization 0.9 \
     --trust-remote-code \
-    --num-scheduler-steps 10 \
-    --no-enable-chunked-prefill \
     --model $MODEL \
     --max-model-len 8192 \
     --max-num-batched-tokens 131072 \
@@ -451,6 +453,8 @@ Some use cases include:
 
 ```bash
 export VLLM_ROCM_USE_AITER=1
+export VLLM_ROCM_USE_AITER_MHA=0
+export VLLM_ROCM_USE_AITER_RMSNORM=0
 python3 /app/vllm/benchmarks/benchmark_latency.py --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 256 --input-len 128 --output-len 2048
 ```
 
@@ -487,7 +491,7 @@ To reproduce the release docker:
 ```bash
     git clone https://github.com/ROCm/vllm.git
     cd vllm
-    git checkout b335519f20495128a47d86f2c01dd467e2fe602b
+    git checkout b432b7a285aa0dcb9677380936ffa74931bb6d6f
     docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
@@ -503,6 +507,13 @@ Use AITER release candidate branch instead:
 ```
 
 ## Changelog
+
+20250715_aiter:
+- No need to specify the --compilation-config parameter, these options were turned on by default
+- Fixed llama3.1 405b CAR issue (no longer need --disable-custom-all-reduce)
+- Fixed +rms_norm custom kernel issue
+- Added quick reduce (set VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=FP to enable. Supported modes are FP, INT8, INT6, INT4)
+- Mitigated the commandr model causing GPU crash through a workaround until the driver issue is fixed
 
 20250620_aiter:
 - V1 on by default (use VLLM_USE_V1=0 to override)
