@@ -613,12 +613,14 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
 
             for(int n = 0; n < 2; n++)
             {
-                Qtmp8x8.b16x4[n*2] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                              to_float<scalar_t>(Qlocal[qkhe_depth][qkratio].xy[n][0])*q_scale,
-                              to_float<scalar_t>(Qlocal[qkhe_depth][qkratio].xy[n][1])*q_scale, 0, false);
-                Qtmp8x8.b16x4[n*2+1] = __builtin_amdgcn_cvt_pk_fp8_f32(
-                              to_float<_Float16>(Qlocal[qkhe_depth][qkratio].xy[n][2])*q_scale,
-                              to_float<_Float16>(Qlocal[qkhe_depth][qkratio].xy[n][3])*q_scale, 0, false);
+              scalar_t* qptr = reinterpret_cast<scalar_t*>(&Qlocal[qkhe_depth][qkratio].xy[n]);
+
+              Qtmp8x8.b16x4[n*2] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                            to_float<scalar_t>(qptr[0])*q_scale,
+                            to_float<scalar_t>(qptr[1])*q_scale, 0, false);
+              Qtmp8x8.b16x4[n*2+1] = __builtin_amdgcn_cvt_pk_fp8_f32(
+                            to_float<scalar_t>(qptr[2])*q_scale,
+                            to_float<scalar_t>(qptr[3])*q_scale, 0, false);
             }
 
             d_out[token_depth] = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
