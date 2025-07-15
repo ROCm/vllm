@@ -471,9 +471,11 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
         Qlocal[qkhe_depth][qkratio].xy[i] =
             shared_logits[qkhe_depth][rowid][lane16id % GQA_RATIO]
                          [2 * qkratio + i];
-        scalar_t* qptr = reinterpret_cast<scalar_t*>(&Qlocal[qkhe_depth][qkratio].xy[i]);
-        for(int k = 0; k< 2; k++)
-            q_max = fmax(to_float<scalar_t>(qptr[k]), q_max);
+        if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto){
+           scalar_t* qptr = reinterpret_cast<scalar_t*>(&Qlocal[qkhe_depth][qkratio].xy[i]);
+           for(int k = 0; k< 2; k++)
+               q_max = fmax(to_float<scalar_t>(qptr[k]), q_max);
+        }
       }
     }
   }
@@ -575,6 +577,7 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
   if constexpr (KV_DTYPE != vllm::Fp8KVCacheDataType::kAuto) {
     // multiply by k_scale if fp8 kv cache
     scale2 *= *k_scale;
+    scale2 /= q_scale;
   }
 
   floatx4 d_out[TLOOP];
