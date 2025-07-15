@@ -240,7 +240,7 @@ class AiterFlashAttentionMetadata:
 
 class AiterFlashAttentionMetadataBuilder(
         AttentionMetadataBuilder[AiterFlashAttentionMetadata]):
-    full_cudagraph_supported: ClassVar[bool] = True
+    full_cudagraph_supported: ClassVar[bool] = False
 
     def __init__(self, runner: "GPUModelRunner", kv_cache_spec: AttentionSpec,
                  block_table: BlockTable):
