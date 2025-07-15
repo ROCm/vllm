@@ -325,9 +325,7 @@ vllm serve amd/Llama-3.1-70B-Instruct-FP8-KV \
     --gpu-memory-utilization 0.99 \
     --num_scheduler-steps 10
 ```
-For FP16 models, remove `--kv-cache-dtype fp8`. 
-
-Change port (for example --port 8005) if port=8000 is currently being used by other processes.
+For FP16 models, remove `--kv-cache-dtype fp8`. Change port (for example --port 8005) if port=8000 is currently being used by other processes.
 
 Run client in a separate terminal. Use port_id from previous step else port-id=8000.
 
