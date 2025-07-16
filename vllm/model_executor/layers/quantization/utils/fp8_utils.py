@@ -48,7 +48,7 @@ def rocm_aiter_gemm_w8a8_blockscale_impl(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     import aiter as rocm_aiter
@@ -61,7 +61,7 @@ def rocm_aiter_gemm_w8a8_blockscale_fake(
     B: torch.Tensor,
     As: torch.Tensor,
     Bs: torch.Tensor,
-    block_size: list[int],
+    block_size: List[int],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
 

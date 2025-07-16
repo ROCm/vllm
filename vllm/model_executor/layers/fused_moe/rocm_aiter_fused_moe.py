@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from enum import IntEnum
 from functools import cache
-from typing import Optional
+from typing import Optional, List
 
 import torch
 
@@ -228,7 +228,7 @@ def rocm_aiter_asm_moe_impl(
     fc2_smooth_scale: Optional[torch.Tensor] = None,
     a16: bool = False,
     per_tensor_quant_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
+    block_shape: Optional[List[int]] = None,
     expert_mask: Optional[torch.Tensor] = None,
     activation_method: int = ActivationMethod.SILU.value,
 ) -> torch.Tensor:
@@ -266,7 +266,7 @@ def rocm_aiter_asm_moe_fake(
     fc2_smooth_scale: Optional[torch.Tensor] = None,
     a16: bool = False,
     per_tensor_quant_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
+    block_shape: Optional[List[int]] = None,
     expert_mask: Optional[torch.Tensor] = None,
     activation_method: int = ActivationMethod.SILU.value,
 ) -> torch.Tensor:
