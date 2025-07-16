@@ -53,6 +53,7 @@ if current_platform.is_rocm():
                                       tl.arange(0, 2))
         batch_query_start, batch_query_end = tl.split(batch_query_indexes)
         query_len = batch_query_end - batch_query_start
+
         if query_len <= 1:
             return
 
@@ -87,7 +88,6 @@ if current_platform.is_rocm():
                           tl.load(v_scale)).to(output_dtype)
             else:
                 v_vals = v_vals.to(output_dtype)
-
             kv_values_off = batch_token_start * E_DIM + \
                 block_idx * BLOCK_SIZE * E_DIM + \
                 tl.arange(0, BLOCK_SIZE)[:, None] * E_DIM + \
@@ -96,11 +96,22 @@ if current_platform.is_rocm():
             tl.store(v_values_ptr + kv_values_off, v_vals, mask=block_mask)
 
     def vllm_layout_trans(b_query_lens_loc, b_seq_lens_loc, block_table,
-                          k_cache, v_cache, k_values, v_values, max_seq_len,
-                          k_scale, v_scale, output_dtype):
+                          k_cache, v_cache, max_seq_len, k_scale, v_scale,
+                          output_dtype):
         H_KV = v_cache.shape[2]
         D = v_cache.shape[3]
         BLOCK_SIZE = v_cache.shape[1]
+        total_tokens = int(b_seq_lens_loc[-1].item())
+        k_values = torch.empty(
+            (total_tokens, H_KV, D),
+            dtype=output_dtype,
+            device=k_cache.device,
+        )
+        v_values = torch.empty(
+            (total_tokens, H_KV, D),
+            dtype=output_dtype,
+            device=v_cache.device,
+        )
 
         grid = (block_table.shape[0],
                 (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE)
@@ -132,8 +143,6 @@ if current_platform.is_rocm():
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        k_values: torch.Tensor,
-        v_values: torch.Tensor,
         out: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
@@ -147,8 +156,9 @@ if current_platform.is_rocm():
         v_scale: torch.Tensor,
     ) -> torch.Tensor:
         k, v = vllm_layout_trans(cu_seqlens_q, cu_seqlens_k, block_table,
-                                 k_cache, v_cache, k_values, v_values,
-                                 max_seqlen_k, k_scale, v_scale, q.dtype)
+                                 k_cache, v_cache, max_seqlen_k, k_scale,
+                                 v_scale, q.dtype)
+
         output = aiter.flash_attn_varlen_func(
             q=q,
             k=k,
@@ -170,8 +180,6 @@ if current_platform.is_rocm():
         q: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
-        k_values: torch.Tensor,
-        v_values: torch.Tensor,
         out: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         cu_seqlens_k: torch.Tensor,
@@ -213,7 +221,6 @@ class AiterFlashAttentionMetadata:
     query_start_loc: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
-    cu_seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
     workspace_buffer: torch.Tensor
@@ -221,8 +228,6 @@ class AiterFlashAttentionMetadata:
     # For cascade attention.
     use_cascade: bool
     common_prefix_len: int
-    k_buffer: torch.Tensor
-    v_buffer: torch.Tensor
 
     # for local attention
     @dataclass
@@ -240,7 +245,7 @@ class AiterFlashAttentionMetadata:
 
 class AiterFlashAttentionMetadataBuilder(
         AttentionMetadataBuilder[AiterFlashAttentionMetadata]):
-    full_cudagraph_supported: ClassVar[bool] = False
+    full_cudagraph_supported: ClassVar[bool] = True
 
     def __init__(self, runner: "GPUModelRunner", kv_cache_spec: AttentionSpec,
                  block_table: BlockTable):
@@ -269,34 +274,27 @@ class AiterFlashAttentionMetadataBuilder(
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
-
-        max_seq_len = int(self.runner.seq_lens_np[:num_reqs].max())
+        if self.runner.full_cuda_graph:
+            max_seq_len = self.runner.max_model_len
+        else:
+            max_seq_len = int(self.runner.seq_lens_np[:num_reqs].max())
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
         block_table = self.block_table
         block_table_tensor = block_table.get_device_tensor()[:num_reqs]
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+
         # Make seq lens equal 0 when query lens equals 1.
         # In vllm v1, rocm passed cases which query lens equals 1
         # in prefill stage.
-        masked_seq_lens = torch.where(query_lens > 1, seq_lens,
-                                      torch.zeros_like(seq_lens))
         block_table.slot_mapping[:num_actual_tokens].copy_(
             block_table.slot_mapping_cpu[:num_actual_tokens],
             non_blocking=True)
+
         # Fill unused with -1. Needed for reshape_and_cache in full cuda graph
         # mode.
         block_table.slot_mapping[num_actual_tokens:].fill_(-1)
 
         slot_mapping = block_table.slot_mapping[:num_actual_tokens]
-
-        cu_seq_lens = torch.zeros(masked_seq_lens.shape[0] + 1,
-                                  dtype=torch.int32,
-                                  device="cuda")
-        torch.cumsum(masked_seq_lens,
-                     dim=0,
-                     dtype=cu_seq_lens.dtype,
-                     out=cu_seq_lens[1:])
 
         def schedule(batch_size, cu_query_lens, max_query_len, seqlens,
                      max_seq_len, causal):
@@ -354,40 +352,36 @@ class AiterFlashAttentionMetadataBuilder(
         nbytes_per_qo_elem = torch.finfo(self.runner.dtype).bits // 8
         max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM -
                               1) // _PARTITION_SIZE_ROCM
+        if self.runner.full_cuda_graph:
+            workspace_buffer = torch.empty(
+                (self.runner.max_num_reqs * self.num_heads_q *
+                 max_num_partitions * self.headdim) * nbytes_per_qo_elem + 2 *
+                (self.runner.max_num_reqs * self.num_heads_q *
+                 max_num_partitions) * 4,
+                dtype=torch.uint8,
+                device=self.runner.device,
+            )
+        else:
+            workspace_buffer = torch.empty(
+                (num_reqs * self.num_heads_q * max_num_partitions *
+                 self.headdim) * nbytes_per_qo_elem + 2 *
+                (num_reqs * self.num_heads_q * max_num_partitions) * 4,
+                dtype=torch.uint8,
+                device=self.runner.device,
+            )
 
-        workspace_buffer = torch.empty(
-            (num_reqs * self.num_heads_q * max_num_partitions * self.headdim) *
-            nbytes_per_qo_elem + 2 *
-            (num_reqs * self.num_heads_q * max_num_partitions) * 4,
-            dtype=torch.uint8,
-            device=self.runner.device,
-        )
-        masked_total_tokens = cu_seq_lens[-1].item()
-        k_buffer = torch.empty(
-            (masked_total_tokens, self.num_heads_kv, self.headdim),
-            dtype=self.runner.dtype,
-            device=self.runner.device,
-        )
-        v_buffer = torch.empty(
-            (masked_total_tokens, self.num_heads_kv, self.headdim),
-            dtype=self.runner.dtype,
-            device=self.runner.device,
-        )
         attn_metadata = AiterFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
-            cu_seq_lens=cu_seq_lens,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
             workspace_buffer=workspace_buffer,
             common_prefix_len=common_prefix_len,
             local_attn_metadata=local_attn_metadata,
-            k_buffer=k_buffer,
-            v_buffer=v_buffer,
         )
         return attn_metadata
 
@@ -588,13 +582,18 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 block_table = attn_metadata.block_table
 
             if max_seqlen_q > 1:
-                cu_seq_lens = attn_metadata.cu_seq_lens
+                cu_seq_lens = torch.zeros(seqused_k.shape[0] + 1,
+                                          dtype=torch.int32,
+                                          device="cuda")
+                torch.cumsum(seqused_k,
+                             dim=0,
+                             dtype=cu_seq_lens.dtype,
+                             out=cu_seq_lens[1:])
+
                 torch.ops.vllm.flash_attn_varlen_func(
                     query[:num_actual_tokens],
                     key_cache,
                     value_cache,
-                    attn_metadata.k_buffer,
-                    attn_metadata.v_buffer,
                     out=output[:num_actual_tokens],
                     cu_seqlens_q=cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
