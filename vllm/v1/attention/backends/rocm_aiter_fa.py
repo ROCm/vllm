@@ -149,9 +149,9 @@ if current_platform.is_rocm():
         block_table: torch.Tensor,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
-        total_tokens: int | None = None,
+        total_tokens: int = 0,
     ) -> torch.Tensor:
-        if total_tokens is None:
+        if total_tokens == 0:
             total_tokens = int(cu_seqlens_k[-1].item())
         k, v = vllm_layout_trans(cu_seqlens_q, cu_seqlens_k, block_table,
                                  k_cache, v_cache, max_seqlen_k, k_scale,
@@ -189,7 +189,7 @@ if current_platform.is_rocm():
         block_table: torch.Tensor,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
-        total_tokens: int | None,
+        total_tokens: int = 0,
     ) -> torch.Tensor:
         return torch.empty(q.shape[0],
                            q.shape[1],
@@ -221,13 +221,12 @@ class AiterFlashAttentionMetadata:
     max_seq_len: int
     seq_lens: torch.Tensor
     slot_mapping: torch.Tensor
-    workspace_buffer: torch.Tensor
     block_table: torch.Tensor
 
     # For cascade attention.
     use_cascade: bool
     common_prefix_len: int
-    total_tokens: int | None
+    total_tokens: int
 
     # for local attention
     @dataclass
@@ -265,7 +264,7 @@ class AiterFlashAttentionMetadataBuilder(
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: Optional[tuple[int, int]] = None
-        self.total_tokens: int | None = None
+        self.total_tokens: int = 0
 
     def reorder_batch(self, input_batch, scheduler_output) -> bool:
         return False
@@ -276,7 +275,7 @@ class AiterFlashAttentionMetadataBuilder(
             * self.vllm_config.scheduler_config.max_num_partial_prefills
         res = self.build(common_prefix_len=0,
                          common_attn_metadata=common_attn_metadata)
-        self.total_tokens = None
+        self.total_tokens = 0
         return res
 
     def build(self,
@@ -286,13 +285,7 @@ class AiterFlashAttentionMetadataBuilder(
 
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
-
-        if self.vllm_config.compilation_config.full_cuda_graph:
-            max_seq_len = self.model_config.max_model_len
-            num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        else:
-            max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
-            num_seqs = common_attn_metadata.num_reqs
+        max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
@@ -352,16 +345,6 @@ class AiterFlashAttentionMetadataBuilder(
 
         use_cascade = common_prefix_len > 0
 
-        nbytes_per_qo_elem = torch.finfo(self.model_config.dtype).bits // 8
-        max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM -
-                              1) // _PARTITION_SIZE_ROCM
-        workspace_buffer = torch.empty(
-            (num_seqs * self.num_heads_q * max_num_partitions * self.headdim) *
-            nbytes_per_qo_elem + 2 *
-            (num_seqs * self.num_heads_q * max_num_partitions) * 4,
-            dtype=torch.uint8,
-            device=self.device,
-        )
         attn_metadata = AiterFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -371,7 +354,6 @@ class AiterFlashAttentionMetadataBuilder(
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
             use_cascade=use_cascade,
-            workspace_buffer=workspace_buffer,
             common_prefix_len=common_prefix_len,
             local_attn_metadata=local_attn_metadata,
             total_tokens=self.total_tokens,
@@ -579,6 +561,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 block_table = attn_metadata.block_table
 
             if max_seqlen_q > 1:
+
                 cu_seq_lens = torch.zeros(seqused_k.shape[0] + 1,
                                           dtype=torch.int32,
                                           device="cuda")
@@ -607,9 +590,19 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     total_tokens=attn_metadata.total_tokens,
                 )
 
+            nbytes_per_qo_elem = torch.finfo(query.dtype).bits // 8
+            workspace_buffer = torch.empty(
+                (block_table.shape[0] * query.shape[1] * _PARTITION_SIZE_ROCM *
+                 query.shape[2]) * nbytes_per_qo_elem + 2 *
+                (block_table.shape[0] * query.shape[1] * _PARTITION_SIZE_ROCM)
+                * 4,
+                dtype=torch.uint8,
+                device=query.device,
+            )
+
             torch.ops.aiter.paged_attention_v1(
                 output[:num_actual_tokens],
-                attn_metadata.workspace_buffer,
+                workspace_buffer,
                 query[:num_actual_tokens],
                 key_cache,
                 value_cache,
