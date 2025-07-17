@@ -818,7 +818,7 @@ __launch_bounds__(NUM_THREADS, 5) void paged_attention_ll4mi_QKV_mfma16_kernel(
                    rowid * ELEMS16_ELEMS8_RATIO * ELEMS8_ELEMS4_RATIO +
                    j * ELEMS8_ELEMS4_RATIO + i;
                const int offset1 = offset % ROWS_PER_WARP;
-               const int offset2 = offset / ROWS_PER_WARP;
+               const int offset2 = offset / ROWS_PER_WARP / 2;
                // output format is 16 qheads across 16 lanes, 16 head elems
                // spread across 4 rows
                tmp_out = gcn_mfma16x16x32_instr<__hip_fp8_e4m3, 0, 0, 0>(
