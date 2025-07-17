@@ -840,7 +840,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                         self.num_heads,
                         self.head_size,
                         self.scale,
-                        causal_mask,
                         attn_masks,
                     )
                 else:
@@ -991,7 +990,6 @@ def _sdpa_attention(
     num_heads: int,
     head_size: int,
     scale: float,
-    is_causal: bool,
     attn_masks: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
     start = 0
@@ -1008,7 +1006,7 @@ def _sdpa_attention(
                 key[:, start:end, :],
                 value[:, start:end, :],
                 dropout_p=0.0,
-                is_causal=is_causal,
+                is_causal=attn_masks is None,
                 attn_mask=attn_masks[i] if attn_masks else None,
                 scale=scale).movedim(query.dim() - 2, 0)
             output[start:end, :, :] = sub_out
