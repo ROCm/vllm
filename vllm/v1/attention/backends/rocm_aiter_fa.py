@@ -272,7 +272,7 @@ class AiterFlashAttentionMetadataBuilder(
 
     def build_for_cudagraph_capture(
             self, common_attn_metadata: CommonAttentionMetadata):
-        self.total_tokens = self.vllm_config.model_config.max_model_len \
+        self.total_tokens = self.model_config.max_model_len \
             * self.vllm_config.scheduler_config.max_num_partial_prefills
         res = self.build(common_prefix_len=0,
                          common_attn_metadata=common_attn_metadata)
@@ -288,7 +288,7 @@ class AiterFlashAttentionMetadataBuilder(
         max_query_len = common_attn_metadata.max_query_len
 
         if self.vllm_config.compilation_config.full_cuda_graph:
-            max_seq_len = self.vllm_config.model_config.max_model_len
+            max_seq_len = self.model_config.max_model_len
             num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         else:
             max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
@@ -352,8 +352,7 @@ class AiterFlashAttentionMetadataBuilder(
 
         use_cascade = common_prefix_len > 0
 
-        nbytes_per_qo_elem = torch.finfo(
-            self.vllm_config.model_config.dtype).bits // 8
+        nbytes_per_qo_elem = torch.finfo(self.model_config.dtype).bits // 8
         max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM -
                               1) // _PARTITION_SIZE_ROCM
         workspace_buffer = torch.empty(
