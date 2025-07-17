@@ -139,17 +139,7 @@ def test_varlen_with_paged_kv(
                                  dtype=torch.int32)
 
     output = torch.empty_like(query)
-    total_tokens = cu_seq_lens[-1].item()
-    k_buffer = torch.empty(
-        (total_tokens, num_kv_heads, head_size),
-        dtype=dtype,
-        device=torch.device("cuda"),
-    )
-    v_buffer = torch.empty(
-        (total_tokens, num_kv_heads, head_size),
-        dtype=dtype,
-        device=torch.device("cuda"),
-    )
+
     maybe_quantized_query = query
     maybe_quantized_key_cache = key_cache
     maybe_quantized_value_cache = value_cache
@@ -169,8 +159,6 @@ def test_varlen_with_paged_kv(
         maybe_quantized_query,
         maybe_quantized_key_cache,
         maybe_quantized_value_cache,
-        k_buffer,
-        v_buffer,
         out=output,
         cu_seqlens_q=cu_query_lens,
         max_seqlen_q=max_query_len,
