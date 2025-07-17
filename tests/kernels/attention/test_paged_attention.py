@@ -165,7 +165,7 @@ def main(
     print("\nresult f16= ", output.shape, output[0,0,:])
     f16_output = output
 
-    diff = f16_output - fp8_ouput
+    diff = f16_output - fp8_output
     print("output mean(fp16, fp8) = ", torch.mean(f16_output), torch.mean(fp8_output))
     print("diff(fp16, fp8) mean, std = ", torch.mean(diff), torch.std(diff))
 
