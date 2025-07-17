@@ -177,7 +177,7 @@ if __name__ == "__main__":
     )
 
     parser = FlexibleArgumentParser(description="Benchmark the paged attention kernel.")
-    #parser.add_argument("--version", type=str, choices=["v1", "v2"], default="v2")
+    parser.add_argument("--version", type=str, choices=["v1", "v2"], default="v2")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seq-len", type=int, default=4096)
     parser.add_argument("--num-query-heads", type=int, default=64)
@@ -190,14 +190,11 @@ if __name__ == "__main__":
     )
     parser.add_argument("--block-size", type=int, choices=[16, 32], default=16)
     parser.add_argument("--use-alibi", action="store_true")
-    '''
     parser.add_argument(
         "--dtype", type=str, choices=["half", "bfloat16", "float"], default="half"
     )
-    '''
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--profile", action="store_true")
-    '''
     parser.add_argument(
         "--kv-cache-dtype",
         type=str,
@@ -210,7 +207,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--custom-paged-attn", action="store_true", help="Use custom paged attention"
     )
-    '''
     args = parser.parse_args()
     print(args)
 
@@ -225,7 +221,7 @@ if __name__ == "__main__":
         head_size=args.head_size,
         block_size=args.block_size,
         use_alibi=args.use_alibi,
-        dtype=STR_DTYPE_TO_TORCH_DTYPE["fp8"],
+        dtype=STR_DTYPE_TO_TORCH_DTYPE[args.dtype],
         seed=args.seed,
         do_profile=args.profile,
         kv_cache_dtype="auto",
