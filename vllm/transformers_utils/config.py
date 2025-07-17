@@ -392,7 +392,10 @@ def get_config(
                     raise RuntimeError(err_msg) from e
                 else:
                     raise e
-        config = _maybe_remap_hf_config_attrs(config)
+            if config.model_type in _CONFIG_REGISTRY:
+                config_class = _CONFIG_REGISTRY[config.model_type]
+                config = config_class.from_pretrained(
+                    model, revision=revision, code_revision=code_revision)
 
     elif config_format == ConfigFormat.MISTRAL:
         # This function loads a params.json config which

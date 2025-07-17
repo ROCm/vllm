@@ -281,6 +281,19 @@ def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
 
 
+def scaled_rms_norm(out: torch.Tensor, input: torch.Tensor,
+                    weight: torch.Tensor, scale: torch.Tensor,
+                    epsilon: float) -> None:
+    torch.ops._C.rms_norm_static_fp8_quant(out, input, weight, scale, epsilon)
+
+
+def scaled_fused_add_rms_norm(out: torch.Tensor, input: torch.Tensor,
+                              residual: torch.Tensor, weight: torch.Tensor,
+                              scale: torch.Tensor, epsilon: float) -> None:
+    torch.ops._C.fused_add_rms_norm_static_fp8_quant(out, input, residual,
+                                                     weight, scale, epsilon)
+
+
 def apply_repetition_penalties_torch(
         logits: torch.Tensor, prompt_mask: torch.Tensor,
         output_mask: torch.Tensor, repetition_penalties: torch.Tensor) -> None:
@@ -1760,6 +1773,11 @@ def open_mem_handle(mem_handle: torch.Tensor):
 
 def free_shared_buffer(ptr: int) -> None:
     torch.ops._C_custom_ar.free_shared_buffer(ptr)
+
+
+def LLMM_Silu(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor,
+              rows_per_block: int) -> None:
+    torch.ops._rocm_C.LLMM_Silu(a, b, out, rows_per_block)
 
 
 # quick all reduce
