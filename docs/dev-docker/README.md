@@ -292,7 +292,7 @@ python3 /app/vllm/benchmarks/benchmark_throughput.py \
     --max-num-seqs $MAX_NUM_SEQS
 ```
 
-For FP16 models, remove `--kv-cache-dtype fp8`. 
+For FP16 models, remove `--kv-cache-dtype fp8`.
 
 When measuring models with long context lengths, performance may improve by setting `--max-model-len` to a smaller value (8192 in this example).  It is important, however, to ensure that the `--max-model-len` is at least as large as the IN + OUT token counts.
 
