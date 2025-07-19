@@ -150,25 +150,39 @@ def main(
     # Warmup.
     print("Verification...")
     run_benchmark = run_cuda_benchmark
+    import copy
 
     key_cache, value_cache = key_cache_fp8, value_cache_fp8
     kv_cache_dtype = "fp8"
     print("\nkey fp8= ", key_cache[0,0,0,:,:])
     run_benchmark(num_iters=1, profile=False)
     print("\nresult fp8= ", output.shape, output[0,0,:])
-    fp8_output = output
-
+    fp8_output = copy.deepcopy(output)
+ 
     key_cache, value_cache = key_cache_f16, value_cache_f16
     kv_cache_dtype = "auto"
     print("\nkey f16= ", key_cache_f16[0,0,0,:,:])
     run_benchmark(num_iters=1, profile=False)
     print("\nresult f16= ", output.shape, output[0,0,:])
-    f16_output = output
+    f16_output = copy.deepcopy(output)
 
+    sel = torch.abs(f16_output)>1e-3 # min precision for fp8 
     diff = f16_output - fp8_output
-    print("output mean(fp16, fp8) = ", torch.mean(f16_output), torch.mean(fp8_output))
-    print("diff(fp16, fp8) mean, std = ", torch.mean(diff), torch.std(diff))
 
+    diff = 100*torch.abs(diff[sel]/f16_output[sel])
+    loc = diff>10 # different > 10%
+
+    print("Diff = 100*(fp16-fp8)/fp16: ",
+          "\nmean   = ", torch.mean(diff).item(),
+          "\nmax    = ", torch.max(diff).item(),
+          "\nmdeian = ", torch.median(diff).item(),
+          "\nstd    = ", torch.std(diff).item())
+
+    print("Outlier: ", loc.shape, torch.sum(loc).item(),
+          "\ndiff = ", diff[loc==True],
+          "\nfp16 = ", f16_output[sel][loc==True],
+          "\nfp8  = ", fp8_output[sel][loc==True],
+          "\nquery= ", query[sel][loc==True])
 
 if __name__ == "__main__":
     logger.warning(
