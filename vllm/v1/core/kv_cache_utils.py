@@ -11,7 +11,8 @@ from typing import Any, Callable, NamedTuple, Optional
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.utils import GiB_bytes, cdiv, sha256_cbor_64bit
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
+from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
+                                        FullAttentionSpec, KVCacheConfig,
                                         KVCacheGroupSpec, KVCacheSpec,
                                         KVCacheTensor, SlidingWindowSpec)
 from vllm.v1.metrics.stats import PrefixCacheStats
@@ -153,6 +154,8 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # TODO(Jialin): For performance, let callers handle ref_cnt bumps to
+    # avoid function calls.
     def incr_ref(self):
         self.ref_cnt += 1
 
@@ -272,6 +275,39 @@ class FreeKVCacheBlockQueue:
         self.num_free_blocks -= 1
         return first_block
 
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        """Pop the first n free blocks and reduce num_free_blocks by n.
+
+        Args:
+            n: The number of blocks to pop.
+
+        Returns:
+            A list of n free blocks.
+        """
+        if n == 0:
+            return []
+        assert self.num_free_blocks >= n
+        self.num_free_blocks -= n
+
+        curr_block = self.fake_free_list_head.next_free_block
+        # Pop n blocks from the head of the list
+        ret = []
+        for _ in range(n):
+            assert curr_block is not None
+            ret.append(curr_block)
+            last_block = curr_block
+            curr_block = curr_block.next_free_block
+            # Reset prev_free_block and next_free_block of all popped blocks
+            last_block.prev_free_block = None
+            last_block.next_free_block = None
+
+        if curr_block is not None:
+            # The queue is not empty, connect the fake head to
+            # the new first block.
+            self.fake_free_list_head.next_free_block = curr_block
+            curr_block.prev_free_block = self.fake_free_list_head
+        return ret
+
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
 
@@ -314,6 +350,29 @@ class FreeKVCacheBlockQueue:
 
         self.num_free_blocks += 1
 
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        """Put a list of blocks back into the free list
+
+        Args:
+            blocks: The blocks to append.
+        """
+        if len(blocks) == 0:
+            return
+        self.num_free_blocks += len(blocks)
+
+        last_block = self.fake_free_list_tail.prev_free_block
+        assert last_block is not None, (
+            "prev_free_block of fake_free_list_tail should always exist")
+        # Add inter-connections between consecutive blocks
+        for block in blocks:
+            block.prev_free_block = last_block
+            last_block.next_free_block = block
+            last_block = block
+
+        # Connect the last block of <blocks> to the fake tail
+        last_block.next_free_block = self.fake_free_list_tail
+        self.fake_free_list_tail.prev_free_block = last_block
+
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
 
@@ -347,9 +406,9 @@ def need_extra_keys(request: Request) -> bool:
     # Multimodal requests need to include the MM hash.
     # LoRA requests need to include the LoRA ID.
     # Request with provided cache salt need to include the salt.
-    return bool(request.mm_positions) or (request.lora_request
-                                          is not None) or (request.cache_salt
-                                                           is not None)
+    return bool(request.mm_hashes) or (request.lora_request
+                                       is not None) or (request.cache_salt
+                                                        is not None)
 
 
 def _gen_mm_extra_hash_keys(request: Request, start_token_idx: int,
@@ -976,7 +1035,11 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
         isinstance(spec, FullAttentionSpec) for spec in kv_cache_spec.values())
     has_sliding_window = any(
         isinstance(spec, SlidingWindowSpec) for spec in kv_cache_spec.values())
-    if has_full_attention and has_sliding_window:
+    has_chunked_local_attention = any(
+        isinstance(spec, ChunkedLocalAttentionSpec)
+        for spec in kv_cache_spec.values())
+    if has_full_attention and (has_sliding_window
+                               or has_chunked_local_attention):
         for layer_name, spec in kv_cache_spec.items():
             if isinstance(spec, SlidingWindowSpec):
                 kv_cache_spec[layer_name] = FullAttentionSpec(
@@ -986,6 +1049,15 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
                     dtype=spec.dtype,
                     use_mla=spec.use_mla,
                     sliding_window=spec.sliding_window,
+                )
+            elif isinstance(spec, ChunkedLocalAttentionSpec):
+                kv_cache_spec[layer_name] = FullAttentionSpec(
+                    block_size=spec.block_size,
+                    num_kv_heads=spec.num_kv_heads,
+                    head_size=spec.head_size,
+                    dtype=spec.dtype,
+                    use_mla=spec.use_mla,
+                    attention_chunk_size=spec.attention_chunk_size,
                 )
 
     if is_hybrid(kv_cache_spec):
@@ -1010,7 +1082,6 @@ def get_kv_cache_config(
         The generated KVCacheConfigs
     """
     check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
-
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
