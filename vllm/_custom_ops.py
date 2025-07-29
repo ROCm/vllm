@@ -50,6 +50,37 @@ def wvSplitK(a: torch.Tensor, b: torch.Tensor, cu_count: int) -> torch.Tensor:
     return torch.ops._rocm_C.wvSplitK(a, b, cu_count)
 
 
+def rocm_grouped_topk(gating_output: torch.Tensor,
+                      topk_weights: torch.Tensor,
+                      topk_ids: torch.Tensor,
+                      num_expert_group: int,
+                      topk_grp: int,
+                      need_renorm: bool,
+                      scoring_func: str = "softmax",
+                      routed_scaling_factor: float = 1.,
+                      num_fused_shared_experts: int = 0) -> None:
+    torch.ops._rocm_C.grouped_topk(gating_output, topk_weights, topk_ids,
+                                   num_expert_group, topk_grp, need_renorm,
+                                   scoring_func, routed_scaling_factor,
+                                   num_fused_shared_experts)
+
+
+def rocm_biased_grouped_topk(gating_output: torch.Tensor,
+                             correction_bias: torch.Tensor,
+                             topk_weights: torch.Tensor,
+                             topk_ids: torch.Tensor,
+                             num_expert_group: int,
+                             topk_group: int,
+                             renormalize: bool,
+                             routed_scaling_factor: float = 1.,
+                             num_fused_shared_experts: int = 0) -> None:
+    torch.ops._rocm_C.biased_grouped_topk(gating_output, correction_bias,
+                                          topk_weights, topk_ids,
+                                          num_expert_group, topk_group,
+                                          renormalize, routed_scaling_factor,
+                                          num_fused_shared_experts)
+
+
 # page attention ops
 def paged_attention_v1(
     out: torch.Tensor,

@@ -28,6 +28,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -106,6 +107,9 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self.num_fused_shared_experts = (
+            self.n_shared_experts
+            if envs.VLLM_ROCM_ENABLE_SHARED_EXPERTS_FUSION else 0)
 
         if config.hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {config.hidden_act}. "
@@ -123,8 +127,9 @@ class DeepseekV2MoE(nn.Module):
             self.gate.e_score_correction_bias = None
 
         self.experts = FusedMoE(
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
+            num_experts=config.n_routed_experts +
+            self.num_fused_shared_experts,
+            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             reduce_results=False,
@@ -135,9 +140,12 @@ class DeepseekV2MoE(nn.Module):
             topk_group=config.topk_group,
             prefix=f"{prefix}.experts",
             scoring_func=config.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias)
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+            num_fused_shared_experts=self.num_fused_shared_experts)
 
-        if config.n_shared_experts is not None:
+        if (config.n_shared_experts is not None
+                and self.num_fused_shared_experts == 0):
             intermediate_size = (config.moe_intermediate_size *
                                  config.n_shared_experts)
             self.shared_experts = DeepseekV2MLP(
@@ -152,7 +160,9 @@ class DeepseekV2MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.n_shared_experts is not None:
+        shared_output = None
+        if (self.n_shared_experts is not None
+                and self.num_fused_shared_experts == 0):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -165,7 +175,7 @@ class DeepseekV2MoE(nn.Module):
             # See DeepseekV2DecoderLayer for more details.
             final_hidden_states = self.experts(hidden_states=hidden_states,
                                                router_logits=router_logits)
-        if shared_output is not None:
+        if shared_output is not None and self.num_fused_shared_experts == 0:
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = final_hidden_states + shared_output
             else:
@@ -693,6 +703,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         self.quant_config = quant_config
         self.model = DeepseekV2Model(vllm_config=vllm_config,
                                      prefix=maybe_prefix(prefix, "model"))
+        self._determine_fused_shared_experts(vllm_config)
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(config.vocab_size,
                                           config.hidden_size,
@@ -749,6 +760,21 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                         device=device),
         })
 
+    def _determine_fused_shared_experts(self, vllm_config: VllmConfig):
+        # self.num_fused_shared_experts = 0
+        if not envs.VLLM_ROCM_ENABLE_SHARED_EXPERTS_FUSION:
+            self.num_fused_shared_experts = 0
+            return
+        if (self.config.architectures[0] != "DeepseekV3ForCausalLM"
+                or self.config.n_routed_experts != 256
+                or self.config.n_shared_experts != 1):
+            envs.VLLM_ROCM_ENABLE_SHARED_EXPERTS_FUSION = False
+            raise NotImplementedError(
+                "Only Deepseek V3/R1 can use shared experts fusion optimization"
+            )
+
+        self.num_fused_shared_experts = self.config.n_shared_experts
+
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
         stacked_params_mapping = [
@@ -765,13 +791,19 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts)
+            num_experts=self.config.n_routed_experts +
+            self.num_fused_shared_experts)
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            if (self.num_fused_shared_experts > 0
+                    and "mlp.shared_experts" in name):
+                name = name.replace(
+                    "mlp.shared_experts",
+                    f"mlp.experts.{self.config.n_routed_experts}")
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:

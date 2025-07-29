@@ -74,6 +74,7 @@ if TYPE_CHECKING:
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_V1: bool = True
+    VLLM_ROCM_ENABLE_SHARED_EXPERTS_FUSION: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -530,6 +531,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V1":
     lambda: bool(int(os.getenv("VLLM_USE_V1", "1"))),
 
+    # Disable shared experts fusion by default
+    "VLLM_ROCM_ENABLE_SHARED_EXPERTS_FUSION":
+    lambda:
+    (os.getenv("VLLM_ROCM_ENABLE_SHARED_EXPERTS_FUSION", "False").lower() in
+     ("true", "1")),
+
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
     "VLLM_ROCM_USE_AITER":
@@ -571,7 +578,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_ROPE":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_ROPE", "True").lower() in
              ("true", "1")),
-             
+
     # Use skinny gemm for FP8 kernels
     "VLLM_ROCM_USE_SKINNY_GEMM":
     lambda: (os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in

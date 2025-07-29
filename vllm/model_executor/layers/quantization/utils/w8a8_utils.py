@@ -46,7 +46,8 @@ if current_platform.is_rocm():
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return aiter_per_token_quant(input.contiguous(), scale, rocm_aiter.dtypes.fp8)
+        return aiter_per_token_quant(input.contiguous(), scale,
+                                     rocm_aiter.dtypes.fp8)
 
     def rocm_aiter_per_token_quant_fp8_fake(
         input: torch.Tensor,
@@ -64,7 +65,8 @@ if current_platform.is_rocm():
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return aiter_per_tensor_quant(input.contiguous(), scale, rocm_aiter.dtypes.fp8)
+        return aiter_per_tensor_quant(input.contiguous(), scale,
+                                      rocm_aiter.dtypes.fp8)
 
     def rocm_aiter_per_tensor_quant_fp8_fake(
         input: torch.Tensor,
@@ -75,7 +77,7 @@ if current_platform.is_rocm():
                                      device=input.device)
         scale_tensor = torch.empty(1, dtype=torch.float32, device=input.device)
         return quantized, scale_tensor
-        
+
     def rocm_aiter_gemm_a8w8_bpreshuffle_impl(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -387,7 +389,7 @@ class Fp8LinearOp:
         # so fallback to naive if per channel or per token
         else:
             if input.dtype != current_platform.fp8_dtype():
-                
+
                 if not self.use_aiter_and_is_supported:
                     # Maybe apply padding to output, see comment in __init__
                     qinput, x_scale = ops.scaled_fp8_quant(

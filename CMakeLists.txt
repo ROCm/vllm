@@ -677,6 +677,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   # _rocm_C extension
   #
   set(VLLM_ROCM_EXT_SRC
+    "csrc/rocm/grouped_topk.cu"
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/attention.cu")

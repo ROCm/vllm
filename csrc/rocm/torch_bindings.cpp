@@ -44,6 +44,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                str kv_cache_dtype,"
       "                Tensor k_scale, Tensor v_scale) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  rocm_ops.def(
+      "biased_grouped_topk(Tensor! gating_output, Tensor! correction_bias, "
+      "Tensor! topk_weights, Tensor! topk_ids, int num_expert_group, int "
+      "topk_group, "
+      "bool renormalize, float routed_scaling_factor=1.0, int "
+      "num_fused_shared_experts=0) -> ()");
+  rocm_ops.impl("biased_grouped_topk", torch::kCUDA, &biased_grouped_topk);
+
+  rocm_ops.def(
+      "grouped_topk(Tensor! gating_output, Tensor! topk_weights, Tensor! "
+      "topk_ids, "
+      "int num_expert_group, int topk_grp, bool need_renorm, str "
+      "scoring_func=\"softmax\", "
+      "float routed_scaling_factor=1.0, int num_fused_shared_experts=0) -> ()");
+  rocm_ops.impl("grouped_topk", torch::kCUDA, &grouped_topk);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
