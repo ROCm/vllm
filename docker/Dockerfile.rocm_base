@@ -10,7 +10,7 @@ ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
 ARG FA_BRANCH="1a7f4dfa"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
-ARG AITER_BRANCH="64876494"
+ARG AITER_BRANCH="6b92d30d"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
 FROM ${BASE_IMAGE} AS base
@@ -109,18 +109,18 @@ RUN mkdir -p /app/install && cp /app/pytorch/dist/*.whl /app/install \
     && cp /app/vision/dist/*.whl /app/install \
     && cp /app/flash-attention/dist/*.whl /app/install
 
-# FROM base AS build_aiter
-# ARG AITER_BRANCH
-# ARG AITER_REPO
-# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-#     pip install /install/*.whl
-# RUN git clone --recursive ${AITER_REPO}
-# RUN cd aiter \
-#     && git checkout ${AITER_BRANCH} \
-#     && git submodule update --init --recursive \
-#     && pip install -r requirements.txt
-# RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py bdist_wheel --dist-dir=dist && ls /app/aiter/dist/*.whl
-# RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
+FROM base AS build_aiter
+ARG AITER_BRANCH
+ARG AITER_REPO
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+    pip install /install/*.whl
+RUN git clone --recursive ${AITER_REPO}
+RUN cd aiter \
+    && git checkout ${AITER_BRANCH} \
+    && git submodule update --init --recursive \
+    && pip install -r requirements.txt
+RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py bdist_wheel --dist-dir=dist && ls /app/aiter/dist/*.whl
+RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 FROM base AS debs
 RUN mkdir /app/debs
@@ -132,8 +132,8 @@ RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
-# RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
-#     cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
 
 FROM base AS final
 RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
@@ -147,17 +147,8 @@ RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
-# RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
-#     pip install /install/*.whl
-
-ARG AITER_BRANCH
-ARG AITER_REPO
-RUN git clone --recursive ${AITER_REPO}
-RUN cd aiter \
-    && git checkout ${AITER_BRANCH} \
-    && git submodule update --init --recursive \
-    && pip install -r requirements.txt
-RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=gfx942 python3 setup.py develop
+RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
+    pip install /install/*.whl
 
 ARG BASE_IMAGE
 ARG HIPBLAS_COMMON_BRANCH
@@ -171,6 +162,8 @@ ARG PYTORCH_REPO
 ARG PYTORCH_VISION_REPO
 ARG FA_BRANCH
 ARG FA_REPO
+ARG AITER_BRANCH
+ARG AITER_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "HIPBLAS_COMMON_BRANCH: ${HIPBLAS_COMMON_BRANCH}" >> /app/versions.txt \
     && echo "HIPBLASLT_BRANCH: ${HIPBLASLT_BRANCH}" >> /app/versions.txt \
