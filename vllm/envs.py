@@ -110,6 +110,8 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
+    VLLM_AITER_TRITON_FP8_BMM: bool = False
+    VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS: bool = False
 
 
 def get_default_cache_root():
@@ -728,6 +730,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # limit will actually be zero-copy decoded.
     "VLLM_MSGPACK_ZERO_COPY_THRESHOLD":
     lambda: int(os.getenv("VLLM_MSGPACK_ZERO_COPY_THRESHOLD", "256")),
+    
+    "VLLM_AITER_TRITON_FP8_BMM":
+    lambda: bool(int(os.getenv("VLLM_AITER_TRITON_FP8_BMM", "0"))),
+    
+    "VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS":
+    lambda: bool(int(os.getenv("VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS", "0"))),
+    
 }
 
 # end-env-vars-definition

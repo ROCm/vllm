@@ -15,6 +15,8 @@ from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
                                                    MLACommonMetadata,
                                                    MLACommonMetadataBuilder)
 
+if envs.VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS:
+    from aiter.ops.triton.fused_concat_zeros import fused_concat_zeros
 # yapf: enable
 
 
@@ -219,14 +221,17 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        B = q_nope.shape[0]
+        if envs.VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS:
+            q, o = fused_concat_zeros(q_nope, q_pe)
+        else:
+            B = q_nope.shape[0]
 
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        o = torch.zeros(B,
-                        self.num_heads,
-                        self.kv_lora_rank,
-                        dtype=q.dtype,
-                        device=q.device)
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            o = torch.zeros(B,
+                            self.num_heads,
+                            self.kv_lora_rank,
+                            dtype=q.dtype,
+                            device=q.device)
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
