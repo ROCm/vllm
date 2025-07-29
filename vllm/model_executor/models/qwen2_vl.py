@@ -244,7 +244,7 @@ def apply_rotary_pos_emb_vision(t: torch.Tensor,
 
     if current_platform.is_rocm():
         from flash_attn.ops.triton.rotary import apply_rotary
-        return apply_rotary(t_, cos, sin).type_as(t)
+        apply_rotary_emb = apply_rotary
 
     output = apply_rotary_emb(t_, cos, sin).type_as(t)
     return output
