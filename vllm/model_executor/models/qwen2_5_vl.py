@@ -218,8 +218,6 @@ def apply_rotary_pos_emb_vision_cached(t: torch.Tensor,
                                        freqs_cos: torch.Tensor,
                                        freqs_sin: torch.Tensor) -> torch.Tensor:
     t_ = t.float()
-    # cos = freqs.cos()
-    # sin = freqs.sin()
     apply_rotary_emb = apply_rotary_emb_torch
     if current_platform.is_cuda():
         from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
@@ -498,14 +496,10 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
             torch.arange(0, dim, 2, dtype=torch.float, device='cpu') / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
-        # self._freqs_cached = None
-        self._cos_cached = None  # Single cached tensor for cos/sin values
-        self._sin_cached = None  # Single cached tensor for cos/sin values
+        self._cos_cached = None
+        self._sin_cached = None
 
-    def _update_freqs_cache(self, seqlen: int) -> torch.Tensor:
-        # if seqlen > self._seq_len_cached:
-        #     seqlen *= 2
-        #     self._seq_len_cached = seqlen
+    def _update_freqs(self, seqlen: int) -> torch.Tensor:
         self.inv_freq = 1.0 / (self.theta**(torch.arange(
             0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device)
                                             / self.dim))
@@ -513,28 +507,19 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
                             device=self.inv_freq.device,
                             dtype=self.inv_freq.dtype)
         freqs = torch.outer(seq, self.inv_freq)
-        # self._freqs_cached = freqs
         return freqs
 
     def update_cos_sin_cache(self, seqlen: int) -> None:
         """Update the cos/sin cache to cover up to the requested sequence length."""
         if seqlen > self._seq_len_cached:
-            # print(f"!!!!!! Qwen2_5_VisionRotaryEmbedding update_cos_sin_cache seqlen: {seqlen}")
             seqlen *= 2
             self._seq_len_cached = seqlen
-            # Update the frequency cache first
-            freqs = self._update_freqs_cache(seqlen)
+            freqs = self._update_freqs(seqlen)
             
-            # Compute cos and sin for the entire cached frequency range
             self._cos_cached = freqs.cos()
             self._sin_cached = freqs.sin()
-        # else:
-        #     print(f"!!!!!! Qwen2_5_VisionRotaryEmbedding update_cos_sin_cache seqlen: {seqlen} is less than _seq_len_cached: {self._seq_len_cached}")
 
     def forward(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
-        # self.update_freqs_cache(seqlen)
-        # self.update_cos_sin_cache(seqlen)
-        # return self._cos_cached[:seqlen], self._sin_cached[:seqlen]
         return self.get_cos_sin(seqlen)
 
     def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -630,10 +615,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
         pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
         max_size = max(h, w)
         
-        # Get the frequency tensor (maintains original interface)
         freqs_cos, freqs_sin = self.rotary_pos_emb(max_size)
         
-        # Index the position embeddings
         rotary_pos_emb_cos = freqs_cos[pos_ids].flatten(1)
         rotary_pos_emb_sin = freqs_sin[pos_ids].flatten(1)
         
