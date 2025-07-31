@@ -214,9 +214,10 @@ def all_gather_interleave(local_tensor, hidden_size: int, tp_size: int):
     result_tensor = torch.cat(ordered_tensors, dim=-1)
     return result_tensor
 
-def apply_rotary_pos_emb_vision_cached(t: torch.Tensor,
-                                       freqs_cos: torch.Tensor,
-                                       freqs_sin: torch.Tensor) -> torch.Tensor:
+
+def apply_rotary_pos_emb_vision_cached(
+        t: torch.Tensor, freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor) -> torch.Tensor:
     t_ = t.float()
     apply_rotary_emb = apply_rotary_emb_torch
     if current_platform.is_cuda():
@@ -309,8 +310,10 @@ class Qwen2_5_VisionAttention(nn.Module):
         q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
                    for x in (q, k, v))
         if rotary_pos_emb_cos is not None:
-            q = apply_rotary_pos_emb_vision_cached(q, rotary_pos_emb_cos, rotary_pos_emb_sin)
-            k = apply_rotary_pos_emb_vision_cached(k, rotary_pos_emb_cos, rotary_pos_emb_sin)
+            q = apply_rotary_pos_emb_vision_cached(q, rotary_pos_emb_cos,
+                                                   rotary_pos_emb_sin)
+            k = apply_rotary_pos_emb_vision_cached(k, rotary_pos_emb_cos,
+                                                   rotary_pos_emb_sin)
 
         if self.attn_backend == _Backend.FLASH_ATTN:
             # from vllm_flash_attn.flash_attn_interface import (
@@ -501,11 +504,11 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
 
     def _update_freqs(self, seqlen: int) -> torch.Tensor:
         self.inv_freq = 1.0 / (self.theta**(torch.arange(
-            0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device)
-                                            / self.dim))
+            0, self.dim, 2, dtype=torch.float, device=self.inv_freq.device) /
+                                            self.dim))
         seq = torch.arange(seqlen,
-                            device=self.inv_freq.device,
-                            dtype=self.inv_freq.dtype)
+                           device=self.inv_freq.device,
+                           dtype=self.inv_freq.dtype)
         freqs = torch.outer(seq, self.inv_freq)
         return freqs
 
@@ -515,7 +518,7 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
             seqlen *= 2
             self._seq_len_cached = seqlen
             freqs = self._update_freqs(seqlen)
-            
+
             self._cos_cached = freqs.cos()
             self._sin_cached = freqs.sin()
 
@@ -614,12 +617,12 @@ class Qwen2_5_VisionTransformer(nn.Module):
         ).permute(0, 2, 1, 3).flatten()
         pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
         max_size = max(h, w)
-        
+
         freqs_cos, freqs_sin = self.rotary_pos_emb(max_size)
-        
+
         rotary_pos_emb_cos = freqs_cos[pos_ids].flatten(1)
         rotary_pos_emb_sin = freqs_sin[pos_ids].flatten(1)
-        
+
         # Reshape for the spatial merge unit
         rotary_pos_emb_cos = rotary_pos_emb_cos.reshape(
             rotary_pos_emb_cos.shape[0] // self.spatial_merge_unit,
@@ -663,15 +666,18 @@ class Qwen2_5_VisionTransformer(nn.Module):
     def get_rope_by_thw(self, t, h, w):
         window_index_thw, cu_seqlens_window_thw = self.get_window_index_thw(
             t, h, w)
-        rotary_pos_emb_thw_cos, rotary_pos_emb_thw_sin = self.rotary_pos_emb_thw(t, h, w)
+        rotary_pos_emb_thw_cos, rotary_pos_emb_thw_sin = self.rotary_pos_emb_thw(
+            t, h, w)
         rotary_pos_emb_thw_cos = rotary_pos_emb_thw_cos[window_index_thw, :, :]
-        rotary_pos_emb_thw_cos = rotary_pos_emb_thw_cos.flatten(start_dim=0, end_dim=1)
+        rotary_pos_emb_thw_cos = rotary_pos_emb_thw_cos.flatten(start_dim=0,
+                                                                end_dim=1)
         rotary_pos_emb_thw_sin = rotary_pos_emb_thw_sin[window_index_thw, :, :]
-        rotary_pos_emb_thw_sin = rotary_pos_emb_thw_sin.flatten(start_dim=0, end_dim=1)
+        rotary_pos_emb_thw_sin = rotary_pos_emb_thw_sin.flatten(start_dim=0,
+                                                                end_dim=1)
         cu_seqlens_thw = torch.repeat_interleave(
             torch.tensor([h * w], dtype=torch.int32), t)
-        return (rotary_pos_emb_thw_cos, rotary_pos_emb_thw_sin, window_index_thw, cu_seqlens_window_thw,
-                cu_seqlens_thw)
+        return (rotary_pos_emb_thw_cos, rotary_pos_emb_thw_sin,
+                window_index_thw, cu_seqlens_window_thw, cu_seqlens_thw)
 
     def compute_attn_mask_seqlen(
         self,
@@ -748,9 +754,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
         cu_window_seqlens = cu_window_seqlens.to(device=self.device,
                                                  non_blocking=True)
         rotary_pos_emb_cos = rotary_pos_emb_cos.to(device=self.device,
-                                                  non_blocking=True)
+                                                   non_blocking=True)
         rotary_pos_emb_sin = rotary_pos_emb_sin.to(device=self.device,
-                                                  non_blocking=True)
+                                                   non_blocking=True)
         window_index = window_index.to(device=hidden_states.device,
                                        non_blocking=True)
 
