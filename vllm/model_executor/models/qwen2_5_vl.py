@@ -212,13 +212,15 @@ def all_gather_interleave(local_tensor, hidden_size: int, tp_size: int):
     return result_tensor
 
 
-def apply_rotary_pos_emb_vision_cached(
-        t: torch.Tensor, freqs_cos: torch.Tensor,
-        freqs_sin: torch.Tensor) -> torch.Tensor:
+def apply_rotary_pos_emb_vision(t: torch.Tensor, freqs_cos: torch.Tensor,
+                                freqs_sin: torch.Tensor) -> torch.Tensor:
     t_ = t.float()
     apply_rotary_emb = apply_rotary_emb_torch
     if current_platform.is_cuda():
         from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
+    elif current_platform.is_rocm():
+        from flash_attn.ops.triton.rotary import apply_rotary
+        apply_rotary_emb = apply_rotary
     output = apply_rotary_emb(t_, freqs_cos, freqs_sin).type_as(t)
     return output
 
@@ -307,10 +309,10 @@ class Qwen2_5_VisionAttention(nn.Module):
         q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
                    for x in (q, k, v))
         if rotary_pos_emb_cos is not None:
-            q = apply_rotary_pos_emb_vision_cached(q, rotary_pos_emb_cos,
-                                                   rotary_pos_emb_sin)
-            k = apply_rotary_pos_emb_vision_cached(k, rotary_pos_emb_cos,
-                                                   rotary_pos_emb_sin)
+            q = apply_rotary_pos_emb_vision(q, rotary_pos_emb_cos,
+                                            rotary_pos_emb_sin)
+            k = apply_rotary_pos_emb_vision(k, rotary_pos_emb_cos,
+                                            rotary_pos_emb_sin)
 
         if self.attn_backend == _Backend.FLASH_ATTN:
             # from vllm_flash_attn.flash_attn_interface import (
@@ -510,7 +512,8 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         return freqs
 
     def update_cos_sin_cache(self, seqlen: int) -> None:
-        """Update the cos/sin cache to cover up to the requested sequence length."""
+        """Update the cos/sin cache to cover up to the requested sequence 
+        length."""
         if seqlen > self._seq_len_cached:
             seqlen *= 2
             self._seq_len_cached = seqlen
@@ -668,8 +671,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
     def get_rope_by_thw(self, t, h, w):
         window_index_thw, cu_seqlens_window_thw = self.get_window_index_thw(
             t, h, w)
-        rotary_pos_emb_thw_cos, rotary_pos_emb_thw_sin = self.rotary_pos_emb_thw(
-            t, h, w)
+        rotary_pos_emb_thw_cos, rotary_pos_emb_thw_sin = (
+            self.rotary_pos_emb_thw(t, h, w))
         rotary_pos_emb_thw_cos = rotary_pos_emb_thw_cos[window_index_thw, :, :]
         rotary_pos_emb_thw_cos = rotary_pos_emb_thw_cos.flatten(start_dim=0,
                                                                 end_dim=1)
