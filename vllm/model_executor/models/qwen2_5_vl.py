@@ -43,7 +43,8 @@ from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
 from vllm.logger import init_logger
 from vllm.model_executor import SamplingMetadata
-from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY, SiluAndMul
+from vllm.model_executor.layers.activation import (_ACTIVATION_REGISTRY,
+                                                   SiluAndMul)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
@@ -174,7 +175,7 @@ class Qwen2_5_VisionMLP(nn.Module):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
-            output_sizes=[hidden_features] * 2, # [gate_proj, up_proj]
+            output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj")
@@ -536,8 +537,9 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
         if vision_config.hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {vision_config.hidden_act}. "
-                             "Only silu is supported for now.")
+            raise ValueError(
+                f"Unsupported activation: {vision_config.hidden_act}. "
+                "Only silu is supported for now.")
 
         self.blocks = nn.ModuleList([
             Qwen2_5_VisionBlock(
