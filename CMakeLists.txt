@@ -194,6 +194,13 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   set(CMAKE_${VLLM_GPU_LANG}_FLAGS "${CMAKE_${VLLM_GPU_LANG}_FLAGS} -Wno-unused-result")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
+
+  #
+  # Support fp8 instructions
+  #
+  set(CMAKE_${VLLM_GPU_LANG}_FLAGS "${CMAKE_${VLLM_GPU_LANG}_FLAGS} -Xclang -target-feature -Xclang +fp8-conversion-insts")
+  set(CMAKE_${VLLM_GPU_LANG}_FLAGS "${CMAKE_${VLLM_GPU_LANG}_FLAGS} -Xclang -target-feature -Xclang +fp8-insts")
+  list(APPEND VLLM_GPU_FLAGS "-Rpass-analysis=kernel-resource-usage")
 endif()
 
 #
