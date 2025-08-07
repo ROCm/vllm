@@ -381,7 +381,6 @@ python3 /app/vllm/benchmarks/benchmark_serving.py \
 # Offline throughput 
 python3 /app/vllm/benchmarks/benchmark_throughput.py --model deepseek-ai/DeepSeek-V3 \
     --input-len <> --output-len <> --tensor-parallel-size 8 \
-    --quantization fp8 --kv-cache-dtype fp8 --dtype float16 \
     --max-model-len 32768 --block-size=1 --trust-remote-code
 
 # Offline Latency
