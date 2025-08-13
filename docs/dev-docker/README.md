@@ -492,7 +492,7 @@ To reproduce the release docker:
     git clone https://github.com/ROCm/vllm.git
     cd vllm
     git checkout 340ea86dfe5955d6f9a9e767d6abab5aacf2c978
-    docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg .
+    docker build -f docker/Dockerfile.rocm -t <your_tag> .
 ```
 
 ### Building AITER Image
@@ -503,7 +503,7 @@ Use AITER release candidate branch instead:
     git clone https://github.com/ROCm/vllm.git
     cd vllm
     git checkout aiter_integration_final
-    docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg .
+    docker build -f docker/Dockerfile.rocm -t <your_tag> .
 ```
 
 ## Changelog
