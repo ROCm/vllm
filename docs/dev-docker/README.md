@@ -12,7 +12,7 @@ The pre-built image includes:
 
 - ROCm™ 6.4.1
 - HipblasLT 0.15
-- vLLM 0.9.1
+- vLLM v0.10.0
 - PyTorch 2.7
 
 ## Pull latest Docker Image
@@ -21,15 +21,13 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- No need to specify the --compilation-config parameter, these options were turned on by default
-- Fixed llama3.1 405b CAR issue (no longer need --disable-custom-all-reduce)
-- Fixed +rms_norm custom kernel issue
-- Added quick reduce (set VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=FP to enable. Supported modes are FP, INT8, INT6, INT4)
-- Mitigated the commandr model causing GPU crash through a workaround until the driver issue is fixed
+- AITER FP8 KV cache
+- vLLM v0.10.0
+- AITER full graph capture
 
 ## Known Issues and Workarounds
 
-- AITER does not support fp8 kv cache
+- None
 
 ## Performance Results
 
@@ -42,14 +40,14 @@ The table below shows performance data where a local inference client is fed req
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 12638.9  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 10756.8               |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 10691.7               |
-|       |           |         | 2048  | 2048   | 1500        | 1500         | 7354.9                |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3912.8 |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 3084.7                |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 2935.9                |
-|       |           |         | 2048  | 2048   | 500         | 500          | 2191.5                |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13383.3  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 11203.6               |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 10963.3               |
+|       |           |         | 2048  | 2048   | 1500        | 1500         | 7560.9                |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3867.7 |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 3043.3                |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 2905.6                |
+|       |           |         | 2048  | 2048   | 500         | 500          | 2174.1                |
 
 *TP stands for Tensor Parallelism.*
 
@@ -493,7 +491,7 @@ To reproduce the release docker:
 ```bash
     git clone https://github.com/ROCm/vllm.git
     cd vllm
-    git checkout b432b7a285aa0dcb9677380936ffa74931bb6d6f
+    git checkout 340ea86dfe5955d6f9a9e767d6abab5aacf2c978
     docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
@@ -509,6 +507,11 @@ Use AITER release candidate branch instead:
 ```
 
 ## Changelog
+
+rocm6.4.1_vllm_0.10.0_20250812:
+- kv-cache-dtype fp8 now works with AITER enabled
+- vLLM v0.10.0
+- AITER full graph capture
 
 20250715_aiter:
 - No need to specify the --compilation-config parameter, these options were turned on by default
