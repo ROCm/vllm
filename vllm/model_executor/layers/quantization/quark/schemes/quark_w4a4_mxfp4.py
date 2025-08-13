@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from enum import Enum
 from typing import Any, Callable, Optional
 
 import torch
@@ -14,7 +15,16 @@ from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 from vllm.platforms import current_platform
 
+
+class GemmKernelType(Enum):
+    """Enum for different GEMM kernel types."""
+    GEMM_A4W4 = "gemm_a4w4"
+    GEMM_AFP4WFP4_PRESHUFFLED_SCALES = "gemm_afp4wfp4_preshuffled_scales"
+    GEMM_AFP4WFP4 = "gemm_afp4wfp4"
+
+
 try:
+    from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_afp4wfp4 import (
         gemm_afp4wfp4, gemm_afp4wfp4_preshuffled_scales)
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
@@ -25,15 +35,28 @@ try:
         from aiter.utility.fp4_utils import (
             dynamic_mxfp4_quant as dynamic_mxfp4_quant_asm)
 
+    def _dispatch_gemm_kernel(weight_preshuffled: bool) -> GemmKernelType:
+        """Dispatch which GEMM kernel path to use based on conditions."""
+        if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
+            if weight_preshuffled:
+                return GemmKernelType.GEMM_A4W4
+            else:
+                return GemmKernelType.GEMM_AFP4WFP4_PRESHUFFLED_SCALES
+        else:
+            return GemmKernelType.GEMM_AFP4WFP4
+
     def gemm_with_dynamic_quant(
         x: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         x_scales: torch.Tensor = None,
         out_dtype: Optional[torch.dtype] = torch.bfloat16,
+        weight_preshuffled: bool = False,
     ) -> torch.Tensor:
         M = x.shape[0]
-        if envs.VLLM_TRITON_FP4_GEMM_USE_ASM and M > 128:
+        kernel_type = _dispatch_gemm_kernel(weight_preshuffled)
+
+        if kernel_type == GemmKernelType.GEMM_A4W4:
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant_asm(x, shuffle=True)
             else:
@@ -44,17 +67,15 @@ try:
                             weight.shape[0],
                             device=x_q.device,
                             dtype=out_dtype)
-            #asm_bias = torch.empty_like(y)
+
             gemm_a4w4(x_q,
                       weight,
                       x_s,
                       weight_scale.view(x_s.dtype),
                       y,
-                      y,
-                      bpreshuffle=False)
-
+                      bpreshuffle=True)
             return y[:M]
-        elif envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
+        elif kernel_type == GemmKernelType.GEMM_AFP4WFP4_PRESHUFFLED_SCALES:
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant_asm(x, shuffle=(M >= 32))
                 x_s = x_s.view(torch.uint8)
@@ -74,19 +95,22 @@ try:
                 x_q, weight, x_s, weight_scale.view(smw // 32, snw * 32),
                 out_dtype, y)
             return y
-        if x_scales is None:
-            x_q, x_s = dynamic_mxfp4_quant(x)
+        elif kernel_type == GemmKernelType.GEMM_AFP4WFP4:
+            if x_scales is None:
+                x_q, x_s = dynamic_mxfp4_quant(x)
+            else:
+                x_q = x
+                x_s = x_scales
+            y = torch.empty(x_q.shape[0],
+                            weight.shape[0],
+                            device=x_q.device,
+                            dtype=out_dtype)
+
+            gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
+            return y
         else:
-            x_q = x
-            x_s = x_scales
-        y = torch.empty(x_q.shape[0],
-                        weight.shape[0],
-                        device=x_q.device,
-                        dtype=out_dtype)
-
-        gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
-
-        return y
+            raise RuntimeError(
+                f"Unknown kernel type in QuarkW4A4MXFP4: {kernel_type}")
 
     def gemm_with_dynamic_quant_fake(
         x: torch.Tensor,
@@ -94,6 +118,7 @@ try:
         weight_scale: torch.Tensor,
         x_scales: torch.Tensor = None,
         out_dtype: Optional[torch.dtype] = torch.bfloat16,
+        weight_preshuffled: bool = False,
     ) -> torch.Tensor:
         return torch.empty((*x.shape[:-1], weight.shape[0]),
                            dtype=out_dtype,
@@ -178,6 +203,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
             torch.cuda.empty_cache()
         else:
             if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
+                # shuffle weight scale
                 weight_scale_shuffle = layer.weight_scale.data
                 sm, sn = weight_scale_shuffle.shape
                 weight_scale_shuffle = weight_scale_shuffle.view(
@@ -187,6 +213,13 @@ class QuarkW4A4MXFP4(QuarkScheme):
                 weight_scale_shuffle = weight_scale_shuffle.view(sm, sn)
                 layer.weight_scale = torch.nn.Parameter(weight_scale_shuffle,
                                                         requires_grad=False)
+
+                # shuffle weight
+                weight_shuffle = layer.weight.data
+                weight_shuffle = shuffle_weight(weight_shuffle,
+                                                layout=(16, 16))
+                layer.weight = torch.nn.Parameter(weight_shuffle,
+                                                  requires_grad=False)
             else:
                 layer.weight_scale = torch.nn.Parameter(
                     layer.weight_scale.data.T.contiguous(),
@@ -242,5 +275,9 @@ class QuarkW4A4MXFP4(QuarkScheme):
             qdq_x, _ = per_token_group_quant_mxfp4(x, OCP_MX_BLOCK_SIZE)
             return F.linear(qdq_x, dq_w, bias)
         else:
+            # record if weight has been preshuffled or not
+            weight_preshuffled = not self.emulate and \
+                envs.VLLM_TRITON_FP4_GEMM_USE_ASM
             return torch.ops.vllm.gemm_with_dynamic_quant(
-                x, layer.weight, layer.weight_scale, x_scales, self.out_dtype)
+                x, layer.weight, layer.weight_scale, x_scales, self.out_dtype,
+                weight_preshuffled)
