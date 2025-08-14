@@ -823,13 +823,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 fused_concat_zeros(x1, x2)
 
         if envs.VLLM_AITER_TRITON_FP8_BMM:
+            max_batch_size = 256
             W_K = W_UK.transpose(0, 1) # 16 512 128
             W_V = W_UV.permute(1, 2, 0) # 16 128 512
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(W_K, dtype=torch.float8_e4m3fnuz)
             self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(W_V, dtype=torch.float8_e4m3fnuz)
-            logger.info(f"[Triton] compiling fp8 BMM with shape = {self.W_K.shape[0]} [1~128] {self.W_K.shape[1]} {self.W_K.shape[2]}")
-            logger.info(f"[Triton] compiling fp8 BMM with shape = {self.W_V.shape[0]} [1~128] {self.W_V.shape[1]} {self.W_V.shape[2]}")
-            for m in range(1, 129):
+            logger.info(f"[Triton] compiling fp8 BMM with shape = {self.W_K.shape[0]} [1~{max_batch_size}] {self.W_K.shape[1]} {self.W_K.shape[2]}")
+            logger.info(f"[Triton] compiling fp8 BMM with shape = {self.W_V.shape[0]} [1~{max_batch_size}] {self.W_V.shape[1]} {self.W_V.shape[2]}")
+            for m in range(1, max_batch_size+1):
                 x = torch.empty((self.W_K.shape[0], m, self.W_K.shape[2]), dtype=torch.bfloat16, device=self.W_K.device)
                 aiter_triton_fp8_bmm_wrapper(x, self.W_K, self.W_K_scale, group_size = 128, transpose_bm = True)
 
