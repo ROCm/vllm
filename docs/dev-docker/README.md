@@ -12,7 +12,7 @@ The pre-built image includes:
 
 - ROCm™ 6.4.1
 - HipblasLT 0.15
-- vLLM 0.9.1
+- vLLM v0.10.0
 - PyTorch 2.7
 
 ## Pull latest Docker Image
@@ -21,15 +21,13 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- No need to specify the --compilation-config parameter, these options were turned on by default
-- Fixed llama3.1 405b CAR issue (no longer need --disable-custom-all-reduce)
-- Fixed +rms_norm custom kernel issue
-- Added quick reduce (set VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=FP to enable. Supported modes are FP, INT8, INT6, INT4)
-- Mitigated the commandr model causing GPU crash through a workaround until the driver issue is fixed
+- AITER FP8 KV cache
+- vLLM v0.10.0
+- AITER full graph capture
 
 ## Known Issues and Workarounds
 
-- AITER does not support fp8 kv cache
+- None
 
 ## Performance Results
 
@@ -42,14 +40,14 @@ The table below shows performance data where a local inference client is fed req
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 12638.9  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 10756.8               |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 10691.7               |
-|       |           |         | 2048  | 2048   | 1500        | 1500         | 7354.9                |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3912.8 |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 3084.7                |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 2935.9                |
-|       |           |         | 2048  | 2048   | 500         | 500          | 2191.5                |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13383.3  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 11203.6               |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 10963.3               |
+|       |           |         | 2048  | 2048   | 1500        | 1500         | 7560.9                |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3867.7 |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 3043.3                |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 2905.6                |
+|       |           |         | 2048  | 2048   | 500         | 500          | 2174.1                |
 
 *TP stands for Tensor Parallelism.*
 
@@ -61,38 +59,38 @@ The table below shows latency measurement, which typically involves assessing th
 
 | Model | Precision | TP Size | Batch Size | Input | Output | MI300X Latency (sec) |
 |-------|-----------|----------|------------|--------|---------|-------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 17.236 |
-| | | | 2 | 128 | 2048 | 18.057 |
-| | | | 4 | 128 | 2048 | 18.450 |
-| | | | 8 | 128 | 2048 | 19.677 |
-| | | | 16 | 128 | 2048 | 22.072 |
-| | | | 32 | 128 | 2048 | 24.932 |
-| | | | 64 | 128 | 2048 | 33.287 |
-| | | | 128 | 128 | 2048 | 46.484 |
-| | | | 1 | 2048 | 2048 | 17.500 |
-| | | | 2 | 2048 | 2048 | 18.055 |
-| | | | 4 | 2048 | 2048 | 18.858 |
-| | | | 8 | 2048 | 2048 | 20.161 |
-| | | | 16 | 2048 | 2048 | 22.347 |
-| | | | 32 | 2048 | 2048 | 25.966 |
-| | | | 64 | 2048 | 2048 | 35.324 |
-| | | | 128 | 2048 | 2048 | 52.394 |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 48.453 |
-| | | | 2 | 128 | 2048 | 49.268 |
-| | | | 4 | 128 | 2048 | 51.136 |
-| | | | 8 | 128 | 2048 | 54.226 |
-| | | | 16 | 128 | 2048 | 57.274 |
-| | | | 32 | 128 | 2048 | 68.901 |
-| | | | 64 | 128 | 2048 | 88.631 |
-| | | | 128 | 128 | 2048 | 117.027 |
-| | | | 1 | 2048 | 2048 | 48.362 |
-| | | | 2 | 2048 | 2048 | 49.121 |
-| | | | 4 | 2048 | 2048 | 52.347 |
-| | | | 8 | 2048 | 2048 | 54.471 |
-| | | | 16 | 2048 | 2048 | 57.841 |
-| | | | 32 | 2048 | 2048 | 70.538 |
-| | | | 64 | 2048 | 2048 | 91.452 |
-| | | | 128 | 2048 | 2048 | 125.471 |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 17.188 |
+| | | | 2 | 128 | 2048 | 17.827 |
+| | | | 4 | 128 | 2048 | 18.492 |
+| | | | 8 | 128 | 2048 | 20.227 |
+| | | | 16 | 128 | 2048 | 21.565 |
+| | | | 32 | 128 | 2048 | 24.999 |
+| | | | 64 | 128 | 2048 | 32.641 |
+| | | | 128 | 128 | 2048 | 46.195 |
+| | | | 1 | 2048 | 2048 | 17.214 |
+| | | | 2 | 2048 | 2048 | 18.012 |
+| | | | 4 | 2048 | 2048 | 18.984 |
+| | | | 8 | 2048 | 2048 | 20.111 |
+| | | | 16 | 2048 | 2048 | 22.547 |
+| | | | 32 | 2048 | 2048 | 25.987 |
+| | | | 64 | 2048 | 2048 | 34.961 |
+| | | | 128 | 2048 | 2048 | 52.283 |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 48.824 |
+| | | | 2 | 128 | 2048 | 49.739 |
+| | | | 4 | 128 | 2048 | 52.271 |
+| | | | 8 | 128 | 2048 | 54.534 |
+| | | | 16 | 128 | 2048 | 58.010 |
+| | | | 32 | 128 | 2048 | 68.460 |
+| | | | 64 | 128 | 2048 | 88.252 |
+| | | | 128 | 128 | 2048 | 118.212 |
+| | | | 1 | 2048 | 2048 | 48.977 |
+| | | | 2 | 2048 | 2048 | 49.881 |
+| | | | 4 | 2048 | 2048 | 52.278 |
+| | | | 8 | 2048 | 2048 | 54.932 |
+| | | | 16 | 2048 | 2048 | 59.072 |
+| | | | 32 | 2048 | 2048 | 70.350 |
+| | | | 64 | 2048 | 2048 | 91.294 |
+| | | | 128 | 2048 | 2048 | 126.984 |
 
 *TP stands for Tensor Parallelism.*
 
@@ -493,8 +491,8 @@ To reproduce the release docker:
 ```bash
     git clone https://github.com/ROCm/vllm.git
     cd vllm
-    git checkout b432b7a285aa0dcb9677380936ffa74931bb6d6f
-    docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
+    git checkout 340ea86dfe5955d6f9a9e767d6abab5aacf2c978
+    docker build -f docker/Dockerfile.rocm -t <your_tag> .
 ```
 
 ### Building AITER Image
@@ -505,10 +503,15 @@ Use AITER release candidate branch instead:
     git clone https://github.com/ROCm/vllm.git
     cd vllm
     git checkout aiter_integration_final
-    docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
+    docker build -f docker/Dockerfile.rocm -t <your_tag> .
 ```
 
 ## Changelog
+
+rocm6.4.1_vllm_0.10.0_20250812:
+- kv-cache-dtype fp8 now works with AITER enabled
+- vLLM v0.10.0
+- AITER full graph capture
 
 20250715_aiter:
 - No need to specify the --compilation-config parameter, these options were turned on by default
