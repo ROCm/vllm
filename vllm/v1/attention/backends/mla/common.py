@@ -220,6 +220,9 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+if envs.VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT:
+    from aiter.ops.triton.fused_qk_concat import fused_qk_rope_cat_and_cache_mla
+
 if envs.VLLM_AITER_TRITON_FP8_BMM:
     def dynamic_per_batched_tensor_quant(
         x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
@@ -670,10 +673,14 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         if self.use_rocm_aiter:
             self.rotary_emb = rotary_emb.forward_hip
+            self.cos_cache, self.sin_cache = rotary_emb.cos_cache, rotary_emb.sin_cache
+            self.rotary_emb_is_neox_style = rotary_emb.is_neox_style
         else:
             self.rotary_emb = rotary_emb.forward_native
             if current_platform.is_cuda():
                 self.rotary_emb = rotary_emb.forward_cuda
+            self.cos_cache, self.sin_cache = rotary_emb.cos_sin_cache.chunk(2, dim = -1)
+            self.rotary_emb_is_neox_style = rotary_emb.is_neox_style
 
         self.q_proj = q_proj
         self.kv_b_proj = kv_b_proj
@@ -815,9 +822,48 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         W_UK, W_UV = kv_b_proj_weight.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         
+        if envs.VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT:
+            kv_cache_size = 8192
+            max_position_embedding = self.cos_cache.shape[0]
+            for prefill_decode_size in [1, 256, 2048]:
+                for decode_batch_size in [0, 1, 256]:
+                    if decode_batch_size > prefill_decode_size:
+                        continue
+
+                    k_scale = torch.ones([1,], dtype=torch.float32, device=W_UK.device)[0]
+
+                    q = torch.empty((decode_batch_size, self.num_heads, self.kv_lora_rank + self.qk_rope_head_dim), dtype=torch.bfloat16, device=W_UK.device)
+                    decode_ql_nope = q[..., :self.kv_lora_rank]
+                    decode_q_pe = q[..., self.kv_lora_rank:]
+
+                    k = torch.empty((prefill_decode_size, 1, self.kv_lora_rank + self.qk_rope_head_dim), dtype=torch.bfloat16, device=W_UK.device)
+                    k_c_normed = k[..., :self.kv_lora_rank].squeeze(1)
+                    k_pe = k[..., self.kv_lora_rank:]
+
+                    input_positions = torch.randint(0, max_position_embedding, (decode_batch_size, ), device=W_UK.device)
+                    slot_mapping = torch.randperm(kv_cache_size, device=W_UK.device)[:prefill_decode_size]
+                    kv_cache = torch.empty((kv_cache_size, 1, self.kv_lora_rank + self.qk_rope_head_dim), dtype=torch.bfloat16, device=W_UK.device)
+                    
+                    logger.info(f"[Triton] compiling fused_qk_rope_cat_and_cache_mla with (decode tokens, total tokens) = ({decode_batch_size}, {prefill_decode_size})")
+                    fused_qk_rope_cat_and_cache_mla(
+                        decode_ql_nope,
+                        decode_q_pe,
+                        k_c_normed.unsqueeze(1),
+                        k_pe,
+                        kv_cache,
+                        slot_mapping,
+                        input_positions,
+                        self.cos_cache,
+                        self.sin_cache,
+                        k_scale,
+                        self.rotary_emb_is_neox_style,
+                        output_q_nope_zeros=True
+                    )
+
         if envs.VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS:
-            logger.info(f"[Triton] compiling fused_concat_zeros with shape = [1~128] {self.num_heads} [{self.kv_lora_rank} : {self.qk_rope_head_dim}]")
-            for m in range(1, 129):
+            max_batch_size = 256
+            logger.info(f"[Triton] compiling fused_concat_zeros with shape = [1~{max_batch_size}] {self.num_heads} [{self.kv_lora_rank} : {self.qk_rope_head_dim}]")
+            for m in range(1, max_batch_size+1):
                 x1 = torch.empty((m, self.num_heads, self.kv_lora_rank), dtype=torch.bfloat16, device=W_UK.device)
                 x2 = torch.empty((m, self.num_heads, self.qk_rope_head_dim), dtype=torch.bfloat16, device=W_UK.device)
                 fused_concat_zeros(x1, x2)
@@ -1021,7 +1067,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             decode_ql_nope, decode_q_pe = \
                 self._q_proj_and_k_up_proj(decode_hs_or_q_c)
 
-            if self.use_rocm_aiter:
+            if envs.VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT:
+                pass
+                # the rope operator for decode is now fused with concat_and_cache_mla operator using fused_qk_rope_cat_and_cache_mla
+            elif self.use_rocm_aiter:
                 self.rotary_emb(attn_metadata.decode.input_positions,
                                 decode_q_pe, decode_k_pe)
             else:
@@ -1044,7 +1093,23 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     prefill_q_pe.contiguous(), prefill_k_pe)
 
         # write the latent and rope to kv cache
-        if kv_cache.numel() > 0:
+        q_nope_pe, q_nope_zeros = None, None
+        if envs.VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT and has_decode and kv_cache.numel() > 0:
+            q_nope_pe, q_nope_zeros = fused_qk_rope_cat_and_cache_mla(
+                decode_ql_nope,
+                decode_q_pe,
+                k_c_normed.unsqueeze(1),
+                k_pe,
+                kv_cache,
+                attn_metadata.slot_mapping.flatten(),
+                attn_metadata.decode.input_positions,
+                self.cos_cache,
+                self.sin_cache,
+                layer._k_scale,
+                self.rotary_emb_is_neox_style,
+                output_q_nope_zeros=True
+            )
+        elif kv_cache.numel() > 0:
             ops.concat_and_cache_mla(
                 k_c_normed,
                 k_pe.squeeze(1),
@@ -1061,6 +1126,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         if has_decode:
             output[:num_decode_tokens] = self._forward_decode(
-                decode_ql_nope, decode_q_pe, kv_cache, attn_metadata)
+                decode_ql_nope, decode_q_pe, kv_cache, attn_metadata, q_nope_pe=q_nope_pe, q_nope_zeros=q_nope_zeros)
 
         return output_padded

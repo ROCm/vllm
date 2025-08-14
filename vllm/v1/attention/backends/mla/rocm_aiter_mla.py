@@ -272,11 +272,15 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         q_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AiterMLAMetadata,
-    ) -> torch.Tensor:
+        q_nope_pe: torch.Tensor = None,
+        q_nope_zeros: torch.Tensor = None,
+        ) -> torch.Tensor:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        if envs.VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS:
+        if envs.VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT and q_nope_pe is not None and q_nope_zeros is not None:
+            q, o = q_nope_pe, q_nope_zeros
+        elif envs.VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS:
             q, o = fused_concat_zeros(q_nope, q_pe)
         else:
             B = q_nope.shape[0]
