@@ -4,9 +4,9 @@
 MODEL=$1
 TP=$2
 DTYPE=$3
-array_bs=$4
-array_in=$5
-array_out=$6
+bs=$4
+IN=$5
+OUT=$6
 LOG_NAME=$7
 
 export VLLM_ROCM_USE_AITER_MHA=0
