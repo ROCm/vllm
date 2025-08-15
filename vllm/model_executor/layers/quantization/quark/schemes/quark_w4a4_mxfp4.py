@@ -16,15 +16,15 @@ from vllm.platforms import current_platform
 
 try:
     from aiter.ops.shuffle import shuffle_weight
-    from aiter.ops.triton.gemm_afp4wfp4 import (
+    from aiter.ops.triton.gemm_afp4wfp4 import (  # noqa: F401
         gemm_afp4wfp4, gemm_afp4wfp4_preshuffled_scales)
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
     from vllm.utils import direct_register_custom_op
     if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
         from aiter import gemm_a4w4
-        from aiter.utility.fp4_utils import (
-            dynamic_mxfp4_quant as dynamic_mxfp4_quant_asm)
+        from aiter.utility.fp4_utils import (dynamic_mxfp4_quant as
+                                             dynamic_mxfp4_quant_asm)
 
     def gemm_with_dynamic_quant(
         x: torch.Tensor,
@@ -144,13 +144,10 @@ class QuarkW4A4MXFP4(QuarkScheme):
             )
             weight_quantizer.scale.data = layer.weight_scale.data
 
-            if not envs.VLLM_QUARK_EMU_MEM_OPT:
-                layer.weight = torch.nn.Parameter(
-                    weight_quantizer(layer.weight.data).to(self.out_dtype),
-                    requires_grad=False,
-                )
-            else:
-                self.weight_quantizer = weight_quantizer
+            layer.weight = torch.nn.Parameter(
+                weight_quantizer(layer.weight.data).to(self.out_dtype),
+                requires_grad=False,
+            )
             layer.weight_scale = None
 
             # This call is necessary to release the scales memory.
