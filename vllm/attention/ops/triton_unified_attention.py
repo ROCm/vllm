@@ -1,5 +1,3 @@
-# The kernels in this file are adapted from vLLM:
-# https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
