@@ -33,7 +33,7 @@ echo ""
 RES_PATH=./bench_results/${LOG_NAME}_TP${TP}_dtype${DTYPE}_wtype${WTYPE}_bs${bs}_input${IN}_output${OUT}
 # Check and create result directory
 if [ -d "${RES_PATH}" ]; then
-    echo "Warning: Directory ${RES_PATH} already exists!"
+    echo "Error: Directory ${RES_PATH} already exists!"
     echo "Please manually delete it and run the script again:"
     echo "rm -rf ${RES_PATH}"
     echo ""
@@ -44,7 +44,7 @@ mkdir -p ${RES_PATH}
 export VLLM_TORCH_PROFILER_DIR=${RES_PATH}
 
 
-python3 ../../benchmark_throughput.py \
+python3 -u ../../benchmark_throughput.py \
     --distributed-executor-backend mp \
     --dtype $DTYPE \
     --disable-detokenize \

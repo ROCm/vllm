@@ -32,7 +32,7 @@ echo ""
 
 RES_PATH=./bench_results/${LOG_NAME}_TP${TP}_dtype${DTYPE}_bs${bs}_input${IN}_output${OUT}
 mkdir -p ${RES_PATH}
-python3 ../../benchmark_throughput.py \
+python3 -u ../../benchmark_throughput.py \
     --distributed-executor-backend mp \
     --dtype $DTYPE \
     --disable-detokenize \
