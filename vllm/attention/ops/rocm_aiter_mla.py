@@ -118,7 +118,7 @@ def mla_decode_fwd_impl(
         # q_fp8, q_scale = per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
         # q_scale = q_scale.to(torch.float)
 
-        q_fp8 = q_fp8.to(torch.float8_e4m3fnuz)
+        q_fp8 = q.to(torch.float8_e4m3fnuz)
         kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
         # kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
