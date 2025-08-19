@@ -45,6 +45,8 @@ def aiter_mla_decode_fwd(
     reduce_final_map=None,
     reduce_partial_map=None,
 
+    q_scale: Optional[torch.Tensor] = None,
+    kv_scale: Optional[torch.Tensor] = None,
     # batch_split_table=None,
     # split_table=None,
     # splits=None,
@@ -70,6 +72,9 @@ def aiter_mla_decode_fwd(
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
+
+        q_scale,
+        kv_scale,
         # batch_split_table,
         # split_table,
         # splits,
@@ -98,6 +103,8 @@ def mla_decode_fwd_impl(
     reduce_final_map: Optional[torch.Tensor] = None,
     reduce_partial_map: Optional[torch.Tensor] = None,
 
+    q_scale: Optional[torch.Tensor] = None,
+    kv_scale: Optional[torch.Tensor] = None,
     # batch_split_table: Optional[torch.Tensor] = None,
     # split_table: Optional[torch.Tensor] = None,
     # splits: Optional[torch.Tensor] = None,
@@ -108,11 +115,12 @@ def mla_decode_fwd_impl(
 
     if True:
         from aiter import per_tensor_quant
-        q_fp8, q_scale = per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
-        q_scale = q_scale.to(torch.float)
+        # q_fp8, q_scale = per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+        # q_scale = q_scale.to(torch.float)
 
+        q_fp8 = q_fp8.to(torch.float8_e4m3fnuz)
         kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
-        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+        # kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
 
         mla_decode_fwd_dispatch(q_fp8,
@@ -179,6 +187,8 @@ def mla_decode_fwd_fake(
     reduce_final_map: Optional[torch.Tensor] = None,
     reduce_partial_map: Optional[torch.Tensor] = None,
 
+    q_scale: Optional[torch.Tensor] = None,
+    kv_scale: Optional[torch.Tensor] = None,
     # batch_split_table: Optional[torch.Tensor] = None,
     # split_table: Optional[torch.Tensor] = None,
     # splits: Optional[torch.Tensor] = None,

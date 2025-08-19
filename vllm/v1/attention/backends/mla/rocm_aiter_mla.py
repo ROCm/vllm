@@ -65,6 +65,8 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     reduce_indptr: Optional[torch.Tensor] = None
     reduce_final_map: Optional[torch.Tensor] = None
     reduce_partial_map: Optional[torch.Tensor] = None
+    q_scale: Optional[torch.Tensor] = None
+    kv_scale: Optional[torch.Tensor] = None
 
 
 class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
@@ -197,6 +199,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 reduce_partial_map,
             )
 
+        q_scale  = torch.ones([1], dtype=torch.float, device="cuda")
+        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+
         attn_metadata = AiterMLADecodeMetadata(
             input_positions=input_positions,
             block_table=block_table,
@@ -210,7 +215,10 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
-            qo_indptr=qo_indptr)
+            qo_indptr=qo_indptr,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            )
 
         return attn_metadata
 
@@ -311,6 +319,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                              attn_metadata.decode.reduce_indptr,
                              attn_metadata.decode.reduce_final_map,
                              attn_metadata.decode.reduce_partial_map,
+                             attn_metadata.decode.q_scale,
+                             attn_metadata.decode.kv_scale,
                              # attn_metadata.decode.batch_split_table,
                              # attn_metadata.decode.split_table,
                              # attn_metadata.decode.splits,
