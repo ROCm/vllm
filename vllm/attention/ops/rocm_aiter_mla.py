@@ -106,27 +106,56 @@ def mla_decode_fwd_impl(
 ) -> None:
     from aiter.mla import mla_decode_fwd_dispatch
 
-    mla_decode_fwd_dispatch(q,
-                            kv_buffer.view(-1, 1, 1, q.shape[-1]),
-                            o,
-                            qo_indptr,
-                            kv_indptr,
-                            kv_indices,
-                            kv_last_page_lens,
-                            max_seqlen_q,
-                            sm_scale=sm_scale,
-                            logit_cap=logit_cap,
-                            num_kv_splits=num_kv_splits,
-                            num_kv_splits_indptr=num_kv_splits_indptr,
-                            work_indptr=work_indptr,
-                            work_info_set=work_info_set,
-                            reduce_indptr=reduce_indptr,
-                            reduce_final_map=reduce_final_map,
-                            reduce_partial_map=reduce_partial_map,
-                            # batch_split_table=batch_split_table,
-                            # split_table=split_table,
-                            # cu_num=splits,
-                            )
+    if True:
+        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+        q_scale = q_scale.to(torch.float)
+
+        kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
+        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+
+
+        mla_decode_fwd_dispatch(q_fp8,
+                                kv_buffer_fp8.view(-1, 1, 1, q.shape[-1]),
+                                o,
+                                qo_indptr,
+                                kv_indptr,
+                                kv_indices,
+                                kv_last_page_lens,
+                                max_seqlen_q,
+                                sm_scale=sm_scale,
+                                logit_cap=logit_cap,
+                                num_kv_splits=num_kv_splits,
+                                num_kv_splits_indptr=num_kv_splits_indptr,
+                                work_indptr=work_indptr,
+                                work_info_set=work_info_set,
+                                reduce_indptr=reduce_indptr,
+                                reduce_final_map=reduce_final_map,
+                                reduce_partial_map=reduce_partial_map,
+                                q_scale=q_scale,
+                                kv_scale=kv_scale,
+                                )
+    else:
+        mla_decode_fwd_dispatch(q,
+                                kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                                o,
+                                qo_indptr,
+                                kv_indptr,
+                                kv_indices,
+                                kv_last_page_lens,
+                                max_seqlen_q,
+                                sm_scale=sm_scale,
+                                logit_cap=logit_cap,
+                                num_kv_splits=num_kv_splits,
+                                num_kv_splits_indptr=num_kv_splits_indptr,
+                                work_indptr=work_indptr,
+                                work_info_set=work_info_set,
+                                reduce_indptr=reduce_indptr,
+                                reduce_final_map=reduce_final_map,
+                                reduce_partial_map=reduce_partial_map,
+                                # batch_split_table=batch_split_table,
+                                # split_table=split_table,
+                                # cu_num=splits,
+                                )
 
 
 def mla_decode_fwd_fake(
