@@ -107,7 +107,8 @@ def mla_decode_fwd_impl(
     from aiter.mla import mla_decode_fwd_dispatch
 
     if True:
-        q_fp8, q_scale = aiter.per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
+        from aiter import per_tensor_quant
+        q_fp8, q_scale = per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
         q_scale = q_scale.to(torch.float)
 
         kv_buffer_fp8 = kv_buffer.to(torch.float8_e4m3fnuz)
