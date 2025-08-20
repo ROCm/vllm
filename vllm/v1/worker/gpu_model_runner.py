@@ -276,6 +276,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         max_seqlen_qo = 2
 
+        self.work_metadata = torch.empty([10],
+                                       dtype=torch.uint64,
+                                       device=self.device)
+        
         self.work_indptr = torch.empty([81],
                                        dtype=torch.int32,
                                        device=self.device)
