@@ -41,9 +41,9 @@ FROM base AS build_hipblaslt
 ARG HIPBLASLT_BRANCH
 RUN git clone -b ${HIPBLASLT_BRANCH} https://github.com/ROCm/rocm-libraries.git
 RUN apt-get remove -y hipblaslt && apt-get autoremove -y && apt-get autoclean -y
-WORKDIR rocm-libraries/projects/hipblaslt/build/release/clients/staging/
+WORKDIR rocm-libraries/projects/hipblaslt/
 RUN ./install.sh -dc -a gfx950
-RUN cd build/relase && make package
+RUN cd build/release && make package
 RUN mkdir -p /app/install && cp build/release/*.deb /app/install
 
 FROM base AS build_triton
