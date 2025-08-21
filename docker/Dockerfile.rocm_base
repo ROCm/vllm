@@ -39,7 +39,7 @@ RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cyth
 
 FROM base AS build_hipblaslt
 ARG HIPBLASLT_BRANCH
-RUN git clone -b ${HIPBLASLT_BRANCH} https://github.com/ROCm/rocm-libraries.git
+RUN git clone -b ${HIPBLASLT_BRANCH} git@github.com:ROCm/rocm-libraries.git
 RUN apt-get remove -y hipblaslt && apt-get autoremove -y && apt-get autoclean -y
 WORKDIR rocm-libraries/projects/hipblaslt/build/release/clients/staging/
 RUN ./install.sh -dc -a gfx950
