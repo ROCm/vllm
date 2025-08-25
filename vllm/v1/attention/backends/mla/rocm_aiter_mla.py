@@ -60,6 +60,7 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     batch_split_table: Optional[torch.Tensor] = None
     split_table: Optional[torch.Tensor] = None
     splits: Optional[torch.Tensor] = None
+    work_metadata: Optional[torch.Tensor] = None
     work_indptr: Optional[torch.Tensor] = None
     work_info_set: Optional[torch.Tensor] = None
     reduce_indptr: Optional[torch.Tensor] = None
@@ -146,6 +147,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
     def _build_decode(self, input_positions: torch.Tensor,
                       block_table: torch.Tensor,
+                      work_metadata: torch.Tensor,
                       work_indptr: torch.Tensor,
                       work_info_set: torch.Tensor,
                       reduce_indptr: torch.Tensor,
@@ -174,28 +176,28 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # reduce_final_map = None
         # reduce_partial_map = None
 
-        if max_seqlen_qo == 1:
-            batch_split_table = None
-            split_table = None
-            splits = None
-        else:
-            # aiter.get_mla_metadata_impl(paged_kv_indptr, num_kv_splits_indptr, batch_split_table, split_table, splits)
-            # if get gpu hang, please use cpu metadata as following:
-            # num_kv_splits_indptr = torch.empty(200, dtype=torch.int32, device=block_table.device)
-            # kv_seq_les = torch.empty(200, dtype=torch.int32, device=block_table.device)
-            # aiter.mla.get_meta_param_balanced(paged_kv_indptr, num_kv_splits_indptr, batch_split_table, split_table, kv_seq_les, splits)
-            aiter.get_mla_metadata_v1(
-                qo_indptr,
-                paged_kv_indptr,
-                16,   # nhead // nhead_kv,
-                1,    # nhead_kv,
-                True,
-                work_info_set,
-                work_indptr,
-                reduce_indptr,
-                reduce_final_map,
-                reduce_partial_map,
-            )
+        # if max_seqlen_qo == 1:
+        # aiter.get_mla_metadata_impl(paged_kv_indptr, num_kv_splits_indptr, batch_split_table, split_table, splits)
+        # if get gpu hang, please use cpu metadata as following:
+        # num_kv_splits_indptr = torch.empty(200, dtype=torch.int32, device=block_table.device)
+        # kv_seq_les = torch.empty(200, dtype=torch.int32, device=block_table.device)
+        # aiter.mla.get_meta_param_balanced(paged_kv_indptr, num_kv_splits_indptr, batch_split_table, split_table, kv_seq_les, splits)
+        if envs.VLLM_MLA_FP8_PADDING:
+            batch_size = qo_indptr.shape[0] - 1
+            qo_indptr = torch.arange(0, (batch_size + 1) * 2, 2, dtype=qo_indptr.dtype, device=qo_indptr.device)
+        aiter.get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            16,   # nhead // nhead_kv,
+            1,    # nhead_kv,
+            True,
+            work_metadata,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        )
 
         attn_metadata = AiterMLADecodeMetadata(
             input_positions=input_positions,
@@ -205,6 +207,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_last_page_len,
             num_kv_splits_indptr=num_kv_splits_indptr,
+            work_metadata=work_metadata,
             work_indptr=work_indptr,
             work_info_set=work_info_set,
             reduce_indptr=reduce_indptr,
@@ -306,6 +309,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                              max_seqlen_qo, self.scale,
                              True, 0.0, 1,
                              attn_metadata.decode.num_kv_splits_indptr,
+                             attn_metadata.decode.work_metadata,
                              attn_metadata.decode.work_indptr,
                              attn_metadata.decode.work_info_set,
                              attn_metadata.decode.reduce_indptr,

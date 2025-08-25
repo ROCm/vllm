@@ -476,6 +476,7 @@ class MLACommonMetadataBuilder(Generic[M]):
 
     def _build_decode(self, input_positions: torch.Tensor,
                       block_table: torch.Tensor,
+                      work_metadata: torch.Tensor,
                       work_indptr: torch.Tensor,
                       work_info_set: torch.Tensor,
                       reduce_indptr: torch.Tensor,
@@ -485,6 +486,7 @@ class MLACommonMetadataBuilder(Generic[M]):
         return MLACommonDecodeMetadata(
             input_positions=input_positions,
             block_table=block_table,
+            work_metadata=self.runner.work_metadata,
             work_indptr=self.runner.work_indptr,
             work_info_set=self.runner.work_info_set,
             reduce_indptr=self.runner.reduce_indptr,
@@ -597,6 +599,12 @@ class MLACommonMetadataBuilder(Generic[M]):
             decode_metadata = self._build_decode(
                 input_positions=input_positions[:self._num_decode_tokens],
                 block_table=block_table[:self._num_decodes, ...],
+                work_metadata=self.runner.work_metadata,
+                work_indptr=self.runner.work_indptr,
+                work_info_set=self.runner.work_info_set,
+                reduce_indptr=self.runner.reduce_indptr,
+                reduce_final_map=self.runner.reduce_final_map,
+                reduce_partial_map=self.runner.reduce_partial_map,
                 seq_lens=seq_lens[:self._num_decodes],
             )
 
