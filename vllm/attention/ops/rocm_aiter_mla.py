@@ -8,7 +8,8 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 import vllm.envs as envs
-
+from aiter.mla import mla_decode_fwd_dispatch
+from aiter import per_tensor_quant
 
 def get_aiter_mla_metadata(max_batch_size: int, block_size: int,
                            max_block_per_batch: int,
@@ -53,13 +54,10 @@ def aiter_mla_decode_fwd(
     # q_rope=None,
     # k_rope=None, 
 ):
-
     if envs.VLLM_MLA_FP8_PADDING:
         assert q.shape.__len__() == 3, f"q shape: {q.shape}"
         assert o.shape.__len__() == 3, f"o shape: {o.shape}"
         
-        from aiter.mla import mla_decode_fwd_dispatch
-        from aiter import per_tensor_quant
         q_fp8, q_scale = per_tensor_quant(q, quant_dtype=torch.float8_e4m3fnuz)
         kv_buffer = kv_buffer.to(torch.float8_e4m3fnuz)
         kv_scale = torch.ones([1], dtype=torch.float, device=kv_buffer.device) 
@@ -92,32 +90,25 @@ def aiter_mla_decode_fwd(
                                 )
         o[:] = o_padded[::2]  # Extract every second element
     else:
-        torch.ops.vllm.rocm_aiter_mla_decode_fwd(
-            q,
-            kv_buffer.view(-1, 1, 1, q.shape[-1]),
-            o,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            max_seqlen_q,
-            sm_scale,
-            varlen,
-            logit_cap,
-            num_kv_splits,
-            num_kv_splits_indptr,
-            work_metadata,
-            work_indptr,
-            work_info_set,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            # batch_split_table,
-            # split_table,
-            # splits,
-            # q_rope,
-            # k_rope,
-        )
+        mla_decode_fwd_dispatch(q,
+                                kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                                o,
+                                qo_indptr,
+                                kv_indptr,
+                                kv_indices,
+                                kv_last_page_lens,
+                                1,
+                                sm_scale=sm_scale,
+                                logit_cap=logit_cap,
+                                num_kv_splits=num_kv_splits,
+                                num_kv_splits_indptr=num_kv_splits_indptr,
+                                work_meta_data=work_metadata,
+                                work_indptr=work_indptr,
+                                work_info_set=work_info_set,
+                                reduce_indptr=reduce_indptr,
+                                reduce_final_map=reduce_final_map,
+                                reduce_partial_map=reduce_partial_map
+                                )
 
 
 def mla_decode_fwd_impl(
