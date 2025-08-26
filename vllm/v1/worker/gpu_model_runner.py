@@ -283,16 +283,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.work_indptr = torch.empty([81],
                                        dtype=torch.int32,
                                        device=self.device)
-        self.work_info_set = torch.empty([self.max_num_reqs + 80, 8],
+        self.work_info_set = torch.empty([self.max_num_reqs * 80, 8],
                                          dtype=torch.int32,
                                          device=self.device)
-        self.reduce_indptr = torch.empty([self.max_num_reqs * max_seqlen_qo  + 1],
+        
+        self.reduce_indptr = torch.empty([self.max_num_reqs + 1],
                                          dtype=torch.int32,
                                          device=self.device)
-        self.reduce_final_map = torch.empty([self.max_num_reqs * max_seqlen_qo, 2],
+        self.reduce_final_map = torch.empty([self.max_num_reqs, 2],
                                             dtype=torch.int32,
                                             device=self.device)
-        self.reduce_partial_map = torch.empty([self.max_num_reqs * max_seqlen_qo],
+        self.reduce_partial_map = torch.empty([self.max_num_reqs * 80],
                                               dtype=torch.int32,
                                               device=self.device)
 
