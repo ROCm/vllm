@@ -148,7 +148,7 @@ def kernel_unified_attention_2d(
         + offs_d[None, :]
     )
 
-    dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
+    dim_mask = offs_d < HEAD_SIZE
     query_mask_0 = query_pos < cur_batch_query_len
     query_mask_1 = query_offset_1 < num_query_heads
 
@@ -464,9 +464,9 @@ def kernel_unified_attention_3d(
         + offs_d[None, :]
     )
 
-    dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
-    query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+    dim_mask = offs_d < HEAD_SIZE
+    query_mask_0 = query_pos < cur_batch_query_len
+    query_mask_1 = query_offset_1 < num_query_heads
 
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
 
