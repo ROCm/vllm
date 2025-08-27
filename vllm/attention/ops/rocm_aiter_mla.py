@@ -63,7 +63,7 @@ def aiter_mla_decode_fwd(
         kv_scale = torch.ones([1], dtype=torch.float, device=kv_buffer.device) 
         batch_size = q_fp8.shape[0]
         q_fp8_padded = torch.ones(batch_size * 2, q_fp8.shape[1], q_fp8.shape[2], dtype=q_fp8.dtype, device=q_fp8.device)
-        q_fp8_padded[::2] = q_fp8
+        q_fp8_padded[1::2] = q_fp8
         qo_indptr_padded = torch.arange(0, (batch_size + 1) * 2, 2, dtype=qo_indptr.dtype, device=qo_indptr.device)
         o_padded = torch.empty((o.shape[0] * 2, o.shape[1], o.shape[2]), dtype=o.dtype, device=o.device).fill_(-1)
         max_seqlen_q_new = 2
@@ -88,7 +88,7 @@ def aiter_mla_decode_fwd(
                                 q_scale=q_scale,
                                 kv_scale=kv_scale,
                                 )
-        o[:] = o_padded[::2]  # Extract every second element
+        o[:] = o_padded[1::2]  # Extract every second element
     else:
         mla_decode_fwd_dispatch(q,
                                 kv_buffer.view(-1, 1, 1, q.shape[-1]),
