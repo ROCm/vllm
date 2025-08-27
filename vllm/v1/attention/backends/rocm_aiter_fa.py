@@ -89,6 +89,7 @@ if current_platform.is_rocm():
             tl.store(k_values_ptr + kv_values_off, k_vals, mask=block_mask)
             tl.store(v_values_ptr + kv_values_off, v_vals, mask=block_mask)
 
+    @torch.inference_mode()
     def vllm_layout_trans(b_query_lens_loc, b_seq_lens_loc, block_table,
                           k_cache, v_cache, max_seq_len, k_scale, v_scale,
                           output_dtype, total_tokens):
@@ -148,10 +149,8 @@ if current_platform.is_rocm():
         block_table: torch.Tensor,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
-        total_tokens: int = 0,
+        total_tokens: int,
     ) -> torch.Tensor:
-        if total_tokens == 0:
-            total_tokens = int(cu_seqlens_k[-1].item())
         k, v = vllm_layout_trans(cu_seqlens_q, cu_seqlens_k, block_table,
                                  k_cache, v_cache, max_seqlen_k, k_scale,
                                  v_scale, q.dtype, total_tokens)
@@ -222,12 +221,10 @@ class AiterFlashAttentionMetadata:
     seq_lens: torch.Tensor
     slot_mapping: torch.Tensor
     block_table: torch.Tensor
-    cu_seq_lens: Optional[torch.Tensor]
 
     # For cascade attention.
     use_cascade: bool
     common_prefix_len: int
-    total_tokens: int
 
 
 class AiterFlashAttentionMetadataBuilder(
@@ -240,6 +237,7 @@ class AiterFlashAttentionMetadataBuilder(
         self.model_config = vllm_config.model_config
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
+        self.compilation_config = vllm_config.compilation_config
         self.device = device
 
         self.num_heads_q = self.model_config.get_num_attention_heads(
@@ -252,16 +250,8 @@ class AiterFlashAttentionMetadataBuilder(
         # Sliding window size to be used with the AOT scheduler will be
         # populated on first build() call.
         self.aot_sliding_window: Optional[tuple[int, int]] = None
-        self.total_tokens: int = 0
-
-    def build_for_cudagraph_capture(
-            self, common_attn_metadata: CommonAttentionMetadata):
-        self.total_tokens = self.model_config.max_model_len \
-            * self.vllm_config.scheduler_config.max_num_partial_prefills
-        res = self.build(common_prefix_len=0,
-                         common_attn_metadata=common_attn_metadata)
-        self.total_tokens = 0
-        return res
+        self.use_full_cuda_graph: bool = \
+            self.compilation_config.cudagraph_mode.has_full_cudagraphs()
 
     def build(self,
               common_prefix_len: int,
@@ -275,24 +265,11 @@ class AiterFlashAttentionMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
-        if max_query_len > 1:
-            # We pre-compute cumulative seq len needed for prefill attention
-            # here to avoid recomputing it for every layer
-            cu_seq_lens = torch.zeros(seq_lens.shape[0] + 1,
-                                      dtype=torch.int32,
-                                      device=seq_lens.device)
-            torch.cumsum(seq_lens,
-                         dim=0,
-                         dtype=cu_seq_lens.dtype,
-                         out=cu_seq_lens[1:])
-            num_actual_kv_tokens = int(cu_seq_lens[-1].item())
+        if self.use_full_cuda_graph:
+            num_actual_kv_tokens = self.model_config.max_seq_len_to_capture * \
+                self.compilation_config.max_capture_size
         else:
-            cu_seq_lens = None
-            num_actual_kv_tokens = 0
-
-        def schedule(batch_size, cu_query_lens, max_query_len, seqlens,
-                     max_seq_len, causal):
-            return None
+            num_actual_kv_tokens = int(seq_lens.sum())
 
         use_cascade = common_prefix_len > 0
 
@@ -305,10 +282,8 @@ class AiterFlashAttentionMetadataBuilder(
             seq_lens=seq_lens,
             block_table=block_table_tensor,
             slot_mapping=slot_mapping,
-            cu_seq_lens=cu_seq_lens,
             use_cascade=use_cascade,
             common_prefix_len=common_prefix_len,
-            total_tokens=self.total_tokens,
         )
         return attn_metadata
 
@@ -381,6 +356,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         logits_soft_cap: Optional[float] = None,
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: Optional[int] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -410,6 +386,9 @@ class AiterFlashAttentionImpl(AttentionImpl):
                                       "encoder/decoder cross-attention "
                                       "are not implemented for "
                                       "FlashAttentionImpl")
+        self.sinks = sinks
+        if self.sinks is not None:
+            raise NotImplementedError("Sinks are not supported for ROCM AITER")
 
     def forward(
         self,
@@ -489,6 +468,15 @@ class AiterFlashAttentionImpl(AttentionImpl):
             block_table = attn_metadata.block_table
 
             if max_seqlen_q > 1:
+                cu_seq_lens = torch.zeros(seqused_k.shape[0] + 1,
+                                          dtype=torch.int32,
+                                          device=query.device)
+
+                torch.cumsum(seqused_k,
+                             dim=0,
+                             dtype=cu_seq_lens.dtype,
+                             out=cu_seq_lens[1:])
+
                 torch.ops.vllm.flash_attn_varlen_func(
                     query[:num_actual_tokens],
                     key_cache,
@@ -501,7 +489,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     alibi_slopes=self.alibi_slopes,
                     window_size=self.sliding_window,
                     block_table=block_table,
-                    cu_seqlens_k=attn_metadata.cu_seq_lens,
+                    cu_seqlens_k=cu_seq_lens,
                     k_scale=layer._k_scale,
                     v_scale=layer._v_scale,
                     total_tokens=attn_metadata.num_actual_kv_tokens,
