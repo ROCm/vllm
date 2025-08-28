@@ -220,6 +220,7 @@ class LlamaAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
+        print("#^# Attention")
         return output
 
     def _init_rotary_emb(self, config: LlamaConfig,
@@ -414,6 +415,7 @@ class LlamaModel(nn.Module):
                 self.layers[self.start_layer:self.end_layer]):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
+            print(f"#^# Layer {idx}")
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:

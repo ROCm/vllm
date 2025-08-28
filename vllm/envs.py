@@ -144,7 +144,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = False
-
+    VLLM_ROCM_USE_TRITON_LA: bool = False
 
 def get_default_cache_root():
     return os.getenv(
@@ -1003,6 +1003,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE":
     lambda: bool(int(os.getenv(\
             "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "0"))),
+
+    # Whether to use triton-light attention implementation.
+    # By default is disabled.
+    "VLLM_ROCM_USE_TRITON_LA":
+    lambda: (os.getenv("VLLM_ROCM_USE_TRITON_LA", "False").lower() in
+             ("true", "1")),
 }
 
 # --8<-- [end:env-vars-definition]
