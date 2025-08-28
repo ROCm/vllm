@@ -1235,7 +1235,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             and has_decode
             and kv_cache.numel() > 0
         ):
-            q_nope_pe, q_nope_zeros = fused_qk_rope_cat_and_cache_mla(
+            if kv_cache.dtype == torch.bfloat16:
+                output_q_nope_zeros = True
+            else:
+                output_q_nope_zeros = False
+                kv_cache = kv_cache.view(torch.float8_e4m3fnuz)
+                
+            q_nope_pe = fused_qk_rope_cat_and_cache_mla(
                 decode_ql_nope,
                 decode_q_pe,
                 k_c_normed.unsqueeze(1),
@@ -1247,8 +1253,12 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 self.sin_cache,
                 layer._k_scale,
                 self.rotary_emb_is_neox_style,
-                output_q_nope_zeros=True,
+                output_q_nope_zeros=output_q_nope_zeros,
+                q_out_dtype=kv_cache.dtype,
             )
+            if output_q_nope_zeros == True:
+                q_nope_pe, q_nope_zeros = q_nope_pe
+
         elif kv_cache.numel() > 0:
             ops.concat_and_cache_mla(
                 k_c_normed,

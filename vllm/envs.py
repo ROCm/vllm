@@ -746,7 +746,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_AITER_TRITON_FP8_BMM", "0"))),
     
     "VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS":
-    lambda: bool(int(os.getenv("VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS", "0"))),
+    lambda: bool(int(os.getenv("VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS", "1"))),
 
     "VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT":
     lambda: bool(int(os.getenv("VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT", "0"))),
