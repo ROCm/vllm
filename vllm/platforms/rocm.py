@@ -289,7 +289,9 @@ class RocmPlatform(Platform):
                         link_type = amdsmi_topo_get_link_type(
                             handle, peer_handle)
                         # type is 2 for XGMI
-                        if link_type["hops"] != 1 or link_type["type"] not in [1, 2]:
+                        if link_type["hops"] != 1 or link_type["type"] not in [
+                                1, 2
+                        ]:
                             return False
                     except AmdSmiException as error:
                         logger.error("AMD 1 hop XGMI detection failed.",
@@ -425,8 +427,8 @@ class RocmPlatform(Platform):
         return 'gfx1' in torch.cuda.get_device_properties(0).gcnArchName
 
     @classmethod
-    def get_piecewise_backend_cls(cls) -> str:
-        return "vllm.compilation.cuda_piecewise_backend.CUDAPiecewiseBackend"  # noqa
+    def get_static_graph_wrapper_cls(cls) -> str:
+        return "vllm.compilation.cuda_graph.CUDAGraphWrapper"
 
     @classmethod
     def stateless_init_device_torch_dist_pg(
