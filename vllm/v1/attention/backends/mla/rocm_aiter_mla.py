@@ -280,9 +280,18 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         ) -> torch.Tensor:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
-
-        if envs.VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT and q_nope_pe is not None and q_nope_zeros is not None:
-            q, o = q_nope_pe, q_nope_zeros
+        
+        if envs.VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT and q_nope_pe is not None:
+            if q_nope_zeros is not None:
+                q, o = q_nope_pe, q_nope_zeros
+            else:
+                q = q_nope_pe
+                B = q.shape[0]
+                o = torch.empty(B,
+                                self.num_heads,
+                                self.kv_lora_rank,
+                                dtype=torch.bfloat16,
+                                device=q.device)
         elif envs.VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS:
             q, o = fused_concat_zeros(q_nope, q_pe)
         else:
