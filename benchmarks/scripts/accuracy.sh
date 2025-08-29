@@ -1,0 +1,1 @@
+lm_eval --model local-completions --model_args model=<model>,base_url=http://0.0.0.0:9000/v1/completions,num_concurrent=256,max_retries=10,max_gen_toks=2048 --tasks gsm8k --num_fewshot 5 --batch_size auto --limit 250  --apply_chat_template 2>&1 | tee -a eval.log
