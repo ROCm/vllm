@@ -44,6 +44,7 @@ class QuarkW8A8Fp8(QuarkScheme):
                                            and envs.VLLM_ROCM_USE_AITER
                                            and envs.VLLM_ROCM_USE_AITER_LINEAR
                                            and current_platform.is_fp8_fnuz())
+
     @classmethod
     def get_min_capability(cls) -> int:
         # lovelace and up
