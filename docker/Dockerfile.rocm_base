@@ -45,28 +45,28 @@ RUN apt-get update -y \
 
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
 
-FROM base AS build_hipblaslt
-ARG HIPBLASLT_BRANCH
-ARG HIPBLAS_COMMON_BRANCH
-# Set to "--legacy_hipblas_direct" for ROCm<=6.2
-ARG LEGACY_HIPBLASLT_OPTION
-RUN git clone https://github.com/ROCm/hipBLAS-common.git
-RUN apt-get remove -y hipblaslt && apt-get autoremove -y && apt-get autoclean -y
-RUN cd hipBLAS-common \
-    && git checkout ${HIPBLAS_COMMON_BRANCH} \
-    && mkdir build \
-    && cd build \
-    && cmake .. \
-    && make package \
-    && dpkg -i ./*.deb
-RUN git clone https://github.com/ROCm/hipBLASLt
-RUN cd hipBLASLt \
-    && git checkout ${HIPBLASLT_BRANCH} \
-    && apt-get install -y llvm-dev \
-    && ./install.sh -dc --architecture ${PYTORCH_ROCM_ARCH} ${LEGACY_HIPBLASLT_OPTION} \
-    && cd build/release \
-    && make package
-RUN mkdir -p /app/install && cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
+# FROM base AS build_hipblaslt
+# ARG HIPBLASLT_BRANCH
+# ARG HIPBLAS_COMMON_BRANCH
+# # Set to "--legacy_hipblas_direct" for ROCm<=6.2
+# ARG LEGACY_HIPBLASLT_OPTION
+# RUN git clone https://github.com/ROCm/hipBLAS-common.git
+# RUN apt-get remove -y hipblaslt && apt-get autoremove -y && apt-get autoclean -y
+# RUN cd hipBLAS-common \
+#     && git checkout ${HIPBLAS_COMMON_BRANCH} \
+#     && mkdir build \
+#     && cd build \
+#     && cmake .. \
+#     && make package \
+#     && dpkg -i ./*.deb
+# RUN git clone https://github.com/ROCm/hipBLASLt
+# RUN cd hipBLASLt \
+#     && git checkout ${HIPBLASLT_BRANCH} \
+#     && apt-get install -y llvm-dev \
+#     && ./install.sh -dc --architecture ${PYTORCH_ROCM_ARCH} ${LEGACY_HIPBLASLT_OPTION} \
+#     && cd build/release \
+#     && make package
+# RUN mkdir -p /app/install && cp /app/hipBLASLt/build/release/*.deb /app/hipBLAS-common/build/*.deb /app/install
 
 FROM base AS build_triton
 ARG TRITON_BRANCH
@@ -126,8 +126,8 @@ RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 FROM base AS debs
 RUN mkdir /app/debs
-RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-    cp /install/*.deb /app/debs
+# RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
+#     cp /install/*.deb /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
@@ -138,11 +138,11 @@ RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 
 FROM base AS final
-RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-    dpkg -i /install/*deb \
-    && perl -p -i -e 's/, hipblas-common-dev \([^)]*?\), /, /g' /var/lib/dpkg/status \
-    && perl -p -i -e 's/, hipblaslt-dev \([^)]*?\), /, /g' /var/lib/dpkg/status \
-    && perl -p -i -e 's/, hipblaslt \([^)]*?\), /, /g' /var/lib/dpkg/status
+# RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
+#     dpkg -i /install/*deb \
+#     && perl -p -i -e 's/, hipblas-common-dev \([^)]*?\), /, /g' /var/lib/dpkg/status \
+#     && perl -p -i -e 's/, hipblaslt-dev \([^)]*?\), /, /g' /var/lib/dpkg/status \
+#     && perl -p -i -e 's/, hipblaslt \([^)]*?\), /, /g' /var/lib/dpkg/status
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
