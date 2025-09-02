@@ -435,7 +435,8 @@ class Fp8LinearMethod(LinearMethodBase):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+              bias: Optional[torch.Tensor] = None,
+              x_quant_scales: torch.Tensor = None) -> torch.Tensor:
 
         if self.use_marlin:
             return apply_fp8_marlin_linear(
@@ -459,6 +460,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
                 cutlass_block_fp8_supported=self.cutlass_block_fp8_supported,
                 use_aiter_and_is_supported=self.use_aiter_and_is_supported,
+                input_quant_scale=x_quant_scales,
             )
 
         return self.fp8_linear.apply(input=x,
