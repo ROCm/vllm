@@ -1,12 +1,9 @@
-# Connect to server docker
-# docker exec -it vllm-server
-
-
-# Run the client benchmark
+# bash client.sh /data/models/gpt-oss-120b
+model=$1
 python3 ../../benchmark_serving.py \
   --host localhost \
-  --port 8000 \
-  --model /data/models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview \
+  --port 9000 \
+  --model ${model} \
   --dataset-name random \
   --random-input-len 1024 \
   --random-output-len 1024 \
