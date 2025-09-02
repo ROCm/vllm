@@ -232,7 +232,7 @@ class RocmPlatform(Platform):
                 if envs.VLLM_ROCM_USE_TRITON_LA:
                     logger.info("Using Triton Light Attention backend on V1 engine.")
                     return ("vllm.v1.attention.backends."
-                        "triton_attn.TritonLightAttentionBackend")
+                        "triton_lattn.TritonLightAttentionBackend")
                 else:
                     logger.info("Using Triton Attention backend on V1 engine.")
                     return ("vllm.v1.attention.backends."
