@@ -2,6 +2,8 @@
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
 ARG BASE_IMAGE=rocm/vllm-dev:base
+ARG AITER_BRANCH="6b92d30d"
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
 FROM ${BASE_IMAGE} AS base
 
@@ -18,6 +20,18 @@ RUN apt-get purge -y sccache; python3 -m pip uninstall -y sccache; rm -f "$(whic
 ARG COMMON_WORKDIR
 WORKDIR ${COMMON_WORKDIR}
 
+FROM base AS build_aiter
+ARG AITER_BRANCH
+ARG AITER_REPO
+# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+#     pip install /install/*.whl
+RUN git clone --recursive ${AITER_REPO}
+RUN cd aiter \
+    && git checkout ${AITER_BRANCH} \
+    && git submodule update --init --recursive \
+    && pip install -r requirements.txt
+RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist && ls /app/aiter/dist/*.whl
+RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 # -----------------------
 # vLLM fetch stages
@@ -42,6 +56,7 @@ RUN cd vllm \
     && python3 setup.py bdist_wheel --dist-dir=dist
 FROM scratch AS export_vllm
 ARG COMMON_WORKDIR
+COPY --from=build_aiter /app/install/*.whl /
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/dist/*.whl /
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/requirements /requirements
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/benchmarks /benchmarks
