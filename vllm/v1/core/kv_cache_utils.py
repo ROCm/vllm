@@ -828,9 +828,9 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
                                 available_memory, page_size)
     virtual_page_size_factor = envs.VLLM_VIRTUAL_PAGE_SIZE_FACTOR
-    logger.info(f"old page size {page_size}, old num blocks {num_blocks}")
+    logger.info(f"VLLM_VIRTUAL_PAGE_SIZE_FACTOR = {virtual_page_size_factor}, old page size {page_size}, old num blocks {num_blocks}")
     num_blocks = num_blocks // virtual_page_size_factor * virtual_page_size_factor
-    logger.info(f"new page size {page_size}, new num blocks {num_blocks}")
+    logger.info(f"VLLM_VIRTUAL_PAGE_SIZE_FACTOR = {virtual_page_size_factor}, new page size {page_size}, new num blocks {num_blocks}")
 
     per_layer_size = page_size * num_blocks
     # All layers have the same KV cache spec, so we create one kv cache group
