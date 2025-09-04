@@ -12,4 +12,7 @@ vllm bench serve \
   --num-prompts 16 \
   --percentile-metrics ttft,tpot,itl,e2el \
   --ignore-eos \
+  # --profile
+  # --seed 123 \
+  # --request-rate 2 \
   2>&1 | tee log.client.log

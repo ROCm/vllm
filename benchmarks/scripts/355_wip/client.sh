@@ -12,3 +12,5 @@ python3 ../../benchmark_serving.py \
   --percentile-metrics ttft,tpot,itl,e2el \
   --ignore-eos \
   # --profile
+  # --seed 123 \
+  # --request-rate 2 \
