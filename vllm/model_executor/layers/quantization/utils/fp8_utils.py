@@ -54,12 +54,12 @@ def rocm_aiter_gemm_w8a8_blockscale_impl(
     block_size: list[int],
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
-    # import aiter as rocm_aiter
-
-    # return rocm_aiter.gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-
-    return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
+    if not envs.VLLM_ROCM_USE_AITER_TRITON_LINEAR:
+        import aiter as rocm_aiter
+        return rocm_aiter.gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
+    else:
+        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+        return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
 
 
 def rocm_aiter_gemm_w8a8_blockscale_fake(
