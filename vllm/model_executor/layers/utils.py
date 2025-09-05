@@ -7,7 +7,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm import envs
-from vllm._aiter_ops import aiter_ops
+from vllm._aiter_ops import aiter_ops, is_rocm_aiter_hipb_gemm_enabled
 from vllm.platforms import current_platform
 
 
@@ -98,6 +98,7 @@ def rocm_unquantized_gemm_wrapper():
                        x: torch.Tensor,
                        weight: torch.Tensor,
                        bias: Optional[torch.Tensor] = None):
+
         k = weight.shape[1]
         _use_skinny = (use_skinny and \
                         x.dtype in [torch.float16, torch.bfloat16] \
@@ -127,6 +128,14 @@ def rocm_unquantized_gemm_wrapper():
     return inner_function
 
 
+def rocm_aiter_hipb_gemm_swizzle(layer: torch.nn.Module,
+                                 x: torch.Tensor,
+                                 weight: torch.Tensor,
+                                 bias: Optional[torch.Tensor] = None):
+
+    return aiter_ops.rocm_aiter_hipb_gemm_swizzle(x, weight, bias)
+
+
 def default_unquantized_gemm(layer: torch.nn.Module,
                              x: torch.Tensor,
                              weight: torch.Tensor,
@@ -147,6 +156,8 @@ def cpu_unquantized_gemm(layer: torch.nn.Module,
 def dispatch_unquantized_gemm() -> Callable[
     [torch.nn.Module, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     torch.Tensor]:
+    if is_rocm_aiter_hipb_gemm_enabled():
+        return rocm_aiter_hipb_gemm_swizzle
     if current_platform.is_rocm():
         return rocm_unquantized_gemm_wrapper()
     elif current_platform.is_cpu():
