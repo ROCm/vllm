@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import importlib
 from typing import Optional
 
 import torch
@@ -10,6 +11,7 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape)
 from vllm.platforms import current_platform
+from vllm.utils import direct_register_custom_op
 
 # Using the default value (240.0) from pytorch will cause accuracy
 # issue on dynamic quantization models. Here use 224.0 for fnuz on ROCm.
@@ -18,6 +20,60 @@ _FP8_FINFO = torch.finfo(_FP8_DTYPE)
 _FP8_MAX = 224.0 if current_platform.is_fp8_fnuz() else _FP8_FINFO.max
 _FP8_MIN = -224.0 if current_platform.is_fp8_fnuz() else _FP8_FINFO.min
 _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
+
+aiter_module_quant = importlib.import_module("aiter.jit.module_quant")
+dynamic_per_tensor_quant = aiter_module_quant.dynamic_per_tensor_quant
+static_per_tensor_quant = aiter_module_quant.static_per_tensor_quant
+
+
+def dynamic_per_tensor_quant_impl(
+        x: torch.Tensor,
+        dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    scale = torch.empty(1, dtype=torch.float, device=x.device)
+    y = torch.empty(x.shape, dtype=dtype, device=x.device)
+    dynamic_per_tensor_quant(y, x, scale)
+    return y, scale.view(1)
+
+
+def dynamic_per_tensor_quant_fake(
+        x: torch.Tensor,
+        dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x, dtype=dtype), torch.empty(1,
+                                                         dtype=torch.float32,
+                                                         device=x.device)
+
+
+def static_per_tensor_quant_impl(
+        x: torch.Tensor, scale: torch.Tensor,
+        dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    y = torch.empty(x.shape, dtype=dtype, device=x.device)
+    static_per_tensor_quant(y, x, scale)
+    return y, scale.view(1)
+
+
+def static_per_tensor_quant_fake(
+        x: torch.Tensor, scale: torch.Tensor,
+        dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x, dtype=dtype), torch.empty(1,
+                                                         dtype=torch.float32,
+                                                         device=x.device)
+
+
+direct_register_custom_op(
+    op_name="dynamic_per_tensor_quant",
+    op_func=dynamic_per_tensor_quant_impl,
+    mutates_args=[],
+    fake_impl=dynamic_per_tensor_quant_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+direct_register_custom_op(
+    op_name="static_per_tensor_quant",
+    op_func=static_per_tensor_quant_impl,
+    mutates_args=[],
+    fake_impl=static_per_tensor_quant_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
 
 
 @CustomOp.register("quant_fp8")
@@ -63,6 +119,26 @@ class QuantFP8(CustomOp):
             num_token_padding=self.num_token_padding,
             scale_ub=scale_ub,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        scale_ub: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert (scale is not None) == self.static
+        assert scale_ub is None or (not self.static and self.group_shape
+                                    == GroupShape.PER_TOKEN
+                                    and scale_ub.numel() == 1)
+
+        if self.group_shape == GroupShape.PER_TENSOR:
+            if scale is None:
+                return torch.ops.vllm.dynamic_per_tensor_quant(x, _FP8_DTYPE)
+            else:
+                return torch.ops.vllm.static_per_tensor_quant(
+                    x, scale, _FP8_DTYPE)
+
+        return self.forward_cuda(x, scale, scale_ub)
 
     def forward_native(
         self,
