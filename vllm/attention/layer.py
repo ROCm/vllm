@@ -128,6 +128,11 @@ class Attention(nn.Module, AttentionLayerBase):
         # but requires q to be quantized as well.
         self._q_scale = torch.tensor(1.0, dtype=torch.float32)
         self._prob_scale = torch.tensor(1.0, dtype=torch.float32)
+        self._out_scale = None
+
+        # Keeping float32 version of _q_scale tensor for assertions
+        # during graph capture. Otherwise asserts are triggeting HIP error
+        self._q_scale_float = 1.0
 
         # We also keep q/k/v_scale on host (cpu) memory for attention
         # backends that require the scales to be on host instead of on device.

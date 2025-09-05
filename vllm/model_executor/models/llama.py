@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+import vllm.envs as envs
 from vllm.attention import Attention, AttentionType
 from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
@@ -92,8 +93,12 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x):
         x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
-        x, _ = self.down_proj(x)
+        if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
+            x, x_scales = self.act_fn(x)
+            x, _ = self.down_proj(x, x_scales)
+        else:
+            x = self.act_fn(x)
+            x, _ = self.down_proj(x)
         return x
 
 

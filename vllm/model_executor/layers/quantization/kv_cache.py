@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
@@ -52,7 +53,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         # regardless whether the kv-scale is available in the checkpoint.
         # No need to process kv scales after loading if we are going to
         # calculate them on the fly.
-        if layer.kv_cache_dtype != "auto" and not layer.calculate_kv_scales:
+        if not layer.calculate_kv_scales:
             if layer.k_scale > 0.0 and layer.v_scale > 0.0:
                 # We prefer to use separate k_scale and v_scale if present
                 k_scale = layer.k_scale.to("cpu").tolist()
@@ -95,6 +96,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             layer._k_scale_float = k_scale
             layer._v_scale_float = v_scale
             if (k_scale == 1.0 and v_scale == 1.0
+                    and (layer.kv_cache_dtype != "auto"
+                         or envs.VLLM_USE_ROCM_FP8_FLASH_ATTN)
                     and "e5m2" not in layer.kv_cache_dtype):
                 logger.warning_once(
                     "Using KV cache scaling factor 1.0 for fp8_e4m3. This "
@@ -124,6 +127,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
 
         # These are used in the final Attention.forward()
         layer._q_scale.copy_(q_scale)
+        layer._q_scale_float = q_scale
+
         layer._prob_scale.copy_(prob_scale)
         if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0
                                               or prob_scale == 1.0):

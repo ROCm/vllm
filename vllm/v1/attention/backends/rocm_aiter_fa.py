@@ -325,6 +325,21 @@ class AiterFlashAttentionMetadataBuilder(
             dtype=torch.uint8,
             device=self.device,
         )
+            # We pre-compute cumulative seq len needed for prefill attention
+            # here to avoid recomputing it for every layer
+            cu_seq_lens = torch.zeros(seq_lens.shape[0] + 1,
+                                      dtype=torch.int32,
+                                      device=seq_lens.device)
+            torch.cumsum(seq_lens,
+                         dim=0,
+                         dtype=cu_seq_lens.dtype,
+                         out=cu_seq_lens[1:])
+            num_actual_kv_tokens = int(cu_seq_lens[-1].item())
+        else:
+            cu_seq_lens = None
+            num_actual_kv_tokens = 0
+
+        use_cascade = common_prefix_len > 0
 
         attn_metadata = AiterFlashAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -446,6 +461,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         self.sinks = sinks
         if self.sinks is not None:
             raise NotImplementedError("Sinks are not supported for ROCM AITER")
+        self.sinks = sinks
 
     def forward(
         self,

@@ -17,7 +17,8 @@ if TYPE_CHECKING:
     VLLM_NCCL_SO_PATH: Optional[str] = None
     LD_LIBRARY_PATH: Optional[str] = None
     VLLM_USE_TRITON_FLASH_ATTN: bool = True
-    VLLM_V1_USE_PREFILL_DECODE_ATTENTION: bool = True
+    VLLM_USE_ROCM_FP8_FLASH_ATTN: bool = True
+    VLLM_V1_USE_PREFILL_DECODE_ATTENTION: bool = False
     VLLM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_FLASH_ATTN_VERSION: Optional[int] = None
     LOCAL_RANK: int = 0
@@ -99,6 +100,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = False
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_USE_AITER_TRITON_SILU_MUL: bool = False
+    VLLM_TRITON_FP4_GEMM_USE_ASM: bool = False
+    VLLM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -369,6 +373,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE":
     lambda: bool(
         os.environ.get("VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE", "1") != "0"),
+
+    # use quantized q,k,v,softmax(qk^T), attn output during prefill
+    "VLLM_USE_ROCM_FP8_FLASH_ATTN":
+    lambda: (os.getenv("VLLM_USE_ROCM_FP8_FLASH_ATTN", "False").lower() in
+             ("true", "1")),
 
     # Feature flag to enable/disable Inductor standalone compile.
     # In torch <= 2.7 we ignore this flag; in torch >= 2.8 this is
@@ -772,6 +781,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter silu mul.
+    # By default is disabled.
+    "VLLM_USE_AITER_TRITON_SILU_MUL":
+    lambda: (os.getenv("VLLM_USE_AITER_TRITON_SILU_MUL", "False").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter fp4 gemm asm.
+    # By default is disabled.
+    "VLLM_TRITON_FP4_GEMM_USE_ASM":
+    lambda: (os.getenv("VLLM_TRITON_FP4_GEMM_USE_ASM", "False").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter rope.
+    # By default is disabled.
+    "VLLM_USE_AITER_TRITON_ROPE":
+    lambda: (os.getenv("VLLM_USE_AITER_TRITON_ROPE", "False").lower() in
              ("true", "1")),
 
     # use rocm skinny gemms
