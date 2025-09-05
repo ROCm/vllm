@@ -99,6 +99,7 @@ def rocm_aiter_topk_softmax_impl(topk_weights: torch.Tensor,
                                  gating_output: torch.Tensor,
                                  renormalize: bool) -> None:
     from aiter import topk_softmax
+    topk_indices = topk_indices.to(torch.int32)
     topk_softmax(topk_weights, topk_indices, token_expert_indices,
                  gating_output, renormalize)
 

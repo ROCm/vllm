@@ -544,7 +544,7 @@ class CompilationConfig:
             # full cudagraph outside the fx graph. This reduces some cpu
             # overhead when the runtime batch_size is not cudagraph captured.
             # see https://github.com/vllm-project/vllm/pull/20059 for details.
-            self.splitting_ops = self._attention_ops
+            self.splitting_ops = list(self._attention_ops)
         elif len(self.splitting_ops) == 0:
             logger.warning_once("Using piecewise compilation with empty "
                                 "splitting_ops.")
@@ -558,6 +558,9 @@ class CompilationConfig:
                     "any problems.")
                 self.cudagraph_mode = CUDAGraphMode.FULL
             self.splitting_ops = []
+
+        if envs.VLLM_LOG_BATCHSIZE_INTERVAL == "deepep_high_throughput" and "vllm.moe_forward" not in self.splitting_ops:
+            self.splitting_ops.append("vllm.moe_forward")
 
     def splitting_ops_contain_attention(self) -> bool:
         return self.splitting_ops is not None and all(

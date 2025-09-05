@@ -997,8 +997,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from vllm.model_executor.layers.fused_moe import (
             BatchedTritonOrDeepGemmExperts, TritonOrDeepGemmExperts)
 
-        assert not self.use_marlin and not self.rocm_aiter_moe_enabled, (
-            "Marlin and ROCm AITER are not supported with all2all yet.")
+        assert not self.use_marlin, (
+            "Marlin are not supported with all2all yet.")
 
         if (prepare_finalize.activation_format ==
                 FusedMoEActivationFormat.BatchedExperts):
@@ -1075,8 +1075,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 logical_to_physical_map=logical_to_physical_map,
                 logical_replica_count=logical_replica_count,
             )
-
-        if self.rocm_aiter_moe_enabled:
+        if self.rocm_aiter_moe_enabled and envs.VLLM_ALL2ALL_BACKEND == 'naive':
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa: E501
                 rocm_aiter_fused_experts)
             return rocm_aiter_fused_experts(

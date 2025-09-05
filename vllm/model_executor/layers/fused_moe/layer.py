@@ -469,8 +469,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             expert_load_view=expert_load_view,
             logical_to_physical_map=logical_to_physical_map,
             logical_replica_count=logical_replica_count)
-
-        if self.rocm_aiter_moe_enabled:
+        if self.rocm_aiter_moe_enabled and envs.VLLM_ALL2ALL_BACKEND == 'naive':
             return self.rocm_aiter_fused_experts(
                 hidden_states=x,
                 w1=layer.w13_weight,
