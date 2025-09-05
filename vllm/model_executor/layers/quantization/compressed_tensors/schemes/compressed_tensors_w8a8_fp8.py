@@ -93,9 +93,13 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             if self.use_aiter_and_is_supported:
                 from aiter.ops.shuffle import shuffle_weight
 
+                from vllm._aiter_ops import (
+                    rocm_aiter_maybe_pad_weight_for_shuffle)
+
                 # keep the weight as (N, K)
-                layer.weight = Parameter(shuffle_weight(weight,
-                                                        layout=(16, 16)),
+                layer.weight = Parameter(shuffle_weight(
+                    rocm_aiter_maybe_pad_weight_for_shuffle(weight),
+                    layout=(16, 16)),
                                          requires_grad=False)
             else:
                 # keep the weight as (K, N)

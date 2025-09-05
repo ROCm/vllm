@@ -43,12 +43,14 @@ if current_platform.is_rocm():
         # accept the weight as # keep the weight as (N, K)
         # NOTE: The weight has to be shuffled in the
         # process_weights_after_loading of the CompressedTensorsW8A8Fp8 class
+        from vllm._aiter_ops import rocm_aiter_maybe_pad_weight_for_shuffle
 
+        padded_input = rocm_aiter_maybe_pad_weight_for_shuffle(input)
         m = input.shape[0]
         n = weight.shape[0]
         from aiter import gemm_a8w8_bpreshuffle_ck
         Y = torch.empty(m, n, dtype=out_dtype, device=input.device)
-        gemm_a8w8_bpreshuffle_ck(input, weight, scale_a, scale_b, Y)
+        gemm_a8w8_bpreshuffle_ck(padded_input, weight, scale_a, scale_b, Y)
         return Y
 
     def rocm_aiter_gemm_a8w8_bpreshuffle_fake(

@@ -8,6 +8,28 @@ from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
 
+def rocm_aiter_maybe_pad_weight_for_shuffle(
+        weight: torch.Tensor,
+        layout: tuple[int, int] = (16, 16),
+) -> torch.Tensor:
+    # pad weights with zeros at the end of the dimension
+    # so that the shuffle works
+    IN, IK = layout
+    BK = IK * 2  # BK = 32
+    # BN = IN      # BN = 16
+
+    # Calculate padding needed for last dimension (K dimension)
+    last_dim = weight.shape[-1]
+    pad_k = (BK - (last_dim % BK)) % BK
+
+    # Pad the weight tensor: (pad_left, pad_right)
+    # for each dimension from last to first
+    padded_weight = torch.nn.functional.pad(weight, (0, pad_k, 0, 0),
+                                            mode='constant',
+                                            value=0)
+    return padded_weight
+
+
 def rocm_aiter_tuned_gemm_impl(
         input: torch.Tensor,
         weight: torch.Tensor,
