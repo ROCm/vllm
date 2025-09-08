@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     VLLM_USE_AITER_TRITON_SILU_MUL: bool = False
     VLLM_TRITON_FP4_GEMM_USE_ASM: bool = False
     VLLM_USE_AITER_TRITON_ROPE: bool = False
+    VLLM_USE_AITER_TRITON_GEMM: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -795,6 +796,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is disabled.
     "VLLM_USE_AITER_TRITON_ROPE":
     lambda: (os.getenv("VLLM_USE_AITER_TRITON_ROPE", "False").lower() in
+             ("true", "1")),
+
+    # Whether to use aiter triton gemm.
+    # By default is disabled.
+    "VLLM_USE_AITER_TRITON_GEMM":
+    lambda: (os.getenv("VLLM_USE_AITER_TRITON_GEMM", "False").lower() in
              ("true", "1")),
 
     # use rocm skinny gemms
