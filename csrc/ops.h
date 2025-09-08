@@ -89,8 +89,7 @@ void convert_vertical_slash_indexes_mergehead(
 void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
               double epsilon);
 
-void fused_add_rms_norm(torch::Tensor& out, torch::Tensor& input,
-                        torch::Tensor& residual_out, torch::Tensor& residual,
+void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
                         torch::Tensor& weight, double epsilon);
 
 void apply_repetition_penalties_(torch::Tensor& logits,
