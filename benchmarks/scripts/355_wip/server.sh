@@ -57,6 +57,6 @@ vllm serve /data/models/amd/Llama-3.3-70B-Instruct-MXFP4-Preview \
   --max-seq-len-to-capture 16384 \
   --no-enable-prefix-caching \
   --max-num-batched-tokens 131072 \
-  --compilation-config '{"full_cuda_graph":true}' \
+  --compilation-config '{"pass_config": {"enable_fusion":true, "enable_noop":true}, "full_cuda_graph":true}' \
   # --enforce-eager 
 
