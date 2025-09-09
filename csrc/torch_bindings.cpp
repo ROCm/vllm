@@ -202,7 +202,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "rms_norm_dynamic_per_token_quant(Tensor! result, Tensor input, "
       "Tensor weight, Tensor! scale, float epsilon, "
-      "Tensor? scale_ub, Tensor!? residual_out, Tensor? residual) -> ()");
+      "Tensor? scale_ub, Tensor!? residual) -> ()");
   ops.impl("rms_norm_dynamic_per_token_quant", torch::kCUDA,
            &rms_norm_dynamic_per_token_quant);
 
