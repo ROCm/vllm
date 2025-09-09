@@ -878,7 +878,7 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     raise NotImplementedError(
                         "fused output quantization only supported for Triton"
                         " implementation in ROCMFlashAttentionImpl for now")
-                paged_attn.forward_decode(
+                output[num_prefill_tokens:] = paged_attn.forward_decode(
                     decode_query,
                     key_cache,
                     value_cache,
@@ -897,7 +897,6 @@ class ROCmFlashAttentionImpl(AttentionImpl):
                     self.alibi_slopes,
                     layer._k_scale,
                     layer._v_scale,
-                    output=output[num_prefill_tokens:],
                 )
             else:
                 # PagedAttention does not support fused quant, manually quantize
