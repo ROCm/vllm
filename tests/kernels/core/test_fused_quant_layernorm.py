@@ -93,9 +93,12 @@ def ops_dynamic_per_token_quant(weight: torch.Tensor,
                                 residual: Optional[torch.Tensor],
                                 scale_ub: Optional[torch.Tensor]) \
         -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    out, scales, residual_out = ops.rms_norm_dynamic_per_token_quant(
-        x, weight, EPS, quant_dtype, scale_ub, residual)
-    return out, scales, residual_out
+    if residual is not None:
+        residual = residual.clone()
+    out, scales = ops.rms_norm_dynamic_per_token_quant(x, weight, EPS,
+                                                       quant_dtype, scale_ub,
+                                                       residual)
+    return out, scales, residual
 
 
 def ops_impl(weight: torch.Tensor,
@@ -144,7 +147,6 @@ def test_rms_norm(
     scale = 1 / (hidden_size)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
     residual = torch.randn_like(x) * scale if add_residual else None
-    residual_out = torch.empty_like(residual) if add_residual else None
     if scale_ub is not None:
         rms_x, _ = ref_rms_norm(layer, x, residual)
         scale_ub = torch.mean(rms_x).to(dtype=torch.float32, device='cuda')
@@ -172,5 +174,4 @@ def test_rms_norm(
                          dtype=torch.float32)
 
     opcheck(torch.ops._C.rms_norm_dynamic_per_token_quant,
-            (output, x, layer.weight, scales, 1e-5, scale_ub, residual_out,
-             residual))
+            (output, x, layer.weight, scales, 1e-5, scale_ub, residual))
