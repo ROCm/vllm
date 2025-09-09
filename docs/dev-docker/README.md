@@ -21,7 +21,8 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- Multiple environment variables are now set by default.
+- vLLM version 0.10.1
+- Flag enabled by default in the docker -VLLM_V1_USE_PREFILL_DECODE_ATTENTION
 
 ## Known Issues and Workarounds
 
@@ -493,7 +494,8 @@ Use AITER release candidate branch instead:
 ## Changelog
 
 rocm6.4.1_vllm_0.10.1_20250909:
-- Multiple environment variables set by default.
+- vLLM version 0.10.1
+- Flag enabled by default in the docker -VLLM_V1_USE_PREFILL_DECODE_ATTENTION
 
 20250715_aiter:
 - No need to specify the --compilation-config parameter, these options were turned on by default
