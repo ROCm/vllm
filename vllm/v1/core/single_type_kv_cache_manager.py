@@ -309,6 +309,14 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if use_eagle and computed_blocks[0]:
             for computed in computed_blocks:
                 computed.pop()
+
+        if len(kv_cache_group_ids) == 1:
+            # if enable vps, the num of blocks hit should be multiple of virtual_page_size_factor
+            num_virtual_blocks = len(computed_blocks[0]) // envs.VLLM_VIRTUAL_PAGE_SIZE_FACTOR
+            num_real_blocks = num_virtual_blocks * envs.VLLM_VIRTUAL_PAGE_SIZE_FACTOR
+            for computed in computed_blocks:
+                for idx in range(num_real_blocks, len(computed_blocks[0])):
+                    computed.pop(idx)
         return computed_blocks
 
     def remove_skipped_blocks(self, request_id: str,
