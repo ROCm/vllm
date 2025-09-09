@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 
 from .fx_utils import find_getitem_maybe
+from .inductor_pass import enable_fake_mode
 from .multi_output_match import MultiOutputMatch
 from .vllm_inductor_pass import VllmInductorPass
 
@@ -374,7 +375,6 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
                                      scale=scale,
                                      epsilon=self.epsilon,
                                      scale_ub=None,
-                                     residual_out=None,
                                      residual=None)
 
             # result, scale
@@ -425,7 +425,6 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
                     fused_return_mapping,
                     epsilon=rms_node.kwargs["epsilon"],
                     scale_ub=None,  # not used but required
-                    residual_out=None,  # not used but required
                     residual=None,  # not used but required
                     **kwargs)
 
@@ -447,14 +446,11 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
     def register(self, pm_pass: PatternMatcherPass,
                  record_match: Callable[[MultiOutputMatch], bool]):
 
-        def pattern(result: torch.Tensor, result_rms: torch.Tensor,
-                    input: torch.Tensor, residual_out: torch.Tensor,
+        def pattern(result: torch.Tensor, input: torch.Tensor,
                     residual: torch.Tensor, weight: torch.Tensor,
                     scale: torch.Tensor):
             at = auto_functionalized(RMS_ADD_OP,
-                                     result=result_rms,
                                      input=input,
-                                     residual_out=residual_out,
                                      residual=residual,
                                      weight=weight,
                                      epsilon=self.epsilon)
@@ -464,11 +460,10 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
                                       scale=scale,
                                       scale_ub=None)
 
-            # result, residual_out, scale
+            # result, residual, scale
             return at1[1], at[2], at1[2]
 
-        def replacement(result: torch.Tensor, result_rms: torch.Tensor,
-                        input: torch.Tensor, residual_out: torch.Tensor,
+        def replacement(result: torch.Tensor, input: torch.Tensor,
                         residual: torch.Tensor, weight: torch.Tensor,
                         scale: torch.Tensor):
             at = auto_functionalized(self.FUSED_OP,
@@ -478,17 +473,14 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
                                      scale=scale,
                                      epsilon=self.epsilon,
                                      scale_ub=None,
-                                     residual_out=residual_out,
                                      residual=residual)
 
-            # result, residual_out, scale
+            # result, residual, scale
             return at[1], at[3], at[2]
 
         inputs = [
             torch.empty(5, 4, device="cuda", dtype=self.quant_dtype),  # result
-            empty_bf16(5, 4),  # result_rms 
             empty_bf16(5, 4),  # input
-            empty_bf16(5, 4),  # residual_out
             empty_bf16(5, 4),  # residual
             empty_bf16(1, 5),  # weight
             empty_fp32(1, 1)  # scale
@@ -525,12 +517,11 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
             with self.inserting_after_match():
                 # Missing epsilon, scalars cannot be inputs to the pattern
                 kwargs = self.match.kwargs.copy()
-                del kwargs["result_rms"]  # not used in the fused op
 
                 fused_return_mapping = {
                     1: (quant_node, 1),  # result
                     2: (quant_node, 2),  # scale
-                    3: (rms_node, 2),  # residual_out
+                    3: (rms_node, 2),  # residual
                 }
                 self.insert_fused_node(
                     fused_return_mapping,
@@ -566,6 +557,7 @@ class FusionPass(VllmInductorPass):
             cls._instance.pass_config = config.compilation_config.pass_config
         return cls._instance
 
+    @enable_fake_mode
     def __init__(self, config: VllmConfig):
         assert self.__class__._instance is None, \
             "FusionPass singleton instance already exists"
@@ -588,12 +580,12 @@ class FusionPass(VllmInductorPass):
                 self.patterns, self.record_match)
 
             # Fuse rms_norm + dynamic per-token fp8 quant
-            # RMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(
-            #     self.patterns, self.record_match)
+            RMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(
+                self.patterns, self.record_match)
 
             # Fuse fused_add_rms_norm + dynamic per-token fp8 quant
-            # FusedAddRMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(
-            #     self.patterns, self.record_match)
+            FusedAddRMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(
+                self.patterns, self.record_match)
 
             # WARNING: This is a hack to clear the pattern matcher cache
             # and allow multiple values of epsilon.
