@@ -387,11 +387,17 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(
-        self, x: torch.Tensor
+        self, x: torch.Tensor, x_quant_scales: torch.Tensor = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
+        # output = self.quant_method.apply(self, x, bias)
+        if isinstance(self.quant_method, UnquantizedLinearMethod):
+            assert x_quant_scales is None, "UnquantizedLinearMethod should not have quantized input"
+            output = self.quant_method.apply(self, x, bias)
+        else:
+            output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
+        
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
             return output

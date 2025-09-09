@@ -115,6 +115,7 @@ def apply_w8a8_block_fp8_linear(
     bias: Optional[torch.Tensor] = None,
     cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
     use_aiter_and_is_supported: bool = False,
+    input_quant_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods
@@ -135,7 +136,12 @@ def apply_w8a8_block_fp8_linear(
                                        scale_a=x_scale,
                                        scale_b=weight_scale.T)
     else:
-        if use_aiter_and_is_supported:
+        output_dtype = input.dtype
+        if input_quant_scale is not None:
+            q_input = input
+            x_scale = input_quant_scale
+            output_dtype = torch.bfloat16
+        elif use_aiter_and_is_supported:
             # print(f"input_2d.shape: {input_2d.shape}, input_2d.stride: {input_2d.stride()}")
             q_input, x_scale = aiter_per1x128_quant(input_2d.contiguous(), quant_dtype=rocm_aiter.dtypes.fp8)
         else:
@@ -150,11 +156,11 @@ def apply_w8a8_block_fp8_linear(
                                       x_scale,
                                       weight_scale,
                                       block_size,
-                                      output_dtype=input.dtype)
+                                      output_dtype=output_dtype)
 
     if bias is not None:
         output = output + bias
-    return output.to(dtype=input.dtype).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def apply_w8a8_block_fp8_linear_fake(
@@ -166,6 +172,7 @@ def apply_w8a8_block_fp8_linear_fake(
     bias: Optional[torch.Tensor] = None,
     cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
     use_aiter_and_is_supported: bool = False,
+    input_quant_scale: torch.Tensor = None,
 ) -> torch.Tensor:
     output_shape = [*input.shape[:-1], weight.shape[0]]
     return torch.empty(output_shape, dtype=input.dtype, device=input.device)

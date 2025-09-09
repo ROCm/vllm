@@ -63,6 +63,10 @@ from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     is_rocm_aiter_fuse_routed_scaling_factor,
 )
 
+from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+import aiter as rocm_aiter
+rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+rocm_aiter_fp8_quant_group_size = 128
 
 class DeepseekV2MLP(nn.Module):
 
@@ -484,10 +488,15 @@ class DeepseekV2MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        hidden_states_quant = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_quant = hidden_states
+
         if self.q_lora_rank is not None:
             # q_c = self.q_a_proj(hidden_states)[0]
             # kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            qkv_lora = self.fused_qkv_a_proj(hidden_states, x_quant_scales = hidden_states_quant)[0]
+            # qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
@@ -576,12 +585,28 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
+        weight = self.input_layernorm.weight
+        eps = self.input_layernorm.variance_epsilon
         if residual is None:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            hidden_states, hidden_states_quant = fused_rms_fp8_group_quant(hidden_states, weight, eps, 
+                                                        None, None, eps, 
+                                                        group_size = rocm_aiter_fp8_quant_group_size,
+                                                        dtype_quant=rocm_aiter_fp8_dtype, 
+                                                        res1=None)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            (hidden_states, hidden_states_quant), residual = fused_rms_fp8_group_quant(hidden_states, weight, eps, 
+                                                        None, None, eps, 
+                                                        group_size = rocm_aiter_fp8_quant_group_size,
+                                                        dtype_quant=rocm_aiter_fp8_dtype, 
+                                                        res1=residual)
+        hidden_states = (hidden_states, hidden_states_quant)
+        # if residual is None:
+        #     residual = hidden_states
+        #     hidden_states = self.input_layernorm(hidden_states)
+        # else:
+        #     hidden_states, residual = self.input_layernorm(
+        #         hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
