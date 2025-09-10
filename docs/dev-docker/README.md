@@ -12,7 +12,7 @@ The pre-built image includes:
 
 - ROCm™ 6.4.1
 - HipblasLT 0.15
-- vLLM 0.9.1
+- vLLM 0.10.1
 - PyTorch 2.7
 
 ## Pull latest Docker Image
@@ -21,15 +21,12 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- No need to specify the --compilation-config parameter, these options were turned on by default
-- Fixed llama3.1 405b CAR issue (no longer need --disable-custom-all-reduce)
-- Fixed +rms_norm custom kernel issue
-- Added quick reduce (set VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=FP to enable. Supported modes are FP, INT8, INT6, INT4)
-- Mitigated the commandr model causing GPU crash through a workaround until the driver issue is fixed
+- vLLM version 0.10.1
+- Flag enabled by default in the docker -VLLM_V1_USE_PREFILL_DECODE_ATTENTION
 
 ## Known Issues and Workarounds
 
-- AITER does not support fp8 kv cache
+- None.
 
 ## Performance Results
 
@@ -42,14 +39,14 @@ The table below shows performance data where a local inference client is fed req
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 12638.9  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 10756.8               |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 10691.7               |
-|       |           |         | 2048  | 2048   | 1500        | 1500         | 7354.9                |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3912.8 |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 3084.7                |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 2935.9                |
-|       |           |         | 2048  | 2048   | 500         | 500          | 2191.5                |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13818.7  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 11612.0               |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 11408.7               |
+|       |           |         | 2048  | 2048   | 1500        | 1500         | 7800.5                |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 4134.0 |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 3177.6                |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 3034.1                |
+|       |           |         | 2048  | 2048   | 500         | 500          | 2214.2                |
 
 *TP stands for Tensor Parallelism.*
 
@@ -61,38 +58,38 @@ The table below shows latency measurement, which typically involves assessing th
 
 | Model | Precision | TP Size | Batch Size | Input | Output | MI300X Latency (sec) |
 |-------|-----------|----------|------------|--------|---------|-------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 17.236 |
-| | | | 2 | 128 | 2048 | 18.057 |
-| | | | 4 | 128 | 2048 | 18.450 |
-| | | | 8 | 128 | 2048 | 19.677 |
-| | | | 16 | 128 | 2048 | 22.072 |
-| | | | 32 | 128 | 2048 | 24.932 |
-| | | | 64 | 128 | 2048 | 33.287 |
-| | | | 128 | 128 | 2048 | 46.484 |
-| | | | 1 | 2048 | 2048 | 17.500 |
-| | | | 2 | 2048 | 2048 | 18.055 |
-| | | | 4 | 2048 | 2048 | 18.858 |
-| | | | 8 | 2048 | 2048 | 20.161 |
-| | | | 16 | 2048 | 2048 | 22.347 |
-| | | | 32 | 2048 | 2048 | 25.966 |
-| | | | 64 | 2048 | 2048 | 35.324 |
-| | | | 128 | 2048 | 2048 | 52.394 |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 48.453 |
-| | | | 2 | 128 | 2048 | 49.268 |
-| | | | 4 | 128 | 2048 | 51.136 |
-| | | | 8 | 128 | 2048 | 54.226 |
-| | | | 16 | 128 | 2048 | 57.274 |
-| | | | 32 | 128 | 2048 | 68.901 |
-| | | | 64 | 128 | 2048 | 88.631 |
-| | | | 128 | 128 | 2048 | 117.027 |
-| | | | 1 | 2048 | 2048 | 48.362 |
-| | | | 2 | 2048 | 2048 | 49.121 |
-| | | | 4 | 2048 | 2048 | 52.347 |
-| | | | 8 | 2048 | 2048 | 54.471 |
-| | | | 16 | 2048 | 2048 | 57.841 |
-| | | | 32 | 2048 | 2048 | 70.538 |
-| | | | 64 | 2048 | 2048 | 91.452 |
-| | | | 128 | 2048 | 2048 | 125.471 |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 15.254 |
+| | | | 2 | 128 | 2048 | 18.157 |
+| | | | 4 | 128 | 2048 | 18.549 |
+| | | | 8 | 128 | 2048 | 20.547 |
+| | | | 16 | 128 | 2048 | 22.164 |
+| | | | 32 | 128 | 2048 | 25.426 |
+| | | | 64 | 128 | 2048 | 33.297 |
+| | | | 128 | 128 | 2048 | 45.792 |
+| | | | 1 | 2048 | 2048 | 15.299 |
+| | | | 2 | 2048 | 2048 | 18.194 |
+| | | | 4 | 2048 | 2048 | 18.942 |
+| | | | 8 | 2048 | 2048 | 20.526 |
+| | | | 16 | 2048 | 2048 | 23.211 |
+| | | | 32 | 2048 | 2048 | 26.516 |
+| | | | 64 | 2048 | 2048 | 34.824 |
+| | | | 128 | 2048 | 2048 | 52.211 |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 47.150 |
+| | | | 2 | 128 | 2048 | 50.933 |
+| | | | 4 | 128 | 2048 | 52.521 |
+| | | | 8 | 128 | 2048 | 55.233 |
+| | | | 16 | 128 | 2048 | 59.065 |
+| | | | 32 | 128 | 2048 | 68.786 |
+| | | | 64 | 128 | 2048 | 88.094 |
+| | | | 128 | 128 | 2048 | 118.512 |
+| | | | 1 | 2048 | 2048 | 47.675 |
+| | | | 2 | 2048 | 2048 | 50.788 |
+| | | | 4 | 2048 | 2048 | 52.405 |
+| | | | 8 | 2048 | 2048 | 55.459 |
+| | | | 16 | 2048 | 2048 | 59.923 |
+| | | | 32 | 2048 | 2048 | 70.388 |
+| | | | 64 | 2048 | 2048 | 91.218 |
+| | | | 128 | 2048 | 2048 | 127.004 |
 
 *TP stands for Tensor Parallelism.*
 
@@ -201,12 +198,6 @@ Note: the `--multi_gpu` parameter can be omitted for small models that fit on a 
 
 Some environment variables enhance the performance of the vLLM kernels on the MI300X / MI325X accelerator. See the AMD Instinct MI300X workload optimization guide for more information.
 
-```bash
-export VLLM_USE_TRITON_FLASH_ATTN=0
-export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1
-
-```
-
 ### vLLM engine performance settings
 
 vLLM provides a number of engine options which can be changed to improve performance.  Refer to the [vLLM Engine Args](https://docs.vllm.ai/en/stable/usage/engine_args.html) documentation for the complete list of vLLM engine options.
@@ -225,8 +216,6 @@ vLLM's benchmark_latency.py script measures end-to-end latency for a specified m
 You can run latency tests for FP8 models with:
 
 ```bash
-export VLLM_USE_TRITON_FLASH_ATTN=0
-export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1
 MODEL=amd/Llama-3.1-405B-Instruct-FP8-KV
 BS=1
 IN=128
@@ -265,8 +254,6 @@ vLLM's benchmark_throughput.py script measures offline throughput.  It can eithe
 You can run throughput tests for FP8 models with:
 
 ```bash
-export VLLM_USE_TRITON_FLASH_ATTN=0
-export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1
 MODEL=amd/Llama-3.1-405B-Instruct-FP8-KV
 IN=128
 OUT=2048
@@ -313,7 +300,6 @@ python3 /app/vllm/benchmarks/benchmark_throughput.py -h
 Benchmark Llama-3.1-70B with input 4096 tokens, output 512 tokens and tensor parallelism 8 as an example,
 
 ```bash
-export VLLM_USE_TRITON_FLASH_ATTN=0
 vllm serve amd/Llama-3.1-70B-Instruct-FP8-KV \
     --swap-space 16 \
     --disable-log-requests \
@@ -432,14 +418,12 @@ Speculative decoding is one of the key features in vLLM. It has been supported o
 Without Speculative Decoding -
 
 ```bash
-export VLLM_USE_TRITON_FLASH_ATTN=0
 python /app/vllm/benchmarks/benchmark_latency.py --model amd/Llama-3.1-405B-Instruct-FP8-KV --max-model-len 26720 -tp 8 --batch-size 1 --input-len 1024 --output-len 128
 ```
 
 With Speculative Decoding -
 
 ```bash
-export VLLM_USE_TRITON_FLASH_ATTN=0
 python /app/vllm/benchmarks/benchmark_latency.py --model amd/Llama-3.1-405B-Instruct-FP8-KV --max-model-len 26720 -tp 8 --batch-size 1 --input-len 1024 --output-len 128 --speculative-model amd/Llama-3.1-8B-Instruct-FP8-KV --num-speculative-tokens 5
 ```
 
@@ -456,7 +440,6 @@ Some use cases include:
 ```bash
 export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_USE_AITER_MHA=0
-export VLLM_ROCM_USE_AITER_RMSNORM=0
 python3 /app/vllm/benchmarks/benchmark_latency.py --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 256 --input-len 128 --output-len 2048
 ```
 
@@ -493,7 +476,7 @@ To reproduce the release docker:
 ```bash
     git clone https://github.com/ROCm/vllm.git
     cd vllm
-    git checkout b432b7a285aa0dcb9677380936ffa74931bb6d6f
+    git checkout 6663000a391911eba96d7864a26ac42b07f6ef29
     docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
 ```
 
@@ -509,6 +492,10 @@ Use AITER release candidate branch instead:
 ```
 
 ## Changelog
+
+rocm6.4.1_vllm_0.10.1_20250909:
+- vLLM version 0.10.1
+- Flag enabled by default in the docker -VLLM_V1_USE_PREFILL_DECODE_ATTENTION
 
 20250715_aiter:
 - No need to specify the --compilation-config parameter, these options were turned on by default
