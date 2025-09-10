@@ -17,6 +17,7 @@ Easy, fast, and cheap LLM serving for everyone
 ---
 
 # Deprecation warning
+
 > [!CAUTION]
 > The ROCm/vllm repository is retired, please use the [upstream](https://github.com/vllm-project/vllm.git) repository
 >
