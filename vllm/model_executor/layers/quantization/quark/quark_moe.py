@@ -389,7 +389,8 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 "EPLB not supported for `QuarkW4A4MXFp4MoEMethod` yet.")
 
         from vllm.model_executor.layers.fused_moe import fused_experts
-
+        from aiter.fused_moe import fused_moe
+        from aiter import ActivationType, QuantType
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -403,22 +404,20 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype)
 
-        out = fused_experts(
+        out = fused_moe(
             x,
             layer.w13_weight,
             layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-            use_mxfp4_w4a4=True,
-            global_num_experts=global_num_experts,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            expert_map=expert_map,
+            topk_weights,
+            topk_ids,
+            quant_type=QuantType.per_1x32,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            a1_scale=None,
-            a2_scale=None,
-            block_shape=None,
-            activation=activation,
+            activation=(
+                ActivationType.Silu
+                if activation == "silu"
+                else ActivationType.Gelu
+            ),
+            doweight_stage1=False,
         )
         return out
