@@ -32,6 +32,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "          Tensor scale_b, int CuCount) -> ()");
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
+  rocm_ops.def(
+      "RocSolIdxBlas(Tensor mat1, Tensor mat2, int  solution_index) -> "
+      "Tensor");
+  rocm_ops.impl("RocSolIdxBlas", torch::kCUDA, &RocSolIdxBlas);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

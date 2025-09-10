@@ -1462,6 +1462,21 @@ def wvSplitKQ(a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype,
     return out
 
 
+if hasattr(torch.ops._rocm_C, "RocSolIdxBlas"):
+
+    @register_fake("_rocm_C::RocSolIdxBlas")
+    def _RocSolIdxBlas_fake(a: torch.Tensor, b: torch.Tensor,
+                            solution_index: int) -> torch.Tensor:
+        return torch.empty((a.size(0), b.size(1)),
+                           dtype=a.dtype,
+                           device=a.device)
+
+
+def RocSolIdxBlas(a: torch.Tensor, b: torch.Tensor,
+                  solution_index: int) -> torch.Tensor:
+    return torch.ops._rocm_C.RocSolIdxBlas(a, b, solution_index)
+
+
 # moe
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
     torch.ops._moe_C.moe_sum(input, output)
