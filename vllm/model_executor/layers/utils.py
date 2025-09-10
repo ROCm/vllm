@@ -109,13 +109,13 @@ def rocm_unquantized_gemm_impl(
                     x.dtype in [torch.float16, torch.bfloat16] \
                     and k % 8 == 0 and bias is None)
 
-    if VLLM_USE_ROCB_GEMM: 
+    if VLLM_USE_ROCB_GEMM:
         solidx = 0
         out = ops.RocSolIdxBlas(x_view, weight.t(), solidx)
         if bias is not None:
             out = out + bias
         return out
-
+      
     if use_skinny is not True:
         return torch.nn.functional.linear(x, weight, bias)
 
