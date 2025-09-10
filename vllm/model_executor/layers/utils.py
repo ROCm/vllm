@@ -115,7 +115,7 @@ def rocm_unquantized_gemm_impl(
         if bias is not None:
             out = out + bias
         return out
-      
+
     if use_skinny is not True:
         return torch.nn.functional.linear(x, weight, bias)
 
