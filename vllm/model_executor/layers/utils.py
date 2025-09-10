@@ -103,7 +103,12 @@ def rocm_unquantized_gemm_wrapper():
         _use_skinny = (use_skinny and \
                         x.dtype in [torch.float16, torch.bfloat16] \
                         and k % 8 == 0 and bias is None)
+        _use_aiter_swizzle = (is_rocm_aiter_hipb_gemm_enabled() and \
+                             x.dtype in [torch.float16, torch.bfloat16] and \
+                             k % 32 == 0)
 
+        if _use_aiter_swizzle:
+            return aiter_ops.rocm_aiter_hipb_gemm_swizzle(x, weight, bias)
         if _use_skinny is not True:
             if use_aiter:
                 return aiter_ops.rocm_aiter_tuned_gemm(x, weight, bias)
@@ -156,8 +161,6 @@ def cpu_unquantized_gemm(layer: torch.nn.Module,
 def dispatch_unquantized_gemm() -> Callable[
     [torch.nn.Module, torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     torch.Tensor]:
-    if is_rocm_aiter_hipb_gemm_enabled():
-        return rocm_aiter_hipb_gemm_swizzle
     if current_platform.is_rocm():
         return rocm_unquantized_gemm_wrapper()
     elif current_platform.is_cpu():

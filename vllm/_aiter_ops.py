@@ -186,16 +186,8 @@ class aiter_ops:
             out_dtype: Optional[torch.dtype] = None,
             scale_a: Optional[torch.Tensor] = None,
             scale_b: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # print(f"rocm_aiter_hipb_gemm")
-        # print(f"input: {input.shape}")
-        # print(f"weight: {weight.shape}")
-        # if bias is not None:
-        #     print(f"bias: {bias.shape}")
-        # print(f"out_dtype: {out_dtype}")
-        # if scale_a is not None:
-        #     print(f"scale_a: {scale_a.shape}")
-        # if scale_b is not None:
-        #     print(f"scale_b: {scale_b.shape}")
+
+        from aiter.ops.shuffle import shuffle_weight
 
         assert input.dtype in [
             torch.bfloat16, torch.float8_e4m3fnuz
@@ -207,10 +199,6 @@ class aiter_ops:
         else:
             inp_view = input
 
-        padded_inp_view = rocm_aiter_maybe_pad_weight_for_shuffle(inp_view)
-        shuffled_weight = shuffle_weights(
-            rocm_aiter_maybe_pad_weight_for_shuffle(weight))[0]
-
         if out_dtype is None:
             out_dtype = input.dtype
 
@@ -221,8 +209,10 @@ class aiter_ops:
         if scale_b is not None and scale_b.dim() == 2:
             scale_b = scale_b.t()
 
+        shuffled_weight = shuffle_weight(weight, layout=(16, 16))
+
         out = torch.ops.vllm.rocm_aiter_hipb_gemm(
-            padded_inp_view,
+            inp_view,
             shuffled_weight.t(),
             bias=bias,
             out_dtype=out_dtype,
