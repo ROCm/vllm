@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility methods for model layers."""
+import os
 from typing import Callable, Optional
 
 import torch
@@ -9,6 +10,9 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
+
+VLLM_USE_CK_TILE_GEMM = (os.getenv("VLLM_USE_CK_TILE_GEMM", "False").lower()
+                         in ("true", "1"))
 
 
 def shuffle_weight(w: torch.Tensor) -> torch.Tensor:
@@ -97,17 +101,21 @@ def rocm_unquantized_gemm_impl(
         weight: torch.Tensor,
         bias: Optional[torch.Tensor] = None) -> torch.Tensor:
     from vllm.platforms.rocm import on_gfx9
+
     k = weight.shape[1]
+    m = weight.shape[0]
+    x_view = x.view(-1, x.size(-1))
+    n = x_view.shape[0]
     use_skinny = (envs.VLLM_ROCM_USE_SKINNY_GEMM and on_gfx9() and \
                     x.dtype in [torch.float16, torch.bfloat16] \
                     and k % 8 == 0 and bias is None)
+    if VLLM_USE_CK_TILE_GEMM and (bias is not None):
+        out = ops.ck_tile_gemm_bf16(x_view, weight, bias, x_view.dtype)
+        return out
 
     if use_skinny is not True:
         return torch.nn.functional.linear(x, weight, bias)
 
-    x_view = x.view(-1, x.size(-1))
-    n = x_view.shape[0]
-    m = weight.shape[0]
     cu_count = current_platform.get_cu_count()
 
     if m > 8 and 0 < n <= 4:

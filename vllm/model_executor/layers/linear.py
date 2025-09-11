@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from abc import abstractmethod
 from typing import Any, Literal, Optional, Union
 
@@ -29,6 +30,9 @@ from vllm.model_executor.parameter import (BasevLLMParameter,
 # yapf: enable
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+
+VLLM_USE_CK_TILE_GEMM = (os.getenv("VLLM_USE_CK_TILE_GEMM", "False").lower()
+                         in ("true", "1"))
 
 logger = init_logger(__name__)
 
@@ -198,11 +202,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def shuffle_weight(self, x: torch.Tensor) -> torch.Tensor:
+        # Hardcode BLOCK_K and BLOCK_N
+        x_ = x
+        x_ = x_.view(x.shape[0] // 16, 16, x.shape[1] // 32, 4, 8)
+        x_ = x_.permute(0, 2, 3, 1, 4)
+        x_ = x_.contiguous()
+        x_ = x_.view(*x.shape)
+        return x_
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if current_platform.is_cpu():
             from vllm.model_executor.layers.utils import (
                 dispatch_cpu_unquantized_gemm)
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+
+        if VLLM_USE_CK_TILE_GEMM and (layer.bias is not None):
+            shuffle_weight = self.shuffle_weight(layer.weight)
+            layer.weight.copy_(shuffle_weight)
 
     def apply(self,
               layer: torch.nn.Module,

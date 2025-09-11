@@ -11,6 +11,9 @@ torch::Tensor wvSplitK(at::Tensor& in_a, at::Tensor& in_b,
 void wvSplitKQ(at::Tensor& in_a, at::Tensor& in_b, at::Tensor& out_c,
                at::Tensor& scale_a, at::Tensor& scale_b, const int64_t CuCount);
 
+torch::Tensor ck_tile_gemm_bf16(torch::Tensor& XQ, torch::Tensor& WQ,
+                                torch::Tensor& bias, torch::Tensor& Y);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,

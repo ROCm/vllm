@@ -32,6 +32,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "          Tensor scale_b, int CuCount) -> ()");
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
+  rocm_ops.def(
+      "ck_tile_gemm_bf16(Tensor XQ, Tensor WQ, Tensor bias, Tensor! Y) -> "
+      "Tensor");
+  rocm_ops.impl("ck_tile_gemm_bf16", torch::kCUDA, &ck_tile_gemm_bf16);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

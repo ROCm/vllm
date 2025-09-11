@@ -924,7 +924,14 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
-    "csrc/rocm/attention.cu")
+    "csrc/rocm/attention.cu"
+    "csrc/rocm/ck_extensions/ck_tile_gemm_bf16/gemm_bf16.cu")
+
+  set(CK_TILE_INCLUDE_DIR
+    "csrc/rocm/ck_extensions/ck_tile_gemm_bf16/include"
+   "csrc/rocm/ck_extensions/include/"
+   "opt/rocm/include"
+  )
 
   define_gpu_extension_target(
     _rocm_C
@@ -933,6 +940,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     SOURCES ${VLLM_ROCM_EXT_SRC}
     COMPILE_FLAGS ${VLLM_GPU_FLAGS}
     ARCHITECTURES ${VLLM_GPU_ARCHES}
+    INCLUDE_DIRECTORIES ${CK_TILE_INCLUDE_DIR}
     USE_SABI 3
     WITH_SOABI)
 endif()

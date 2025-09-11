@@ -144,7 +144,8 @@ class cmake_build_ext(build_ext):
 
         # Select the build type.
         # Note: optimization level + debug info are set by the build type
-        default_cfg = "Debug" if self.debug else "RelWithDebInfo"
+        #default_cfg = "Debug" if self.debug else "RelWithDebInfo"
+        default_cfg = "Release"
         cfg = envs.CMAKE_BUILD_TYPE or default_cfg
 
         cmake_args = [
