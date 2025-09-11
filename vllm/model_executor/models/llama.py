@@ -58,8 +58,44 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 
 from vllm.platforms import current_platform
+from vllm.platforms import current_platform
+from vllm.utils import direct_register_custom_op
+
 if current_platform.is_rocm():
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+
+    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+        import aiter as rocm_aiter
+        rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+        rocm_aiter_fp8_quant_group_size = 128
+    
+    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+        from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
+        
+        def act_mul_and_fp8_group_quant_impl(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return act_mul_and_fp8_group_quant(x, activation="silu", group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
+        
+        def act_mul_and_fp8_group_quant_fake(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            M, N = x.shape
+            assert N % 2 == 0
+            N_half = N // 2
+            x_fp8 = torch.empty((M, N_half), dtype=rocm_aiter_fp8_dtype, device=x.device)
+            out_bs = torch.empty((M, (N_half + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size), dtype=torch.float32, device=x.device)
+            return x_fp8, out_bs
+        
+        direct_register_custom_op(
+            op_name="act_mul_and_fp8_group_quant",
+            op_func=act_mul_and_fp8_group_quant_impl,
+            mutates_args=[],
+            fake_impl=act_mul_and_fp8_group_quant_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
 
 class LlamaMLP(nn.Module):
 
@@ -96,12 +132,14 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x):
         x, _ = self.gate_up_proj(x)
-        if envs.VLLM_USE_AITER_TRITON_SILU_MUL:
-            x, x_scales = self.act_fn(x)
-            x, _ = self.down_proj(x, x_scales)
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+            x = torch.ops.vllm.act_mul_and_fp8_group_quant(x)
         else:
             x = self.act_fn(x)
-            x, _ = self.down_proj(x)
+        x_quant_scales = None
+        if isinstance(x, tuple):
+            x, x_quant_scales = x
+        x, _ = self.down_proj(x, x_quant_scales=x_quant_scales)
         return x
 
 
