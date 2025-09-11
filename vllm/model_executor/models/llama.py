@@ -58,44 +58,18 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 
 from vllm.platforms import current_platform
-from vllm.platforms import current_platform
-from vllm.utils import direct_register_custom_op
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
-if current_platform.is_rocm():
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and not envs.VLLM_ROCM_USE_AITER_MHA
+else:
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
 
-    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
-
-    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
-        import aiter as rocm_aiter
-        rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
-        rocm_aiter_fp8_quant_group_size = 128
-    
-    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
-        from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
-        
-        def act_mul_and_fp8_group_quant_impl(
-            x: torch.Tensor,        
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return act_mul_and_fp8_group_quant(x, activation="silu", group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
-        
-        def act_mul_and_fp8_group_quant_fake(
-            x: torch.Tensor,        
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            M, N = x.shape
-            assert N % 2 == 0
-            N_half = N // 2
-            x_fp8 = torch.empty((M, N_half), dtype=rocm_aiter_fp8_dtype, device=x.device)
-            out_bs = torch.empty((M, (N_half + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size), dtype=torch.float32, device=x.device)
-            return x_fp8, out_bs
-        
-        direct_register_custom_op(
-            op_name="act_mul_and_fp8_group_quant",
-            op_func=act_mul_and_fp8_group_quant_impl,
-            mutates_args=[],
-            fake_impl=act_mul_and_fp8_group_quant_fake,
-            dispatch_key=current_platform.dispatch_key,
-        )
+VLLM_ROCM_USE_AITER_MHA = envs.VLLM_ROCM_USE_AITER_MHA
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=} {VLLM_ROCM_USE_AITER_MHA=}")
 
 class LlamaMLP(nn.Module):
 
@@ -125,14 +99,18 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
+
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
+        self.block_quant = hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size is not None
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and not self.block_quant:
+            logger.info("[Aiter] [WARNING] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT will not be activated because this model is not using blocked quantization")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
         x, _ = self.gate_up_proj(x)
-        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and self.block_quant:
             x = torch.ops.vllm.act_mul_and_fp8_group_quant(x)
         else:
             x = self.act_fn(x)

@@ -217,12 +217,14 @@ from vllm.v1.attention.backends.utils import (AttentionMetadataBuilder,
                                               split_decodes_and_prefills)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-if current_platform.is_rocm():
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+logger = init_logger(__name__)
+
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
         from aiter.ops.triton.fused_kv_cache import fused_qk_rope_cat_and_cache_mla
         
-    VLLM_ROCM_USE_AITER_TRITON_FP8_BMM = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FP8_BMM
+    VLLM_ROCM_USE_AITER_TRITON_FP8_BMM = envs.VLLM_ROCM_USE_AITER_TRITON_FP8_BMM
     VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE = envs.VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE
     assert VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE > 0, "VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE must be positive integer"
     if VLLM_ROCM_USE_AITER_TRITON_FP8_BMM:
@@ -240,7 +242,14 @@ if current_platform.is_rocm():
             return x_quant, x_quant_scale
         
         from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+    VLLM_ROCM_USE_AITER_TRITON_FP8_BMM = False
+    VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE = 0
 
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FP8_BMM=} {VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}")
+    
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
     is_vllm_fa = True
@@ -258,7 +267,6 @@ try:
 except ImportError:
     flashinfer_available = False
 
-logger = init_logger(__name__)
 
 CUDNN_WORKSPACE_SIZE = 12800
 
@@ -1217,7 +1225,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         mla_output_zeros = None
         decode_q_out = None
         if kv_cache.numel() > 0:
-            if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and hasattr(self, "rotary_emb"):
+            if positions is not None:
+                # positions is not None entails that Q and K are not RoPE embedded yet, therefore, fused_qk_rope_cat_and_cache_mla is called
+                assert hasattr(self, "rotary_emb"), f"rotary_emb not found in {self}"
                 cos, sin = self.rotary_emb.cos_sin_cache.chunk(2, dim = -1)
                 is_neox = self.rotary_emb.is_neox_style
                 q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1274,9 +1284,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             assert attn_metadata.decode is not None
             decode_q_nope, decode_q_pe = decode_q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-            
+
             if VLLM_ROCM_USE_AITER_TRITON_FP8_BMM:
-                decode_ql_nope = decode_q_out[... , :self.W_K.shape[1]] if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE else None
+                decode_ql_nope = decode_q_out[... , :self.W_K.shape[1]] if (kv_cache.numel() > 0 and positions is not None) else None
                 decode_ql_nope = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(decode_q_nope, self.W_K, self.W_K_scale, group_size = 128, YQ = decode_ql_nope, transpose_bm = True, transpose_bm_in = True)
                 self._forward_decode(
                     decode_ql_nope, decode_q_pe, kv_c_and_k_pe_cache=kv_cache, attn_metadata=attn_metadata, layer=layer, mla_output_zeros=mla_output_zeros, decode_q_out=decode_q_out, output=output[:num_decode_tokens])

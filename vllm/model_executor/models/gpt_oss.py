@@ -34,9 +34,12 @@ from .utils import (AutoWeightsLoader, WeightsMapper, extract_layer_index,
                     maybe_prefix)
 import os
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and not envs.VLLM_ROCM_USE_AITER_MHA
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
         from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
@@ -46,6 +49,11 @@ else:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD = False
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = False
+
+VLLM_ROCM_USE_AITER_MHA = envs.VLLM_ROCM_USE_AITER_MHA
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=} {VLLM_ROCM_USE_AITER_MHA=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM=}")
 
 class OAIAttention(nn.Module):
 
@@ -137,6 +145,7 @@ class OAIAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
         if isinstance(hidden_states, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
+        if isinstance(hidden_states, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             hidden_states, res = hidden_states
             t, hidden_states = fused_add_rmsnorm_pad(
                 hidden_states, self.norm.weight, self.norm.variance_epsilon,
@@ -144,6 +153,8 @@ class OAIAttention(nn.Module):
         else:
             t = self.norm(hidden_states)
         qkv, _ = self.qkv(t)
+        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # q, k = self.rotary_emb(positions, q, k)
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             attn_output = self.attn(q, k, v, positions=positions)
@@ -193,6 +204,7 @@ class MLPBlock(torch.nn.Module):
 
     def forward(self, x: torch.Tensor | tuple) -> torch.Tensor:
         if isinstance(x, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
+        if isinstance(x, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             x, res = x
             t, x = fused_add_rmsnorm_pad(x,
                                          self.norm.weight,
@@ -203,12 +215,14 @@ class MLPBlock(torch.nn.Module):
             t = self.norm(x)
 
         if VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
+        if VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
             g = gemm_a16w16(t[:, :self.hidden_size], self.router.weight, self.router.bias)
         else:
             g = self.router(t[:, :self.hidden_size])
         t = self.experts(hidden_states=t,
                          router_logits=g)[:, :self.hidden_size]
 
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             return x, t
         return x + t

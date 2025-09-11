@@ -29,8 +29,12 @@ from vllm.utils import direct_register_custom_op
 logger = init_logger(__name__)
 USE_XFORMERS_OPS = None
 
-if current_platform.is_rocm():
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}")
 
 def check_xformers_availability():
     global USE_XFORMERS_OPS
@@ -256,7 +260,7 @@ class Attention(nn.Module, AttentionLayerBase):
         if self.use_output:
             output_shape = (output_shape
                             if output_shape is not None else query.shape)
-            if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+            if positions is not None:
                 output = torch.empty(output_shape,
                                     dtype=query.dtype,
                                     device=query.device)
@@ -522,16 +526,11 @@ def unified_attention_with_output(
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
 
-    if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
-        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
-        from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAImpl
-        if isinstance(self.impl, TritonAttentionImpl):
-            assert self.impl.kv_sharing_target_layer_name is None, "kv_sharing_target_layer_name error"
-        elif isinstance(self.impl, AiterMLAImpl):
-            pass
-        else:
-            raise NotImplementedError("VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=1 only supports Attention with TritonAttentionImpl or AiterMLAImpl")
-
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAImpl
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and (isinstance(self.impl, TritonAttentionImpl) or isinstance(self.impl, AiterMLAImpl)):
+        # fusing RoPE with flushing kv_cache operation
+        assert hasattr(self.impl, "rotary_emb") and self.impl.rotary_emb is not None and positions is not None, f"rotary_emb not found in {self.impl=} and positions cannot be None"
         self.impl.forward(self,
                         query,
                         key,
@@ -542,6 +541,7 @@ def unified_attention_with_output(
                         output_scale=output_scale,
                         positions=positions)
     else:
+        assert positions is None, f"positions must be None {positions=}"
         self.impl.forward(self,
                         query,
                         key,

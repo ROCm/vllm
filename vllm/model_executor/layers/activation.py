@@ -15,13 +15,58 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
+from vllm.utils import direct_register_custom_op
 
-if current_platform.is_rocm():
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT
     VLLM_TRITON_FP4_GEMM_USE_ASM = envs.VLLM_ROCM_USE_AITER and envs.VLLM_TRITON_FP4_GEMM_USE_ASM
     
     if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
         from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+
+    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+        logger.info("[Aiter] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=1")
+        from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
+        import aiter as rocm_aiter
+        rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+        rocm_aiter_fp8_quant_group_size = 128
+        
+        def act_mul_and_fp8_group_quant_impl(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return act_mul_and_fp8_group_quant(x, activation="silu", group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
+        
+        def act_mul_and_fp8_group_quant_fake(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            M, N = x.shape
+            assert N % 2 == 0
+            N_half = N // 2
+            x_fp8 = torch.empty((M, N_half), dtype=rocm_aiter_fp8_dtype, device=x.device)
+            out_bs = torch.empty((M, (N_half + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size), dtype=torch.float32, device=x.device)
+            return x_fp8, out_bs
+        
+        direct_register_custom_op(
+            op_name="act_mul_and_fp8_group_quant",
+            op_func=act_mul_and_fp8_group_quant_impl,
+            mutates_args=[],
+            fake_impl=act_mul_and_fp8_group_quant_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
+
+else:
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
+    VLLM_TRITON_FP4_GEMM_USE_ASM = False
+
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=}")
+logger.info(f"[Aiter] {VLLM_TRITON_FP4_GEMM_USE_ASM=}")
     
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
