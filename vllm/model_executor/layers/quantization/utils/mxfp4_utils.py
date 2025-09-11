@@ -46,7 +46,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
             if torch.cuda.get_device_capability()[0] == 10:
                 scale_layout = BlackwellMXScaleLayout
         else:
-            if envs.TRITON_HIP_PRESHUFFLE_SCALES:
+            if envs.ROCM_TRITON_MOE_PRESHUFFLE_SCALES:
                 scale_layout = GFX950MXScaleLayout
     else:
         """ weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel

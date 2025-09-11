@@ -181,7 +181,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM: bool = True
-    TRITON_HIP_PRESHUFFLE_SCALES: bool = True
+    ROCM_TRITON_MOE_PRESHUFFLE_SCALES: bool = True
 def get_default_cache_root():
     return os.getenv(
         "XDG_CACHE_HOME",
@@ -1264,8 +1264,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM", "1"))),
 
     # Apply preshuffling for mxfp4 scales for ROCm backend
-    "TRITON_HIP_PRESHUFFLE_SCALES":
-    lambda: bool(int(os.getenv("TRITON_HIP_PRESHUFFLE_SCALES", "1"))),
+    "ROCM_TRITON_MOE_PRESHUFFLE_SCALES":
+    lambda: bool(int(os.getenv("ROCM_TRITON_MOE_PRESHUFFLE_SCALES", "1"))),
 }
 
 # --8<-- [end:env-vars-definition]
