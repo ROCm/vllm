@@ -362,11 +362,13 @@ class ReplicatedLinear(LinearBase):
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        if isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert x_quant_scales is None, "UnquantizedLinearMethod should not have quantized input"
-            output = self.quant_method.apply(self, x, bias)
-        else:
+        from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+        from vllm.model_executor.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
+        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkW4A4MXFP4):
             output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
+        else:
+            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
+            output = self.quant_method.apply(self, x, bias)
 
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
@@ -590,12 +592,15 @@ class ColumnParallelLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
-        assert self.quant_method is not None
-        if isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert x_quant_scales is None, "UnquantizedLinearMethod should not have quantized input"
-            output_parallel = self.quant_method.apply(self, input_, bias)
-        else:
+        assert self.quant_method is not None            
+        from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+        from vllm.model_executor.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
+        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkW4A4MXFP4):
             output_parallel = self.quant_method.apply(self, input_, bias, x_quant_scales=x_quant_scales)
+        else:
+            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
+            output_parallel = self.quant_method.apply(self, input_, bias)
+
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1377,12 +1382,13 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        if isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert x_quant_scales is None, "UnquantizedLinearMethod should not have quantized input"
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-        else:
+        from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+        from vllm.model_executor.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
+        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkW4A4MXFP4):
             output_parallel = self.quant_method.apply(self, input_parallel, bias_, x_quant_scales=x_quant_scales)
-
+        else:
+            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
