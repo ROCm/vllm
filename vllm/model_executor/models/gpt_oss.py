@@ -136,7 +136,7 @@ class OAIAttention(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
-        if isinstance(hidden_states, tuple) and current_platform.is_rocm() and VLLM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
+        if isinstance(hidden_states, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             hidden_states, res = hidden_states
             t, hidden_states = fused_add_rmsnorm_pad(
                 hidden_states, self.norm.weight, self.norm.variance_epsilon,
@@ -144,25 +144,7 @@ class OAIAttention(nn.Module):
         else:
             t = self.norm(hidden_states)
         qkv, _ = self.qkv(t)
-        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # q, k = self.rotary_emb(positions, q, k)
-        if VLLM_USE_AITER_TRITON_FUSED_SPLIT_QKV_ROPE:
-            cos, sin = self.rotary_emb.cos_sin_cache.chunk(2, dim = -1)
-            q, k, v = fused_qkv_split_qk_rope(
-                qkv,
-                cos,
-                sin,
-                positions,
-                self.num_local_attention_heads, self.num_local_key_value_heads, self.head_dim,
-                is_neox=self.rotary_emb.is_neox_style,
-                offsets = None,
-                reuse_freqs_front_part = (self.head_dim // 2 == cos.shape[-1]),
-                nope_first = False,
-            )
-            q = q.view(-1, self.q_size)
-            k = k.view(-1, self.kv_size)
-            attn_output = self.attn(q, k, v)
-        elif VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             attn_output = self.attn(q, k, v, positions=positions)
         else:
@@ -172,7 +154,7 @@ class OAIAttention(nn.Module):
             attn_output = self.attn(q, k, v)
             v = v.contiguous()
         output, _ = self.o_proj(attn_output)
-        if current_platform.is_rocm() and VLLM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             return output, hidden_states
         return output + hidden_states
 
@@ -210,7 +192,7 @@ class MLPBlock(torch.nn.Module):
                                 activation="swigluoai")
 
     def forward(self, x: torch.Tensor | tuple) -> torch.Tensor:
-        if isinstance(x, tuple) and current_platform.is_rocm() and VLLM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
+        if isinstance(x, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             x, res = x
             t, x = fused_add_rmsnorm_pad(x,
                                          self.norm.weight,
@@ -220,14 +202,14 @@ class MLPBlock(torch.nn.Module):
         else:
             t = self.norm(x)
 
-        if current_platform.is_rocm():
+        if VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
             g = gemm_a16w16(t[:, :self.hidden_size], self.router.weight, self.router.bias)
         else:
             g = self.router(t[:, :self.hidden_size])
         t = self.experts(hidden_states=t,
                          router_logits=g)[:, :self.hidden_size]
 
-        if current_platform.is_rocm() and VLLM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             return x, t
         return x + t
 
@@ -292,7 +274,7 @@ class GptOssModel(nn.Module):
         x = self.embedding(input_ids)
         for layer in self.layers:
             x = layer(x, positions)
-        if isinstance(x, tuple) and current_platform.is_rocm() and VLLM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
+        if isinstance(x, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             x, res = x
             x, _ = fused_add_rmsnorm_pad(x, self.norm.weight,
                                          self.norm.variance_epsilon, res)
@@ -625,4 +607,79 @@ class GptOssModel(nn.Module):
                                             heads_per_rank, head_start,
                                             weights, stacked_params_mapping)
         else:
-            return self._load_weights_other(weights)
+            return self._load_weights_other(ep_rank_end, ep_rank_start,
+                                            heads_per_rank, head_start,
+                                            weights, stacked_params_mapping)
+
+
+class GptOssForCausalLM(nn.Module):
+    packed_modules_mapping = {"qkv": ["q_proj", "k_proj", "v_proj"]}
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={
+            ".self_attn.": ".attn.",
+            ".post_attention_layernorm.": ".mlp.norm.",
+        },
+        orig_to_new_suffix={
+            ".embed_tokens.weight": ".embedding.weight",
+            ".input_layernorm.weight": ".attn.norm.weight",
+            ".post_attention_layernorm.weight": ".mlp.norm.weight",
+
+            # MoE MXFP4 weights
+            ".gate_up_proj_blocks": ".w13_weight",
+            ".down_proj_blocks": ".w2_weight",
+            ".gate_up_proj_scales": ".w13_weight_scale",
+            ".down_proj_scales": ".w2_weight_scale",
+
+            # MoE other weights
+            ".gate_up_proj": ".w13_weight",
+            ".down_proj": ".w2_weight",
+
+            # MoE Bias
+            ".gate_up_proj_bias": ".w13_bias",
+            ".down_proj_bias": ".w2_bias",
+        },
+    )
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.vllm_config = vllm_config
+        self.config = vllm_config.model_config.hf_config
+
+        self.model = GptOssModel(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+        )
+        self.lm_head = ParallelLMHead(
+            self.config.vocab_size,
+            self.config.hidden_size,
+        )
+        self.logits_processor = LogitsProcessor(self.config.vocab_size)
+
+    def forward(self,
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                intermediate_tensors: Optional[IntermediateTensors] = None,
+                inputs_embeds: Optional[torch.Tensor] = None) -> torch.Tensor:
+        assert intermediate_tensors is None
+        assert inputs_embeds is None
+        return self.model(input_ids, positions)
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                       sampling_metadata)
+        return logits
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."]
+                           if self.config.tie_word_embeddings else None),
+        )
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
