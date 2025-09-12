@@ -145,7 +145,6 @@ class OAIAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
         if isinstance(hidden_states, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
-        if isinstance(hidden_states, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             hidden_states, res = hidden_states
             t, hidden_states = fused_add_rmsnorm_pad(
                 hidden_states, self.norm.weight, self.norm.variance_epsilon,
@@ -204,7 +203,6 @@ class MLPBlock(torch.nn.Module):
 
     def forward(self, x: torch.Tensor | tuple) -> torch.Tensor:
         if isinstance(x, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
-        if isinstance(x, tuple) and VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             x, res = x
             t, x = fused_add_rmsnorm_pad(x,
                                          self.norm.weight,
@@ -215,14 +213,12 @@ class MLPBlock(torch.nn.Module):
             t = self.norm(x)
 
         if VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
-        if VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
             g = gemm_a16w16(t[:, :self.hidden_size], self.router.weight, self.router.bias)
         else:
             g = self.router(t[:, :self.hidden_size])
         t = self.experts(hidden_states=t,
                          router_logits=g)[:, :self.hidden_size]
 
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD:
             return x, t
         return x + t
