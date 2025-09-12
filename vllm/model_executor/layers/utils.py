@@ -98,6 +98,9 @@ def default_unquantized_gemm(layer: torch.nn.Module,
 
 
 def aiter_GEMM_check(m, n, k):
+    # use hipblaslt for the larger GEMMs
+    if m > 2048 and n > 512 and k > 512:
+        return False
     return ((n == 5120 and k == 2880) or (n == 2880 and k == 4096)
             or (n == 128 and k == 2880) or (n == 640 and k == 2880)
             or (n == 2880 and k == 512))
@@ -110,29 +113,27 @@ def rocm_unquantized_gemm_impl(
     from vllm.platforms.rocm import on_gfx9
     k = weight.shape[1]
     m = weight.shape[0]
-    if x.is_contiguous():
-        x_view = x.view(-1, x.size(-1))
-    else:
-        x_view = x.reshape(-1, x.size(-1))
-    n = x_view.shape[0]
-    use_skinny = (envs.VLLM_ROCM_USE_SKINNY_GEMM and on_gfx9() and \
-                    x.dtype in [torch.float16, torch.bfloat16] \
-                    and k % 8 == 0 and bias is None)
+    n = x.shape[0]
 
     if (VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM 
         and aiter_GEMM_check(n, m, k) 
         and x.dtype in [torch.float16, torch.bfloat16]):
         return gemm_a16w16(x, weight, bias)
 
+    use_skinny = (envs.VLLM_ROCM_USE_SKINNY_GEMM and \
+                    x.dtype in [torch.float16, torch.bfloat16] \
+                    and k % 8 == 0 and bias is None and on_gfx9())
+
     if use_skinny is not True:
         return torch.nn.functional.linear(x, weight, bias)
 
-    # x_view = x.view(-1, x.size(-1))
-    # n = x_view.shape[0]
-    # m = weight.shape[0]
-    cu_count = current_platform.get_cu_count()
+    if x.is_contiguous():
+        x_view = x.view(-1, x.size(-1))
+    else:
+        x_view = x.reshape(-1, x.size(-1))
 
     if m > 8 and 0 < n <= 4:
+        cu_count = current_platform.get_cu_count()
         out = ops.wvSplitK(weight, x_view, cu_count)
         return out.view(*x.shape[:-1], weight.shape[0])
     elif m % 4 == 0 and n == 1 and k <= 8192:
