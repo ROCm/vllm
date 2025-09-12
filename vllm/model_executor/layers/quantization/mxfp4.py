@@ -432,10 +432,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_aiter_weight = layer.w2_weight.contiguous()
                 w2_aiter_scale = layer.w2_weight_scale.contiguous()
                 
+                e, n, k = w13_aiter_weight.shape
+                b1_aiter = layer.w13_bias.view(-1, n//2, 2).permute(0,2,1).contiguous().view(-1, n)
+                w13_aiter_weight = w13_aiter_weight.view(e, n//2, 2, k).permute(0,2,1,3).contiguous().view(e, n, k)
+                w13_aiter_scale = w13_aiter_scale.view(e, n//2, 2, -1).permute(0,2,1,3).contiguous().view(e, n,-1)
+                
                 self.w13_weight_aiter_tensor = shuffle_mxfp4_weight(w13_aiter_weight, 16, True)
                 self.w13_scale_aiter_tensor = shuffle_mxfp4_scale(w13_aiter_scale, True)
                 self.w2_weight_aiter_tensor = shuffle_mxfp4_weight(w2_aiter_weight, 16, False)
                 self.w2_scale_aiter_tensor = shuffle_mxfp4_scale(w2_aiter_scale, False)
+                self.w13_bias_aiter_tensor = b1_aiter
                 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight, layer.w13_weight_scale, num_warps)
@@ -449,9 +455,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
-            # print(f'[DEBUG zhimding] w13_aiter_weight: {self.w13_weight_aiter_tensor.shape}, w2_aiter_weight: {self.w2_weight_aiter_tensor.shape}, w13_triton_weight: {self.w13_weight_triton_tensor.shape}, w2_triton_weight:{self.w2_weight_triton_tensor.shape}')
-
-            # print(f"!!!!!{self.w13_scale_aiter_tensor.shape=}, {self.w13_scale_aiter_tensor.dtype=} {self.w2_scale_aiter_tensor.shape=}")
 
             # need to delete the original weights to save memory on single GPU
             del layer.w13_weight
@@ -621,11 +624,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     None, # sorted_weights
                     None,
                     self.w13_scale_aiter_tensor,
-                    layer.w13_bias,
+                    self.w13_bias_aiter_tensor,
                     BLOCKM, # block_size
                 )
-                # print(f'[DEBUG ] out1: {out.shape}')
-                print(f"solin:================")
                 aiter.moe_cktile2stages_gemm2(
                     cktile_moe_out1,
                     self.w2_weight_aiter_tensor,
@@ -642,22 +643,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.w2_bias,
                     BLOCKM, # block_size
                 )
-                # return moe_out
+                return moe_out
                 
-            out3 = triton_kernel_moe_forward(
-                hidden_states=x,
-                w1=self.w13_weight_triton_tensor,
-                w2=self.w2_weight_triton_tensor,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize,
-                global_num_experts=global_num_experts,
-                expert_map=expert_map,
-                w1_bias=layer.w13_bias,
-                w2_bias=layer.w2_bias,
-                w1_precision=self.w13_precision_config,
-                w2_precision=self.w2_precision_config,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-            )
-            checkAllclose(out3, moe_out, msg="triton vs aiter")
-            return out3
+            # out3 = triton_kernel_moe_forward(
+            #     hidden_states=x,
+            #     w1=self.w13_weight_triton_tensor,
+            #     w2=self.w2_weight_triton_tensor,
+            #     gating_output=router_logits,
+            #     topk=top_k,
+            #     renormalize=renormalize,
+            #     global_num_experts=global_num_experts,
+            #     expert_map=expert_map,
+            #     w1_bias=layer.w13_bias,
+            #     w2_bias=layer.w2_bias,
+            #     w1_precision=self.w13_precision_config,
+            #     w2_precision=self.w2_precision_config,
+            #     apply_router_weight_on_input=apply_router_weight_on_input,
+            # )
+            # return out3
