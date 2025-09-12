@@ -566,7 +566,8 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None):
+              bias: Optional[torch.Tensor] = None,
+              x_quant_scales: Optional[torch.Tensor] = None):
         """
         Use the output of create_weights and the CompressedTensorsScheme
         associated with the layer to apply the forward pass with the
@@ -577,7 +578,11 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
-        return scheme.apply_weights(layer, x, bias=bias)
+        elif isinstance(scheme, CompressedTensorsW8A8Fp8):        
+            return scheme.apply_weights(layer, x, bias=bias, x_quant_scales=x_quant_scales)
+        else:
+            assert x_quant_scales is None, f"x_quant_scales is not supported for {scheme.__class__}"
+            return scheme.apply_weights(layer, x, bias=bias)
 
 
 class CompressedTensorsKVCacheMethod(BaseKVCacheMethod):

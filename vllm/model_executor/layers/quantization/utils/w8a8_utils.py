@@ -345,6 +345,7 @@ class Fp8LinearOp:
         input_scale: Optional[torch.Tensor] = None,
         input_scale_ub: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        x_quant_scales: Optional[torch.Tensor] = None,
         # TODO(luka) remove this parameter in favor of __init__
         use_per_token_if_dynamic: Optional[bool] = None
     ) -> torch.Tensor:
@@ -404,6 +405,8 @@ class Fp8LinearOp:
                         qinput, x_scale = (
                             torch.ops.vllm.rocm_aiter_per_tensor_quant_fp8(
                                 input_2d, scale=input_scale))
+            elif x_quant_scales is not None:
+                qinput, x_scale = input_2d, x_quant_scales
             else:
                 qinput, x_scale = input_2d, input_scale
 
