@@ -26,6 +26,16 @@ if has_triton_kernels():
 
 if TYPE_CHECKING:
     from triton_kernels.matmul_ogs import PrecisionConfig
+    
+def swiglu(x, alpha: float = 1.702, limit: float = 7.0, interleaved: bool = True):
+    if interleaved:
+        x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    else:
+        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    return out_glu * (x_linear + 1)
 
 
 def triton_kernel_moe_forward(
@@ -128,6 +138,15 @@ def triton_kernel_fused_experts(
         (swiglu_alpha, swiglu_limit), 2)
     gammas = routing_data.gate_scal if routing_data else None
 
+    # intermediate_cache1 = matmul_ogs(
+    #     hidden_states,
+    #     w1,
+    #     w1_bias,
+    #     routing_data,
+    #     gather_indx=gather_indx,
+    #     precision_config=w1_precision,
+    #     gammas=gammas if apply_router_weight_on_input else None,
+    #     fused_activation=act)
     intermediate_cache1 = matmul_ogs(
         hidden_states,
         w1,
@@ -135,8 +154,8 @@ def triton_kernel_fused_experts(
         routing_data,
         gather_indx=gather_indx,
         precision_config=w1_precision,
-        gammas=gammas if apply_router_weight_on_input else None,
-        fused_activation=act)
+        gammas=gammas if apply_router_weight_on_input else None)
+    intermediate_cache1 = swiglu(intermediate_cache1, interleaved=False)
 
     intermediate_cache3 = matmul_ogs(
         intermediate_cache1,
