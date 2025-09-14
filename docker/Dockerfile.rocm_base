@@ -149,7 +149,8 @@ FROM base AS final
 #     dpkg -i /install/*deb \
 #     && sed -i 's/, rccl-dev \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status \
 #     && sed -i 's/, rccl \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status
-RUN pip3 uninstall -y triton_kernels
+RUN echo "Entering Base as final"
+RUN echo "Uninstalling triton " && pip uninstall -y triton_kernels
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
