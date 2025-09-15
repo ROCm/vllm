@@ -264,6 +264,7 @@ class AiterFlashAttentionMetadataBuilder(
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
+        self.workspace_buffer = None
 
     def build(self,
               common_prefix_len: int,
@@ -318,7 +319,9 @@ class AiterFlashAttentionMetadataBuilder(
                              dtype=cu_seq_lens.dtype,
                              out=cu_seq_lens[1:])
 
-        workspace_buffer = torch.empty(
+        # FIXME(zejun): Here is fixing a hip illegal memory access bug issue
+        # by assigning the workspace_buffer to self.workspace_buffer.
+        self.workspace_buffer = torch.empty(
             (num_seqs * self.num_heads_q * max_num_partitions * self.headdim) *
             nbytes_per_qo_elem + 2 *
             (num_seqs * self.num_heads_q * max_num_partitions) * 4,
@@ -355,7 +358,7 @@ class AiterFlashAttentionMetadataBuilder(
             common_prefix_len=common_prefix_len,
             k_buffer=k_buffer,
             v_buffer=v_buffer,
-            workspace_buffer=workspace_buffer,
+            workspace_buffer=self.workspace_buffer,
             cu_seq_lens=cu_seq_lens,
         )
         return attn_metadata
