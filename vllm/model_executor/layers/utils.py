@@ -99,7 +99,7 @@ def default_unquantized_gemm(layer: torch.nn.Module,
 
 def aiter_GEMM_check(m, n, k):
     # use hipblaslt for the larger GEMMs
-    if m > 2048 and n > 512 and k > 512:
+    if m > 2048 and n > 512:
         return False
     return ((n == 5120 and k == 2880) or (n == 2880 and k == 4096)
             or (n == 128 and k == 2880) or (n == 640 and k == 2880)
