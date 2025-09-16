@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Union
 from pydantic import TypeAdapter, field_validator
 from pydantic.dataclasses import dataclass
 
+import vllm.envs as envs
 from vllm.compilation.inductor_pass import CallableInductorPass, InductorPass
 from vllm.config.utils import config
 from vllm.logger import init_logger
@@ -74,11 +75,11 @@ class PassConfig:
     don't all have access to full configuration - that would create a cycle as
     the `PassManager` is set as a property of config."""
 
-    enable_fusion: bool = False
+    enable_fusion: bool = field(default_factory=lambda: envs.VLLM_USE_V1)
     """Whether to enable the custom fusion (RMSNorm/SiluMul+quant) pass."""
-    enable_attn_fusion: bool = False
+    enable_attn_fusion: bool = field(default_factory=lambda: envs.VLLM_USE_V1)
     """Whether to enable the custom attention+quant fusion pass."""
-    enable_noop: bool = False
+    enable_noop: bool = field(default_factory=lambda: envs.VLLM_USE_V1)
     """Whether to enable the custom no-op elimination pass."""
     enable_sequence_parallelism: bool = False
     """Whether to enable sequence parallelism."""
@@ -222,7 +223,7 @@ class CompilationConfig:
     constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
 
     # CudaGraph compilation
-    cudagraph_mode: Optional[CUDAGraphMode] = None
+    cudagraph_mode: Optional[CUDAGraphMode] = CUDAGraphMode.FULL
     """
     The mode of the cudagraph:
 
@@ -428,6 +429,16 @@ class CompilationConfig:
         count_all = self.custom_ops.count("all")
         assert count_none + count_all <= 1, "Can only specify 'none' or 'all'"
 
+        if "+rms_norm" not in self.custom_ops and \
+            "-rms_norm" not in self.custom_ops:
+            self.custom_ops.append("+rms_norm")
+        if "+silu_and_mul" not in self.custom_ops and \
+            "-silu_and_mul" not in self.custom_ops:
+            self.custom_ops.append("+silu_and_mul")
+        if "+quant_fp8" not in self.custom_ops and \
+            "-quant_fp8" not in self.custom_ops:
+            self.custom_ops.append("+quant_fp8")
+
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:
         #    https://github.com/pytorch/pytorch/issues/147924
@@ -592,7 +603,9 @@ class CompilationConfig:
                 # captured. see https://github.com/vllm-project/vllm/pull/20059
                 # for details. make a copy to avoid mutating the class-level
                 # list via reference.
-                self.splitting_ops = list(self._attention_ops)
+                self.splitting_ops = ([] if self.cudagraph_mode
+                                      == CUDAGraphMode.FULL else list(
+                                          self._attention_ops))
         elif len(self.splitting_ops) == 0:
             logger.warning_once(
                 "Using piecewise compilation with empty "
