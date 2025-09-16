@@ -212,8 +212,8 @@ class MLPBlock(torch.nn.Module):
         else:
             t = self.norm(x)
 
-        if VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
-            g = gemm_a16w16(t[:, :self.hidden_size], self.router.weight, self.router.bias)
+        if current_platform.is_rocm():
+            g = torch.ops.vllm.rocm_unquantized_gemm_impl(t[:, :self.hidden_size], self.router.weight, self.router.bias)
         else:
             g = self.router(t[:, :self.hidden_size])
         t = self.experts(hidden_states=t,
