@@ -75,11 +75,11 @@ class PassConfig:
     don't all have access to full configuration - that would create a cycle as
     the `PassManager` is set as a property of config."""
 
-    enable_fusion: bool = field(default_factory=lambda: not envs.VLLM_USE_V1)
+    enable_fusion: bool = field(default_factory=lambda: envs.VLLM_USE_V1)
     """Whether to enable the custom fusion (RMSNorm/SiluMul+quant) pass."""
-    enable_attn_fusion: bool = False
+    enable_attn_fusion: bool = field(default_factory=lambda: envs.VLLM_USE_V1)
     """Whether to enable the custom attention+quant fusion pass."""
-    enable_noop: bool = field(default_factory=lambda: not envs.VLLM_USE_V1)
+    enable_noop: bool = field(default_factory=lambda: envs.VLLM_USE_V1)
     """Whether to enable the custom no-op elimination pass."""
     enable_sequence_parallelism: bool = False
     """Whether to enable sequence parallelism."""
@@ -223,7 +223,7 @@ class CompilationConfig:
     constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
 
     # CudaGraph compilation
-    cudagraph_mode: Optional[CUDAGraphMode] = None
+    cudagraph_mode: Optional[CUDAGraphMode] = CUDAGraphMode.FULL
     """
     The mode of the cudagraph:
 
@@ -410,6 +410,16 @@ class CompilationConfig:
         count_all = self.custom_ops.count("all")
         assert count_none + count_all <= 1, "Can only specify 'none' or 'all'"
 
+        if "+rms_norm" not in self.custom_ops and \
+            "-rms_norm" not in self.custom_ops:
+            self.custom_ops.append("+rms_norm")
+        if "+silu_and_mul" not in self.custom_ops and \
+            "-silu_and_mul" not in self.custom_ops:
+            self.custom_ops.append("+silu_and_mul")
+        if "+quant_fp8" not in self.custom_ops and \
+            "-quant_fp8" not in self.custom_ops:
+            self.custom_ops.append("+quant_fp8")
+
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:
         #    https://github.com/pytorch/pytorch/issues/147924
@@ -540,28 +550,7 @@ class CompilationConfig:
             "set_splitting_ops_for_v1 should only be called when "
             "level is CompilationLevel.PIECEWISE")
 
-        if self.splitting_ops is None:
-            # NOTE: When using full cudagraph, instead of setting an empty
-            # list and capture the full cudagraph inside the flattened fx
-            # graph, we keep the piecewise fx graph structure but capture the
-            # full cudagraph outside the fx graph. This reduces some cpu
-            # overhead when the runtime batch_size is not cudagraph captured.
-            # see https://github.com/vllm-project/vllm/pull/20059 for details.
-            # make a copy to avoid mutating the class-level list via reference.
-            self.splitting_ops = list(self._attention_ops)
-        elif len(self.splitting_ops) == 0:
-            logger.warning_once("Using piecewise compilation with empty "
-                                "splitting_ops.")
-            if self.cudagraph_mode == CUDAGraphMode.PIECEWISE:
-                logger.warning_once(
-                    "When compilation level is piecewise with empty "
-                    "splitting_ops, PIECEWISE cudagraph_mode will be "
-                    "treated as FULL cudagraph_mode. Please ensure you are "
-                    "using attention backends that support cudagraph or set "
-                    "cudagraph_mode to NONE explicitly if encountering "
-                    "any problems.")
-                self.cudagraph_mode = CUDAGraphMode.FULL
-            self.splitting_ops = []
+        self.splitting_ops = []
 
         if envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput":
             # exclude MoE dispatch/combine from capture by ensuring
