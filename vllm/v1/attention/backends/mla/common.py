@@ -980,7 +980,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if VLLM_ROCM_USE_AITER_TRITON_FP8_BMM:
             x = x.view(-1, self.num_heads, self.kv_lora_rank)
             output = output.view(-1, self.num_heads, self.v_head_dim)
-            batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(x, self.W_V, self.W_V_scale, group_size = 128, YQ = output, transpose_bm = True, transpose_bm_in = True)
             output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(x, self.W_V, self.W_V_scale, group_size = 128, YQ = output, transpose_bm = True, transpose_bm_in = True)
             x = output.view(-1, self.num_heads * self.v_head_dim)
         else:
