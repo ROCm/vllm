@@ -387,23 +387,11 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(
-        self, x: torch.Tensor, x_quant_scales: torch.Tensor = None,
+        self, x: torch.Tensor
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsLinearMethod
-        if isinstance(self.quant_method, CompressedTensorsLinearMethod):
-            output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
-        else:
-            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
-            output = self.quant_method.apply(self, x, bias)
-        # output = self.quant_method.apply(self, x, bias)
-        if isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert x_quant_scales is None, "UnquantizedLinearMethod should not have quantized input"
-            output = self.quant_method.apply(self, x, bias)
-        else:
-            output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
-        
+        output = self.quant_method.apply(self, x, bias)
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
             return output
@@ -617,18 +605,13 @@ class ColumnParallelLinear(LinearBase):
         param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
-        self, input_, x_quant_scales: torch.Tensor = None,
+        self, input_
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
-        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsLinearMethod
-        if isinstance(self.quant_method, CompressedTensorsLinearMethod):
-            output_parallel = self.quant_method.apply(self, input_, bias, x_quant_scales=x_quant_scales)
-        else:
-            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
-            output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1397,8 +1380,7 @@ class RowParallelLinear(LinearBase):
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
-        self, input_,
-        x_quant_scales = None
+        self, input_
     ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[Parameter]]]:
         if self.input_is_parallel:
             input_parallel = input_
@@ -1413,12 +1395,9 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsLinearMethod
-        if isinstance(self.quant_method, CompressedTensorsLinearMethod):
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_, x_quant_scales=x_quant_scales)
-        else:
-            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        output_parallel = self.quant_method.apply(self,
+                                                  input_parallel,
+                                                  bias=bias_)
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:

@@ -115,8 +115,7 @@ if TYPE_CHECKING:
     VLLM_AITER_TRITON_FP8_BMM: bool = False
     VLLM_AITER_TRITON_FUSED_CONCAT_ZEROS: bool = False
     VLLM_AITER_TRITON_FUSED_ROPE_CACHE_CONCAT: bool = False
-    VLLM_MLA_FP8_PADDING: bool = False,
-    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT: bool = False
+    VLLM_MLA_FP8_PADDING: bool = False
 
 
 def get_default_cache_root():
@@ -755,9 +754,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     
     "VLLM_MLA_FP8_PADDING":
     lambda: bool(int(os.getenv("VLLM_MLA_FP8_PADDING", "0"))),
-    
-    "VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT":
-    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "0"))),
     
 }
 
