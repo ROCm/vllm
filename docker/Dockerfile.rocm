@@ -1,7 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base_rocm7_build38
+ARG BASE_IMAGE=rocm/vllm-dev:base_rocm7_0930_rc1_20250916_tuned_20250917
 
 FROM ${BASE_IMAGE} AS base
 
@@ -30,10 +30,9 @@ ONBUILD RUN git clone ${VLLM_REPO} \
 	    && cd vllm \
 	    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
 	    && git checkout FETCH_HEAD \
-        && if [[ ${VLLM_REPO} != "https://github.com/vllm-project/vllm.git" ]] ; then \
+        && if [ ${VLLM_REPO} != "https://github.com/vllm-project/vllm.git" ] ; then \
                git remote add upstream "https://github.com/vllm-project/vllm.git" \
-               && git fetch upstream \
-           fi
+               && git fetch upstream ; fi
 FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 
 # -----------------------
