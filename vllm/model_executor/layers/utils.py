@@ -113,7 +113,7 @@ def rocm_unquantized_gemm_impl(
     from vllm.platforms.rocm import on_gfx9
     k = weight.shape[1]
     m = weight.shape[0]
-    n = x.shape[0]
+    n = x.numel() // x.size(-1)
 
     if (VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM 
         and aiter_GEMM_check(n, m, k) 
