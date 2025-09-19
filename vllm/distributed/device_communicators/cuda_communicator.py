@@ -5,6 +5,7 @@ from functools import cache
 from typing import Callable, Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
@@ -268,6 +269,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             op = self.rocm_allreduce_dispatcher.dispatch(input_)
             logger.debug(f"ROCm allreduce dispatcher dispatched: {op}")
             out = op(input_)
+
+            ### compare
+            torch_out = input_.clone()
+            dist.all_reduce(torch_out, group=self.device_group)
+
+            # Calculate differences
+            diff = out - torch_out
+            max_diff = torch.max(torch.abs(diff)).item()
+            mean_diff = torch.mean(torch.abs(diff)).item()
+            mse = torch.mean(diff ** 2).item()
+
+            # Get op name for logging
+            op_name = op.__class__.__name__ if hasattr(op, '__class__') else str(op)
+
+            logger.info(f"AllReduce Comparison - Op: {op_name}")
+            logger.info(f"Max diff: {max_diff:.6e}, Mean diff: {mean_diff:.6e}, MSE: {mse:.6e}")
+            logger.info(f"Input shape: {input_.shape}, dtype: {input_.dtype}")
+
         else:
             ca_comm = self.ca_comm
             if ca_comm is not None and not ca_comm.disabled and \
