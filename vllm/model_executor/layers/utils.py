@@ -99,9 +99,9 @@ def default_unquantized_gemm(layer: torch.nn.Module,
     return torch.nn.functional.linear(x, weight, bias)
 
 
-def aiter_GEMM_check(m, n, k):
+def aiter_GEMM_check(m, n, k, dtype):
     if (VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM == False 
-        or x.dtype not in [torch.float16, torch.bfloat16]):
+        or dtype not in [torch.float16, torch.bfloat16]):
         return False
     # use hipblaslt for the larger GEMMs
     if m > 2048 and n > 512:
@@ -120,7 +120,7 @@ def rocm_unquantized_gemm_impl(
     m = weight.shape[0]
     n = x.numel() // x.size(-1)
 
-    if aiter_GEMM_check(n, m, k):
+    if aiter_GEMM_check(n, m, k, x.dtype):
         return gemm_a16w16(x, weight, bias)
 
     use_skinny = (envs.VLLM_ROCM_USE_SKINNY_GEMM and \
