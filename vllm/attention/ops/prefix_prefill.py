@@ -7,7 +7,7 @@
 import torch
 
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import not_mi350
+from vllm.platforms.rocm import on_gfx950
 from vllm.triton_utils import tl, triton
 
 # Static kernels parameters
@@ -865,7 +865,7 @@ def context_attention_fwd(q,
     max_seq_len = 0 if max_seq_len is None else max_seq_len
     extra_kargs = {}
     if current_platform.is_rocm():
-        if not_mi350():
+        if not on_gfx950():
             extra_kargs = {"kpack": 1, "waves_per_eu": 2}
         else:
             extra_kargs = {"waves_per_eu": 2}

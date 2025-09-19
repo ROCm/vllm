@@ -11,10 +11,10 @@ from vllm import envs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
-    from vllm.platforms.rocm import not_mi350
+    from vllm.platforms.rocm import on_gfx950
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
     # use triton gemms only on mi350
-    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = not not_mi350()
+    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = on_gfx950()
 else:
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = False
 

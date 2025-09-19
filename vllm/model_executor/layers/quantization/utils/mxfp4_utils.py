@@ -33,7 +33,8 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         scale_layout, scale_layout_opts = StridedLayout, dict()
 
     elif current_platform.is_rocm():
-        from triton_kernels.target_info import is_hip, is_hip_cdna4
+        from vllm.platforms.rocm import on_gfx950 
+        from triton_kernels.target_info import is_hip
         from triton_kernels.tensor_details.layout import (
             BlackwellMXScaleLayout, GFX950MXScaleLayout, HopperMXScaleLayout,
             HopperMXValueLayout)
@@ -46,8 +47,8 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
             if torch.cuda.get_device_capability()[0] == 10:
                 scale_layout = BlackwellMXScaleLayout
         else:
-            # activate preshuffling on only cdna4
-            if is_hip_cdna4() and envs.ROCM_TRITON_MOE_PRESHUFFLE_SCALES:
+            # activate preshuffling on only gfx950
+            if on_gfx950() and envs.ROCM_TRITON_MOE_PRESHUFFLE_SCALES:
                 scale_layout = GFX950MXScaleLayout
     else:
         """ weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel
