@@ -380,6 +380,10 @@ class RocmPlatform(Platform):
                 else:
                     parallel_config.worker_cls = "vllm.worker.worker.Worker"
 
+        if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA:
+            # enable the request reorder if we are using AITER MHA for calculation
+            vllm_config.scheduler_config.split_prefill_from_chunk = True
+
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
         if model_arch in _ROCM_UNSUPPORTED_MODELS:
