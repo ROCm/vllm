@@ -11,8 +11,10 @@ from vllm import envs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
+    from vllm.platforms.rocm import not_mi350
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
-    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = True
+    # use triton gemms only on mi350
+    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = not not_mi350()
 else:
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = False
 
@@ -98,6 +100,9 @@ def default_unquantized_gemm(layer: torch.nn.Module,
 
 
 def aiter_GEMM_check(m, n, k):
+    if (VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM == False 
+        or x.dtype not in [torch.float16, torch.bfloat16]):
+        return False
     # use hipblaslt for the larger GEMMs
     if m > 2048 and n > 512:
         return False
@@ -115,9 +120,7 @@ def rocm_unquantized_gemm_impl(
     m = weight.shape[0]
     n = x.numel() // x.size(-1)
 
-    if (VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM 
-        and aiter_GEMM_check(n, m, k) 
-        and x.dtype in [torch.float16, torch.bfloat16]):
+    if aiter_GEMM_check(n, m, k):
         return gemm_a16w16(x, weight, bias)
 
     use_skinny = (envs.VLLM_ROCM_USE_SKINNY_GEMM and \
