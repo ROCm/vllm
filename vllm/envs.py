@@ -103,7 +103,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_TRITON_FP4_GEMM_USE_ASM: bool = False
-    VLLM_USE_AITER_TRITON_ROPE: bool = False
+    VLLM_USE_AITER_TRITON_ROPE: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -806,9 +806,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
              ("true", "1")),
 
     # Whether to use aiter rope.
-    # By default is disabled.
+    # By default is enabled.
     "VLLM_USE_AITER_TRITON_ROPE":
-    lambda: (os.getenv("VLLM_USE_AITER_TRITON_ROPE", "False").lower() in
+    lambda: (os.getenv("VLLM_USE_AITER_TRITON_ROPE", "True").lower() in
              ("true", "1")),
 
     # use rocm skinny gemms
