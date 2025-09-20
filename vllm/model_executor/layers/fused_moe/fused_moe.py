@@ -1539,7 +1539,7 @@ def fused_experts_impl(
     assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
     assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
     assert hidden_states.dtype in [
-        torch.float32, torch.float16, torch.bfloat16
+        torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e4m3fnuz
     ]
 
     num_tokens = hidden_states.size(0)
