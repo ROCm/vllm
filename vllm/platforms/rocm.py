@@ -74,12 +74,14 @@ _ROCM_DEVICE_ID_NAME_MAP: dict[str, str] = {
 }
 
 # Prevent use of clashing `{CUDA/HIP}_VISIBLE_DEVICES``
-if "HIP_VISIBLE_DEVICES" in os.environ:
-    val = os.environ["HIP_VISIBLE_DEVICES"]
-    if cuda_val := os.environ.get("CUDA_VISIBLE_DEVICES", None):
-        assert val == cuda_val
-    else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = val
+# if "HIP_VISIBLE_DEVICES" in os.environ:
+#     val = os.environ["HIP_VISIBLE_DEVICES"]
+#     if cuda_val := os.environ.get("CUDA_VISIBLE_DEVICES", None):
+#         print("cuda val: ", cuda_val)
+#         print("val: ", val)
+#         assert val == cuda_val
+#     else:
+#         os.environ["CUDA_VISIBLE_DEVICES"] = val
 
 # AMDSMI utils
 # Note that NVML is not affected by `{CUDA/HIP}_VISIBLE_DEVICES`,
@@ -195,7 +197,7 @@ class RocmPlatform(Platform):
     ray_device_key: str = "GPU"
     dist_backend: str = "nccl"
     # rocm shares the same device control env var as CUDA
-    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+    device_control_env_var: str = "HIP_VISIBLE_DEVICES"
 
     supported_quantization: list[str] = [
         "awq", "gptq", "fp8", "compressed-tensors", "fbgemm_fp8", "gguf",

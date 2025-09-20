@@ -1054,8 +1054,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from vllm.model_executor.layers.fused_moe import (
             BatchedTritonOrDeepGemmExperts, TritonOrDeepGemmExperts)
 
-        assert not self.use_marlin and not self.rocm_aiter_moe_enabled, (
-            "Marlin and ROCm AITER are not supported with all2all yet.")
+        assert not self.use_marlin, (
+            "Marlin are not supported with all2all yet.")
 
         if (prepare_finalize.activation_format ==
                 FusedMoEActivationFormat.BatchedExperts):
@@ -1121,67 +1121,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             assert logical_to_physical_map is not None
             assert logical_replica_count is not None
             assert isinstance(layer, FusedMoE)
-
-        if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
-            assert activation == 'silu', (
-                f"Expected 'silu' activation but got {activation}")
-            assert scoring_func == 'sigmoid', (
-                f"Expected 'sigmoid' scoring func but got {scoring_func}")
-            if self.block_quant:
-                assert (renormalize and use_grouped_topk
-                        and custom_routing_function is None)
-
-                return torch.ops.vllm.flashinfer_fused_moe_blockscale_fp8(
-                    routing_logits=router_logits.to(torch.float32),
-                    routing_bias=e_score_correction_bias,
-                    x=x,
-                    w13_weight=layer.w13_weight,
-                    w13_weight_scale_inv=layer.w13_weight_scale_inv,
-                    w2_weight=layer.w2_weight,
-                    w2_weight_scale_inv=layer.w2_weight_scale_inv,
-                    global_num_experts=global_num_experts,
-                    top_k=top_k,
-                    num_expert_group=num_expert_group,
-                    topk_group=topk_group,
-                    intermediate_size=layer.intermediate_size_per_partition,
-                    expert_offset=layer.ep_rank * layer.local_num_experts,
-                    local_num_experts=layer.local_num_experts,
-                    block_shape=self.quant_config.weight_block_size,
-                    routed_scaling=routed_scaling_factor,
-                )
-            else:
-                assert (not renormalize
-                        and custom_routing_function is not None)
-                return apply_flashinfer_per_tensor_scale_fp8(
-                    layer=layer,
-                    hidden_states=x,
-                    router_logits=router_logits,
-                    routing_bias=e_score_correction_bias,
-                    global_num_experts=global_num_experts,
-                    top_k=top_k,
-                    num_expert_group=num_expert_group,
-                    topk_group=topk_group,
-                    apply_router_weight_on_input=apply_router_weight_on_input)
-
-        topk_weights, topk_ids = FusedMoE.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            indices_type=self.topk_indices_dtype,
-            enable_eplb=enable_eplb,
-            expert_map=expert_map,
-            expert_load_view=expert_load_view,
-            logical_to_physical_map=logical_to_physical_map,
-            logical_replica_count=logical_replica_count,
-        )
+        if not self.flashinfer_moe_enabled:
+            topk_weights, topk_ids = FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                indices_type=self.topk_indices_dtype,
+                enable_eplb=enable_eplb,
+                expert_map=expert_map,
+                expert_load_view=expert_load_view,
+                logical_to_physical_map=logical_to_physical_map,
+                logical_replica_count=logical_replica_count,
+            )
 
         if self.rocm_aiter_moe_enabled:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa: E501
