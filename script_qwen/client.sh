@@ -8,5 +8,5 @@ python3 -m vllm.entrypoints.cli.main bench serve --backend vllm  \
     --max-concurrency ${MAX_CONCURRENCY} \
     --random-input-len ${IN} \
     --random-output-len ${OUT} \
-    --seed 123 \
-    --ignore-eos
+    --ignore-eos \
+    #--profile \
