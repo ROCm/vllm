@@ -38,6 +38,32 @@ def silu_mul_replacement_static(result: torch.Tensor,
     return at[1]
 
 
+def silu_mul_mxfp4_gemm_pattern(result: torch.Tensor,
+                            result_silu_mul: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
+                            scale: torch.Tensor):
+    at1 = auto_functionalized(torch.ops._C.silu_and_mul.default,
+                              result=result_silu_mul,
+                              input=input)
+    at2 = auto_functionalized(torch.ops.vllm.gemm_with_dynamic_quant.default,
+                              result=result,
+                              x=at1[1],
+                              weight=weight,
+                              weight_scale=scale,
+                              x_scales=None)
+    return at2[1]
+
+
+def silu_mul_mxfp4_gemm_replacement(result: torch.Tensor,
+                            result_silu_mul: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
+                            scale: torch.Tensor):
+    at = auto_functionalized(torch.ops.vllm.silu_and_mul_mxfp4_gemm.default,
+                             result=result,
+                             x=input,
+                             weight=weight,
+                             weight_scale=scale)
+    return at[1]
+
+
 def empty_bf16(*args, **kwargs):
     return torch.empty(*args, **kwargs, dtype=torch.bfloat16, device="cuda")
 
@@ -49,6 +75,10 @@ def empty_fp8(*args, **kwargs):
 
 def empty_fp32(*args, **kwargs):
     return torch.empty(*args, **kwargs, dtype=torch.float32, device="cuda")
+
+
+def empty_fp4(*args, **kwargs):
+    return torch.empty(*args, **kwargs, dtype=torch.uint8, device="cuda")
 
 
 class ActivationQuantFusionPass(VllmInductorPass):
@@ -75,6 +105,17 @@ class ActivationQuantFusionPass(VllmInductorPass):
         ]
         register_replacement(silu_mul_pattern_static,
                              silu_mul_replacement_static, inputs, fwd_only,
+                             self.patterns)
+        
+        inputs = [
+            empty_bf16(5, 4),  # result
+            empty_bf16(5, 4),  # result_silu_mul
+            empty_bf16(5, 4),  # input
+            empty_fp4(4, 8),  # weight
+            empty_fp4(1, 1), # scale
+        ]
+        register_replacement(silu_mul_mxfp4_gemm_pattern,
+                             silu_mul_mxfp4_gemm_replacement, inputs, fwd_only,
                              self.patterns)
 
     def __call__(self, graph: torch.fx.Graph):
