@@ -395,14 +395,8 @@ class ReplicatedLinear(LinearBase):
         if isinstance(self.quant_method, CompressedTensorsLinearMethod):
             output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
         else:
-            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
+            # assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
             output = self.quant_method.apply(self, x, bias)
-        # output = self.quant_method.apply(self, x, bias)
-        if isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert x_quant_scales is None, "UnquantizedLinearMethod should not have quantized input"
-            output = self.quant_method.apply(self, x, bias)
-        else:
-            output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
         
         output_bias = self.bias if self.skip_bias_add else None
         if not self.return_bias:
@@ -627,7 +621,7 @@ class ColumnParallelLinear(LinearBase):
         if isinstance(self.quant_method, CompressedTensorsLinearMethod):
             output_parallel = self.quant_method.apply(self, input_, bias, x_quant_scales=x_quant_scales)
         else:
-            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
+            # assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
             output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
@@ -1417,7 +1411,7 @@ class RowParallelLinear(LinearBase):
         if isinstance(self.quant_method, CompressedTensorsLinearMethod):
             output_parallel = self.quant_method.apply(self, input_parallel, bias_, x_quant_scales=x_quant_scales)
         else:
-            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
+            # assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
             output_parallel = self.quant_method.apply(self, input_parallel, bias_)
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
