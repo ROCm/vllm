@@ -25,6 +25,7 @@ ARG COMMON_WORKDIR
 COPY ./deepep_required/nvshmem-main/ ${COMMON_WORKDIR}/nvshmem-main
 COPY ./deepep_required/deepEP_private ${COMMON_WORKDIR}/deepEP_private
 COPY ./deepep_required/install_deepep.sh ${COMMON_WORKDIR}/install_deepep.sh
+RUN chmod +x ${COMMON_WORKDIR}/install_deepep.sh
 RUN echo "✅ Successfully copied nv-shmem & deepEP_private source code"
 WORKDIR ${COMMON_WORKDIR}
 # source build nv-shmem
@@ -84,4 +85,28 @@ ENV HIP_FORCE_DEV_KERNARG=1
 # Enable Aiter. Make sure this only exists on the aiter branch.
 # ENV VLLM_ROCM_USE_AITER=1
 
+# Create a wrapper script that runs only once
+RUN cat > /opt/entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+# Check if installation has already been done
+if [ ! -f /opt/.deepep_installed ]; then
+    echo "🚀 First run detected - installing deepEP..."
+    /opt/install_deepep.sh
+    
+    # Create flag file to mark installation complete
+    touch /opt/.deepep_installed
+    echo "✅ deepEP installation completed and marked"
+else
+    echo "📋 deepEP already installed, skipping installation"
+fi
+
+# Execute the original command or default to bash
+exec "$@"
+EOF
+
+RUN chmod +x /opt/entrypoint.sh
+
+ENTRYPOINT ["/opt/entrypoint.sh"]
 CMD ["/bin/bash"]
