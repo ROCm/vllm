@@ -4,7 +4,9 @@ This guide is based on https://amd.atlassian.net/wiki/spaces/MLSE/pages/11190578
 nv-shmem, https://github.com/anghostcici/nvshmem.git, is a private repo owned by Nicole.Nie. You may use this zip to acquire the latest nvshmem for its build [nvshmem-main.zip](https://amdcloud-my.sharepoint.com/:u:/g/personal/danli103_amd_com/EUi9AszhzDBNiZk0P_fF_C0BP2TW60WWaQD6dxyykzyq5w?e=PGNapB) and unzip it locally.
 In case you cannot access this zip file, the alternative is to scp it:
 ```shell
+cd vllm/docker/deepep_required
 scp -r gyu@hjbog-srdc-35.amd.com:/home/gyu/nvshmem-main.zip ./
+unzip nvshmem-main.zip
 ```
 Then clone deepep:
 ```shell
@@ -18,14 +20,14 @@ DOCKER_BUILDKIT=1 docker build --no-cache -f Dockerfile.rocm_deepep_base -t rocm
 ## Launch docker and install deepep inside container
 ```shell
 docker run -itd --rm --cap-add=SYS_PTRACE -e SHELL=/bin/bash --network=host --security-opt seccomp=unconfined --device=/dev/kfd --device=/dev/dri -v /home/gyu:/home/gyu/ -v /mnt:/mnt --group-add video --ipc=host --name ${CONTAINER_NAME} rocm/vllm_deepep
-
-docker exec -it ${CONTAINER_NAME} bash
-
-bash install_deepep.sh
 ```
+nv-shmem and deepep will be **automatically built and installed** after launching the docker, which can take some time.
+Please wait until you can find **.deepep_installed** file in /opt, whcih means the installation has finished.
 ## Run vLLM with deepep_high_throughput mode
-Currently only eager mode is verified.
+Enter the container and run vLLM with deepep. Currently only eager mode is verified.
 ```shell
+# enter container
+docker exec -it ${CONTAINER_NAME} bash
 # launch server
 export HF_HOME=/mnt/raid0/models/
 export VLLM_USE_V1=1
