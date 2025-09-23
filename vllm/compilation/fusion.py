@@ -9,6 +9,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._ops import OpOverload
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -79,6 +80,22 @@ FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
     torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
 }
 
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    AITER_RMS_GROUP_QUANT_OP = torch.ops.vllm.rocm_aiter_fused_rms_fp8_group_quant.default
+    BLOCK_LINEAR_OP = torch.ops.vllm.apply_w8a8_block_fp8_linear.default
+    AITER_BLOCK_LINEAR_OP = \
+        torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale.default
+    AITER_RMS_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
+    AITER_FUSED_ADD_RMS_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
+    
+    import aiter as rocm_aiter
+    rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+    rocm_aiter_fp8_quant_group_size = 128
+    
+    # FUSED_OPS[FusedRMSQuantKey(kFp8DynamicGroupSym, False)] = \
+    #     torch.ops.vllm.rocm_aiter_fused_rms_fp8_group_quant
+    # FUSED_OPS[FusedRMSQuantKey(kFp8DynamicGroupSym, True)] = \
+    #     torch.ops.vllm.rocm_aiter_fused_rms_fp8_group_quant
 
 class QuantMultiOutputMatch(MultiOutputMatch):
 
@@ -502,6 +519,136 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
                     **kwargs)
 
 
+class AiterRMSGroupQuantFP8Pattern(RMSNormQuantPattern):
+
+    def __init__(self,
+                 epsilon: float,
+                 quant_dtype: torch.dtype,
+                 group_shape: GroupShape = (1, 128),
+                 symmetric=True):
+        self.epsilon = epsilon
+        self.quant_dtype = quant_dtype
+
+    def register(self, pm_pass: PatternMatcherPass):
+
+        def pattern(input: torch.Tensor, weight: torch.Tensor, #result_rms: torch.Tensor,
+                    linear_weight: torch.Tensor,
+                    linear_weight_scale: torch.Tensor):
+            at1 = AITER_RMS_OP(x=input,
+                               weight=weight,
+                               variance_epsilon=self.epsilon)
+            
+            at2 = BLOCK_LINEAR_OP(input=at1,
+                                    weight=linear_weight,
+                                    block_size=[128, 128],
+                                    weight_scale=linear_weight_scale,
+                                    input_scale=None,
+                                    bias=None,
+                                    cutlass_block_fp8_supported=False,
+                                    use_aiter_and_is_supported=True)
+
+            return at2
+
+        def replacement(input: torch.Tensor, weight: torch.Tensor,
+                        linear_weight: torch.Tensor,
+                        linear_weight_scale: torch.Tensor):
+            # AITER_RMS_GROUP_QUANT_OP returns (input_quant, input_quant_scales, residual),
+            # where residual is ignored here
+            at1 = AITER_RMS_GROUP_QUANT_OP(x=input,
+                                           residual=None,
+                                           weight=weight,
+                                           variance_epsilon=self.epsilon)
+            
+            at2 = AITER_BLOCK_LINEAR_OP(A=at1[0],
+                                        B=linear_weight,
+                                        As=at1[1],
+                                        Bs=linear_weight_scale,
+                                        block_size=[128, 128],
+                                        output_dtype=input.dtype)
+
+            return at2
+
+        inputs = [
+            empty_bf16(5, 4),  # input
+            empty_bf16(1, 5),  # weight
+            torch.empty((2, 5), device="cuda", dtype=FP8_DTYPE), # linear_weight
+            empty_fp32(1, 1),  # scale # linear_weight_scale
+        ]
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            inputs,
+            pm.fwd_only,
+            pm_pass)
+
+
+class AiterFusedAddRMSGroupQuantPattern(RMSNormQuantPattern):
+
+    def __init__(self,
+                 epsilon: float,
+                 quant_dtype: torch.dtype,
+                 group_shape: GroupShape = (1, 128),
+                 symmetric=True):
+        self.epsilon = epsilon
+        self.quant_dtype = quant_dtype
+
+    def register(self, pm_pass: PatternMatcherPass,
+                 record_match: Callable[[MultiOutputMatch], bool]):
+
+        def pattern(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+                    linear_weight: torch.Tensor,
+                    linear_weight_scale: torch.Tensor):
+            at1 = AITER_FUSED_ADD_RMS_OP(x=input,
+                                         residual=residual,
+                                         weight=weight,
+                                         variance_epsilon=self.epsilon)
+            
+            at2 = BLOCK_LINEAR_OP(input=at1[0],
+                                    weight=linear_weight,
+                                    block_size=[128, 128],
+                                    weight_scale=linear_weight_scale,
+                                    input_scale=None,
+                                    bias=None,
+                                    cutlass_block_fp8_supported=False,
+                                    use_aiter_and_is_supported=True)
+
+            return at2
+
+        def replacement(input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+                        linear_weight: torch.Tensor,
+                        linear_weight_scale: torch.Tensor):
+
+            at1 = AITER_RMS_GROUP_QUANT_OP(x=input,
+                                           residual=residual,
+                                           weight=weight,
+                                           variance_epsilon=self.epsilon)
+            
+            at2 = AITER_BLOCK_LINEAR_OP(A=at1[0],
+                                        B=linear_weight,
+                                        As=at1[1],
+                                        Bs=linear_weight_scale,
+                                        block_size=[128, 128],
+                                        output_dtype=input.dtype)
+
+            return at2
+
+        inputs = [
+            empty_bf16(5, 4),  # input
+            empty_bf16(5, 4),  # residual
+            empty_bf16(1, 5),  # weight
+            torch.empty((2, 5), device="cuda", dtype=FP8_DTYPE), # linear_weight
+            empty_fp32(1, 1), # linear_weight_scale
+        ]
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            inputs,
+            pm.fwd_only,
+            pm_pass)
+
+
 class FusionPass(VllmInductorPass):
     """
     This pass fuses a pre-defined set of custom ops into fused ops.
@@ -558,6 +705,14 @@ class FusionPass(VllmInductorPass):
             # Fuse fused_add_rms_norm + dynamic per-token fp8 quant
             FusedAddRMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(
                 self.patterns, self.record_match)
+            
+            if envs.VLLM_ROCM_USE_AITER:
+                # Fuse rms_norm + dynamic group fp8 quant
+                # AiterRMSGroupQuantFP8Pattern(epsilon, FP8_DTYPE).register(
+                #     self.patterns)
+                
+                AiterFusedAddRMSGroupQuantPattern(epsilon, FP8_DTYPE).register(
+                    self.patterns)
 
             # WARNING: This is a hack to clear the pattern matcher cache
             # and allow multiple values of epsilon.
@@ -587,8 +742,10 @@ class FusionPass(VllmInductorPass):
     def __call__(self, graph: fx.Graph):
         self.begin()
         self.dump_graph(graph, "before_fusion")
-
+        if torch.cuda.current_device() == 0:
+            graph.print_tabular()
         count = self.patterns.apply(graph)
+        print(f"Applied {count} fusion patterns")
         logger.debug("Replaced %s patterns", count)
         self.dump_graph(graph, "after_pattern_match")
 
@@ -596,5 +753,7 @@ class FusionPass(VllmInductorPass):
         self.process_matches(graph)
         logger.debug("Post-processed %s matches", len(self.matches))
         self.dump_graph(graph, "after_fusion")
+        if torch.cuda.current_device() == 0:
+            graph.print_tabular()
         self.matches.clear()
         self.end_and_log()
