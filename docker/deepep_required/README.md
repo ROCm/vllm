@@ -1,6 +1,16 @@
 # Setup environment for deepep on ROCM
 This guide is based on https://amd.atlassian.net/wiki/spaces/MLSE/pages/1119057874/vLLM+deployment+with+DeepEP.
-
+## Prepare nv-shmem and deepep repo
+nv-shmem, https://github.com/anghostcici/nvshmem.git, is a private repo owned by Nicole.Nie. You may use this zip to acquire the latest nvshmem for its build [nvshmem-main.zip](https://amdcloud-my.sharepoint.com/:u:/g/personal/danli103_amd_com/EUi9AszhzDBNiZk0P_fF_C0BP2TW60WWaQD6dxyykzyq5w?e=PGNapB) and unzip it locally.
+In case you cannot access this zip file, the alternative is to scp it:
+```shell
+scp -r gyu@hjbog-srdc-35.amd.com:/home/gyu/nvshmem-main.zip ./
+```
+Then clone deepep:
+```shell
+git clone -b develop-ali https://github.com/ROCm/deepEP_private.git
+```
+**NOTE: Do remember to put nv-shmem and deepep under ./deepep_required/**
 ## Build docker image
 ```shell
 DOCKER_BUILDKIT=1 docker build --no-cache -f Dockerfile.rocm_deepep_base -t rocm/vllm_deepep .
