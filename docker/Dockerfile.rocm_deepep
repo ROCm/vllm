@@ -1,0 +1,103 @@
+# build image for vllm deepep rocm
+ARG AITER_BRANCH="wjx/grouped_gemm"
+ARG VLLM_BRANCH="ganyi/llama_fp8_03122025/deepep"
+ARG DEEPEP_BRANCH="develop-ali"
+ARG ARG_PYTORCH_ROCM_ARCH="gfx942"
+ARG COMMON_WORKDIR=/opt
+# user this image as default
+# 1. source build nvshmem and deepep
+# 2. reinstall aiter
+# 3. reinstall vllm
+ARG BASE_IMAGE=rocm/ali-private:ubuntu22.04_rocm6.4.3.127_aiter_6b586ae_vllm_5b842c2_20250911
+
+FROM ${BASE_IMAGE} AS base
+
+ARG ARG_PYTORCH_ROCM_ARCH
+ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
+
+# Install some basic utilities
+RUN apt-get update -q -y && apt-get install -q -y \
+    sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
+    apt-transport-https ca-certificates wget curl libopenmpi-dev openmpi-bin libibverbs-dev \
+    && echo "✅ Successfully installed dependencies"
+
+ARG COMMON_WORKDIR
+COPY ./nvshmem-main/ ${COMMON_WORKDIR}/nvshmem-main
+COPY ./deepEP_private ${COMMON_WORKDIR}/deepEP_private
+RUN echo "✅ Successfully copied nv-shmem & deepEP_private source code"
+WORKDIR ${COMMON_WORKDIR}
+# source build nv-shmem
+ENV PATH=/opt/rocm-6.4.3/llvm/bin/:/opt/rocm-6.4.3/bin/:/usr/local/sbin/:/usr/local/bin/:/usr/sbin/:/usr/bin/
+RUN echo "✅ PATH is set to $PATH"
+RUN cd ./nvshmem-main/nvshmem_src_rocm_wip \
+    && cp runtime_patches/amd_warp_sync_functions.h /opt/rocm-6.4.3/include/hip/amd_detail/ \
+    && echo "=== Environment ===" \
+    && env | grep -E "(CC|CXX|LD|ROCM|HIP)" \
+    && echo "=== Compiler versions ===" \
+    && gcc --version \
+    && clang --version \
+    && echo "=== Starting build ===" \
+    && rm -rf build/ \
+    && CMAKE_ARGS="-DAMDGPU_TARGETS=gfx942 -DCMAKE_HIP_ARCHITECTURES=gfx942" ./configure \
+    && make -j -C build \
+    && echo "✅ Successfully built NVSHMEM"
+
+# source build deepep
+RUN cd deepEP_private \
+    && git submodule sync \
+    && git submodule update --init --recursive \
+    && echo "✅ SUCCESS: DeepEP repository ready"
+# Replace with verification
+RUN if [ -f "/usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py" ]; then \
+        sed -i 's/-fno-gpu-rdc/-fgpu-rdc/g' /usr/local/lib/python3.10/dist-packages/torch/utils/cpp_extension.py && \
+        echo "Successfully replaced -fno-gpu-rdc with -fgpu-rdc"; \
+    else \
+        echo "Warning: cpp_extension.py not found"; \
+    fi
+ENV LD_LIBRARY_PATH=/opt/mpich/install/lib/:$LD_LIBRARY_PATH
+RUN echo "✅ LD_LIBRARY_PATH is set to $LD_LIBRARY_PATH"
+RUN cd deepEP_private \
+    && echo "=== Environment ===" \
+    && env | grep -E "(CC|CXX|LD|ROCM|HIP)" \
+    && echo "=== Compiler versions ===" \
+    && gcc --version \
+    && clang --version \
+    && echo "=== Starting build ===" \
+    && rm -rf build/ \
+    && AITER_MOE=1 ROCM_HOME=/opt/rocm-6.4.3/ OMPI_DIR=/opt/mpich/install ROCSHMEM_DIR=/opt/nvshmem-main/nvshmem_src_rocm_wip/build/src/ python3 setup.py --variance rocm build develop --force-nvshmem-api 2>&1 \
+    && echo "✅ Successfully built and installed DeepEP"
+
+ARG AITER_BRANCH
+# reinstall aiter
+RUN cd aiter \
+    && git fetch origin ${AITER_BRANCH} \
+    && git reset --hard \
+    && git checkout ${AITER_BRANCH} \
+    && python3 -m pip uninstall -y aiter \
+    && python3 setup.py develop \
+    && echo "✅ Successfully reinstalled Aiter"
+
+ARG VLLM_BRANCH
+# reinstall vllm
+RUN cd vllm \
+    && git fetch origin ${VLLM_BRANCH} \
+    && git reset --hard \
+    && git checkout ${VLLM_BRANCH} \
+    && python3 -m pip uninstall -y vllm \
+    && python3 setup.py develop \
+    && echo "✅ Successfully reinstalled VLLM"
+
+ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
+ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
+ENV TOKENIZERS_PARALLELISM=false
+
+# ENV that can improve safe tensor loading, and end-to-end time
+ENV SAFETENSORS_FAST_GPU=1
+
+# Performance environment variable.
+ENV HIP_FORCE_DEV_KERNARG=1
+
+# Enable Aiter. Make sure this only exists on the aiter branch.
+# ENV VLLM_ROCM_USE_AITER=1
+
+CMD ["/bin/bash"]
