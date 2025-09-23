@@ -1,3 +1,0 @@
-[submodule "docker/docker/deepep_required/deepEP_private"]
-	path = docker/docker/deepep_required/deepEP_private
-	url = git@github.com:ROCm/deepEP_private.git
