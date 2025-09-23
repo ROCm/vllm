@@ -18,71 +18,91 @@ try:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 
     from vllm.utils import direct_register_custom_op
     if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
         from aiter import gemm_a4w4, per_1x32_f4_quant_hip
 
     def gemm_with_dynamic_quant(
+        result: torch.Tensor,
         x: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         x_scales: torch.Tensor = None,
-        out_dtype: Optional[torch.dtype] = torch.bfloat16,
-    ) -> torch.Tensor:
-        M = x.shape[0]
+        out_dtype: Optional[torch.dtype] = torch.bfloat16
+    ) -> None:
         if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
+            M = x.shape[0]
             if x_scales is None:
                 # use hip quant kernel for performance
                 x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
             else:
                 x_q = x
                 x_s = x_scales
-
             # 32 alignment is enough for dim0 padding of output for
             # gemm_a4w4 kernel
             y = torch.empty((M + 31) // 32 * 32,
                             weight.shape[0],
                             device=x_q.device,
                             dtype=out_dtype)
-
             gemm_a4w4(x_q,
                       weight,
                       x_s,
                       weight_scale.view(x_s.dtype),
                       y,
                       bpreshuffle=True)
-            return y[:M]
+            result.copy_(y[:M])
         else:
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant(x)
             else:
                 x_q = x
                 x_s = x_scales
-            y = torch.empty(x_q.shape[0],
-                            weight.shape[0],
-                            device=x_q.device,
-                            dtype=out_dtype)
-
-            gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
-            return y
+            gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, result)
 
     def gemm_with_dynamic_quant_fake(
+        result: torch.Tensor,
         x: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         x_scales: torch.Tensor = None,
-        out_dtype: Optional[torch.dtype] = torch.bfloat16,
-    ) -> torch.Tensor:
-        return torch.empty((*x.shape[:-1], weight.shape[0]),
-                           dtype=out_dtype,
-                           device=x.device)
+        out_dtype: Optional[torch.dtype] = torch.bfloat16
+    ) -> None:
+        return
 
     direct_register_custom_op(
         op_name="gemm_with_dynamic_quant",
         op_func=gemm_with_dynamic_quant,
-        mutates_args=[],
+        mutates_args=['result'],
         fake_impl=gemm_with_dynamic_quant_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
+    def silu_and_mul_mxfp4_gemm(
+        result: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: Optional[torch.dtype] = torch.bfloat16
+    ) -> None:
+        x_fp4, blockscale_e8m0 = act_mul_and_mxfp4_quant(x, 'silu')
+        gemm_with_dynamic_quant(result, x_fp4, weight, weight_scale, blockscale_e8m0, out_dtype)
+
+    def silu_and_mul_mxfp4_gemm_fake(
+        result: torch.Tensor,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        out_dtype: Optional[torch.dtype] = torch.bfloat16
+    ) -> None:
+        return
+
+    direct_register_custom_op(
+        op_name="silu_and_mul_mxfp4_gemm",
+        op_func=silu_and_mul_mxfp4_gemm,
+        mutates_args=['result'],
+        fake_impl=silu_and_mul_mxfp4_gemm_fake,
         dispatch_key=current_platform.dispatch_key,
     )
 
@@ -225,5 +245,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
             return F.linear(x, dq_w, bias)
         else:
-            return torch.ops.vllm.gemm_with_dynamic_quant(
-                x, layer.weight, layer.weight_scale, x_quant_scales, self.out_dtype)
+            result = torch.empty((*x.shape[:-1], layer.weight.shape[0]), dtype=self.out_dtype, device=x.device)
+            torch.ops.vllm.gemm_with_dynamic_quant(
+                result, x, layer.weight, layer.weight_scale, x_quant_scales, self.out_dtype)
+            return result
