@@ -187,87 +187,6 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
             layer.w13_input_scale = None
             layer.w2_input_scale = None
 
-    def _maybe_pad_rocm_aiter_per_token_fused_moe_weights(
-            self,
-            w2_weight,
-            w2_weight_scale,
-            w13_weight,
-            w13_weight_scale):
-        """
-        Pads the MoE weights and scales to align with block quantization 
-        requirements.
-        
-        aiter.fmoe_fp8_blockscale_g1u1 only support out dtype = bf16, 
-        inter_dim % 256 = 0 and fc_scale_blkn and fc_scale_blkk is 128
-        """
-
-        if (not self.rocm_aiter_moe_enabled):
-            return (w2_weight, w2_weight_scale, w13_weight,
-                    w13_weight_scale)
-
-        logger.info_once(
-            "ROCm AITER Padding MoE weights and scales for per-token-per-channel quantization."
-        )
-        block_n: int = 64
-        if w13_weight.dtype in [torch.float8_e4m3fn, torch.float8_e4m3fnuz]:
-            block_n = 128
-
-        num_experts, hidden_size, inter_dim = w2_weight.shape
-        padded_inter_dim = ((inter_dim + block_n - 1) // block_n) * block_n
-
-        # k_block_scale is also known as hidden_size_block
-        # Pad w2_weight to
-        #   [num_experts, hidden_size, inter_dim]
-        # Padding Logic:
-        #   [expert(local_expert:EP), hidden_size, inter_dim]
-        # after padding inter_dim with 0.0 to multiple of 256
-        #   [expert(local_expert:EP), hidden_size, padded_inter_dim]
-        if padded_inter_dim > inter_dim:
-            pad_size = padded_inter_dim - inter_dim
-            w2_weight = F.pad(w2_weight, (0, pad_size), value=0.0)
-
-        # Pad w13_weight to
-        #   [num_experts, 2 * inter_dim, hidden_size]
-        # Padding Logic:
-        #   ​[expert(local_expert:EP), inter_dim*2, dim]
-        # after reshape
-        #   [expert(local_expert:EP), 2, inter_dim, dim]
-        # after right padding
-        #   [expert(local_expert:EP), 2, padded_inter_dim, dim]
-        # after reshape
-        #   [expert(local_expert:EP), 2 * padded_inter_dim, dim]
-        w13_weight = w13_weight.view(num_experts, 2, inter_dim, hidden_size)
-        if padded_inter_dim > inter_dim:
-            pad_size = padded_inter_dim - inter_dim
-            w13_weight = F.pad(w13_weight, (0, 0, 0, pad_size), value=0.0)
-        w13_weight = w13_weight.view(num_experts, 2 * padded_inter_dim,
-                                     hidden_size)
-
-        # Pad w13_weight_scale_inv to
-        #   [num_experts, 2 * inter_dim_block_scale, 1]
-        # Padding Logic:
-        #   k_block_scale = ((hidden_size + 1 - 1) // 1)
-        #   ​[expert(local_expert:EP), inter_dim_block_scale*2, 1] # noqa: E501
-        # after reshape
-        #   [expert(local_expert:EP), 2, inter_dim_block_scale, 1] # noqa: E501
-        # after right padding with 1.0
-        #   [expert(local_expert:EP), 2, padded_inter_dim_block_scale, 1] # noqa: E501
-        # after reshape
-        #   [expert(local_expert:EP), 2 * padded_inter_dim_block_scale, 1] # noqa: E501
-        k_block_scale = w13_weight_scale.shape[
-            2]  # k_block_scale = (hidden_size + 1 - 1) // 1
-        w13_weight_scale = w13_weight_scale.view(
-            num_experts, 2, inter_dim, k_block_scale)
-        if padded_inter_dim > inter_dim:
-            pad_size = padded_inter_dim - inter_dim
-            w13_weight_scale = F.pad(w13_weight_scale,
-                                         (0, 0, 0, pad_size),
-                                         value=1.0)
-        w13_weight_scale = w13_weight_scale.view(
-            num_experts, 2 * padded_inter_dim, k_block_scale)
-
-        return w2_weight, w2_weight_scale, w13_weight, w13_weight_scale
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
@@ -343,22 +262,6 @@ class QuarkW8A8Fp8MoEMethod(QuarkMoEMethod):
                 layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale,
                                                            requires_grad=False)
 
-                if self.rocm_aiter_moe_enabled:
-                    (w2_weight, w2_weight_scale_inv, w13_weight, w13_weight_scale_inv
-                    ) = self._maybe_pad_rocm_aiter_per_token_fused_moe_weights(
-                        w2_weight,
-                        w2_weight_scale,
-                        w13_weight,
-                        w13_weight_scale,
-                    )
-
-                    # torch.compile() cannot use Parameter subclasses.
-                    layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-                    layer.w13_weight_scale = torch.nn.Parameter(w13_weight_scale_inv,
-                                                        requires_grad=False)
-                    layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-                    layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale_inv,
-                                                        requires_grad=False)
         # Property to determine if AITER is used
         if self.rocm_aiter_moe_enabled:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa E501
