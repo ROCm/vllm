@@ -735,10 +735,7 @@ class FusionPass(VllmInductorPass):
     def __call__(self, graph: fx.Graph):
         self.begin()
         self.dump_graph(graph, "before_fusion")
-        if torch.cuda.current_device() == 0:
-            graph.print_tabular()
         count = self.patterns.apply(graph)
-        print(f"Applied {count} fusion patterns")
         logger.debug("Replaced %s patterns", count)
         self.dump_graph(graph, "after_pattern_match")
 
@@ -746,7 +743,5 @@ class FusionPass(VllmInductorPass):
         self.process_matches(graph)
         logger.debug("Post-processed %s matches", len(self.matches))
         self.dump_graph(graph, "after_fusion")
-        if torch.cuda.current_device() == 0:
-            graph.print_tabular()
         self.matches.clear()
         self.end_and_log()
