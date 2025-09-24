@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionLayer
 from vllm.attention.ops.rocm_aiter_mla import aiter_mla_decode_fwd
 from vllm.config import VllmConfig
+from vllm.platforms import current_platform
 from vllm.utils import cdiv
 # yapf conflicts with isort for this docstring
 # yapf: disable
@@ -27,6 +28,31 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 def is_aiter_mla_enabled() -> bool:
     return envs.VLLM_ROCM_USE_AITER \
         and envs.VLLM_ROCM_USE_AITER_MLA
+
+
+def is_rocm_aiter_fp8bmm_enabled() -> bool:
+    return current_platform.is_rocm() \
+        and envs.VLLM_ROCM_USE_AITER_FP8BMM \
+        and envs.VLLM_ROCM_USE_AITER
+
+
+if is_rocm_aiter_fp8bmm_enabled():
+    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
+        as aiter_triton_fp8_bmm)
+    from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
+
+    def dynamic_per_batched_tensor_quant(
+            x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
+        B, M, N = x.shape
+        x = x.contiguous().view(B * M, N)
+        x_quant = torch.empty((B * M, N), dtype=dtype, device=x.device)
+        x_quant_scale = torch.empty((1, ),
+                                    dtype=torch.float32,
+                                    device=x.device)
+        dynamic_per_tensor_quant_fp8_i8(x_quant, x, x_quant_scale)
+        x_quant = x_quant.view(B, M, N)
+        return x_quant, x_quant_scale
 
 
 class AiterMLABackend(MLACommonBackend):
@@ -198,6 +224,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             raise NotImplementedError(
                 "Aiter MLA does not support one of the following: "
                 "alibi_slopes, sliding_window, logits_soft_cap")
+        self.fp8_dtype = current_platform.fp8_dtype()
 
         from aiter import flash_attn_varlen_func
         self.flash_attn_varlen_func = flash_attn_varlen_func
@@ -219,6 +246,59 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         )
 
         return output
+
+    def _v_up_proj(self, x, out):
+        if not is_rocm_aiter_fp8bmm_enabled():
+            return super()._v_up_proj(x, out)
+        x = x.view(-1, self.num_heads, self.kv_lora_rank)
+        out = out.view(-1, self.num_heads, self.v_head_dim)
+        out = aiter_triton_fp8_bmm(x,
+                                   self.W_V,
+                                   self.W_V_scale,
+                                   group_size=128,
+                                   YQ=out,
+                                   transpose_bm=True,
+                                   transpose_bm_in=True)
+        x = out.view(-1, self.num_heads * self.v_head_dim)
+        return x
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype):
+
+        # we currently do not have quantized bmm's which are needed for
+        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
+        # the bmm's in 16-bit, the extra memory overhead of this is fairly low
+        kv_b_proj_weight = self.get_and_maybe_dequant_weights(
+            self.kv_b_proj, act_dtype).T
+        assert kv_b_proj_weight.shape == (
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim)), (
+                f"{kv_b_proj_weight.shape=}, "
+                f"{self.kv_lora_rank=}, "
+                f"{self.num_heads=}, "
+                f"{self.qk_nope_head_dim=}, "
+                f"{self.v_head_dim=}")
+        kv_b_proj_weight = kv_b_proj_weight.view(
+            self.kv_lora_rank,
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+        )
+
+        W_UK, W_UV = kv_b_proj_weight.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        self.W_UK_T = W_UK.permute(1, 2, 0)
+        if is_rocm_aiter_fp8bmm_enabled():
+            W_K = W_UK.transpose(0, 1)
+            W_V = W_UV.permute(1, 2, 0)
+            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
+                W_K, dtype=self.fp8_dtype)
+            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
+                W_V, dtype=self.fp8_dtype)
+        else:
+            # Convert from (L, N, V) to (N, L, V)
+            self.W_UV = W_UV.transpose(0, 1)
+            # Convert from (L, N, P) to (N, P, L)
+            self.W_UK_T = W_UK.permute(1, 2, 0)
 
     def _forward_decode(
         self,
@@ -253,3 +333,17 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                              attn_metadata.decode.paged_kv_last_page_len)
 
         return o, None
+
+    def forward(self,
+                layer,
+                q,
+                k_c_normed,
+                k_pe,
+                kv_cache,
+                attn_metadata,
+                output=None,
+                output_scale=None,
+                output_block_scale=None):
+        return super().forward(layer, q, k_c_normed, k_pe, kv_cache,
+                               attn_metadata, output, output_scale,
+                               output_block_scale)
