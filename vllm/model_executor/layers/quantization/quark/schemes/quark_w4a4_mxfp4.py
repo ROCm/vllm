@@ -15,10 +15,12 @@ from vllm.model_executor.parameter import (GroupQuantScaleParameter,
 from vllm.platforms import current_platform
 
 try:
+    import triton
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
     from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+    from aiter.ops.triton.fused_mxfp4_quant import _fused_rms_mxfp4_quant_kernel
 
     from vllm.utils import direct_register_custom_op
     if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
@@ -103,6 +105,69 @@ try:
         op_func=silu_and_mul_mxfp4_gemm,
         mutates_args=['result'],
         fake_impl=silu_and_mul_mxfp4_gemm_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
+    def add_rmsnorm_mxfp4_gemm(
+        result: torch.Tensor, input: torch.Tensor, residual_out: torch.Tensor,
+        residual: torch.Tensor, weight_rms: torch.Tensor, 
+        weight_gemm: torch.Tensor, scale: torch.Tensor, epsilon: float,
+        out_dtype: Optional[torch.dtype] = torch.bfloat16
+    ) -> None:
+        MXFP4_QUANT_BLOCK_SIZE = 32
+        M, N1 = input.shape
+        BLOCK_SIZE = max(triton.next_power_of_2(N1), MXFP4_QUANT_BLOCK_SIZE)
+        BLOCK_SIZE = max(BLOCK_SIZE, MXFP4_QUANT_BLOCK_SIZE)
+        res_row_stride = residual.stride(0)
+        out_res_row_stride = residual_out.stride(0)
+        rms_out_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=input.device)
+        rms_out_bs = torch.empty(
+            ((N1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE, M),
+            dtype=torch.uint8,
+            device=input.device,
+        ).T
+        _fused_rms_mxfp4_quant_kernel[(M,)](
+            input,
+            weight_rms,
+            None,
+            None,
+            residual,
+            rms_out_fp4,
+            rms_out_bs,
+            None,
+            residual_out,
+            epsilon,
+            0.0,
+            M,
+            N1,
+            0,
+            input.stride(0),
+            0,
+            res_row_stride,
+            rms_out_fp4.stride(0),
+            *rms_out_bs.stride(),
+            0,
+            out_res_row_stride,
+            BLOCK_SIZE=BLOCK_SIZE,
+            MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+            SKIP_SECOND_INPUT=True,
+            FIRST_INPUT_RES=True,
+        )
+        gemm_with_dynamic_quant(result, rms_out_fp4, weight_gemm, scale, rms_out_bs, out_dtype)
+    
+    def add_rmsnorm_mxfp4_gemm_fake(
+        result: torch.Tensor, input: torch.Tensor, residual_out: torch.Tensor,
+        residual: torch.Tensor, weight_rms: torch.Tensor, 
+        weight_gemm: torch.Tensor, scale: torch.Tensor, epsilon: float,
+        out_dtype: Optional[torch.dtype] = torch.bfloat16
+    ) -> None:
+        return
+    
+    direct_register_custom_op(
+        op_name="add_rmsnorm_mxfp4_gemm",
+        op_func=add_rmsnorm_mxfp4_gemm,
+        mutates_args=['result', 'residual_out'],
+        fake_impl=add_rmsnorm_mxfp4_gemm_fake,
         dispatch_key=current_platform.dispatch_key,
     )
 
