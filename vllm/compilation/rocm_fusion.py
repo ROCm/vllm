@@ -235,18 +235,16 @@ class ROCmFusionPass(VllmInductorPass):
                    for node in match.match.nodes)
 
     def __call__(self, graph: torch.fx.Graph):
-        logger.info(graph)
-
         self.begin()
         self.dump_graph(graph, "before_rocm_fusion")
 
         count = self.patterns.apply(graph)
-        logger.info("Replaced %s patterns", count)
+        logger.debug("Replaced %s patterns", count)
         self.dump_graph(graph, "after_pattern_match")
 
         # Manually process multi-output matches (and run DCE)
         self.process_matches(graph)
-        logger.info("Post-processed %s matches", len(self.matches))
+        logger.debug("Post-processed %s matches", len(self.matches))
         self.dump_graph(graph, "after_rocm_fusion")
         self.matches.clear()
         self.end_and_log()
