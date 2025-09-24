@@ -185,6 +185,18 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         if envs.VLLM_MLA_FP8_PADDING:
             batch_size = qo_indptr.shape[0] - 1
             qo_indptr = torch.arange(0, (batch_size + 1) * 2, 2, dtype=qo_indptr.dtype, device=qo_indptr.device)
+        # max_seqlen_qo should be set according to the MTP. For example, MTP1 corresponds to max_seqlen_qo=2.
+        if self.runner.speculative_config is not None and self.runner.speculative_config.num_speculative_tokens is not None:
+            max_seqlen_qo = self.runner.speculative_config.num_speculative_tokens + 1
+        else:
+            max_seqlen_qo = 1
+        page_size = self.runner.block_size
+        split_params = {
+            "kv_granularity": max(page_size, 16),
+            "max_seqlen_qo": max_seqlen_qo,
+            "uni_seqlen_qo": max_seqlen_qo,
+            "fast_mode": 1,
+        }
         aiter.get_mla_metadata_v1(
             qo_indptr,
             paged_kv_indptr,
@@ -197,6 +209,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             reduce_indptr,
             reduce_final_map,
             reduce_partial_map,
+            split_params=split_params
         )
 
         attn_metadata = AiterMLADecodeMetadata(
