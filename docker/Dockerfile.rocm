@@ -101,7 +101,7 @@ RUN cd /vllm-workspace \
 # -----------------------
 # Final vLLM image
 FROM base AS final
-ENV FLATMM_HIP_CLANG_PATH=/app/git/llvm-projects/build/bin/
+ENV FLATMM_HIP_CLANG_PATH=/app/git/llvm-project/build/bin/
 RUN mkdir -p /app/git && cd /app/git && git clone -b DivergentAlign https://github.com/jrbyrnes/llvm-project.git \
     && cd llvm-project \
     && mkdir build && cd build \
