@@ -1,5 +1,6 @@
-ARG BASE_IMAGE=registry-sc-harbor.amd.com/framework/compute-rocm-dkms-component-baas-rel:25_ubuntu22.04_py3.10_pytorch_rocm7.1_internal_testing_0ea0592f
-# ARG HIPBLASLT_BRANCH="aa0bda7b"
+ARG BASE_IMAGE=rocm/pytorch-private:vllm_48_rocm7.0_aiter_0918_1380dc
+ARG HIPBLASLT_BRANCH="9176baa4996408fd323ed7c1a1492a09997e8d05"
+ARG HIPBLASLT_REPO="https://github.com/ROCm/rocm-libraries.git"
 # ARG HIPBLAS_COMMON_BRANCH="9b80ba8e"
 # ARG LEGACY_HIPBLASLT_OPTION=
 ARG TRITON_BRANCH="pytorch/rocm7.1_internal_testing"
@@ -43,10 +44,41 @@ RUN apt-get update -y \
     && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
     && python3 --version && python3 -m pip --version
-
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
 
-# FROM base AS build_hipblaslt
+ARG HIPBLASLT_BRANCH
+ARG HIPBLASLT_REPO
+FROM base AS build_hipblaslt
+RUN git clone ${HIPBLASLT_REPO}
+RUN cd rocm-libraries/projects/hipblaslt                                                              \
+&& git checkout ${HIPBLASLT_BRANCH}                                                                  \
+&& pip install -r tensilelite/requirements.txt                                                       \
+&& ./install.sh -cd -a gfx1101                                                                       \
+&& BASE_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f1-3)                         \
+&& SO_VERSION=$(echo "${BASE_VERSION}" | cut -d. -f1,2)                                              \
+&& ROCM_LIBPATCH_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f4 | cut -d- -f1)    \
+&& DEBIAN_REVISION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*-\([0-9]*\)~.*/\1/')       \
+&& UBUNTU_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*~//')                       \
+&& FC=gfortran CXX=/opt/rocm/bin/amdclang++ CC=/opt/rocm/bin/amdclang                                \
+    cmake -B build -S .                                                                              \
+      -DHIPBLASLT_PROJECT_VERSION="${BASE_VERSION}.${ROCM_LIBPATCH_VERSION}"                         \
+      -DHIPBLASLT_SOVERSION="${SO_VERSION}"                                                          \
+      -DCPACK_DEBIAN_PACKAGE_RELEASE="${DEBIAN_REVISION}~${UBUNTU_VERSION}"                          \
+      -DCMAKE_PREFIX_PATH="/opt/rocm/lib/llvm;/opt/rocm"                                 \
+      -DCMAKE_SHARED_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN'     \
+      -DCMAKE_EXE_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN/../lib' \
+      -DCMAKE_INSTALL_PREFIX="/opt/rocm"                                                      \
+      -DROCM_SYMLINK_LIBS=OFF                                                                        \
+      -DROCM_PATH="/opt/rocm"                                                                  \
+      -DGPU_TARGETS="gfx950;gfx942"                                                                  \
+      -DCMAKE_BUILD_TYPE=Release                                                                     \
+      -DHIPBLASLT_ENABLE_FETCH=ON                                                                    \
+      -DCMAKE_INSTALL_LIBDIR=lib                                                                     \
+      -DBLA_STATIC=ON                                                                                \
+&& cmake --build build --target package --parallel                                                   \
+&& mkdir -p /app/install && cp build/*.deb /app/install
+
+
 # ARG HIPBLASLT_BRANCH
 # ARG HIPBLAS_COMMON_BRANCH
 # # Set to "--legacy_hipblas_direct" for ROCm<=6.2
@@ -75,6 +107,8 @@ ARG TRITON_REPO
 RUN git clone ${TRITON_REPO}
 RUN cd triton \
     && git checkout ${TRITON_BRANCH} \
+    && if [ ! -f setup.py ]; then cd python; fi \
+    && python3 setup.py bdist_wheel --dist-dir=dist \
     && mkdir -p /app/install
 RUN if [ -d triton/python/triton_kernels ]; then \
     pip install build \
@@ -129,10 +163,10 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
 FROM base AS debs
 RUN mkdir /app/debs
-# RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-#     cp /install/*.deb /app/debs
+RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
+    cp /install/*.deb /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
-   cp /install/*.whl /app/debs
+    cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
@@ -141,10 +175,11 @@ RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
 
 FROM base AS final
-# RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-#     dpkg -i /install/*deb \
-#     && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
-#     && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status
+RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
+    dpkg --remove --force-depends hipblaslt hipblaslt-dev                                             \
+    && dpkg -i --force-depends /install/*.deb \ 
+    && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
+    && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status
 # RUN --mount=type=bind,from=build_rccl,src=/app/install/,target=/install \
 #     dpkg -i /install/*deb \
 #     && sed -i 's/, rccl-dev \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status \
@@ -175,9 +210,9 @@ ARG FA_REPO
 ARG AITER_BRANCH
 ARG AITER_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
-    # && echo "HIPBLAS_COMMON_BRANCH: ${HIPBLAS_COMMON_BRANCH}" >> /app/versions.txt \
-    # && echo "HIPBLASLT_BRANCH: ${HIPBLASLT_BRANCH}" >> /app/versions.txt \
-    # && echo "LEGACY_HIPBLASLT_OPTION: ${LEGACY_HIPBLASLT_OPTION}" >> /app/versions.txt \
+    && echo "HIPBLAS_COMMON_BRANCH: ${HIPBLAS_COMMON_BRANCH}" >> /app/versions.txt \
+    && echo "HIPBLASLT_BRANCH: ${HIPBLASLT_BRANCH}" >> /app/versions.txt \
+    && echo "LEGACY_HIPBLASLT_OPTION: ${LEGACY_HIPBLASLT_OPTION}" >> /app/versions.txt \
     && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /app/versions.txt \
     && echo "TRITON_REPO: ${TRITON_REPO}" >> /app/versions.txt \
     && echo "PYTORCH_BRANCH: ${PYTORCH_BRANCH}" >> /app/versions.txt \
