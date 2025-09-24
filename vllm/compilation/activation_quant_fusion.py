@@ -108,11 +108,11 @@ class ActivationQuantFusionPass(VllmInductorPass):
                              self.patterns)
         
         inputs = [
-            empty_bf16(5, 4),  # result
-            empty_bf16(5, 4),  # result_silu_mul
-            empty_bf16(5, 4),  # input
-            empty_fp4(4, 8),  # weight
-            empty_fp4(1, 1), # scale
+            empty_bf16(32, 32),  # result
+            empty_bf16(32, 32),  # result_silu_mul
+            empty_bf16(32, 32),  # input
+            empty_fp4(32, 32),  # weight
+            empty_fp4(32, 1), # scale
         ]
         register_replacement(silu_mul_mxfp4_gemm_pattern,
                              silu_mul_mxfp4_gemm_replacement, inputs, fwd_only,
