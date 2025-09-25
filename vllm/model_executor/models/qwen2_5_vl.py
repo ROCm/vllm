@@ -70,7 +70,6 @@ from .interfaces import (MultiModalEmbeddings, SupportsLoRA,
                          SupportsMultiModal, SupportsPP, SupportsQuant)
 from .qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
 from .qwen2_vl import (Qwen2VLMultiModalProcessor, Qwen2VLProcessingInfo,
-                       apply_rotary_pos_emb_vision,
                        apply_rotary_pos_emb_vision_2c)
 from .utils import (AutoWeightsLoader, WeightsMapper, cast_overflow_tensors,
                     init_vllm_registered_model, maybe_prefix,
@@ -354,8 +353,6 @@ class Qwen2_5_VisionAttention(nn.Module):
         q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
                    for x in (q, k, v))
         if rotary_pos_emb is not None:
-            # q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
-            # k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
             q, k = apply_rotary_pos_emb_vision_2c(q, k, rotary_pos_emb)
 
         if self.is_flash_attn_backend:
