@@ -42,7 +42,7 @@ class QuantMultiOutputMatch(MultiOutputMatch):
 
     def __init__(self, match: Match, quant_op, fused_op):
         super().__init__(match)
-        # assert isinstance(quant_op, OpOverload)
+        assert isinstance(quant_op, OpOverload)
         assert isinstance(fused_op, OpOverload)
         self.QUANT_OP = quant_op  # in-place quant op
         self.FUSED_OP = fused_op  # in-place fused quant op
@@ -146,14 +146,14 @@ class AddRMSNormMXFP4GemmPattern:
             return at[1], at[2]
 
         inputs = [
-            empty_bf16(32, 32),  # result
-            empty_bf16(32, 32),  # result_rms
-            empty_bf16(32, 32),  # input
-            empty_bf16(32, 32),  # residual_out
-            empty_bf16(32, 32),  # residual
+            empty_bf16(32, 4),  # result
+            empty_bf16(32, 4),  # result_rms
+            empty_bf16(32, 4),  # input
+            empty_bf16(32, 4),  # residual_out
+            empty_bf16(32, 4),  # residual
             empty_bf16(1, 32),   # weight_rms
-            empty_fp4(32, 32),   # weight_gemm
-            empty_fp4(32, 1),    # scale
+            empty_fp4(32, 4),   # weight_gemm
+            empty_fp4(1, 1),    # scale
         ]
 
         register_replacement(
@@ -214,6 +214,10 @@ class ROCmFusionPass(VllmInductorPass):
         for epsilon in [1e-5, 1e-6]:
             AddRMSNormMXFP4GemmPattern(epsilon).register(
                 self.patterns, self.record_match)
+            
+            # WARNING: This is a hack to clear the pattern matcher cache
+            # and allow multiple values of epsilon.
+            torch._inductor.pattern_matcher._seen_patterns.clear()
     
     def record_match(self, match: MultiOutputMatch) -> bool:
         # Hijack the extra_check to record the match and
