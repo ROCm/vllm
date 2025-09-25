@@ -1,7 +1,7 @@
 ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:7.0-complete
 ARG HIPBLASLT_REPO="https://github.com/ROCm/rocm-libraries.git"
 ARG HIPBLASLT_COMMIT="9176baa4"
-ARG TRITON_BRANCH="56765e8c"
+ARG TRITON_BRANCH="57c693b6"
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG PYTORCH_BRANCH="1c57644d"
 ARG PYTORCH_VISION_BRANCH="v0.23.0"
