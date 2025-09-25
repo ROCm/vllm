@@ -3,7 +3,7 @@ ARG HIPBLASLT_BRANCH="9176baa4996408fd323ed7c1a1492a09997e8d05"
 ARG HIPBLASLT_REPO="https://github.com/ROCm/rocm-libraries.git"
 # ARG HIPBLAS_COMMON_BRANCH="9b80ba8e"
 # ARG LEGACY_HIPBLASLT_OPTION=
-ARG TRITON_BRANCH="pytorch/rocm7.1_internal_testing"
+ARG TRITON_BRANCH="57c693b627fe058878ade4163a0a8df95d9fefa1"
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG PYTORCH_BRANCH="triton_kernel_wrap_fix"
 ARG PYTORCH_VISION_BRANCH="5dc9e7de"
@@ -46,37 +46,37 @@ RUN apt-get update -y \
     && python3 --version && python3 -m pip --version
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
 
-ARG HIPBLASLT_BRANCH
-ARG HIPBLASLT_REPO
-FROM base AS build_hipblaslt
-RUN git clone ${HIPBLASLT_REPO}
-RUN cd rocm-libraries/projects/hipblaslt                                                              \
-&& git checkout ${HIPBLASLT_BRANCH}                                                                  \
-&& pip install -r tensilelite/requirements.txt                                                       \
-&& ./install.sh -cd -a gfx1101                                                                       \
-&& BASE_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f1-3)                         \
-&& SO_VERSION=$(echo "${BASE_VERSION}" | cut -d. -f1,2)                                              \
-&& ROCM_LIBPATCH_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f4 | cut -d- -f1)    \
-&& DEBIAN_REVISION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*-\([0-9]*\)~.*/\1/')       \
-&& UBUNTU_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*~//')                       \
-&& FC=gfortran CXX=/opt/rocm/bin/amdclang++ CC=/opt/rocm/bin/amdclang                                \
-    cmake -B build -S .                                                                              \
-      -DHIPBLASLT_PROJECT_VERSION="${BASE_VERSION}.${ROCM_LIBPATCH_VERSION}"                         \
-      -DHIPBLASLT_SOVERSION="${SO_VERSION}"                                                          \
-      -DCPACK_DEBIAN_PACKAGE_RELEASE="${DEBIAN_REVISION}~${UBUNTU_VERSION}"                          \
-      -DCMAKE_PREFIX_PATH="/opt/rocm/lib/llvm;/opt/rocm"                                 \
-      -DCMAKE_SHARED_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN'     \
-      -DCMAKE_EXE_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN/../lib' \
-      -DCMAKE_INSTALL_PREFIX="/opt/rocm"                                                      \
-      -DROCM_SYMLINK_LIBS=OFF                                                                        \
-      -DROCM_PATH="/opt/rocm"                                                                  \
-      -DGPU_TARGETS="gfx950;gfx942"                                                                  \
-      -DCMAKE_BUILD_TYPE=Release                                                                     \
-      -DHIPBLASLT_ENABLE_FETCH=ON                                                                    \
-      -DCMAKE_INSTALL_LIBDIR=lib                                                                     \
-      -DBLA_STATIC=ON                                                                                \
-&& cmake --build build --target package --parallel                                                   \
-&& mkdir -p /app/install && cp build/*.deb /app/install
+# ARG HIPBLASLT_BRANCH
+# ARG HIPBLASLT_REPO
+# FROM base AS build_hipblaslt
+# RUN git clone ${HIPBLASLT_REPO}
+# RUN cd rocm-libraries/projects/hipblaslt                                                              \
+# && git checkout ${HIPBLASLT_BRANCH}                                                                  \
+# && pip install -r tensilelite/requirements.txt                                                       \
+# && ./install.sh -cd -a gfx1101                                                                       \
+# && BASE_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f1-3)                         \
+# && SO_VERSION=$(echo "${BASE_VERSION}" | cut -d. -f1,2)                                              \
+# && ROCM_LIBPATCH_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f4 | cut -d- -f1)    \
+# && DEBIAN_REVISION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*-\([0-9]*\)~.*/\1/')       \
+# && UBUNTU_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*~//')                       \
+# && FC=gfortran CXX=/opt/rocm/bin/amdclang++ CC=/opt/rocm/bin/amdclang                                \
+#     cmake -B build -S .                                                                              \
+#       -DHIPBLASLT_PROJECT_VERSION="${BASE_VERSION}.${ROCM_LIBPATCH_VERSION}"                         \
+#       -DHIPBLASLT_SOVERSION="${SO_VERSION}"                                                          \
+#       -DCPACK_DEBIAN_PACKAGE_RELEASE="${DEBIAN_REVISION}~${UBUNTU_VERSION}"                          \
+#       -DCMAKE_PREFIX_PATH="/opt/rocm/lib/llvm;/opt/rocm"                                 \
+#       -DCMAKE_SHARED_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN'     \
+#       -DCMAKE_EXE_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN/../lib' \
+#       -DCMAKE_INSTALL_PREFIX="/opt/rocm"                                                      \
+#       -DROCM_SYMLINK_LIBS=OFF                                                                        \
+#       -DROCM_PATH="/opt/rocm"                                                                  \
+#       -DGPU_TARGETS="gfx950;gfx942"                                                                  \
+#       -DCMAKE_BUILD_TYPE=Release                                                                     \
+#       -DHIPBLASLT_ENABLE_FETCH=ON                                                                    \
+#       -DCMAKE_INSTALL_LIBDIR=lib                                                                     \
+#       -DBLA_STATIC=ON                                                                                \
+# && cmake --build build --target package --parallel                                                   \
+# && mkdir -p /app/install && cp build/*.deb /app/install
 
 
 # ARG HIPBLASLT_BRANCH
@@ -146,7 +146,7 @@ RUN mkdir -p /app/install \
    # && cp /app/pytorch/dist/*.whl /app/install \
    # && cp /app/vision/dist/*.whl /app/install \
     && cp /app/flash-attention/dist/*.whl /app/install
-RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
+# RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
 # FROM base AS build_aiter
 # ARG AITER_BRANCH
@@ -163,35 +163,36 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
 FROM base AS debs
 RUN mkdir /app/debs
-RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-    cp /install/*.deb /app/debs
+# RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
+#     cp /install/*.deb /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+#     cp /install/*.whl /app/debs
 # RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
 
 FROM base AS final
-RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-    dpkg --remove --force-depends hipblaslt hipblaslt-dev                                             \
-    && dpkg -i --force-depends /install/*.deb \ 
-    && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
-    && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status
+# RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
+#     dpkg --remove --force-depends hipblaslt hipblaslt-dev                                             \
+#     && dpkg -i --force-depends /install/*.deb \ 
+#     && sed -i 's/, hipblaslt-dev \(.*\), hipcub-dev/, hipcub-dev/g' /var/lib/dpkg/status \
+#     && sed -i 's/, hipblaslt \(.*\), hipfft/, hipfft/g' /var/lib/dpkg/status
 # RUN --mount=type=bind,from=build_rccl,src=/app/install/,target=/install \
 #     dpkg -i /install/*deb \
 #     && sed -i 's/, rccl-dev \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status \
 #     && sed -i 's/, rccl \(.*\), rocalution/, rocalution/g' /var/lib/dpkg/status
 RUN echo "Entering Base as final"
-RUN echo "Uninstalling triton " && pip uninstall -y triton_kernels
+# RUN echo "triggering uncache"
+RUN echo "Uninstalling triton " && pip uninstall -y triton triton_kernels
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     pip install /install/*.whl
-RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-    pip install /install/*.whl
+# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+#     pip install /install/*.whl
 # RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 #     pip install /install/*.whl
 
