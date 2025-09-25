@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
 import hashlib
 import inspect
 import json
 import types
 from contextlib import contextmanager
 from typing import Any, Callable, Optional, Union
+from torch._subclasses.fake_tensor import (FakeTensorMode,
+                                           unset_fake_temporarily)
 
 import torch
 from torch import fx
@@ -114,3 +117,20 @@ class CallableInductorPass(InductorPass):
 
     def uuid(self) -> Any:
         return self._uuid
+
+
+def enable_fake_mode(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Applies a FakeTensorMode context. This is useful when you don't want to
+    create or run things with real tensors.
+    """
+
+    @functools.wraps(fn)
+    def fn_new(*args, **kwargs) -> Any:
+        with torch._guards.tracing(
+                None), unset_fake_temporarily(), FakeTensorMode():
+            result = fn(*args, **kwargs)
+
+        return result
+
+    return fn_new
