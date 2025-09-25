@@ -562,7 +562,7 @@ class CompilationConfig:
                 self.cudagraph_mode = CUDAGraphMode.FULL
             self.splitting_ops = []
 
-        if envs.VLLM_LOG_BATCHSIZE_INTERVAL == "deepep_high_throughput" and "vllm.moe_forward" not in self.splitting_ops:
+        if envs.VLLM_ALL2ALL_BACKEND == "deepep_high_throughput" and "vllm.moe_forward" not in self.splitting_ops:
             self.splitting_ops.append("vllm.moe_forward")
 
     def splitting_ops_contain_attention(self) -> bool:
