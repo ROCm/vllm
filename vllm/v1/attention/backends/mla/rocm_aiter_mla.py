@@ -367,6 +367,16 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if positions is None:
+            return super().forward(layer=layer,
+                                   q=q,
+                                   k_c_normed=k_c_normed,
+                                   k_pe=k_pe,
+                                   kv_cache=kv_cache,
+                                   attn_metadata=attn_metadata,
+                                   output=output,
+                                   output_scale=output_scale,
+                                   output_block_scale=output_block_scale)
         assert output is not None, "Output tensor must be provided."
 
         if output_scale is not None or output_block_scale is not None:
@@ -473,14 +483,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                                                       YQ=decode_ql_nope,
                                                       transpose_bm=True,
                                                       transpose_bm_in=True)
-                self._forward_decode(decode_ql_nope,
-                                     decode_q_pe,
-                                     kv_c_and_k_pe_cache=kv_cache,
-                                     attn_metadata=attn_metadata,
-                                     layer=layer,
-                                     mla_output_zeros=mla_output_zeros,
-                                     decode_q_out=decode_q_out,
-                                     output=output[:num_decode_tokens])
+                return self._forward_decode(decode_ql_nope,
+                                            decode_q_pe,
+                                            kv_c_and_k_pe_cache=kv_cache,
+                                            attn_metadata=attn_metadata,
+                                            layer=layer,
+                                            mla_output_zeros=mla_output_zeros,
+                                            decode_q_out=decode_q_out,
+                                            output=output[:num_decode_tokens])
             # Convert from (B, N, P) to (N, B, P)
             decode_q_nope = decode_q_nope.transpose(0, 1)
 

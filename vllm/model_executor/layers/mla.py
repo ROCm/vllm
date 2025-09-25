@@ -104,6 +104,7 @@ class MultiHeadLatentAttention(CustomOp):
 
         self.prefix = prefix
         self.debug_layer_idx = int(self.prefix.split(".")[-2])
+        self.mla_attn.impl.rotary_emb = self.rotary_emb
 
     def forward_native(
         self,
@@ -159,9 +160,6 @@ class MultiHeadLatentAttention(CustomOp):
 
     def forward_hip(self, positions: torch.Tensor,
                     hidden_states: torch.Tensor):
-        from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAImpl
-        if not isinstance(self.mla_attn.attn_backend, AiterMLAImpl):
-            return self.forward_cuda(positions, hidden_states)
         q_c = None
         kv_lora = None
 
