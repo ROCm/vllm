@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Optional
 
 import torch
+from gguf import Union
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -309,8 +310,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
     def _forward_decode(
         self,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
+        q: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AiterMLAMetadata,
         layer: AttentionLayer,
@@ -320,6 +320,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
     ) -> torch.Tensor:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
+
+        if isinstance(q, tuple):
+            q_nope, q_pe = q
+        else:
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         B = q_nope.shape[0]
 
@@ -483,8 +489,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                                                       YQ=decode_ql_nope,
                                                       transpose_bm=True,
                                                       transpose_bm_in=True)
-                return self._forward_decode(decode_ql_nope,
-                                            decode_q_pe,
+                return self._forward_decode((decode_ql_nope, decode_q_pe),
                                             kv_c_and_k_pe_cache=kv_cache,
                                             attn_metadata=attn_metadata,
                                             layer=layer,
