@@ -1,6 +1,4 @@
 ARG BASE_IMAGE=rocm/dev-ubuntu-22.04:7.0-complete
-ARG HIPBLASLT_REPO="https://github.com/ROCm/rocm-libraries.git"
-ARG HIPBLASLT_COMMIT="9176baa4"
 ARG TRITON_BRANCH="57c693b6"
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG PYTORCH_BRANCH="1c57644d"
@@ -44,43 +42,6 @@ RUN apt-get update -y \
     && python3 --version && python3 -m pip --version
 
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
-
-# Below, we use the install.sh script to install hipblaslt build dependencies but because the script
-# is not designed to only install the deps and also builds hipblaslt we use -a gfx1101 to ensure the
-# build time will be quick because we aren't using the build from the script. The -a option passed to
-# the script does not need to be the same as -DGPU_TARGETS="gfx950;gfx942" which is where the actual
-FROM base AS build_hipblaslt
-ARG HIPBLASLT_REPO
-ARG HIPBLASLT_COMMIT
-RUN git clone ${HIPBLASLT_REPO} && \
-    cd rocm-libraries/projects/hipblaslt && \
-    git checkout ${HIPBLASLT_COMMIT}
-RUN cd rocm-libraries/projects/hipblaslt && \
-    pip install -r tensilelite/requirements.txt \
-    && ./install.sh -cd -a gfx1101 \
-    && BASE_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f1-3)                       \
-    && SO_VERSION=$(echo "${BASE_VERSION}" | cut -d. -f1,2)                                            \
-    && ROCM_LIBPATCH_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | cut -d. -f4 | cut -d- -f1)  \
-    && DEBIAN_REVISION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*-\([0-9]*\)~.*/\1/')     \
-    && UBUNTU_VERSION=$(dpkg-query -W -f='${Version}\n' hipblaslt | sed 's/.*~//')                     \
-    && FC=gfortran CXX=/opt/rocm/bin/amdclang++ CC=/opt/rocm/bin/amdclang                              \
-        cmake -B build -S .                                                                            \
-        -DHIPBLASLT_PROJECT_VERSION="${BASE_VERSION}.${ROCM_LIBPATCH_VERSION}"                         \
-        -DHIPBLASLT_SOVERSION="${SO_VERSION}"                                                          \
-        -DCPACK_DEBIAN_PACKAGE_RELEASE="${DEBIAN_REVISION}~${UBUNTU_VERSION}"                          \
-        -DCMAKE_PREFIX_PATH="/opt/rocm/lib/llvm;/opt/rocm"                                             \
-        -DCMAKE_SHARED_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN'     \
-        -DCMAKE_EXE_LINKER_FLAGS_INIT='-Wl,--enable-new-dtags,--build-id=sha1,--rpath,\$ORIGIN/../lib' \
-        -DCMAKE_INSTALL_PREFIX="/opt/rocm "                                                            \
-        -DROCM_SYMLINK_LIBS=OFF                                                                        \
-        -DROCM_PATH="/opt/rocm"                                                                        \
-        -DGPU_TARGETS="${PYTORCH_ROCM_ARCH}"                                                           \
-        -DCMAKE_BUILD_TYPE=Release                                                                     \
-        -DHIPBLASLT_ENABLE_FETCH=ON                                                                    \
-        -DCMAKE_INSTALL_LIBDIR=lib                                                                     \
-        -DBLA_STATIC=ON                                                                                \
-    && cmake --build build --target package --parallel
-RUN mkdir -p /app/install && cp rocm-libraries/projects/hipblaslt/build/*.deb /app/install
 
 FROM base AS build_triton
 ARG TRITON_BRANCH
@@ -144,8 +105,6 @@ RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 FROM base AS debs
 RUN mkdir /app/debs
-RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \
-    cp /install/*.deb /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
@@ -159,16 +118,9 @@ RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 
 FROM base AS final
 RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
-    dpkg --remove --force-depends hipblaslt hipblaslt-dev \
-    && dpkg -i --force-depends /install/*.deb \
-    && perl -p -i -e 's/, hipblaslt-dev \([^)]*?\), /, /g' /var/lib/dpkg/status \
-    && perl -p -i -e 's/, hipblaslt \([^)]*?\), /, /g' /var/lib/dpkg/status
-RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
     pip install /install/*.whl
 
 ARG BASE_IMAGE
-ARG HIPBLASLT_REPO
-ARG HIPBLASLT_COMMIT
 ARG TRITON_BRANCH
 ARG TRITON_REPO
 ARG PYTORCH_BRANCH
@@ -180,8 +132,6 @@ ARG FA_REPO
 ARG AITER_BRANCH
 ARG AITER_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
-    && echo "HIPBLASLT_REPO: ${HIPBLASLT_REPO}" >> /app/versions.txt \
-    && echo "HIPBLASLT_COMMIT: ${HIPBLASLT_COMMIT}" >> /app/versions.txt \
     && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /app/versions.txt \
     && echo "TRITON_REPO: ${TRITON_REPO}" >> /app/versions.txt \
     && echo "PYTORCH_BRANCH: ${PYTORCH_BRANCH}" >> /app/versions.txt \
