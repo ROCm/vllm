@@ -195,13 +195,11 @@ class MultiHeadLatentAttention(CustomOp):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim:], k_pe)
-
         attn_out = self.mla_attn(
             q,
             kv_c_normed,
             k_pe,
+            positions=positions,
             output_shape=(hidden_states.shape[0],
                           self.num_heads * self.v_head_dim))
         return self.o_proj(attn_out)[0]
