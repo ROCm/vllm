@@ -13,6 +13,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from .inductor_pass import enable_fake_mode
 from .fx_utils import find_getitem_maybe
 from .multi_output_match import MultiOutputMatch
 from .vllm_inductor_pass import VllmInductorPass
@@ -146,13 +147,13 @@ class AddRMSNormMXFP4GemmPattern:
             return at[1], at[2]
 
         inputs = [
-            empty_bf16(32, 4),  # result
-            empty_bf16(32, 4),  # result_rms
-            empty_bf16(32, 4),  # input
-            empty_bf16(32, 4),  # residual_out
-            empty_bf16(32, 4),  # residual
-            empty_bf16(1, 32),   # weight_rms
-            empty_fp4(32, 4),   # weight_gemm
+            empty_bf16(4, 4),  # result
+            empty_bf16(4, 4),  # result_rms
+            empty_bf16(4, 4),  # input
+            empty_bf16(4, 4),  # residual_out
+            empty_bf16(4, 4),  # residual
+            empty_bf16(1, 4),   # weight_rms
+            empty_fp4(4, 4),   # weight_gemm
             empty_fp4(1, 1),    # scale
         ]
 
@@ -204,6 +205,7 @@ class ROCmFusionPass(VllmInductorPass):
     https://github.com/pytorch/pytorch/pull/139321#issuecomment-2452354980
     """
 
+    @enable_fake_mode
     def __init__(self, config: VllmConfig):
         super().__init__(config)
 
