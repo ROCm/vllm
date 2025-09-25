@@ -40,9 +40,11 @@ def empty_fp4(*args, **kwargs):
 
 class QuantMultiOutputMatch(MultiOutputMatch):
 
-    def __init__(self, match: Match, fused_op):
+    def __init__(self, match: Match, quant_op, fused_op):
         super().__init__(match)
+        # assert isinstance(quant_op, OpOverload)
         assert isinstance(fused_op, OpOverload)
+        self.QUANT_OP = quant_op  # in-place quant op
         self.FUSED_OP = fused_op  # in-place fused quant op
 
     def insert_fused_node(self, fused_return_mapping: dict[int, tuple[torch.fx.Node, int]], **kwargs):
@@ -97,13 +99,13 @@ class QuantMultiOutputMatch(MultiOutputMatch):
 
 
 ADD_RMS_OP = torch.ops._C.fused_add_rms_norm.default
-QUANT_F4GEMM_OP = torch.ops.vllm.gemm_with_dynamic_quant.default
 
 
 class AddRMSNormMXFP4GemmPattern:
     def __init__(self, epsilon: float):
         self.epsilon = epsilon
         self.FUSED_OP = torch.ops.vllm.add_rmsnorm_mxfp4_gemm.default
+        self.QUANT_F4GEMM_OP = torch.ops.vllm.gemm_with_dynamic_quant.default
         
     def register(self, pm_pass: PatternMatcherPass, record_match: Callable[[MultiOutputMatch], bool]):
 
@@ -119,7 +121,7 @@ class AddRMSNormMXFP4GemmPattern:
                                     residual=residual,
                                     weight=weight_rms,
                                     epsilon=self.epsilon)
-            at2 = auto_functionalized(QUANT_F4GEMM_OP,
+            at2 = auto_functionalized(self.QUANT_F4GEMM_OP,
                                     result=result,
                                     x=at1[1],
                                     weight=weight_gemm,
@@ -161,14 +163,14 @@ class AddRMSNormMXFP4GemmPattern:
             fwd_only,
             pm_pass,
             extra_check=lambda m: record_match(
-                self.Match(m, self.FUSED_OP)))
+                self.Match(m, self.QUANT_F4GEMM_OP, self.FUSED_OP)))
 
     class Match(QuantMultiOutputMatch):
 
         def process(self):
             # Find the nodes in the match that we need to rebind
             add_rms_node = self.find_auto_fn(ADD_RMS_OP)
-            quant_f4gemm_node = self.find_auto_fn(QUANT_F4GEMM_OP)
+            quant_f4gemm_node = self.find_auto_fn(self.QUANT_OP)
 
             assert len(add_rms_node.users) == 2
             assert len(quant_f4gemm_node.users) == 1
