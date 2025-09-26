@@ -12,6 +12,7 @@ import torch
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm._aiter_ops import aiter_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     group_broadcast)
@@ -53,49 +54,14 @@ def cutlass_scaled_mm(
                                  scale_b=Bs.T)
 
 
-def rocm_aiter_gemm_w8a8_blockscale_impl(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: list[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
+if (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+        and envs.VLLM_ROCM_USE_AITER_LINEAR
+        and current_platform.is_fp8_fnuz()):
+
     import aiter as rocm_aiter
+    from aiter import get_hip_quant
 
-    return rocm_aiter.gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
-
-
-def rocm_aiter_gemm_w8a8_blockscale_fake(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    block_size: list[int],
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-
-    m = A.shape[0]
-    n = B.shape[0]
-    Y = torch.empty(m, n, dtype=output_dtype, device=A.device)
-    return Y
-
-
-if current_platform.is_rocm():
-    direct_register_custom_op(
-        op_name="rocm_aiter_gemm_w8a8_blockscale",
-        op_func=rocm_aiter_gemm_w8a8_blockscale_impl,
-        mutates_args=[],
-        fake_impl=rocm_aiter_gemm_w8a8_blockscale_fake,
-        dispatch_key=current_platform.dispatch_key,
-    )
-    if (envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_LINEAR
-            and current_platform.is_fp8_fnuz()):
-
-        import aiter as rocm_aiter
-        from aiter import get_hip_quant
-
-        aiter_per1x128_quant = get_hip_quant(rocm_aiter.QuantType.per_1x128)
+    aiter_per1x128_quant = get_hip_quant(rocm_aiter.QuantType.per_1x128)
 
 
 def dispatch_w8a8_blockscale_func(
@@ -110,8 +76,11 @@ def dispatch_w8a8_blockscale_func(
 ], torch.Tensor]:
     if use_cutlass:
         return cutlass_scaled_mm
-    if (use_aiter_and_is_supported):
-        return torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale
+    if (use_aiter_and_is_supported == 1):
+        # return torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale
+        return aiter_ops.gemm_a8w8_blockscale
+    elif (use_aiter_and_is_supported == 2):
+        return aiter_ops.gemm_a8w8_blockscale_bpreshuffle
     return w8a8_block_fp8_matmul
 
 
@@ -125,7 +94,7 @@ def apply_w8a8_block_fp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
-    use_aiter_and_is_supported: bool = False,
+    use_aiter_and_is_supported: int = 0,
 ) -> torch.Tensor:
     assert input_scale is None
     # View input as 2D matrix for fp8 methods

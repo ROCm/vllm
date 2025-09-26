@@ -1,11 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from enum import IntEnum
 from typing import Optional
 
 import torch
 
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
+
+
+class AITEROpMode(IntEnum):
+    NO_AITER = 0
+    AITER = 1
+    SWIZZLE_AITER = 2
+
+
+def use_swizzle(n: int, k: int, layout: tuple[int, int]) -> bool:
+    return n % layout[0] == 0 and k % (layout[1] * 2) == 0
 
 
 def use_swizzle_gemm(n: int, k: int, dtype: torch.dtype) -> bool:
@@ -85,3 +96,37 @@ class aiter_ops:
             scale_a=scale_a,
             scale_b=scale_b,
         )
+
+    @staticmethod
+    def gemm_a8w8_blockscale(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        block_size: list[int],
+        output_dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        import aiter as rocm_aiter
+
+        return rocm_aiter.gemm_a8w8_blockscale(A,
+                                               B,
+                                               As,
+                                               Bs,
+                                               dtype=output_dtype)
+
+    @staticmethod
+    def gemm_a8w8_blockscale_bpreshuffle(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        block_size: list[int],
+        output_dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        import aiter as rocm_aiter
+        As_t = As.transpose(0, 1).contiguous().view(*As.shape)
+        return rocm_aiter.gemm_a8w8_blockscale_bpreshuffle(A,
+                                                           B,
+                                                           As_t,
+                                                           Bs,
+                                                           dtype=output_dtype)

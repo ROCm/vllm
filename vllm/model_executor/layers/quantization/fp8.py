@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm._aiter_ops import AITEROpMode
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -232,10 +233,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # AITER is only supported on ROCm and only for FP8_FNUZ
         # and at the moment are MI300 series
-        self.use_aiter_and_is_supported = (current_platform.is_rocm()
-                                           and envs.VLLM_ROCM_USE_AITER
-                                           and envs.VLLM_ROCM_USE_AITER_LINEAR
-                                           and current_platform.is_fp8_fnuz())
+        self.use_aiter_and_is_supported: int = int(
+            current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
+            and envs.VLLM_ROCM_USE_AITER_LINEAR
+            and current_platform.is_fp8_fnuz())
 
         self.block_quant = self.quant_config.weight_block_size is not None
         self.act_q_static = self.quant_config.activation_scheme == "static"
@@ -386,6 +387,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 weight_scale_inv = layer.weight_scale_inv.data
 
             weight = self._maybe_pad_weight(weight)
+
+            if self.use_aiter_and_is_supported:
+                from vllm._aiter_ops import use_swizzle
+                layout = (16, 16)
+                if use_swizzle(*weight.shape, layout):
+                    self.use_aiter_and_is_supported = \
+                        AITEROpMode.SWIZZLE_AITER.value
+                if (self.use_aiter_and_is_supported == \
+                    AITEROpMode.SWIZZLE_AITER.value):
+                    from aiter.ops.shuffle import shuffle_weight
+                    weight = shuffle_weight(weight, layout=(16, 16))
 
             # Torch.compile cannot use Parameter subclasses.
             layer.weight = Parameter(weight, requires_grad=False)
