@@ -91,7 +91,7 @@ def benchmark_vision_rotary(
         f"heads={num_heads}, head_dim={head_size}, dtype={dtype}"
     )
     print(f"Iters: warmup={warmup_iter}, bench={benchmark_iter}")
-    print(f"1c (sepqrated q and k): mean={mean_1c:.4f} ms, median={med_1c:.4f} ms")
+    print(f"1c (separated q and k): mean={mean_1c:.4f} ms, median={med_1c:.4f} ms")
     print(f"2c (fused q and k):  mean={mean_2c:.4f} ms, median={med_2c:.4f} ms")
     print(f"Fusion speedup: {mean_1c / mean_2c:.3f}x")
 
