@@ -296,7 +296,8 @@ class CudaPlatformBase(Platform):
                         set_kv_cache_layout)
                     set_kv_cache_layout("HND")
                 return FLASHINFER_V1
-            elif selected_backend == _Backend.FLEX_ATTENTION:
+            elif selected_backend == _Backend.FLEX_ATTENTION \
+                 or envs.VLLM_ENABLE_DETERMINISM:
                 logger.info_once("Using FlexAttention backend on V1 engine.")
                 return FLEX_ATTENTION_V1
             elif selected_backend == _Backend.TRITON_ATTN:

@@ -9,6 +9,8 @@ ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
 ARG AITER_BRANCH="2ab9f4cd"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG BATCH_INVARIANT_OPS_BRANCH="9bfcaf6c"
+ARG BATCH_INVARIANT_OPS_REPO="https://github.com/thinking-machines-lab/batch_invariant_ops"
 
 FROM ${BASE_IMAGE} AS base
 
@@ -103,6 +105,15 @@ RUN cd aiter \
 RUN pip install pyyaml && cd aiter && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist && ls /app/aiter/dist/*.whl
 RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
+FROM base AS build_batch_invariant_ops
+ARG BATCH_INVARIANT_OPS_BRANCH
+ARG BATCH_INVARIANT_OPS_REPO
+RUN git clone ${BATCH_INVARIANT_OPS_REPO}
+RUN cd batch_invariant_ops \
+    && git checkout ${BATCH_INVARIANT_OPS_BRANCH} \
+    && pip wheel . --no-deps --wheel-dir=dist
+RUN mkdir -p /app/install && cp /app/batch_invariant_ops/dist/*.whl /app/install
+
 FROM base AS debs
 RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
@@ -114,6 +125,8 @@ RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_batch_invariant_ops,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 
 FROM base AS final
@@ -131,6 +144,8 @@ ARG FA_BRANCH
 ARG FA_REPO
 ARG AITER_BRANCH
 ARG AITER_REPO
+ARG BATCH_INVARIANT_OPS_BRANCH
+ARG BATCH_INVARIANT_OPS_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "TRITON_BRANCH: ${TRITON_BRANCH}" >> /app/versions.txt \
     && echo "TRITON_REPO: ${TRITON_REPO}" >> /app/versions.txt \
@@ -141,4 +156,6 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
     && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
-    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt
+    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt \
+    && echo "BATCH_INVARIANT_OPS_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
+    && echo "BATCH_INVARIANT_OPS_REPO: ${AITER_REPO}" >> /app/versions.txt

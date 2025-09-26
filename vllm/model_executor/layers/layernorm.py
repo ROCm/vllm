@@ -209,7 +209,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        if self.variance_size_override is not None:
+        if (envs.VLLM_ENABLE_DETERMINISM
+                or self.variance_size_override is not None):
             return self.forward_native(x, residual)
 
         add_residual = residual is not None
@@ -224,7 +225,8 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        if self.variance_size_override is not None:
+        if (envs.VLLM_ENABLE_DETERMINISM
+                or self.variance_size_override is not None):
             return self.forward_native(x, residual)
 
         add_residual = residual is not None

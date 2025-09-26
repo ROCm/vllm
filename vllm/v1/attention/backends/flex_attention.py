@@ -13,6 +13,7 @@ from torch.nn.attention.flex_attention import (BlockMask, _mask_mod_signature,
                                                create_block_mask,
                                                flex_attention)
 
+import vllm.envs as envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
                                               is_quantized_kv_cache)
@@ -499,9 +500,9 @@ class FlexAttentionMetadata:
                                             dim=0)
         used_pages_padded = used_pages_padded.reshape(
             used_pages_padded.shape[0] // self.q_block_size, -1)
-        used_pages_padded = used_pages_padded // page_to_block_ratio
-        kv_indices = unique_static_unsorted((used_pages_padded.long()),
-                                            M=self.num_blocks).to(torch.int32)
+        used_pages_padded = used_pages_padded // page_to_block_ratio + 1
+        kv_indices = unique_static_unsorted(
+            (used_pages_padded.long()), M=self.num_blocks).to(torch.int32) - 1
 
         kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
         block_mask_kwargs = {
@@ -570,11 +571,12 @@ class FlexAttentionMetadataBuilder(
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
-        self.direct_build: bool = is_torch_equal_or_newer("2.9.0.dev0")
+        self.direct_build: bool = is_torch_equal_or_newer(
+            "2.9.0.dev0") or envs.VLLM_ENABLE_DETERMINISM
         self.q_block_size: int = 16 if is_torch_equal_or_newer(
-            "2.9.0.dev0") else 128
+            "2.9.0.dev0") or envs.VLLM_ENABLE_DETERMINISM else 128
         self.kv_block_size: int = 16 if is_torch_equal_or_newer(
-            "2.9.0.dev0") else 128
+            "2.9.0.dev0") or envs.VLLM_ENABLE_DETERMINISM else 128
 
     def reorder_batch(self, input_batch: "InputBatch",
                       scheduler_output: "SchedulerOutput") -> bool:
@@ -839,6 +841,12 @@ def get_kernel_options(query, block_m, block_n,
     kernel_options: dict[str, Union[int, bool]] = {
         "FORCE_USE_FLEX_ATTENTION": True,
     }
+    if envs.VLLM_ENABLE_DETERMINISM:
+        kernel_options["BLOCK_M"] = 16
+        kernel_options["BLOCK_N"] = 16
+        kernel_options["IS_DIVISIBLE"] = False
+        return kernel_options
+
     if use_direct_build:
         kernel_options["BLOCK_M"] = block_m
         kernel_options["BLOCK_N"] = block_n

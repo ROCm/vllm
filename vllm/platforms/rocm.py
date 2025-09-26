@@ -231,7 +231,12 @@ class RocmPlatform(Platform):
                 f"is not MLA type while requested for MLA backend.")
 
         if envs.VLLM_USE_V1:
-            if envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA \
+            if envs.VLLM_ENABLE_DETERMINISM \
+               or selected_backend == _Backend.FLEX_ATTENTION:
+                logger.info("Using Flex Attention backend on V1 engine.")
+                return ("vllm.v1.attention.backends."
+                        "flex_attention.FlexAttentionBackend")
+            elif envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MHA \
                 and on_gfx9():
                 logger.info("Using Flash Attention backend on V1 engine.")
                 return ("vllm.v1.attention.backends."
