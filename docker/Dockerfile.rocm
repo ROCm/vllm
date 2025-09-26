@@ -1,7 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=dllehr:355_wip_base
+ARG BASE_IMAGE=rocm/vllm-private:355_wip_base_image_0925
 ARG AITER_BRANCH="355_wip"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 

@@ -5,7 +5,7 @@ ARG HIPBLASLT_REPO="https://github.com/ROCm/rocm-libraries.git"
 # ARG LEGACY_HIPBLASLT_OPTION=
 ARG TRITON_BRANCH="57c693b627fe058878ade4163a0a8df95d9fefa1"
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG PYTORCH_BRANCH="triton_kernel_wrap_fix"
+ARG PYTORCH_BRANCH="rocm7.1_internal_testing-tritonlatest"
 ARG PYTORCH_VISION_BRANCH="5dc9e7de"
 ARG PYTORCH_REPO="https://github.com/ROCm/pytorch.git"
 ARG PYTORCH_VISION_REPO="https://github.com/pytorch/vision.git"
@@ -109,7 +109,7 @@ RUN cd triton \
     && git checkout ${TRITON_BRANCH} \
     && if [ ! -f setup.py ]; then cd python; fi \
     && python3 setup.py bdist_wheel --dist-dir=dist \
-    && mkdir -p /app/install
+    && mkdir -p /app/install && cp dist/triton*.whl /app/install
 RUN if [ -d triton/python/triton_kernels ]; then \
     pip install build \
     && cd triton/python/triton_kernels \
@@ -121,31 +121,31 @@ RUN cd /opt/rocm/share/amd_smi \
 RUN mkdir -p /app/install && cp /opt/rocm/share/amd_smi/dist/*.whl /app/install
 
 FROM base AS build_pytorch
-#ARG PYTORCH_BRANCH
-#ARG PYTORCH_VISION_BRANCH
-#ARG PYTORCH_REPO
-#ARG PYTORCH_VISION_REPO
+ARG PYTORCH_BRANCH
+ARG PYTORCH_VISION_BRANCH
+ARG PYTORCH_REPO
+ARG PYTORCH_VISION_REPO
 ARG FA_BRANCH
 ARG FA_REPO
-#RUN git clone ${PYTORCH_REPO} pytorch
-#RUN cd pytorch && git checkout ${PYTORCH_BRANCH} && \
-#    pip install -r requirements.txt && git submodule update --init --recursive \
-#    && python3 tools/amd_build/build_amd.py \
-#    && CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist \
-#    && pip install dist/*.whl
-#RUN git clone ${PYTORCH_VISION_REPO} vision
-#RUN cd vision && git checkout ${PYTORCH_VISION_BRANCH} \
-#    && python3 setup.py bdist_wheel --dist-dir=dist \
-#    && pip install dist/*.whl
+RUN git clone ${PYTORCH_REPO} pytorch
+RUN cd pytorch && git checkout ${PYTORCH_BRANCH} && \
+   pip install -r requirements.txt && git submodule update --init --recursive \
+   && python3 tools/amd_build/build_amd.py \
+   && CMAKE_PREFIX_PATH=$(python3 -c 'import sys; print(sys.prefix)') python3 setup.py bdist_wheel --dist-dir=dist \
+   && pip install dist/*.whl
+RUN git clone ${PYTORCH_VISION_REPO} vision
+RUN cd vision && git checkout ${PYTORCH_VISION_BRANCH} \
+   && python3 setup.py bdist_wheel --dist-dir=dist \
+   && pip install dist/*.whl
 RUN git clone ${FA_REPO}
 RUN cd flash-attention \
     && git checkout ${FA_BRANCH} \
     && git submodule update --init \
     && GPU_ARCHS=$(echo ${PYTORCH_ROCM_ARCH} | sed -e 's/;gfx1[0-9]\{3\}//g') python3 setup.py bdist_wheel --dist-dir=dist
 RUN mkdir -p /app/install \
-   # && cp /app/pytorch/dist/*.whl /app/install \
-   # && cp /app/vision/dist/*.whl /app/install \
-    && cp /app/flash-attention/dist/*.whl /app/install
+   && cp /app/pytorch/dist/*.whl /app/install \
+   && cp /app/vision/dist/*.whl /app/install \
+   && cp /app/flash-attention/dist/*.whl /app/install
 # RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
 # FROM base AS build_aiter
@@ -169,8 +169,8 @@ RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
-# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-#     cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
 # RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
 
@@ -187,12 +187,13 @@ FROM base AS final
 RUN echo "Entering Base as final"
 # RUN echo "triggering uncache"
 RUN echo "Uninstalling triton " && pip uninstall -y triton triton_kernels
+RUN echo "Uninstalling torch " && pip uninstall -y torch
 RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     pip install /install/*.whl
-# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-#     pip install /install/*.whl
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+    pip install /install/*.whl
 # RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 #     pip install /install/*.whl
 
