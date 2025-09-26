@@ -133,6 +133,7 @@ COPY --from=export_vllm /docker ${COMMON_WORKDIR}/vllm/docker
 
 ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
 ENV TOKENIZERS_PARALLELISM=false
+ENV VLLM_ROCM_USE_AITER=1
 
 # ENV that can improve safe tensor loading, and end-to-end time
 ENV SAFETENSORS_FAST_GPU=1
