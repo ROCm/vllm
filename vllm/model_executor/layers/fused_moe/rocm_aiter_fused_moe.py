@@ -156,7 +156,8 @@ def rocm_aiter_grouped_topk_impl(
     from aiter import grouped_topk
 
     grouped_topk(gating_output, topk_weights, topk_ids, num_expert_group,
-                 topk_group, need_renorm, scoring_func, routed_scaling_factor)
+                 topk_group, need_renorm, scoring_func == "softmax",
+                 routed_scaling_factor)
 
 
 def rocm_aiter_grouped_topk_fake(
