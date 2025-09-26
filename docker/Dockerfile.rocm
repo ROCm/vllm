@@ -23,6 +23,21 @@ ARG COMMON_WORKDIR
 WORKDIR ${COMMON_WORKDIR}
 
 # --------------
+# JPVILLAM: TEMP fix for rccl perf
+FROM base AS rocm_rccl
+ARG RCCL_REPO="https://github.com/ROCm/rccl.git"
+ARG RCCL_BRANCH="develop"
+
+RUN apt install rocm-cmake -y
+
+RUN git clone "$RCCL_REPO" \
+    && cd rccl \
+    && git checkout "$RCCL_BRANCH" \
+    && ./install.sh -p --amdgpu_targets="$GFX_COMPILATION_ARCH"
+
+RUN mkdir -p /app/install && cp /app/rccl/build/release/*.deb/ /app/install
+
+# --------------
 # DLL: TEMP since aiter is volatile.  When base is locked still build aiter
 FROM base AS build_aiter
 ARG AITER_BRANCH
@@ -65,6 +80,7 @@ RUN cd vllm \
 FROM scratch AS export_vllm
 ARG COMMON_WORKDIR
 COPY --from=build_aiter /app/install/*.whl /
+COPY --from=rocm_rccl /app/install/*.deb /
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/dist/*.whl /
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/requirements /requirements
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/benchmarks /benchmarks
@@ -123,6 +139,11 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     && pip install -U -r requirements/rocm.txt \
     && pip uninstall -y vllm \
     && pip install *.whl
+
+# JPVILLAM: TEMP install rccl
+RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
+    cd /install \
+    && DEBIAN_FRONTEND=noninteractive dpkg -i --force-all *.deb
 
 ARG COMMON_WORKDIR
 
