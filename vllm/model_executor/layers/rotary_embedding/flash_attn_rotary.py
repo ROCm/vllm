@@ -27,7 +27,7 @@ def _rotary_1c(
     cos,
     nheads,
     seqlen,
-    ROTARY_DIM_HALF,
+    ROTARY_DIM_HALF: tl.constexpr,
     ROTARY_DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -37,6 +37,7 @@ def _rotary_1c(
     if not INTERLEAVED:
         # Load the 1st and 2nd halves of X, do calculation, then
         # store to 1st and 2nd halves of OUT
+        rk_half = tl.max_contiguous(tl.multiple_of(rk_half, 4), 4)
         X = X + (rh[:, None, None] * stride_nheads + rm[None, :, None] *
                  stride_seqlen + rk_half[None, None, :] * stride_headdim)
         OUT = OUT + (rh[:, None, None] * stride_out_nheads +
@@ -115,7 +116,7 @@ def rotary_kernel(
     BLOCK_M: tl.constexpr,
 ):
     BLOCK_K: tl.constexpr = triton.next_power_of_2(ROTARY_DIM)
-    ROTARY_DIM_HALF = ROTARY_DIM // 2
+    ROTARY_DIM_HALF: tl.constexpr = ROTARY_DIM // 2
     pid_head = tl.program_id(axis=0)
     pid_m = tl.program_id(axis=1)
     pid_batch = tl.program_id(axis=2)
@@ -258,7 +259,7 @@ def apply_rotary_2c(
 
     grid = lambda META: (triton.cdiv(nheads, META["BLOCK_H"]),
                          triton.cdiv(seqlen, META["BLOCK_M"]), batch)  # noqa
-    BLOCK_M = 8 if rotary_dim <= 128 else 4
+    BLOCK_M = 16 if rotary_dim <= 128 else 8
 
     # Need this, otherwise Triton tries to launch from cuda:0 and we get
     # ValueError: Pointer argument (at 0) cannot be accessed from Triton
