@@ -215,15 +215,18 @@ def apply_rotary_2c(
     Arguments:
         x: (batch, seqlen, nheads, headdim) if cu_seqlens is None
             else (total_seqlen, nheads, headdim).
-        cos: (seqlen_ro, rotary_dim / 2)
-        sin: (seqlen_ro, rotary_dim / 2)
+        y: (batch, seqlen, nheads, headdim) if cu_seqlens is None
+            else (total_seqlen, nheads, headdim).
+        freqs: (seqlen_ro, rotary_dim / 2)
         seqlen_offsets: integer or integer tensor of size (batch,)
         cu_seqlens: (batch + 1,) or None
         max_seqlen: int
     Returns:
-        y: (batch, seqlen, nheads, headdim)
+        out_x: (batch, seqlen, nheads, headdim)
+        out_y: (batch, seqlen, nheads, headdim)
     """
     is_varlen = cu_seqlens is not None
+    assert x.shape == y.shape
     if not is_varlen:
         batch, seqlen, nheads, headdim = x.shape
     else:
@@ -234,13 +237,11 @@ def apply_rotary_2c(
         batch = batch_p_1 - 1
         seqlen = max_seqlen
     seqlen_ro, rotary_dim = freqs.shape
-    # assert sin.shape == cos.shape
     rotary_dim *= 2
     assert rotary_dim <= headdim, "rotary_dim must be <= headdim"
     assert headdim <= 256, "Only support headdim <= 256"
     assert seqlen_ro >= seqlen, "seqlen_ro must be >= seqlen"
 
-    # cos, sin = cos.contiguous(), sin.contiguous()
     freqs = freqs.contiguous()
     if isinstance(seqlen_offsets, torch.Tensor):
         assert seqlen_offsets.shape == (batch, )
