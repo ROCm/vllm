@@ -228,7 +228,7 @@ def apply_rotary_2c(
     """
     is_varlen = cu_seqlens is not None
     assert x.shape == y.shape
-    if not is_varlen:
+    if cu_seqlens is None:
         batch, seqlen, nheads, headdim = x.shape
     else:
         assert max_seqlen is not None, "If cu_seqlens is passed in, " \
