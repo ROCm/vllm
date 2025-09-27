@@ -786,7 +786,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM":
-    lambda: (os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "False").lower() in
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in
              ("true", "1")),
 
     # Whether to use aiter mla ops.
