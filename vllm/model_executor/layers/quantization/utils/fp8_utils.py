@@ -152,7 +152,9 @@ def apply_w8a8_block_fp8_linear(
     else:
         if use_aiter_and_is_supported:
             q_input, x_scale = aiter_per1x128_quant(
-                input_2d.contiguous(), quant_dtype=rocm_aiter.dtypes.fp8)
+                input_2d.contiguous(),
+                quant_dtype=rocm_aiter.dtypes.fp8,
+                transpose_scale=use_aiter_and_is_supported == 2)
         else:
             q_input, x_scale = per_token_group_quant_fp8(
                 input_2d, block_size[1], column_major_scales=use_cutlass)

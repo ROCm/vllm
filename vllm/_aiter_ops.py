@@ -124,9 +124,8 @@ class aiter_ops:
         output_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
         import aiter as rocm_aiter
-        As_t = As.transpose(0, 1).contiguous().view(*As.shape)
         return rocm_aiter.gemm_a8w8_blockscale_bpreshuffle(A,
                                                            B,
-                                                           As_t,
+                                                           As,
                                                            Bs,
                                                            dtype=output_dtype)
