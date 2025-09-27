@@ -77,7 +77,6 @@ def dispatch_w8a8_blockscale_func(
     if use_cutlass:
         return cutlass_scaled_mm
     if (use_aiter_and_is_supported == 1):
-        # return torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale
         return aiter_ops.gemm_a8w8_blockscale
     elif (use_aiter_and_is_supported == 2):
         return aiter_ops.gemm_a8w8_blockscale_bpreshuffle
