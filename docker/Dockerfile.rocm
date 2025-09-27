@@ -35,7 +35,7 @@ RUN git clone "$RCCL_REPO" \
     && git checkout "$RCCL_BRANCH" \
     && ./install.sh -p --amdgpu_targets="$GFX_COMPILATION_ARCH"
 
-RUN mkdir -p /app/install && cp /app/rccl/build/release/*.deb/ /app/install
+RUN mkdir -p /app/install && cp /app/rccl/build/release/*.deb /app/install
 
 # --------------
 # DLL: TEMP since aiter is volatile.  When base is locked still build aiter
