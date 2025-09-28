@@ -5,9 +5,11 @@ import pytest
 import torch
 
 from tests.kernels.allclose_default import get_default_atol, get_default_rtol
+# yapf: disable
 from vllm.model_executor.models.qwen2_vl import (
     Qwen2VisionRotaryEmbedding, apply_rotary_pos_emb_vision,
     apply_rotary_pos_emb_vision_2c)
+# yapf: enable
 from vllm.platforms import current_platform
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
