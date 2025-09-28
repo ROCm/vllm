@@ -541,7 +541,6 @@ def unified_attention_with_output(
                         output_scale=output_scale,
                         positions=positions)
     else:
-        assert positions is None, f"positions must be None {positions=}"
         self.impl.forward(self,
                         query,
                         key,
