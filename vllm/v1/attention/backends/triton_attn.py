@@ -295,8 +295,6 @@ class TritonAttentionImpl(AttentionImpl):
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         positions: torch.Tensor = None,
-        cos_sin_cache: torch.Tensor = None,
-        is_neox: bool = False,
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
