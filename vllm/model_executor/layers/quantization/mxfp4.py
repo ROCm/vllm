@@ -708,10 +708,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_local_tokens=None,
                     moe_sorting_dispatch_policy=0,
                     dtype=None,
-                    n_pad_zeros=self.intermediate_pad // 64 * 64 * 2,
-                    k_pad_zeros=self.hidden_pad // 128 * 128,
-                    n_pad_zeros2=self.hidden_pad // 64 * 64,
-                    k_pad_zeros2=self.intermediate_pad // 128 * 128,
+                    hidden_pad=self.hidden_pad,
+                    intermediate_pad=self.intermediate_pad,
                     bias1=self.w13_bias_aiter_tensor,
                     bias2=layer.w2_bias,
                 )
