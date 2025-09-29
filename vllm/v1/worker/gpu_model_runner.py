@@ -61,7 +61,6 @@ from vllm.v1.attention.backends.utils import (
     make_kv_sharing_fast_prefill_attention_metadata,
     reorder_batch_to_split_decodes_and_prefills,
     reorder_batch_to_split_decodes_prefills_and_chunks)
->>>>>>> 6ca4159b9 (refactor attention backend for perf boost)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         ChunkedLocalAttentionSpec,

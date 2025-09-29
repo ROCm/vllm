@@ -32,7 +32,7 @@ if current_platform.is_rocm():
     import triton
     import triton.language as tl
     from vllm.utils import direct_register_custom_op
-    from aiter.ops.triton.utils.device_info import get_num_sms
+    from aiter.ops.triton.utils.arch_info import get_num_sms
 
     def block_size(x, head_dim):
         return min(65536 // x.element_size(), triton.next_power_of_2(head_dim))
