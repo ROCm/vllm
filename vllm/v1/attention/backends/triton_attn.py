@@ -200,13 +200,6 @@ class TritonAttentionBackend(AttentionBackend):
         return TritonAttentionMetadataBuilder
 
 
-@cache
-def use_aiter_unified_attention() -> bool:
-    """Check if aiter unified attention should be used."""
-    # VLLM_ROCM_USE_AITER_MHA needs to set to 0 as well as it is set
-    # to 1 as default
-    return envs.VLLM_ROCM_USE_AITER \
-        and envs.VLLM_USE_AITER_UNIFIED_ATTENTION
 
 
 class TritonAttentionImpl(AttentionImpl):
@@ -258,24 +251,12 @@ class TritonAttentionImpl(AttentionImpl):
 
         self.fp8_dtype = current_platform.fp8_dtype()
 
-        # If not using prefill decode attention, we use the Triton
-        # unified attention implementation.
-        if use_aiter_unified_attention():
-            logger.info_once(
-                "Using aiter unified attention for TritonAttentionImpl")
-            from aiter.ops.triton.unified_attention import unified_attention
+        # Unified attention implementation to be provided by the caller
+        # at runtime (via rocm_dynamic dispatcher).
+        self._unified_attention = None
 
-            self.unified_attention = unified_attention
-        elif not envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION:
-            logger.info_once(
-                "Using vllm unified attention for TritonAttentionImpl")
-            from vllm.attention.ops.triton_unified_attention import (
-                unified_attention)
-            self.unified_attention = unified_attention
-        else:
-            logger.info_once(
-                "Using vllm split prefill decode attention for TritonAttentionImpl"
-            )
+        # Auto-set unified attention implementation based on environment variables
+        self._setup_unified_attention_impl()
 
         self.sinks = sinks
         if sinks is not None:
@@ -334,10 +315,11 @@ class TritonAttentionImpl(AttentionImpl):
         # Whenever making a change in this method, please benchmark the
         # performance to make sure it does not introduce any overhead.
 
-        use_prefill_decode_attn = (
+        # Runtime choice strictly controlled by rocm_dynamic dispatcher.
+        # If a unified attention implementation is set, use it; otherwise
+        # use split prefill/decode path.
+        use_prefill_decode_attn = (self._unified_attention is None) or \
             envs.VLLM_V1_USE_PREFILL_DECODE_ATTENTION
-            and not use_aiter_unified_attention()
-        )
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         if use_prefill_decode_attn:
@@ -469,7 +451,9 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
 
-            self.unified_attention(
+            # Use the unified attention implementation provided by dispatcher
+            unified_impl = self._unified_attention
+            unified_impl(
                 q=query[:num_actual_tokens],
                 k=key_cache,
                 v=value_cache,
@@ -491,4 +475,14 @@ class TritonAttentionImpl(AttentionImpl):
                 output_scale=output_scale,
             )
 
-        return output
+
+    def _setup_unified_attention_impl(self) -> None:
+        """Auto-setup unified attention implementation based on environment variables."""
+        from vllm.v1.attention.backends.rocm_mha_backend_helper import get_unified_attention_impl
+        self._unified_attention = get_unified_attention_impl()
+
+
+    def set_unified_attention_impl(self, fn) -> None:
+        # Set the callable for unified attention, or None to force split path
+        self._unified_attention = fn
+
