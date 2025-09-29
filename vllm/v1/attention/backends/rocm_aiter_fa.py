@@ -432,6 +432,8 @@ class AiterFlashAttentionImpl(AttentionImpl):
         if self.sinks is not None:
             raise NotImplementedError("Sinks are not supported for ROCM AITER")
 
+        self.fp8_dtype = current_platform.fp8_dtype()
+
     def forward(
         self,
         layer: torch.nn.Module,
