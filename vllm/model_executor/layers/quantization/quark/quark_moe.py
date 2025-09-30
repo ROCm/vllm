@@ -522,8 +522,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             raise NotImplementedError(
                 "EPLB not supported for `QuarkW4A4MXFp4MoEMethod` yet.")
 
-        from vllm.model_executor.layers.fused_moe import fused_experts
-
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -538,17 +536,37 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype)
 
-        out = fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-            activation=activation,
-            global_num_experts=global_num_experts,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            expert_map=expert_map,
-            quant_config=self.moe_quant_config,
-        )
+        if envs.VLLM_ROCM_USE_CK_MXFP4_MOE:
+            from aiter import ActivationType, QuantType
+            from aiter.fused_moe import fused_moe
+
+            out = fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                quant_type=QuantType.per_1x32,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                activation=(ActivationType.Silu
+                            if activation == "silu" else ActivationType.Gelu),
+                doweight_stage1=False,
+            )
+        else:
+            from vllm.model_executor.layers.fused_moe import fused_experts
+
+            out = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_map=expert_map,
+                quant_config=self.moe_quant_config,
+            )
         return out
