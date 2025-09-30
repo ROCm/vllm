@@ -17,7 +17,8 @@ OCP_MX_BLOCK_SIZE = 32
 
 @cache
 def use_fp4_aiter_moe():
-    return current_platform.supports_mx() and envs.VLLM_ROCM_USE_AITER
+    return current_platform.supports_mx() and envs.VLLM_ROCM_USE_AITER \
+        and not envs.VLLM_ROCM_USE_EMULATED_MXFP4_MOE
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
