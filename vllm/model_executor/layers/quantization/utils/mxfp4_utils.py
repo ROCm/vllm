@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import cache
 from typing import Callable, Optional
 
 import torch
@@ -13,6 +14,9 @@ logger = init_logger(__name__)
 
 OCP_MX_BLOCK_SIZE = 32
 
+@cache
+def use_fp4_aiter_moe():
+    return current_platform.supports_mx() and envs.VLLM_ROCM_USE_AITER and not envs.VLLM_ROCM_USE_EMULATED_MXFP4_MOE
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """ weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel
@@ -33,7 +37,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         scale_layout, scale_layout_opts = StridedLayout, dict()
 
     elif current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx950 
+        from vllm.platforms.rocm import on_gfx950
         from triton_kernels.target_info import is_hip
         from triton_kernels.tensor_details.layout import (
             BlackwellMXScaleLayout, GFX950MXScaleLayout, HopperMXScaleLayout,

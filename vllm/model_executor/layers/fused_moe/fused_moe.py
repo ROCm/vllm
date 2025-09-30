@@ -36,7 +36,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     calculate_tile_tokens_dim)
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    dequant_mxfp4)
+    dequant_mxfp4, use_fp4_aiter_moe)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op, is_torch_equal_or_newer
@@ -530,7 +530,7 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
-    elif use_mxfp4_w4a4:
+    elif use_mxfp4_w4a4 and use_fp4_aiter_moe():
         assert A_scale is not None
         assert B_scale is not None
     else:
@@ -1659,7 +1659,7 @@ def fused_experts_impl(
     else:
         out_hidden_states = torch.empty_like(hidden_states)
 
-    if use_mxfp4_w4a4 and not current_platform.supports_mx():
+    if use_mxfp4_w4a4 and not use_fp4_aiter_moe():
         # Weight has to be dequantized for mxfp4 emulation.
         w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
         w1_scale = None
@@ -1719,7 +1719,7 @@ def fused_experts_impl(
                                 use_int8_w8a16=use_int8_w8a16,
                                 use_int4_w4a16=use_int4_w4a16,
                                 use_mxfp4_w4a4=use_mxfp4_w4a4
-                                and current_platform.supports_mx(),
+                                and use_fp4_aiter_moe(),
                                 per_channel_quant=per_channel_quant,
                                 block_shape=block_shape,
                                 B_bias=w1_bias)
@@ -1771,7 +1771,7 @@ def fused_experts_impl(
                                 use_int8_w8a16=use_int8_w8a16,
                                 use_int4_w4a16=use_int4_w4a16,
                                 use_mxfp4_w4a4=use_mxfp4_w4a4
-                                and current_platform.supports_mx(),
+                                and use_fp4_aiter_moe(),
                                 per_channel_quant=per_channel_quant,
                                 block_shape=block_shape,
                                 B_bias=w2_bias)

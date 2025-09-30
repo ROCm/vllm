@@ -102,6 +102,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_CK_MXFP4_MOE: bool = False
+    VLLM_ROCM_USE_EMULATED_MXFP4_MOE: bool = False
     VLLM_TRITON_FP4_GEMM_USE_ASM: bool = False
     VLLM_USE_AITER_TRITON_ROPE: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -799,6 +801,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA":
     lambda: (os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in
+             ("true", "1")),
+
+    "VLLM_ROCM_USE_CK_MXFP4_MOE":
+    lambda: (os.getenv("VLLM_ROCM_USE_CK_MXFP4_MOE", "False").lower() in
+             ("true", "1")),
+
+    "VLLM_ROCM_USE_EMULATED_MXFP4_MOE":
+    lambda: (os.getenv("VLLM_ROCM_USE_EMULATED_MXFP4_MOE", "False").lower() in
              ("true", "1")),
 
     # Whether to use aiter fp4 gemm asm.
