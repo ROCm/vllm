@@ -483,6 +483,22 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
+    def process_weights_after_loading(self, layer):
+        if envs.VLLM_ROCM_USE_CK_MXFP4_MOE:
+            from aiter.utility.fp4_utils import e8m0_shuffle
+
+            # Pre-shuffle weight scales
+            s0, s1, _ = layer.w13_weight_scale.shape
+            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+            w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+
+            s0, s1, _ = layer.w2_weight_scale.shape
+            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+            w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            torch.cuda.empty_cache()
+
     def get_fused_moe_quant_config(
             self, layer: torch.nn.Module) -> Optional[FusedMoEQuantConfig]:
         return mxfp4_w4a4_moe_quant_config(
