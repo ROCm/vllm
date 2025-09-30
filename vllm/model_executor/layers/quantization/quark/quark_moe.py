@@ -418,7 +418,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 "not implemented. Please open an issue.")
 
         self.emulate = False
-        if use_fp4_aiter_moe():
+        if not use_fp4_aiter_moe():
             self.emulate = True
             logger.warning_once(
                 "The current platform does not support native MXFP4 "
