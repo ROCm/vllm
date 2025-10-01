@@ -76,6 +76,7 @@ def get_mla_metadata(
         is_fp8_kvcache, topk)
 
 
+
 def flash_mla_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -148,6 +149,30 @@ def flash_mla_with_kvcache(
     return out, softmax_lse
 
 
+def reference_mla_sparse_prefill(q, kv, indices, sm_scale: float, d_v) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    import math
+    def log2sumexp2(a: torch.Tensor, dim: int) -> torch.Tensor:
+        return torch.logsumexp(a * math.log(2), dim=dim) * math.log2(math.e)
+
+    skv = kv.shape[0]
+    sq = q.shape[0]
+    topk = indices.shape[-1]
+    dqk = q.shape[-1]
+    indices = indices[:, 0, :] # [s_q, topk]
+    invalid_indices_mask = (indices < 0) | (indices >= skv)
+    qs = q.float()  # [s_q, h_q, d_qk]
+    kvs = kv[:, 0, :].float()  # [s_kv, d_qk]
+
+    kvs = torch.index_select(kvs, 0, indices.masked_fill(invalid_indices_mask, 0).flatten()).view(sq, topk, dqk)  # [s_q, topk, d_qk]
+    attn_score = qs @ kvs.transpose(1, 2)    # [s_q, h_q, topk]
+    attn_score.masked_fill_(invalid_indices_mask.unsqueeze(1), float('-inf'))
+    attn_score *= sm_scale * math.log2(math.e)
+    max_logits = torch.max(attn_score, dim=-1)[0]   # [s_q, h_q]
+    lse = log2sumexp2(attn_score, dim=-1)   # [s_q, h_q]
+    attn_score = torch.exp2(attn_score - lse.unsqueeze(-1))   # [s_q, h_q, topk]
+    result = attn_score @ kvs[:, :, :d_v]
+    return (result.to(q.dtype), max_logits, lse)
+
 def flash_mla_sparse_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -174,8 +199,9 @@ def flash_mla_sparse_prefill(
     - max_logits:  [s_q, h_q], float
     - lse: [s_q, h_q], float, 2-based log-sum-exp
     """
-    results = torch.ops._flashmla_C.sparse_prefill_fwd(q, kv, indices,
-                                                       sm_scale, d_v)
+    results = reference_mla_sparse_prefill(q, kv, indices, sm_scale, d_v)
+    # results = torch.ops._flashmla_C.sparse_prefill_fwd(q, kv, indices,
+    #                                                    sm_scale, d_v)
     return results
 
 

@@ -260,8 +260,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
 
-            self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
-                seq_lens, self.kv_cache_spec.block_size, self.num_sms)
+            # self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
+            #     seq_lens, self.kv_cache_spec.block_size, self.num_sms)
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=common_attn_metadata.
                 block_table_tensor[:num_decodes, ...],

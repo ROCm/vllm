@@ -982,7 +982,8 @@ class DeepseekV2MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states)
+        out = self.mla_attn(positions, hidden_states)
+        return out
 
 
 class DeepseekV2DecoderLayer(nn.Module):

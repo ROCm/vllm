@@ -201,7 +201,6 @@ def _convert_req_index_to_global_index_kernel(
     out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
     tl.store(out_ptr_ij, out_val)
 
-
 def triton_convert_req_index_to_global_index(
         req_id: torch.Tensor,  # int32 [num_tokens]
         block_table: torch.
@@ -520,6 +519,7 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
 
+
         q = torch.cat([ql_nope, q_pe], dim=-1)
 
         # write the latent and rope to kv cache
@@ -532,13 +532,11 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=layer._k_scale,
             )
-
         if self.kv_cache_dtype != "fp8_ds_mla":
             attn_out = self._forward_bf16_kv(q, kv_cache, topk_indices_global,
                                              attn_metadata)
         else:
             attn_out = self._forward_fp8_kv(q, kv_cache, topk_indices_global,
                                             attn_metadata)
-
         self._v_up_proj(attn_out, out=output[:num_actual_toks])
         return output
