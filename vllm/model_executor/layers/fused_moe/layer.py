@@ -892,6 +892,7 @@ class FusedMoE(CustomOp):
             elif (current_platform.is_rocm() or current_mxfp4_backend
                   == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM or
                   current_mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16):
+                hidden_size = round_up(hidden_size, 256)
 
         # For smuggling this layer into the fused moe custom op
         compilation_config = vllm_config.compilation_config

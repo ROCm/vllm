@@ -1642,18 +1642,19 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 # Convert from (N, B, L) to (B, N, L)
                 decode_ql_nope = decode_ql_nope.transpose(0, 1)
 
-            if VLLM_ROCM_USE_AITER_TRITON_FP8_BMM:
-                decode_ql_nope = decode_q_out[... , :self.W_K.shape[1]] if (kv_cache.numel() > 0 and positions is not None) else None
-                decode_ql_nope = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(decode_q_nope, self.W_K, self.W_K_scale, group_size = 128, YQ = decode_ql_nope, transpose_bm = True, transpose_bm_in = True)
-                self._forward_decode(
-                    decode_ql_nope, decode_q_pe, kv_c_and_k_pe_cache=kv_cache, attn_metadata=attn_metadata, layer=layer, mla_output_zeros=mla_output_zeros, decode_q_out=decode_q_out, output=output[:num_decode_tokens])
-            else:
-                # Convert from (B, N, P) to (N, B, P)
-                decode_q_nope = decode_q_nope.transpose(0, 1)
-                # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                decode_ql_nope = torch.bmm(decode_q_nope, self.W_UK_T)
-                # Convert from (N, B, L) to (B, N, L)
-                decode_ql_nope = decode_ql_nope.transpose(0, 1)
+            if fp8_attention:
+                ql_nope_shape = decode_ql_nope.shape
+                decode_ql_nope, _ = ops.scaled_fp8_quant(
+                    decode_ql_nope.reshape([
+                        ql_nope_shape[0], ql_nope_shape[1] * ql_nope_shape[2]
+                    ]), layer._q_scale)
+                decode_ql_nope = decode_ql_nope.reshape(ql_nope_shape)
+                q_pe_shape = decode_q_pe.shape
+                decode_q_pe, _ = ops.scaled_fp8_quant(
+                    decode_q_pe.reshape(
+                        [q_pe_shape[0], q_pe_shape[1] * q_pe_shape[2]]),
+                    layer._q_scale)
+                decode_q_pe = decode_q_pe.reshape(q_pe_shape)
 
             decode_q = (decode_ql_nope, decode_q_pe)
             if self.dcp_world_size > 1:

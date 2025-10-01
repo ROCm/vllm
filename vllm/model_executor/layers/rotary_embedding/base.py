@@ -10,6 +10,7 @@ from vllm.model_executor.custom_op import CustomOp
 
 from .common import apply_rotary_emb_torch
 from .rocm_aiter_rope_ops import (is_rocm_triton_rotary_embedding_enabled,
+                                  is_rocm_rotary_embedding_enabled,
                                   rocm_aiter_rotary_emb)
 
 
@@ -48,6 +49,8 @@ class RotaryEmbedding(CustomOp):
             cache = cache.to(dtype)
         self.cos_sin_cache: torch.Tensor
         self.register_buffer("cos_sin_cache", cache, persistent=False)
+        self.is_rocm_aiter_enabled = \
+            is_rocm_rotary_embedding_enabled()
         self.is_rocm_triton_rotary_embedding_enabled = \
             is_rocm_triton_rotary_embedding_enabled()
 
@@ -149,7 +152,7 @@ class RotaryEmbedding(CustomOp):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # currently only rotary embedding ops from AITER package are
         # supported for HiP forward.
-        if self.is_rocm_aiter_triton_enabled:
+        if self.is_rocm_triton_rotary_embedding_enabled:
             return self.forward_cuda(positions, query, key, offsets)
         elif self.is_rocm_aiter_enabled:
             return self.forward_hip_rocm_aiter(positions, query, key, offsets,

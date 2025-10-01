@@ -895,6 +895,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_USE_AITER_TRITON_ROPE":
     lambda: (os.getenv("VLLM_USE_AITER_TRITON_ROPE", "True").lower() in
+             ("true", "1")),
 
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.

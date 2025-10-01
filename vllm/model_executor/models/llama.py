@@ -62,7 +62,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
-    from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+    #from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and not envs.VLLM_ROCM_USE_AITER_MHA
 else:
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False

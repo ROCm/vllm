@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Optional
 
 import torch
-
+from vllm import envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType)
 from vllm.attention.ops.triton_unified_attention import unified_attention

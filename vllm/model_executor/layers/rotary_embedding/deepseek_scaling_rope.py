@@ -96,7 +96,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         offsets: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """PyTorch-native implementation equivalent to forward()."""
-        if self.is_rocm_aiter_triton_enabled:
+        if self.is_rocm_triton_rotary_embedding_enabled:
             return self.forward_cuda(positions, query, key, offsets)
         elif self.is_rocm_aiter_enabled:
             return self.forward_hip_rocm_aiter(positions, query, key, offsets)
@@ -132,12 +132,3 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query = query_rot
             key = key_rot
         return query, key
-
-    def forward_cuda(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-        return self.forward_native(positions, query, key, offsets)
