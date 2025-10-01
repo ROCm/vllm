@@ -30,7 +30,8 @@
   #define __HIP__GFX9__
 #endif
 
-#if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1101__))
+#if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+                           defined(__gfx1150__) || defined(__gfx1151__))
   #define __HIP__GFX11__
 #endif
 
