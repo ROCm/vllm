@@ -5,6 +5,7 @@ from typing import Any, Callable, Optional
 
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEConfig,
