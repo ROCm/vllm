@@ -7,8 +7,6 @@ import torch
 import torch._inductor.pattern_matcher as pm
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
-from torch._subclasses.fake_tensor import (FakeTensorMode,
-                                           unset_fake_temporarily)
 
 from vllm.attention import Attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
@@ -19,7 +17,8 @@ from vllm.platforms import current_platform
 from vllm.utils import round_up
 
 from .fusion import QUANT_OPS, empty_bf16, empty_fp32, empty_i32
-from .vllm_inductor_pass import VllmInductorPass
+from .inductor_pass import enable_fake_mode
+from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 logger = init_logger(__name__)
 
@@ -53,6 +52,10 @@ class AttentionQuantPattern(ABC):
         assert self.quant_key in QUANT_OPS, \
             f"unsupported quantization scheme {self.quant_key}"
         self.QUANT_OP = QUANT_OPS[self.quant_key]
+
+    def empty(self, *args, **kwargs):
+        kwargs = {'dtype': self.dtype, 'device': "cuda", **kwargs}
+        return torch.empty(*args, **kwargs)
 
     def empty_quant(self, *args, **kwargs):
         kwargs = {'dtype': self.quant_dtype, 'device': "cuda", **kwargs}
@@ -141,40 +144,25 @@ class AttentionFp8StaticQuantPattern(AttentionQuantPattern):
                                       output_block_scale=None)
             return RESHAPE_OP(at1[1], [-1, self.num_heads * self.head_size])
 
-        # Need custom fake mode, otherwise tracing happens with real tensors.
-        # That would not work for the unified_attention custom op.
-        with unset_fake_temporarily(), FakeTensorMode():
-            inputs = [
-                torch.empty(5,
-                            self.num_heads,
-                            self.head_size,
-                            device="cuda",
-                            dtype=self.dtype),  # q
-                torch.empty(5,
-                            self.num_heads,
-                            self.head_size,
-                            device="cuda",
-                            dtype=self.dtype),  # k
-                torch.empty(5,
-                            self.num_heads,
-                            self.head_size,
-                            device="cuda",
-                            dtype=self.dtype),  # v
-                torch.empty(5,
-                            self.num_heads,
-                            self.head_size,
-                            dtype=self.dtype,
-                            device="cuda"),
-                self.empty_quant(5, self.num_heads *
-                                 self.head_size),  # quant_output
-                empty_fp32(1, 1)  # scale
-            ]
+        inputs = [
+            self.empty(5, self.num_heads, self.head_size,
+                       dtype=self.dtype),  # q
+            self.empty(5, self.num_heads, self.head_size,
+                       dtype=self.dtype),  # k
+            self.empty(5, self.num_heads, self.head_size,
+                       dtype=self.dtype),  # v
+            self.empty(5, self.num_heads, self.head_size,
+                       dtype=self.dtype),  # attn_output
+            self.empty_quant(5,
+                             self.num_heads * self.head_size),  # quant_output
+            empty_fp32(1, 1)  # scale
+        ]
 
-            pm.register_replacement(
-                pattern, replacement, inputs,
-                AttentionQuantPattern.wrap_trace_fn(
-                    AttentionQuantPattern.fx_view_to_reshape, pm.fwd_only),
-                pm_pass)
+        pm.register_replacement(
+            pattern, replacement, inputs,
+            AttentionQuantPattern.wrap_trace_fn(
+                AttentionQuantPattern.fx_view_to_reshape, pm.fwd_only),
+            pm_pass)
 
 
 class AttentionNvfp4QuantPattern(AttentionQuantPattern):
@@ -237,30 +225,26 @@ class AttentionNvfp4QuantPattern(AttentionQuantPattern):
                                 [-1, self.num_heads * self.head_size // 2])
             return output, at2[2]
 
-        # Need custom fake mode, otherwise tracing happens with real tensors.
-        # That would not work for the unified_attention custom op.
-        with unset_fake_temporarily(), FakeTensorMode():
-            inputs = [
-                empty_bf16(5, self.num_heads, self.head_size),  # q
-                empty_bf16(5, self.num_heads, self.head_size),  # k
-                empty_bf16(5, self.num_heads, self.head_size),  # v
-                empty_bf16(5, self.num_heads, self.head_size),  # output_attn
-                self.empty_quant(5, self.num_heads * self.head_size //
-                                 2),  # output_quant
-                empty_i32(128,
-                          round_up(self.num_heads * self.head_size // 16,
-                                   4)),  # output_scale
-                empty_fp32(1, 1),  # input_scale
-            ]
+        inputs = [
+            empty_bf16(5, self.num_heads, self.head_size),  # q
+            empty_bf16(5, self.num_heads, self.head_size),  # k
+            empty_bf16(5, self.num_heads, self.head_size),  # v
+            empty_bf16(5, self.num_heads, self.head_size),  # output_attn
+            self.empty_quant(5, self.num_heads * self.head_size //
+                             2),  # output_quant
+            empty_i32(128, round_up(self.num_heads * self.head_size // 16,
+                                    4)),  # output_scale
+            empty_fp32(1, 1),  # input_scale
+        ]
 
-            pm.register_replacement(
-                pattern, replacement, inputs,
-                AttentionQuantPattern.wrap_trace_fn(
-                    AttentionQuantPattern.fx_view_to_reshape, pm.fwd_only),
-                pm_pass)
+        pm.register_replacement(
+            pattern, replacement, inputs,
+            AttentionQuantPattern.wrap_trace_fn(
+                AttentionQuantPattern.fx_view_to_reshape, pm.fwd_only),
+            pm_pass)
 
 
-class AttnFusionPass(VllmInductorPass):
+class AttnFusionPass(VllmPatternMatcherPass):
     """
     This pass fuses post-attention quantization onto attention if supported.
 
@@ -273,6 +257,7 @@ class AttnFusionPass(VllmInductorPass):
     support are attention kernels, which need to support fusing output quant.
     """
 
+    @enable_fake_mode
     def __init__(self, config: VllmConfig):
         super().__init__(config)
 
@@ -284,7 +269,8 @@ class AttnFusionPass(VllmInductorPass):
                 layer, config.model_config.dtype)
             pattern_fp8.register_if_supported(self.patterns)
 
-            if current_platform.is_cuda():
+            if current_platform.is_cuda() and hasattr(torch.ops._C,
+                                                      "scaled_fp4_quant"):
                 pattern_nvfp4 = AttentionNvfp4QuantPattern(
                     layer, config.model_config.dtype)
                 pattern_nvfp4.register_if_supported(self.patterns)
@@ -295,20 +281,12 @@ class AttnFusionPass(VllmInductorPass):
                 "were found in CompilationConfig.static_forward_context "
                 "so no fusion patterns were registered.")
 
+        self.dump_patterns(config, self.patterns)
+
+    @VllmInductorPass.time_and_log
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
-        self.begin()
-        self.dump_graph(graph, "before_attn_fusion")
-
-        count = self.patterns.apply(graph)
-
-        # TODO: Move this to pass_manager.py after the fx graph broken issue
-        # has been resolved.
-        # see https://github.com/vllm-project/vllm/issues/23091
-        graph.eliminate_dead_code()
-
-        logger.debug("Fused quantization onto %s attention nodes", count)
-        self.dump_graph(graph, "after_attn_fusion")
-        self.end_and_log()
+        self.matched_count = self.patterns.apply(graph)
+        logger.debug("Fused quant onto %s attention nodes", self.matched_count)
 
     def uuid(self):
         return VllmInductorPass.hash_source(self, AttentionQuantPattern,

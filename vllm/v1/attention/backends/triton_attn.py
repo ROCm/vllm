@@ -1,29 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Attention layer with PagedAttention and Triton prefix prefill."""
+"""High-Performance Triton-only Attention layer."""
 from dataclasses import dataclass
-from functools import cache
 from typing import ClassVar, Optional
 
 import torch
 
-from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType)
-from vllm.attention.ops.chunked_prefill_paged_decode import (
-    chunked_prefill_paged_decode)
-from vllm.attention.ops.paged_attn import PagedAttention
+from vllm.attention.ops.triton_unified_attention import unified_attention
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey, kFp8StaticTensorSym)
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               AttentionMetadataBuilder,
                                               CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+if current_platform.is_cuda_alike():
+    from vllm import _custom_ops as ops
+elif current_platform.is_xpu():
+    from vllm._ipex_ops import ipex_ops as ops
 
 logger = init_logger(__name__)
 
@@ -75,9 +74,9 @@ class TritonAttentionMetadataBuilder(
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
                  vllm_config: VllmConfig, device: torch.device):
-        self.device = device
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
         self.block_size = kv_cache_spec.block_size
-        self.kv_cache_spec = kv_cache_spec
 
         model_config = vllm_config.model_config
         self.num_heads_q = model_config.get_num_attention_heads(
@@ -151,20 +150,15 @@ class TritonAttentionBackend(AttentionBackend):
 
     @classmethod
     def get_supported_dtypes(cls) -> list[torch.dtype]:
-        return [torch.float16, torch.bfloat16]
-
-    @classmethod
-    def get_supported_head_sizes(cls) -> list[int]:
-        return [32, 64, 96, 128, 160, 192, 224, 256]
+        return [torch.float16, torch.bfloat16, torch.float32]
 
     @classmethod
     def validate_head_size(cls, head_size: int) -> None:
-        supported_head_sizes = cls.get_supported_head_sizes()
-        if head_size not in supported_head_sizes:
-            attn_type = cls.__name__.removesuffix("Backend")
+        # Triton Attention supports any head size above 32
+        if head_size < 32:
             raise ValueError(
-                f"Head size {head_size} is not supported by {attn_type}. "
-                f"Supported head sizes are: {supported_head_sizes}. "
+                f"Head size {head_size} is not supported by TritonAttention."
+                f"Head sizes need to be larger or equal 32 for this backend. "
                 "Set VLLM_ATTENTION_BACKEND=FLEX_ATTENTION to use "
                 "FlexAttention backend which supports all head sizes.")
 
@@ -189,7 +183,7 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def use_cascade_attention(*args, **kwargs) -> bool:
@@ -198,15 +192,6 @@ class TritonAttentionBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["TritonAttentionMetadataBuilder"]:
         return TritonAttentionMetadataBuilder
-
-
-@cache
-def use_aiter_unified_attention() -> bool:
-    """Check if aiter unified attention should be used."""
-    # VLLM_ROCM_USE_AITER_MHA needs to set to 0 as well as it is set
-    # to 1 as default
-    return envs.VLLM_ROCM_USE_AITER \
-        and envs.VLLM_USE_AITER_UNIFIED_ATTENTION
 
 
 class TritonAttentionImpl(AttentionImpl):
@@ -291,7 +276,7 @@ class TritonAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: FlashAttentionMetadata,
+        attn_metadata: TritonAttentionMetadata,
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         positions: torch.Tensor = None,
@@ -299,14 +284,14 @@ class TritonAttentionImpl(AttentionImpl):
         is_neox: bool = False,
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Forward pass with FlashAttention.
+        """Forward pass with Paged Attention impl. in Triton.
 
         Args:
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: shape =
-                [2, num_blocks, block_size, num_kv_heads, head_size]
+                [num_blocks, 2, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]

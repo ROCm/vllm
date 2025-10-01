@@ -3,6 +3,7 @@
 """Custom activation functions."""
 import math
 from typing import Optional
+from functools import cache
 
 import torch
 import torch.nn as nn
@@ -11,26 +12,39 @@ import torch.nn.functional as F
 from vllm import envs
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
 from vllm.utils import direct_register_custom_op
 
-from vllm.logger import init_logger
 logger = init_logger(__name__)
 
-if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
-    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT
-    VLLM_TRITON_FP4_GEMM_USE_ASM = envs.VLLM_ROCM_USE_AITER and envs.VLLM_TRITON_FP4_GEMM_USE_ASM
+@cache
+def is_rocm_aiter_fp4_asm_gemm_enabled() -> bool:
+    return current_platform.is_rocm() \
+        and envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM \
+        and envs.VLLM_ROCM_USE_AITER
+@cache
+def is_rocm_use_aiter_triton_silu_mul_fp4_quant() -> bool:
+    return current_platform.is_rocm() \
+        and envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT \
+        and envs.VLLM_ROCM_USE_AITER
     
-    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
+@cache
+def is_rocm_use_aiter_triton_silu_mul_fp8_quant() -> bool:
+    return current_platform.is_rocm() \
+        and envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT \
+        and envs.VLLM_ROCM_USE_AITER
+
+
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    
+    if is_rocm_use_aiter_triton_silu_mul_fp4_quant():
         from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
 
-    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
-
-    if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
-        logger.info("[Aiter] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=1")
+    if is_rocm_use_aiter_triton_silu_mul_fp8_quant():
         from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
         import aiter as rocm_aiter
         rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
@@ -59,14 +73,9 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             dispatch_key=current_platform.dispatch_key,
         )
 
-else:
-    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT = False
-    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
-    VLLM_TRITON_FP4_GEMM_USE_ASM = False
-
-logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT=}")
-logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=}")
-logger.info(f"[Aiter] {VLLM_TRITON_FP4_GEMM_USE_ASM=}")
+logger.info(f"[Aiter] {is_rocm_use_aiter_triton_silu_mul_fp4_quant=}")
+logger.info(f"[Aiter] {is_rocm_use_aiter_triton_silu_mul_fp8_quant=}")
+logger.info(f"[Aiter] {is_rocm_aiter_fp4_asm_gemm_enabled()=}")
     
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
@@ -118,7 +127,7 @@ class SiluAndMul(CustomOp):
     def __init__(self):
         super().__init__()
 
-        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
+        if is_rocm_use_aiter_triton_silu_mul_fp4_quant():
             self.op = lambda x, shuffle: act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
         elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul
@@ -136,8 +145,8 @@ class SiluAndMul(CustomOp):
     def forward_cuda(self,
                      x: torch.Tensor,
                      scale: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
-            shuffle = VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32
+        if is_rocm_use_aiter_triton_silu_mul_fp4_quant():
+            shuffle = is_rocm_aiter_fp4_asm_gemm_enabled() and x.shape[0] >= 32
             out, out_scales = self.op(x, shuffle)
             return out, out_scales
         else:
@@ -153,13 +162,6 @@ class SiluAndMul(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x)
         return out
-
-    def forward_neuron(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        x_reshaped = x.view(-1, x.shape[-1])
-        s = x_reshaped[:, :d] * F.sigmoid(x_reshaped[:, :d])
-        result = s * x_reshaped[:, d:]
-        return result.view(*x.shape[:-1], d)
 
 
 @CustomOp.register("mul_and_silu")
@@ -421,8 +423,117 @@ class ReLUSquaredActivation(CustomOp):
         return torch.square(F.relu(x))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        #TODO : implement cuda kenrels
+        #TODO : implement cuda kernels
         return self.forward_native(x)
+
+
+@CustomOp.register("xielu")
+class XIELU(CustomOp):
+    """
+    Applies the xIELU activation function introduced in https://arxiv.org/abs/2411.13010
+    If the user has installed the nickjbrowning/XIELU, we import xIELU CUDA
+    Otherwise, we emit a single warning and use xIELU Python
+    """
+
+    def __init__(
+        self,
+        alpha_p_init: float = 0.8,
+        alpha_n_init: float = 0.8,
+        beta: float = 0.5,
+        eps: float = -1e-6,
+        dtype: torch.dtype = torch.bfloat16,
+        with_vector_loads: bool = False,
+    ):
+        super().__init__()
+        self.alpha_p = nn.Parameter(
+            torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=dtype)) -
+                      1).unsqueeze(0))
+        self.alpha_n = nn.Parameter(
+            torch.log(
+                torch.exp(torch.tensor(alpha_n_init - beta, dtype=dtype)) -
+                1).unsqueeze(0))
+        self.register_buffer("beta", torch.tensor(beta, dtype=dtype))
+        self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
+        self.with_vector_loads = with_vector_loads
+        # Temporary until xIELU CUDA fully implemented
+        self._beta_scalar = float(self.beta.detach().cpu().float().item())
+        self._eps_scalar = float(self.eps.detach().cpu().float().item())
+
+        self._xielu_cuda_obj = None
+        try:
+            import xielu.ops  # noqa: F401
+
+            self._xielu_cuda_obj = torch.classes.xielu.XIELU()
+            msg = "Using experimental xIELU CUDA."
+            try:
+                from torch._dynamo import allow_in_graph
+
+                self._xielu_cuda_fn = allow_in_graph(self._xielu_cuda)
+                msg += " Enabled torch._dynamo for xIELU CUDA."
+            except Exception as err:
+                msg += (f" Could not enable torch._dynamo for xIELU ({err}) - "
+                        "this may result in slower performance.")
+                self._xielu_cuda_fn = self._xielu_cuda
+            logger.warning_once(msg)
+        except Exception as err:
+            logger.warning_once(
+                "CUDA-fused xIELU not available (%s) –"
+                " falling back to a Python version.\n"
+                "For CUDA xIELU (experimental), `pip install git+https://github.com/nickjbrowning/XIELU`",
+                str(err),
+            )
+
+    def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
+        alpha_p = nn.functional.softplus(self.alpha_p)
+        alpha_n = self.beta + nn.functional.softplus(self.alpha_n)
+        return torch.where(
+            x > 0,
+            alpha_p * x * x + self.beta * x,
+            (torch.expm1(torch.min(x, self.eps)) - x) * alpha_n +
+            self.beta * x,
+        )
+
+    def _xielu_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        """Firewall function to prevent torch.compile from seeing .item()"""
+        assert self._xielu_cuda_obj is not None, (
+            "XIELU CUDA object must not be None")
+        original_shape = x.shape
+        # CUDA kernel expects 3D tensors, reshape if needed
+        while x.dim() < 3:
+            x = x.unsqueeze(0)
+        if x.dim() > 3:
+            x = x.view(-1, 1, x.size(-1))
+        if original_shape != x.shape:
+            logger.warning_once(
+                "Warning: xIELU input tensor expects 3 dimensions"
+                " but got (shape: %s). Reshaping to (shape: %s).",
+                original_shape,
+                x.shape,
+            )
+        result = self._xielu_cuda_obj.forward(
+            x,
+            self.alpha_p,
+            self.alpha_n,
+            # Temporary until xIELU CUDA fully implemented ->
+            # self.{beta,eps}.item()
+            self._beta_scalar,
+            self._eps_scalar,
+            self.with_vector_loads,
+        )
+        return result.view(original_shape)
+
+    def forward_native(self, input: torch.Tensor) -> torch.Tensor:
+        if self._xielu_cuda_obj is not None and input.is_cuda:
+            if not torch._dynamo.is_compiling():
+                return self._xielu_cuda_fn(input)
+            else:
+                logger.warning_once(
+                    "torch._dynamo is compiling, using Python version of xIELU."
+                )
+        return self._xielu_python(input)
+
+    def forward_cuda(self, input: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(input)
 
 
 class ScaledActivation(nn.Module):
@@ -488,6 +599,8 @@ _ACTIVATION_REGISTRY = LazyDict({
     lambda: nn.Tanh(),
     "sigmoid":
     lambda: nn.Sigmoid(),
+    "xielu":
+    lambda: XIELU(),
 })
 
 

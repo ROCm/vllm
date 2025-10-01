@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import cache
 from typing import Callable, Optional
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op, is_torch_equal_or_newer
@@ -12,6 +14,12 @@ import vllm.envs as envs
 logger = init_logger(__name__)
 
 OCP_MX_BLOCK_SIZE = 32
+
+
+@cache
+def use_fp4_aiter_moe():
+    return current_platform.supports_mx() and envs.VLLM_ROCM_USE_AITER \
+        and not envs.VLLM_ROCM_USE_EMULATED_MXFP4_MOE
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):

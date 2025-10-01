@@ -13,8 +13,7 @@ from vllm.utils import direct_register_custom_op
 
 
 def is_rocm_aiter_rmsnorm_enabled() -> bool:
-    return current_platform.is_rocm() \
-        and envs.VLLM_ROCM_USE_AITER_RMSNORM \
+    return envs.VLLM_ROCM_USE_AITER_RMSNORM \
         and envs.VLLM_ROCM_USE_AITER
 
 
@@ -143,6 +142,13 @@ class RMSNorm(CustomOp):
             self.weight = torch.ones(hidden_size)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
+        weight_dtype = self.weight.data.dtype
+
+        if current_platform.is_rocm():
+            self.rocm_norm_func = dispatch_rocm_rmsnorm_func(
+                with_fused_add=False, dtype=weight_dtype)
+            self.rocm_norm_func_with_add = dispatch_rocm_rmsnorm_func(
+                with_fused_add=True, dtype=weight_dtype)
 
     def forward_native(
         self,
@@ -191,13 +197,27 @@ class RMSNorm(CustomOp):
             return self.forward_native(x, residual)
 
         add_residual = residual is not None
-        norm_func = dispatch_cuda_rmsnorm_func(add_residual)
-
         if add_residual:
-            return norm_func(x, residual, self.weight.data,
-                             self.variance_epsilon)
+            return fused_add_rms_norm(x, residual, self.weight.data,
+                                      self.variance_epsilon)
         else:
-            return norm_func(x, self.weight.data, self.variance_epsilon)
+            return rms_norm(x, self.weight.data, self.variance_epsilon)
+
+    def forward_hip(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+
+        add_residual = residual is not None
+        if add_residual:
+            return self.rocm_norm_func_with_add(x, residual, self.weight.data,
+                                                self.variance_epsilon)
+        else:
+            return self.rocm_norm_func(x, self.weight.data,
+                                       self.variance_epsilon)
 
     def forward_xpu(
         self,
@@ -294,3 +314,48 @@ class GemmaRMSNorm(CustomOp):
                 self.forward_static)
             self._is_compiled = True
         return self.forward_native(x, residual)
+
+
+@CustomOp.register("poly_norm")
+class PolyNorm(CustomOp):
+    """Polynomial normalization.
+
+    Computes x -> w_0 * RMSNorm(x^3) + w_1 * RMSNorm(x^2) + w_2 * RMSNorm(x) + b
+    where w_n is the learned weight and b is the bias.
+    Refer to https://arxiv.org/html/2411.03884v1
+    """
+
+    def __init__(
+        self,
+        eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(3) / 3)
+        self.bias = torch.nn.Parameter(torch.zeros(1))
+        self.variance_epsilon = eps
+
+    def _norm(self, x):
+        return x / torch.sqrt(
+            x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward().
+
+        Refer to https://github.com/BryceZhuo/PolyCom?tab=readme-ov-file/README.md
+        """
+
+        orig_dtype = x.dtype
+        x_float = x.to(torch.float32)
+        output = (self.weight[0] * self._norm(x_float**3) +
+                  self.weight[1] * self._norm(x_float**2) +
+                  self.weight[2] * self._norm(x_float) + self.bias)
+        return output.to(orig_dtype)
+
+    def forward_cuda(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        return poly_norm(x, self.weight, self.bias, self.variance_epsilon)

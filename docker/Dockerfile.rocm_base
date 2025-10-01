@@ -16,7 +16,7 @@ ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
 
 FROM ${BASE_IMAGE} AS base
 
-ENV PATH=/opt/rocm/llvm/bin:$PATH
+ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV ROCM_PATH=/opt/rocm
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
 ARG PYTORCH_ROCM_ARCH=gfx942;gfx950
@@ -173,6 +173,17 @@ RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 # RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
+
+FROM base AS debs
+RUN mkdir /app/debs
+RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
 
 FROM base AS final
 # RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \

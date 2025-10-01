@@ -6,6 +6,7 @@ The architecture is the same as granitemoe but with the addition of shared
 experts.
 """
 from collections.abc import Iterable
+from itertools import islice
 from typing import Optional
 
 import torch
@@ -24,7 +25,6 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from .granitemoe import GraniteMoeAttention, GraniteMoeModel, GraniteMoeMoE
@@ -200,8 +200,7 @@ class GraniteMoeSharedModel(nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(positions, hidden_states)
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -311,11 +310,9 @@ class GraniteMoeSharedForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                                    inputs_embeds)
         return hidden_states
 
-    def compute_logits(
-            self, hidden_states: torch.Tensor,
-            sampling_metadata: SamplingMetadata) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+    def compute_logits(self,
+                       hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def make_empty_intermediate_tensors(

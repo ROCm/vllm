@@ -13,7 +13,8 @@ import vllm.envs as envs
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (get_ep_group, get_tensor_model_parallel_rank,
+from vllm.distributed import (get_ep_group, get_pp_group,
+                              get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -29,8 +30,11 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
-from vllm.platforms import current_platform
+
+from .interfaces import SupportsEagle3, SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper, extract_layer_index,
+                    is_pp_missing_parameter,
+                    make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 import os
 
@@ -96,10 +100,7 @@ class OAIAttention(nn.Module):
 
         self.sinks = torch.nn.Parameter(
             torch.empty(config.num_attention_heads // tp_size,
-                        dtype=torch.bfloat16,
                         requires_grad=False))
-
-        self.norm = RMSNorm(config.hidden_size, eps=1e-5)
 
         self.q_size = self.num_attention_heads * self.head_dim // tp_size
         self.kv_size = self.num_key_value_heads * self.head_dim // tp_size
@@ -186,8 +187,7 @@ class MLPBlock(torch.nn.Module):
         self.hidden_size = config.hidden_size
         self.norm = RMSNorm(config.hidden_size, eps=1e-5)
         self.router = torch.nn.Linear(config.hidden_size,
-                                      config.num_local_experts,
-                                      dtype=torch.bfloat16)
+                                      config.num_local_experts)
         assert config.intermediate_size % self.world_size == 0
         self.experts = FusedMoE(num_experts=config.num_local_experts,
                                 top_k=config.num_experts_per_tok,
@@ -242,12 +242,28 @@ class TransformerBlock(torch.nn.Module):
                             self.layer_idx,
                             quant_config=quant_config,
                             prefix=f"{prefix}.mlp")
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-5)
 
-    def forward(self, hidden_states: torch.Tensor,
-                positions: torch.Tensor) -> torch.Tensor:
-        attn_output = self.attn(hidden_states, positions)
-        output = self.mlp(attn_output)
-        return output
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
+        hidden_states = self.attn(hidden_states, positions)
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
+        output = self.mlp(hidden_states)
+        return output, residual
 
 
 @support_torch_compile
@@ -269,15 +285,21 @@ class GptOssModel(nn.Module):
             self.config.vocab_size,
             self.config.hidden_size,
         )
-        self.layers = torch.nn.ModuleList([
-            TransformerBlock(
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            self.config.num_hidden_layers,
+            lambda prefix: TransformerBlock(
                 self.config,
                 cache_config=self.cache_config,
                 quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, f"block.{layer_idx}"),
-            ) for layer_idx in range(self.config.num_hidden_layers)
-        ])
+                prefix=prefix,
+            ),
+            prefix=f"{prefix}.layers",
+        )
         self.norm = RMSNorm(self.config.hidden_size, eps=1e-5)
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], self.config.hidden_size))
+        self.aux_hidden_state_layers = tuple[int, ...]()
 
     def forward(self, input_ids: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
@@ -324,6 +346,10 @@ class GptOssModel(nn.Module):
                           intermediate_size)
 
         for name, weight in weights:
+            # Skip layers on other devices.
+            if is_pp_missing_parameter(name, self):
+                continue
+
             # FIXME(woosuk): Remove this after testing.
             weight = weight.cuda()
 
@@ -505,6 +531,10 @@ class GptOssModel(nn.Module):
                           intermediate_size)
 
         for name, weight in weights:
+            # Skip layers on other devices.
+            if is_pp_missing_parameter(name, self):
+                continue
+
             if ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
                 # Extract gate and up projection parts
@@ -622,18 +652,15 @@ class GptOssModel(nn.Module):
                                             weights, stacked_params_mapping)
 
 
-class GptOssForCausalLM(nn.Module):
+class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     packed_modules_mapping = {"qkv": ["q_proj", "k_proj", "v_proj"]}
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
             ".self_attn.": ".attn.",
-            ".post_attention_layernorm.": ".mlp.norm.",
         },
         orig_to_new_suffix={
             ".embed_tokens.weight": ".embedding.weight",
-            ".input_layernorm.weight": ".attn.norm.weight",
-            ".post_attention_layernorm.weight": ".mlp.norm.weight",
 
             # MoE MXFP4 weights
             ".gate_up_proj_blocks": ".w13_weight",
@@ -667,22 +694,32 @@ class GptOssForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
+            prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        num_layers = len(self.model.layers)
+        return (2, num_layers // 2, num_layers - 3)
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
 
     def forward(self,
                 input_ids: torch.Tensor,
                 positions: torch.Tensor,
                 intermediate_tensors: Optional[IntermediateTensors] = None,
                 inputs_embeds: Optional[torch.Tensor] = None) -> torch.Tensor:
-        assert intermediate_tensors is None
-        assert inputs_embeds is None
-        return self.model(input_ids, positions)
+        return self.model(input_ids, positions, intermediate_tensors,
+                          inputs_embeds)
 
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str,

@@ -23,7 +23,7 @@ TORCH_DEVICE_IDENTITY = None
 # The condition to determine if it is on a platform that supports
 # torch._scaled_mm rowwise feature.
 # The condition is determined once as the operations
-# are time consuming.
+# are time-consuming.
 USE_ROWWISE_TORCH_SCALED_MM = (current_platform.is_rocm() and version.parse(
     torch.__version__) >= version.parse("2.7")
                                and current_platform.has_device_capability(94))
@@ -179,7 +179,7 @@ def rocm_per_tensor_w8a8_scaled_mm_impl(qinput: torch.Tensor,
                                         bias: torch.Tensor) -> torch.Tensor:
     from vllm.platforms.rocm import on_mi3xx
     if envs.VLLM_ROCM_USE_SKINNY_GEMM and on_mi3xx(
-    ) and qinput.shape[0] == 1 and qinput.shape[1] % 16 == 0:
+    ) and qinput.shape[0] == 1 and qinput.shape[1] % 16 == 0 and bias is None:
         output = ops.wvSplitKQ(weight.t(), qinput, out_dtype, scale_a, scale_b,
                                current_platform.get_cu_count())
     else:
@@ -356,12 +356,10 @@ class Fp8LinearOp:
     def __init__(self,
                  act_quant_static: bool,
                  act_quant_group_shape: GroupShape = GroupShape.PER_TENSOR,
-                 pad_output: Optional[bool] = None,
-                 force_fp8_e4m3fnuz: bool = False):
+                 pad_output: Optional[bool] = None):
         if current_platform.is_rocm():
             self.preferred_backend = "rocm"
-        elif current_platform.is_cuda(
-        ) and not force_fp8_e4m3fnuz and cutlass_fp8_supported():
+        elif current_platform.is_cuda() and cutlass_fp8_supported():
             if has_flashinfer() and current_platform.has_device_capability(
                     100):
                 self.preferred_backend = "flashinfer"

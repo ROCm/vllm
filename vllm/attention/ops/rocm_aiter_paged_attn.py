@@ -115,10 +115,8 @@ class AITERPagedAttention(PagedAttention):
             )
 
         if "fp8" in kv_cache_dtype:
-            kv_cache_torch_dtype = FP8_DTYPE
-            # kv_cache_torch_dtype = torch.int8
-            key_cache = key_cache.view(kv_cache_torch_dtype)
-            value_cache = value_cache.view(kv_cache_torch_dtype)
+            key_cache = key_cache.view(current_platform.fp8_dtype())
+            value_cache = value_cache.view(current_platform.fp8_dtype())
 
         if blocksparse_vert_stride is not None and blocksparse_vert_stride > 1:
             # use blocksparse paged attention
