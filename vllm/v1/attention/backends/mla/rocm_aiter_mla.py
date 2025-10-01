@@ -321,18 +321,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        if isinstance(q, tuple):
-            q_nope, q_pe = q
-        else:
-            q_nope, q_pe = q.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if type(q) is tuple:
+            q = torch.cat(q, dim=-1)
 
-        B = q_nope.shape[0]
+        assert isinstance(q, torch.Tensor)
+        B = q.shape[0]
 
         if decode_q_out is not None:
             q = decode_q_out
-        else:
-            q = torch.cat([q_nope, q_pe], dim=-1)
         if mla_output_zeros is not None:
             o = mla_output_zeros
             assert o.shape[0] == B, f"{o.shape[0]=} {B=}"
@@ -358,7 +354,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                              attn_metadata.decode.paged_kv_indices,
                              attn_metadata.decode.paged_kv_last_page_len)
 
-        return self._v_up_proj(o, output)
+        return o, None
 
     def forward(
         self,
@@ -546,9 +542,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 # decode_q do allgather in head dim.
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
-            # call decode attn
-            attn_out, lse = super()._forward_decode(decode_q, kv_cache,
-                                                    attn_metadata, layer)
+            attn_out, lse = self._forward_decode(decode_q, kv_cache,
+                                                 attn_metadata, layer)
 
             # recorect dcp attn_out with lse.
             if self.dcp_world_size > 1:
