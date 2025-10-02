@@ -176,6 +176,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16: bool = True
     VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB: Optional[int] = None
     VLLM_NIXL_ABORT_REQUEST_TIMEOUT: int = 480
+    VLLM_ROCM_USE_CK_MXFP4_MOE: bool = False
+    VLLM_ROCM_USE_EMULATED_MXFP4_MOE: bool = False
     VLLM_USE_CUDNN_PREFILL: bool = False
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
@@ -1010,6 +1012,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB":
     lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)),
+
+    "VLLM_ROCM_USE_CK_MXFP4_MOE":
+    lambda: (os.getenv("VLLM_ROCM_USE_CK_MXFP4_MOE", "False").lower() in
+             ("true", "1")),
+
+    "VLLM_ROCM_USE_EMULATED_MXFP4_MOE":
+    lambda: (os.getenv("VLLM_ROCM_USE_EMULATED_MXFP4_MOE", "False").lower() in
+             ("true", "1")),
 
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
     "Q_SCALE_CONSTANT":

@@ -115,6 +115,7 @@ class RotaryEmbedding(CustomOp):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.use_flashinfer:
             torch.ops.vllm.flashinfer_rotary_embedding(positions, query, key,
@@ -126,10 +127,15 @@ class RotaryEmbedding(CustomOp):
         from vllm import _custom_ops as ops
         self._match_cos_sin_cache_dtype(query)
 
-        # ops.rotary_embedding() is an in-place operation
-        # that updates the query and key tensors.
-        ops.rotary_embedding(positions, query, key, self.head_size,
-                             self.cos_sin_cache, self.is_neox_style)
+        if self.is_rocm_triton_rotary_embedding_enabled:
+            rocm_aiter_rotary_emb(positions, query, key, self.cos_sin_cache,
+                                  self.head_size, self.rotary_dim,
+                                  self.is_neox_style, offsets)
+        else:
+            # ops.rotary_embedding() is an in-place operation
+            # that updates the query and key tensors.
+            ops.rotary_embedding(positions, query, key, self.head_size,
+                                 self.cos_sin_cache, self.is_neox_style)
         return query, key
 
     def forward_hip(
