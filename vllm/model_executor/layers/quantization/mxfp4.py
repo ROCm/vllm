@@ -36,6 +36,11 @@ from vllm.utils import (has_triton_kernels, is_torch_equal_or_newer,
                         next_power_of_2, round_up)
 from vllm.utils.flashinfer import has_flashinfer
 
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+    import aiter
+    from aiter.fused_moe import fused_topk, moe_sorting
+    from aiter.ops.shuffle import shuffle_mxfp4_weight, shuffle_mxfp4_scale
+
 logger = init_logger(__name__)
 
 
@@ -596,18 +601,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             else:
                 num_warps = 8
 
-            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-                layer.w13_weight, layer.w13_weight_scale, num_warps)
-            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight, layer.w2_weight_scale, num_warps)
+            if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+                w13_aiter_weight = layer.w13_weight.contiguous()
+                w13_aiter_scale = layer.w13_weight_scale.contiguous()
+                w2_aiter_weight = layer.w2_weight.contiguous()
+                w2_aiter_scale = layer.w2_weight_scale.contiguous()
 
-            self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex))
-            self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex))
+                e, n, k = w13_aiter_weight.shape
+                w13_aiter_weight = w13_aiter_weight.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
+                w13_aiter_scale = w13_aiter_scale.view(e, n // 2, 2, -1).permute(0, 2, 1, 3).contiguous().view(e, n, -1)
 
-            self.w13_weight_triton_tensor = w13_weight
-            self.w2_weight_triton_tensor = w2_weight
+                self.w13_weight_aiter_tensor = shuffle_mxfp4_weight(w13_aiter_weight, 16, True)
+                self.w13_scale_aiter_tensor = shuffle_mxfp4_scale(w13_aiter_scale, True)
+                self.w2_weight_aiter_tensor = shuffle_mxfp4_weight(w2_aiter_weight, 16, False)
+                self.w2_scale_aiter_tensor = shuffle_mxfp4_scale(w2_aiter_scale, False)
+                self.w13_bias_aiter_tensor = layer.w13_bias.view(-1, n // 2, 2).permute(0, 2, 1).contiguous().view(-1, n)
+            else:
+                w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+                    layer.w13_weight, layer.w13_weight_scale, num_warps)
+                w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+                    layer.w2_weight, layer.w2_weight_scale, num_warps)
+
+                self.w13_precision_config = PrecisionConfig(
+                    weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex))
+                self.w2_precision_config = PrecisionConfig(
+                    weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex))
+
+                self.w13_weight_triton_tensor = w13_weight
+                self.w2_weight_triton_tensor = w2_weight
 
             # need to delete the original weights to save memory on single GPU
             del layer.w13_weight
@@ -969,6 +990,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             return output
+        elif current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+                token_num = x.shape[0]
+                BLOCKM = 16 if token_num < 2048 else 32
+                topk_weights, topk_ids = fused_topk(x, router_logits, top_k, True)
+                sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
+                    topk_ids,
+                    topk_weights,
+                    self.num_experts,
+                    x.shape[1],
+                    torch.bfloat16,
+                    BLOCKM
+                )
+                _, n1, k1 = self.w13_weight_aiter_tensor.shape
+                _, k2, n2 = self.w2_weight_aiter_tensor.shape
+                D = n2 if k2 == k1 else n2*2
+                cktile_moe_out1 = torch.empty((token_num, top_k, D), dtype=torch.bfloat16, device=x.device)
+                aiter.moe_cktile2stages_gemm1(
+                    x,
+                    self.w13_weight_aiter_tensor,
+                    cktile_moe_out1,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    top_k,
+                    192, # n_pad_zeros
+                    128, # k_pad_zeros
+                    None, # sorted_weights
+                    None,
+                    self.w13_scale_aiter_tensor,
+                    self.w13_bias_aiter_tensor,
+                    BLOCKM, # block_size
+                )
+                aiter.moe_cktile2stages_gemm2(
+                    cktile_moe_out1,
+                    self.w2_weight_aiter_tensor,
+                    moe_out,
+                    sorted_ids,
+                    sorted_expert_ids,
+                    num_valid_ids,
+                    top_k,
+                    192, # n_pad_zeros
+                    128, # k_pad_zeros
+                    sorted_weights, # sorted_weights
+                    None,
+                    self.w2_scale_aiter_tensor,
+                    layer.w2_bias,
+                    BLOCKM, # block_size
+                )
+                return moe_out
+
         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
             from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (  # noqa: E501
                 triton_kernel_moe_forward)
