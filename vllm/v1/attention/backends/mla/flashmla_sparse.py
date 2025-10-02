@@ -23,7 +23,23 @@ from vllm.v1.attention.backends.mla.common import MLACommonBaseImpl
 from vllm.v1.attention.backends.utils import (AttentionCGSupport,
                                               AttentionMetadataBuilder,
                                               CommonAttentionMetadata)
+from vllm.v1.attention.backends.mla.common import is_rocm_aiter_fp8bmm_enabled
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+
+if is_rocm_aiter_fp8bmm_enabled():
+    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
+        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant
+        as aiter_triton_fp8_bmm)
+
+    def dynamic_per_batched_tensor_quant(
+            x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn):
+        DTYPE_MAX = torch.finfo(dtype).max
+        min_val, max_val = x.aminmax()
+        amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
+        scale = DTYPE_MAX / amax
+        x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
+        return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -503,10 +519,14 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
                                dim=-1)
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
-        # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-        ql_nope = torch.bmm(q_nope, self.W_UK_T)
-        # Convert from (N, B, L) to (B, N, L)
-        ql_nope = ql_nope.transpose(0, 1)
+        if is_rocm_aiter_fp8bmm_enabled():
+            # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
+            ql_nope = aiter_triton_fp8_bmm(q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True)
+        else:
+            # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+            ql_nope = torch.bmm(q_nope, self.W_UK_T)
+            # Convert from (N, B, L) to (B, N, L)
+            ql_nope = ql_nope.transpose(0, 1)
 
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
