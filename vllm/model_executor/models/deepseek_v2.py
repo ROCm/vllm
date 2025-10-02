@@ -100,6 +100,35 @@ elif current_platform.is_xpu():
 
 logger = init_logger(__name__)
 
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD
+    from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+
+    #VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and envs.VLLM_ROCM_USE_AITER_MLA
+
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        import aiter as rocm_aiter
+        rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+        rocm_aiter_fp8_quant_group_size = 128
+
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD:
+        from aiter.ops.triton.fused_mul_add import fused_mul_add
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+
+#VLLM_ROCM_USE_AITER_MLA = envs.VLLM_ROCM_USE_AITER_MLA
+#logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=} {VLLM_ROCM_USE_AITER_MLA=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT=}")
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=}")
+
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -143,7 +172,10 @@ class DeepseekV2MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+            x = torch.ops.vllm.act_mul_and_fp8_group_quant(gate_up)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -275,23 +307,28 @@ class DeepseekV2MoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 
-        fused_moe_out = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
-
-        if self.shared_experts is not None:
-            shared_output, final_hidden_states = fused_moe_out
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16 and shared_output is not None:
+            final_hidden_states = self.experts(hidden_states=hidden_states,
+                                            router_logits=router_logits)
+            final_hidden_states = fused_mul_add(final_hidden_states, self.routed_scaling_factor, shared_output)
         else:
-            shared_output = None
-            final_hidden_states = fused_moe_out
 
-        # Fix FP16 overflow
-        # See DeepseekV2DecoderLayer for more details.
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states *= self.routed_scaling_factor
-        elif self.shared_experts is not None:
-            assert shared_output is not None
-            shared_output *= 1.0 / self.routed_scaling_factor
+            fused_moe_out = self.experts(hidden_states=hidden_states,
+                                         router_logits=router_logits)
+
+            if self.shared_experts is not None:
+                shared_output, final_hidden_states = fused_moe_out
+            else:
+                shared_output = None
+                final_hidden_states = fused_moe_out
+
+            # Fix FP16 overflow
+            # See DeepseekV2DecoderLayer for more details.
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states *= self.routed_scaling_factor
+            elif self.shared_experts is not None:
+                assert shared_output is not None
+                shared_output *= (1. / self.routed_scaling_factor)
 
         if self.shared_experts is not None:
             assert shared_output is not None
@@ -1141,11 +1178,31 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
-            residual = hidden_states.clone()
-            hidden_states = self.input_layernorm(hidden_states)
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            weight = self.input_layernorm.weight
+            eps = self.input_layernorm.variance_epsilon
+            if residual is None:
+                residual = hidden_states
+                (hidden_states_quant, hidden_states_quant_scales), _, _, _ = fused_rms_fp8_group_quant(hidden_states, weight, eps,
+                                                            None, None, eps,
+                                                            group_size=rocm_aiter_fp8_quant_group_size,
+                                                            dtype_quant=rocm_aiter_fp8_dtype,
+                                                            res1=None)
+            else:
+                (hidden_states_quant, hidden_states_quant_scales), _, _, residual = fused_rms_fp8_group_quant(hidden_states, weight, eps,
+                                                            None, None, eps,
+                                                            group_size=rocm_aiter_fp8_quant_group_size,
+                                                            dtype_quant=rocm_aiter_fp8_dtype,
+                                                            res1=residual)
+            hidden_states = (hidden_states_quant, hidden_states_quant_scales)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if residual is None:
+                residual = hidden_states.clone()
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -1162,7 +1219,23 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual *= 1.0 / self.routed_scaling_factor
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            weight = self.post_attention_layernorm.weight
+            eps = self.post_attention_layernorm.variance_epsilon
+            (hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant, _, residual = fused_rms_fp8_group_quant(hidden_states, weight, eps,
+                                                        None, None, eps,
+                                                        group_size=rocm_aiter_fp8_quant_group_size,
+                                                        dtype_quant=rocm_aiter_fp8_dtype,
+                                                        res1=residual,
+                                                        output_unquantized_inp1=isinstance(self.mlp, DeepseekV2MoE))
+            if isinstance(self.mlp, DeepseekV2MoE):
+                hidden_states = ((hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant)
+            else:
+                hidden_states = (hidden_states_quant, hidden_states_quant_scales)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
