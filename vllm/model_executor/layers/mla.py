@@ -10,6 +10,12 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
+import vllm.envs as envs
+from vllm.platforms import current_platform
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 @dataclass
 class MLAModules:
@@ -136,8 +142,23 @@ class MultiHeadLatentAttention(CustomOp):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+            if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+                weight = self.q_a_layernorm.weight
+                eps = self.q_a_layernorm.variance_epsilon
+                weight2 = self.kv_a_layernorm.weight
+                eps2 = self.kv_a_layernorm.variance_epsilon
+                kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
+                                        dim=-1)
+                (q_c, q_c_scale), _, kv_c_normed, _ = fused_rms_fp8_group_quant(q_c, weight, eps,
+                                                        kv_c, weight2, eps2,
+                                                        group_size=rocm_aiter_fp8_quant_group_size,
+                                                        dtype_quant=rocm_aiter_fp8_dtype,
+                                                        res1=None)
+
+                q = self.q_b_proj(q_c, x_quant_scales = q_c_scale)[0]
+            else:
+                q_c = self.q_a_layernorm(q_c)
+                q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, \
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -146,9 +167,10 @@ class MultiHeadLatentAttention(CustomOp):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
-                                   dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        if self.q_lora_rank is None or not VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
+                                       dim=-1)
+            kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe

@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -972,6 +973,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     "VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4", "0"))),
+
+    # Use AITER Triton fused RMSNORM + Quantization
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1"))),
 
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM":
