@@ -62,7 +62,6 @@ class CompressedTensorsLinearTransformMethod(LinearMethodBase):
                        output_partition_sizes: list[int], input_size: int,
                        output_size: int, params_dtype: torch.dtype,
                        **extra_weight_attrs):
-
         # get weight loader for transforms
         weight_loader: Callable = extra_weight_attrs.get(
             "weight_loader")  # type: ignore[assignment]

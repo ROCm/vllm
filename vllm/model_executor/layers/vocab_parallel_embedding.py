@@ -240,6 +240,8 @@ class VocabParallelEmbedding(CustomOp):
         quant_method = None
         if quant_config is not None:
             quant_method = quant_config.get_quant_method(self, prefix=prefix)
+            print(f'>>> MY quant_method in EMBED is {quant_method.__class__.__name__}')
+
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
 
@@ -394,6 +396,7 @@ class VocabParallelEmbedding(CustomOp):
         else:
             assert loaded_weight.shape[output_dim] == self.org_vocab_size
 
+        #if isinstance(param, BasevLLMParameter):
         # Copy the data. Select chunk corresponding to current shard.
         loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         param[:loaded_weight.shape[0]].data.copy_(loaded_weight)

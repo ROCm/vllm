@@ -81,7 +81,7 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
         import aiter as rocm_aiter
         rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
-        rocm_aiter_fp8_quant_group_size = 128    
+        rocm_aiter_fp8_quant_group_size = 128
 
 else:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = False
@@ -111,6 +111,7 @@ class DeepseekV2MLP(nn.Module):
         # across the ranks within the tp_group. In this case the weights are
         # replicated and no collective ops are needed.
         # Otherwise we use standard TP with an allreduce at the end.
+        #print(f'>>> in MLP mergedcolumn {quant_config.get_name()}', flush=True)
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
@@ -560,6 +561,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
 
         if self.q_lora_rank is not None:
+            
             self.fused_qkv_a_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -1051,6 +1053,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts,
                     continue
 
                 param = params_dict[name]
+                #print(f'>>> param name {name}, {param.__class__.__name__}')
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1105,8 +1108,9 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts,
 
                     if is_pp_missing_parameter(name, self):
                         continue
-
+                    
                     param = params_dict[name]
+                    #print(f'>>> param name {name}, {param.__class__.__name__}')
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)

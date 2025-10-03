@@ -174,6 +174,7 @@ class Attention(nn.Module, AttentionLayerBase):
 
         quant_method = quant_config.get_quant_method(
             self, prefix=prefix) if quant_config else None
+
         if quant_method is not None and not isinstance(
                 quant_method, UnquantizedLinearMethod):
             assert isinstance(quant_method, BaseKVCacheMethod)

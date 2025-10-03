@@ -17,7 +17,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.quark.quark_moe import (  # noqa: E501
     QuarkMoEMethod)
 from vllm.model_executor.layers.quantization.quark.schemes import (
-    QuarkScheme, QuarkW4A4MXFP4, QuarkW8A8Fp8, QuarkW8A8Int8)
+    QuarkScheme, QuarkW16A4MXFP4, QuarkW4A4MXFP4, QuarkW8A8Fp8, QuarkW8A8Int8)
 from vllm.model_executor.layers.quantization.quark.utils import (
     deep_compare, should_ignore_layer)
 from vllm.platforms import current_platform
@@ -56,7 +56,8 @@ class QuarkConfig(QuantizationConfig):
         return "quark"
 
     def get_quant_method(self, layer: torch.nn.Module,
-                         prefix: str) -> Optional["QuantizeMethodBase"]:
+                         prefix: str,
+                         params_dtype: Optional[torch.dtype] = None) -> Optional["QuantizeMethodBase"]:
         from vllm.attention.layer import Attention  # Avoid circular import
 
         # Check if the layer is skipped for quantization.
@@ -64,7 +65,13 @@ class QuarkConfig(QuantizationConfig):
         if should_ignore_layer(prefix,
                                ignore=exclude_layers,
                                fused_mapping=self.packed_modules_mapping):
-            return UnquantizedLinearMethod()
+            if prefix == "lm_head":
+                return UnquantizedLinearMethod()
+           # return UnquantizedLinearMethod()
+            scheme = self.get_scheme(layer=layer, layer_name=prefix, params_dtype=params_dtype)
+            layer.scheme = scheme
+            return QuarkLinearMethod(self)
+            
         if isinstance(layer, LinearBase):
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
@@ -223,6 +230,15 @@ class QuarkConfig(QuantizationConfig):
         # Only symmetric weight quantization supported.
         return is_int8_dtype and is_tensor and is_weight_symmetric and is_static
 
+    def _is_mx_fp4_bf16(self, weight_quant: Optional[dict[str, Any]],
+                   input_quant: Optional[dict[str, Any]],
+                   params_dtype: Optional[torch.dtype]) -> bool:
+                # Input and weight dtype needs to be fp4.
+        if weight_quant.get("dtype") == "fp4" and params_dtype == torch.bfloat16:
+            logger.debug("Detected Quark with bf16 weights")
+            return True
+        return False
+
     def _is_mx_fp4(self, weight_quant: Optional[dict[str, Any]],
                    input_quant: Optional[dict[str, Any]]) -> bool:
         # Confirm weights and input quantized.
@@ -307,14 +323,13 @@ class QuarkConfig(QuantizationConfig):
                 dict[str, Any], self.quant_config.get("global_quant_config"))
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkScheme":
+    def _get_scheme_from_config(self, config: dict[str, Any], params_dtype: Optional[torch.dtype] = None) -> "QuarkScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
                 "and bias quantized are not supported")
         weight_config = cast(dict[str, Any], config.get("weight"))
         input_config = cast(dict[str, Any], config.get("input_tensors"))
-
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False)
@@ -325,6 +340,8 @@ class QuarkConfig(QuantizationConfig):
             return QuarkW8A8Int8(qscheme=weight_qscheme,
                                  is_static_input_scheme=True,
                                  input_symmetric=input_config.get("symmetric"))
+        elif self._is_mx_fp4_bf16(weight_config, input_config, params_dtype):
+            return QuarkW16A4MXFP4(weight_config, input_config)
         elif self._is_mx_fp4(weight_config, input_config):
             return QuarkW4A4MXFP4(weight_config, input_config)
 
@@ -333,12 +350,13 @@ class QuarkConfig(QuantizationConfig):
                                   f"Input config: {input_config}")
 
     def get_scheme(self, layer: torch.nn.Module,
-                   layer_name: str) -> "QuarkScheme":
+                   layer_name: str,
+                   params_dtype: Optional[torch.dtype] = None) -> "QuarkScheme":
 
         layer_quant_config = self._find_matched_config(layer_name, layer)
 
         # Find the quant_scheme
-        scheme = self._get_scheme_from_config(layer_quant_config)
+        scheme = self._get_scheme_from_config(layer_quant_config, params_dtype)
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         self._check_scheme_supported(scheme.get_min_capability())
@@ -374,6 +392,9 @@ class QuarkLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
+
+    def weight_v2_supported(self, layer: torch.nn.Module):
+        return False if isinstance(layer.scheme, QuarkW16A4MXFP4) else True
 
     def create_weights(self, layer: torch.nn.Module,
                        input_size_per_partition: int,

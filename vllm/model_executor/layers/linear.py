@@ -56,6 +56,12 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "PetitNvFp4LinearMethod",
 ]
 
+def use_weight_loader_v2(layer):
+    if layer.quant_method.__class__.__name__ not in WEIGHT_LOADER_V2_SUPPORTED:
+        return False
+    if layer.quant_method.__class__.__name__ ==  "QuarkLinearMethod" and layer.scheme.__class__.__name__ == "QuarkW16A4MXFP4":
+        return False
+    return True
 
 def adjust_bitblas_shard(param, shard_size, shard_offset):
     bitblas_tile_size = getattr(param, "bitblas_tile_size", None)
@@ -272,7 +278,10 @@ class LinearBase(CustomOp):
                 QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self,
-                                                              prefix=prefix)
+                                                              prefix=prefix,
+                                                              params_dtype=self.params_dtype)
+        #linear quant_method {quant_config.get_name()} {self.quant_method.__class__.__name__}')
+
         self.return_bias = return_bias
         self.disable_tp = disable_tp
         self.tp_rank = (get_tensor_model_parallel_rank()
@@ -334,6 +343,7 @@ class ReplicatedLinear(LinearBase):
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
+
         self.quant_method.create_weights(self,
                                          self.input_size,
                                          self.output_partition_sizes,
@@ -471,6 +481,7 @@ class ColumnParallelLinear(LinearBase):
             output_sizes = [output_size]
 
         assert self.quant_method is not None
+        
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -479,8 +490,7 @@ class ColumnParallelLinear(LinearBase):
             output_size=self.output_size,
             params_dtype=self.params_dtype,
             weight_loader=(
-                self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                self.weight_loader_v2 if use_weight_loader_v2(self) else self.weight_loader))
         if bias:
             self.bias = Parameter(
                 torch.empty(self.output_size_per_partition,
@@ -1267,6 +1277,7 @@ class RowParallelLinear(LinearBase):
         self.reduce_results = reduce_results
 
         assert self.quant_method is not None
+
         self.quant_method.create_weights(
             layer=self,
             input_size_per_partition=self.input_size_per_partition,
@@ -1275,8 +1286,7 @@ class RowParallelLinear(LinearBase):
             output_size=self.output_size,
             params_dtype=self.params_dtype,
             weight_loader=(
-                self.weight_loader_v2 if self.quant_method.__class__.__name__
-                in WEIGHT_LOADER_V2_SUPPORTED else self.weight_loader))
+                self.weight_loader_v2 if use_weight_loader_v2(self) else self.weight_loader))
         if not reduce_results and (bias and not skip_bias_add):
             raise ValueError("When not reduce the results, adding bias to the "
                              "results can lead to incorrect results")
@@ -1430,6 +1440,7 @@ class QKVCrossParallelLinear(LinearBase):
         # Empty placeholders for loading as a single module.
         placeholder_size = 0
         assert self.quant_method is not None
+
         self.quant_method.create_weights(self,
                                          placeholder_size, [placeholder_size],
                                          placeholder_size,
@@ -1598,7 +1609,7 @@ class QKVCrossParallelLinear(LinearBase):
                  if loaded_shard_id == "q" else self.kv_proj_encoder)
         target_param = self.select_proj_params(layer, param)
         shard_id_args = (loaded_shard_id, ) if loaded_shard_id != "q" else ()
-        if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED:
+        if use_weight_loader_v2(self):
             layer.weight_loader_v2(target_param, loaded_weight, *shard_id_args)
         else:
             layer.weight_loader(target_param, loaded_weight, *shard_id_args)

@@ -72,10 +72,6 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             fake_impl=act_mul_and_fp8_group_quant_fake,
             dispatch_key=current_platform.dispatch_key,
         )
-
-logger.info(f"[Aiter] {is_rocm_use_aiter_triton_silu_mul_fp4_quant=}")
-logger.info(f"[Aiter] {is_rocm_use_aiter_triton_silu_mul_fp8_quant=}")
-logger.info(f"[Aiter] {is_rocm_aiter_fp4_asm_gemm_enabled()=}")
     
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):

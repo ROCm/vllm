@@ -3,9 +3,10 @@
 
 from functools import cache
 from typing import Any, Callable, Optional
-
+import traceback
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter, UninitializedParameter
 
 from vllm import envs
 from vllm.model_executor.layers.quantization.quark.schemes import QuarkScheme
@@ -14,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
 from vllm.model_executor.parameter import (GroupQuantScaleParameter,
                                            PackedvLLMParameter)
 from vllm.platforms import current_platform
+from vllm.model_executor.utils import set_weight_attrs
 
 
 @cache
@@ -100,9 +102,10 @@ try:
 except ImportError:
     dynamic_mxfp4_quant = gemm_afp4wfp4 = None
 
-__all__ = ["QuarkW4A4MXFP4"]
+__all__ = ["QuarkW4A4MXFP4", "QuarkW16A4MXFP4"]
 
 
+        
 class QuarkW4A4MXFP4(QuarkScheme):
 
     def __init__(self, weight_quant_spec: dict[str, Any],
@@ -187,6 +190,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
                 layer.weight_scale = torch.nn.Parameter(
                     layer.weight_scale.data.T.contiguous(),
                     requires_grad=False)
+                
 
     def create_weights(self, layer: torch.nn.Module,
                        output_partition_sizes: list[int],
@@ -195,7 +199,8 @@ class QuarkW4A4MXFP4(QuarkScheme):
                        **kwargs):
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
-
+        #print(f'>>> Im in QuarkW4A4 create_weights {layer.__class__.__name__}')
+        #traceback.print_stack()
         # WEIGHT
         weight = PackedvLLMParameter(
             data=torch.empty(
@@ -238,3 +243,63 @@ class QuarkW4A4MXFP4(QuarkScheme):
             return torch.ops.vllm.gemm_with_dynamic_quant(
                 x, layer.weight, layer.weight_scale, x_quant_scales,
                 self.rocm_use_aiter_fp4_asm_gemm, self.out_dtype)
+
+class QuarkW16A4MXFP4(QuarkW4A4MXFP4):
+    def __init__(self, weight_quant_spec: dict[str, Any],
+                 input_quant_spec: dict[str, Any]):
+        self.out_dtype = torch.get_default_dtype()
+        self.qscheme = "per_group"
+        self.weight_quant_spec = weight_quant_spec
+        self.input_quant_spec = input_quant_spec
+        self.emulate = not current_platform.supports_mx()
+        self.rocm_use_aiter_fp4_asm_gemm = is_rocm_aiter_fp4_asm_gemm_enabled()
+        if not self.emulate and (dynamic_mxfp4_quant is None
+                                 or gemm_afp4wfp4 is None):
+            # Currently need these kernels if not emulating
+            raise NotImplementedError(
+                f"{self.__class__.__name__} requires AITER to be installed "
+                "for non-emulation mode! Please refer to "
+                "https://github.com/ROCm/aiter for installation details.")
+        
+##Sample for how UnquantilzedLinearMethod creates weights
+    def create_weights(self, layer: torch.nn.Module,
+                       output_partition_sizes: list[int],
+                       input_size_per_partition: int,
+                       params_dtype: torch.dtype, weight_loader: Callable,
+                       **kwargs):
+                # This method creates unquantized linear weights.
+        # The weights are not quantized, and they are not sharded.
+        # The amount of memory allocated for the weights is
+        # sum(output_partition_sizes) * input_size_per_partition.
+        try:
+            weight = Parameter(torch.empty(sum(output_partition_sizes),
+                                           input_size_per_partition,
+                                           dtype=params_dtype),
+                               requires_grad=False)
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error("Failed to create unquantized linear weights: %s", e)
+            if torch.cuda.is_available():
+                logger.debug("CUDA device: %s", torch.cuda.current_device())
+                logger.debug("Allocated: %.2f GiB",
+                             torch.cuda.memory_allocated() / GiB_bytes)
+                logger.debug("Reserved: %.2f GiB",
+                             torch.cuda.memory_reserved() / GiB_bytes)
+            raise RuntimeError(
+                "Failed to create unquantized linear weights. "
+                "This may be caused by insufficient memory to allocate "
+                "the weight.") from e
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0, "weight_loader": weight_loader})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, kwargs)
+
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.weight = torch.nn.Parameter(layer.weight.data,
+                                                requires_grad=False)
+        w_q, w_s = dynamic_mxfp4_quant(layer.weight)
+        layer.weight_scale = torch.nn.Parameter(
+                    w_s.T.contiguous(),
+                    requires_grad=False)
+        layer.weight = torch.nn.Parameter(w_q,
+                                        requires_grad=False)
+        #super().process_weights_after_loading(layer)
