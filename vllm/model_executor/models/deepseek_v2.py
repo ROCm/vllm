@@ -33,6 +33,7 @@ import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+import vllm.envs as envs
 from vllm.attention import Attention
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.ops.common import pack_seq_triton, unpack_seq_triton
