@@ -217,6 +217,28 @@ def _convert_req_index_to_global_index_kernel(
     out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
     tl.store(out_ptr_ij, out_val)
 
+def ref_convert_to_gloabl(
+        req_id, block_table, token_indices, block_size
+):
+    req_id_c = req_id.contiguous()
+    block_table_c = block_table.contiguous()
+    token_indices_c = token_indices.contiguous()
+    max_num_blocks = block_table_c.size(-1)
+    num_tokens = token_indices.size(0)
+    out = torch.empty_like(token_indices_c)
+    idxs_in = token_indices_c // block_size
+    idxs_out = token_indices_c % block_size
+    block_table_idexed = block_table_c[req_id_c] # [num_tokens, max_num_blocks_per_req]
+    for i in range(num_tokens):
+        idx_mask = (idxs_in[i] < 0) | (idxs_in[i] >= max_num_blocks)
+        idxs_in[i][idx_mask] = -1 # set to -1
+        out_idxed = block_table_idexed[i][idxs_in[i]] * block_size + idxs_out[i]
+        out_idxed[idx_mask] = -1    # set the output val to -1
+        out[i] = out_idxed
+    return out
+
+
+
 def triton_convert_req_index_to_global_index(
         req_id: torch.Tensor,  # int32 [num_tokens]
         block_table: torch.
@@ -404,6 +426,27 @@ class FlashMLASparseMetadataBuilder(
         return metadata
 
 
+def flash_mla_sparse_prefill_triton(
+    q,
+    kv,
+    cu_seqlens_q,
+    max_seqlen_q,
+    softmax_scale,
+    topk_indices,
+    kv_lora_rank=512
+):
+    from aiter.ops.triton.unified_attention_sparse_mla import unified_attention_sparse_mla
+
+    qs, qh, _ = q.shape
+    out = torch.randn([qs, qh, kv_lora_rank], dtype=torch.bfloat16, device=q.device)
+    block_table = torch.empty_like(topk_indices)    # no use
+    num_seq = cu_seqlens_q.size(0) - 1
+    seqused_k = torch.randn([num_seq], device=q.device)  # no use
+    max_seqlen_k = 0
+    unified_attention_sparse_mla(q, kv, out, cu_seqlens_q, max_seqlen_q, seqused_k, max_seqlen_k, softmax_scale, topk_indices, block_table, kv_lora_rank)
+    return out
+
+
 class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
 
     def __init__(
@@ -436,23 +479,37 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
             self, q: torch.Tensor, kv_c_and_k_pe_cache: torch.Tensor,
             topk_indices: torch.Tensor,
             attn_metadata: FlashMLASparseMetadata) -> torch.Tensor:
-        num_tokens = q.shape[0]
-        kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
-            -1, 1, kv_c_and_k_pe_cache.shape[-1])
 
-        # NOTE(Chen): kernel requires num_local_head to be a multiple of
-        # 64 on hopper and 128 on blackwell
-        if self.num_heads % self.padding != 0:
-            assert self.padding % self.num_heads == 0
-            logger.warning_once(f"padding num_heads to {self.padding} \
-                    due to sparse attn kernel requirement")
-            q_padded = q.new_empty((q.shape[0], self.padding, q.shape[2]))
-            q_padded[:, :self.num_heads, :] = q
-            q = q_padded
+        if current_platform.is_rocm():
+            if self.num_heads % self.padding != 0:
+                assert self.padding % self.num_heads == 0
+                logger.warning_once(f"padding num_heads to {self.padding} \
+                        due to sparse attn kernel requirement")
+                q_padded = q.new_empty((q.shape[0], self.padding, q.shape[2]))
+                q_padded[:, :self.num_heads, :] = q
+                q = q_padded
+            blk_size = attn_metadata.block_size
+            tokens, heads, head_dim = kv_c_and_k_pe_cache.shape
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(tokens // blk_size, blk_size, heads, head_dim)
+            output = flash_mla_sparse_prefill_triton(q, kv_c_and_k_pe_cache, attn_metadata.query_start_loc, attn_metadata.max_query_len, self.softmax_scale, topk_indices)
+        else:
+            num_tokens = q.shape[0]
+            kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.view(
+                -1, 1, kv_c_and_k_pe_cache.shape[-1])
 
-        topk_indices = topk_indices.view(num_tokens, 1, -1)
-        output = flash_mla_sparse_prefill(q, kv_c_and_k_pe_cache, topk_indices,
-                                          self.softmax_scale)[0]
+            # NOTE(Chen): kernel requires num_local_head to be a multiple of
+            # 64 on hopper and 128 on blackwell
+            if self.num_heads % self.padding != 0:
+                assert self.padding % self.num_heads == 0
+                logger.warning_once(f"padding num_heads to {self.padding} \
+                        due to sparse attn kernel requirement")
+                q_padded = q.new_empty((q.shape[0], self.padding, q.shape[2]))
+                q_padded[:, :self.num_heads, :] = q
+                q = q_padded
+
+            topk_indices = topk_indices.view(num_tokens, 1, -1)
+            output = flash_mla_sparse_prefill(q, kv_c_and_k_pe_cache, topk_indices,
+                                            self.softmax_scale)[0]
         output = output[:, :self.num_heads, :]
         return output
 
@@ -529,15 +586,23 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
             ql_nope = ql_nope.transpose(0, 1)
 
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
-
         # TODO: handle index / kv_cache correctly
-        topk_indices_global = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
-        )
+        # topk_indices_global = triton_convert_req_index_to_global_index(
+        #     attn_metadata.req_id_per_token,
+        #     attn_metadata.block_table,
+        #     topk_indices,
+        #     BLOCK_SIZE=attn_metadata.block_size,
+        #     NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+        # )
+
+        # Note: the above triton kernel may triggers some strange unexpected crush on Mi308, 
+        # although the code looks fine on memory access pattern, this ref torch impl can help
+        # to alleviate this issue.
+        topk_indices_global = ref_convert_to_gloabl(
+            attn_metadata.req_id_per_token, 
+            attn_metadata.block_table, 
+            topk_indices, 
+            attn_metadata.block_size)
 
 
         q = torch.cat([ql_nope, q_pe], dim=-1)
@@ -552,9 +617,13 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=layer._k_scale,
             )
+        
         if self.kv_cache_dtype != "fp8_ds_mla":
             attn_out = self._forward_bf16_kv(q, kv_cache, topk_indices_global,
                                              attn_metadata)
+            # from aiter.ops.triton.unified_attention_sparse_mla import unified_attention_sparse_mla
+            # unified_attention_sparse_mla(q, )
+            
         else:
             attn_out = self._forward_fp8_kv(q, kv_cache, topk_indices_global,
                                             attn_metadata)

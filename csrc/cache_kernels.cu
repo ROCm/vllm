@@ -551,7 +551,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
 #ifndef USE_ROCM
   __syncwarp();
 #endif
-  float scale = fmaxf(amax, 1e-4) / 448.0f;
+  float scale = fmaxf(amax, 1e-4) / 240.0f;
   if (use_ue8m0) {
     scale = exp2f(ceilf(log2f(scale)));
   }

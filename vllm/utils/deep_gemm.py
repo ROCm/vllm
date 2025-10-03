@@ -189,11 +189,12 @@ def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
                              weights: torch.Tensor, context_lens: torch.Tensor, block_tables: torch.Tensor,
                              max_model_len: int):
     from vllm.utils import cdiv
+    fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, heads, dim = q.size()
     kv_cache, scale = kv_cache[..., :dim], kv_cache[...,dim:]
     scale = scale.contiguous().view(torch.float)
     q = q.float()
-    kv_cache = kv_cache.view(torch.float8_e4m3fn).float() * scale
+    kv_cache = kv_cache.view(fp8_dtype).float() * scale
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
     context_lens = context_lens.tolist()
@@ -296,8 +297,20 @@ def fp8_paged_mqa_logits(
     """
     _lazy_init()
     if _fp8_paged_mqa_logits_impl is None:
-        return ref_fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len)
-        # return _missing()
+        if current_platform.is_rocm():
+            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits_stage1
+            # from aiter.aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits_stage1
+            batch_size, next_n, heads, head_dim = q_fp8.shape
+            out_qk = torch.full(
+                (heads, batch_size * next_n, max_model_len),
+                float("-inf"),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            deepgemm_fp8_paged_mqa_logits_stage1(q_fp8, kv_cache_fp8, weights, out_qk, context_lens, block_tables, max_model_len)
+            return out_qk.sum(dim=0)
+        else:
+            return ref_fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len)
     return _fp8_paged_mqa_logits_impl(q_fp8,
                                       kv_cache_fp8,
                                       weights,
@@ -325,6 +338,7 @@ def per_block_cast_to_fp8(
         x: torch.Tensor,
         block_size: list[int] = DEFAULT_BLOCK_SIZE,
         use_ue8m0: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_dtype = current_platform.fp8_dtype()
     assert x.dim() == 2
     m, n = x.shape
     block_m, block_n = block_size
@@ -336,7 +350,7 @@ def per_block_cast_to_fp8(
     x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
     sf = x_amax / 448.0
     sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    x_scaled = (x_view * (1.0 / sf)).to(fp8_dtype)
     return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
         x_view.size(0), x_view.size(2))
 

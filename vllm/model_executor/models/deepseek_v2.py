@@ -485,6 +485,7 @@ def cp_gather_indexer_k_quant_cache(
     num_blocks, block_size, _ = kv_cache.shape
     head_dim = dst_value.shape[-1]
     kv_cache = kv_cache.view(num_blocks, -1)
+    fp8_dtype = current_platform.fp8_dtype()
 
     expected_value = []
     expected_scale = []
@@ -524,10 +525,28 @@ def cp_gather_indexer_k_quant_cache(
 
     gather_value = torch.cat(expected_value, dim=0).view(-1, head_dim)
     gather_scale = torch.cat(expected_scale, dim=0).view(-1, 4)
-    gather_value = gather_value.view(torch.float8_e4m3fn)
+    gather_value = gather_value.view(fp8_dtype)
     gather_scale = gather_scale.view(torch.float32)
     dst_value.copy_(gather_value)
     dst_scale.copy_(gather_scale)
+
+
+def ref_indexer_k_cache(
+    k,
+    kv_cache,
+    slot_mapping,
+):
+    num_tokens = k.size(0)
+    blk_size = kv_cache.size(1)
+    invalid_mask = slot_mapping < 0
+    slot_mapping[invalid_mask] = 0
+    blk_id = slot_mapping // blk_size
+    blk_off = slot_mapping % blk_size
+    for i in range(num_tokens):
+        blk_loc = blk_id[i]
+        blk_off_loc = blk_off[i]
+        kv_cache[blk_loc][blk_off_loc] = k[i]
+
 
 
 def sparse_attn_indexer(
@@ -571,6 +590,7 @@ def sparse_attn_indexer(
     has_decode = attn_metadata.num_decodes > 0
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
+    fp8_dtype = current_platform.fp8_dtype()
 
     ops.indexer_k_quant_and_cache(
         k,
@@ -586,7 +606,7 @@ def sparse_attn_indexer(
         num_prefills = attn_metadata.num_prefills
         k_fp8 = torch.empty([prefill_metadata.total_seq_lens, head_dim],
                             device=k.device,
-                            dtype=torch.float8_e4m3fn)
+                            dtype=fp8_dtype)
         k_scale = torch.empty([prefill_metadata.total_seq_lens, 1],
                               device=k.device,
                               dtype=torch.float32)
@@ -708,8 +728,9 @@ def sparse_attn_indexer_fake(
     _flattened_kv = torch.empty([total_seq_lens, head_dim + 4],
                                 device=k.device,
                                 dtype=torch.uint8)
+    fp8_dtype = current_platform.fp8_dtype()
     _k_fp8 = _flattened_kv[..., :head_dim].view(
-        torch.float8_e4m3fn).contiguous()
+        fp8_dtype).contiguous()
     _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
     return topk_indices_buffer
 
@@ -801,8 +822,7 @@ class Indexer(nn.Module):
         q_fp8, q_scale = per_token_group_quant_fp8(q,
                                                    self.quant_block_size,
                                                    column_major_scales=False,
-                                                   use_ue8m0=self.scale_fmt
-                                                   is not None)
+                                                   use_ue8m0=self.scale_fmt == 'ue8m0')
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
