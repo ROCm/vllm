@@ -170,8 +170,9 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
         return count_ones_per_row.sum()
 
     k = kv
-    q = q.float()
-    k = k.float() * scale
+    # q = q.float()
+    # k = k.float() * scale
+    # k = k.float()
 
     mask_lo = torch.arange(0, seq_len_kv, device='cuda')[None, :] >= cu_seqlen_ks[:, None]
     mask_hi = torch.arange(0, seq_len_kv, device='cuda')[None, :] < cu_seqlen_ke[:, None]
@@ -179,7 +180,8 @@ def ref_fp8_mqa_logits(q: torch.Tensor, kv: torch.Tensor, weights: torch.Tensor,
 
     score = torch.einsum('mhd,nd->hmn', q, k)
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float('-inf'))
+    # logits = logits.masked_fill(~mask, float('-inf'))
+    logits = logits.masked_fill(~mask, float('-inf')).to(torch.bfloat16)
 
     cost = mask.sum()
     return logits, cost
@@ -192,8 +194,9 @@ def ref_fp8_paged_mqa_logits(q: torch.Tensor, kv_cache: torch.Tensor,
     batch_size, next_n, heads, dim = q.size()
     kv_cache, scale = kv_cache[..., :dim], kv_cache[...,dim:]
     scale = scale.contiguous().view(torch.float)
-    q = q.float()
-    kv_cache = kv_cache.view(torch.float8_e4m3fn).float() * scale
+    # q = q.float()
+    # kv_cache = kv_cache.view(torch.float8_e4m3fn).float() * scale
+    # kv_cache = kv_cache.float()
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full([batch_size * next_n, max_model_len], float('-inf'), device=q.device, dtype=torch.float32)
     context_lens = context_lens.tolist()
