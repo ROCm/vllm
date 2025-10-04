@@ -34,6 +34,8 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     VLLM_USE_AITER_TRITON_ROPE = envs.VLLM_USE_AITER_TRITON_ROPE
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
         from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+        from vllm.model_executor.layers.utils import aiter_GEMM_check, rocm_unquantized_gemm_impl
+        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 else:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
     VLLM_USE_AITER_TRITON_ROPE = False
@@ -232,6 +234,8 @@ class TritonAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.scale = float(scale)
         self.num_kv_heads = num_kv_heads
+        self.q_size = num_heads * head_size
+        self.kv_size = num_kv_heads * head_size
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
@@ -295,8 +299,6 @@ class TritonAttentionImpl(AttentionImpl):
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         positions: torch.Tensor = None,
-        cos_sin_cache: torch.Tensor = None,
-        is_neox: bool = False,
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
@@ -347,6 +349,26 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             key_cache, value_cache = kv_cache.unbind(0)
 
+        out_dtype = query.dtype
+        # self.qkv_linear is not None entails /app/vllm/vllm/attention/layers/gptoss_mergeed_attention.p::ROCMGPTOSSMergedAttention is used to call unified_attention_with_output
+        if hasattr(self, "qkv_linear") and self.qkv_linear is not None:
+            hidden_states = query
+            weight = self.qkv_linear.weight
+            bias = self.qkv_linear.bias if not self.qkv_linear.skip_bias_add else None
+            if aiter_GEMM_check(hidden_states.shape[0], weight.shape[0], weight.shape[1], hidden_states.dtype):
+                qkv = gemm_a16w16(hidden_states, weight, bias, skip_reduce=(query.shape[0] <= 256))
+            else:
+                qkv = rocm_unquantized_gemm_impl(hidden_states, weight, bias)
+            query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if query.dim() == 3:
+                query = query.view(query.shape[0], query.shape[1], self.num_heads, self.head_size)
+                key = key.view(key.shape[0], key.shape[1], self.num_kv_heads, self.head_size)
+                value = value.view(value.shape[0], value.shape[1], self.num_kv_heads, self.head_size)
+            else:
+                query = query.view(-1, self.num_heads, self.head_size)
+                key = key.view(-1, self.num_kv_heads, self.head_size)
+                value = value.view(-1, self.num_kv_heads, self.head_size)
+        
         # positions is not None entails that Q and K are not RoPE embedded yet, therefore, either fused_qk_rope_reshape_and_cache or self.rotary_emb is called
         if positions is not None and query.shape[0] <= 256:
             assert (
@@ -379,12 +401,13 @@ class TritonAttentionImpl(AttentionImpl):
                     flash_layout=(not use_prefill_decode_attn),
                     apply_scale=is_fp8_kv_cache,
                     offs=None,
-                    q_out=query,
-                    k_out=key,
+                    q_out=query if query.dim() == 3 else torch.empty(query.shape[1:], dtype=out_dtype, device=query.device),
+                    k_out=key if key.dim() == 3 else torch.empty(key.shape[1:], dtype=out_dtype, device=query.device),
                     output_zeros=True,
                     zeros_out=output,
                 )
             )
+            # print("pass TritonAttentionImpl")
             if is_fp8_kv_cache:
                 key_cache = key_cache.view(key_cache_og_dtype)
                 value_cache = value_cache.view(value_cache_og_dtype)

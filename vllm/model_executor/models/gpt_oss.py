@@ -38,6 +38,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    from vllm.attention.layers.gptoss_mergeed_attention import ROCMGPTOSSMergedAttention
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and not envs.VLLM_ROCM_USE_AITER_MHA
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD
@@ -128,19 +129,35 @@ class OAIAttention(nn.Module):
         # Only apply sliding window to every other layer
         sliding_window = (config.sliding_window if self.layer_idx %
                           2 == 0 else None)
-        self.attn = Attention(
-            self.num_local_attention_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_local_key_value_heads,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            per_layer_sliding_window=sliding_window,
-            attn_type=AttentionType.DECODER,
-            prefix=f"{prefix}.attn",
-            sinks=self.sinks,
-            rotary_emb=self.rotary_emb if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE else None,
-        )
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+            self.attn = ROCMGPTOSSMergedAttention(
+                self.num_local_attention_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_local_key_value_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                per_layer_sliding_window=sliding_window,
+                attn_type=AttentionType.DECODER,
+                prefix=f"{prefix}.attn",
+                sinks=self.sinks,
+                rotary_emb=self.rotary_emb,
+                qkv_linear=self.qkv,
+            )
+        else:
+            self.attn = Attention(
+                self.num_local_attention_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_local_key_value_heads,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                per_layer_sliding_window=sliding_window,
+                attn_type=AttentionType.DECODER,
+                prefix=f"{prefix}.attn",
+                sinks=self.sinks,
+            )
+        
 
     def forward(self, hidden_states: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
@@ -151,15 +168,11 @@ class OAIAttention(nn.Module):
                 res)
         else:
             t = self.norm(hidden_states)
-        qkv, _ = self.qkv(t)
-        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # q, k = self.rotary_emb(positions, q, k)
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            attn_output = self.attn(q, k, v, positions=positions)
+            attn_output = self.attn(t, t, t, positions=positions)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size],
-                                dim=-1)
+            qkv, _ = self.qkv(t)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
             v = v.contiguous()
