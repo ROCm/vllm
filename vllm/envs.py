@@ -110,6 +110,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -900,6 +902,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER Triton fused RMSNORM + Quantization
     "VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1"))),
+
+    # Use AITER Triton fused elementwise multiply + elementwise addtion
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD", "1"))),
+
+    # Use AITER Triton fused SiLU Mul + FP8 per-token group quant
+    "VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT", "1"))),
+
 
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

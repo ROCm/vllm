@@ -16,6 +16,8 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = False
 
 @dataclass
 class MLAModules:
