@@ -10,10 +10,10 @@ This documentation includes information for running the popular Llama 3.1 series
 
 The pre-built image includes:
 
-- ROCm™ 6.4.1
+- ROCm™ 7.0.0
 - HipblasLT 0.15
-- vLLM 0.10.1
-- PyTorch 2.7
+- vLLM 0.10.2
+- PyTorch 2.9
 
 ## Pull latest Docker Image
 
@@ -21,8 +21,9 @@ Pull the most recent validated docker image with `docker pull rocm/vllm-dev:main
 
 ## What is New
 
-- vLLM version 0.10.1
-- Flag enabled by default in the docker -VLLM_V1_USE_PREFILL_DECODE_ATTENTION
+- Support for FP4 models
+- GPT-OSS support
+- Support for MI35x
 
 ## Known Issues and Workarounds
 
@@ -39,14 +40,14 @@ The table below shows performance data where a local inference client is fed req
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13818.7  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 11612.0               |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 11408.7               |
-|       |           |         | 2048  | 2048   | 1500        | 1500         | 7800.5                |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 4134.0 |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 3177.6                |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 3034.1                |
-|       |           |         | 2048  | 2048   | 500         | 500          | 2214.2                |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13212.5  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 11312.8               |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 11376.7               |
+|       |           |         | 2048  | 2048   | 1500        | 1500         | 7252.1                |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 4201.7 |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 3176.3                |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 2992.0                |
+|       |           |         | 2048  | 2048   | 500         | 500          | 2153.7                |
 
 *TP stands for Tensor Parallelism.*
 
@@ -58,38 +59,38 @@ The table below shows latency measurement, which typically involves assessing th
 
 | Model | Precision | TP Size | Batch Size | Input | Output | MI300X Latency (sec) |
 |-------|-----------|----------|------------|--------|---------|-------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 15.254 |
-| | | | 2 | 128 | 2048 | 18.157 |
-| | | | 4 | 128 | 2048 | 18.549 |
-| | | | 8 | 128 | 2048 | 20.547 |
-| | | | 16 | 128 | 2048 | 22.164 |
-| | | | 32 | 128 | 2048 | 25.426 |
-| | | | 64 | 128 | 2048 | 33.297 |
-| | | | 128 | 128 | 2048 | 45.792 |
-| | | | 1 | 2048 | 2048 | 15.299 |
-| | | | 2 | 2048 | 2048 | 18.194 |
-| | | | 4 | 2048 | 2048 | 18.942 |
-| | | | 8 | 2048 | 2048 | 20.526 |
-| | | | 16 | 2048 | 2048 | 23.211 |
-| | | | 32 | 2048 | 2048 | 26.516 |
-| | | | 64 | 2048 | 2048 | 34.824 |
-| | | | 128 | 2048 | 2048 | 52.211 |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 47.150 |
-| | | | 2 | 128 | 2048 | 50.933 |
-| | | | 4 | 128 | 2048 | 52.521 |
-| | | | 8 | 128 | 2048 | 55.233 |
-| | | | 16 | 128 | 2048 | 59.065 |
-| | | | 32 | 128 | 2048 | 68.786 |
-| | | | 64 | 128 | 2048 | 88.094 |
-| | | | 128 | 128 | 2048 | 118.512 |
-| | | | 1 | 2048 | 2048 | 47.675 |
-| | | | 2 | 2048 | 2048 | 50.788 |
-| | | | 4 | 2048 | 2048 | 52.405 |
-| | | | 8 | 2048 | 2048 | 55.459 |
-| | | | 16 | 2048 | 2048 | 59.923 |
-| | | | 32 | 2048 | 2048 | 70.388 |
-| | | | 64 | 2048 | 2048 | 91.218 |
-| | | | 128 | 2048 | 2048 | 127.004 |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 15.882 |
+| | | | 2 | 128 | 2048 | 17.934 |
+| | | | 4 | 128 | 2048 | 18.487 |
+| | | | 8 | 128 | 2048 | 20.251 |
+| | | | 16 | 128 | 2048 | 22.307 |
+| | | | 32 | 128 | 2048 | 29.933 |
+| | | | 64 | 128 | 2048 | 32.359 |
+| | | | 128 | 128 | 2048 | 45.419 |
+| | | | 1 | 2048 | 2048 | 15.959 |
+| | | | 2 | 2048 | 2048 | 18.177 |
+| | | | 4 | 2048 | 2048 | 18.684 |
+| | | | 8 | 2048 | 2048 | 20.716 |
+| | | | 16 | 2048 | 2048 | 23.136 |
+| | | | 32 | 2048 | 2048 | 26.969 |
+| | | | 64 | 2048 | 2048 | 34.359 |
+| | | | 128 | 2048 | 2048 | 52.351 |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 49.098 |
+| | | | 2 | 128 | 2048 | 51.009 |
+| | | | 4 | 128 | 2048 | 52.979 |
+| | | | 8 | 128 | 2048 | 55.675 |
+| | | | 16 | 128 | 2048 | 58.982 |
+| | | | 32 | 128 | 2048 | 67.889 |
+| | | | 64 | 128 | 2048 | 86.844 |
+| | | | 128 | 128 | 2048 | 117.440 |
+| | | | 1 | 2048 | 2048 | 49.033 |
+| | | | 2 | 2048 | 2048 | 51.316 |
+| | | | 4 | 2048 | 2048 | 52.947 |
+| | | | 8 | 2048 | 2048 | 55.863 |
+| | | | 16 | 2048 | 2048 | 60.103 |
+| | | | 32 | 2048 | 2048 | 69.632 |
+| | | | 64 | 2048 | 2048 | 89.826 |
+| | | | 128 | 2048 | 2048 | 126.433 |
 
 *TP stands for Tensor Parallelism.*
 
@@ -206,7 +207,6 @@ Below is a list of a few of the key vLLM engine arguments for performance; these
 - **--max-model-len** : Maximum context length supported by the model instance. Can be set to a lower value than model configuration value to improve performance and gpu memory utilization.
 - **--max-num-batched-tokens** : The maximum prefill size, i.e., how many prompt tokens can be packed together in a single prefill. Set to a higher value to improve prefill performance at the cost of higher gpu memory utilization. 65536 works well for LLama models.
 - **--max-num-seqs** : The maximum decode batch size (default 256). Using larger values will allow more prompts to be processed concurrently, resulting in increased throughput (possibly at the expense of higher latency).  If the value is too large, there may not be enough GPU memory for the KV cache, resulting in requests getting preempted.  The optimal value will depend on the GPU memory, model size, and maximum context length.
-- **--max-seq-len-to-capture** : Maximum sequence length for which Hip-graphs are captured and utilized. It's recommended to use Hip-graphs for the best decode performance. The default value of this parameter is 8K, which is lower than the large context lengths supported by recent models such as LLama. Set this parameter to max-model-len or maximum context length supported by the model for best performance.
 - **--gpu-memory-utilization** : The ratio of GPU memory reserved by a vLLM instance. Default value is 0.9.  Increasing the value (potentially as high as 0.99) will increase the amount of memory available for KV cache.  When running in graph mode (i.e. not using `--enforce-eager`), it may be necessary to use a slightly smaller value of 0.92 - 0.95 to ensure adequate memory is available for the HIP graph.
 
 ### Latency Benchmark
@@ -271,7 +271,6 @@ python3 /app/vllm/benchmarks/benchmark_throughput.py \
     --model $MODEL \
     --max-model-len 8192 \
     --max-num-batched-tokens 131072 \
-    --max-seq-len-to-capture 131072 \
     --input-len $IN \
     --output-len $OUT \
     --tensor-parallel-size $TP \
@@ -471,13 +470,21 @@ Please refer to the [Benchmarking Machine Learning using ROCm and AMD GPUs: Repr
 
 ## Docker Manifest
 
-To reproduce the release docker:
+Clone the vLLM repository:
 
 ```bash
-    git clone https://github.com/ROCm/vllm.git
+    git clone https://github.com/vllm-project/vllm.git
     cd vllm
-    git checkout 6663000a391911eba96d7864a26ac42b07f6ef29
-    docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
+```
+
+Use the following command to build the image directly from the specified commit.
+
+```bash
+     docker build -f docker/Dockerfile.rocm \
+    --build-arg REMOTE_VLLM=1 \
+    --build-arg VLLM_REPO=https://github.com/ROCm/vllm \
+    --build-arg VLLM_BRANCH="790d22168820507f3105fef29596549378cfe399" \
+    -t vllm-rocm .
 ```
 
 ### Building AITER Image
@@ -492,6 +499,11 @@ Use AITER release candidate branch instead:
 ```
 
 ## Changelog
+
+rocm7.0.0_vllm_0.10.2_20251002:
+- Support for FP4 models
+- GPT-OSS support
+- Support for MI35x
 
 rocm6.4.1_vllm_0.10.1_20250909:
 - vLLM version 0.10.1
