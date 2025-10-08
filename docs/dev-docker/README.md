@@ -13,7 +13,7 @@ The pre-built image includes:
 - ROCm™ 7.0.0
 - HipblasLT 0.15
 - vLLM 0.10.2
-- PyTorch 2.7
+- PyTorch 2.9
 
 ## Pull latest Docker Image
 
@@ -470,13 +470,21 @@ Please refer to the [Benchmarking Machine Learning using ROCm and AMD GPUs: Repr
 
 ## Docker Manifest
 
-To reproduce the release docker:
+Clone the vLLM repository:
 
 ```bash
-    git clone https://github.com/ROCm/vllm.git
+    git clone https://github.com/vllm-project/vllm.git
     cd vllm
-    git checkout 790d22168820507f3105fef29596549378cfe399
-    docker build -f docker/Dockerfile.rocm -t <your_tag> --build-arg USE_CYTHON=1 .
+```
+
+Use the following command to build the image directly from the specified commit.
+
+```bash
+     docker build -f docker/Dockerfile.rocm \
+    --build-arg REMOTE_VLLM=1 \
+    --build-arg VLLM_REPO=https://github.com/ROCm/vllm \
+    --build-arg VLLM_BRANCH="790d22168820507f3105fef29596549378cfe399" \
+    -t vllm-rocm .
 ```
 
 ### Building AITER Image
