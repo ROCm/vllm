@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     VLLM_NCCL_SO_PATH: Optional[str] = None
     LD_LIBRARY_PATH: Optional[str] = None
     VLLM_USE_TRITON_FLASH_ATTN: bool = True
-    VLLM_V1_USE_PREFILL_DECODE_ATTENTION: bool = False
+    VLLM_V1_USE_PREFILL_DECODE_ATTENTION: bool = True
     VLLM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_FLASH_ATTN_VERSION: Optional[int] = None
     LOCAL_RANK: int = 0
@@ -100,7 +100,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_NCCL_FOR_DP_SYNCHRONIZATION: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_V1: bool = True
-    VLLM_ROCM_USE_AITER: bool = False
+    VLLM_ROCM_USE_AITER: bool = True
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -491,7 +491,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the unified triton kernel.
     "VLLM_V1_USE_PREFILL_DECODE_ATTENTION":
     lambda:
-    (os.getenv("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", "False").lower() in
+    (os.getenv("VLLM_V1_USE_PREFILL_DECODE_ATTENTION", "True").lower() in
      ("true", "1")),
 
     # Use AITER triton unified attention for V1 attention
@@ -910,7 +910,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
     "VLLM_ROCM_USE_AITER":
-    lambda: (os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER", "True").lower() in
              ("true", "1")),
 
     # Whether to use aiter paged attention.
