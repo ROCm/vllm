@@ -208,6 +208,9 @@ if TYPE_CHECKING:
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
 
+    # Just for intermediate data dump
+    IS_PROFILING_RUN: bool = False
+
 
 def get_default_cache_root():
     return os.getenv(

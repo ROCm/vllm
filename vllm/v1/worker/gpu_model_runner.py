@@ -3034,6 +3034,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         assert cudagraph_runtime_mode is None or \
             cudagraph_runtime_mode.valid_runtime_modes()
+        envs.IS_PROFILING_RUN = True
 
         # If cudagraph_mode.decode_mode() == FULL and
         # cudagraph_mode.separate_routine(). This means that we are using
@@ -3280,6 +3281,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
+
+        envs.IS_PROFILING_RUN = False
+
         return hidden_states, hidden_states[logit_indices]
 
     @torch.inference_mode()

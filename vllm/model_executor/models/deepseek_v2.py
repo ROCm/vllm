@@ -77,6 +77,8 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+import vllm.envs as envs
+
 if current_platform.is_cuda_alike():
     from vllm import _custom_ops as ops
 elif current_platform.is_xpu():
@@ -1189,8 +1191,15 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        layer_index = 0
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            # Dump layer output
+            layer_name = str(layer_index)
+            if get_tensor_model_parallel_rank() == 0 and not envs.IS_PROFILING_RUN:
+                torch.save(hidden_states, "hidden_states_layer_"+layer_name)
+                torch.save(residual, "residual_layer_"+layer_name)
+            layer_index += 1
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
