@@ -217,26 +217,40 @@ def _convert_req_index_to_global_index_kernel(
     out_ptr_ij = out_ptr + token_id * out_stride0 + indice_id * out_stride1
     tl.store(out_ptr_ij, out_val)
 
-def ref_convert_to_gloabl(
-        req_id, block_table, token_indices, block_size
-):
+
+def ref_convert_to_gloabl(req_id: torch.Tensor,
+                      block_table: torch.Tensor,
+                      token_indices: torch.Tensor,
+                      block_size: int) -> torch.Tensor:
+    # Ensure contiguous
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
     max_num_blocks = block_table_c.size(-1)
-    num_tokens = token_indices.size(0)
-    out = torch.empty_like(token_indices_c)
+
+    # Compute block index and intra-block offset
     idxs_in = token_indices_c // block_size
     idxs_out = token_indices_c % block_size
-    block_table_idexed = block_table_c[req_id_c] # [num_tokens, max_num_blocks_per_req]
-    for i in range(num_tokens):
-        idx_mask = (idxs_in[i] < 0) | (idxs_in[i] >= max_num_blocks)
-        idxs_in[i][idx_mask] = -1 # set to -1
-        out_idxed = block_table_idexed[i][idxs_in[i]] * block_size + idxs_out[i]
-        out_idxed[idx_mask] = -1    # set the output val to -1
-        out[i] = out_idxed
-    return out
 
+    block_table_indexed = block_table_c[req_id_c]
+
+    invalid = (idxs_in < 0) | (idxs_in >= max_num_blocks)
+
+    idxs_in_clamped = idxs_in.masked_fill(invalid, 0)
+
+    num_tokens = idxs_in_clamped.size(0)
+    rest = idxs_in_clamped.numel() // num_tokens
+    gathered = torch.gather(
+        block_table_indexed, 
+        1,
+        idxs_in_clamped.view(num_tokens, rest)
+    ).view_as(idxs_in_clamped)
+
+    # Compute global indices and apply invalid mask
+    out = gathered * block_size + idxs_out
+    out = out.masked_fill(invalid, -1)
+
+    return out
 
 
 def triton_convert_req_index_to_global_index(
@@ -480,7 +494,8 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
             topk_indices: torch.Tensor,
             attn_metadata: FlashMLASparseMetadata) -> torch.Tensor:
 
-        if current_platform.is_rocm():
+        # The triton sparse mla kernel is too slow, fallback to ref impl
+        if False:
             if self.num_heads % self.padding != 0:
                 assert self.padding % self.num_heads == 0
                 logger.warning_once(f"padding num_heads to {self.padding} \

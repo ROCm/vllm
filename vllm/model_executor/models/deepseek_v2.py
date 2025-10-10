@@ -615,7 +615,7 @@ def sparse_attn_indexer(
             k_fp8,
             k_scale,
             prefill_metadata.block_table,
-            prefill_metadata.cu_seq_lens,
+            prefill_metadata.cu_seq_lens_cpu,
             num_prefills,
         )
         cu_seqlen_ks = prefill_metadata.cu_seqlen_ks

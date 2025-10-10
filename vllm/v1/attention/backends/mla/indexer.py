@@ -56,6 +56,7 @@ class DeepseekV32IndexerPrefillMetadata:
     cu_seqlen_ks: torch.Tensor
     cu_seqlen_ke: torch.Tensor
     cu_seq_lens: torch.Tensor
+    cu_seq_lens_cpu: torch.Tensor
     total_seq_lens: int
 
 
@@ -243,7 +244,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 cu_seqlen_ks=cu_seqlen_ks,
                 cu_seqlen_ke=cu_seqlen_ke,
                 cu_seq_lens=cu_seq_lens,
-                total_seq_lens=total_seq_lens,
+                cu_seq_lens_cpu=cu_seq_lens.cpu(),
+                total_seq_lens=total_seq_lens.cpu(),
             )
 
         decode_metadata = None
