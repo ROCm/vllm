@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_LINEAR: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
@@ -206,6 +207,7 @@ if TYPE_CHECKING:
     VLLM_NCCL_INCLUDE_PATH: Optional[str] = None
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
+    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM: bool = True
 
 
 def get_default_cache_root():
@@ -850,6 +852,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_LINEAR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_LINEAR", "True").lower() in ("true", "1")
     ),
+    "VLLM_ROCM_USE_AITER_TRITON_LINEAR":
+    lambda: (os.getenv("VLLM_ROCM_USE_AITER_TRITON_LINEAR", "True").lower() in
+             ("true", "1")),
+
     # Whether to use aiter moe ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MOE": lambda: (
@@ -1362,6 +1368,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - VLLM_GC_DEBUG='{"top_objects":5}': enable GC debugger with
     #                                      top 5 collected objects
     "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
+
+    # Use AITER Triton BF16 GEMM kernels
+    "VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM", "1"))),
 }
 
 # --8<-- [end:env-vars-definition]

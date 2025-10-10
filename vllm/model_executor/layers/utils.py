@@ -11,6 +11,14 @@ from vllm import envs
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.utils import direct_register_custom_op
 
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM:
+    from vllm.platforms.rocm import on_gfx950
+    from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    # use triton gemms only on mi350
+    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = on_gfx950()
+else:
+    VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM = False
+
 
 def shuffle_weight(w: torch.Tensor) -> torch.Tensor:
     # Shuffle weight along the last dimension so that
@@ -100,12 +108,33 @@ def default_unquantized_gemm(
     return torch.nn.functional.linear(x, weight, bias)
 
 
+def aiter_GEMM_check(m, n, k, dtype):
+    if (VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM == False
+        or dtype not in [torch.float16, torch.bfloat16]):
+        return False
+    # use hipblaslt for the larger GEMMs
+    if m > 2048 and n > 512:
+        return False
+    return ((n == 5120 and k == 2880) or (n == 2880 and k == 4096)
+            or (n == 128 and k == 2880) or (n == 640 and k == 2880)
+            or (n == 2880 and k == 512))
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     from vllm.platforms.rocm import on_gfx9
 
+    x_view = x.view(-1, x.size(-1))
+    n = x_view.shape[0]
+    m = weight.shape[0]
+    cu_count = current_platform.get_cu_count()
     k = weight.shape[1]
+
+
+    if aiter_GEMM_check(n, m, k, x.dtype):
+        return gemm_a16w16(x, weight, bias)
+
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
         and on_gfx9()
@@ -115,11 +144,6 @@ def rocm_unquantized_gemm_impl(
 
     if use_skinny is not True:
         return torch.nn.functional.linear(x, weight, bias)
-
-    x_view = x.view(-1, x.size(-1))
-    n = x_view.shape[0]
-    m = weight.shape[0]
-    cu_count = current_platform.get_cu_count()
 
     if m > 8 and 0 < n <= 4:
         out = ops.wvSplitK(weight, x_view, cu_count, bias)
