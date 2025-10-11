@@ -1,6 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
+#ARG BASE_IMAGE=rocm/vllm-dev:base_rocm7_0930_rc1_20250917
 ARG BASE_IMAGE=rocm/vllm-dev:base
 
 FROM ${BASE_IMAGE} AS base
@@ -23,13 +24,13 @@ WORKDIR ${COMMON_WORKDIR}
 # vLLM fetch stages
 FROM base AS fetch_vllm_0
 ONBUILD COPY ./ vllm/
-FROM base AS fetch_vllm_1
-ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_BRANCH="main"
-ONBUILD RUN git clone ${VLLM_REPO} \
-	    && cd vllm \
-	    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
-	    && git checkout FETCH_HEAD
+#FROM base AS fetch_vllm_1
+#ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+#ARG VLLM_BRANCH="main"
+#ONBUILD RUN git clone ${VLLM_REPO} \
+#	    && cd vllm \
+#	    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
+#	    && git checkout FETCH_HEAD
 FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 
 # -----------------------
@@ -39,7 +40,9 @@ FROM fetch_vllm AS build_vllm
 RUN cd vllm \
     && python3 -m pip install -r requirements/rocm.txt \
     && python3 setup.py clean --all  \
-    && python3 setup.py bdist_wheel --dist-dir=dist
+    && ln -sf /opt/rocm/lib/libamdhip64.so /usr/lib/libamdhip64.so \
+    && VLLM_TARGET_DEVICE=rocm ROCM_PATH=/opt/rocm/ VLLM_GPU_LANG=HIP SETUPTOOLS_SCM_PRETEND_VERSION=0.8.4.dev python3 setup.py bdist_wheel --dist-dir=dist
+    # && python3 setup.py bdist_wheel --dist-dir=dist
 FROM scratch AS export_vllm
 ARG COMMON_WORKDIR
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/dist/*.whl /
