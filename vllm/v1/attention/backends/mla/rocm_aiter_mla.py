@@ -26,7 +26,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 def is_aiter_mla_enabled() -> bool:
     return envs.VLLM_ROCM_USE_AITER \
-        and envs.VLLM_ROCM_USE_AITER_MLA
+        and (envs.VLLM_ROCM_USE_AITER_MLA or envs.VLLM_ROCM_USE_AITER_TRITON_MHA)
 
 
 class AiterMLABackend(MLACommonBackend):
@@ -195,7 +195,10 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 "Aiter MLA does not support one of the following: "
                 "alibi_slopes, sliding_window, logits_soft_cap")
 
-        from aiter import flash_attn_varlen_func
+        if envs.VLLM_ROCM_USE_AITER_TRITON_MHA:
+            from aiter.ops.triton.MHA import flash_attn_varlen_func
+        else:
+            from aiter import flash_attn_varlen_func
         self.flash_attn_varlen_func = flash_attn_varlen_func
 
     def _flash_attn_varlen_diff_headdims(self,
@@ -205,7 +208,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                                          return_softmax_lse=False,
                                          softmax_scale=None,
                                          **kwargs):
-        output = self.flash_attn_varlen_func(
+        result = self.flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -213,8 +216,11 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             return_lse=return_softmax_lse,
             **kwargs,
         )
-
-        return output
+        if envs.VLLM_ROCM_USE_AITER_TRITON_MHA and type(result) is tuple and return_softmax_lse:
+            output, lse = result
+            lse = lse.T.contiguous()
+            return (output, lse)
+        return result
 
     def _forward_decode(
         self,
