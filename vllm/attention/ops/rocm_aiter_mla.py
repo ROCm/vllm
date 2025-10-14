@@ -33,6 +33,12 @@ def aiter_mla_decode_fwd(
     kv_indices: torch.Tensor | None = None,
     kv_last_page_lens: torch.Tensor | None = None,
     logit_cap: float = 0.0,
+    work_meta_data: torch.Tensor | None = None,
+    work_indptr: torch.Tensor | None = None,
+    work_info_set: torch.Tensor | None = None,
+    reduce_indptr: torch.Tensor | None = None,
+    reduce_final_map: torch.Tensor | None = None,
+    reduce_partial_map: torch.Tensor | None = None,
 ):
     torch.ops.vllm.rocm_aiter_mla_decode_fwd(
         q,
@@ -45,6 +51,12 @@ def aiter_mla_decode_fwd(
         kv_last_page_lens,
         sm_scale=sm_scale,
         logit_cap=logit_cap,
+        work_meta_data = work_meta_data,
+        work_indptr = work_indptr,
+        work_info_set=  work_info_set,
+        reduce_indptr = reduce_indptr,
+        reduce_final_map = reduce_final_map,
+        reduce_partial_map = reduce_partial_map,
     )
 
 
@@ -59,6 +71,12 @@ def mla_decode_fwd_impl(
     kv_last_page_lens: torch.Tensor | None = None,
     sm_scale: float = 1.0,
     logit_cap: float = 0.0,
+    work_meta_data: torch.Tensor = None,
+    work_indptr: torch.Tensor = None,
+    work_info_set: torch.Tensor = None,
+    reduce_indptr: torch.Tensor = None,
+    reduce_final_map: torch.Tensor = None,
+    reduce_partial_map: torch.Tensor = None,
 ) -> None:
     from aiter.mla import mla_decode_fwd
 
@@ -73,6 +91,12 @@ def mla_decode_fwd_impl(
         max_seqlen_qo,
         sm_scale=sm_scale,
         logit_cap=logit_cap,
+        work_meta_data=work_meta_data,
+        work_indptr=work_indptr,
+        work_info_set=work_info_set,
+        reduce_indptr=reduce_indptr,
+        reduce_final_map=reduce_final_map,
+        reduce_partial_map=reduce_partial_map,
     )
 
 

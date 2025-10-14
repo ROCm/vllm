@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Optional, Union
+import math
 
 import torch
 
@@ -56,6 +57,18 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     # The query indptr, shape : [num_decode + 1]
     qo_indptr: torch.Tensor | None = None
 
+    work_metadata: torch.Tensor | None = None
+
+    work_info_set: torch.Tensor | None = None
+
+    work_indptr: torch.Tensor | None = None
+
+    reduce_indptr: torch.Tensor | None = None
+
+    reduce_final_map: torch.Tensor | None = None
+
+    reduce_partial_map: torch.Tensor | None = None
+
 
 class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
     pass
@@ -82,12 +95,25 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             "AITER MLAonly supports block size 1."
         )
 
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+
         self.compilation_config = vllm_config.compilation_config
         max_num_pages_per_req = cdiv(
             vllm_config.model_config.max_model_len, self.kv_cache_spec.block_size
         )
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
+
+        max_qo_len = 1
+        max_qo_tiles_per_batch = int(math.ceil)
+        self.work_metadata = torch.empty([10], dtype=torch.uint64, device="cuda")
+        self.work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device='cuda')
+        self.work_info_set = torch.empty([max_num_reqs * max_qo_tiles_per_batch * cu_num, 8], dtype=torch.int32, device='cuda').fill_(-1)
+        self.reduce_indptr = torch.empty([max_num_reqs * max_qo_tiles_per_batch + 1], dtype=torch.int32, device='cuda')
+        self.reduce_final_map = torch.empty([max_num_reqs * max_qo_tiles_per_batch, 2], dtype=torch.int32, device='cuda')
+        self.reduce_partial_map = torch.empty([max_num_reqs * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device='cuda')
 
         # Preparing persistent buffers
         # TODO: we can disambiguate between decode and mixed-prefill decode here
@@ -139,6 +165,28 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 block_table_bounds.cumsum(dim=0, dtype=torch.int32),
             ]
         )
+        kv_indptr_cpu = torch.zeros([query_start_loc_cpu.size(0)], dtype=torch.int32)
+        torch.cumsum(seq_lens_cpu, dim=0, out=kv_indptr_cpu[1:])
+
+        import aiter
+        aiter.get_mla_metadata_v1(
+            query_start_loc_cpu,
+            kv_indptr_cpu,
+            self.num_heads // self.kv_cache_spec.num_kv_heads,
+            self.kv_cache_spec.num_kv_heads,
+            False,
+            self.work_metadata,
+            self.work_info_set,
+            self.work_indptr,
+            self.reduce_indptr,
+            self.reduce_final_map,
+            self.reduce_partial_map,
+            kv_granularity=max(page_size, 16),
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=False
+        )
+
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             num_actual_pages = paged_kv_indices.size(0)
@@ -176,6 +224,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+            work_metadata=self.work_metadata,
+            work_info_set=self.work_info_set,
+            work_indptr=self.work_indptr,
+            reduce_indptr=self.reduce_indptr,
+            reduce_final_map=self.reduce_final_map,
+            reduce_partial_map=self.reduce_partial_map,
         )
 
         return attn_metadata
@@ -274,6 +328,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             attn_metadata.decode.paged_kv_indptr,
             attn_metadata.decode.paged_kv_indices,
             attn_metadata.decode.paged_kv_last_page_len,
+            work_meta_data=attn_metadata.decode.work_metadata,
+            work_indptr=attn_metadata.decode.work_indptr,
+            work_info_set=attn_metadata.decode.work_info_set,
+            reduce_indptr=attn_metadata.decode.reduce_indptr,
+            reduce_final_map=attn_metadata.decode.reduce_final_map,
+            reduce_partial_map=attn_metadata.decode.reduce_partial_map,
         )
 
         return o, None
