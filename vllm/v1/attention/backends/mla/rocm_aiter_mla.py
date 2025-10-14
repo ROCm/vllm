@@ -196,7 +196,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 "alibi_slopes, sliding_window, logits_soft_cap")
 
         if envs.VLLM_ROCM_USE_AITER_TRITON_MHA:
-            from aiter.ops.triton.MHA import flash_attn_varlen_func
+            from aiter.ops.triton.mha import flash_attn_varlen_func
         else:
             from aiter import flash_attn_varlen_func
         self.flash_attn_varlen_func = flash_attn_varlen_func
