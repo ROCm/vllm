@@ -121,6 +121,7 @@ def test_fusion_rmsnorm_quant(
     )
     with vllm.config.set_current_vllm_config(vllm_config), monkeypatch.context() as m:
         m.setenv("VLLM_ROCM_USE_AITER", "1")
+        m.setenv("VLLM_ROCM_USE_AITER_LINEAR", "0")
         m.setenv("VLLM_ROCM_USE_AITER_RMSNORM", "1")
 
         # Reshape pass is needed for the fusion pass to work
