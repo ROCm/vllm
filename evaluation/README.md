@@ -37,6 +37,8 @@
     bash launch_deepseekr1_ptpc_fp8.sh
     ```
 
+    We currently use pure tp8 since it gives better performance than TP8 + EP8, which is subject to change as optimization continues.
+
     The example command:
     ```
     export VLLM_USE_V1=1
@@ -62,7 +64,6 @@
     --trust-remote-code \
     --no-enable-prefix-caching \
     --disable-log-requests \
-    --enable-expert-parallel \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --gpu_memory_utilization 0.9 \
     --block-size 1
@@ -93,7 +94,7 @@
         --port 8000 \
         --model ${model} \
         --dataset-name random \
-        --random-input-len 3500 \
+        --random-input-len 3584 \
         --random-output-len 1024 \
         --max-concurrency 64 \
         --num-prompts 128 \
