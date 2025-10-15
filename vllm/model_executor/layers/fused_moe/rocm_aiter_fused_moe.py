@@ -100,7 +100,7 @@ class ActivationMethod(IntEnum):
 def is_rocm_aiter_moe_enabled() -> bool:
     return (
         current_platform.is_rocm()
-        and (envs.VLLM_ROCM_USE_AITER_MOE or envs.VLLM_ROCM_USE_AITER_ASMMOE)
+        and envs.VLLM_ROCM_USE_AITER_MOE
         and envs.VLLM_ROCM_USE_AITER
     )
 
@@ -491,7 +491,6 @@ def rocm_aiter_fused_experts(
     apply_router_weight_on_input: bool = False,
     expert_map: Optional[torch.Tensor] = None,
     quant_config: Optional[FusedMoEQuantConfig] = None,
-    use_asm: bool = False,
 ) -> torch.Tensor:
     if quant_config is None:
         quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
@@ -535,23 +534,6 @@ def rocm_aiter_fused_experts(
             per_tensor_quant_scale=None,
             expert_mask=expert_mask,
             activation_method=activation_method,
-        )
-
-    elif use_asm:
-        return torch.ops.vllm.rocm_aiter_asm_moe(
-            hidden_states,
-            w1,
-            w2,
-            topk_weights,
-            topk_ids,
-            fc1_scale=quant_config.w1_scale,
-            fc2_scale=quant_config.w2_scale,
-            fc1_smooth_scale=quant_config.a1_scale,
-            fc2_smooth_scale=quant_config.a2_scale,
-            a16=False,
-            block_shape=quant_config.block_shape,
-            activation_method=activation_method,
-            expert_mask=expert_mask,
         )
     else:
         quant_method = QuantMethod.NO.value
