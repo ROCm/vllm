@@ -217,7 +217,7 @@ if TYPE_CHECKING:
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
 
-    VLLM_ROCM_USE_AITER_TRITON_MHA: bool = False
+    VLLM_ROCM_USE_AITER_TRITON_MLA: bool = False
 
 def get_default_cache_root():
     return os.getenv(
@@ -1410,9 +1410,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #                                      top 5 collected objects
     "VLLM_GC_DEBUG": lambda: os.getenv("VLLM_GC_DEBUG", ""),
 
-    # Apply preshuffling for mxfp4 scales for ROCm backend
-    "VLLM_ROCM_USE_AITER_TRITON_MHA":
-    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MHA", "1"))),
+    # Use AITER Triton MLA
+    "VLLM_ROCM_USE_AITER_TRITON_MLA":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MLA", "1"))),
 }
 
 # --8<-- [end:env-vars-definition]
