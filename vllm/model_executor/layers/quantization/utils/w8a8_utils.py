@@ -450,6 +450,8 @@ def dispatch_w8a8_scaled_mm(
     preferred_backend: str, per_tensor_weights: bool, per_tensor_activations: bool
 ) -> Callable[..., torch.Tensor]:
     if per_tensor_weights and per_tensor_activations:
+        if preferred_backend == "aiter":
+            return rocm_aiter_per_tensor_w8a8_scaled_mm
         if preferred_backend == "rocm":
             return rocm_per_tensor_w8a8_scaled_mm
         if preferred_backend == "flashinfer":
