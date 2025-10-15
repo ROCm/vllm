@@ -183,7 +183,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM: bool = True
     ROCM_TRITON_MOE_PRESHUFFLE_SCALES: bool = True
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
-    VLLM_ROCM_USE_AITER_TRITON_MHA: bool = False
+    VLLM_ROCM_USE_AITER_TRITON_MLA: bool = False
 
 def get_default_cache_root():
     return os.getenv(
@@ -1273,9 +1273,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ROCM_TRITON_MOE_PRESHUFFLE_SCALES":
     lambda: bool(int(os.getenv("ROCM_TRITON_MOE_PRESHUFFLE_SCALES", "1"))),
 
-    # Apply preshuffling for mxfp4 scales for ROCm backend
-    "VLLM_ROCM_USE_AITER_TRITON_MHA":
-    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MHA", "1"))),
+    # Use AITER Triton MLA
+    "VLLM_ROCM_USE_AITER_TRITON_MLA":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MLA", "1"))),
 }
 
 # --8<-- [end:env-vars-definition]
