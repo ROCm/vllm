@@ -314,63 +314,6 @@ def rocm_aiter_fused_moe_fake(
     return torch.empty_like(hidden_states)
 
 
-def rocm_aiter_asm_moe_impl(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    fc1_scale: Optional[torch.Tensor] = None,
-    fc2_scale: Optional[torch.Tensor] = None,
-    fc1_smooth_scale: Optional[torch.Tensor] = None,
-    fc2_smooth_scale: Optional[torch.Tensor] = None,
-    a16: bool = False,
-    per_tensor_quant_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    expert_mask: Optional[torch.Tensor] = None,
-    activation_method: int = ActivationMethod.SILU.value,
-) -> torch.Tensor:
-    from aiter import ActivationType
-    from aiter.fused_moe_bf16_asm import asm_moe
-
-    activation = ActivationType(activation_method)
-    return asm_moe(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        fc1_scale=fc1_scale,
-        fc2_scale=fc2_scale,
-        fc1_smooth_scale=fc1_smooth_scale,
-        fc2_smooth_scale=fc2_smooth_scale,
-        a16=a16,
-        per_tensor_quant_scale=per_tensor_quant_scale,
-        block_shape=None if block_shape is None else tuple(block_shape),
-        activation=activation,
-        expert_mask=expert_mask,
-    )
-
-
-def rocm_aiter_asm_moe_fake(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weight: torch.Tensor,
-    topk_ids: torch.Tensor,
-    fc1_scale: Optional[torch.Tensor] = None,
-    fc2_scale: Optional[torch.Tensor] = None,
-    fc1_smooth_scale: Optional[torch.Tensor] = None,
-    fc2_smooth_scale: Optional[torch.Tensor] = None,
-    a16: bool = False,
-    per_tensor_quant_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-    expert_mask: Optional[torch.Tensor] = None,
-    activation_method: int = ActivationMethod.SILU.value,
-) -> torch.Tensor:
-    return torch.empty_like(hidden_states)
-
-
 if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="rocm_aiter_asm_moe_tkw1",
@@ -382,14 +325,6 @@ if current_platform.is_rocm():
         op_name="rocm_aiter_fused_moe",
         op_func=rocm_aiter_fused_moe_impl,
         fake_impl=rocm_aiter_fused_moe_fake,
-    )
-
-    direct_register_custom_op(
-        op_name="rocm_aiter_asm_moe",
-        op_func=rocm_aiter_asm_moe_impl,
-        mutates_args=[],
-        fake_impl=rocm_aiter_asm_moe_fake,
-        dispatch_key=current_platform.dispatch_key,
     )
 
     direct_register_custom_op(
