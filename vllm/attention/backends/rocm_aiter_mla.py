@@ -379,6 +379,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             v,
             **kwargs,
         )
+        # Transpose the LSE if Triton MHA is used:
+        # (q.shape[0], num_q_heads) to (num_q_heads, q.shape[0])
         if envs.VLLM_ROCM_USE_AITER_TRITON_MHA and type(result) is tuple and return_softmax_lse:
             output, lse = result
             lse = lse.T.contiguous()
