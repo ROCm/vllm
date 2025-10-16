@@ -176,12 +176,6 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         max_seqlen_qo = torch.max(query_lens).item()
 
         import aiter
-        print("the work_metadata: ", self.work_metadata, flush=True)
-        print("the work_info_set: ", self.work_info_set, flush=True)
-        print("the work_indptr: ", self.work_indptr, flush=True)
-        print("the input buffer: ", self.reduce_indptr, flush=True)
-        print("the input buffer: ", self.reduce_final_map, flush=True)
-        print("the input buffer: ", self.reduce_partial_map, flush=True)
         aiter.get_mla_metadata_v1(
             query_start_loc_device,
             kv_indptr,
@@ -194,7 +188,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self.reduce_indptr,
             self.reduce_final_map,
             self.reduce_partial_map,
-            kv_granularity=max(page_size, 16),
+            kv_granularity=max(self.kv_cache_spec.block_size, 16),
             max_seqlen_qo=max_seqlen_qo,
             uni_seqlen_qo=max_seqlen_qo,
             fast_mode=True
@@ -325,7 +319,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         B = q.shape[0]
         o = torch.zeros(
             B, self.num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
-        )
+        ).fill_(-1)
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
