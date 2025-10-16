@@ -10,7 +10,7 @@ import torch
 import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionLayer
 from vllm.attention.ops.rocm_aiter_mla import aiter_mla_decode_fwd
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.utils import cdiv
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
@@ -318,7 +318,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
         o = torch.zeros(
-            B, self.num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+            B, self.num_heads, self.kv_lora_rank, dtype=torch.bfloat16, device=q.device
         ).fill_(-1)
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -341,6 +341,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             reduce_indptr=attn_metadata.decode.reduce_indptr,
             reduce_final_map=attn_metadata.decode.reduce_final_map,
             reduce_partial_map=attn_metadata.decode.reduce_partial_map,
+            q_scale=layer._q_scale,
+            kv_scale=layer._k_scale,
         )
 
         return o, None
