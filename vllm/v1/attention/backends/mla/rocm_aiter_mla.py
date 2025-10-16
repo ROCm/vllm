@@ -57,6 +57,8 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     # The query indptr, shape : [num_decode + 1]
     qo_indptr: torch.Tensor | None = None
 
+    max_seqlen_qo: int = 1
+
     work_metadata: torch.Tensor | None = None
 
     work_info_set: torch.Tensor | None = None
@@ -106,8 +108,11 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
 
-        max_qo_len = 1
-        max_qo_tiles_per_batch = int(math.ceil)
+        # num_mtp = vllm_config.speculative_config.num_speculative_tokens
+        # num_mtp = 1 if num_mtp is None else num_mtp
+        max_seqlen_qo = 1 if vllm_config.speculative_config is None else vllm_config.speculative_config.num_speculative_tokens
+
+        max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * self.num_heads / 128))
         self.work_metadata = torch.empty([10], dtype=torch.uint64, device="cuda")
         self.work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device='cuda')
         self.work_info_set = torch.empty([max_num_reqs * max_qo_tiles_per_batch * cu_num, 8], dtype=torch.int32, device='cuda').fill_(-1)
@@ -165,16 +170,24 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 block_table_bounds.cumsum(dim=0, dtype=torch.int32),
             ]
         )
-        kv_indptr_cpu = torch.zeros([query_start_loc_cpu.size(0)], dtype=torch.int32)
-        torch.cumsum(seq_lens_cpu, dim=0, out=kv_indptr_cpu[1:])
+        kv_indptr = torch.zeros([query_start_loc_cpu.size(0)], dtype=torch.int32, device='cuda')
+        torch.cumsum(seq_lens_device, dim=0, out=kv_indptr[1:])
+        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        max_seqlen_qo = torch.max(query_lens).item()
 
         import aiter
+        print("the work_metadata: ", self.work_metadata, flush=True)
+        print("the work_info_set: ", self.work_info_set, flush=True)
+        print("the work_indptr: ", self.work_indptr, flush=True)
+        print("the input buffer: ", self.reduce_indptr, flush=True)
+        print("the input buffer: ", self.reduce_final_map, flush=True)
+        print("the input buffer: ", self.reduce_partial_map, flush=True)
         aiter.get_mla_metadata_v1(
-            query_start_loc_cpu,
-            kv_indptr_cpu,
+            query_start_loc_device,
+            kv_indptr,
             self.num_heads // self.kv_cache_spec.num_kv_heads,
             self.kv_cache_spec.num_kv_heads,
-            False,
+            True,
             self.work_metadata,
             self.work_info_set,
             self.work_indptr,
@@ -182,9 +195,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self.reduce_final_map,
             self.reduce_partial_map,
             kv_granularity=max(page_size, 16),
-            max_seqlen_qo=1,
-            uni_seqlen_qo=1,
-            fast_mode=False
+            max_seqlen_qo=max_seqlen_qo,
+            uni_seqlen_qo=max_seqlen_qo,
+            fast_mode=True
         )
 
 
@@ -224,6 +237,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
+            max_seqlen_qo=max_seqlen_qo,
             work_metadata=self.work_metadata,
             work_info_set=self.work_info_set,
             work_indptr=self.work_indptr,
@@ -317,14 +331,13 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         # max_seqlen_qo must be 1 except for MTP
         # TODO: Find the best value for MTP
-        max_seqlen_qo = 1
         aiter_mla_decode_fwd(
             q,
             kv_buffer,
             o,
             self.scale,
             attn_metadata.decode.qo_indptr,
-            max_seqlen_qo,
+            attn_metadata.decode.max_seqlen_qo,
             attn_metadata.decode.paged_kv_indptr,
             attn_metadata.decode.paged_kv_indices,
             attn_metadata.decode.paged_kv_last_page_len,
