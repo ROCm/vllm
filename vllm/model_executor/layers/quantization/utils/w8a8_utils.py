@@ -220,7 +220,7 @@ def rocm_aiter_per_tensor_w8a8_scaled_mm(
     bias: torch.Tensor,
     output_shape: list,
 ) -> torch.Tensor:
-    output = aiter_ops.rocm_aiter_tuned_gemm(
+    output = aiter_ops.tuned_gemm(
         qinput,
         weight.t(),
         out_dtype=out_dtype,

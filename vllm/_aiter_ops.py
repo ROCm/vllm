@@ -8,6 +8,13 @@ from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
 
+# This less strict condition works generally for
+# all bpreshuffle CK kernels and MoE kernels
+# However, it is recommended to use use_shuffle()
+# switch to use_swizzle_gemm when in runtime or staging
+# the actual kernel throws error like gemm shape not supported
+# Currently this condition is used to determine
+# whether to use bpreshuffle PTPC GEMM kernel.
 def use_swizzle_gemm(n: int, k: int, dtype: torch.dtype) -> bool:
     multiple_of: int = 64
 
@@ -15,6 +22,12 @@ def use_swizzle_gemm(n: int, k: int, dtype: torch.dtype) -> bool:
         multiple_of = 128
 
     return n % multiple_of == 0 and k % multiple_of == 0
+
+
+def can_shuffle(n: int, k: int, layout: tuple[int, int]):
+    IN, IK = layout
+    BK = IK * 2
+    return (n % IN == 0) and (k % BK == 0)
 
 
 def rocm_aiter_tuned_gemm_impl(
@@ -52,6 +65,50 @@ def rocm_aiter_tuned_gemm_fake(
     return torch.empty((m, n), dtype=out_dtype, device=input.device)
 
 
+def rocm_aiter_hip_bpreshuffle_gemm_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    scale_a: Optional[torch.Tensor] = None,
+    scale_b: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # This AITER function can be used for
+    # - BF16 and FP16 matmul
+    #   e.g. vllm/model_executor/layers/linear.py
+    # - per-tensor activations + per-tensor weights
+    #   e.g. vllm/model_executor/layers/quantization/utils/w8a8_utils.py
+
+    from aiter import hipb_mm
+
+    return hipb_mm(
+        input,
+        weight.t(),
+        solution_index=-1,
+        bias=bias,
+        out_dtype=out_dtype,
+        scaleA=scale_a,
+        scaleB=scale_b.t() if scale_b is not None else None,
+        scaleOut=None,
+        bpreshuffle=True,
+    )
+
+
+def rocm_aiter_hip_bpreshuffle_gemm_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    scale_a: Optional[torch.Tensor] = None,
+    scale_b: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    m = input.shape[0]
+    n = weight.shape[0]
+    if out_dtype is None:
+        out_dtype = input.dtype
+    return torch.empty((m, n), dtype=out_dtype, device=input.device)
+
+
 if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="rocm_aiter_tuned_gemm",
@@ -61,10 +118,35 @@ if current_platform.is_rocm():
         dispatch_key=current_platform.dispatch_key,
     )
 
+    direct_register_custom_op(
+        op_name="rocm_aiter_hip_bpreshuffle_gemm",
+        op_func=rocm_aiter_hip_bpreshuffle_gemm_impl,
+        mutates_args=[],
+        fake_impl=rocm_aiter_hip_bpreshuffle_gemm_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+
 
 class aiter_ops:
+    _initialized = False
+
+    @classmethod
+    def initialize(cls) -> None:
+        # Add a safeguard so that
+        # aiter_ops can still be imported
+        # on non-ROCm platforms and called
+        # without causing errors
+        if not current_platform.is_rocm():
+            return
+        if cls._initialized:
+            return
+        from aiter import hipb_create_extension
+
+        hipb_create_extension()
+        cls._initialized = True
+
     @staticmethod
-    def rocm_aiter_tuned_gemm(
+    def tuned_gemm(
         input: torch.Tensor,  # [M, K]
         weight: torch.Tensor,  # [N, K]
         bias: Optional[torch.Tensor] = None,
@@ -80,3 +162,31 @@ class aiter_ops:
             scale_a=scale_a,
             scale_b=scale_b,
         )
+
+    def hip_bpreshuffle_gemm(
+        input: torch.Tensor,  # [M, K]
+        weight: torch.Tensor,  # [N, K]
+        bias: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        scale_a: Optional[torch.Tensor] = None,
+        scale_b: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if input.dim() >= 3:
+            inp_view = input.view(-1, input.size(-1))
+            batched = True
+        else:
+            inp_view = input
+            batched = False
+        output = torch.ops.vllm.rocm_aiter_hip_bpreshuffle_gemm(
+            inp_view,
+            weight,
+            bias=bias,
+            out_dtype=out_dtype,
+            scale_a=scale_a,
+            scale_b=scale_b,
+        )
+
+        if batched:
+            output = output.view(*input.shape[:-1], weight.shape[0])
+
+        return output

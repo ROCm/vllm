@@ -11,6 +11,8 @@ from vllm import envs
 from vllm._aiter_ops import aiter_ops
 from vllm.platforms import CpuArchEnum, current_platform
 
+aiter_ops.initialize()
+
 
 def shuffle_weight(w: torch.Tensor) -> torch.Tensor:
     # Shuffle weight along the last dimension so that
@@ -118,7 +120,7 @@ def rocm_unquantized_gemm_wrapper():
 
         if _use_skinny is not True:
             if use_aiter:
-                return aiter_ops.rocm_aiter_tuned_gemm(x, weight, bias)
+                return aiter_ops.tuned_gemm(x, weight, bias)
             return torch.nn.functional.linear(x, weight, bias)
 
         x_view = x.view(-1, x.size(-1))
@@ -134,7 +136,7 @@ def rocm_unquantized_gemm_wrapper():
             return out.view(*x.shape[:-1], weight.shape[0])
 
         if use_aiter:
-            return aiter_ops.rocm_aiter_tuned_gemm(x, weight, bias)
+            return aiter_ops.tuned_gemm(x, weight, bias)
         return torch.nn.functional.linear(x, weight, bias)
 
     return inner_function
@@ -251,9 +253,22 @@ def cpu_unquantized_gemm(
     return layer.cpu_linear(x, weight, bias)
 
 
-def dispatch_unquantized_gemm() -> Callable[
+def rocm_aiter_hip_bpreshuffle_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+):
+    return aiter_ops.hip_bpreshuffle_gemm(x, weight, bias)
+
+
+def dispatch_unquantized_gemm(
+    use_swizzle: bool = False,
+) -> Callable[
     [torch.nn.Module, torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor
 ]:
+    if current_platform.is_rocm() and use_swizzle:
+        return rocm_aiter_hip_bpreshuffle_unquantized_gemm
     if current_platform.is_rocm():
         return rocm_unquantized_gemm_wrapper()
     elif current_platform.is_cpu():
