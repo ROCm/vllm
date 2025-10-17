@@ -209,7 +209,7 @@ if TYPE_CHECKING:
     VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES: bool = True
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_PATTERN_MATCH_DEBUG: Optional[str] = None
-
+    VLLM_ROCM_USE_AITER_TRITON_MLA: bool = True
 
 def get_default_cache_root():
     return os.getenv(
@@ -1434,8 +1434,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME":
     lambda: os.getenv("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
                       "VLLM_OBJECT_STORAGE_SHM_BUFFER"),
-}
 
+    # Apply preshuffling for mxfp4 scales for ROCm backend
+    "VLLM_ROCM_USE_AITER_TRITON_MLA":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MLA", "1"))),
+    }
 # --8<-- [end:env-vars-definition]
 
 
