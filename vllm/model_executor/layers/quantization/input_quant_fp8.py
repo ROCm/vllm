@@ -20,22 +20,6 @@ _FP8_MIN = -224.0 if current_platform.is_fp8_fnuz() else _FP8_FINFO.min
 _FP8_MIN_SCALING_FACTOR = 1.0 / (_FP8_MAX * 512.0)
 
 
-def rocm_aiter_per_tensor_quant(
-    x: torch.Tensor, scale: Optional[torch.Tensor], dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.quant import per_tensor_quant_hip
-
-    return per_tensor_quant_hip(x, scale, dtype)
-
-
-def rocm_aiter_per_token_quant(
-    x: torch.Tensor, scale: Optional[torch.Tensor], dtype: torch.dtype
-) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.quant import per_token_quant_hip
-
-    return per_token_quant_hip(x, scale, dtype)
-
-
 @CustomOp.register("quant_fp8")
 class QuantFP8(CustomOp):
     """
@@ -117,26 +101,25 @@ class QuantFP8(CustomOp):
         scale: Optional[torch.Tensor] = None,
         scale_ub: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        use_aiter_per_tensor_quant = (
+        from vllm._aiter_ops import aiter_ops
+
+        use_aiter_quant = (
             not self.is_group_quant
-            and self.group_shape == GroupShape.PER_TENSOR
             and self.use_aiter
             and scale_ub is None
             and x.is_contiguous()
         )
+        use_aiter_per_tensor_quant = (
+            use_aiter_quant and self.group_shape == GroupShape.PER_TENSOR
+        )
         use_aiter_per_token_quant = (
-            not self.is_group_quant
-            and self.group_shape == GroupShape.PER_TOKEN
-            and self.use_aiter
-            and scale_ub is None
-            and not self.static
-            and x.is_contiguous()
+            use_aiter_quant and self.group_shape == GroupShape.PER_TOKEN
         )
 
         if use_aiter_per_tensor_quant:
-            return rocm_aiter_per_tensor_quant(x, scale, _FP8_DTYPE)
+            return aiter_ops.rocm_aiter_per_tensor_quant(x, scale, _FP8_DTYPE)
         if use_aiter_per_token_quant:
-            return rocm_aiter_per_token_quant(x, scale, _FP8_DTYPE)
+            return aiter_ops.rocm_aiter_per_token_quant(x, scale, _FP8_DTYPE)
         # Fallback to CUDA implementation
         return self.forward_cuda(x, scale, scale_ub)
 
