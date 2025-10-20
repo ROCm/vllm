@@ -58,7 +58,8 @@ class ChunkedLocalAttention(Attention):
                  cache_config: Optional[CacheConfig] = None,
                  quant_config: Optional[QuantizationConfig] = None,
                  kv_sharing_target_layer_name: Optional[str] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 **kwargs):
         dtype = torch.get_default_dtype()
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
@@ -88,4 +89,5 @@ class ChunkedLocalAttention(Attention):
             quant_config=quant_config,
             prefix=prefix,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
-            attn_backend=attn_backend)
+            attn_backend=attn_backend,
+            **kwargs)
