@@ -17,6 +17,12 @@ import math
 logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
+@triton.jit
+def fast_exp(x):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    return tl.math.exp2(x * RCP_LN2)
+
+
 def select_2d_config(
     block_size,
     head_size,
@@ -130,8 +136,8 @@ def cdiv_fn(x, y):
 @triton.jit
 def apply_softcap(S, x):
     Sdiv = S / x
-    p1 = tl.exp(Sdiv)
-    p2 = tl.exp(-Sdiv)
+    p1 = tl.math.exp2(Sdiv)
+    p2 = tl.math.exp2(-Sdiv)
     return x * (p1 - p2) / (p1 + p2)
 
 
@@ -164,7 +170,7 @@ def kernel_unified_attention_2d(
     seq_lens_ptr,  # [num_seqs]
     alibi_slopes_ptr,  # [num_query_heads]
     qq_bias_ptr,  # [num_query_tokens, num_query_tokens]
-    scale,  # float32
+    scale: tl.constexpr,  # float32
     k_scale,  # float32
     v_scale,  # float32
     out_scale,  # float32
@@ -205,6 +211,10 @@ def kernel_unified_attention_2d(
 ):
     kv_head_idx = tl.program_id(0)
     q_block_global_idx = tl.program_id(1)
+
+    # needed to use exp2 (exp2 -> exp conversion)
+    RCP_LN2 = 1.4426950408889634
+    qk_scale = scale * RCP_LN2
 
     seq_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs,
                            BLOCK_Q, True)
@@ -258,11 +268,12 @@ def kernel_unified_attention_2d(
     if not USE_SINKS:
         M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     else:
+         # Prescale with RCP_LN2, needed for exp2
         M = tl.load(
             sink_ptr + query_offset_1,
             mask=query_mask_1,
             other=float("-inf"),
-        ).to(dtype=tl.float32)
+        ).to(dtype=tl.float32) * RCP_LN2
 
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
@@ -371,15 +382,16 @@ def kernel_unified_attention_2d(
         else:
             V = V_load
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-
-        S += scale * tl.dot(Q, K)
+        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
+        S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
+            # softcap here uses exp2 and consumes RCP_LN2 conversion.
+            # multiply by RCP_LN2 again to be used in later exp2
+            S = apply_softcap(S, softcap) * RCP_LN2 
+        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
                      S, float("-inf"))
@@ -389,7 +401,8 @@ def kernel_unified_attention_2d(
                          < SLIDING_WINDOW, S, float("-inf"))
 
         if USE_ALIBI_SLOPES:
-            S += alibi_slope[:, None] * (seq_offset - context_len)
+            # prescale w. RCP_LN2 for later exp2
+            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
 
         if USE_QQ_BIAS:
             # compute key positions relative to query section
@@ -401,7 +414,8 @@ def kernel_unified_attention_2d(
                 mask=is_query_key[None, :],  # avoid OOB for context keys
                 other=0.0,
             )
-            S += qq_bias
+            # prescale w. RCP_LN2 for later exp2
+            S += qq_bias * RCP_LN2
 
         # compute running maximum
         # m_j : (BLOCK_M,)
@@ -412,13 +426,13 @@ def kernel_unified_attention_2d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, TILE_SIZE)
-        P = tl.exp(S - m_j[:, None])
+        P = tl.math.exp2(S - m_j[:, None])
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+        alpha = tl.math.exp2(M - m_j)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -501,6 +515,10 @@ def kernel_unified_attention_3d(
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
 
+    # needed to use exp2 (exp2 -> exp conversion)
+    RCP_LN2 = 1.4426950408889634
+    qk_scale = scale * RCP_LN2
+
     seq_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs,
                            BLOCK_Q, True)
 
@@ -557,11 +575,12 @@ def kernel_unified_attention_3d(
 
     if USE_SINKS:
         if segm_idx == 0:
+            # Prescale with RCP_LN2, needed for exp2
             M = tl.load(
                 sink_ptr + query_offset_1,
                 mask=query_mask_1,
                 other=float("-inf"),
-            ).to(dtype=tl.float32)
+            ).to(dtype=tl.float32) * RCP_LN2
         else:
             M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     else:
@@ -654,11 +673,13 @@ def kernel_unified_attention_3d(
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        S += scale * tl.dot(Q, K)
+        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
+        S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
-            S = apply_softcap(S, softcap)
+            # softcap here uses exp2 and consumes RCP_LN2 conversion.
+            # multiply by RCP_LN2 again to be used in later exp2
+            S = apply_softcap(S, softcap) * RCP_LN2
 
         S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
                      S, float("-inf"))
@@ -668,7 +689,8 @@ def kernel_unified_attention_3d(
                          < SLIDING_WINDOW, S, float("-inf"))
 
         if USE_ALIBI_SLOPES:
-            S += alibi_slope[:, None] * (seq_offset - context_len)
+            # prescale w. RCP_LN2 for later exp2
+            S += alibi_slope[:, None] * (seq_offset - context_len) * RCP_LN2
 
         if USE_QQ_BIAS:
             # compute key positions relative to query section
@@ -680,7 +702,8 @@ def kernel_unified_attention_3d(
                 mask=is_query_key[None, :],  # avoid OOB for context keys
                 other=0.0,
             )
-            S += qq_bias
+            # prescale w. RCP_LN2 for later exp2
+            S += qq_bias * RCP_LN2
 
         # compute running maximum
         # m_j : (BLOCK_M,)
@@ -691,13 +714,13 @@ def kernel_unified_attention_3d(
         m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
 
         # P : (BLOCK_M, TILE_SIZE,)
-        P = tl.exp(S - m_j[:, None])
+        P = tl.math.exp2(S - m_j[:, None])
 
         # l_j : (BLOCK_M,)
         l_j = tl.sum(P, axis=1)
 
         # alpha : (BLOCK_M, )
-        alpha = tl.exp(M - m_j)
+        alpha = tl.math.exp2(M - m_j)
 
         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
         acc = acc * alpha[:, None]
@@ -769,8 +792,11 @@ def reduce_segments(
     act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
     segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32)
-    dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1,
-                        0).to(tl.int1)
+
+    if HEAD_SIZE_PADDED != HEAD_SIZE:
+        dim_mask = offs_d < HEAD_SIZE
+    else:
+        dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
     # load segment maxima
     segm_offset = (query_token_idx.to(tl.int64) *
@@ -786,7 +812,7 @@ def reduce_segments(
     segm_expsum = tl.load(segm_expsum_ptr + segm_offset,
                           mask=segm_mask,
                           other=0.0)
-    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
+    segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
     overall_expsum = tl.sum(segm_expsum)
 
     # load, rescale, and add segment attention outputs
@@ -801,7 +827,7 @@ def reduce_segments(
         mask=segm_mask[:, None] & dim_mask[None, :],
         other=0.0,
     )
-    segm_output *= tl.exp(segm_max - overall_max)[:, None]
+    segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
     acc_sum = tl.sum(segm_output, axis=0)
     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
