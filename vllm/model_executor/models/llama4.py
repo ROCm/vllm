@@ -24,6 +24,8 @@ import torch
 from torch import nn
 from transformers import Llama4TextConfig
 
+from vllm import envs
+from vllm import platforms as current_platform
 from vllm.attention import Attention
 from vllm.attention.layers.chunked_local_attention import ChunkedLocalAttention
 from vllm.compilation.decorators import support_torch_compile
@@ -43,6 +45,13 @@ from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
 from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
                     is_pp_missing_parameter)
 
+
+VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = (
+    current_platform.is_rocm()
+    and envs.VLLM_ROCM_USE_AITER
+    and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+    and not envs.VLLM_ROCM_USE_AITER_MHA
+)
 
 class Llama4MoE(nn.Module):
 
@@ -198,6 +207,16 @@ class Llama4Attention(nn.Module):
         use_chunked_local_attn = not self.nope and config.attention_chunk_size
         attn_cls = (ChunkedLocalAttention
                     if use_chunked_local_attn else Attention)
+        extra_args = {}
+        if use_chunked_local_attn:
+            extra_args["attention_chunk_size"] = config.attention_chunk_size
+        self.use_fused_rope = (
+            VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+            and self.rotary_emb is not None
+            and self.qk_norm is None
+        )
+        if self.use_fused_rope:
+            extra_args["rotary_emb"] = self.rotary_emb
         self.attn = attn_cls(
             self.num_heads,
             self.head_dim,
@@ -206,9 +225,7 @@ class Llama4Attention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
-            **({
-                "attention_chunk_size": config.attention_chunk_size
-            } if use_chunked_local_attn else {}))
+            **extra_args)
 
     def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
         floor = torch.floor((positions + 1.0) / self.floor_scale)
@@ -223,6 +240,15 @@ class Llama4Attention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # For limited cases that match Llama3's behavior, use fused RoPE
+        if self.use_fused_rope:
+            assert not (
+                self.attn_temperature_tuning and self.nope
+            ), f"{self.attn_temperature_tuning=} and {self.nope=} must be False with {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}"
+            attn_output = self.attn(q, k, v, positions=positions)
+            output, _ = self.o_proj(attn_output)
+            return output
 
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
