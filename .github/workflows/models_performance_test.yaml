@@ -35,6 +35,14 @@ jobs:
         with:
           ref: ${{ github.event.inputs.vllm_branch }}
 
+      - name: Show disk usage
+        run: |
+          df -h
+      
+      - name: Check models performance test script
+        run: |
+          ls -all /models/
+
       - name: Docker login
         run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
 
@@ -42,6 +50,11 @@ jobs:
         run: |
           docker pull ${{ env.BASE_IMAGE }}
       
+      - name: Show the dns config
+        run: |
+          echo "=== DNS configuration ==="
+          cat /etc/resolv.conf
+
       - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile.mod
@@ -71,14 +84,16 @@ jobs:
 
           RUN echo "=== vLLM version AFTER installation ===" && pip show vllm || true
           EOF
-  
+
       - name: Show Dockerfile
         run: cat Dockerfile.mod
 
       - name: Build Docker image
         run: |
-          IMAGE_TAG=rocm/vllm-aiter-ci:${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}
-          docker build -t $IMAGE_TAG -f Dockerfile.mod .
+          TAG=$(echo "${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}" | tr '/' '-')
+          IMAGE_TAG="rocm/vllm-aiter-ci:$TAG"
+          docker build -t "$IMAGE_TAG" -f Dockerfile.mod .
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
 
       - name: Clean up Rocm processes
         run: |
@@ -91,15 +106,33 @@ jobs:
           docker run -dt \
           --device=/dev/dri \
           --device=/dev/kfd \
-          --shm-size=16G \
-          --group-add $(getent group render | cut -d: -f3) \
-          --group-add $(getent group video | cut -d: -f3) \
+          --privileged \
+          --device /dev/fuse \
+          --cap-add SYS_ADMIN \
+          --shm-size=64G \
+          --user root \
+          --group-add "$(getent group render | cut -d: -f3)" \
+          --group-add "$(getent group video | cut -d: -f3)" \
           -v "${{ github.workspace }}:/workspace" \
+          -v /models:/models \
           -w /workspace \
           --name vllm_test \
-          $IMAGE_TAG
+          "${{ env.IMAGE_TAG }}"
+      
+      - name: Show the models
+        run: |
+          docker exec vllm_test ls /models
+
+      - name: Run performance tests
+        run: |
+          docker exec vllm_test ./.github/scripts/benchmark.sh /models/EmbeddedLLM/deepseek-r1-FP8-Dynamic
 
       - name: Clean up Rocm processes
         if: ${{ always() }}
         run: |
           ./.github/scripts/clean_up_rocm.sh
+      
+      - name: Remove Docker container
+        if: ${{ always() }}
+        run: |
+          docker rm -f vllm_test || true
