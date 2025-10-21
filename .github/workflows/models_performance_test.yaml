@@ -1,0 +1,105 @@
+name: Build and Performance Test
+
+on:
+  pull_request:
+    branches:
+      - dev/perf
+  workflow_dispatch:
+    inputs:
+      vllm_branch:
+        description: 'vLLM branch or commit (default: latest dev/perf)'
+        required: false
+        default: 'dev/perf'
+      aiter_branch:
+        description: 'Aiter branch or commit (default: latest main)'
+        required: false
+        default: ''
+
+env:
+  BASE_IMAGE: "rocm/vllm-dev:nightly"
+  AITER_REPO: "https://github.com/ROCm/aiter.git"
+  AITER_BRANCH: ${{ github.event.inputs.aiter_branch || 'main' }}
+  vLLM_REPO: "https://github.com/ROCm/vllm.git"
+  vLLM_BRANCH: ${{ github.event.inputs.vllm_branch || 'dev/perf' }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: vllm-mi308-8gpu
+    steps:
+      - name: Checkout vLLM repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.vllm_branch }}
+
+      - name: Docker login
+        run: docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Download the vLLM base image
+        run: |
+          docker pull ${{ env.BASE_IMAGE }}
+      
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.mod
+          FROM ${{ env.BASE_IMAGE }}
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+
+          RUN git clone ${{ env.AITER_REPO }} /aiter && \\
+              cd /aiter && \\
+              git checkout ${{ env.AITER_BRANCH }} && \\
+              git submodule sync && git submodule update --init --recursive && \\
+              python3 setup.py develop
+
+          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+
+          RUN echo "=== vLLM version BEFORE uninstall ===" && pip show vllm || true
+          RUN pip uninstall -y vllm
+
+          RUN git clone ${{ env.vLLM_REPO }} /vllm && \\
+              cd /vllm && \\
+              git checkout ${{ env.vLLM_BRANCH }} && \\
+              pip install -U -r requirements/rocm.txt && \\
+              python3 setup.py develop
+
+          RUN echo "=== vLLM version AFTER installation ===" && pip show vllm || true
+          EOF
+  
+      - name: Show Dockerfile
+        run: cat Dockerfile.mod
+
+      - name: Build Docker image
+        run: |
+          IMAGE_TAG=rocm/vllm-aiter-ci:${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}
+          docker build -t $IMAGE_TAG -f Dockerfile.mod .
+
+      - name: Clean up Rocm processes
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: vllm_test"
+          docker run -dt \
+          --device=/dev/dri \
+          --device=/dev/kfd \
+          --shm-size=16G \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name vllm_test \
+          $IMAGE_TAG
+
+      - name: Clean up Rocm processes
+        if: ${{ always() }}
+        run: |
+          ./.github/scripts/clean_up_rocm.sh
