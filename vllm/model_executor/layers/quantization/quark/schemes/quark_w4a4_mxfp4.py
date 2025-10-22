@@ -73,7 +73,7 @@ try:
                                 dtype=out_dtype)
 
                 gemm_a4w4(x_q,
-                          weight,
+                          weight.view(x_q.dtype),
                           x_s,
                           weight_scale.view(x_s.dtype),
                           y,
