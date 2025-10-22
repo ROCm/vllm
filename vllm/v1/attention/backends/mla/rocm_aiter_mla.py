@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from dataclasses import dataclass
 from typing import ClassVar, Optional, Union
-import math
 
 import torch
 
 import vllm.envs as envs
 from vllm.attention.backends.abstract import AttentionLayer
 from vllm.attention.ops.rocm_aiter_mla import aiter_mla_decode_fwd
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.utils import cdiv
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBackend,
@@ -110,15 +110,33 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
         # num_mtp = vllm_config.speculative_config.num_speculative_tokens
         # num_mtp = 1 if num_mtp is None else num_mtp
-        max_seqlen_qo = 1 if vllm_config.speculative_config is None else vllm_config.speculative_config.num_speculative_tokens
+        max_seqlen_qo = (
+            1
+            if vllm_config.speculative_config is None
+            else vllm_config.speculative_config.num_speculative_tokens
+        )
 
         max_qo_tiles_per_batch = int(math.ceil(max_seqlen_qo * self.num_heads / 128))
         self.work_metadata = torch.empty([10], dtype=torch.uint64, device="cuda")
-        self.work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device='cuda')
-        self.work_info_set = torch.empty([max_num_reqs * max_qo_tiles_per_batch * cu_num, 8], dtype=torch.int32, device='cuda').fill_(-1)
-        self.reduce_indptr = torch.empty([max_num_reqs * max_qo_tiles_per_batch + 1], dtype=torch.int32, device='cuda')
-        self.reduce_final_map = torch.empty([max_num_reqs * max_qo_tiles_per_batch, 2], dtype=torch.int32, device='cuda')
-        self.reduce_partial_map = torch.empty([max_num_reqs * max_qo_tiles_per_batch * cu_num], dtype=torch.int32, device='cuda')
+        self.work_indptr = torch.empty([cu_num + 1], dtype=torch.int32, device="cuda")
+        self.work_info_set = torch.empty(
+            [max_num_reqs * max_qo_tiles_per_batch * cu_num, 8],
+            dtype=torch.int32,
+            device="cuda",
+        ).fill_(-1)
+        self.reduce_indptr = torch.empty(
+            [max_num_reqs * max_qo_tiles_per_batch + 1],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.reduce_final_map = torch.empty(
+            [max_num_reqs * max_qo_tiles_per_batch, 2], dtype=torch.int32, device="cuda"
+        )
+        self.reduce_partial_map = torch.empty(
+            [max_num_reqs * max_qo_tiles_per_batch * cu_num],
+            dtype=torch.int32,
+            device="cuda",
+        )
 
         # Preparing persistent buffers
         # TODO: we can disambiguate between decode and mixed-prefill decode here
@@ -170,12 +188,15 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 block_table_bounds.cumsum(dim=0, dtype=torch.int32),
             ]
         )
-        kv_indptr = torch.zeros([query_start_loc_cpu.size(0)], dtype=torch.int32, device='cuda')
+        kv_indptr = torch.zeros(
+            [query_start_loc_cpu.size(0)], dtype=torch.int32, device="cuda"
+        )
         torch.cumsum(seq_lens_device, dim=0, out=kv_indptr[1:])
         query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_seqlen_qo = torch.max(query_lens).item()
 
         import aiter
+
         aiter.get_mla_metadata_v1(
             query_start_loc_device,
             kv_indptr,
@@ -191,9 +212,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             kv_granularity=max(self.kv_cache_spec.block_size, 16),
             max_seqlen_qo=max_seqlen_qo,
             uni_seqlen_qo=max_seqlen_qo,
-            fast_mode=True
+            fast_mode=True,
         )
-
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
             num_actual_pages = paged_kv_indices.size(0)
