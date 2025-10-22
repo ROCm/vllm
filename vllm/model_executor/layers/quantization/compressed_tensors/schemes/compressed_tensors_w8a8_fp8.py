@@ -151,6 +151,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             )
 
             from vllm._aiter_ops import can_shuffle
+
             layout = (16, 16)
             use_swizzle_gemm = can_shuffle(*weight.shape, layout=layout)
             self.use_aiter_and_is_supported = (
