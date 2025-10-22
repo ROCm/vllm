@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=rocm/pytorch-private:vllm_48_rocm7.0_aiter_0918_1380dc
+ARG BASE_IMAGE=registry-sc-harbor.amd.com/framework/compute-rocm-dkms-component-baas-rel:99_ubuntu22.04_py3.10_pytorch_rocm7.1_internal_testing_be7050d1
 ARG HIPBLASLT_BRANCH="9176baa4996408fd323ed7c1a1492a09997e8d05"
 ARG HIPBLASLT_REPO="https://github.com/ROCm/rocm-libraries.git"
 # ARG HIPBLAS_COMMON_BRANCH="9b80ba8e"
@@ -16,7 +16,7 @@ ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
 
 FROM ${BASE_IMAGE} AS base
 
-ENV PATH=/opt/rocm/llvm/bin:$PATH
+ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV ROCM_PATH=/opt/rocm
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
 ARG PYTORCH_ROCM_ARCH=gfx942;gfx950
@@ -173,6 +173,17 @@ RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 # RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
+
+FROM base AS debs
+RUN mkdir /app/debs
+RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
 
 FROM base AS final
 # RUN --mount=type=bind,from=build_hipblaslt,src=/app/install/,target=/install \

@@ -1,7 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-private:355_wip_base_image_0925
+ARG BASE_IMAGE=rocm/vllm-private:355_wip_base_image_1020
 ARG AITER_BRANCH="355_wip"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
@@ -33,7 +33,7 @@ RUN apt install rocm-cmake -y
 RUN git clone "$RCCL_REPO" \
     && cd rccl \
     && git checkout "$RCCL_BRANCH" \
-    && ./install.sh -p --amdgpu_targets="$GFX_COMPILATION_ARCH"
+    && ./install.sh -p --amdgpu_targets="$AITER_ROCM_ARCH"
 
 RUN mkdir -p /app/install && cp /app/rccl/build/release/*.deb /app/install
 
@@ -153,6 +153,7 @@ COPY --from=export_vllm /examples ${COMMON_WORKDIR}/vllm/examples
 COPY --from=export_vllm /docker ${COMMON_WORKDIR}/vllm/docker
 
 ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
+ENV RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
 ENV TOKENIZERS_PARALLELISM=false
 ENV VLLM_ROCM_USE_AITER=1
 
