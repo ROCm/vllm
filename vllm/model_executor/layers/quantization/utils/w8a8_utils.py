@@ -53,6 +53,8 @@ if current_platform.is_rocm():
         n = weight.shape[0]
         from aiter import gemm_a8w8_bpreshuffle_ck
 
+        print(f"input.shape: {input.shape}, weight.shape: {weight.shape}")
+
         Y = torch.empty(m, n, dtype=out_dtype, device=input.device)
         gemm_a8w8_bpreshuffle_ck(input, weight, scale_a, scale_b, Y)
         return Y
