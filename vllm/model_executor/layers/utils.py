@@ -161,7 +161,10 @@ def rocm_aiter_swizzle_hipb_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
-    return aiter_ops.hip_bpreshuffle_gemm(x, weight, bias)
+    output = aiter_ops.hip_bpreshuffle_gemm(x, weight, bias=None)
+    if bias is not None:
+        output = output + bias
+    return output
 
 
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:

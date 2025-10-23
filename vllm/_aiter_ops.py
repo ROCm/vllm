@@ -134,8 +134,12 @@ class aiter_ops:
         scale_a: torch.Tensor | None = None,
         scale_b: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+
         assert out_dtype == torch.bfloat16, (
-            "hip_bpreshuffle_gemm only supports bfloat16 output dtype"
+            f"hip_bpreshuffle_gemm only supports bfloat16 output dtype"
+            f", you have passed in {out_dtype}"
         )
         if input.dim() >= 3:
             inp_view = input.view(-1, input.size(-1))

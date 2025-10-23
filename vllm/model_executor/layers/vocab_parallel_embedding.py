@@ -74,7 +74,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 
             layout = (16, 16)
 
-            weight = layer.weight.data
+            weight = layer.weight
 
             if aiter_ops.can_shuffle(weight.shape[0], weight.shape[1], layout):
                 shuffled_weight = shuffle_weight(weight, layout)
