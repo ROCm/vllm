@@ -105,6 +105,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
+    VLLM_ROCM_USE_AITER_LINEAR_FP8HIPB: bool = (
+        True  # For experimentation. Will be replaced with dispatching logic
+    )
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
@@ -864,6 +867,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_LINEAR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_LINEAR", "True").lower() in ("true", "1")
+    ),
+    # For experimentation. Will be replaced with dispatching logic
+    # Whether to use swizzle hipb_mm for PTPC fp8 GEMM, use ck_bpreshuffle_gemm
+    # if disabled.
+    "VLLM_ROCM_USE_AITER_LINEAR_FP8HIPB": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_LINEAR_FP8HIPB", "True").lower() in ("true", "1")
     ),
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (

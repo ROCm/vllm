@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from functools import cache
 
 import torch
 from packaging import version
@@ -32,6 +33,15 @@ USE_ROWWISE_TORCH_SCALED_MM = (
     and version.parse(torch.__version__) >= version.parse("2.7")
     and current_platform.has_device_capability(94)
 )
+
+
+# Experimentation Feature: Will be replaced with dispatching logic
+# Whether to use swizzle hipb_mm for PTPC fp8 GEMM, use ck_bpreshuffle_gemm if disabled.
+# @cache is needed as envs.VARIABLE is extremely costly to invoke.
+@cache
+def is_rocm_aiter_swizzle_hipb_mm_enabled() -> bool:
+    return envs.VLLM_ROCM_USE_AITER_LINEAR_FP8HIPB
+
 
 if current_platform.is_rocm():
 
@@ -386,9 +396,14 @@ def rocm_aiter_per_token_w8a8_scaled_mm(
     bias: torch.Tensor,
     output_shape: list,
 ) -> torch.Tensor:
-    output = torch.ops.vllm.rocm_aiter_gemm_a8w8_bpreshuffle(
-        qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b
-    )
+    if is_rocm_aiter_swizzle_hipb_mm_enabled():
+        output = aiter_ops.hip_bpreshuffle_gemm(
+            qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b
+        )
+    else:
+        output = torch.ops.vllm.rocm_aiter_gemm_a8w8_bpreshuffle(
+            qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b
+        )
     if bias is not None:
         output = output + bias
 
