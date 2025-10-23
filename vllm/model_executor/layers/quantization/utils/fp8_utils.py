@@ -93,6 +93,11 @@ if current_platform.is_rocm():
         from aiter import get_hip_quant
 
         aiter_per1x128_quant = get_hip_quant(rocm_aiter.QuantType.per_1x128)
+    
+    def aiter_triton_a16w8_gemm_check(m, n, k):
+        if m <= 256:        
+            return (n == 7168 and k == 2048) # DS-R1 o_proj for decode
+        return False
 
 
 def rocm_aiter_ck_tile_gemm_w8a8_blockscale_impl(
@@ -236,6 +241,12 @@ def apply_w8a8_block_fp8_linear(
             q_input = input
             x_scale = input_quant_scale
             output_dtype = torch.bfloat16
+        elif aiter_triton_a16w8_gemm_check(input_2d.shape[0], weight.shape[0], input_2d.shape[1]):
+            from aiter.ops.triton.gemm_a16w8_blockscale import gemm_a16w8_blockscale
+            output = gemm_a16w8_blockscale(input_2d, weight, weight_scale, dtype=output_dtype)
+            if bias is not None:
+                output = output + bias
+            return output.view(*output_shape)
         elif use_aiter_and_is_supported and current_platform.is_fp8_fnuz():
             q_input, x_scale = aiter_per1x128_quant(
                 input_2d.contiguous(), quant_dtype=rocm_aiter.dtypes.fp8)
