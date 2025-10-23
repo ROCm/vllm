@@ -127,8 +127,9 @@ def dispatch_rocm_rmsnorm_func(with_fused_add: bool, dtype: torch.dtype):
         torch.float16,
         torch.bfloat16,
     ]
+    from vllm.platforms.rocm import on_gfx9
 
-    if use_aiter and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PADDING:
+    if use_aiter and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PADDING and on_gfx9():
         from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
         return fused_add_rmsnorm_pad
 
