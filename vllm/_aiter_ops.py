@@ -74,6 +74,23 @@ else:
 
 
 class aiter_ops:
+    _initialized = False
+
+    @classmethod
+    def initialize(cls) -> None:
+        # Add a safeguard so that
+        # aiter_ops can still be imported
+        # on non-ROCm platforms and called
+        # without causing errors
+        if not current_platform.is_rocm():
+            return
+        if cls._initialized:
+            return
+        from aiter import hipb_create_extension
+
+        hipb_create_extension()
+        cls._initialized = True
+
     @staticmethod
     def rocm_aiter_tuned_gemm(
         input: torch.Tensor,  # [M, K]
@@ -108,3 +125,40 @@ class aiter_ops:
             scale,
         )
         return out, scale
+
+    def hip_bpreshuffle_gemm(
+        input: torch.Tensor,  # [M, K]
+        weight: torch.Tensor,  # [N, K]
+        bias: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        scale_a: torch.Tensor | None = None,
+        scale_b: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert out_dtype == torch.bfloat16, (
+            "hip_bpreshuffle_gemm only supports bfloat16 output dtype"
+        )
+        if input.dim() >= 3:
+            inp_view = input.view(-1, input.size(-1))
+            batched = True
+        else:
+            inp_view = input
+            batched = False
+
+        from aiter import hipb_mm
+
+        output = hipb_mm(
+            inp_view,
+            weight.t(),
+            solution_index=-1,
+            bias=bias,
+            out_dtype=out_dtype,
+            scaleA=scale_a,
+            scaleB=scale_b.t() if scale_b is not None else None,
+            scaleOut=None,
+            bpreshuffle=True,
+        )
+
+        if batched:
+            output = output.view(*input.shape[:-1], weight.shape[0])
+
+        return output
