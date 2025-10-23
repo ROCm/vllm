@@ -8,7 +8,6 @@ from typing import Any
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-import vllm.envs as envs
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -236,26 +235,26 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
 
-        if (
-            current_platform.is_rocm()
-            and envs.VLLM_ROCM_USE_AITER
-            and envs.VLLM_ROCM_USE_AITER_LINEAR
-        ):
-            from aiter.ops.shuffle import shuffle_weight
+        # if (
+        #     current_platform.is_rocm()
+        #     and envs.VLLM_ROCM_USE_AITER
+        #     and envs.VLLM_ROCM_USE_AITER_LINEAR
+        # ):
+        #     from aiter.ops.shuffle import shuffle_weight
 
-            import vllm._aiter_ops as aiter_ops
+        #     import vllm._aiter_ops as aiter_ops
 
-            layout = (16, 16)
+        #     layout = (16, 16)
 
-            weight = layer.weight
+        #     weight = layer.weight
 
-            if aiter_ops.can_shuffle(weight.shape[0], weight.shape[1], layout):
-                shuffled_weight = shuffle_weight(weight, layout)
-                self._gemm_func = dispatch_unquantized_gemm(use_swizzle=True)
-            else:
-                shuffled_weight = weight
+        #     if aiter_ops.can_shuffle(weight.shape[0], weight.shape[1], layout):
+        #         shuffled_weight = shuffle_weight(weight, layout)
+        #         self._gemm_func = dispatch_unquantized_gemm(use_swizzle=True)
+        #     else:
+        #         shuffled_weight = weight
 
-            layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
+        #     layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
 
     def apply(
         self,
