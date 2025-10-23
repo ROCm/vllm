@@ -16,7 +16,10 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     all_close_1d, normalize_e4m3fn_to_e4m3fnuz, per_tensor_dequantize)
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-
+from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+    is_rocm_aiter_moe_enabled,
+    use_mxfp4_aiter_moe,
+)
 logger = init_logger(__name__)
 
 __all__ = [
@@ -293,15 +296,23 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 "QuarkW4A4MXFp4MoEMethod with static input scales is currently "
                 "not implemented. Please open an issue.")
 
-        if not current_platform.supports_mx():
-            self.emulate = True
+        self.emulate = not current_platform.supports_mx() or not (
+            use_mxfp4_aiter_moe()
+        )
+
+        if self.emulate:
             logger.warning_once(
-                "The current platform does not support native MXFP4 "
+                f"The current mode (supports_mx={current_platform.supports_mx()}, "
+                f"use_mxfp4_aiter_moe={use_mxfp4_aiter_moe()}, "
+                "does not support native MXFP4/MXFP6 "
                 "computation. Simulated weight dequantization and activation "
                 "QDQ (quantize and dequantize) will be used, with the linear "
                 "layers computed in high precision.")
         else:
             self.emulate = False
+            logger.info_once(
+                "The current mode supports native MoE MXFP4 computation"
+            )
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
@@ -359,6 +370,24 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        
+    def process_weights_after_loading(self, layer):
+        if self.emulate:
+            return
+
+        from aiter.utility.fp4_utils import e8m0_shuffle
+
+        # Pre-shuffle weight scales
+        s0, s1, _ = layer.w13_weight_scale.shape
+        w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+        w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+        layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+
+        s0, s1, _ = layer.w2_weight_scale.shape
+        w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+        w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+        layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+        torch.cuda.empty_cache()
 
     def apply(
         self,
@@ -403,22 +432,44 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype)
 
-        out = fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=True,
-            use_mxfp4_w4a4=True,
-            global_num_experts=global_num_experts,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            expert_map=expert_map,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=None,
-            a2_scale=None,
-            block_shape=None,
-            activation=activation,
-        )
+        if not self.emulate:
+            from aiter import ActivationType, QuantType
+            from aiter.fused_moe import fused_moe
+
+            aiter_acts = {
+                ActivationType.No.name.lower(): ActivationType.No,
+                ActivationType.Silu.name.lower(): ActivationType.Silu,
+                ActivationType.Gelu.name.lower(): ActivationType.Gelu,
+            }
+            assert activation in aiter_acts, (
+                f"Aiter CK fp4 MoE doesn't support activation {activation}"
+            )
+            out = fused_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                quant_type=QuantType.per_1x32,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                activation=aiter_acts[activation],
+                doweight_stage1=False,
+            )
+        else:
+            from vllm.model_executor.layers.fused_moe import fused_experts
+
+            out = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=True,
+                activation=activation,
+                global_num_experts=global_num_experts,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                expert_map=expert_map,
+                quant_config=self.moe_quant_config,
+            )
         return out

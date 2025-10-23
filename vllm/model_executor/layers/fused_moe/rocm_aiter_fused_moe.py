@@ -33,6 +33,13 @@ class ActivationMethod(IntEnum):
     SILU = 0
     GELU = 1
 
+@cache
+def use_mxfp4_aiter_moe() -> bool:
+    return (
+        current_platform.is_rocm()
+        and envs.VLLM_ROCM_USE_CK_MXFP4_MOE
+        and envs.VLLM_ROCM_USE_AITER
+    )
 
 @cache
 def is_rocm_aiter_moe_enabled() -> bool:

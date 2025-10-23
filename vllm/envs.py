@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FP8_BMM: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_MXFP4BMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE: int = 256
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT: bool = False
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT: bool = True
@@ -185,6 +186,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS: bool = True
     VLLM_ROCM_USE_AITER_TRITON_MLA: bool = False
+    VLLM_ROCM_USE_CK_MXFP4_MOE: bool = False
 
 def get_default_cache_root():
     return os.getenv(
@@ -1251,6 +1253,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER Triton fused FP8 per-token group quant + FP8 batched GEMM
     "VLLM_ROCM_USE_AITER_TRITON_FP8_BMM":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FP8_BMM", "1"))),
+
+    # Use AITER Triton fused MXFP4 per-token group quant + MXFP4 batched GEMM
+    "VLLM_ROCM_USE_AITER_TRITON_MXFP4BMM":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MXFP4BMM", "0"))),
+
     "VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE":
     lambda: int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE", 256)),
 
@@ -1282,6 +1289,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER Triton MLA
     "VLLM_ROCM_USE_AITER_TRITON_MLA":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MLA", "0"))),
+
+    # If set, enables CK fp4 MoE
+    "VLLM_ROCM_USE_CK_MXFP4_MOE": lambda: (
+        os.getenv("VLLM_ROCM_USE_CK_MXFP4_MOE", "False").lower() in ("true", "1")
+    ),
 }
 
 # --8<-- [end:env-vars-definition]

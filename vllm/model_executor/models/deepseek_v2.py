@@ -76,6 +76,7 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
 
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+        #from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant as fused_rms_fp8_group_quant
 
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
         import aiter as rocm_aiter
@@ -84,7 +85,6 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
 
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD:
         from aiter.ops.triton.fused_mul_add import fused_mul_add
-    
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_a16w16 import fused_gemm_a8w8_blockscale_a16w16
         from aiter.ops.triton.fused_fp8_quant import fused_reduce_act_mul_fp8_group_quant
@@ -171,6 +171,7 @@ class DeepseekV2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj")
+
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
@@ -181,13 +182,14 @@ class DeepseekV2MLP(nn.Module):
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
+        self.use_triton_fused_silu_mul_fp8_quant = VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and quant_config.get_name() == 'fp8'
 
     def forward(self, x):
         x_quant_scales = None
         if isinstance(x, tuple):
             x, x_quant_scales = x
         gate_up, _ = self.gate_up_proj(x, x_quant_scales=x_quant_scales)
-        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
+        if self.use_triton_fused_silu_mul_fp8_quant:
             x = torch.ops.vllm.act_mul_and_fp8_group_quant(gate_up)
         else:
             x = self.act_fn(gate_up)
@@ -240,7 +242,7 @@ class DeepseekV2MoE(nn.Module):
         vllm_config = get_current_vllm_config()
         eplb_config = vllm_config.parallel_config.eplb_config
         self.enable_eplb = enable_eplb
-
+        self.use_triton_fused_shared_expert = VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and quant_config.get_name() == 'fp8'
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_logical_experts = self.n_routed_experts
         self.n_physical_experts = (self.n_logical_experts +
@@ -290,19 +292,32 @@ class DeepseekV2MoE(nn.Module):
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and self.n_shared_experts is not None:
+        if (
+            self.use_triton_fused_shared_expert
+            and self.n_shared_experts is not None
+        ):
             hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
-            shared_output_q, shared_output_s, router_logits = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
-                hidden_states_shared = hidden_states_shared,
-                hidden_states_shared_scale = hidden_states_shared_scale,
-                weight_gate_up = self.shared_experts.gate_up_proj.weight,
-                weight_scale_gate_up = self.shared_experts.gate_up_proj.weight_scale_inv,
-                hidden_states_moe_gate = hidden_states,
-                weight_moe_gate = self.gate.weight,
-                bias_shared = self.shared_experts.gate_up_proj.bias if not self.shared_experts.gate_up_proj.skip_bias_add else None,
-                bias_moe_gate = self.gate.bias if not self.gate.skip_bias_add else None,
+            shared_output_q, shared_output_s, router_logits = (
+                torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
+                    hidden_states_shared=hidden_states_shared,
+                    hidden_states_shared_scale=hidden_states_shared_scale,
+                    weight_gate_up=self.shared_experts.gate_up_proj.weight,
+                    weight_scale_gate_up=self.shared_experts.gate_up_proj.weight_scale_inv,
+                    hidden_states_moe_gate=hidden_states,
+                    weight_moe_gate=self.gate.weight,
+                    bias_shared=(
+                        self.shared_experts.gate_up_proj.bias
+                        if not self.shared_experts.gate_up_proj.skip_bias_add
+                        else None
+                    ),
+                    bias_moe_gate=(
+                        self.gate.bias if not self.gate.skip_bias_add else None
+                    ),
                 )
-            shared_output, _ = self.shared_experts.down_proj(shared_output_q, x_quant_scales = shared_output_s)
+            )
+            shared_output, _ = self.shared_experts.down_proj(
+                shared_output_q, x_quant_scales=shared_output_s
+            )
         else:
             if self.n_shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states_shared)
@@ -621,7 +636,7 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             rotary_emb=self.rotary_emb if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE else None,
         )
-
+        self.use_triton_fused_rmsnorm_fp8_quant = VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT and quant_config.get_name() == 'fp8'
         self.prefix = prefix
         self.debug_layer_idx = int(self.prefix.split(".")[-2])
 
@@ -644,7 +659,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
-            if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+            if self.use_triton_fused_rmsnorm_fp8_quant:
                 weight = self.q_a_layernorm.weight
                 eps = self.q_a_layernorm.variance_epsilon
                 weight2 = self.kv_a_layernorm.weight
@@ -665,7 +680,7 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states, x_quant_scales = hidden_states_quant)[0]
             q = self.q_proj(hidden_states, x_quant_scales = hidden_states_quant)[0]
 
-        if self.q_lora_rank is None or not VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        if self.q_lora_rank is None or not self.use_triton_fused_rmsnorm_fp8_quant:
             kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim],
                                     dim=-1)
             kv_c_normed = self.kv_a_layernorm(kv_c)
@@ -717,10 +732,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
+        self.use_triton_fused_rmsnorm_fp8_quant = VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT and quant_config.get_name() == 'fp8'
+
         if model_config.use_mla:
             attn_cls = DeepseekV2MLAAttention
         else:
             attn_cls = DeepseekV2Attention
+
         self.self_attn = attn_cls(
             config=config,
             hidden_size=self.hidden_size,
@@ -769,7 +787,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        if self.use_triton_fused_rmsnorm_fp8_quant:
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.variance_epsilon
             if residual is None:
@@ -809,7 +827,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual *= 1. / self.routed_scaling_factor
 
         # Fully Connected
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        if self.use_triton_fused_rmsnorm_fp8_quant:
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.variance_epsilon
             (hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant, _, residual = fused_rms_fp8_group_quant(hidden_states, weight, eps, 
