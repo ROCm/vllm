@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-import vllm.envs as envs
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -62,27 +61,6 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
-
-        if (
-            current_platform.is_rocm()
-            and envs.VLLM_ROCM_USE_AITER
-            and envs.VLLM_ROCM_USE_AITER_LINEAR
-        ):
-            from aiter.ops.shuffle import shuffle_weight
-
-            import vllm._aiter_ops as aiter_ops
-
-            layout = (16, 16)
-
-            weight = layer.weight
-
-            if aiter_ops.can_shuffle(weight.shape[0], weight.shape[1], layout):
-                shuffled_weight = shuffle_weight(weight, layout)
-                self._gemm_func = dispatch_unquantized_gemm(use_swizzle=True)
-            else:
-                shuffled_weight = weight
-
-            layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
 
     def apply(
         self,
@@ -579,4 +557,3 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, input_):
         del input_
-        raise RuntimeError("LMHead's weights should be used in the sampler.")
