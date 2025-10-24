@@ -83,6 +83,12 @@
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --gpu_memory_utilization 0.9 \
     --block-size 1
+
+    # other optiions
+    # MTP
+    --speculative-config='{"method": "deepseek_mtp", "num_speculative_tokens": 1}'
+    # async-scheduling, now MTP and async-scheduling cannot co-work
+    --async-scheduling
     ```
 
 ## Curl request
