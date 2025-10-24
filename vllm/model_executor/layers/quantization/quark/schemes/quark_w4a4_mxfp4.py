@@ -23,6 +23,12 @@ try:
     if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
         from aiter import gemm_a4w4, per_1x32_f4_quant_hip
 
+    def aiter_triton_gemm_check(m, n, k):
+        if m <= 64:
+            return ((n == 8192 and k == 8192) or (n == 10240 and k == 8192)
+                    or (n == 57344 and k == 8192) or (n == 8192 and k == 28672))
+        return False
+    
     def gemm_with_dynamic_quant(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -33,8 +39,12 @@ try:
         M = x.shape[0]
         N = weight.shape[0]
         if envs.VLLM_TRITON_FP4_GEMM_USE_ASM:
+            
+            K = x.shape[1]
+            if x_scales is not None:
+                K *= 2
 
-            if M <= 64:
+            if aiter_triton_gemm_check(M, N, K):
                 if x_scales is None:
                     # use hip quant kernel for performance
                     if M >= 32:
