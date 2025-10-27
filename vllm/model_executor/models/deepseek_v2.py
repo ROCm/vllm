@@ -290,6 +290,10 @@ class DeepseekV2MoE(nn.Module):
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if torch.cuda.is_available():
+            self.alt_stream = torch.cuda.Stream()
+
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and self.n_shared_experts is not None:
             hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
             shared_output_q, shared_output_s, router_logits = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
@@ -302,35 +306,61 @@ class DeepseekV2MoE(nn.Module):
                 bias_shared = self.shared_experts.gate_up_proj.bias if not self.shared_experts.gate_up_proj.skip_bias_add else None,
                 bias_moe_gate = self.gate.bias if not self.gate.skip_bias_add else None,
                 )
-            shared_output, _ = self.shared_experts.down_proj(shared_output_q, x_quant_scales = shared_output_s)
+
+            #Overlap shared_fused_exports and MOE
+            #Guard to prevent repeated lines
+            did_fma = False
+            if self.alt_stream is not None and VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16 and shared_output is not None: 
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output, _ = self.shared_experts.down_proj(
+                        shared_output_q, x_quant_scales = shared_output_s
+                    )
+                
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits
+                )
+
+                final_hidden_states = fused_mul_add(
+                    final_hidden_states, self.routed_scaling_factor, shared_output
+                )
+
+                current_stream.wait_stream(self.alt_stream)
+                did_fma = True
+            else:
+                shared_output, _ = self.shared_experts.down_proj(shared_output_q, x_quant_scales = shared_output_s)
         else:
             if self.n_shared_experts is not None:
                 shared_output = self.shared_experts(hidden_states_shared)
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
 
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16 and shared_output is not None:
-            final_hidden_states = self.experts(hidden_states=hidden_states,
-                                            router_logits=router_logits)
-            final_hidden_states = fused_mul_add(final_hidden_states, self.routed_scaling_factor, shared_output)
-        else:
-            if hidden_states.dtype != torch.float16:
-                final_hidden_states = self.experts(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits) * self.routed_scaling_factor
-            else:
-                # Fix FP16 overflow
-                # See DeepseekV2DecoderLayer for more details.
+        if not did_fma:
+            if VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16 and shared_output is not None:
                 final_hidden_states = self.experts(hidden_states=hidden_states,
                                                 router_logits=router_logits)
-            if shared_output is not None:
+                final_hidden_states = fused_mul_add(final_hidden_states, self.routed_scaling_factor, shared_output)
+            else:
                 if hidden_states.dtype != torch.float16:
-                    final_hidden_states = final_hidden_states + shared_output
+                    final_hidden_states = self.experts(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits) * self.routed_scaling_factor
                 else:
                     # Fix FP16 overflow
                     # See DeepseekV2DecoderLayer for more details.
-                    final_hidden_states = final_hidden_states + shared_output \
-                        * (1. / self.routed_scaling_factor)
+                    final_hidden_states = self.experts(hidden_states=hidden_states,
+                                                    router_logits=router_logits)
+                if shared_output is not None:
+                    if hidden_states.dtype != torch.float16:
+                        final_hidden_states = final_hidden_states + shared_output
+                    else:
+                        # Fix FP16 overflow
+                        # See DeepseekV2DecoderLayer for more details.
+                        final_hidden_states = final_hidden_states + shared_output \
+                            * (1. / self.routed_scaling_factor)
 
         if self.tp_size > 1:
             final_hidden_states = (
