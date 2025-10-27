@@ -206,6 +206,7 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
