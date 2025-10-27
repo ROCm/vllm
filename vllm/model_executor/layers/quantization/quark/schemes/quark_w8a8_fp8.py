@@ -30,6 +30,8 @@ class QuarkW8A8Fp8(QuarkScheme):
             and self.input_qscheme == "per_channel")
         self.fp8_linear = Fp8LinearOp(
             use_per_token_if_dynamic=self.use_per_token_if_dynamic)
+        self.out_dtype = torch.get_default_dtype()
+        
 
     @classmethod
     def get_min_capability(cls) -> int:
