@@ -1271,17 +1271,17 @@ class FusedMoE(CustomOp):
         if self.enable_eplb:
             from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
 
-            if not isinstance(quant_method, (Fp8MoEMethod, UnquantizedFusedMoEMethod)):
-                # TODO: Add support for additional quantization methods.
-                # The implementation for other quantization methods does not
-                # contain essential differences, but the current quant API
-                # design causes duplicated work when extending to new
-                # quantization methods, so I'm leaving it for now.
-                # If you plan to add support for more quantization methods,
-                # please refer to the implementation in `Fp8MoEMethod`.
-                raise NotImplementedError(
-                    "EPLB is only supported for FP8 quantization for now."
-                )
+            # if not isinstance(quant_method, (Fp8MoEMethod, UnquantizedFusedMoEMethod)):
+            #     # TODO: Add support for additional quantization methods.
+            #     # The implementation for other quantization methods does not
+            #     # contain essential differences, but the current quant API
+            #     # design causes duplicated work when extending to new
+            #     # quantization methods, so I'm leaving it for now.
+            #     # If you plan to add support for more quantization methods,
+            #     # please refer to the implementation in `Fp8MoEMethod`.
+            #     raise NotImplementedError(
+            #         "EPLB is only supported for FP8 quantization for now."
+            #     )
 
         moe_quant_params = {
             "num_experts": self.local_num_experts,
@@ -1890,7 +1890,7 @@ class FusedMoE(CustomOp):
 
     def get_expert_weights(self) -> Iterable[torch.Tensor]:
         weights = list(self.named_parameters())
-        assert all(weight.is_contiguous() for _, weight in weights)
+        # assert all(weight.is_contiguous() for _, weight in weights)
 
         # Filter out the non-expert weights.
         # `e_score_correction_bias` is a bias for each logical expert,

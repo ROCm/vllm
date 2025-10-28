@@ -141,6 +141,7 @@ def shuffle_layer(
 
     p2p_ops: list[P2POp] = []
 
+
     # 2. Initiate sending of weights.
     experts_send_loc: dict[int, int] = {}
     for src in range(num_local_experts):
@@ -224,11 +225,42 @@ def shuffle_layer(
             for weight in expert_weights_buffer
         ]
 
+    # op_info = []
+    # for op in p2p_ops:
+    #     if op is None:
+    #         op_info.append(None)
+    #         continue
+            
+    #     op_data = {
+    #         'isend': op.op.__name__ == "isend",
+    #         'peer': op.peer,
+    #         'tag': getattr(op, 'tag', 0),
+    #         'tensor_shape': op.tensor.shape,
+    #         'tensor_dtype': op.tensor.dtype,
+    #         'tensor_device': op.tensor.device,
+    #     }
+    #     op_info.append(op_data)
+    # torch.save({"op":op_info}, f"op_info_device_{ep_rank}.pt")
+
     # 4. Execute the P2P operations. The real communication happens here.
     if p2p_ops:
         reqs = batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
+    # if p2p_ops:
+    #     reqs = []
+    #     for op in p2p_ops:
+    #         if op is None:
+    #             continue
+    #         if op.op.__name__ == "isend":
+    #             print("isend: ", op.peer)
+    #             req = torch.distributed.isend(op.tensor, op.peer, op.group, op.tag)
+    #         else:
+    #             print("irecv: ", op.peer)
+    #             req = torch.distributed.irecv(op.tensor, op.peer, op.group, op.tag)
+    #         reqs.append(req)
+    #     for req in reqs:
+    #         req.wait()
 
     # 5. Copy the weights from the buffer back to the original weights.
     for dst in range(num_local_experts):
@@ -325,6 +357,7 @@ def rearrange_expert_weights_inplace(
         # NOTE(bowen): We need this synchronize to run, but I don't know why.
         # If you figure out the reason, please let me know -- thank you!
         torch.cuda.synchronize()
+        print("layer: ", layer)
         shuffle_layer(
             num_local_physical_experts,
             ep_rank,

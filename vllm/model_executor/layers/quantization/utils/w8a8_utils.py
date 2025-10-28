@@ -503,6 +503,13 @@ class Fp8LinearOp:
             and current_platform.is_fp8_fnuz()
             and pad_output is not True
         )
+        # if pad_output:
+        #    print("aa")
+        self.pad_output = pad_output
+        self.aiter = envs.VLLM_ROCM_USE_AITER
+        self.rocm = envs.VLLM_ROCM_USE_AITER_LINEAR
+        self.pla = current_platform.is_rocm()
+        self.f8 = current_platform.is_fp8_fnuz()
 
         if self.use_aiter_and_is_supported:
             self.preferred_backend = "aiter"
@@ -515,6 +522,7 @@ class Fp8LinearOp:
                 self.preferred_backend = "cutlass"
         else:
             self.preferred_backend = "torch"
+        self.bak = self.preferred_backend
 
         # Note: we pad the input because torch._scaled_mm is more performant
         # for matrices with batch dimension > 16.

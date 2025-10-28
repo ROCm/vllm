@@ -429,6 +429,7 @@ class EplbState:
         # rearrangement step and perform rearrangement to ensure all ranks are
         # performing collective communication.
         self.expert_rearrangement_step += 1
+        print("self.expert_step: ", self.expert_rearrangement_step)
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             self.expert_rearrangement_step = 0
             self.rearrange(model)
