@@ -597,8 +597,8 @@ class ColumnParallelLinear(LinearBase):
         # Matrix multiply.
         assert self.quant_method is not None            
         from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-        from vllm.model_executor.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
-        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkW4A4MXFP4):
+        from vllm.model_executor.layers.quantization.quark.quark import QuarkLinearMethod
+        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkLinearMethod):
             output_parallel = self.quant_method.apply(self, input_, bias, x_quant_scales=x_quant_scales)
         else:
             assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"

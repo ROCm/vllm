@@ -25,8 +25,10 @@ try:
 
     def aiter_triton_gemm_check(m, n, k):
         if m <= 64:
-            return ((n == 8192 and k == 8192) or (n == 10240 and k == 8192)
-                    or (n == 57344 and k == 8192) or (n == 8192 and k == 28672))
+            return (
+                (n == 10240 and k == 8192) or (n == 8192 and k == 8192) or (n == 57344 and k == 8192) or (n == 8192 and k == 28672) or 
+                (n ==  1280 and k == 8192) or (n == 8192 and k == 1024) or (n ==  7168 and k == 8192) or (n == 8192 and k ==  3584)
+                    ) 
         return False
     
     def gemm_with_dynamic_quant(
@@ -67,14 +69,15 @@ try:
 
                 gemm_afp4wfp4_preshuffled_weight_scales(x_q.view(torch.uint8), weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
                         x_s, weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), out_dtype, y)
+                
             else:
                 
                 if x_scales is None:
                     # use hip quant kernel for performance
                     x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
                 else:
-                    x_q = x
-                    x_s = x_scales
+                    x_q = x.view(torch.float4_e2m1fn_x2)
+                    x_s = x_scales.view(torch.float8_e8m0fnu)
 
                 # 32 alignment is enough for dim0 padding of output for
                 # gemm_a4w4 kernel
@@ -82,7 +85,17 @@ try:
                                 weight.shape[0],
                                 device=x_q.device,
                                 dtype=out_dtype)
-
+                
+                # weight = weight.view(x_q.dtype)
+                # weight_scale = weight_scale.view(x_s.dtype)
+                # print("fp4dtype", x_q.dtype, weight.dtype, x_s.dtype, weight_scale.dtype)
+                
+                # gemm_a4w4(x_q,
+                #           weight,
+                #           x_s,
+                #           weight_scale,
+                #           y,
+                #           bpreshuffle=True)
                 gemm_a4w4(x_q,
                           weight.view(x_q.dtype),
                           x_s,

@@ -11,6 +11,71 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_TRITON_FP4_GEMM_USE_ASM = envs.VLLM_ROCM_USE_AITER and envs.VLLM_TRITON_FP4_GEMM_USE_ASM
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT
+
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT:
+        from aiter import per_1x32_f4_quant_hip
+        from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+        rocm_aiter_fp4_quant_group_size = 32
+        
+        def rocm_aiter_fused_rms_and_fp4_group_quant_impl(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float,
+            residual: Optional[torch.Tensor] = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            M = x.shape[0]
+            res = None
+            if M <= 64:
+                shuffle = VLLM_TRITON_FP4_GEMM_USE_ASM and (M >= 32)
+                (x_fp4, out_bs), _, res = fused_rms_mxfp4_quant(x, weight, eps, 
+                                                    None, None, eps, 
+                                                    res1=residual,
+                                                    shuffle=shuffle,
+                                                    scale_shuffle_padding=True)
+            else:
+                shuffle = VLLM_TRITON_FP4_GEMM_USE_ASM
+                if residual is not None:
+                    x_rms, res = torch.ops.vllm.rocm_aiter_fused_add_rms_norm(x, residual, weight, eps)
+                else:
+                    x_rms = torch.ops.vllm.rocm_aiter_rms_norm(x, weight, eps)
+                x_fp4, out_bs = per_1x32_f4_quant_hip(x_rms, shuffle=shuffle)
+
+            if res is None:
+                return x_fp4, out_bs, x
+            return x_fp4, out_bs, res
+        
+        def rocm_aiter_fused_rms_and_fp4_group_quant_fake(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            eps: float,
+            residual: Optional[torch.Tensor] = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            M, N = x.shape
+            x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+            scaleN_valid = (N + rocm_aiter_fp4_quant_group_size - 1) // rocm_aiter_fp4_quant_group_size
+            scaleM = (M + 255) // 256 * 256
+            scaleN = (scaleN_valid + 7) // 8 * 8
+            out_bs = torch.empty((scaleM, scaleN), dtype=torch.uint8, device=x.device)
+            res = torch.empty((M, N), dtype=x.dtype, device=x.device)
+            return x_fp4, out_bs, res
+        
+        direct_register_custom_op(
+            op_name="rocm_aiter_fused_rms_and_fp4_group_quant",
+            op_func=rocm_aiter_fused_rms_and_fp4_group_quant_impl,
+            mutates_args=[],
+            fake_impl=rocm_aiter_fused_rms_and_fp4_group_quant_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT = False
+
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT=}")
 
 def is_rocm_aiter_rmsnorm_enabled() -> bool:
     return current_platform.is_rocm() \

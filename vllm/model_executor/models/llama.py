@@ -56,16 +56,22 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
+from vllm.model_executor.layers.quantization.quark.quark import QuarkLinearMethod
+from vllm.model_executor.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
 
 from vllm.platforms import current_platform
 from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
-    from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
+    from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT, VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT
+    from vllm.model_executor.layers.layernorm import VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
 else:
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT = False
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
 
 VLLM_ROCM_USE_AITER_MHA = envs.VLLM_ROCM_USE_AITER_MHA
@@ -104,15 +110,23 @@ class LlamaMLP(nn.Module):
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
-        self.block_quant = hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size is not None
+        self.block_quant = isinstance(self.down_proj.quant_method, Fp8LinearMethod) and hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size is not None
         if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and not self.block_quant:
-            logger.info("[Aiter] [WARNING] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT will not be activated because this model is not using blocked quantization")
+            logger.info(f"[Aiter] [WARNING] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT will not be activated because {self.__class__.__name__} is not using FP8 blockscale GEMM")
+        self.fp4_block_quant_gemm = (isinstance(self.down_proj.quant_method, QuarkLinearMethod) and hasattr(self.down_proj, "scheme") and isinstance(self.down_proj.scheme, QuarkW4A4MXFP4))
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT and not self.fp4_block_quant_gemm:
+            logger.info(f"[Aiter] [WARNING] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT will not be activated because {self.__class__.__name__} is not using FP4 blockscale GEMM")
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        x, _ = self.gate_up_proj(x)
-        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and self.block_quant:
-            x = torch.ops.vllm.act_mul_and_fp8_group_quant(x)
+        x_quant_scales = None
+        if isinstance(x, tuple):
+            x, x_quant_scales = x
+        x, _ = self.gate_up_proj(x, x_quant_scales=x_quant_scales)
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT and self.fp4_block_quant_gemm:
+            x = torch.ops.vllm.rocm_aiter_act_mul_and_fp4_group_quant(x)
+        elif VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT and self.block_quant:
+            x = torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant(x)
         else:
             x = self.act_fn(x)
         x_quant_scales = None
@@ -220,7 +234,11 @@ class LlamaAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        hidden_states_quant = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_quant = hidden_states
+
+        qkv, _ = self.qkv_proj(hidden_states, x_quant_scales = hidden_states_quant)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
@@ -316,6 +334,12 @@ class LlamaDecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.input_layernorm_with_fp4_block_quant_gemm = (isinstance(self.self_attn.qkv_proj.quant_method, QuarkLinearMethod) and hasattr(self.self_attn.qkv_proj, "scheme") and isinstance(self.self_attn.qkv_proj.scheme, QuarkW4A4MXFP4))
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT and not self.input_layernorm_with_fp4_block_quant_gemm:
+            logger.info(f"[Aiter] [WARNING] VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT will not be activated because {self.self_attn.__class__.__name__} is not using FP4 blockscale GEMM")
+        self.post_attention_layernorm_with_fp4_block_quant_gemm = (isinstance(self.mlp.gate_up_proj.quant_method, QuarkLinearMethod) and hasattr(self.mlp.gate_up_proj, "scheme") and isinstance(self.mlp.gate_up_proj.scheme, QuarkW4A4MXFP4))
+        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT and not self.post_attention_layernorm_with_fp4_block_quant_gemm:
+            logger.info(f"[Aiter] [WARNING] VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT will not be activated because {self.mlp.__class__.__name__} is not using FP4 blockscale GEMM")
 
     def forward(
         self,
@@ -324,18 +348,34 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT and self.input_layernorm_with_fp4_block_quant_gemm:
+            weight = self.input_layernorm.weight
+            eps = self.input_layernorm.variance_epsilon
+            if residual is None:
+                residual = hidden_states
+                hidden_states_quant, hidden_states_quant_scales, _ = torch.ops.vllm.rocm_aiter_fused_rms_and_fp4_group_quant(hidden_states, weight, eps, None)
+            else:
+                hidden_states_quant, hidden_states_quant_scales, residual = torch.ops.vllm.rocm_aiter_fused_rms_and_fp4_group_quant(hidden_states, weight, eps, residual)
+            hidden_states = (hidden_states_quant, hidden_states_quant_scales)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual)
         hidden_states = self.self_attn(positions=positions,
-                                       hidden_states=hidden_states)
+                                    hidden_states=hidden_states)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT and self.post_attention_layernorm_with_fp4_block_quant_gemm:
+            weight = self.post_attention_layernorm.weight
+            eps = self.post_attention_layernorm.variance_epsilon
+            hidden_states_quant, hidden_states_quant_scales, residual = torch.ops.vllm.rocm_aiter_fused_rms_and_fp4_group_quant(hidden_states, weight, eps, residual)
+            hidden_states = (hidden_states_quant, hidden_states_quant_scales)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 

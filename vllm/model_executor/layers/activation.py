@@ -26,22 +26,52 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     
     if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
         from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+        rocm_aiter_fp4_quant_group_size = 32
+        
+        def rocm_aiter_act_mul_and_fp4_group_quant_impl(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            M = x.shape[0]
+            shuffle = VLLM_TRITON_FP4_GEMM_USE_ASM and (M >= 32)
+            x_fp4, out_bs = act_mul_and_mxfp4_quant(x, activation="silu", shuffle=shuffle, scale_shuffle_padding=True)
+            return x_fp4, out_bs
+        
+        def rocm_aiter_act_mul_and_fp4_group_quant_fake(
+            x: torch.Tensor,        
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            M, N = x.shape
+            assert N % 4 == 0
+            N_half = N // 2
+            x_fp4 = torch.empty((M, N_half // 2), dtype=torch.uint8, device=x.device)
+            scaleN_valid = (N_half + rocm_aiter_fp4_quant_group_size - 1) // rocm_aiter_fp4_quant_group_size
+            scaleM = (M + 255) // 256 * 256
+            scaleN = (scaleN_valid + 7) // 8 * 8
+            out_bs = torch.empty((scaleM, scaleN), dtype=torch.uint8, device=x.device)
+            return x_fp4, out_bs
+        
+        direct_register_custom_op(
+            op_name="rocm_aiter_act_mul_and_fp4_group_quant",
+            op_func=rocm_aiter_act_mul_and_fp4_group_quant_impl,
+            mutates_args=[],
+            fake_impl=rocm_aiter_act_mul_and_fp4_group_quant_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
+
 
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
 
     if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT:
-        logger.info("[Aiter] VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT=1")
         from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
         import aiter as rocm_aiter
         rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
         rocm_aiter_fp8_quant_group_size = 128
         
-        def act_mul_and_fp8_group_quant_impl(
+        def rocm_aiter_act_mul_and_fp8_group_quant_impl(
             x: torch.Tensor,        
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return act_mul_and_fp8_group_quant(x, activation="silu", group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
+            return rocm_aiter_act_mul_and_fp8_group_quant(x, activation="silu", group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
         
-        def act_mul_and_fp8_group_quant_fake(
+        def rocm_aiter_act_mul_and_fp8_group_quant_fake(
             x: torch.Tensor,        
         ) -> tuple[torch.Tensor, torch.Tensor]:
             M, N = x.shape
@@ -52,10 +82,10 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             return x_fp8, out_bs
         
         direct_register_custom_op(
-            op_name="act_mul_and_fp8_group_quant",
-            op_func=act_mul_and_fp8_group_quant_impl,
+            op_name="rocm_aiter_act_mul_and_fp8_group_quant",
+            op_func=rocm_aiter_act_mul_and_fp8_group_quant_impl,
             mutates_args=[],
-            fake_impl=act_mul_and_fp8_group_quant_fake,
+            fake_impl=rocm_aiter_act_mul_and_fp8_group_quant_fake,
             dispatch_key=current_platform.dispatch_key,
         )
 
@@ -118,9 +148,7 @@ class SiluAndMul(CustomOp):
     def __init__(self):
         super().__init__()
 
-        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
-            self.op = lambda x, shuffle: act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
-        elif current_platform.is_cuda_alike():
+        if current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul
         elif current_platform.is_xpu():
             from vllm._ipex_ops import ipex_ops
@@ -136,16 +164,11 @@ class SiluAndMul(CustomOp):
     def forward_cuda(self,
                      x: torch.Tensor,
                      scale: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT:
-            shuffle = VLLM_TRITON_FP4_GEMM_USE_ASM and x.shape[0] >= 32
-            out, out_scales = self.op(x, shuffle)
-            return out, out_scales
-        else:
-            d = x.shape[-1] // 2
-            output_shape = (x.shape[:-1] + (d, ))
-            out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-            self.op(out, x)
-            return out
+        d = x.shape[-1] // 2
+        output_shape = (x.shape[:-1] + (d, ))
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        self.op(out, x)
+        return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
