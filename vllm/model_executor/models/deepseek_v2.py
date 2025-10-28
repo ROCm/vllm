@@ -292,9 +292,6 @@ class DeepseekV2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if torch.cuda.is_available():
-            self.alt_stream = torch.cuda.Stream()
-
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and self.n_shared_experts is not None:
             hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
             shared_output_q, shared_output_s, router_logits = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
@@ -309,11 +306,13 @@ class DeepseekV2MoE(nn.Module):
                 )
 
             #Overlap shared_fused_exports and MOE
+            if torch.cuda.is_available():
+                self.alt_stream = torch.cuda.Stream()
+
             #Guard to prevent repeated lines
             did_fma = False
-            if self.alt_stream is not None and VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16 and shared_output is not None: 
+            if self.alt_stream is not None: #and VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16: #Commented out for debugging purposes
                 current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
 
                 with torch.cuda.stream(self.alt_stream):
                     shared_output, _ = self.shared_experts.down_proj(
@@ -325,11 +324,13 @@ class DeepseekV2MoE(nn.Module):
                     router_logits=router_logits
                 )
 
+
+                current_stream.wait_stream(self.alt_stream)
+                
                 final_hidden_states = fused_mul_add(
                     final_hidden_states, self.routed_scaling_factor, shared_output
                 )
 
-                current_stream.wait_stream(self.alt_stream)
                 did_fma = True
             else:
                 shared_output, _ = self.shared_experts.down_proj(shared_output_q, x_quant_scales = shared_output_s)
