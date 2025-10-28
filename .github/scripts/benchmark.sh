@@ -27,6 +27,7 @@ export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
 # Get the model path from the first argument
 model_path="$1"
 
+echo "Benchmarking model at path: $model_path"
 ls "$model_path"
 
 # Launch the vLLM server (add a timeout to prevent indefinite hanging)
