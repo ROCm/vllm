@@ -122,7 +122,7 @@ docker run -it --rm --ipc=host --network=host --group-add render \
     -e HF_HOME=/data \
     -e HF_TOKEN=<token> \
     -v /data:/data \
-    rocm/vllm-dev:main
+    rocm/vllm:latest
 ```
 
 Note: The instructions in this document use `/data` to store the models.  If you choose a different directory, you will also need to make that change to the host volume mount when launching the docker container.  For example, `-v /home/username/models:/data` in place of `-v /data:/data` would store the models in /home/username/models on the host.  Some models can be quite large; please ensure that you have sufficient disk space prior to downloading the model.  Since the model download may take a long time, you can use `tmux` or `screen` to avoid getting disconnected.
