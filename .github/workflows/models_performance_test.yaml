@@ -6,6 +6,14 @@ on:
       - dev/perf
   workflow_dispatch:
     inputs:
+      vllm_repo:
+        description: 'vLLM repo (default: https://github.com/ROCm/vllm.git)'
+        required: false
+        default: 'https://github.com/ROCm/vllm.git'
+      aiter_repo:
+        description: 'Aiter repo (default: https://github.com/ROCm/aiter.git)'
+        required: false
+        default: 'https://github.com/ROCm/aiter.git'
       vllm_branch:
         description: 'vLLM branch or commit (default: latest dev/perf)'
         required: false
@@ -21,12 +29,11 @@ on:
 
 env:
   BASE_IMAGE: "rocm/vllm-dev:nightly"
-  AITER_REPO: "https://github.com/ROCm/aiter.git"
+  AITER_REPO: ${{ github.event.inputs.aiter_repo || 'https://github.com/ROCm/aiter.git' }}
   AITER_BRANCH: ${{ github.event.inputs.aiter_branch || 'dev/perf' }}
-  vLLM_REPO: "https://github.com/ROCm/vllm.git"
+  vLLM_REPO: ${{ github.event.inputs.vllm_repo || 'https://github.com/ROCm/vllm.git' }}
   vLLM_BRANCH: ${{ github.event.inputs.vllm_branch || 'dev/perf' }}
   MODEL_NAME: ${{ github.event.inputs.model_name || 'deepseekr1_ptpc_fp8' }}
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -39,6 +46,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.vllm_branch }}
+          fetch-depth: 0  # ensure getting the latest full code history
 
       - name: Show disk usage
         run: |
@@ -123,16 +131,19 @@ jobs:
         run: |
           docker exec vllm_test git config --global --add safe.directory /workspace
           docker exec vllm_test pip install lm_eval tenacity
+          docker exec vllm_test apt update
+          docker exec vllm_test apt install -y jq
           
       - name: Run performance tests
         run: |
           docker exec vllm_test ./.github/scripts/benchmark.sh ${{ env.MODEL_NAME }} benchmark_results.json
       
       - name: Upload benchmark results
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark_results-${{ env.MODEL_NAME }}-${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}-${{ github.run_id }}
-          path: benchmark_results.json
+          name: benchmark_results-${{ env.MODEL_NAME }}-${{ github.run_id }}
+          path: models_performance_test/*.json
         continue-on-error: true
 
       - name: Clean up Rocm processes
