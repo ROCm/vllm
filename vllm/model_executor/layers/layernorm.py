@@ -124,6 +124,7 @@ def rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
     residual: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
         x,
@@ -135,6 +136,7 @@ def rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
         group_size=rocm_aiter_fp8_quant_group_size,
         dtype_quant=rocm_aiter_fp8_dtype,
         res1=residual,
+        transpose_scale=transpose_scale,
     )
     return (x_quant, x_quant_scales, res)
 
@@ -144,6 +146,7 @@ def rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M, N = x.shape
     scale_shape = (
@@ -162,6 +165,7 @@ def rocm_aiter_rmsnorm_fp8_group_quant_impl(
     residual: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
         x,
@@ -173,6 +177,7 @@ def rocm_aiter_rmsnorm_fp8_group_quant_impl(
         group_size=rocm_aiter_fp8_quant_group_size,
         dtype_quant=rocm_aiter_fp8_dtype,
         res1=residual,
+        transpose_scale=transpose_scale,
     )
     return (x_quant, x_quant_scales)
 
@@ -182,83 +187,7 @@ def rocm_aiter_rmsnorm_fp8_group_quant_fake(
     residual: torch.Tensor,
     weight: torch.Tensor,
     variance_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    M, N = x.shape
-    scale_shape = (
-        M,
-        (N + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size,
-    )
-    return (
-        torch.empty_like(x, dtype=rocm_aiter_fp8_dtype, device=x.device),
-        torch.empty(scale_shape, dtype=torch.float32, device=x.device),
-    )
-
-
-def rocm_aiter_rmsnorm_with_add_fp8_group_quant_transpose_scale_impl(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
-        x,
-        weight,
-        variance_epsilon,
-        None,
-        None,
-        None,
-        group_size=rocm_aiter_fp8_quant_group_size,
-        dtype_quant=rocm_aiter_fp8_dtype,
-        res1=residual,
-        transpose_scale=True,
-    )
-    return (x_quant, x_quant_scales, res)
-
-
-def rocm_aiter_rmsnorm_with_add_fp8_group_quant_transpose_scale_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    M, N = x.shape
-    scale_shape = (
-        M,
-        (N + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size,
-    )
-    return (
-        torch.empty_like(x, dtype=rocm_aiter_fp8_dtype, device=x.device),
-        torch.empty(scale_shape, dtype=torch.float32, device=x.device),
-        torch.empty_like(residual, device=residual.device),
-    )
-
-
-def rocm_aiter_rmsnorm_fp8_group_quant_transpose_scale_impl(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    (x_quant, x_quant_scales), _, _, res = fused_rms_fp8_group_quant(
-        x,
-        weight,
-        variance_epsilon,
-        None,
-        None,
-        None,
-        group_size=rocm_aiter_fp8_quant_group_size,
-        dtype_quant=rocm_aiter_fp8_dtype,
-        res1=residual,
-        transpose_scale=True,
-    )
-    return (x_quant, x_quant_scales)
-
-
-def rocm_aiter_rmsnorm_fp8_group_quant_transpose_scale_fake(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    weight: torch.Tensor,
-    variance_epsilon: float,
+    transpose_scale: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, N = x.shape
     scale_shape = (
@@ -297,22 +226,6 @@ if current_platform.is_rocm():
         op_func=rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl,
         mutates_args=[],
         fake_impl=rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake,
-        dispatch_key=current_platform.dispatch_key,
-    )
-
-    direct_register_custom_op(
-        op_name="rocm_aiter_rmsnorm_fp8_group_quant_transpose_scale",
-        op_func=rocm_aiter_rmsnorm_fp8_group_quant_transpose_scale_impl,
-        mutates_args=[],
-        fake_impl=rocm_aiter_rmsnorm_fp8_group_quant_transpose_scale_fake,
-        dispatch_key=current_platform.dispatch_key,
-    )
-
-    direct_register_custom_op(
-        op_name="rocm_aiter_rmsnorm_with_add_fp8_group_quant_transpose_scale",
-        op_func=rocm_aiter_rmsnorm_with_add_fp8_group_quant_transpose_scale_impl,
-        mutates_args=[],
-        fake_impl=rocm_aiter_rmsnorm_with_add_fp8_group_quant_transpose_scale_fake,
         dispatch_key=current_platform.dispatch_key,
     )
 
