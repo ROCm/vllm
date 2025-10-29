@@ -222,14 +222,15 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 "alibi_slopes, sliding_window, logits_soft_cap"
             )
 
-        from aiter import flash_attn_varlen_func
+        #from aiter import flash_attn_varlen_func
+        from aiter.ops.triton.mha import flash_attn_varlen_func
 
         self.flash_attn_varlen_func = flash_attn_varlen_func
 
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
-        output = self.flash_attn_varlen_func(
+        result = self.flash_attn_varlen_func(
             q=q,
             k=k,
             v=v,
@@ -238,7 +239,12 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             **kwargs,
         )
 
-        return output
+        if type(result) is tuple and return_softmax_lse:
+            output, lse = result
+            lse = lse.T.contiguous()
+            return (output, lse)
+
+        return result
 
     def _forward_decode(
         self,
