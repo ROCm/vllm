@@ -151,47 +151,33 @@ if current_platform.is_rocm():
 
         def aiter_per1x128_quant_impl(
             x: torch.Tensor,
+            transpose_scale: bool = False,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            return aiter_per1x128_quant(x, quant_dtype=rocm_aiter.dtypes.fp8)
+            return aiter_per1x128_quant(
+                x,
+                quant_dtype=rocm_aiter.dtypes.fp8,
+                transpose_scale=transpose_scale,
+            )
 
         def aiter_per1x128_quant_fake(
             x: torch.Tensor,
+            transpose_scale: bool = False,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             shape, device = x.shape, x.device
             y = torch.empty(shape, dtype=rocm_aiter.dtypes.fp8, device=device)
             scale = torch.empty(
                 (*shape[:-1], shape[-1] // 128), dtype=torch.float32, device=device
             )
-            return y, scale
-
-        def aiter_per1x128_quant_transpose_scale_impl(
-            x: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return aiter_per1x128_quant(
-                x, quant_dtype=rocm_aiter.dtypes.fp8, transpose_scale=True
-            )
-
-        def aiter_per1x128_quant_transpose_scale_fake(
-            x: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            shape, device = x.shape, x.device
-            y = torch.empty(shape, dtype=rocm_aiter.dtypes.fp8, device=device)
-            scale = torch.empty(
-                (*shape[:-1], shape[-1] // 128), dtype=torch.float32, device=device
-            )
-            scale = scale.t().contiguous().view(*scale.shape)
+            # Don't have to do this as after view,
+            # the stride is the same as the original scale
+            # if transpose_scale:
+            #     scale = scale.t().contiguous().view(*scale.shape)
             return y, scale
 
         direct_register_custom_op(
             op_name="rocm_aiter_per1x128_quant",
             op_func=aiter_per1x128_quant_impl,
             fake_impl=aiter_per1x128_quant_fake,
-        )
-
-        direct_register_custom_op(
-            op_name="rocm_aiter_per1x128_quant_transpose_scale",
-            op_func=aiter_per1x128_quant_transpose_scale_impl,
-            fake_impl=aiter_per1x128_quant_transpose_scale_fake,
         )
 
 
@@ -439,24 +425,18 @@ class W8A8BlockFp8LinearOp:
     ) -> torch.Tensor:
         assert self.act_quant_group_shape == GroupShape(1, 128)
 
+        q_input, input_scale = torch.ops.vllm.rocm_aiter_per1x128_quant(
+            input_2d.contiguous(),
+            transpose_scale=self.is_weight_swizzled,
+        )
         if self.is_weight_swizzled:
-            q_input, input_scale = (
-                torch.ops.vllm.rocm_aiter_per1x128_quant_transpose_scale(
-                    input_2d.contiguous()
-                )
-            )
-
-            return torch.ops.vllm.rocm_aiter_bpreshuffle_gemm_w8a8_blockscale(
+            return torch.ops.vllm.rocm_aiter_bpreshuffle_gemm_w8a8_blockscale(  # noqa: E501
                 q_input,
                 weight,
                 input_scale,
                 weight_scale,
                 input_2d.dtype,
             )
-
-        q_input, input_scale = torch.ops.vllm.rocm_aiter_per1x128_quant(
-            input_2d.contiguous()
-        )
 
         return torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale(
             q_input,
