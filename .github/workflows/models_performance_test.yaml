@@ -14,6 +14,10 @@ on:
         description: 'Aiter branch or commit (default: latest dev/perf)'
         required: false
         default: 'dev/perf'
+      model_name:
+        description: 'Model name (default: deepseekr1_ptpc_fp8)'
+        required: false
+        default: 'deepseekr1_ptpc_fp8'
 
 env:
   BASE_IMAGE: "rocm/vllm-dev:nightly"
@@ -21,6 +25,7 @@ env:
   AITER_BRANCH: ${{ github.event.inputs.aiter_branch || 'dev/perf' }}
   vLLM_REPO: "https://github.com/ROCm/vllm.git"
   vLLM_BRANCH: ${{ github.event.inputs.vllm_branch || 'dev/perf' }}
+  MODEL_NAME: ${{ github.event.inputs.model_name || 'deepseekr1_ptpc_fp8' }}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -39,7 +44,7 @@ jobs:
         run: |
           df -h
       
-      - name: Check models performance test script
+      - name: Show models directory
         run: |
           ls -all /models/
 
@@ -121,12 +126,12 @@ jobs:
           
       - name: Run performance tests
         run: |
-          docker exec vllm_test ./.github/scripts/benchmark.sh /models/EmbeddedLLM/deepseek-r1-FP8-Dynamic benchmark_results.json
+          docker exec vllm_test ./.github/scripts/benchmark.sh ${{ env.MODEL_NAME }} benchmark_results.json
       
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark_results-${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}-${{ github.run_id }}
+          name: benchmark_results-${{ env.MODEL_NAME }}-${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}-${{ github.run_id }}
           path: benchmark_results.json
         continue-on-error: true
 
