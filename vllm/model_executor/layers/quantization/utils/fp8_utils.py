@@ -101,21 +101,98 @@ def rocm_aiter_gemm_w8a8_blockscale_fake(
     return Y
 
 
+def rocm_aiter_bpreshuffle_gemm_w8a8_blockscale_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    import aiter as rocm_aiter
+
+    return rocm_aiter.gemm_a8w8_blockscale_bpreshuffle(A, B, As, Bs, dtype=output_dtype)
+
+
+def rocm_aiter_bpreshuffle_gemm_w8a8_blockscale_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    m = A.shape[0]
+    n = B.shape[0]
+    Y = torch.empty(m, n, dtype=output_dtype, device=A.device)
+    return Y
+
+
 if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="rocm_aiter_gemm_w8a8_blockscale",
         op_func=rocm_aiter_gemm_w8a8_blockscale_impl,
         fake_impl=rocm_aiter_gemm_w8a8_blockscale_fake,
     )
+
+    direct_register_custom_op(
+        op_name="rocm_aiter_bpreshuffle_gemm_w8a8_blockscale",
+        op_func=rocm_aiter_bpreshuffle_gemm_w8a8_blockscale_impl,
+        fake_impl=rocm_aiter_bpreshuffle_gemm_w8a8_blockscale_fake,
+    )
+
     if (
         envs.VLLM_ROCM_USE_AITER
         and envs.VLLM_ROCM_USE_AITER_LINEAR
-        and current_platform.is_fp8_fnuz()
+        and current_platform.supports_fp8()
     ):
         import aiter as rocm_aiter
         from aiter import get_hip_quant
 
         aiter_per1x128_quant = get_hip_quant(rocm_aiter.QuantType.per_1x128)
+
+        def aiter_per1x128_quant_impl(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return aiter_per1x128_quant(x, quant_dtype=rocm_aiter.dtypes.fp8)
+
+        def aiter_per1x128_quant_fake(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            shape, device = x.shape, x.device
+            y = torch.empty(shape, dtype=rocm_aiter.dtypes.fp8, device=device)
+            scale = torch.empty(
+                (*shape[:-1], shape[-1] // 128), dtype=torch.float32, device=device
+            )
+            return y, scale
+
+        def aiter_per1x128_quant_transpose_scale_impl(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return aiter_per1x128_quant(
+                x, quant_dtype=rocm_aiter.dtypes.fp8, transpose_scale=True
+            )
+
+        def aiter_per1x128_quant_transpose_scale_fake(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            shape, device = x.shape, x.device
+            y = torch.empty(shape, dtype=rocm_aiter.dtypes.fp8, device=device)
+            scale = torch.empty(
+                (*shape[:-1], shape[-1] // 128), dtype=torch.float32, device=device
+            )
+            scale = scale.t().contiguous().view(*scale.shape)
+            return y, scale
+
+        direct_register_custom_op(
+            op_name="rocm_aiter_per1x128_quant",
+            op_func=aiter_per1x128_quant_impl,
+            fake_impl=aiter_per1x128_quant_fake,
+        )
+
+        direct_register_custom_op(
+            op_name="rocm_aiter_per1x128_quant_transpose_scale",
+            op_func=aiter_per1x128_quant_transpose_scale_impl,
+            fake_impl=aiter_per1x128_quant_transpose_scale_fake,
+        )
 
 
 # TODO we should be able to change the type of block_size to GroupShape
@@ -253,12 +330,15 @@ class W8A8BlockFp8LinearOp:
         act_quant_group_shape: GroupShape,
         cutlass_block_fp8_supported: bool = CUTLASS_BLOCK_FP8_SUPPORTED,
         use_aiter_and_is_supported: bool = False,
+        is_weight_swizzled: bool = False,
     ):
         self.weight_group_shape = weight_group_shape
         self.act_quant_group_shape = act_quant_group_shape
         self.is_deep_gemm_supported = is_deep_gemm_supported()
         self.is_hopper = current_platform.is_device_capability(90)
         self.use_deep_gemm_e8m0 = is_deep_gemm_e8m0_used()
+        # At the moment, we only support swizzled weights for ROCm.
+        self.is_weight_swizzled = is_weight_swizzled and current_platform.is_rocm()
 
         # Get the correct blockscale mul and input quant operations.
         # We can't use _dispatch_w8a8_blockscale_op to figure out if we want
@@ -358,9 +438,26 @@ class W8A8BlockFp8LinearOp:
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
         assert self.act_quant_group_shape == GroupShape(1, 128)
-        q_input, input_scale = aiter_per1x128_quant(
-            input_2d.contiguous(), quant_dtype=rocm_aiter.dtypes.fp8
+
+        if self.is_weight_swizzled:
+            q_input, input_scale = (
+                torch.ops.vllm.rocm_aiter_per1x128_quant_transpose_scale(
+                    input_2d.contiguous()
+                )
+            )
+
+            return torch.ops.vllm.rocm_aiter_bpreshuffle_gemm_w8a8_blockscale(
+                q_input,
+                weight,
+                input_scale,
+                weight_scale,
+                input_2d.dtype,
+            )
+
+        q_input, input_scale = torch.ops.vllm.rocm_aiter_per1x128_quant(
+            input_2d.contiguous()
         )
+
         return torch.ops.vllm.rocm_aiter_gemm_w8a8_blockscale(
             q_input,
             weight,
