@@ -365,6 +365,26 @@ ROCM_AITER_FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
     ): torch.ops.vllm.rocm_aiter_rmsnorm_fused_add_dynamic_quant.default,  # noqa: E501
 }
 
+AITER_RMS_GROUP_QUANT_OP = torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant.default  # noqa: E501
+AITER_RMS_ADD_GROUP_QUANT_OP = (
+    torch.ops.vllm.rocm_aiter_rmsnorm_with_add_fp8_group_quant.default  # noqa: E501
+)
+
+AITER_BLOCK_QUANT_OP = torch.ops.vllm.rocm_aiter_per1x128_quant.default  # noqa: E501
+AITER_RMS_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
+AITER_RMS_ADD_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default  # noqa: E501
+
+# Transpose scale patterns
+AITER_BLOCK_QUANT_OP_TRANSPOSE_SCALE = (
+    torch.ops.vllm.rocm_aiter_per1x128_quant_transpose_scale.default  # noqa: E501
+)
+AITER_RMS_GROUP_QUANT_OP_TRANSPOSE_SCALE = (
+    torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant_transpose_scale.default  # noqa: E501
+)
+AITER_RMS_ADD_GROUP_QUANT_OP_TRANSPOSE_SCALE = (
+    torch.ops.vllm.rocm_aiter_rmsnorm_with_add_fp8_group_quant_transpose_scale.default  # noqa: E501
+)
+
 
 class RMSNormAiterQuantPattern(RMSNormQuantPattern):
     def __init__(self, epsilon, key):
@@ -459,6 +479,168 @@ class FusedAddRMSNormAiterDynamicQuantPattern(RMSNormAiterQuantPattern):
             )
 
 
+class AiterRMSGroupQuantFP8Pattern:
+    def __init__(self, epsilon: float, quant_dtype: torch.dtype):
+        self.epsilon = epsilon
+        self.quant_dtype = quant_dtype
+
+    def register(self, pm_pass: PatternMatcherPass):
+        def pattern(
+            input: torch.Tensor,
+            weight: torch.Tensor,  # result_rms: torch.Tensor,
+        ):
+            at1 = AITER_RMS_OP(x=input, weight=weight, variance_epsilon=self.epsilon)
+
+            at2 = AITER_BLOCK_QUANT_OP(x=at1[0])
+
+            return at2[0], at2[1]
+
+        def replacement(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ):
+            at = AITER_RMS_GROUP_QUANT_OP(
+                x=input, residual=None, weight=weight, variance_epsilon=self.epsilon
+            )
+
+            return at[0], at[1]
+
+        inputs = [
+            empty_bf16(5, 4),  # input
+            empty_bf16(1, 5),  # weight
+        ]
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only, pm_pass)
+
+
+class AiterFusedAddRMSGroupQuantPattern:
+    def __init__(self, epsilon: float, quant_dtype: torch.dtype):
+        self.epsilon = epsilon
+        self.quant_dtype = quant_dtype
+
+    def register(self, pm_pass: PatternMatcherPass):
+        def pattern(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+        ):
+            at1 = AITER_RMS_ADD_OP(
+                x=input,
+                residual=residual,
+                weight=weight,
+                variance_epsilon=self.epsilon,
+            )
+
+            at2 = AITER_BLOCK_QUANT_OP(x=at1[0])
+
+            # result, scale, residual
+            return at2[0], at2[1], at1[1]
+
+        def replacement(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+        ):
+            at = AITER_RMS_ADD_GROUP_QUANT_OP(
+                x=input,
+                residual=residual,
+                weight=weight,
+                variance_epsilon=self.epsilon,
+            )
+
+            # result, scale, residual
+            return at[0], at[1], at[2]
+
+        inputs = [
+            empty_bf16(5, 4),  # input
+            empty_bf16(5, 4),  # residual
+            empty_bf16(1, 5),  # weight
+        ]
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only, pm_pass)
+
+
+class AiterRMSGroupQuantFP8TransposeScalePattern:
+    def __init__(self, epsilon: float, quant_dtype: torch.dtype):
+        self.epsilon = epsilon
+        self.quant_dtype = quant_dtype
+
+    def register(self, pm_pass: PatternMatcherPass):
+        def pattern(
+            input: torch.Tensor,
+            weight: torch.Tensor,  # result_rms: torch.Tensor,
+        ):
+            at1 = AITER_RMS_OP(x=input, weight=weight, variance_epsilon=self.epsilon)
+
+            at2 = AITER_BLOCK_QUANT_OP_TRANSPOSE_SCALE(x=at1[0])
+
+            return at2[0], at2[1]
+
+        def replacement(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+        ):
+            at = AITER_RMS_GROUP_QUANT_OP_TRANSPOSE_SCALE(
+                x=input, residual=None, weight=weight, variance_epsilon=self.epsilon
+            )
+
+            return at[0], at[1]
+
+        inputs = [
+            empty_bf16(5, 4),  # input
+            empty_bf16(1, 5),  # weight
+        ]
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only, pm_pass)
+
+
+class AiterFusedAddRMSGroupQuantTransposeScalePattern:
+    def __init__(self, epsilon: float, quant_dtype: torch.dtype):
+        self.epsilon = epsilon
+        self.quant_dtype = quant_dtype
+
+    def register(self, pm_pass: PatternMatcherPass):
+        def pattern(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+        ):
+            at1 = AITER_RMS_ADD_OP(
+                x=input,
+                residual=residual,
+                weight=weight,
+                variance_epsilon=self.epsilon,
+            )
+
+            at2 = AITER_BLOCK_QUANT_OP_TRANSPOSE_SCALE(x=at1[0])
+
+            # result, scale, residual
+            return at2[0], at2[1], at1[1]
+
+        def replacement(
+            input: torch.Tensor,
+            residual: torch.Tensor,
+            weight: torch.Tensor,
+        ):
+            at = AITER_RMS_ADD_GROUP_QUANT_OP_TRANSPOSE_SCALE(
+                x=input,
+                residual=residual,
+                weight=weight,
+                variance_epsilon=self.epsilon,
+            )
+
+            # result, scale, residual
+            return at[0], at[1], at[2]
+
+        inputs = [
+            empty_bf16(5, 4),  # input
+            empty_bf16(5, 4),  # residual
+            empty_bf16(1, 5),  # weight
+        ]
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only, pm_pass)
+
+
 class RMSNormAiterQuantFusionPass(VllmPatternMatcherPass):
     """
     This pass fuses aiter rms_norm & quant custom ops into a fused rms_norm_quant op.
@@ -482,6 +664,22 @@ class RMSNormAiterQuantFusionPass(VllmPatternMatcherPass):
                 self.patterns
             )
 
+            # Fuse rms_norm + dynamic group fp8 quant
+            AiterRMSGroupQuantFP8Pattern(epsilon, FP8_DTYPE).register(self.patterns)
+
+            AiterFusedAddRMSGroupQuantPattern(epsilon, FP8_DTYPE).register(
+                self.patterns
+            )
+
+            # Fuse rms_norm + dynamic group fp8 quant transpose scale
+            AiterRMSGroupQuantFP8TransposeScalePattern(epsilon, FP8_DTYPE).register(
+                self.patterns
+            )
+
+            AiterFusedAddRMSGroupQuantTransposeScalePattern(
+                epsilon, FP8_DTYPE
+            ).register(self.patterns)
+
         self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
@@ -495,4 +693,8 @@ class RMSNormAiterQuantFusionPass(VllmPatternMatcherPass):
             RMSNormQuantPattern,
             RMSNormAiterDynamicQuantPattern,
             FusedAddRMSNormAiterDynamicQuantPattern,
+            AiterRMSGroupQuantFP8Pattern,
+            AiterFusedAddRMSGroupQuantPattern,
+            AiterRMSGroupQuantFP8TransposeScalePattern,
+            AiterFusedAddRMSGroupQuantTransposeScalePattern,
         )
