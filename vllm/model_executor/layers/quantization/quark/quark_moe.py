@@ -553,13 +553,16 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             indices_type=self.topk_indices_dtype)
 
         if envs.VLLM_ROCM_USE_CK_MXFP4_MOE:
-            from aiter import ActivationType, QuantType
+            from aiter import ActivationType, QuantType, dtypes
             from aiter.fused_moe import fused_moe
+
+            w13_weight_fp4x2 = layer.w13_weight.view(dtypes.fp4x2)
+            w2_weight_fp4x2 = layer.w2_weight.view(dtypes.fp4x2)
 
             out = fused_moe(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                w13_weight_fp4x2,
+                w2_weight_fp4x2,
                 topk_weights,
                 topk_ids,
                 quant_type=QuantType.per_1x32,
