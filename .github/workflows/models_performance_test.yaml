@@ -100,7 +100,7 @@ jobs:
         run: |
           TAG=$(echo "${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}" | tr '/' '-')
           IMAGE_TAG="rocm/vllm-aiter-ci:$TAG"
-          docker build -t "$IMAGE_TAG" -f Dockerfile.mod .
+          docker build --no-cache -t "$IMAGE_TAG" -f Dockerfile.mod .
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
       
       - name: Clean up Rocm processes
