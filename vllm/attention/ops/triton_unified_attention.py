@@ -17,12 +17,6 @@ import math
 logger = init_logger(__name__)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
-@triton.jit
-def fast_exp(x):
-    RCP_LN2: tl.constexpr = 1.4426950408889634
-    return tl.math.exp2(x * RCP_LN2)
-
-
 def select_2d_config(
     block_size,
     head_size,
@@ -32,6 +26,7 @@ def select_2d_config(
     max_seqlen_k,
     num_queries_per_kv,
     num_2d_prgms,
+    element_size,
 ):
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -48,7 +43,6 @@ def select_2d_config(
         else:
             num_stages_2d = 3
             num_warps = 2
-            TILE_SIZE = block_size
 
         if max_seqlen_q >= 256:
             BLOCK_M = 128
@@ -70,18 +64,24 @@ def select_2d_config(
         return {"BLOCK_M": BLOCK_M, "BLOCK_Q": BLOCK_Q, "TILE_SIZE": TILE_SIZE}
 
 
-def select_3d_config(head_size, block_size, element_size, max_seqlen_k, num_2d_prgms):
+def select_3d_config(
+    head_size, block_size, max_seqlen_k, num_2d_prgms, element_size
+):
     if current_platform.is_rocm():
         cu_count = current_platform.get_cu_count()
-        target_num_prgms = cu_count * 4
+        if head_size < 128 or element_size == 1:
+            cu_mult = 4
+        else:
+            cu_mult = 2         
+        target_num_prgms = cu_count * cu_mult
+        TILE_SIZE = 64
         reduce_num_warps = 2
-        attn_warps = 2
-        TILE_SIZE = block_size
-        MAX_SEGMENTS = min(128, math.ceil(max_seqlen_k / TILE_SIZE))
+        attn_warps = 2 if (head_size < 128 or element_size == 1)  else 4
+        MIN_SEGMENTS = 8 if (head_size < 128 or element_size == 1) else 4
+
         num_segments = math.ceil(target_num_prgms / num_2d_prgms)
         num_segments = triton.next_power_of_2(num_segments)
         num_segments = min(num_segments, 128)
-        MIN_SEGMENTS = 16 if TILE_SIZE <= 16 else 8
         num_segments = max(num_segments, MIN_SEGMENTS)
         if num_segments == MIN_SEGMENTS:
             reduce_num_warps = 1
@@ -111,21 +111,37 @@ def select_3d_config(head_size, block_size, element_size, max_seqlen_k, num_2d_p
         reduce_config = {"NUM_SEGMENTS_PER_SEQ": 16, "TILE_SIZE": TILE_SIZE}
         return attn_config, reduce_config
 
-
 def use_2d_kernel(
-    head_size, sliding_window, all_decode, max_seqlen_q, max_seqlen_k, num_2d_prgms
+    head_size,
+    sliding_window,
+    all_decode,
+    max_seqlen_q,
+    max_seqlen_k,
+    target_num_prgms,
+    num_2d_prgms,
+    element_size,
 ):
     if current_platform.is_rocm():
         cu_count = current_platform.get_cu_count()
-        target_num_prgms = cu_count * 4
+        if head_size < 128 or element_size == 1:
+            cu_mult = 4
+        else:
+            cu_mult = 2         
+        target_num_prgms = cu_count * cu_mult
         return (
             (sliding_window > 0)
             or (max_seqlen_k <= 512)
-            or (num_2d_prgms > target_num_prgms)
+            or (num_2d_prgms > target_num_prgms 
+                and (element_size > 1 or all_decode == False))
         )
     else:
-        return max_seqlen_q > 1 or num_2d_prgms > 128
+        return max_seqlen_q > 1 or num_2d_prgms > 128  
 
+
+@triton.jit
+def fast_exp(x):
+    RCP_LN2: tl.constexpr = 1.4426950408889634
+    return tl.math.exp2(x * RCP_LN2)
 
 
 @triton.jit
@@ -381,8 +397,6 @@ def kernel_unified_attention_2d(
                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
         else:
             V = V_load
-
-
         # S : (BLOCK_M, TILE_SIZE)
         # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
         S = qk_scale * tl.dot(Q, K)
@@ -390,7 +404,7 @@ def kernel_unified_attention_2d(
         if USE_SOFTCAP:
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
-            S = apply_softcap(S, softcap) * RCP_LN2 
+            S = apply_softcap(S, softcap) * RCP_LN2
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         S = tl.where(query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
@@ -517,7 +531,7 @@ def kernel_unified_attention_3d(
 
     # needed to use exp2 (exp2 -> exp conversion)
     RCP_LN2 = 1.4426950408889634
-    qk_scale = scale * RCP_LN2
+    qk_scale: tl.constexpr = scale * RCP_LN2
 
     seq_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs,
                            BLOCK_Q, True)
@@ -631,7 +645,7 @@ def kernel_unified_attention_3d(
 
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset +
                                      seq_offset // BLOCK_SIZE).to(tl.int64)
-        
+
         v_offset = (physical_block_idx[:, None] * stride_v_cache_0 +
                     kv_head_idx * stride_v_cache_2 +
                     offs_d[None, :] * stride_v_cache_3 +
@@ -673,7 +687,6 @@ def kernel_unified_attention_3d(
         seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
 
         # S : (BLOCK_M, TILE_SIZE)
-        # qk_scale = scale * RCP_LN2 (log_2 e) so that we can use exp2 later
         S = qk_scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
@@ -794,7 +807,7 @@ def reduce_segments(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32)
 
     if HEAD_SIZE_PADDED != HEAD_SIZE:
-        dim_mask = offs_d < HEAD_SIZE
+        dim_mask = tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE
     else:
         dim_mask = tl.full((1,), 1, dtype=tl.int1)
 
@@ -882,6 +895,7 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+    kv_element_size = k.element_size()
 
     BLOCK_M = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(
         num_queries_per_kv)
@@ -896,15 +910,21 @@ def unified_attention(
     #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
     #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
     #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    # TODO (cagri): this needs to be gated
-    cu_count = current_platform.get_cu_count()
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-    target_num_prgms = cu_count * 4
+
     num_2d_prgms = total_num_q_blocks * num_kv_heads
     ALL_DECODE = max_seqlen_q == 1
+
+    
     # if batch contains a prefill
     if use_2d_kernel(
-        head_size, SLIDING_WINDOW, ALL_DECODE, max_seqlen_q, max_seqlen_k, num_2d_prgms
+        head_size,
+        SLIDING_WINDOW,
+        ALL_DECODE,
+        max_seqlen_q,
+        max_seqlen_k,
+        num_2d_prgms,
+        kv_element_size
     ):
         config = select_2d_config(
             block_size,
@@ -915,6 +935,7 @@ def unified_attention(
             max_seqlen_k,
             num_queries_per_kv,
             num_2d_prgms,
+            kv_element_size
         )
         assert config["BLOCK_Q"] >= 1
         total_num_q_blocks = q.shape[0] // config["BLOCK_Q"] + num_seqs
@@ -970,7 +991,11 @@ def unified_attention(
 
     else:
         attn_config, reduce_config = select_3d_config(
-            head_size, block_size, q.element_size(), max_seqlen_k, num_2d_prgms
+            head_size,
+            block_size,
+            max_seqlen_k,
+            num_2d_prgms,
+            kv_element_size,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         segm_output = torch.empty(
