@@ -186,7 +186,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS: bool = True
     VLLM_ROCM_USE_AITER_TRITON_MLA: bool = False
-    VLLM_ROCM_USE_CK_MXFP4_MOE: bool = False
+    VLLM_ROCM_USE_CK_MXFP4_MOE: bool = True
 
 def get_default_cache_root():
     return os.getenv(
@@ -1292,7 +1292,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
     # If set, enables CK fp4 MoE
     "VLLM_ROCM_USE_CK_MXFP4_MOE": lambda: (
-        os.getenv("VLLM_ROCM_USE_CK_MXFP4_MOE", "False").lower() in ("true", "1")
+        os.getenv("VLLM_ROCM_USE_CK_MXFP4_MOE", "True").lower() in ("true", "1")
     ),
 }
 
