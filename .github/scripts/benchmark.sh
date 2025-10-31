@@ -30,24 +30,24 @@ echo
 echo "========== LAUNCHING vLLM SERVER =============="
 ./.github/scripts/launch_models.sh $model_name $model_path &
 
-VLLM_PID=$!
+vllm_pid=$!
 
 echo
 echo "========== WAITING FOR SERVER TO BE READY ========"
-MAX_RETRIES=60
-RETRY_INTERVAL=60
-for ((i=1; i<=MAX_RETRIES; i++)); do
+max_retries=60
+retry_interval=60
+for ((i=1; i<=max_retries; i++)); do
     if curl -s http://localhost:8000/v1/completions -o /dev/null; then
         echo "vLLM server is up."
         break
     fi
-    echo "Waiting for vLLM server to be ready... ($i/$MAX_RETRIES)"
-    sleep $RETRY_INTERVAL
+    echo "Waiting for vLLM server to be ready... ($i/$max_retries)"
+    sleep $retry_interval
 done
 
 if ! curl -s http://localhost:8000/v1/completions -o /dev/null; then
-    echo "vLLM server did not start after $((MAX_RETRIES * RETRY_INTERVAL)) seconds."
-    kill $VLLM_PID
+    echo "vLLM server did not start after $((max_retries * retry_interval)) seconds."
+    kill $vllm_pid
     exit 1
 fi
 
@@ -69,44 +69,51 @@ lm_eval \
     --batch_size 100 \
     --output_path "models_performance_test/$output_path"
 
-find models_performance_test -name "*.json" -type f | while read file; do
-    echo "----- $file -----"
-    cat "$file"
-    echo
-done
-
 # Parse lm_eval output and compare metrics to baseline
-
-RESULT_FILE="models_performance_test/$output_path"
-if [[ ! -f "$RESULT_FILE" ]]; then
-    echo "ERROR: Could not find results file at $RESULT_FILE"
-    kill $VLLM_PID
+result_file=$(ls -1t models_performance_test/*.json 2>/dev/null | head -n 1)
+if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
+    echo "ERROR: No results JSON file found in models_performance_test/"
+    kill $vllm_pid
     exit 2
+else
+    echo "RESULT_FILE: $result_file"
 fi
-echo "RESULT_FILE: $RESULT_FILE"
 
 # Extract metrics from the output json using jq
-STRICT=$(jq '.results.gsm8k["exact_match,strict-match"]' "$RESULT_FILE")
-FLEXIBLE=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$RESULT_FILE")
+strict_match_value=$(jq '.results.gsm8k["exact_match,strict-match"]' "$result_file")
+flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$result_file")
 
-echo
-echo "========== RESULTS COMPARISON =============="
-echo "Strict Match:    $STRICT (baseline: $BASELINE_STRICT)"
-echo "Flexible Match:  $FLEXIBLE (baseline: $BASELINE_FLEXIBLE)"
 
-# Calculate delta with baseline
-DELTA_STRICT=$(awk -v current="$STRICT" -v base="$BASELINE_STRICT" 'BEGIN { d=current-base; printf "%+.6f", d }')
-DELTA_FLEXIBLE=$(awk -v current="$FLEXIBLE" -v base="$BASELINE_FLEXIBLE" 'BEGIN { d=current-base; printf "%+.6f", d }')
+{
+    echo
+    echo "========== RESULTS COMPARISON =============="
+    echo "Strict Match:    $strict_match_value (baseline: $baseline_strict_match_value)"
+    echo "Flexible Match:  $flexible_extract_value (baseline: $baseline_flexible_extract_value)"
 
-echo "Delta Strict:    $DELTA_STRICT"
-echo "Delta Flexible:  $DELTA_FLEXIBLE"
+    # Calculate delta with baseline
+    delta_strict=$(awk -v current="$strict_match_value" -v base="$baseline_strict_match_value" 'BEGIN { d=current-base; printf "%+.6f", d }')
+    delta_flexible=$(awk -v current="$flexible_extract_value" -v base="$baseline_flexible_extract_value" 'BEGIN { d=current-base; printf "%+.6f", d }')
 
-EXIT_CODE=$?
-if [ $EXIT_CODE -eq 0 ]; then
+    echo "Delta Strict:    $delta_strict"
+    echo "Delta Flexible:  $delta_flexible"
+
+    # If either delta_strict or delta_flexible is greater than 0.05, then fail/exit
+    awk -v d1="$delta_strict" -v d2="$delta_flexible" '
+        BEGIN {
+            if (d1 < -0.05 || d1 > 0.05 || d2 < -0.05 || d2 > 0.05) {
+                print "vLLM BENCHMARK FAILED: the delta of strict match or flexible match exceeds 0.05";
+                exit 1;
+            }
+            print "vLLM BENCHMARK PASSED: the delta of strict match or flexible match is within 0.05";
+        }'
+} | tee comparison.log
+
+exit_code=$?
+if [ $exit_code -eq 0 ]; then
     echo
     echo "========== vLLM BENCHMARK COMPLETED SUCCESSFULLY =========="
 else
     echo
-    echo "========== vLLM BENCHMARK FAILED WITH EXIT CODE $EXIT_CODE =========="
-    exit $EXIT_CODE
+    echo "========== vLLM BENCHMARK FAILED WITH EXIT CODE $exit_code =========="
+    exit $exit_code
 fi

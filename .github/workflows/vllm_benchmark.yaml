@@ -1,4 +1,4 @@
-name: Build and Performance Test
+name: vLLM Benchmark Workflow
 
 on:
   pull_request:
@@ -141,10 +141,18 @@ jobs:
       - name: Upload benchmark results
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: benchmark_results-${{ env.MODEL_NAME }}-${{ github.run_id }}
           path: models_performance_test/*.json
+      
+      - name: Upload comparison log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
         continue-on-error: true
+        with:
+          name: comparison_log-${{ env.MODEL_NAME }}-${{ github.run_id }}
+          path: comparison.log
 
       - name: Clean up Rocm processes
         if: ${{ always() }}
