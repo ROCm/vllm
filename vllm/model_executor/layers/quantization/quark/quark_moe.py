@@ -556,10 +556,17 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             from aiter import ActivationType, QuantType
             from aiter.fused_moe import fused_moe
 
+            if hasattr(torch, "float4_e2m1fn_x2"):
+                w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+                w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+            else:
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
+
             out = fused_moe(
                 x,
-                layer.w13_weight,
-                layer.w2_weight,
+                w13_weight,
+                w2_weight,
                 topk_weights,
                 topk_ids,
                 quant_type=QuantType.per_1x32,
