@@ -117,7 +117,6 @@ def use_2d_kernel(
     all_decode,
     max_seqlen_q,
     max_seqlen_k,
-    target_num_prgms,
     num_2d_prgms,
     element_size,
 ):
