@@ -340,9 +340,26 @@ export VLLM_ROCM_USE_AITER_MHA=0
 vllm bench latency --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 256 --input-len 128 --output-len 2048
 ```
 
-## Building vLLM docker images for ROCm
+## Building vLLM docker image for ROCm
 
-For instructions on how to build a vLLM docker image, see https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html#build-image-from-source
+To build a vLLM image correpsonding to the current rocm/vllm:latest, clone the vLLM repository:
+
+```bash
+    git clone https://github.com/vllm-project/vllm.git
+    cd vllm
+```
+
+Then use the following command to build the image directly from the specified commit.
+
+```bash
+     docker build -f docker/Dockerfile.rocm \
+    --build-arg REMOTE_VLLM=1 \
+    --build-arg VLLM_REPO=https://github.com/ROCm/vllm \
+    --build-arg VLLM_BRANCH="38f225c2abeadc04c2cc398814c2f53ea02c3c72" \
+    -t vllm-rocm .
+```
+
+For further instructions on how to build an upstream vLLM docker image, see https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html#build-image-from-source
 
 ## Changelog
 
