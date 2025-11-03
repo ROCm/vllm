@@ -12,7 +12,7 @@ The pre-built image includes:
 
 - ROCm™ 7.0.0
 - HipblasLT 1.0.0
-- vLLM 0.11.1
+- vLLM 0.11.1 RC
 - PyTorch 2.9
 
 ## Pull latest Docker Image
@@ -22,7 +22,7 @@ Pull the most recent validated docker image with `docker pull rocm/vllm:latest`
 ## What is New
 
 - Support for Llama4 FP4 & Granite4 model
-- vLLM version 0.11.1
+- vLLM version 0.11.1 RC
 - Default AITER on
 
 ## Known Issues and Workarounds
@@ -366,9 +366,9 @@ For further instructions on how to build an upstream vLLM docker image, see http
 
 ## Changelog
 
-rocm7.0.0_vllm_0.11.1_20251028:
+rocm7.0.0_vllm_0.11.1_20251103:
 - Support for Llama4 FP4 & Granite4 model
-- vLLM version 0.11.1
+- vLLM version 0.11.1 RC
 - Default AITER on
 
 rocm7.0.0_vllm_0.10.2_20251002:
