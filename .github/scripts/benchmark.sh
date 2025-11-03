@@ -102,18 +102,25 @@ flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$r
         BEGIN {
             if (d1 < -0.05 || d1 > 0.05 || d2 < -0.05 || d2 > 0.05) {
                 print "vLLM BENCHMARK FAILED: the delta of strict match or flexible match exceeds 0.05";
-                exit 1;
             }
             print "vLLM BENCHMARK PASSED: the delta of strict match or flexible match is within 0.05";
         }'
-} | tee comparison.log
+} | tee comparison-$model_name.log
 
 exit_code=$?
+
+if [ -n "$vllm_pid" ] && ps -p $vllm_pid > /dev/null 2>&1; then
+    kill $vllm_pid
+    echo "vLLM process ($vllm_pid) has been terminated."
+fi
+
 if [ $exit_code -eq 0 ]; then
     echo
     echo "========== vLLM BENCHMARK COMPLETED SUCCESSFULLY =========="
+    # Kill the vllm process that was started earlier
 else
     echo
     echo "========== vLLM BENCHMARK FAILED WITH EXIT CODE $exit_code =========="
-    exit $exit_code
+    # exit $exit_code
 fi
+

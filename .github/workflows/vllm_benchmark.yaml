@@ -23,9 +23,18 @@ on:
         required: false
         default: 'dev/perf'
       model_name:
-        description: 'Model name (default: deepseekr1_ptpc_fp8, options: deepseekr1_ptpc_fp8, deepseek-r1, qwen3coder_ptpc_fp8, qwen3next)'
+        description: |
+          'Comma-separated model names (default: deepseekr1_ptpc_fp8, options: deepseekr1_ptpc_fp8, deepseekr1, qwen3coder_ptpc_fp8, qwen3next). 
+          You can specify multiple models (e.g., "deepseekr1_ptpc_fp8,qwen3coder_ptpc_fp8") to run them as a matrix and benchmark them in parallel.'
         required: false
-        default: 'deepseekr1_ptpc_fp8'
+        type: choice
+        options:
+          - deepseekr1_ptpc_fp8
+          - deepseekr1
+          - qwen3coder_ptpc_fp8
+          - qwen3next
+        default: ['deepseekr1_ptpc_fp8']
+        multiple: true
 
 env:
   BASE_IMAGE: "rocm/vllm-dev:nightly"
@@ -33,13 +42,21 @@ env:
   AITER_BRANCH: ${{ github.event.inputs.aiter_branch || 'dev/perf' }}
   vLLM_REPO: ${{ github.event.inputs.vllm_repo || 'https://github.com/ROCm/vllm.git' }}
   vLLM_BRANCH: ${{ github.event.inputs.vllm_branch || 'dev/perf' }}
-  MODEL_NAME: ${{ github.event.inputs.model_name || 'deepseekr1_ptpc_fp8' }}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build-and-test:
+    strategy:
+      matrix:
+        include:
+          - model: deepseekr1_ptpc_fp8
+          - model: deepseekr1
+          - model: qwen3coder_ptpc_fp8
+          - model: qwen3next
+      fail-fast: false
     runs-on: vllm-mi308-8gpu
     steps:
       - name: Checkout vLLM repo
@@ -100,7 +117,7 @@ jobs:
         run: |
           TAG=$(echo "${{ env.vLLM_BRANCH }}-${{ env.AITER_BRANCH }}" | tr '/' '-')
           IMAGE_TAG="rocm/vllm-aiter-ci:$TAG"
-          docker build --no-cache -t "$IMAGE_TAG" -f Dockerfile.mod .
+          docker build -t "$IMAGE_TAG" -f Dockerfile.mod .
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
       
       - name: Clean up Rocm processes
@@ -110,7 +127,7 @@ jobs:
       - name: Run the container
         run: |
           set -ex
-          echo "Starting container: vllm_test"
+          echo "Starting container: vllm_test_${{ matrix.model }}"
           docker run -dt \
           --device=/dev/dri \
           --device=/dev/kfd \
@@ -124,26 +141,27 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -v /models:/models \
           -w /workspace \
-          --name vllm_test \
+          --name vllm_test_${{ matrix.model }} \
           "${{ env.IMAGE_TAG }}"
       
       - name: Install Denpendencies
         run: |
-          docker exec vllm_test git config --global --add safe.directory /workspace
-          docker exec vllm_test pip install lm_eval tenacity
-          docker exec vllm_test apt update
-          docker exec vllm_test apt install -y jq
+          docker exec vllm_test_${{ matrix.model }} git config --global --add safe.directory /workspace
+          docker exec vllm_test_${{ matrix.model }} pip install lm_eval tenacity
+          docker exec vllm_test_${{ matrix.model }} apt update
+          docker exec vllm_test_${{ matrix.model }} apt install -y jq
           
       - name: Run performance tests
         run: |
-          docker exec vllm_test ./.github/scripts/benchmark.sh ${{ env.MODEL_NAME }} benchmark_results.json
+          echo "Running benchmark for model: ${{ env.MODEL_NAME }}"
+          docker exec vllm_test_${{ matrix.model }} ./.github/scripts/benchmark.sh "${{ env.MODEL_NAME }}" "benchmark_results-${{ env.MODEL_NAME }}.json"
       
       - name: Upload benchmark results
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
-          name: benchmark_results-${{ env.MODEL_NAME }}-${{ github.run_id }}
+          name: benchmark_results-${{ matrix.model }}-${{ github.run_id }}
           path: models_performance_test/*.json
       
       - name: Upload comparison log
@@ -151,8 +169,8 @@ jobs:
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
-          name: comparison_log-${{ env.MODEL_NAME }}-${{ github.run_id }}
-          path: comparison.log
+          name: comparison_log-${{ matrix.model }}-${{ github.run_id }}
+          path: comparison-*.log
 
       - name: Clean up Rocm processes
         if: ${{ always() }}
@@ -162,4 +180,4 @@ jobs:
       - name: Remove Docker container
         if: ${{ always() }}
         run: |
-          docker rm -f vllm_test || true
+          docker rm -f vllm_test_${{ matrix.model }} || true
