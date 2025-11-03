@@ -23,7 +23,7 @@ on:
         required: false
         default: 'dev/perf'
       model_name:
-        description: 'Model name (default: deepseekr1_ptpc_fp8)'
+        description: 'Model name (default: deepseekr1_ptpc_fp8, options: deepseekr1_ptpc_fp8, deepseek-r1, qwen3coder_ptpc_fp8, qwen3next)'
         required: false
         default: 'deepseekr1_ptpc_fp8'
 
