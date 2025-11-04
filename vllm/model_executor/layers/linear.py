@@ -250,7 +250,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             weight = layer.weight
 
             if aiter_ops.can_shuffle(weight.shape[0], weight.shape[1], layout):
-                shuffled_weight = shuffle_weight(weight, layout)
+                shuffled_weight = shuffle_weight(weight, layout).t()
                 self._gemm_func = dispatch_unquantized_gemm(use_swizzle=True)
             else:
                 shuffled_weight = weight

@@ -402,7 +402,7 @@ def rocm_aiter_per_token_w8a8_scaled_mm(
         )
     else:
         output = torch.ops.vllm.rocm_aiter_gemm_a8w8_bpreshuffle(
-            qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b
+            qinput, weight.t(), out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b.t() if scale_b is not None else None
         )
     if bias is not None:
         output = output + bias
@@ -607,8 +607,8 @@ class Fp8LinearOp:
         if self.use_aiter_and_is_supported and not (
             per_tensor_weights and per_tensor_activations
         ):
-            # weight is in (N, K)
-            output_shape = [*input.shape[:-1], weight.shape[0]]
+            # weight is in (K, N)
+            output_shape = [*input.shape[:-1], weight.shape[1]]
 
         # TODO(luka) do this dispatch during init (after ScaledMM refactor)
         w8a8_scaled_mm_func = dispatch_w8a8_scaled_mm(

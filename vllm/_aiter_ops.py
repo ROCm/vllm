@@ -128,7 +128,7 @@ class aiter_ops:
 
     def hip_bpreshuffle_gemm(
         input: torch.Tensor,  # [M, K]
-        weight: torch.Tensor,  # [N, K]
+        weight: torch.Tensor,  # [K, N]
         bias: torch.Tensor | None = None,
         out_dtype: torch.dtype | None = None,
         scale_a: torch.Tensor | None = None,
@@ -152,17 +152,17 @@ class aiter_ops:
 
         output = hipb_mm(
             inp_view,
-            weight.t(),
+            weight,
             solution_index=-1,
             bias=bias,
             out_dtype=out_dtype,
             scaleA=scale_a,
-            scaleB=scale_b.t() if scale_b is not None else None,
+            scaleB=scale_b,
             scaleOut=None,
             bpreshuffle=True,
         )
 
         if batched:
-            output = output.view(*input.shape[:-1], weight.shape[0])
+            output = output.view(*input.shape[:-1], weight.shape[1])
 
         return output
