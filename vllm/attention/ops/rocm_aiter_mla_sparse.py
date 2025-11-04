@@ -83,13 +83,13 @@ def rocm_fp8_mqa_logits(
     """
 
     # TODO(ganyi): Uncomment this after aiter merge this kernel into main
-    # if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
-    #     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+    if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
-    #     kv, scale = kv
-    #     return fp8_mqa_logits(q, kv, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
-    # else:
-    return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+        kv, scale = kv
+        return fp8_mqa_logits(q, kv, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
+    else:
+        return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
