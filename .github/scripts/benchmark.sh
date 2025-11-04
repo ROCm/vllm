@@ -102,13 +102,14 @@ flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$r
         BEGIN {
             if (d1 < -0.05 || d1 > 0.05 || d2 < -0.05 || d2 > 0.05) {
                 print "vLLM BENCHMARK FAILED: the delta of strict match or flexible match exceeds 0.05";
+                exit 1;
             }
             print "vLLM BENCHMARK PASSED: the delta of strict match or flexible match is within 0.05";
         }'
 } | tee comparison-$model_name.log
 
 exit_code=$?
-if [ $exit_code -eq 1 ]; then
+if [ $exit_code -eq 0 ]; then
     echo
     echo "========== vLLM BENCHMARK COMPLETED SUCCESSFULLY =========="
 else

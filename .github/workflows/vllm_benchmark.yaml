@@ -60,13 +60,13 @@ jobs:
       matrix:
         include:
           - model: deepseekr1_ptpc_fp8
-            enabled: ${{ github.event.inputs.deepseekr1_ptpc_fp8 || true }}
+            enabled: ${{ github.event_name == 'pull_request' || github.event.inputs.deepseekr1_ptpc_fp8 }}
           - model: deepseekr1
-            enabled: ${{ github.event.inputs.deepseekr1 || true }}
+            enabled: ${{ github.event.inputs.deepseekr1 && github.event_name != 'pull_request' }}
           - model: qwen3coder_ptpc_fp8
-            enabled: ${{ github.event.inputs.qwen3coder_ptpc_fp8 || true }}
+            enabled: ${{ github.event.inputs.qwen3coder_ptpc_fp8 && github.event_name != 'pull_request' }}
           - model: qwen3next
-            enabled: ${{ github.event.inputs.qwen3next || true }}
+            enabled: ${{ github.event.inputs.qwen3next && github.event_name != 'pull_request' }}
       fail-fast: false
     runs-on: vllm-mi308-8gpu
     steps:
@@ -180,7 +180,7 @@ jobs:
           docker exec vllm_test_${{ matrix.model }} ./.github/scripts/benchmark.sh "${{ env.MODEL_NAME }}" "benchmark_results-${{ env.MODEL_NAME }}.json"
       
       - name: Upload benchmark results
-        if: ${{ matrix.enabled }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
@@ -188,7 +188,7 @@ jobs:
           path: models_performance_test/*.json
       
       - name: Upload comparison log
-        if: ${{ matrix.enabled }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
@@ -201,6 +201,10 @@ jobs:
           ./.github/scripts/clean_up_rocm.sh
       
       - name: Remove Docker container
-        if: ${{ matrix.enabled }}
+        if: ${{ always() }}
         run: |
           docker rm -f vllm_test_${{ matrix.model }} || true
+
+      - name: Mark as skipped
+        if: ${{ !matrix.enabled }}
+        run: echo "This benchmark was skipped because ${{ matrix.enabled }} is disabled."
