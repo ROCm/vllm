@@ -12,7 +12,7 @@ The pre-built image includes:
 
 - ROCm™ 7.0.0
 - HipblasLT 1.0.0
-- vLLM 0.10.2
+- vLLM 0.11.1 RC
 - PyTorch 2.9
 
 ## Pull latest Docker Image
@@ -21,13 +21,15 @@ Pull the most recent validated docker image with `docker pull rocm/vllm:latest`
 
 ## What is New
 
-- Support for FP4 models
-- GPT-OSS support
-- Support for MI35x
+- Support for Llama4 FP4 & Granite4 model
+- vLLM version 0.11.1 RC
+- Default AITER on
 
 ## Known Issues and Workarounds
 
-- None.
+- AITER must be explicitly disabled other than gfx942 and gfx950.
+- Disable AITER for Llama 3.1 405B FP8 for better performance results with BS=1
+- Drops observed with an input and output sequence length of 128/128 on the Llama4 Maverick 17B 128E FP8 model
 
 ## Performance Results
 
@@ -39,14 +41,14 @@ The table below shows performance data where a local inference client is fed req
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13212.5  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 11312.8               |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 11376.7               |
-|       |           |         | 2048  | 2048   | 1500        | 1500         | 7252.1                |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 4201.7 |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 3176.3                |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 2992.0                |
-|       |           |         | 2048  | 2048   | 500         | 500          | 2153.7                |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13279.6  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 11449.7               |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 11347.4               |
+|       |           |         | 2048  | 2048   | 1500        | 1500         | 7651.7                |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3816.8 |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 3099.6                |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 3026.1                |
+|       |           |         | 2048  | 2048   | 500         | 500          | 2196.4                |
 
 *TP stands for Tensor Parallelism.*
 
@@ -58,38 +60,38 @@ The table below shows latency measurement, which typically involves assessing th
 
 | Model | Precision | TP Size | Batch Size | Input | Output | MI300X Latency (sec) |
 |-------|-----------|----------|------------|--------|---------|-------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 15.882 |
-| | | | 2 | 128 | 2048 | 17.934 |
-| | | | 4 | 128 | 2048 | 18.487 |
-| | | | 8 | 128 | 2048 | 20.251 |
-| | | | 16 | 128 | 2048 | 22.307 |
-| | | | 32 | 128 | 2048 | 29.933 |
-| | | | 64 | 128 | 2048 | 32.359 |
-| | | | 128 | 128 | 2048 | 45.419 |
-| | | | 1 | 2048 | 2048 | 15.959 |
-| | | | 2 | 2048 | 2048 | 18.177 |
-| | | | 4 | 2048 | 2048 | 18.684 |
-| | | | 8 | 2048 | 2048 | 20.716 |
-| | | | 16 | 2048 | 2048 | 23.136 |
-| | | | 32 | 2048 | 2048 | 26.969 |
-| | | | 64 | 2048 | 2048 | 34.359 |
-| | | | 128 | 2048 | 2048 | 52.351 |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 49.098 |
-| | | | 2 | 128 | 2048 | 51.009 |
-| | | | 4 | 128 | 2048 | 52.979 |
-| | | | 8 | 128 | 2048 | 55.675 |
-| | | | 16 | 128 | 2048 | 58.982 |
-| | | | 32 | 128 | 2048 | 67.889 |
-| | | | 64 | 128 | 2048 | 86.844 |
-| | | | 128 | 128 | 2048 | 117.440 |
-| | | | 1 | 2048 | 2048 | 49.033 |
-| | | | 2 | 2048 | 2048 | 51.316 |
-| | | | 4 | 2048 | 2048 | 52.947 |
-| | | | 8 | 2048 | 2048 | 55.863 |
-| | | | 16 | 2048 | 2048 | 60.103 |
-| | | | 32 | 2048 | 2048 | 69.632 |
-| | | | 64 | 2048 | 2048 | 89.826 |
-| | | | 128 | 2048 | 2048 | 126.433 |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 16.154 |
+| | | | 2 | 128 | 2048 | 18.041 |
+| | | | 4 | 128 | 2048 | 18.322 |
+| | | | 8 | 128 | 2048 | 20.800 |
+| | | | 16 | 128 | 2048 | 21.850 |
+| | | | 32 | 128 | 2048 | 25.513 |
+| | | | 64 | 128 | 2048 | 32.539 |
+| | | | 128 | 128 | 2048 | 45.193 |
+| | | | 1 | 2048 | 2048 | 16.256 |
+| | | | 2 | 2048 | 2048 | 18.084 |
+| | | | 4 | 2048 | 2048 | 18.851 |
+| | | | 8 | 2048 | 2048 | 20.930 |
+| | | | 16 | 2048 | 2048 | 23.079 |
+| | | | 32 | 2048 | 2048 | 26.873 |
+| | | | 64 | 2048 | 2048 | 34.585 |
+| | | | 128 | 2048 | 2048 | 51.856 |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 48.138 |
+| | | | 2 | 128 | 2048 | 48.366 |
+| | | | 4 | 128 | 2048 | 49.790 |
+| | | | 8 | 128 | 2048 | 53.546 |
+| | | | 16 | 128 | 2048 | 55.685 |
+| | | | 32 | 128 | 2048 | 67.445 |
+| | | | 64 | 128 | 2048 | 86.597 |
+| | | | 128 | 128 | 2048 | 120.387 |
+| | | | 1 | 2048 | 2048 | 48.555 |
+| | | | 2 | 2048 | 2048 | 48.348 |
+| | | | 4 | 2048 | 2048 | 49.828 |
+| | | | 8 | 2048 | 2048 | 53.415 |
+| | | | 16 | 2048 | 2048 | 57.398 |
+| | | | 32 | 2048 | 2048 | 68.519 |
+| | | | 64 | 2048 | 2048 | 90.234 |
+| | | | 128 | 2048 | 2048 | 130.518 |
 
 *TP stands for Tensor Parallelism.*
 
@@ -337,6 +339,7 @@ Once all prompts are processed, terminate the server gracefully (ctrl+c).
 ```bash
 export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_USE_AITER_MHA=0
+export VLLM_ROCM_QUICK_REDUCE_QUANTIZATION=FP #or INT8, INT6, INT4
 vllm bench latency --model amd/Mixtral-8x22B-Instruct-v0.1-FP8-KV -tp 8 --batch-size 256 --input-len 128 --output-len 2048
 ```
 
@@ -362,6 +365,11 @@ Then use the following command to build the image directly from the specified co
 For further instructions on how to build an upstream vLLM docker image, see https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html#build-image-from-source
 
 ## Changelog
+
+rocm7.0.0_vllm_0.11.1_20251103:
+- Support for Llama4 FP4 & Granite4 model
+- vLLM version 0.11.1 RC
+- Default AITER on
 
 rocm7.0.0_vllm_0.10.2_20251002:
 - Support for FP4 models
