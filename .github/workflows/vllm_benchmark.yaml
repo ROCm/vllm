@@ -64,9 +64,9 @@ jobs:
           - model: deepseekr1
             enabled: ${{ github.event.inputs.deepseekr1 || true }}
           - model: qwen3coder_ptpc_fp8
-            enabled: ${{ github.event.inputs.qwen3coder_ptpc_fp8 }}
+            enabled: ${{ github.event.inputs.qwen3coder_ptpc_fp8 || true }}
           - model: qwen3next
-            enabled: ${{ github.event.inputs.qwen3next }}
+            enabled: ${{ github.event.inputs.qwen3next || true }}
       fail-fast: false
     runs-on: vllm-mi308-8gpu
     steps:
