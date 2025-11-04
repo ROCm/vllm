@@ -1654,17 +1654,27 @@ def convert_fp8(output: torch.Tensor,
 
 
 def gather_and_maybe_dequant_cache(
-        src_cache: torch.Tensor,
-        dst: torch.Tensor,
-        block_table: torch.Tensor,
-        cu_seq_lens: torch.Tensor,
-        batch_size: int,
-        kv_cache_dtype: str,
-        scale: torch.Tensor,
-        seq_starts: Optional[torch.Tensor] = None) -> None:
+    src_cache: torch.Tensor,
+    dst: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    token_to_seq: torch.Tensor,
+    num_tokens: int,
+    kv_cache_dtype: str,
+    scale: torch.Tensor,
+    seq_starts: torch.Tensor | None = None,
+) -> None:
     torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
-        src_cache, dst, block_table, cu_seq_lens, batch_size, kv_cache_dtype,
-        scale, seq_starts)
+        src_cache,
+        dst,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        num_tokens,
+        kv_cache_dtype,
+        scale,
+        seq_starts,
+    )
 
 
 def cp_gather_cache(src_cache: torch.Tensor,
