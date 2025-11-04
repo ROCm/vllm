@@ -108,19 +108,11 @@ flexible_extract_value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "$r
 } | tee comparison-$model_name.log
 
 exit_code=$?
-
-if [ -n "$vllm_pid" ] && ps -p $vllm_pid > /dev/null 2>&1; then
-    kill $vllm_pid
-    echo "vLLM process ($vllm_pid) has been terminated."
-fi
-
-if [ $exit_code -eq 0 ]; then
+if [ $exit_code -eq 1 ]; then
     echo
     echo "========== vLLM BENCHMARK COMPLETED SUCCESSFULLY =========="
-    # Kill the vllm process that was started earlier
 else
     echo
     echo "========== vLLM BENCHMARK FAILED WITH EXIT CODE $exit_code =========="
-    # exit $exit_code
+    exit $exit_code
 fi
-
