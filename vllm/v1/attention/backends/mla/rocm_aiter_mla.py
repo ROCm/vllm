@@ -241,21 +241,27 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
-        o = torch.zeros(B,
-                        self.num_heads,
-                        self.kv_lora_rank,
-                        dtype=q.dtype,
-                        device=q.device)
+        o = torch.zeros(
+            B, self.num_heads, self.kv_lora_rank, dtype=torch.bfloat16, device=q.device
+        )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
         # max_seqlen_qo must be 1 except for MTP
         # TODO: Find the best value for MTP
         max_seqlen_qo = 1
-        aiter_mla_decode_fwd(q, kv_buffer, o, self.scale,
-                             attn_metadata.decode.qo_indptr, max_seqlen_qo,
-                             attn_metadata.decode.paged_kv_indptr,
-                             attn_metadata.decode.paged_kv_indices,
-                             attn_metadata.decode.paged_kv_last_page_len)
+        aiter_mla_decode_fwd(
+            q,
+            kv_buffer,
+            o,
+            self.scale,
+            attn_metadata.decode.qo_indptr,
+            max_seqlen_qo,
+            attn_metadata.decode.paged_kv_indptr,
+            attn_metadata.decode.paged_kv_indices,
+            attn_metadata.decode.paged_kv_last_page_len,
+            q_scale=layer._q_scale,
+            kv_scale=layer._k_scale,
+        )
 
         return o, None
