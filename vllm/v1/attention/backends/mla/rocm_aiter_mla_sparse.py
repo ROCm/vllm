@@ -18,7 +18,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBaseImpl,
-    is_rocm_aiter_fp8bmm_enabled,
+    is_rocm_aiter_bmm_enabled,
 )
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
@@ -31,9 +31,12 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 logger = init_logger(__name__)
 
-if is_rocm_aiter_fp8bmm_enabled():
+if is_rocm_aiter_bmm_enabled():
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as aiter_triton_fp8_bmm,  # noqa: E501
+    )
+    from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
+        batched_gemm_afp4wfp4_pre_quant as aiter_triton_fp4_bmm,
     )
 
     def dynamic_per_batched_tensor_quant(
@@ -330,13 +333,31 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
         k_pe = k_pe[:num_actual_toks, ...]
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        # Convert from (B, N, P) to (N, B, P)
+        # [num_heads-B, batch_size-M, qk_nope_head_dim-K]
         q_nope = q_nope.transpose(0, 1)
-        if is_rocm_aiter_fp8bmm_enabled():
-            # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
+
+        if self.use_aiter_fp8_bmm:
             ql_nope = aiter_triton_fp8_bmm(
-                q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+                q_nope, self.W_UK, self.W_UK_scale, group_size=128, transpose_bm=True
             )
+        elif self.use_aiter_fp4_bmm:
+            # q_nope [num_heads-B, batch_size-M, qk_nope_head_dim-K]
+            # W_UK [num_heads-B, kv_lora_rank-N, qk_nope_head_dim-K]
+            # ql_nope [num_heads-B, batch_size-M, kv_lora_rank-N]
+            ql_nope = torch.empty(
+                q_nope.shape[0],
+                q_nope.shape[1],
+                self.W_UK.shape[1],
+                device=q_nope.device,
+                dtype=torch.bfloat16,
+            )
+            aiter_triton_fp4_bmm(
+                q_nope, self.W_UK, self.W_UK_scale, torch.bfloat16, ql_nope
+            )
+
+            # ql_nope [batch_size-M, num_heads-B, kv_lora_rank-N]
+            ql_nope = ql_nope.transpose(0, 1)
+
         else:
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
             ql_nope = torch.bmm(q_nope, self.W_UK_T)

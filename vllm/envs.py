@@ -111,7 +111,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_TRITON_ROPE: bool = True
     VLLM_ROCM_USE_AITER_CUSTOM_ALL_REDUCE: bool = True
-    VLLM_ROCM_USE_AITER_FP8BMM: bool = True
+    VLLM_ROCM_USE_AITER_BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -929,8 +929,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Whether to use aiter triton fp8 bmm kernel
     # By default is enabled.
-    "VLLM_ROCM_USE_AITER_FP8BMM": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER_FP8BMM", "True").lower() in ("true", "1")
+    "VLLM_ROCM_USE_AITER_BMM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_BMM", "True").lower() in ("true", "1")
     ),
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
@@ -1579,7 +1579,7 @@ def compute_hash() -> str:
         "VLLM_ROCM_USE_AITER_MHA",
         "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM",
         "VLLM_ROCM_USE_TRITON_ROPE",
-        "VLLM_ROCM_USE_AITER_FP8BMM",
+        "VLLM_ROCM_USE_AITER_BMM",
         "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION",
         "VLLM_ROCM_USE_SKINNY_GEMM",
         "VLLM_ROCM_FP8_PADDING",

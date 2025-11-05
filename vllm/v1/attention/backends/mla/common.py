@@ -191,6 +191,7 @@ import functools
 from abc import abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import cache
 from typing import ClassVar, Generic, TypeVar
 
 import torch
@@ -270,17 +271,21 @@ except ImportError:
     flashinfer_available = False
 
 
-def is_rocm_aiter_fp8bmm_enabled() -> bool:
+@cache
+def is_rocm_aiter_bmm_enabled() -> bool:
     return (
         current_platform.is_rocm()
-        and envs.VLLM_ROCM_USE_AITER_FP8BMM
+        and envs.VLLM_ROCM_USE_AITER_BMM
         and envs.VLLM_ROCM_USE_AITER
     )
 
 
-if is_rocm_aiter_fp8bmm_enabled():
+if is_rocm_aiter_bmm_enabled():
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as aiter_triton_fp8_bmm,  # noqa: E501
+    )
+    from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
+        batched_gemm_afp4wfp4_pre_quant as aiter_triton_fp4_bmm,
     )
 
     def dynamic_per_batched_tensor_quant(
@@ -1125,6 +1130,10 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             )
 
         def get_and_maybe_dequant_weights(layer: LinearBase):
+            # skip the dequant for the U8 weight for aiter MXFP4 bmm
+            if is_rocm_aiter_bmm_enabled() and layer.weight.dtype == torch.uint8:
+                return layer.weight
+
             if not isinstance(layer.quant_method, UnquantizedLinearMethod):
                 # NOTE: This should only be used offline, since it's O(N^3)
                 eye = torch.eye(
@@ -1138,12 +1147,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 return dequant_weights.T
             return layer.weight
 
-        # we currently do not have quantized bmm's which are needed for
-        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
-        # the bmm's in 16-bit, the extra memory overhead of this is fairly low
+        # kv_b_proj_weight [kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_vim)]
         kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
+        fp4_factor = 2 if kv_b_proj_weight.dtype == torch.uint8 else 1
+
         assert kv_b_proj_weight.shape == (
-            self.kv_lora_rank,
+            self.kv_lora_rank // fp4_factor,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
         ), (
             f"{kv_b_proj_weight.shape=}, "
@@ -1152,73 +1161,157 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             f"{self.qk_nope_head_dim=}, "
             f"{self.v_head_dim=}"
         )
-        kv_b_proj_weight = kv_b_proj_weight.view(
-            self.kv_lora_rank,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
 
-        W_UK, W_UV = kv_b_proj_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
+        if is_rocm_aiter_bmm_enabled():
+            # for FP8 deepseek model, the weight in attention part is FP8
+            # for new released amd FP4 deepseek model, the weight in attention
+            # part is BF16. For both above cases, the FP8 BMM is used
+            self.use_aiter_fp8_bmm = bool(
+                kv_b_proj_weight.dtype
+                in [torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.bfloat16]
+            )
+            # for old released amd version FP4 deepseek model, the weight in attention
+            # part is U8, the FP4 BMM is used by default
+            # TODO(zejun): move BF16 weight to use FP4 BMM
+            self.use_aiter_fp4_bmm = bool(kv_b_proj_weight.dtype in [torch.uint8])
 
-        if is_rocm_aiter_fp8bmm_enabled():
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
-            W_V = W_UV.permute(1, 2, 0)  # 16 128 512
-            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
-                W_K, dtype=current_platform.fp8_dtype()
-            )
-            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
-                W_V, dtype=current_platform.fp8_dtype()
-            )
+            if self.use_aiter_fp8_bmm:
+                # kv_b_proj_weight [kv_lora_rank, num_heads,
+                # (qk_nope_head_dim + v_head_dim)]
+                kv_b_proj_weight = kv_b_proj_weight.view(
+                    self.kv_lora_rank,
+                    self.num_heads,
+                    (self.qk_nope_head_dim + self.v_head_dim),
+                )
+
+                # W_UK [kv_lora_rank, num_heads, qk_nope_head_dim]
+                # W_UV [kv_lora_rank, num_heads, v_head_dim]
+                W_UK, W_UV = kv_b_proj_weight.split(
+                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
+
+                # W_UK [num_heads, kv_lora_rank, qk_nope_head_dim]
+                W_UK = W_UK.transpose(0, 1)
+
+                # W_UV [num_heads, v_head_dim, kv_lora_rank]
+                W_UV = W_UV.permute(1, 2, 0)
+
+                self.W_UK, self.W_UK_scale = dynamic_per_batched_tensor_quant(
+                    W_UK, dtype=current_platform.fp8_dtype()
+                )
+                self.W_UV, self.W_UV_scale = dynamic_per_batched_tensor_quant(
+                    W_UV, dtype=current_platform.fp8_dtype()
+                )
+            elif self.use_aiter_fp4_bmm:
+                from vllm.model_executor.layers.quantization.quark.utils import (
+                    quark_post_load_weights,
+                )
+
+                # shape [num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank]
+                kv_b_proj_weight = kv_b_proj_weight.T
+                kv_b_proj_weight_scale = self.kv_b_proj.weight_scale.T
+                self.W_UK, self.W_UK_scale, self.W_UV, self.W_UV_scale = (
+                    quark_post_load_weights(
+                        self.qk_nope_head_dim,
+                        self.v_head_dim,
+                        kv_b_proj_weight,
+                        kv_b_proj_weight_scale,
+                    )
+                )
+            else:
+                raise ValueError("[Error][ROCm] No suitable aiter BMM kernel is found")
 
             # The kernel operates on non-padded inputs. Hence, pre-compiling
             # triton kernel to avoid runtime compilation for unseen batch sizes
             # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
             # On DS-R1, this step adds roughly 50s to the model loading time.
-            max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            pre_compilation_list = list(range(1, max_batch_size + 1))
+            # the precompile size is aligned with the default cuda graph num
+            # token size
+            max_batch_size = 1024
+            pre_compilation_list = [1, 2, 4] + list(range(8, max_batch_size + 1, 8))
             if is_global_first_rank():
+                DTYPE_STR = " "
+                if self.use_aiter_fp8_bmm:
+                    DTYPE_STR = " fp8 "
+                elif self.use_aiter_fp4_bmm:
+                    DTYPE_STR = " fp4 "
+                else:
+                    raise ValueError("Precompile invalid dtype BMM kernel")
+
                 pre_compilation_list = tqdm(
                     pre_compilation_list,
-                    desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
+                    desc="[Aiter Triton] Pre-compiling" + DTYPE_STR + "BMM kernel",
                     total=max_batch_size,
                 )
 
-            for m in pre_compilation_list:
+            for num_tokens in pre_compilation_list:
                 x = torch.empty(
-                    (self.W_K.shape[0], m, self.W_K.shape[2]),
+                    (self.W_UK.shape[0], num_tokens, self.W_UK.shape[2] * fp4_factor),
                     dtype=torch.bfloat16,
-                    device=self.W_K.device,
-                )
-                aiter_triton_fp8_bmm(
-                    x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+                    device=self.W_UK.device,
                 )
 
-                x = torch.empty(
-                    (self.W_V.shape[0], m, self.W_V.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=self.W_V.device,
-                )
-                aiter_triton_fp8_bmm(
-                    x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
-                )
+                if self.use_aiter_fp8_bmm:
+                    aiter_triton_fp8_bmm(
+                        x, self.W_UK, self.W_UK_scale, group_size=128, transpose_bm=True
+                    )
+
+                if self.use_aiter_fp4_bmm:
+                    out = torch.empty(
+                        (
+                            self.W_UK.shape[0],
+                            num_tokens,
+                            self.W_UK.shape[1],
+                        ),
+                        dtype=torch.bfloat16,
+                        device=self.W_UK.device,
+                    )
+                    aiter_triton_fp4_bmm(
+                        x, self.W_UK, self.W_UK_scale, torch.bfloat16, out
+                    )
         else:
+            # normal path for BMM
+            kv_b_proj_weight = kv_b_proj_weight.view(
+                self.kv_lora_rank,
+                self.num_heads,
+                (self.qk_nope_head_dim + self.v_head_dim),
+            )
+
+            W_UK, W_UV = kv_b_proj_weight.split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
+
             # Convert from (L, N, V) to (N, L, V)
             self.W_UV = W_UV.transpose(0, 1)
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
 
-    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
-        # Convert from (B, N, L) to (N, B, L)
+    def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor) -> None:
+        # x [num_heads-B, batch_size-M, kv_lora_rank-K]
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
 
-        if is_rocm_aiter_fp8bmm_enabled():
-            out = out.view(-1, self.num_heads, self.v_head_dim)
-            # Multiply + Transpose (N, B, L) x (N, L, V)->(N, B, V)->(B, N, V)
-            x = aiter_triton_fp8_bmm(
-                x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True, YQ=out
-            )
+        # W_UV [num_heads-B, v_head_dim-N, kv_lora_rank-K]
+        if is_rocm_aiter_bmm_enabled():
+            if self.use_aiter_fp8_bmm:
+                # out [batch_size-M, num_heads-B, v_head_dim-N]
+                out = out.view(-1, self.num_heads, self.v_head_dim)
+                x = aiter_triton_fp8_bmm(
+                    x,
+                    self.W_UV,
+                    self.W_UV_scale,
+                    group_size=128,
+                    transpose_bm=True,
+                    YQ=out,
+                )
+                out.view(-1, self.num_heads * self.v_head_dim)
+            elif self.use_aiter_fp4_bmm:
+                # out [num_heads-B, batch_size-M, v_head_dim-N]
+                out = out.view(-1, self.num_heads, self.v_head_dim).transpose(0, 1)
+                aiter_triton_fp4_bmm(x, self.W_UV, self.W_UV_scale, torch.bfloat16, out)
+                # out [batch_size-M, num_heads-B, v_head_dim-N]
+                out = out.transpose(0, 1).view(-1, self.num_heads * self.v_head_dim)
+            else:
+                raise RuntimeError("No aiter bmm kernel will be called")
         else:
             # Convert from (B, N * V) to (N, B, V)
             out = out.view(-1, self.num_heads, self.v_head_dim).transpose(0, 1)
@@ -1520,101 +1613,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
         return attn_out, lse.transpose(0, 1).contiguous()
-
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        def get_layer_weight(layer):
-            WEIGHT_NAMES = ("weight", "qweight", "weight_packed")
-            for attr in WEIGHT_NAMES:
-                if hasattr(layer, attr):
-                    return getattr(layer, attr)
-            raise AttributeError(
-                f"Layer '{layer}' has no recognized weight attribute: {WEIGHT_NAMES}."
-            )
-
-        def get_and_maybe_dequant_weights(layer: LinearBase):
-            if not isinstance(layer.quant_method, UnquantizedLinearMethod):
-                # NOTE: This should only be used offline, since it's O(N^3)
-                eye = torch.eye(
-                    layer.input_size_per_partition,
-                    dtype=act_dtype,
-                    device=get_layer_weight(layer).device,
-                )
-                dequant_weights = layer.quant_method.apply(layer, eye, bias=None)
-                del eye
-                # standardize to (output, input)
-                return dequant_weights.T
-            return layer.weight
-
-        # we currently do not have quantized bmm's which are needed for
-        # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
-        # the bmm's in 16-bit, the extra memory overhead of this is fairly low
-        kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
-        assert kv_b_proj_weight.shape == (
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-        ), (
-            f"{kv_b_proj_weight.shape=}, "
-            f"{self.kv_lora_rank=}, "
-            f"{self.num_heads=}, "
-            f"{self.qk_nope_head_dim=}, "
-            f"{self.v_head_dim=}"
-        )
-        kv_b_proj_weight = kv_b_proj_weight.view(
-            self.kv_lora_rank,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-
-        W_UK, W_UV = kv_b_proj_weight.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
-
-        if is_rocm_aiter_fp8bmm_enabled():
-            W_K = W_UK.transpose(0, 1)  # 16 512 128
-            W_V = W_UV.permute(1, 2, 0)  # 16 128 512
-            self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
-                W_K, dtype=current_platform.fp8_dtype()
-            )
-            self.W_V, self.W_V_scale = dynamic_per_batched_tensor_quant(
-                W_V, dtype=current_platform.fp8_dtype()
-            )
-
-            # The kernel operates on non-padded inputs. Hence, pre-compiling
-            # triton kernel to avoid runtime compilation for unseen batch sizes
-            # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
-            # On DS-R1, this step adds roughly 50s to the model loading time.
-            max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            pre_compilation_list = list(range(1, max_batch_size + 1))
-            if is_global_first_rank():
-                pre_compilation_list = tqdm(
-                    pre_compilation_list,
-                    desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
-                    total=max_batch_size,
-                )
-
-            for m in pre_compilation_list:
-                x = torch.empty(
-                    (self.W_K.shape[0], m, self.W_K.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=self.W_K.device,
-                )
-                aiter_triton_fp8_bmm(
-                    x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
-                )
-
-                x = torch.empty(
-                    (self.W_V.shape[0], m, self.W_V.shape[2]),
-                    dtype=torch.bfloat16,
-                    device=self.W_V.device,
-                )
-                aiter_triton_fp8_bmm(
-                    x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
-                )
-        else:
-            # Convert from (L, N, V) to (N, L, V)
-            self.W_UV = W_UV.transpose(0, 1)
-            # Convert from (L, N, P) to (N, P, L)
-            self.W_UK_T = W_UK.permute(1, 2, 0)
 
     def _compute_prefill_context(
         self,
@@ -1971,15 +1969,36 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 decode_pe_padded.copy_(decode_q_pe)
                 decode_q_pe = decode_pe_padded
 
-            if is_rocm_aiter_fp8bmm_enabled():
-                # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
-                decode_ql_nope = aiter_triton_fp8_bmm(
-                    decode_q_nope,
-                    self.W_K,
-                    self.W_K_scale,
-                    group_size=128,
-                    transpose_bm=True,
-                )
+            if is_rocm_aiter_bmm_enabled():
+                if self.use_aiter_fp8_bmm:
+                    # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
+                    decode_ql_nope = aiter_triton_fp8_bmm(
+                        decode_q_nope,
+                        self.W_UK,
+                        self.W_UK_scale,
+                        group_size=128,
+                        transpose_bm=True,
+                    )
+                elif self.use_aiter_fp4_bmm:
+                    # decode_q_nope [num_heads-B, batch_size-M, qk_nope_head_dim-K]
+                    # decode_ql_nope [num_heads-B, batch_size-M, kv_lora_rank-N]
+                    # W_UK [num_heads-B, kv-lora_rank-N, qk_nope_head_dim-K]
+                    decode_ql_nope = torch.empty(
+                        decode_q_nope.shape[0],
+                        decode_q_nope.shape[1],
+                        self.W_UK.shape[1],
+                        dtype=torch.bfloat16,
+                        device=decode_q_nope.device,
+                    )
+                    aiter_triton_fp4_bmm(
+                        decode_q_nope,
+                        self.W_UK,
+                        self.W_UK_scale,
+                        torch.bfloat16,
+                        decode_ql_nope,
+                    )
+                    # decode_ql_nope [batch_size-M, num_heads-B, kv_lora_rank-N]
+                    decode_ql_nope = decode_ql_nope.transpose(0, 1)
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = decode_q_nope.shape

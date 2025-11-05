@@ -9,6 +9,7 @@ export VLLM_ROCM_USE_TRITON_ROPE=1 # add for acc
 export VLLM_DISABLE_COMPILE_CACHE=1
 # FIXME: for now disable fp4 asm gemm because of running issue
 export VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=0
+export VLLM_ROCM_USE_AITER_BMM=1
 export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0 # disable for acc
 
 export TRITON_HIP_ASYNC_COPY_BYPASS_PERMUTE=1
