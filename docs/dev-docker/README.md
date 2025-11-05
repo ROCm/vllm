@@ -1,8 +1,8 @@
 # vLLM FP8 latency and throughput benchmarks on the AMD Instinct™ MI300X GPU
 
-vLLM is a toolkit and library for large language model (LLM) inference and serving. It uses the PagedAttention algorithm to reduce memory consumption and increase throughput through dynamic key and value allocation in GPU memory. vLLM also incorporates the latest LLM acceleration and quantization algorithms, such as FP8 GeMM, FP8 KV cache, continuous batching, flash attention, HIP graph, tensor parallelism, GPTQ, AWQ, and token speculation. In addition, AMD implements high-performance custom kernels and modules in vLLM to further enhance performance.
+vLLM is a toolkit and library for large language model (LLM) inference and serving. It uses the PagedAttention algorithm to reduce memory consumption and increase throughput through dynamic key and value allocation in GPU memory. vLLM also incorporates the latest LLM acceleration and quantization algorithms, such as FP8 GEMM, FP8 KV cache, continuous batching, flash attention, HIP graph, tensor parallelism, GPTQ, AWQ, and speculative decoding. In addition, AMD implements high-performance custom kernels and modules in vLLM to further enhance performance.
 
-This documentation ceovers running Meta’s popular Llama 3.1 series models with a pre-built AMD vLLM Docker image optimized for AMD Instinct™ MI300X or MI325X GPUs. The container is available on [AMD Infinity Hub](https://www.amd.com/en/developer/resources/infinity-hub.html).
+This documentation covers running Meta’s popular Llama 3.x series models with a pre-built AMD vLLM Docker image optimized for AMD Instinct™ MI300X, MI325X, MI350X, and MI355X GPUs. The container is available on [AMD Infinity Hub](https://www.amd.com/en/developer/resources/infinity-hub.html).
 
 The prebuilt image includes:
 
@@ -23,7 +23,7 @@ Pull the latest validated Docker image with `docker pull rocm/vllm:latest`
 
 ## Known issues and workarounds
 
-- AITER must be explicitly disabled on GPUs other than gfx942 and gfx950.
+- AITER must be explicitly disabled on GPU architectures other than gfx942 and gfx950.
 - Disable AITER for Llama 3.1 405B FP8 for better performance with a batch size of 1 (BS=1).
 - Performance drops may occur with an input and output sequence length of 128/128 on the Llama4 Maverick 17B 128E FP8 model.
 
@@ -97,19 +97,19 @@ Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 processors, 2.25 TiB RAM, 8x AM
 
 ### Preparation- accessing the models
 
-The vLLM Docker image supports any model compatible with vLLM.  When running with FP8,AMD provides quantized versions of several popular models, or you can quantize models yourself using Quark.  The vLLM benchmark scripts can automatically download models and store them in a Hugging Face cache directory for reuse in future tests. Alternatively, you can pre-download the model to the cache or another directory on your system.
+The vLLM Docker image supports any model compatible with vLLM.  When running with FP8, AMD provides quantized versions of several popular models, or you can quantize models yourself using Quark. The vLLM benchmark scripts can automatically download models and store them in a Hugging Face cache directory for reuse in future tests. Alternatively, you can pre-download the model to the cache or another directory on your system.
 
-Many HuggingFace models, including Llama-3.1, have gated access.  You will need to set up an account at [Hugging Face](https://huggingface.co), search for the model of interest, and request access if necessary. You will also need to create a token for accessing these models from vLLM by going to your [user profile](https://huggingface.co/settings/profile), selecting **Access Tokens**, clicking **+ Create New Token**, and creating a new **Read** token.
+Many HuggingFace models, including Llama-3.1, have gated access. You will need to set up an account at [Hugging Face](https://huggingface.co), search for the model of interest, and request access if necessary. You will also need to create a token for accessing these models from vLLM by going to your [user profile](https://huggingface.co/settings/profile), selecting **Access Tokens**, clicking **+ Create New Token**, and creating a new **Read** token.
 
 ### System optimization
 
-Before running performance tests you should ensure the system is optimized according to the [ROCm documentation](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html).  In particular, it is important to ensure that NUMA auto-balancing is disabled.
+Before running performance tests, ensure the system is optimized according to the [ROCm documentation](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html). In particular, it is important to ensure that NUMA auto-balancing is disabled.
 
 > **Note:** Check that NUMA balancing is properly set by inspecting the output of the command below, which should have a value of 0, with, `cat /proc/sys/kernel/numa_balancing`*
 
 ### Launch AMD vLLM Docker
 
-Download and launch the docker.  The HF_TOKEN is required to be set (either here or after launching the container) if you want to allow vLLM to download gated models automatically; use your HuggingFace token in place of `<token>` in the command below:
+Download and launch the Docker container. `HF_TOKEN` must be set (either here or after launching the container) to allow vLLM to download gated models automatically. Replace `<token>` with your Hugging Face token in the command below:
 
 ```bash
 docker run -it --rm --ipc=host --network=host --group-add render \
