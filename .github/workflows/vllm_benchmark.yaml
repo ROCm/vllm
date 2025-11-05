@@ -63,13 +63,13 @@ jobs:
       matrix:
         include:
           - model: deepseekr1_ptpc_fp8
-            enabled: ${{ github.event_name == 'pull_request' || github.event.inputs.deepseekr1_ptpc_fp8 }}
+            enabled: ${{ github.event_name == 'pull_request' || github.event.inputs.deepseekr1_ptpc_fp8 == 'true' || github.event_name == 'schedule' }}
           - model: deepseekr1
-            enabled: ${{ github.event.inputs.deepseekr1 && github.event_name != 'pull_request' }}
+            enabled: ${{ github.event.inputs.deepseekr1 == 'true' || github.event_name == 'schedule' }}
           - model: qwen3coder_ptpc_fp8
-            enabled: ${{ github.event.inputs.qwen3coder_ptpc_fp8 && github.event_name != 'pull_request' }}
+            enabled: ${{ github.event.inputs.qwen3coder_ptpc_fp8 == 'true' || github.event_name == 'schedule' }}
           - model: qwen3next
-            enabled: ${{ github.event.inputs.qwen3next && github.event_name != 'pull_request' }}
+            enabled: ${{ github.event.inputs.qwen3next == 'true' || github.event_name == 'schedule' }}
       fail-fast: false
     runs-on: vllm-mi308-8gpu
     steps:
