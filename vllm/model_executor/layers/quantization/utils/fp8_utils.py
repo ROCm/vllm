@@ -130,7 +130,7 @@ if current_platform.is_rocm():
     if (
         envs.VLLM_ROCM_USE_AITER
         and envs.VLLM_ROCM_USE_AITER_LINEAR
-        and current_platform.is_fp8_fnuz()
+        and current_platform.supports_fp8()
     ):
         import aiter as rocm_aiter
         from aiter import get_hip_quant
