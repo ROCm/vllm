@@ -230,7 +230,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
-
+from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import batched_gemm_afp4wfp4_pre_quant
 
 class QueryLenSupport(Enum):
     """Defines the level of query length support for an attention backend's
@@ -1141,7 +1141,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
         # the bmm's in 16-bit, the extra memory overhead of this is fairly low
+        print("self.kv_b_proj:", self.kv_b_proj)
         kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj).T
+        print("self.kv_b_proj after dequant:", self.kv_b_proj)
         assert kv_b_proj_weight.shape == (
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -1165,6 +1167,8 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         if is_rocm_aiter_fp8bmm_enabled():
             W_K = W_UK.transpose(0, 1)  # 16 512 128
             W_V = W_UV.permute(1, 2, 0)  # 16 128 512
+            print("W_K.dtype:", W_K.dtype)
+            print("W_V.dtype:", W_V.dtype)
             self.W_K, self.W_K_scale = dynamic_per_batched_tensor_quant(
                 W_K, dtype=current_platform.fp8_dtype()
             )
@@ -1544,6 +1548,60 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 # standardize to (output, input)
                 return dequant_weights.T
             return layer.weight
+
+        print("self.kv_b_proj:", self.kv_b_proj.shape)
+        print("self.qv_nope_head_dim:", self.qk_nope_head_dim, "self.v_head_dim:", self.v_head_dim)
+        if self.kv_b_proj.weight.dtype == torch.uint8: # mxfp4 elemnts packed in a byte
+            kv_b_proj_weight = self.kv_b_proj.weight.view(
+                self.kv_lora_rank,
+                self.num_heads,
+                self.qv_nope_head_dim // 2 + self.v_head_dim // 2,
+            )
+            W_UK, W_UV = kv_b_proj_weight.split(
+                [self.qk_nope_head_dim // 2, self.v_head_dim // 2], dim=-1
+            )
+            if is_global_first_rank():
+                max_batch_size = 1024  # [ToDo] Find the optimal upper limit
+                pre_compilation_list = list(range(1, max_batch_size + 1))
+                pre_compilation_list = tqdm(
+                    pre_compilation_list,
+                    desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
+                    total=max_batch_size,
+                )
+                for m in pre_compilation_list:
+                    x = torch.empty(
+                        (self.W_K.shape[0], m, self.W_K.shape[2]),
+                        dtype=torch.bfloat16,
+                        device=self.W_K.device,
+                    )
+                    out = torch.empty(
+                        x.shape[0], x.shape[1], x.shape[2], device=x.device, dtype=torch.bfloat16
+                    )
+
+                    # aiter_triton_fp8_bmm(
+                    #     x, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
+                    # )
+                    batched_gemm_afp4wfp4_pre_quant(
+                        x,
+                        self.W_K,
+                        self.W_k_scale,
+                        torch.bfloat16
+                    )
+
+                    x = torch.empty(
+                        (self.W_V.shape[0], m, self.W_V.shape[2]),
+                        dtype=torch.bfloat16,
+                        device=self.W_V.device,
+                    )
+                    batched_gemm_afp4wfp4_pre_quant(
+                        x,
+                        self.W_V,
+                        self.W_V_scale,
+                        torch.bfloat16
+                    )
+                    # aiter_triton_fp8_bmm(
+                    #     x, self.W_V, self.W_V_scale, group_size=128, transpose_bm=True
+                    # )
 
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
@@ -1971,7 +2029,14 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 decode_pe_padded.copy_(decode_q_pe)
                 decode_q_pe = decode_pe_padded
 
-            if is_rocm_aiter_fp8bmm_enabled():
+            if self.kv_b_proj.weight.dtype == torch.uint8:
+                decode_ql_nope = batched_gemm_afp4wfp4_pre_quant(
+                    decode_q_nope,
+                    self.W_K,
+                    self.W_k_scale,
+                    torch.bfloat16
+                )
+            elif is_rocm_aiter_fp8bmm_enabled():
                 # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
                 decode_ql_nope = aiter_triton_fp8_bmm(
                     decode_q_nope,
