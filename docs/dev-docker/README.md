@@ -29,7 +29,7 @@ Pull the latest validated Docker image with `docker pull rocm/vllm:latest`
 
 ## Performance results
 
-The data in the following tables serves as a reference to help you validate observed performance. It should not be interpreted as the peak performance achievable on the AMD Instinct™ MI300X GPU with vLLM. For details on MLPerf 4.1 inference results, see the MLPerf section in this document. The performance numbers were collected using the steps described below.
+The data in the following tables serves as a reference to help you validate observed performance. It should not be interpreted as the peak performance achievable on the AMD Instinct™ MI300X GPU with vLLM.
 
 ### Throughput measurements
 
@@ -99,11 +99,11 @@ Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 processors, 2.25 TiB RAM, 8x AM
 
 The vLLM Docker image supports any model compatible with vLLM.  When running with FP8, AMD provides quantized versions of several popular models, or you can quantize models yourself using Quark. The vLLM benchmark scripts can automatically download models and store them in a Hugging Face cache directory for reuse in future tests. Alternatively, you can pre-download the model to the cache or another directory on your system.
 
-Many HuggingFace models, including Llama-3.1, have gated access. You will need to set up an account at [Hugging Face](https://huggingface.co), search for the model of interest, and request access if necessary. You will also need to create a token for accessing these models from vLLM by going to your [user profile](https://huggingface.co/settings/profile), selecting **Access Tokens**, clicking **+ Create New Token**, and creating a new **Read** token.
+Many HuggingFace models, including Meta's Llama 3.x, have gated access. You will need to set up an account at [HuggingFace](https://huggingface.co), search for the model of interest, and request access if necessary. You will also need to create a token for accessing these models from vLLM by going to your [user profile](https://huggingface.co/settings/profile), selecting **Access Tokens**, clicking **+ Create New Token**, and creating a new **Read** token.
 
 ### System optimization
 
-Before running performance tests, ensure the system is optimized according to the [ROCm documentation](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html). In particular, it is important to ensure that NUMA auto-balancing is disabled.
+Before running performance tests, ensure the system is optimized according to the [ROCm MI300X System Optimization Guide](https://rocm.docs.amd.com/en/latest/how-to/system-optimization/mi300x.html). In particular, it is important to ensure that NUMA auto-balancing is disabled.
 
 > **Note:** Check that NUMA balancing is properly set by inspecting the output of the command below, which should have a value of 0, with, `cat /proc/sys/kernel/numa_balancing`*
 
@@ -123,72 +123,6 @@ docker run -it --rm --ipc=host --network=host --group-add render \
 ```
 
 > **Note:** This document uses `/data` to store models.  If you choose a different directory, you will also need to update the host volume mount when launching the Docker container.  For example, `-v /home/username/models:/data` instead of `-v /data:/data` will store models in `/home/username/models` on the host. Some models can be large, so ensure you have sufficient disk space before downloading. Because downloads may take a long time, consider using `tmux` or `screen` to prevent disconnection.
-
-### Downloading models with Hugging Face CLI
-
-To download models directly (instead of letting vLLM download them automatically), you can use the `huggingface-cli` inside the running Docker container. Log in using the token you created earlier. It is not necessary to save the token as a git credential.
-
-```bash
-huggingface-cli login
-```
-
-You can download a model to the `huggingface-cache` directory using a command similar to the following (replace with the name of the model you want to download):
-
-```bash
-sudo mkdir -p /data/huggingface-cache
-sudo chmod -R a+w /data/huggingface-cache
-HF_HOME=/data/huggingface-cache huggingface-cli download meta-llama/Llama-3.1-405B-Instruct --exclude "original/*"
-```
-
-Alternatively, you can download the model to a specific directory, for example, if you want to quantize it using Quark:
-
-```bash
-sudo mkdir -p /data/llama-3.1
-sudo chmod -R a+w /data/llama-3.1
-huggingface-cli download meta-llama/Llama-3.1-405B-Instruct --exclude "original/*" --local-dir /data/llama-3.1/Llama-3.1-405B-Instruct
-```
-
-In the benchmark commands provided later in this document, replace the model name, for example, `amd/Llama-3.1-405B-Instruct-FP8-KV` with the path to the model, for example, `/data/llama-3.1/Llama-3.1-405B-Instruct`.
-
-### Use pre-quantized models
-
-AMD provides [FP8-quantized versions](https://huggingface.co/collections/amd/quark-quantized-ocp-fp8-models) of several models to make them easier to run, including:
-
-- <https://huggingface.co/amd/Llama-3.1-8B-Instruct-FP8-KV>
-- <https://huggingface.co/amd/Llama-3.1-70B-Instruct-FP8-KV>
-- <https://huggingface.co/amd/Llama-3.1-405B-Instruct-FP8-KV>
-
-Some models may be private and accessible only to members of <https://huggingface.co/amd>.
-
-These FP8 quantized checkpoints were generated with AMD’s Quark Quantizer. For more information about Quark, see <https://quark.docs.amd.com/latest/quark_example_torch_llm_gen.html>
-
-### Quantize your own models
-
-This step is optional if you want to quantize your own model instead of using AMD's pre-quantized models. These instructions use Llama-3.1-405B as an example, but the commands are similar for other models.
-
-1. Download the model from <https://huggingface.co/meta-llama/Llama-3.1-405B> to the `/data/llama-3.1` directory, as described above.
-
-2. [Download and install Quark](https://quark.docs.amd.com/latest/install.html).
-
-3. Run the quantization script in the example folder using the following command:
-
-    ```bash
-    # path to quark quantization script
-    export QUARK_DIR=/data/quark-0.6.0+dba9ca364/examples/torch/language_modeling/llm_ptq/quantize_quark.py
-    # path to Model 
-    export MODEL_DIR=/data/llama-3.1/Llama-3.1-405B-Instruct
-    python3 $QUARK_DIR \
-    --model_dir $MODEL_DIR \
-    --output_dir Llama-3.1-405B-Instruct-FP8-KV \
-    --kv_cache_dtype fp8 \
-    --quant_scheme w_fp8_a_fp8 \
-    --num_calib_data 128 \
-    --model_export quark_safetensors \
-    --no_weight_matrix_merge \
-    --multi_gpu
-    ```
-
-    > **Note:** The `--multi_gpu` parameter can be omitted for small models that fit on a single GPU.
 
 ## Performance testing with AMD vLLM Docker
 
@@ -237,8 +171,6 @@ vllm bench latency \
 
 When measuring models with long context lengths, performance may improve by setting `--max-model-len` to a smaller value. However, ensure that `--max-model-len` is at least as large as the sum of the input and output token counts.
 
-To estimate Time To First Token (TTFT) with the `vllm bench latency` tool, set the output length (`OUT`) to `1` token.  It is also recommended to use `--enforce-eager` for a more accurate measurement of the actual time to generate the first token. For a more comprehensive TTFT measurement, use the Online Serving Benchmark.
-
 For more information about available parameters, run:
 
 ```bash
@@ -282,7 +214,7 @@ When measuring models with long context lengths, performance may improve by sett
 
 It is also important to tune vLLM’s `--max-num-seqs` parameter based on the model and input/output lengths. Larger values allow vLLM to use more GPU memory for the KV cache and process more prompts concurrently. However, if the value is too large, the KV cache might reach its capacity, causing vLLM to cancel and reprocess some prompts. Suggested values for various models and configurations are listed below.
 
-For models that fit on a single GPU, it is usually best to run with `--tensor-parallel-size 1`. Requests can then be distributed across multiple copies of vLLM running on different GPUs. This is more efficient than running a single copy of the model with `--tensor-parallel-size 8`.
+For models that fit on a single GPU, it is usually best to run with `--tensor-parallel-size 1` (default). Requests can then be distributed across multiple copies of vLLM running on different GPUs. This is more efficient than running a single copy of the model with `--tensor-parallel-size 8`.
 
 For optimal performance, the `PROMPTS` value should be a multiple of the `MAX_NUM_SEQS` value. For example, if `MAX_NUM_SEQS=1500`, then the `PROMPTS` value could be `1500`, `3000`, and so on.  If `PROMPTS` is smaller than `MAX_NUM_SEQS`, there won’t be enough prompts for vLLM to maximize concurrency.
 
@@ -360,6 +292,74 @@ Then use the following command to build the image directly from the specified co
 ```
 
 For further instructions on how to build an upstream vLLM docker image, see <https://docs.vllm.ai/en/latest/getting_started/installation/gpu.html#build-image-from-source>
+
+## (Optional) Model download and quantization
+
+### Downloading models with Hugging Face CLI
+
+To download models directly (instead of letting vLLM download them automatically), you can use the `huggingface-cli` inside the running Docker container. Log in using the token you created earlier. It is not necessary to save the token as a git credential.
+
+```bash
+huggingface-cli login
+```
+
+You can download a model to the `huggingface-cache` directory using a command similar to the following (replace with the name of the model you want to download):
+
+```bash
+sudo mkdir -p /data/huggingface-cache
+sudo chmod -R a+w /data/huggingface-cache
+HF_HOME=/data/huggingface-cache huggingface-cli download meta-llama/Llama-3.1-405B-Instruct --exclude "original/*"
+```
+
+Alternatively, you can download the model to a specific directory, for example, if you want to quantize it using Quark:
+
+```bash
+sudo mkdir -p /data/llama-3.1
+sudo chmod -R a+w /data/llama-3.1
+huggingface-cli download meta-llama/Llama-3.1-405B-Instruct --exclude "original/*" --local-dir /data/llama-3.1/Llama-3.1-405B-Instruct
+```
+
+In the benchmark commands provided later in this document, replace the model name, for example, `amd/Llama-3.1-405B-Instruct-FP8-KV` with the path to the model, for example, `/data/llama-3.1/Llama-3.1-405B-Instruct`.
+
+### Use pre-quantized models
+
+AMD provides [FP8-quantized versions](https://huggingface.co/collections/amd/quark-quantized-ocp-fp8-models) of several models to make them easier to run, including:
+
+- <https://huggingface.co/amd/Llama-3.1-8B-Instruct-FP8-KV>
+- <https://huggingface.co/amd/Llama-3.1-70B-Instruct-FP8-KV>
+- <https://huggingface.co/amd/Llama-3.1-405B-Instruct-FP8-KV>
+
+Some models may be private and accessible only to members of <https://huggingface.co/amd>.
+
+These FP8 quantized checkpoints were generated with AMD’s Quark Quantizer. For more information about Quark, see <https://quark.docs.amd.com/latest/quark_example_torch_llm_gen.html>
+
+### Quantize your own models
+
+This step is optional if you want to quantize your own model instead of using AMD's pre-quantized models. These instructions use Llama-3.1-405B as an example, but the commands are similar for other models.
+
+1. Download the model from <https://huggingface.co/meta-llama/Llama-3.1-405B> to the `/data/llama-3.1` directory, as described above.
+
+2. [Download and install Quark](https://quark.docs.amd.com/latest/install.html).
+
+3. Run the quantization script in the example folder using the following command:
+
+    ```bash
+    # path to quark quantization script
+    export QUARK_DIR=/data/quark-0.6.0+dba9ca364/examples/torch/language_modeling/llm_ptq/quantize_quark.py
+    # path to Model 
+    export MODEL_DIR=/data/llama-3.1/Llama-3.1-405B-Instruct
+    python3 $QUARK_DIR \
+    --model_dir $MODEL_DIR \
+    --output_dir Llama-3.1-405B-Instruct-FP8-KV \
+    --kv_cache_dtype fp8 \
+    --quant_scheme w_fp8_a_fp8 \
+    --num_calib_data 128 \
+    --model_export quark_safetensors \
+    --no_weight_matrix_merge \
+    --multi_gpu
+    ```
+
+    > **Note:** The `--multi_gpu` parameter can be omitted for small models that fit on a single GPU.
 
 ## Changelog
 
