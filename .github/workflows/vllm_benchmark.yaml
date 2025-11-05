@@ -5,8 +5,8 @@ on:
     branches:
       - dev/perf
   schedule:
-    # 0 16 * * * means every day at 16:00 UTC, which is 00:00 Beijing time.
-    - cron: '0 16 * * *'
+    # 0 15 * * * means every day at 15:00 UTC, which is 23:00 Beijing time.
+    - cron: '0 15 * * *'
   workflow_dispatch:
     inputs:
       vllm_repo:
