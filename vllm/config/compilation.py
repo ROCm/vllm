@@ -302,7 +302,7 @@ class CompilationConfig:
     constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
 
     # CudaGraph compilation
-    cudagraph_mode: CUDAGraphMode | None = None
+    cudagraph_mode: CUDAGraphMode | None = CUDAGraphMode.FULL
     """
     The mode of the cudagraph:
 
@@ -557,6 +557,17 @@ class CompilationConfig:
         count_all = self.custom_ops.count("all")
         assert count_none + count_all <= 1, "Can only specify 'none' or 'all'"
 
+        def add_default_custom_op(op_name: str):
+            if (
+                f"+{op_name}" not in self.custom_ops
+                and f"-{op_name}" not in self.custom_ops
+            ):
+                self.custom_ops.append(f"+{op_name}")
+
+        add_default_custom_op("rms_norm")
+        add_default_custom_op("silu_and_mul")
+        add_default_custom_op("quant_fp8")
+
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:
         #    https://github.com/pytorch/pytorch/issues/147924
@@ -778,7 +789,11 @@ class CompilationConfig:
             # captured. see https://github.com/vllm-project/vllm/pull/20059
             # for details. Make a copy to avoid mutating the class-level
             # list via reference.
-            self.splitting_ops = list(self._attention_ops)
+            self.splitting_ops = (
+                []
+                if self.cudagraph_mode == CUDAGraphMode.FULL
+                else list(self._attention_ops)
+            )
         elif len(self.splitting_ops) == 0:
             logger.warning_once("Using piecewise compilation with empty splitting_ops")
             if self.cudagraph_mode == CUDAGraphMode.PIECEWISE:
@@ -831,6 +846,15 @@ class CompilationConfig:
         return self.splitting_ops is not None and all(
             op in self.splitting_ops for op in self._attention_ops
         )
+
+    def add_missing_attention_splitting_ops(self):
+        if self.splitting_ops is None:
+            self.splitting_ops = list(self._attention_ops)
+            return
+
+        for op in self._attention_ops:
+            if op not in self.splitting_ops:
+                self.splitting_ops.append(op)
 
     def is_attention_compiled_piecewise(self) -> bool:
         if not self.splitting_ops_contain_attention():

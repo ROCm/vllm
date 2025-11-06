@@ -131,7 +131,7 @@ class SchedulerConfig:
     like full attention and sliding window attention.
     """
 
-    async_scheduling: bool = False
+    async_scheduling: bool = True
     """EXPERIMENTAL: If set to True, perform async scheduling. This may help
     reduce the CPU overheads, leading to better latency and throughput. However,
     async scheduling is currently not supported with some features such as
