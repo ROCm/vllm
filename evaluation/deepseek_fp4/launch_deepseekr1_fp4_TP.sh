@@ -31,7 +31,6 @@ echo "running $model_path"
 # FIXME: for now use 0.8 for memory utilization
 vllm serve $model_path \
   --host localhost \
-  --port 9000 \
   --tensor-parallel-size 8 \
   --max-num-batched-tokens 32768 \
   --trust-remote-code \
