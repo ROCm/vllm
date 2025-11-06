@@ -316,6 +316,44 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.all2all_manager.destroy()
             self.all2all_manager = None
 
+
+    def all_gather(
+        self, input_: torch.Tensor | list[torch.Tensor], dim: int = 0
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """Equal-length all-gather on dim 0, mirroring all_gatherv's structure.
+
+        If PyNccl is unavailable/disabled/dim < 0, falls back to base implementation.
+        """
+        if dim < 0:
+            return super().all_gather(input_, dim)
+        if dim != 0:
+            raise NotImplementedError("only dim 0 all-gather is supported")
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            return super().all_gather(input_, dim)
+
+        world_size = self.world_size
+
+        def _all_gather_single(inp: torch.Tensor) -> torch.Tensor:
+            input_size = inp.size()
+            output_size = (input_size[0] * world_size,) + input_size[1:]
+            output_tensor = torch.empty(
+                output_size, dtype=inp.dtype, device=inp.device
+            )
+            pynccl_comm.all_gather(output_tensor, inp)
+            return output_tensor
+
+        if isinstance(input_, torch.Tensor):
+            return _all_gather_single(input_)
+
+        output_list: list[torch.Tensor] = []
+        pynccl_comm.group_start()
+        for inp in input_:
+            output_list.append(_all_gather_single(inp))
+        pynccl_comm.group_end()
+        return output_list
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],

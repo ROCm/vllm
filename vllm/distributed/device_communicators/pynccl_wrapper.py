@@ -92,6 +92,8 @@ class ncclDataTypeEnum:
             return cls.ncclFloat64
         if dtype == torch.bfloat16:
             return cls.ncclBfloat16
+        if dtype == torch.float8_e4m3fnuz or dtype == torch.float8_e4m3fn:
+            return cls.ncclUint8
         raise ValueError(f"Unsupported dtype: {dtype}")
 
 
