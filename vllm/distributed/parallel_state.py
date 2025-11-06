@@ -385,6 +385,10 @@ class GroupCoordinator:
             torch.ops._C, "init_shm_manager"
         )
 
+        import torch_dist_ext
+        if torch_dist_ext.comm is None:
+            torch_dist_ext.setup_env(self.rank, self.world_size, self.device_group)
+
     @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""
@@ -1185,6 +1189,17 @@ def init_distributed_environment(
             rank=rank,
             timeout=timeout,
         )
+    # import torch_dist_ext
+    # if torch_dist_ext.comm is None:
+    #     # print(rank, world_size)
+    #     torch_dist_ext.setup_env(rank, world_size)
+        # aiter_dist.set_custom_all_reduce(True)
+        # init_distributed_environment(
+        #     world_size=tp_size,
+        #     rank=rankID,
+        #     distributed_init_method=get_distributed_init_method(get_ip(), get_open_port()),
+        # )
+
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
