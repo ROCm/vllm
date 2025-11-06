@@ -30,16 +30,14 @@ echo "running $model_path"
 
 vllm serve $model_path \
   --host localhost \
-  --port 9000 \
   --tensor-parallel-size 8 \
   --max-num-batched-tokens 32768 \
   --trust-remote-code \
   --no-enable-prefix-caching \
   --disable-log-requests \
-  --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
   --gpu_memory_utilization 0.9 \
   --block-size 1 \
-  --seed 123 2>&1 | tee log.server.log &
+  --enforce-eager \
 
   # --enforce-eager \
   # --enable-expert-parallel \
