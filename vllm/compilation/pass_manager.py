@@ -32,6 +32,8 @@ from .inductor_pass import CustomGraphPass, InductorPass, get_pass_context
 from .noop_elimination import NoOpEliminationPass
 from .sequence_parallelism import SequenceParallelismPass
 
+from .my_collective_fusion import AllReduceFusionPass
+
 logger = init_logger(__name__)
 
 
