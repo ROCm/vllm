@@ -71,6 +71,7 @@ try:
             else:
                 x_q = x
                 x_s = x_scales
+
             y = torch.empty(x_q.shape[0],
                             weight.shape[0],
                             device=x_q.device,
@@ -87,9 +88,15 @@ try:
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: Optional[torch.dtype] = torch.bfloat16,
     ) -> torch.Tensor:
-        return torch.empty((*x.shape[:-1], weight.shape[0]),
-                           dtype=out_dtype,
-                           device=x.device)
+        M = x.shape[0]
+        if rocm_use_aiter_fp4_asm_gemm:
+            return torch.empty(((M + 31) // 32 * 32, weight.shape[0]),
+                            dtype=out_dtype,
+                            device=x.device)[:M]
+        else:
+            return torch.empty((M, weight.shape[0]),
+                            dtype=out_dtype,
+                            device=x.device)
 
     direct_register_custom_op(
         op_name="gemm_with_dynamic_quant",
