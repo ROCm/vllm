@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_TUNED_CONFIG_FOLDER: Optional[str] = None
     VLLM_DISABLE_PAD_FOR_CUDAGRAPH: bool = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FP8_BMM: bool = True
@@ -210,6 +211,7 @@ if TYPE_CHECKING:
     VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME: str = "VLLM_OBJECT_STORAGE_SHM_BUFFER"
     VLLM_PATTERN_MATCH_DEBUG: Optional[str] = None
     VLLM_ROCM_USE_AITER_TRITON_MLA: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS: bool = True
 
 def get_default_cache_root():
     return os.getenv(
@@ -1377,6 +1379,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER Triton fused RMSNORM + Quantization
     "VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT", "1"))),
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT", "1"))),
 
     # Use AITER Triton fused elementwise multiply + elementwise addtion
     "VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD":
@@ -1407,6 +1411,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER Triton BF16 GEMM kernels
     "VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM", "1"))),
+
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS", "1"))),
 
     # Apply preshuffling for mxfp4 scales for ROCm backend
     "ROCM_TRITON_MOE_PRESHUFFLE_SCALES":

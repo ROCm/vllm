@@ -850,6 +850,7 @@ class FusedMoE(CustomOp):
         num_redundant_experts: int = 0,
         has_bias: bool = False,
         is_sequence_parallel=False,
+        skip_shared_experts: Optional[bool] = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -968,6 +969,7 @@ class FusedMoE(CustomOp):
         self.e_score_correction_bias = e_score_correction_bias
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
+        self.skip_shared_experts = skip_shared_experts
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
@@ -1700,7 +1702,11 @@ class FusedMoE(CustomOp):
                     hidden_states, router_logits, self.layer_name)
             return fused_output[..., :og_hidden_states]
         else:
-            if current_platform.is_tpu():
+            if self.skip_shared_experts:
+                fused_output = torch.ops.vllm.moe_forward_shared_skip_shared(
+                    hidden_states, router_logits, self.layer_name)
+                return fused_output[..., :og_hidden_states]
+            elif current_platform.is_tpu():
                 # TODO: Once the OOM issue for the TPU backend is resolved, we
                 # will switch to using the moe_forward custom op.
                 shared_output, fused_output = self.forward_impl(
@@ -1871,7 +1877,7 @@ class FusedMoE(CustomOp):
         # shared experts must be called here
         if (not isinstance(self.quant_method.fused_experts,
                            FusedMoEModularKernel)
-                and self.shared_experts is not None):
+                and self.shared_experts is not None and not self.skip_shared_experts):
             shared_output = self.shared_experts(hidden_states)
         else:
             shared_output = None
@@ -1922,7 +1928,8 @@ class FusedMoE(CustomOp):
 
             return states
 
-        if self.shared_experts is None:
+        # print(f"forward_impl {shared_output is None} {isinstance(final_hidden_states, tuple)}")
+        if self.shared_experts is None or self.skip_shared_experts:
             assert not isinstance(final_hidden_states, tuple)
             return reduce_output(final_hidden_states)
         else:
@@ -2039,6 +2046,36 @@ direct_register_custom_op(
     op_func=moe_forward_shared,
     mutates_args=["hidden_states"],
     fake_impl=moe_forward_shared_fake,
+    dispatch_key=current_platform.dispatch_key,
+    tags=(torch.Tag.needs_fixed_stride_order, ),
+)
+
+
+def moe_forward_shared_skip_shared(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    assert self.shared_experts is not None
+    return self.forward_impl(hidden_states, router_logits)
+
+
+def moe_forward_shared_skip_shared_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    fused_out = torch.empty_like(hidden_states)
+    return fused_out
+
+
+direct_register_custom_op(
+    op_name="moe_forward_shared_skip_shared",
+    op_func=moe_forward_shared_skip_shared,
+    mutates_args=["hidden_states"],
+    fake_impl=moe_forward_shared_skip_shared_fake,
     dispatch_key=current_platform.dispatch_key,
     tags=(torch.Tag.needs_fixed_stride_order, ),
 )

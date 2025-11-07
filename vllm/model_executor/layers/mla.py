@@ -113,6 +113,10 @@ class MultiHeadLatentAttention(CustomOp):
         q_c = None
         kv_lora = None
 
+        hidden_states_scales = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scales = hidden_states
+
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, \
                 "fused_qkv_a_proj is required when q_lora_rank is not None"
@@ -120,7 +124,7 @@ class MultiHeadLatentAttention(CustomOp):
                 "q_a_layernorm is required when q_lora_rank is not None"
             assert self.q_b_proj is not None, \
                 "q_b_proj is required when q_lora_rank is not None"
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            qkv_lora = self.fused_qkv_a_proj(hidden_states, x_quant_scales=hidden_states_scales)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
