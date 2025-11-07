@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, Union
 
 import torch
 
@@ -108,7 +108,7 @@ class MultiHeadLatentAttention(CustomOp):
     def forward_native(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
