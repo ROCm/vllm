@@ -233,8 +233,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import batched_gemm_afp4wfp4_pre_quant
 
 
-ENABLE_FP4=True
-
 class QueryLenSupport(Enum):
     """Defines the level of query length support for an attention backend's
     decode pipeline.
@@ -1199,7 +1197,6 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         # Convert from (B, N, L) to (N, B, L)
         # x [num_heads, batch_size, kv_lora_rank]
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
-        print("[Unified Path]", "out shape:", out.shape, "out dtype:", out.dtype)
 
         if self.W_V.dtype == torch.uint8:
             out = out.view(-1, self.num_heads, self.v_head_dim)
@@ -1209,13 +1206,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             out_buffer = torch.empty(
                             x.shape[0], # num_heads
                             x.shape[1], # batchsize
-                            self.W_V.shape[2] * 2, # v
+                            self.W_V.shape[1], # v
                             device=x.device,
                             dtype=torch.bfloat16)
-            print("In _v_up_proj:")
-            print("x.shape:", x.shape, " self.W_V.shape:", self.W_V.shape,
-                    "out_buffer.shape:", out_buffer.shape, " out.shape:",
-                    out.shape)
             batched_gemm_afp4wfp4_pre_quant(
                     x,
                     self.W_V,
@@ -1224,7 +1217,6 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     out_buffer
             )
             out_buffer = out_buffer.transpose(0, 1) # [batchsize, num_heads, v]
-            #out = out.transpose(0, 1) # [num_heads, batch_size, v]
             out.copy_(out_buffer)
         elif is_rocm_aiter_fp8bmm_enabled() and (not ENABLE_FP4):
             out = out.view(-1, self.num_heads, self.v_head_dim)
@@ -1474,11 +1466,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 return dequant_weights.T
             return layer.weight
 
-        print("self.kv_b_proj:", self.kv_b_proj.weight.shape)
-        print("self.qk_nope_head_dim:", self.qk_nope_head_dim, "self.v_head_dim:", self.v_head_dim)
-
-        if self.kv_b_proj.weight.dtype == torch.uint8 and ENABLE_FP4: # mxfp4 elemnts packed in a byte
-            # self.kv_b_proj [num_heads * (qk_nope_head_dim + v_head_dim), q_lora_rank]
+        if self.kv_b_proj.weight.dtype == torch.uint8: # mxfp4 elemnts packed in a byte
+            # kv_b_proj [num_heads * (qk_nope_head_dim + v_head_dim), q_lora_rank]
             kv_b_proj_weight = self.kv_b_proj.weight.T
             kv_b_proj_weight = kv_b_proj_weight.reshape(
                 self.kv_lora_rank,
@@ -1490,24 +1479,25 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             )
             # W_K [self.kv_lora_rank, num_heads, qk_nope_head_dim // 2] -> [num_heads, kv_lora_rank, qk_nope_head_dim //2]
             self.W_K = W_UK.transpose(0, 1)
-            # W_V [kv_lora_rank, num_heads, v_head_dim // 2] -> [num_heads, v_head_dim // 2, kv_lora_rank]
-            #self.W_V = W_UV.permute(1, 2, 0)
-            self.W_V = W_UV.transpose(0, 1)
+            # W_V [kv_lora_rank, num_heads, v_head_dim // 2] -> [num_heads, v_head_dim, kv_lora_rank // 2]
+            # Alway pack at the last dimension, need check acc here.
+            self.W_V = W_UV.permute(1, 2, 0)
+            self.W_V = self.W_V.reshape(self.num_heads, self.v_head_dim, self.kv_lora_rank // 2)
 
-            # split w_scale
             kv_b_proj_weight_sc = self.kv_b_proj.weight_scale
-            print("kv_b_proj_weight_sc.shape:", kv_b_proj_weight_sc.shape)
-            # Shape should be [num_headsx(qk_nope_head_dim+v_head_dim), kv_lora_rank // 32]
-            kv_b_proj_weight_sc = self.kv_b_proj.weight_scale.T.reshape(
-                    self.kv_lora_rank,
+            # kv_b_proj_weight_sc: [num_heads x (qk_nope_head_dim+v_head_dim), kv_lora_rank // 32]
+              
+            # Obtain W_V_Scale first
+            W_scale = self.kv_b_proj.weight_scale.view(
                     self.num_heads,
-                    self.qk_nope_head_dim // 32 + self.v_head_dim // 32
-        )
-            # self.W_K_scale [kv_lora_rank, num_heads, qk_nope_head_dim //32]
-            self.W_K_scale, self.W_V_scale = kv_b_proj_weight_sc.split(
-                    [self.qk_nope_head_dim // 32, self.v_head_dim // 32], dim=-1) 
-            self.W_K_scale = self.W_K_scale.transpose(0, 1) 
-            self.W_V_scale = self.W_V_scale.permute(1, 2, 0)
+                    self.qk_nope_head_dim + self.v_head_dim,
+                    self.kv_lora_rank // 32)
+            self.W_K_scale, self.W_V_scale = W_scale.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+
+            # Obtain W_K_scale 
+            self.W_K_scale = self.W_K_scale.view(self.num_heads, self.qk_nope_head_dim//32, self.kv_lora_rank)
+            self.W_K_scale =  self.W_K_scale.permute(0, 2, 1)
+
             max_batch_size = 1024  # [ToDo] Find the optimal upper limit
             pre_compilation_list = list(range(1, max_batch_size + 1))
             if is_global_first_rank():
@@ -1517,24 +1507,17 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     total=max_batch_size,
                 )
             for m in pre_compilation_list:
-                #print("Pre-Compiling first kernel", flush=True)
-                #print("self.W_K.shape:", self.W_K.shape, flush=True)
-                #print("self.W_K_scale.shape:", self.W_K_scale.shape, flush=True)
                 # [ num_heads, m, qk_nope_head_dim // 2 * 2]
                 x = torch.empty(
                     (self.W_K.shape[0], m, self.W_K.shape[2] * 2),
                     dtype=torch.bfloat16,
                     device=self.W_K.device,
                 )
-                #print("x.shape:", x.shape, flush=True)
                 # x shape [ num_heads, m , qk_nope_head_dim //2 * 2]
                 # W_K shape [num_heads, kv_lora_ranks, qk_nope_head_dim //2]
                 out = torch.empty(
                     x.shape[0], x.shape[1], self.W_K.shape[1], device=x.device, dtype=torch.bfloat16
                 )
-                #print("out.shape:", out.shape, flush=True)
-
-                # self.W_K [kv_lora_rank, num_heads, qk_nope_head_dim //32]
 
                 batched_gemm_afp4wfp4_pre_quant(
                     x,
@@ -1544,21 +1527,16 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     out                        
                 )
 
-                print("Pre-Compiling second kernel", flush=True)
                 ## x [ num_heads, m,  kv_lora_rank]
                 x = torch.empty(
-                    (self.W_V.shape[0], m, self.W_V.shape[2] * 2),
+                    (self.W_V.shape[0], m, self.W_V.shape[2] ** 2),
                     dtype=torch.bfloat16,
                     device=self.W_V.device,
                 )
-                print("x.shape:", x.shape, flush=True)
                 ## [num_heads, m, kv_lora_rank] x [ num_heads, v_head_dim // 2, kv_lora_rank]
                 ## [num_heads, m, v_head_dim //2]
                 out = torch.empty(
-                        x.shape[0], x.shape[1], self.W_K.shape[1], device=x.device, dtype=torch.bfloat16)
-                print("out.shape:", out.shape, flush=True)
-                print("self.W_V.shape:", self.W_V.shape, flush=True)
-                print("self.W_V_scale.shape:", self.W_V_scale.shape, flush=True)
+                        x.shape[0], x.shape[1], self.W_V.shape[1], device=x.device, dtype=torch.bfloat16)
                 batched_gemm_afp4wfp4_pre_quant(
                     x,
                     self.W_V,
@@ -1566,8 +1544,8 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     torch.bfloat16,
                     out
                 )
+            # Early return, the left is for fp8 scenario.
             return 
-
 
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
@@ -2002,7 +1980,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 decode_pe_padded.copy_(decode_q_pe)
                 decode_q_pe = decode_pe_padded
 
-            if self.kv_b_proj.weight.dtype == torch.uint8 and ENABLE_FP4:
+            if self.kv_b_proj.weight.dtype == torch.uint8:
                 decode_ql_nope = torch.empty(decode_q_nope.shape[0], decode_q_nope.shape[1], self.W_K.shape[1], dtype=torch.bfloat16, device=decode_q_nope.device)
                 batched_gemm_afp4wfp4_pre_quant(
                     decode_q_nope,
@@ -2012,7 +1990,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     decode_ql_nope
                 )
                 decode_ql_nope = decode_ql_nope.transpose(0, 1)
-                print("[FP4 Path] decode_ql_nope.shape:", decode_ql_nope.shape, "dtype:", decode_ql_nope.dtype)
             elif is_rocm_aiter_fp8bmm_enabled():
                 # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
                 decode_ql_nope = aiter_triton_fp8_bmm(
@@ -2022,7 +1999,6 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     group_size=128,
                     transpose_bm=True,
                 )
-                print("[FP8 Path] decode_ql_nope.shape:", decode_ql_nope.shape, "dtype:", decode_ql_nope.dtype)
             else:
                 # Pads the head_dim if necessary (for the underlying kernel)
                 N, B, P = decode_q_nope.shape
