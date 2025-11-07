@@ -210,11 +210,11 @@ vllm bench throughput \
 
 For FP16/BF16 models, remove `--kv-cache-dtype fp8`.
 
-When measuring models with long context lengths, performance may improve by setting `--max-model-len` to a smaller value (`8192` in this example). However, ensure that `--max-model-len` is at least as large as the total number of input and output tokens.
+When benchmarking models with long context lengths, performance may improve by setting `--max-model-len` to a smaller value (`8192` in this example). However, ensure that `--max-model-len` is at least as large as the total number of input and output tokens.
 
 It is also important to tune vLLM’s `--max-num-seqs` parameter based on the model and input/output lengths. Larger values allow vLLM to use more GPU memory for the KV cache and process more prompts concurrently. However, if the value is too large, the KV cache might reach its capacity, causing vLLM to cancel and reprocess some prompts. Suggested values for various models and configurations are listed below.
 
-For models that fit on a single GPU, it is usually best to run with `--tensor-parallel-size 1` (default). Requests can then be distributed across multiple copies of vLLM running on different GPUs. This is more efficient than running a single copy of the model with `--tensor-parallel-size 8`.
+For models that fit on a single GPU e.g. [amd/Llama-3.1-8B-Instruct-FP8-KV](https://huggingface.co/amd/Llama-3.1-8B-Instruct-FP8-KV), you don't need to set the `--tensor-parallel-size $TP` argument (defaults to 1). Requests can then be distributed across multiple copies of vLLM running on different GPUs; for example, see the vLLM guide for [Data Parallel Deployment](https://docs.vllm.ai/en/stable/serving/data_parallel_deployment.html). This is more efficient than running a single copy of the model with `--tensor-parallel-size 8`.
 
 For optimal performance, the `PROMPTS` value should be a multiple of the `MAX_NUM_SEQS` value. For example, if `MAX_NUM_SEQS=1500`, then the `PROMPTS` value could be `1500`, `3000`, and so on.  If `PROMPTS` is smaller than `MAX_NUM_SEQS`, there won’t be enough prompts for vLLM to maximize concurrency.
 
