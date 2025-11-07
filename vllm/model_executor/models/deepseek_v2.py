@@ -822,7 +822,7 @@ class DeepseekV2MLAAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
         return self.mla_attn(positions, hidden_states)
 
