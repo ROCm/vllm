@@ -294,6 +294,139 @@ if is_rocm_aiter_fp8bmm_enabled():
         return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
+# Add Triton imports for custom kernel
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
+if TRITON_AVAILABLE:
+    # Define autotune configurations for the fused quantization kernel
+    def get_fp8_quant_autotune_configs():
+        return [
+            triton.Config({"BLOCK_SIZE": 256}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 512}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 1024}, num_warps=8),
+            triton.Config({"BLOCK_SIZE": 2048}, num_warps=8),
+        ]
+
+    @triton.autotune(
+        configs=get_fp8_quant_autotune_configs(),
+        key=["ql_nope_numel", "q_pe_numel"],
+    )
+    @triton.jit
+    def fused_dual_fp8_quant_kernel(
+        # Input tensors
+        ql_nope_ptr, q_pe_ptr,
+        # Output tensors  
+        ql_nope_out_ptr, q_pe_out_ptr,
+        # Tensor info
+        ql_nope_numel, q_pe_numel,
+        # Quantization scale (as pointer)
+        q_scale_ptr,
+        # Grid parameters
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        CUDA graph compatible fused kernel that quantizes both ql_nope and q_pe tensors.
+        Uses @triton.autotune for AOT compilation and graph compatibility.
+        """
+        pid = tl.program_id(0)
+        
+        # Load the scale value once
+        q_scale = tl.load(q_scale_ptr)
+        
+        # Process ql_nope tensor
+        ql_nope_offset = pid * BLOCK_SIZE
+        ql_nope_offsets = ql_nope_offset + tl.arange(0, BLOCK_SIZE)
+        ql_nope_mask = ql_nope_offsets < ql_nope_numel
+        
+        # Load ql_nope data
+        ql_nope_data = tl.load(ql_nope_ptr + ql_nope_offsets, 
+                               mask=ql_nope_mask, other=0.0)
+        
+        # Quantize: x_fp8 = (x * scale).clamp(-448, 448).to(fp8)
+        # 448 is the max value for float8_e4m3fn
+        ql_nope_scaled = ql_nope_data * q_scale
+        ql_nope_clamped = tl.clamp(ql_nope_scaled, -448.0, 448.0)
+        
+        # Store quantized result
+        tl.store(ql_nope_out_ptr + ql_nope_offsets,
+                 ql_nope_clamped, mask=ql_nope_mask)
+        
+        # Process q_pe tensor  
+        q_pe_offset = pid * BLOCK_SIZE
+        q_pe_offsets = q_pe_offset + tl.arange(0, BLOCK_SIZE)
+        q_pe_mask = q_pe_offsets < q_pe_numel
+        
+        # Load q_pe data
+        q_pe_data = tl.load(q_pe_ptr + q_pe_offsets,
+                            mask=q_pe_mask, other=0.0)
+        
+        # Quantize: x_fp8 = (x * scale).clamp(-448, 448).to(fp8)
+        q_pe_scaled = q_pe_data * q_scale
+        q_pe_clamped = tl.clamp(q_pe_scaled, -448.0, 448.0)
+        
+        # Store quantized result
+        tl.store(q_pe_out_ptr + q_pe_offsets,
+                 q_pe_clamped, mask=q_pe_mask)
+
+    def fused_dual_fp8_quant(
+        ql_nope: torch.Tensor,  # Shape: (B, N, L)
+        q_pe: torch.Tensor,     # Shape: (B, N, R) 
+        q_scale: torch.Tensor,  # Scalar quantization scale
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        CUDA graph compatible fused FP8 quantization using autotuned Triton kernel.
+        
+        This function:
+        1. Flattens both tensors for processing
+        2. Quantizes both tensors in a single autotuned kernel launch
+        3. Reshapes results back to original shapes
+        
+        Returns:
+            Tuple of (quantized_ql_nope, quantized_q_pe)
+        """
+        # Store original shapes for reshaping
+        ql_nope_shape = ql_nope.shape
+        q_pe_shape = q_pe.shape
+        
+        # Flatten tensors for kernel processing
+        ql_nope_flat = ql_nope.contiguous().view(-1)
+        q_pe_flat = q_pe.contiguous().view(-1)
+        
+        # Allocate output tensors
+        ql_nope_out = torch.empty_like(ql_nope_flat, dtype=current_platform.fp8_dtype())
+        q_pe_out = torch.empty_like(q_pe_flat, dtype=current_platform.fp8_dtype())
+        
+        # Calculate grid size to process both tensors
+        total_elements = max(ql_nope_flat.numel(), q_pe_flat.numel())
+        
+        # Ensure scale is a contiguous tensor for kernel access
+        if q_scale.numel() == 1:
+            q_scale_tensor = q_scale.contiguous()
+        else:
+            # If scale is not scalar, take the first element
+            q_scale_tensor = q_scale.flatten()[0:1].contiguous()
+        
+        # Launch autotuned kernel (CUDA graph compatible)
+        grid = lambda meta: (triton.cdiv(total_elements, meta["BLOCK_SIZE"]),)
+        fused_dual_fp8_quant_kernel[grid](
+            ql_nope_flat, q_pe_flat,
+            ql_nope_out, q_pe_out,
+            ql_nope_flat.numel(), q_pe_flat.numel(),
+            q_scale_tensor,  # Pass tensor directly, not scalar value
+        )
+        
+        # Reshape outputs back to original shapes
+        ql_nope_quantized = ql_nope_out.view(ql_nope_shape)
+        q_pe_quantized = q_pe_out.view(q_pe_shape)
+        
+        return ql_nope_quantized, q_pe_quantized
+
+
 logger = init_logger(__name__)
 
 CUDNN_WORKSPACE_SIZE = 12800
@@ -1892,20 +2025,28 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 decode_ql_nope = decode_ql_nope.transpose(0, 1)
 
             if fp8_attention:
-                ql_nope_shape = decode_ql_nope.shape
-                decode_ql_nope, _ = ops.scaled_fp8_quant(
-                    decode_ql_nope.reshape(
-                        [ql_nope_shape[0], ql_nope_shape[1] * ql_nope_shape[2]]
-                    ),
-                    layer._q_scale,
-                )
-                decode_ql_nope = decode_ql_nope.reshape(ql_nope_shape)
-                q_pe_shape = decode_q_pe.shape
-                decode_q_pe, _ = ops.scaled_fp8_quant(
-                    decode_q_pe.reshape([q_pe_shape[0], q_pe_shape[1] * q_pe_shape[2]]),
-                    layer._q_scale,
-                )
-                decode_q_pe = decode_q_pe.reshape(q_pe_shape)
+                if TRITON_AVAILABLE and current_platform.is_rocm() and attn_metadata is not None:
+                    # Use CUDA graph compatible autotuned Triton kernel
+                    decode_ql_nope, decode_q_pe = fused_dual_fp8_quant(
+                        decode_ql_nope, decode_q_pe, layer._q_scale
+                    )
+                else:
+                    # Fallback to separate quantization calls
+                    # (for non-ROCm platforms or when Triton unavailable)
+                    ql_nope_shape = decode_ql_nope.shape
+                    decode_ql_nope, _ = ops.scaled_fp8_quant(
+                        decode_ql_nope.reshape(
+                            [ql_nope_shape[0], ql_nope_shape[1] * ql_nope_shape[2]]
+                        ),
+                        layer._q_scale,
+                    )
+                    decode_ql_nope = decode_ql_nope.reshape(ql_nope_shape)
+                    q_pe_shape = decode_q_pe.shape
+                    decode_q_pe, _ = ops.scaled_fp8_quant(
+                        decode_q_pe.reshape([q_pe_shape[0], q_pe_shape[1] * q_pe_shape[2]]),
+                        layer._q_scale,
+                    )
+                    decode_q_pe = decode_q_pe.reshape(q_pe_shape)
 
             decode_q = (decode_ql_nope, decode_q_pe)
             if self.dcp_world_size > 1:
