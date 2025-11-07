@@ -1928,7 +1928,6 @@ class FusedMoE(CustomOp):
 
             return states
 
-        # print(f"forward_impl {shared_output is None} {isinstance(final_hidden_states, tuple)}")
         if self.shared_experts is None or self.skip_shared_experts:
             assert not isinstance(final_hidden_states, tuple)
             return reduce_output(final_hidden_states)

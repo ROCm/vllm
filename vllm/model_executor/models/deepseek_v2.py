@@ -365,7 +365,8 @@ class DeepseekV2MoE(nn.Module):
             self.rocm_aiter_triton_fused_shared_expert_func = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert_fp4
         else:
             self.rocm_aiter_triton_fused_shared_expert_func = None
-        logger.info(f"[Aiter] {self.__class__.__name__} is registered with {self.rocm_aiter_triton_fused_shared_expert_func.__name__}")
+        if self.rocm_aiter_triton_fused_shared_expert_func is not None:
+            logger.info(f"[Aiter] {self.__class__.__name__} is registered with {self.rocm_aiter_triton_fused_shared_expert_func.__name__}")
 
 
         self.n_redundant_experts = eplb_config.num_redundant_experts
@@ -978,15 +979,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         elif self.use_triton_fused_rmsnorm_fp4_quant:
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.variance_epsilon
-            (hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant, _, residual = fused_rms_mxfp4_quant(hidden_states, weight, eps, 
-                                                        None, None, eps, 
-                                                        res1=residual,
-                                                        shuffle=False,
-                                                        scale_shuffle_padding=False,
-                                                        output_unquantized_inp1=isinstance(self.mlp, DeepseekV2MoE))
             if isinstance(self.mlp, DeepseekV2MoE):
+                (hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant, _, residual = fused_rms_mxfp4_quant(hidden_states, weight, eps, 
+                                                            None, None, eps, 
+                                                            res1=residual,
+                                                            shuffle=False,
+                                                            scale_shuffle_padding=False,
+                                                            output_unquantized_inp1=True)
                 hidden_states = ((hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant)
             else:
+                (hidden_states_quant, hidden_states_quant_scales), _, _, residual = fused_rms_mxfp4_quant(hidden_states, weight, eps, 
+                                                            None, None, eps, 
+                                                            res1=residual,
+                                                            shuffle=False,
+                                                            scale_shuffle_padding=False,
+                                                            output_unquantized_inp1=False)
                 hidden_states = (hidden_states_quant, hidden_states_quant_scales)
         else:
             hidden_states, residual = self.post_attention_layernorm(
