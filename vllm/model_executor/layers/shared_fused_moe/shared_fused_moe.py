@@ -48,6 +48,12 @@ class SharedFusedMoE(FusedMoE):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
             )
+        elif self.skip_shared_experts:
+            fused_out = super().forward(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+            shared_out = None
         else:
             shared_out, fused_out = super().forward(
                 hidden_states=hidden_states,

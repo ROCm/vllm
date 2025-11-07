@@ -71,17 +71,135 @@ logger = init_logger(__name__)
 
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT
     #from vllm.model_executor.layers.activation import VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and envs.VLLM_ROCM_USE_AITER_MLA
-
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS
+    
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
-
-    if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
         import aiter as rocm_aiter
         rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
         rocm_aiter_fp8_quant_group_size = 128
+    
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT:
+        from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+        rocm_aiter_fp4_dtype = torch.uint8
+        rocm_aiter_fp4_quant_group_size = 32
+
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS:
+        from aiter.ops.triton.fused_gemm_a8w8_blockscale_a16w16 import fused_gemm_a8w8_blockscale_a16w16
+        from aiter.ops.triton.fused_fp8_quant import fused_reduce_act_mul_fp8_group_quant
+        import aiter as rocm_aiter
+        rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
+        rocm_aiter_fp8_quant_group_size = 128
+        
+        def rocm_aiter_triton_fused_shared_expert_fp8_impl(
+            hidden_states_shared: torch.Tensor,
+            hidden_states_shared_scale: torch.Tensor,
+            weight_gate_up: torch.Tensor,
+            weight_scale_gate_up: torch.Tensor,
+            hidden_states_moe_gate: torch.Tensor,
+            weight_moe_gate: torch.Tensor,
+            bias_shared: torch.Tensor,
+            bias_moe_gate: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            shared_output, router_logits = fused_gemm_a8w8_blockscale_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
+                                            bias_fp8=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True)
+            if shared_output.dim() == 3:
+                (shared_output_q, shared_output_s), router_logits = fused_reduce_act_mul_fp8_group_quant(shared_output, activation="silu", x2=router_logits, group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
+            else:
+                (shared_output_q, shared_output_s), _ = fused_reduce_act_mul_fp8_group_quant(shared_output, activation="silu", x2=None, group_size=rocm_aiter_fp8_quant_group_size, dtype_quant=rocm_aiter_fp8_dtype)
+            return shared_output_q, shared_output_s, router_logits
+        
+        def rocm_aiter_triton_fused_shared_expert_fp8_fake(
+            hidden_states_shared: torch.Tensor,
+            hidden_states_shared_scale: torch.Tensor,
+            weight_gate_up: torch.Tensor,
+            weight_scale_gate_up: torch.Tensor,
+            hidden_states_moe_gate: torch.Tensor,
+            weight_moe_gate: torch.Tensor,
+            bias_shared: torch.Tensor,
+            bias_moe_gate: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            M = hidden_states_shared.shape[0]
+            N = weight_gate_up.shape[0]
+            N_moe = weight_moe_gate.shape[0]
+            device = hidden_states_shared.device
+            assert N % 2 == 0
+            N_half = N // 2
+            assert N_half == 256, f"{weight_gate_up.shape}"
+            assert N_half == N_moe, f"{weight_moe_gate.shape}"
+            shared_output_q = torch.empty((M, N_half), dtype=rocm_aiter_fp8_dtype, device=device)
+            shared_output_s = torch.empty((M, (N_half + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size), dtype=torch.float32, device=device)
+            router_logits = torch.empty((M, N_moe), dtype=hidden_states_moe_gate.dtype, device=device)
+            return shared_output_q, shared_output_s, router_logits
+        
+
+        direct_register_custom_op(
+            op_name="rocm_aiter_triton_fused_shared_expert_fp8",
+            op_func=rocm_aiter_triton_fused_shared_expert_fp8_impl,
+            mutates_args=[],
+            fake_impl=rocm_aiter_triton_fused_shared_expert_fp8_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
+
+        from aiter.ops.triton.fused_gemm_afp4wfp4_a16w16 import fused_gemm_afp4wfp4_a16w16
+        from aiter.ops.triton.fused_mxfp4_quant import fused_reduce_act_mul_and_mxfp4_quant
+        rocm_aiter_fp4_dtype = torch.uint8
+        rocm_aiter_fp4_quant_group_size = 32
+
+        def rocm_aiter_triton_fused_shared_expert_fp4_impl(
+            hidden_states_shared: torch.Tensor,
+            hidden_states_shared_scale: torch.Tensor,
+            weight_gate_up: torch.Tensor,
+            weight_scale_gate_up: torch.Tensor,
+            hidden_states_moe_gate: torch.Tensor,
+            weight_moe_gate: torch.Tensor,
+            bias_shared: torch.Tensor,
+            bias_moe_gate: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            # print(hidden_states_shared.shape, weight_gate_up.shape, hidden_states_shared_scale.shape,)
+            shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
+                                            is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True)
+            if shared_output.dim() == 3:
+                (shared_output_q, shared_output_s), router_logits = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=router_logits, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
+            else:
+                (shared_output_q, shared_output_s), _ = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=None, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
+            return shared_output_q, shared_output_s, router_logits
+        
+        def rocm_aiter_triton_fused_shared_expert_fp4_fake(
+            hidden_states_shared: torch.Tensor,
+            hidden_states_shared_scale: torch.Tensor,
+            weight_gate_up: torch.Tensor,
+            weight_scale_gate_up: torch.Tensor,
+            hidden_states_moe_gate: torch.Tensor,
+            weight_moe_gate: torch.Tensor,
+            bias_shared: torch.Tensor,
+            bias_moe_gate: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            M = hidden_states_shared.shape[0]
+            N = weight_gate_up.shape[0]
+            N_moe = weight_moe_gate.shape[0]
+            device = hidden_states_shared.device
+            assert N % 4 == 0
+            N_half = N // 2
+            assert N_half == 256, f"{weight_gate_up.shape}"
+            assert N_half == N_moe, f"{weight_moe_gate.shape}"
+            shared_output_q = torch.empty((M, N_half // 2), dtype=rocm_aiter_fp4_dtype, device=device)
+            shared_output_s = torch.empty((M, (N_half + rocm_aiter_fp4_quant_group_size - 1) // rocm_aiter_fp4_quant_group_size), dtype=torch.uint8, device=device)
+            router_logits = torch.empty((M, N_moe), dtype=hidden_states_moe_gate.dtype, device=device)
+            return shared_output_q, shared_output_s, router_logits
+        
+
+        direct_register_custom_op(
+            op_name="rocm_aiter_triton_fused_shared_expert_fp4",
+            op_func=rocm_aiter_triton_fused_shared_expert_fp4_impl,
+            mutates_args=[],
+            fake_impl=rocm_aiter_triton_fused_shared_expert_fp4_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
 
 else:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT = False
@@ -239,6 +357,16 @@ class DeepseekV2MoE(nn.Module):
         # Load balancing settings.
         eplb_config = parallel_config.eplb_config
         self.enable_eplb = parallel_config.enable_eplb
+        self.use_triton_fused_shared_expert_fp8 = VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and quant_config.get_name() == 'fp8'
+        self.use_triton_fused_shared_expert_fp4 = VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and quant_config.get_name() == 'quark'
+        if self.use_triton_fused_shared_expert_fp8:
+            self.rocm_aiter_triton_fused_shared_expert_func = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert_fp8
+        elif self.use_triton_fused_shared_expert_fp4:
+            self.rocm_aiter_triton_fused_shared_expert_func = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert_fp4
+        else:
+            self.rocm_aiter_triton_fused_shared_expert_func = None
+        logger.info(f"[Aiter] {self.__class__.__name__} is registered with {self.rocm_aiter_triton_fused_shared_expert_func.__name__}")
+
 
         self.n_redundant_experts = eplb_config.num_redundant_experts
         self.n_logical_experts = self.n_routed_experts
@@ -287,6 +415,8 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
+            self.skip_shared_experts = (self.use_triton_fused_shared_expert_fp8 or self.use_triton_fused_shared_expert_fp4)
+
             self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
                 num_experts=config.n_routed_experts,
@@ -307,6 +437,7 @@ class DeepseekV2MoE(nn.Module):
                 enable_eplb=self.enable_eplb,
                 num_redundant_experts=self.n_redundant_experts,
                 is_sequence_parallel=self.is_sequence_parallel,
+                skip_shared_experts=self.skip_shared_experts,
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -317,23 +448,60 @@ class DeepseekV2MoE(nn.Module):
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        shared_output = None
+        if (
+            self.skip_shared_experts
+            and self.n_shared_experts is not None
+        ):  
+            assert isinstance(hidden_states_shared, tuple), f"hidden_states_shared must be a tuple of quantized acitvation and scales"
+            hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
+            shared_output_q, shared_output_s, router_logits = (
+                self.rocm_aiter_triton_fused_shared_expert_func(
+                    hidden_states_shared=hidden_states_shared,
+                    hidden_states_shared_scale=hidden_states_shared_scale,
+                    weight_gate_up=self.shared_experts.gate_up_proj.weight,
+                    weight_scale_gate_up=(
+                        self.shared_experts.gate_up_proj.weight_scale_inv 
+                        if self.use_triton_fused_shared_expert_fp8 
+                        else self.shared_experts.gate_up_proj.weight_scale.T
+                    ),
+                    hidden_states_moe_gate=hidden_states,
+                    weight_moe_gate=self.gate.weight,
+                    bias_shared=(
+                        self.shared_experts.gate_up_proj.bias
+                        if not self.shared_experts.gate_up_proj.skip_bias_add
+                        else None
+                    ),
+                    bias_moe_gate=(
+                        self.gate.bias if not self.gate.skip_bias_add else None
+                    ),
+                )
+            )
+            shared_output, _ = self.shared_experts.down_proj(
+                shared_output_q, x_quant_scales=shared_output_s
+            )
+        else:
+            # Chunk the hidden states so they aren't replicated across TP ranks.
+            # This avoids duplicate computation in self.experts.
+            # TODO: We can replace the all_reduce at the end of attn with a
+            # reduce_scatter instead of chunking here.
+            if self.is_sequence_parallel:
+                hidden_states = torch.ops.vllm.sequence_parallel_chunk(
+                    hidden_states)
 
-        # Chunk the hidden states so they aren't replicated across TP ranks.
-        # This avoids duplicate computation in self.experts.
-        # TODO: We can replace the all_reduce at the end of attn with a
-        # reduce_scatter instead of chunking here.
-        if self.is_sequence_parallel:
-            hidden_states = torch.ops.vllm.sequence_parallel_chunk(
-                hidden_states)
-
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+            # router_logits: (num_tokens, n_experts)
+            # print(f"gate_gemm {hidden_states.shape} {self.gate.weight.shape} gate_up_proj {hidden_states_shared.shape} {self.shared_experts.gate_up_proj.weight.shape} {self.shared_experts.gate_up_proj.weight_scale.shape}")
+            router_logits, _ = self.gate(hidden_states)
 
         fused_moe_out = self.experts(hidden_states=hidden_states,
                                      router_logits=router_logits)
 
         if self.shared_experts is not None:
-            shared_output, final_hidden_states = fused_moe_out
+            if self.skip_shared_experts:
+                assert shared_output is not None
+                _, final_hidden_states = fused_moe_out
+            else:
+                shared_output, final_hidden_states = fused_moe_out
         else:
             shared_output = None
             final_hidden_states = fused_moe_out
@@ -679,6 +847,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
+        self.use_triton_fused_rmsnorm_fp8_quant = VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT and quant_config.get_name() == 'fp8'
+        self.use_triton_fused_rmsnorm_fp4_quant = VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP4_QUANT and quant_config.get_name() == 'quark'
+
         if model_config.use_mla:
             attn_cls = DeepseekV2MLAAttention
         else:
@@ -723,6 +894,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
         self.routed_scaling_factor = config.routed_scaling_factor
+        
 
     def forward(
         self,
@@ -731,7 +903,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        if self.use_triton_fused_rmsnorm_fp8_quant:
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.variance_epsilon
             if residual is None:
@@ -747,6 +919,25 @@ class DeepseekV2DecoderLayer(nn.Module):
                                                             group_size=rocm_aiter_fp8_quant_group_size,
                                                             dtype_quant=rocm_aiter_fp8_dtype, 
                                                             res1=residual)
+            hidden_states = (hidden_states_quant, hidden_states_quant_scales)
+        elif self.use_triton_fused_rmsnorm_fp4_quant:
+            weight = self.input_layernorm.weight
+            eps = self.input_layernorm.variance_epsilon
+            if residual is None:
+                residual = hidden_states
+                (hidden_states_quant, hidden_states_quant_scales), _, _, _ = fused_rms_mxfp4_quant(hidden_states, weight, eps, 
+                                                            None, None, eps, 
+                                                            res1=None,
+                                                            shuffle=False,
+                                                            scale_shuffle_padding=False,
+                                                            output_unquantized_inp1=False)
+            else:
+                (hidden_states_quant, hidden_states_quant_scales), _, _, residual = fused_rms_mxfp4_quant(hidden_states, weight, eps, 
+                                                            None, None, eps, 
+                                                            res1=residual,
+                                                            shuffle=False,
+                                                            scale_shuffle_padding=False,
+                                                            output_unquantized_inp1=False)
             hidden_states = (hidden_states_quant, hidden_states_quant_scales)
         else:
             if residual is None:
@@ -771,7 +962,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual *= 1. / self.routed_scaling_factor
 
         # Fully Connected
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
+        if self.use_triton_fused_rmsnorm_fp8_quant:
             weight = self.post_attention_layernorm.weight
             eps = self.post_attention_layernorm.variance_epsilon
             (hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant, _, residual = fused_rms_fp8_group_quant(hidden_states, weight, eps, 
@@ -779,6 +970,19 @@ class DeepseekV2DecoderLayer(nn.Module):
                                                         group_size=rocm_aiter_fp8_quant_group_size,
                                                         dtype_quant=rocm_aiter_fp8_dtype, 
                                                         res1=residual,
+                                                        output_unquantized_inp1=isinstance(self.mlp, DeepseekV2MoE))
+            if isinstance(self.mlp, DeepseekV2MoE):
+                hidden_states = ((hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant)
+            else:
+                hidden_states = (hidden_states_quant, hidden_states_quant_scales)
+        elif self.use_triton_fused_rmsnorm_fp4_quant:
+            weight = self.post_attention_layernorm.weight
+            eps = self.post_attention_layernorm.variance_epsilon
+            (hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant, _, residual = fused_rms_mxfp4_quant(hidden_states, weight, eps, 
+                                                        None, None, eps, 
+                                                        res1=residual,
+                                                        shuffle=False,
+                                                        scale_shuffle_padding=False,
                                                         output_unquantized_inp1=isinstance(self.mlp, DeepseekV2MoE))
             if isinstance(self.mlp, DeepseekV2MoE):
                 hidden_states = ((hidden_states_quant, hidden_states_quant_scales), hidden_states_unquant)
