@@ -165,39 +165,19 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             bias_shared: torch.Tensor,
             bias_moe_gate: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            # print(hidden_states_shared.shape, weight_gate_up.shape, hidden_states_shared_scale.shape, weight_scale_gate_up.shape, hidden_states_moe_gate.shape, weight_moe_gate.shape, 
-            #       bias_shared is None, bias_moe_gate is None)
-            M = hidden_states_shared.shape[0]
+            # M = hidden_states_shared.shape[0]
             
-            if True:
-                # shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
-                #                                 is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=False) # skip_reduce = true, acc = 0.6
-                shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
-                                                is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True) # skip_reduce = true, acc = 0.6
-                # print(shared_output1.shape)
-                # if M < 16:
-                #     assert shared_output1.shape[0] == 14 and shared_output1.dim()==3 
-                if shared_output.dim() == 3:
-                    assert shared_output.shape[0] > 1
-                    shared_output = shared_output.sum(axis = 0).to(torch.bfloat16)
-                    router_logits = router_logits.sum(axis = 0).to(torch.bfloat16)
-                    # torch.testing.assert_close(shared_output, shared_output1, equal_nan=True)
-                    # torch.testing.assert_close(router_logits, router_logits1, equal_nan=True)
-                # shared_output_q1, shared_output_s1 = act_mul_and_mxfp4_quant(shared_output1, activation="silu", shuffle=False, scale_shuffle_padding=False)
-
-                # if shared_output.dim() == 3:
-                #     shared_output = shared_output.sum(axis = 0).to(torch.bfloat16)
-                #     router_logits = router_logits.sum(axis = 0).to(torch.bfloat16)
-                # shared_output_q, shared_output_s = act_mul_and_mxfp4_quant(shared_output, activation="silu", shuffle=False, scale_shuffle_padding=False)
-                if shared_output.dim() == 3:
-                    (shared_output_q, shared_output_s), router_logits = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=router_logits, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
-                else:
-                    (shared_output_q, shared_output_s), _ = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=None, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
+            shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
+                                            is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True)
+            if shared_output.dim() == 3:
+                (shared_output_q, shared_output_s), router_logits = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=router_logits, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
             else:
-                assert bias_shared is None # acc good if always use this chunk of code
-                shared_output = gemm_afp4wfp4(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up)
-                router_logits = gemm_a16w16(hidden_states_moe_gate, weight_moe_gate, bias=bias_moe_gate) 
-                shared_output_q, shared_output_s = act_mul_and_mxfp4_quant(shared_output, activation="silu", shuffle=False, scale_shuffle_padding=False)
+                (shared_output_q, shared_output_s), _ = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=None, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
+
+            # assert bias_shared is None
+            # shared_output = gemm_afp4wfp4(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up)
+            # router_logits = gemm_a16w16(hidden_states_moe_gate, weight_moe_gate, bias=bias_moe_gate) 
+            # shared_output_q, shared_output_s = act_mul_and_mxfp4_quant(shared_output, activation="silu", shuffle=False, scale_shuffle_padding=False)
             
             return shared_output_q, shared_output_s, router_logits
         
