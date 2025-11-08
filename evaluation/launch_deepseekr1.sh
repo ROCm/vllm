@@ -13,6 +13,7 @@ export VLLM_USE_V1=1 # default v1
 export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 # need tuning for different scenarios
 
 # for profiling
+export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1
 export VLLM_TORCH_PROFILER_WITH_STACK=1
 export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
 export VLLM_TORCH_PROFILER_DIR=/root/profiler
