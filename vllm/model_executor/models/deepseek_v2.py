@@ -429,7 +429,6 @@ class DeepseekV2MoE(nn.Module):
             )
 
             self.skip_shared_experts = (self.use_triton_fused_shared_expert_fp8 or self.use_triton_fused_shared_expert_fp4)
-            # self.skip_shared_experts = False
 
             self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
@@ -472,11 +471,11 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states)
             
         shared_output = None
+        router_logits = None
         if (
             self.skip_shared_experts
             and self.n_shared_experts is not None
         ):  
-        # if self.rocm_aiter_triton_fused_shared_expert_func is not None and self.n_shared_experts is not None:  
             assert isinstance(hidden_states_shared, tuple), f"hidden_states_shared must be a tuple of quantized acitvation and scales"
             hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
             shared_output_q, shared_output_s, router_logits = (
@@ -507,19 +506,11 @@ class DeepseekV2MoE(nn.Module):
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            # pass
 
-        # router_logits1, _ = self.gate(hidden_states)
-        # print(router_logits, router_logits1)
-        # c = torch.testing.assert_close(router_logits, router_logits1, equal_nan=True)
         fused_moe_out = self.experts(hidden_states=hidden_states,
                                      router_logits=router_logits)
 
         if self.shared_experts is not None:
-            # shared_output_none, final_hidden_states = fused_moe_out
-            # print(shared_output_none, shared_output)
-            # c = torch.testing.assert_close(shared_output_none, shared_output, atol=0.1, rtol=0.1)
-            # shared_output = shared_output_none
             if self.skip_shared_experts:
                 assert shared_output is not None
                 shared_output_none, final_hidden_states = fused_moe_out
