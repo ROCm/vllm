@@ -72,13 +72,14 @@ try:
                 x_q = x
                 x_s = x_scales
 
+            # x_s = x_s.contiguous()
             y = torch.empty(x_q.shape[0],
                             weight.shape[0],
                             device=x_q.device,
                             dtype=out_dtype)
 
             gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
-            return y
+            return y[:M]
 
     def gemm_with_dynamic_quant_fake(
         x: torch.Tensor,
