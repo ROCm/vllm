@@ -105,6 +105,7 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             bias_shared: torch.Tensor,
             bias_moe_gate: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            
             shared_output, router_logits = fused_gemm_a8w8_blockscale_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
                                             bias_fp8=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True)
             if shared_output.dim() == 3:
@@ -146,7 +147,11 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
         )
 
         from aiter.ops.triton.fused_gemm_afp4wfp4_a16w16 import fused_gemm_afp4wfp4_a16w16
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
         from aiter.ops.triton.fused_mxfp4_quant import fused_reduce_act_mul_and_mxfp4_quant
+        from aiter.ops.triton.activation import act_mul_and_mxfp4_quant
+        import torch.nn.functional as F
         rocm_aiter_fp4_dtype = torch.uint8
         rocm_aiter_fp4_quant_group_size = 32
 
@@ -160,13 +165,40 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             bias_shared: torch.Tensor,
             bias_moe_gate: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            # print(hidden_states_shared.shape, weight_gate_up.shape, hidden_states_shared_scale.shape,)
-            shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
-                                            is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True)
-            if shared_output.dim() == 3:
-                (shared_output_q, shared_output_s), router_logits = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=router_logits, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
+            # print(hidden_states_shared.shape, weight_gate_up.shape, hidden_states_shared_scale.shape, weight_scale_gate_up.shape, hidden_states_moe_gate.shape, weight_moe_gate.shape, 
+            #       bias_shared is None, bias_moe_gate is None)
+            M = hidden_states_shared.shape[0]
+            
+            if True:
+                # shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
+                #                                 is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=False) # skip_reduce = true, acc = 0.6
+                shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
+                                                is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True) # skip_reduce = true, acc = 0.6
+                # print(shared_output1.shape)
+                # if M < 16:
+                #     assert shared_output1.shape[0] == 14 and shared_output1.dim()==3 
+                if shared_output.dim() == 3:
+                    assert shared_output.shape[0] > 1
+                    shared_output = shared_output.sum(axis = 0).to(torch.bfloat16)
+                    router_logits = router_logits.sum(axis = 0).to(torch.bfloat16)
+                    # torch.testing.assert_close(shared_output, shared_output1, equal_nan=True)
+                    # torch.testing.assert_close(router_logits, router_logits1, equal_nan=True)
+                # shared_output_q1, shared_output_s1 = act_mul_and_mxfp4_quant(shared_output1, activation="silu", shuffle=False, scale_shuffle_padding=False)
+
+                # if shared_output.dim() == 3:
+                #     shared_output = shared_output.sum(axis = 0).to(torch.bfloat16)
+                #     router_logits = router_logits.sum(axis = 0).to(torch.bfloat16)
+                # shared_output_q, shared_output_s = act_mul_and_mxfp4_quant(shared_output, activation="silu", shuffle=False, scale_shuffle_padding=False)
+                if shared_output.dim() == 3:
+                    (shared_output_q, shared_output_s), router_logits = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=router_logits, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
+                else:
+                    (shared_output_q, shared_output_s), _ = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=None, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
             else:
-                (shared_output_q, shared_output_s), _ = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=None, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
+                assert bias_shared is None # acc good if always use this chunk of code
+                shared_output = gemm_afp4wfp4(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up)
+                router_logits = gemm_a16w16(hidden_states_moe_gate, weight_moe_gate, bias=bias_moe_gate) 
+                shared_output_q, shared_output_s = act_mul_and_mxfp4_quant(shared_output, activation="silu", shuffle=False, scale_shuffle_padding=False)
+            
             return shared_output_q, shared_output_s, router_logits
         
         def rocm_aiter_triton_fused_shared_expert_fp4_fake(
@@ -417,6 +449,7 @@ class DeepseekV2MoE(nn.Module):
             )
 
             self.skip_shared_experts = (self.use_triton_fused_shared_expert_fp8 or self.use_triton_fused_shared_expert_fp4)
+            # self.skip_shared_experts = False
 
             self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
@@ -449,11 +482,21 @@ class DeepseekV2MoE(nn.Module):
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Chunk the hidden states so they aren't replicated across TP ranks.
+        # This avoids duplicate computation in self.experts.
+        # TODO: We can replace the all_reduce at the end of attn with a
+        # reduce_scatter instead of chunking here.
+        if self.is_sequence_parallel:
+            hidden_states = torch.ops.vllm.sequence_parallel_chunk(
+                hidden_states)
+            
         shared_output = None
         if (
             self.skip_shared_experts
             and self.n_shared_experts is not None
         ):  
+        # if self.rocm_aiter_triton_fused_shared_expert_func is not None and self.n_shared_experts is not None:  
             assert isinstance(hidden_states_shared, tuple), f"hidden_states_shared must be a tuple of quantized acitvation and scales"
             hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
             shared_output_q, shared_output_s, router_logits = (
@@ -482,26 +525,27 @@ class DeepseekV2MoE(nn.Module):
                 shared_output_q, x_quant_scales=shared_output_s
             )
         else:
-            # Chunk the hidden states so they aren't replicated across TP ranks.
-            # This avoids duplicate computation in self.experts.
-            # TODO: We can replace the all_reduce at the end of attn with a
-            # reduce_scatter instead of chunking here.
-            if self.is_sequence_parallel:
-                hidden_states = torch.ops.vllm.sequence_parallel_chunk(
-                    hidden_states)
-
             # router_logits: (num_tokens, n_experts)
-            # print(f"gate_gemm {hidden_states.shape} {self.gate.weight.shape} gate_up_proj {hidden_states_shared.shape} {self.shared_experts.gate_up_proj.weight.shape} {self.shared_experts.gate_up_proj.weight_scale.shape}")
             router_logits, _ = self.gate(hidden_states)
+            # pass
 
+        # router_logits1, _ = self.gate(hidden_states)
+        # print(router_logits, router_logits1)
+        # c = torch.testing.assert_close(router_logits, router_logits1, equal_nan=True)
         fused_moe_out = self.experts(hidden_states=hidden_states,
                                      router_logits=router_logits)
 
         if self.shared_experts is not None:
+            # shared_output_none, final_hidden_states = fused_moe_out
+            # print(shared_output_none, shared_output)
+            # c = torch.testing.assert_close(shared_output_none, shared_output, atol=0.1, rtol=0.1)
+            # shared_output = shared_output_none
             if self.skip_shared_experts:
                 assert shared_output is not None
-                _, final_hidden_states = fused_moe_out
+                shared_output_none, final_hidden_states = fused_moe_out
+                assert shared_output_none is None
             else:
+                assert shared_output is None
                 shared_output, final_hidden_states = fused_moe_out
         else:
             shared_output = None

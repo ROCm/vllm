@@ -1929,6 +1929,7 @@ class FusedMoE(CustomOp):
             return states
 
         if self.shared_experts is None or self.skip_shared_experts:
+            assert shared_output is None
             assert not isinstance(final_hidden_states, tuple)
             return reduce_output(final_hidden_states)
         else:
@@ -2058,6 +2059,7 @@ def moe_forward_shared_skip_shared(
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
     assert self.shared_experts is not None
+    assert self.skip_shared_experts is True
     return self.forward_impl(hidden_states, router_logits)
 
 
