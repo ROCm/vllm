@@ -9,7 +9,20 @@ from vllm.attention import Attention
 from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from torch import nn
+import vllm.envs as envs
+from vllm.platforms import current_platform
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
+
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE #and envs.VLLM_ROCM_USE_AITER_MLA
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+
+VLLM_ROCM_USE_AITER_MLA = envs.VLLM_ROCM_USE_AITER_MLA
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=} {VLLM_ROCM_USE_AITER_MLA=}")
 
 @dataclass
 class MLAModules:
@@ -100,6 +113,7 @@ class MultiHeadLatentAttention(CustomOp):
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             kv_b_proj=self.kv_b_proj,
+            rotary_emb=self.rotary_emb if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE else None,
         )
 
         self.prefix = prefix
@@ -147,15 +161,24 @@ class MultiHeadLatentAttention(CustomOp):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim:], k_pe)
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+            attn_out = self.mla_attn(
+                q,
+                kv_c_normed,
+                k_pe,
+                output_shape=(hidden_states.shape[0],
+                            self.num_heads * self.v_head_dim),
+                positions=positions)
+        else:
+            q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim:], k_pe)
 
-        attn_out = self.mla_attn(
-            q,
-            kv_c_normed,
-            k_pe,
-            output_shape=(hidden_states.shape[0],
-                          self.num_heads * self.v_head_dim))
+            attn_out = self.mla_attn(
+                q,
+                kv_c_normed,
+                k_pe,
+                output_shape=(hidden_states.shape[0],
+                            self.num_heads * self.v_head_dim))
         return self.o_proj(attn_out)[0]
 
     def forward_cuda(self, *args, **kwargs):
