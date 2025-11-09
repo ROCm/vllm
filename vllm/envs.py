@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FP8_BMM: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_MXFP4_BMM: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE: int = 256
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP4_QUANT: bool = False
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT: bool = True
@@ -1393,6 +1394,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER Triton fused FP8 per-token group quant + FP8 batched GEMM
     "VLLM_ROCM_USE_AITER_TRITON_FP8_BMM":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FP8_BMM", "1"))),
+    "VLLM_ROCM_USE_AITER_TRITON_MXFP4_BMM":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MXFP4_BMM", "1"))),
     "VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE":
     lambda: int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FP8_BMM_MAX_BATCH_SIZE", 256)),
 

@@ -233,20 +233,31 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: AiterMLAMetadata,
         layer: AttentionLayer,
+        mla_output_zeros: torch.Tensor = None,
+        decode_q_cat: torch.Tensor = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
-        if type(q) is tuple:
+        if decode_q_cat is not None:
+            q = decode_q_cat
+        elif type(q) is tuple:
             q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
-        o = torch.zeros(B,
-                        self.num_heads,
-                        self.kv_lora_rank,
-                        dtype=torch.bfloat16,
-                        device=q.device)
+
+        if mla_output_zeros is not None:
+            o = mla_output_zeros
+            assert o.shape[0] == B, f"{o.shape[0]=} {B=}"
+            assert o.shape[1] == self.num_heads, f"{o.shape[1]=} {self.num_heads=}"
+            assert o.shape[2] == self.kv_lora_rank, f"{o.shape[2]=} {self.kv_lora_rank=}"
+        else:
+            o = torch.zeros(B,
+                            self.num_heads,
+                            self.kv_lora_rank,
+                            dtype=torch.bfloat16,
+                            device=q.device)
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
