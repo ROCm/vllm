@@ -167,7 +167,7 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             # M = hidden_states_shared.shape[0]
             
-            shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
+            shared_output, router_logits = fused_gemm_afp4wfp4_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up.T, hidden_states_moe_gate, weight_moe_gate, 
                                             is_fp4_preshuffled=False, bias_fp4=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True)
             if shared_output.dim() == 3:
                 (shared_output_q, shared_output_s), router_logits = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=router_logits, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
@@ -175,7 +175,7 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
                 (shared_output_q, shared_output_s), _ = fused_reduce_act_mul_and_mxfp4_quant(shared_output, activation="silu", x2=None, shuffle=False, scale_shuffle_padding=False, dtype=hidden_states_moe_gate.dtype)
 
             # assert bias_shared is None
-            # shared_output = gemm_afp4wfp4(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up)
+            # shared_output = gemm_afp4wfp4(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up.T)
             # router_logits = gemm_a16w16(hidden_states_moe_gate, weight_moe_gate, bias=bias_moe_gate) 
             # shared_output_q, shared_output_s = act_mul_and_mxfp4_quant(shared_output, activation="silu", shuffle=False, scale_shuffle_padding=False)
             
@@ -430,6 +430,28 @@ class DeepseekV2MoE(nn.Module):
 
             self.skip_shared_experts = (self.use_triton_fused_shared_expert_fp8 or self.use_triton_fused_shared_expert_fp4)
 
+            # if self.skip_shared_experts:
+            #     self.experts = FusedMoE(
+            #         num_experts=config.n_routed_experts,
+            #         top_k=config.num_experts_per_tok,
+            #         hidden_size=config.hidden_size,
+            #         intermediate_size=config.moe_intermediate_size,
+            #         reduce_results=False,
+            #         renormalize=config.norm_topk_prob,
+            #         quant_config=quant_config,
+            #         use_grouped_topk=True,
+            #         num_expert_group=config.n_group,
+            #         topk_group=config.topk_group,
+            #         prefix=f"{prefix}.experts",
+            #         scoring_func=config.scoring_func,
+            #         # we do scaling outside, set factor to 1.0 to avoid double mul
+            #         routed_scaling_factor=1.0,
+            #         e_score_correction_bias=self.gate.e_score_correction_bias,
+            #         enable_eplb=self.enable_eplb,
+            #         num_redundant_experts=self.n_redundant_experts,
+            #         is_sequence_parallel=self.is_sequence_parallel,
+            #     )
+            # else:
             self.experts = SharedFusedMoE(
                 shared_experts=self.shared_experts,
                 num_experts=config.n_routed_experts,
@@ -486,7 +508,7 @@ class DeepseekV2MoE(nn.Module):
                     weight_scale_gate_up=(
                         self.shared_experts.gate_up_proj.weight_scale_inv 
                         if self.use_triton_fused_shared_expert_fp8 
-                        else self.shared_experts.gate_up_proj.weight_scale.T
+                        else self.shared_experts.gate_up_proj.weight_scale
                     ),
                     hidden_states_moe_gate=hidden_states,
                     weight_moe_gate=self.gate.weight,
@@ -503,6 +525,8 @@ class DeepseekV2MoE(nn.Module):
             shared_output, _ = self.shared_experts.down_proj(
                 shared_output_q, x_quant_scales=shared_output_s
             )
+            # shared_output = self.shared_experts(hidden_states)
+            # router_logits, _ = self.gate(hidden_states)
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
@@ -515,6 +539,7 @@ class DeepseekV2MoE(nn.Module):
                 assert shared_output is not None
                 shared_output_none, final_hidden_states = fused_moe_out
                 assert shared_output_none is None
+                # final_hidden_states = fused_moe_out
             else:
                 assert shared_output is None
                 shared_output, final_hidden_states = fused_moe_out
