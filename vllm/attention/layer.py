@@ -649,8 +649,6 @@ def unified_attention_with_output(
                         output=output,
                         output_scale=output_scale)
 
-    maybe_save_kv_layer_to_connector(layer_name, kv_cache)
-
 
 def unified_attention_with_output_fake(
     query: torch.Tensor,
