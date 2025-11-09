@@ -220,7 +220,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             return_lse=return_softmax_lse,
             **kwargs,
         )
-        if envs.VLLM_ROCM_USE_AITER_TRITON_MLA and type(result) is tuple and return_softmax_lse:
+        if envs.VLLM_ROCM_USE_AITER_TRITON_MLA and type(
+                result) is tuple and return_softmax_lse:
             output, lse = result
             lse = lse.T.contiguous()
             return (output, lse)
@@ -244,7 +245,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         o = torch.zeros(B,
                         self.num_heads,
                         self.kv_lora_rank,
-                        dtype=q.dtype,
+                        dtype=torch.bfloat16,
                         device=q.device)
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
@@ -252,10 +253,18 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         # max_seqlen_qo must be 1 except for MTP
         # TODO: Find the best value for MTP
         max_seqlen_qo = 1
-        aiter_mla_decode_fwd(q, kv_buffer, o, self.scale,
-                             attn_metadata.decode.qo_indptr, max_seqlen_qo,
-                             attn_metadata.decode.paged_kv_indptr,
-                             attn_metadata.decode.paged_kv_indices,
-                             attn_metadata.decode.paged_kv_last_page_len)
+        aiter_mla_decode_fwd(
+            q,
+            kv_buffer,
+            o,
+            self.scale,
+            attn_metadata.decode.qo_indptr,
+            max_seqlen_qo,
+            attn_metadata.decode.paged_kv_indptr,
+            attn_metadata.decode.paged_kv_indices,
+            attn_metadata.decode.paged_kv_last_page_len,
+            q_scale=layer._q_scale,
+            kv_scale=layer._k_scale,
+        )
 
         return o, None
