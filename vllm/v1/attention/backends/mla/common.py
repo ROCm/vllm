@@ -1704,14 +1704,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     decode_ql_nope = decode_q_cat[... , :self.W_K.shape[1]] if (kv_cache.numel() > 0 and positions is not None) else None
                 else:
                     decode_ql_nope = None
-                    # decode_ql_nope = torch.empty(
-                    #     x.shape[0],
-                    #     x.shape[1],
-                    #     self.W_K.shape[2],
-                    #     device=x.device,
-                    #     dtype=torch.bfloat16,
-                    # )
-                #print(f'>>> x {x.shape}, q_nope_out {q_nope_out.shape}, self.W_K {self.W_K.shape}')
 
                 decode_ql_nope = batched_gemm_a16wfp4(
                     x,
