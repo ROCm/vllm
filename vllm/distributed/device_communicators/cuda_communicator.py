@@ -86,6 +86,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
             AITERCustomAllreduce = None
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduceFusion,
+        )
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.device_communicators.quick_all_reduce import (
             QuickAllReduce,
@@ -102,6 +105,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm = None
+        self.caf_comm = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         if use_torch_symm_mem and current_platform.is_cuda():
@@ -126,6 +130,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                         and not self.symm_mem_comm.disabled
                     ),
                 )
+            self.caf_comm = CustomAllreduceFusion(group=self.cpu_group)
             if current_platform.is_rocm():
                 # Initialize a custom quick all-reduce implementation for AMD.
                 # Quick reduce is designed as a complement to custom allreduce.

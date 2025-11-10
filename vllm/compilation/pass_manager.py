@@ -27,6 +27,7 @@ if current_platform.is_rocm():
 if current_platform.is_cuda():
     from .collective_fusion import AllReduceFusionPass, AsyncTPPass
 
+from .collective_ar_fusion import AllReduceFusionPass
 from .fix_functionalization import FixFunctionalizationPass
 from .inductor_pass import CustomGraphPass, InductorPass, get_pass_context
 from .noop_elimination import NoOpEliminationPass

@@ -324,3 +324,75 @@ class CustomAllreduce:
             rank = dist.get_rank(group=group)
         if ops is not None:
             ops.free_shared_buffer(pointers[rank])
+
+
+class CustomAllreduceFusion:
+    _SUPPORTED_WORLD_SIZES = [2, 4, 8]
+
+    # max_size: max supported allreduce size
+    def __init__(
+        self,
+        group: ProcessGroup,
+        max_size_in_bytes=8192 * 16384,
+    ) -> None:
+        """
+        Args:
+            group: the process group to work on. If None, it will use the
+                default process group.
+        It is the caller's responsibility to make sure each communicator
+        is bind to a unique device, and all communicators in this group
+        are in the same node.
+        """
+        self._IS_CAPTURING = False
+        self.disabled = True
+
+        if not custom_ar:
+            # disable because of missing custom allreduce library
+            # e.g. in a non-GPU environment
+            logger.info(
+                "Custom allreduce is disabled because "
+                "of missing custom allreduce library"
+            )
+            return
+
+        self.group = group
+
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
+
+        if not all(in_the_same_node_as(group, source_rank=0)):
+            # No need to initialize custom allreduce for multi-node case.
+            logger.warning(
+                "Custom allreduce is disabled because this process group"
+                " spans across nodes."
+            )
+            return
+
+        rank = dist.get_rank(group=self.group)
+        self.rank = rank
+        world_size = dist.get_world_size(group=self.group)
+        if world_size == 1:
+            return
+
+        if world_size not in CustomAllreduceFusion._SUPPORTED_WORLD_SIZES:
+            logger.warning(
+                "Custom allreduce fusion is disabled due to an unsupported world"
+                " size: %d. Supported world sizes: %s. To silence this "
+                "warning, specify disable_custom_all_reduce=True explicitly.",
+                world_size,
+                str(CustomAllreduceFusion._SUPPORTED_WORLD_SIZES),
+            )
+            return
+
+        torch.cuda.set_device(rank)
+        self.fptr = ops.init_custom_ar_fusion(rank, world_size, max_size_in_bytes)
+        handle = ops.get_custom_ar_fusion_handle(self.fptr)
+        handle_list = [None] * world_size
+        dist.all_gather_object(handle_list, handle, group=group)
+        ops.open_custom_ar_fusion_handles(self.fptr, handle_list)
+        # self.workspace = self.get_workspace()
+        print(f"init CustomAllreduceFusion at rank:{rank}", flush=True)
+
+    def get_workspace(self):
+        return ops.get_custom_ar_fusion_workspace(self.fptr)

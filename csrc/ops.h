@@ -372,3 +372,15 @@ void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                    int64_t quant_level, bool cast_bf2half = false);
 int64_t qr_max_size();
 #endif
+
+fptr_t init_custom_ar_fusion(int64_t rank, int64_t world_size,
+                             int64_t max_size_in_bytes);
+void destroy_custom_ar_fusion(fptr_t fptr);
+torch::Tensor get_arfusion_handle(fptr_t fptr);
+void open_arfusion_handles(fptr_t fptr, std::vector<torch::Tensor> handles);
+torch::Tensor get_arfusion_workspace(fptr_t fptr);
+void allreduce_rms_fusion(int64_t rank, int64_t nranks,
+                          torch::Tensor& allreduce_in,
+                          torch::Tensor& residual_in, torch::Tensor& rms_gamma,
+                          torch::Tensor& residual_out, torch::Tensor& norm_out,
+                          double eps, torch::Tensor& workspace);

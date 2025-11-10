@@ -798,4 +798,30 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
 #endif
 }
 
+TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar_fusion),
+                     custom_ar_fusion) {
+  // Custom all-reduce fusion kernels
+  custom_ar_fusion.def(
+      "init_custom_ar_fusion(int rank, int world_size, int max_size_in_bytes) "
+      "-> int");
+  custom_ar_fusion.impl("init_custom_ar_fusion", &init_custom_ar_fusion);
+  custom_ar_fusion.def("destroy_custom_ar_fusion(int fptr) -> ()");
+  custom_ar_fusion.impl("destroy_custom_ar_fusion", &destroy_custom_ar_fusion);
+
+  custom_ar_fusion.def("get_handle(int fptr) -> Tensor");
+  custom_ar_fusion.impl("get_handle", &get_arfusion_handle);
+  custom_ar_fusion.def("open_handles(int fptr,  Tensor[](b!) handles) -> ()");
+  custom_ar_fusion.impl("open_handles", &open_arfusion_handles);
+  custom_ar_fusion.def("get_workspace(int fptr) -> Tensor");
+  custom_ar_fusion.impl("get_workspace", torch::kCUDA, &get_arfusion_workspace);
+  custom_ar_fusion.impl("get_workspace", torch::kCPU, &get_arfusion_workspace);
+
+  custom_ar_fusion.def(
+      "allreduce_rms_fusion(int rank, int nranks, Tensor allreduce_in, Tensor "
+      "residual_in, Tensor rms_gamma, Tensor residual_out, Tensor norm_out, "
+      "float eps, Tensor workspace) -> ()");
+  custom_ar_fusion.impl("allreduce_rms_fusion", torch::kCUDA,
+                        &allreduce_rms_fusion);
+}
+
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

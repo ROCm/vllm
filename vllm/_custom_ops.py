@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -2273,6 +2274,67 @@ def qr_open_handles(fa: int, handles: list[torch.Tensor]) -> None:
 
 def qr_max_size() -> int:
     return torch.ops._C_custom_ar.qr_max_size()
+
+
+# all reduce fusion
+def init_custom_ar_fusion(rank: int, world_size: int, max_size_in_bytes: int) -> int:
+    return torch.ops._C_custom_ar_fusion.init_custom_ar_fusion(
+        rank, world_size, max_size_in_bytes
+    )
+
+
+def destroy_custom_ar_fusion(fptr: int) -> None:
+    torch.ops._C_custom_ar_fusion.destroy_custom_ar_fusion(fptr)
+
+
+def get_custom_ar_fusion_handle(fptr: int) -> torch.Tensor:
+    return torch.ops._C_custom_ar_fusion.get_handle(fptr)
+
+
+def open_custom_ar_fusion_handles(fptr: int, handles: list[torch.Tensor]) -> ():
+    return torch.ops._C_custom_ar_fusion.open_handles(fptr, handles)
+
+
+def get_custom_ar_fusion_workspace(fptr: int) -> torch.Tensor:
+    return torch.ops._C_custom_ar_fusion.get_workspace(fptr)
+
+
+@register_fake("_C_custom_ar_fusion::get_workspace")
+def get_custom_ar_fusion_workspace_fake(fptr: int) -> torch.Tensor:
+    nbytes = (8 * 3 + 5) * ctypes.sizeof(ctypes.c_void_p)
+    return torch.empty(nbytes, dtype=torch.uint8)
+
+
+def allreduce_rms_fusion(
+    rank: int,
+    nranks: int,
+    allreduce_in: torch.Tensor,
+    residual_in: torch.Tensor,
+    rms_gamma: torch.Tensor,
+    residual_out: torch.Tensor,
+    norm_out: torch.Tensor,
+    eps: float,
+    workspace: torch.Tensor,
+) -> ():
+    print(f"allreduce_rms_fusion called at {rank}", flush=True)
+    return torch.ops._C_custom_ar_fusion.allreduce_rms_fusion(
+        rank,
+        nranks,
+        allreduce_in,
+        residual_in,
+        rms_gamma,
+        residual_out,
+        norm_out,
+        eps,
+        workspace,
+    )
+
+
+# @register_fake("_C_custom_ar_fusion::allreduce_rms_fusion")
+# def allreduce_rms_fusion_fake(rank: int, nranks: int, allreduce_in: torch.Tensor,
+#     residual_in: torch.Tensor, rms_gamma: torch.Tensor, residual_out: torch.Tensor,
+#     norm_out: torch.Tensor, eps: float, workspace: torch.Tensor) -> ():
+#     return
 
 
 def get_flash_mla_metadata(
