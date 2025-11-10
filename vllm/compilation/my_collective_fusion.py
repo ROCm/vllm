@@ -90,7 +90,7 @@ class AllReduceFusedAddRMSNormPattern(BasePattern):
             # workspace = workspace.cuda(rank)
             # hidden_dim = input.shape[-1]
             norm_out, residual_out = torch_dist_ext.allreduce_rms_fusion_(rank, world_size, residual, input, 
-                weight, self.epsilon, torch_dist_ext.get_workspace())
+                weight, self.epsilon, torch_dist_ext.get_workspace(input))
             
             # allreduce_in, residual
             return norm_out, residual_out
