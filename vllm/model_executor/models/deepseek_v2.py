@@ -96,6 +96,7 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
         rocm_aiter_fp4_quant_group_size = 32
 
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS:
+        from aiter.ops.triton.fused_gemm_afp4wfp4_mul_add import fused_gemm_afp4wfp4_mul_add
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_a16w16 import fused_gemm_a8w8_blockscale_a16w16
         from aiter.ops.triton.fused_fp8_quant import fused_reduce_act_mul_fp8_group_quant
         import aiter as rocm_aiter
@@ -217,6 +218,37 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             op_func=rocm_aiter_triton_fused_shared_expert_fp4_impl,
             mutates_args=[],
             fake_impl=rocm_aiter_triton_fused_shared_expert_fp4_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
+
+
+        def rocm_aiter_triton_fused_down_proj_mul_add_fp4_impl(
+            hidden_states_shared: torch.Tensor,
+            hidden_states_shared_scale: torch.Tensor,
+            weight_down_proj: torch.Tensor,
+            weight_scale_down_proj: torch.Tensor,
+            routed_scaling_factor: float,
+            final_hidden_states: torch.Tensor,
+        ) -> torch.Tensor:
+            out = fused_gemm_afp4wfp4_mul_add(hidden_states_shared, weight_down_proj, hidden_states_shared_scale, weight_scale_down_proj.T, routed_scaling_factor, final_hidden_states, fuse_type=1)
+            return out
+        
+        def rocm_aiter_triton_fused_down_proj_mul_add_fp4_fake(
+            hidden_states_shared: torch.Tensor,
+            hidden_states_shared_scale: torch.Tensor,
+            weight_down_proj: torch.Tensor,
+            weight_scale_down_proj: torch.Tensor,
+            routed_scaling_factor: float,
+            final_hidden_states: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty_like(final_hidden_states)
+            return out
+        
+        direct_register_custom_op(
+            op_name="rocm_aiter_triton_fused_down_proj_mul_add_fp4",
+            op_func=rocm_aiter_triton_fused_down_proj_mul_add_fp4_impl,
+            mutates_args=[],
+            fake_impl=rocm_aiter_triton_fused_down_proj_mul_add_fp4_fake,
             dispatch_key=current_platform.dispatch_key,
         )
 
@@ -515,9 +547,9 @@ class DeepseekV2MoE(nn.Module):
                     ),
                 )
             )
-            shared_output, _ = self.shared_experts.down_proj(
-                shared_output_q, x_quant_scales=shared_output_s
-            )
+            # shared_output, _ = self.shared_experts.down_proj(
+            #     shared_output_q, x_quant_scales=shared_output_s
+            # )
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
@@ -527,7 +559,7 @@ class DeepseekV2MoE(nn.Module):
 
         if self.shared_experts is not None:
             if self.skip_shared_experts:
-                assert shared_output is not None
+                # assert shared_output is not None
                 shared_output_none, final_hidden_states = fused_moe_out
                 assert shared_output_none is None
                 # final_hidden_states = fused_moe_out
@@ -540,7 +572,10 @@ class DeepseekV2MoE(nn.Module):
 
         # Fix FP16 overflow
         # See DeepseekV2DecoderLayer for more details.
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16 and shared_output is not None:
+        if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and hidden_states.dtype != torch.float16:
+            assert shared_output is None
+            final_hidden_states = torch.ops.vllm.rocm_aiter_triton_fused_down_proj_mul_add_fp4(shared_output_q, shared_output_s, self.shared_experts.down_proj.weight, self.shared_experts.down_proj.weight_scale, self.routed_scaling_factor, final_hidden_states)
+        elif VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16 and shared_output is not None:
             final_hidden_states = fused_mul_add(final_hidden_states, self.routed_scaling_factor, shared_output)
         else:
             if hidden_states.dtype != torch.float16:
