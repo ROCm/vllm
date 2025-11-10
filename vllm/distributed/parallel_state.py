@@ -387,7 +387,7 @@ class GroupCoordinator:
 
         import torch_dist_ext
         if torch_dist_ext.comm is None:
-            torch_dist_ext.setup_env(self.rank, self.world_size, self.device_group)
+            torch_dist_ext.setup_env(self.rank, self.world_size, group=self.device_group)
 
     @property
     def first_rank(self):
