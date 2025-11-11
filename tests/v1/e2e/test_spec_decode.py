@@ -391,7 +391,10 @@ def test_eagle_correctness(
                 "multi-token eagle spec decode on current platform"
             )
 
-        if attn_backend == "FLASH_ATTN" and current_platform.is_rocm():
+        if (
+            attn_backend in ["FLASH_ATTN", "ROCM_AITER_FA", "ROCM_AITER_UNIFIED_ATTN"]
+            and current_platform.is_rocm()
+        ):
             m.setenv("VLLM_ROCM_USE_AITER", "1")
 
         method, model_name, spec_model_name, tp_size = model_setup

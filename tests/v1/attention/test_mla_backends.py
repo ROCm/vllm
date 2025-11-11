@@ -23,6 +23,7 @@ from vllm.attention.ops.flashmla import is_flashmla_dense_supported
 from vllm.attention.utils.fa_utils import flash_attn_supports_mla
 from vllm.config.vllm import set_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.attention.backends.mla.common import QueryLenSupport
@@ -35,6 +36,7 @@ BACKENDS_TO_TEST = [
     AttentionBackendEnum.FLASH_ATTN_MLA,
     AttentionBackendEnum.FLASHINFER_MLA,
     AttentionBackendEnum.TRITON_MLA,
+    AttentionBackendEnum.ROCM_AITER_MLA,
 ]
 
 # Remove sm100 backends from the list if not using sm100
@@ -49,6 +51,20 @@ if not flash_attn_supports_mla():
 # Remove FLASHMLA from the list if not supported
 if not is_flashmla_dense_supported()[0]:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHMLA)
+
+# Remove FLASH_ATTN_MLA on ROCm
+if (
+    current_platform.is_rocm()
+    and AttentionBackendEnum.FLASH_ATTN_MLA in BACKENDS_TO_TEST
+):
+    BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASH_ATTN_MLA)
+
+# Remove ROCM_AITER_MLA on non-ROCm platforms
+if (
+    not current_platform.is_rocm()
+    and AttentionBackendEnum.ROCM_AITER_MLA in BACKENDS_TO_TEST
+):
+    BACKENDS_TO_TEST.remove(AttentionBackendEnum.ROCM_AITER_MLA)
 
 SPEC_DECODE_BACKENDS = []
 for backend in BACKENDS_TO_TEST:
@@ -70,6 +86,20 @@ for backend in BACKENDS_TO_TEST:
     else:
         block_size = 16
     BACKEND_BLOCK_SIZES[backend] = block_size
+
+# Remove FLASH_ATTN_MLA on ROCm
+if (
+    current_platform.is_rocm()
+    and AttentionBackendEnum.FLASH_ATTN_MLA in BACKENDS_TO_TEST
+):
+    BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASH_ATTN_MLA)
+
+# Remove ROCM_AITER_MLA on non-ROCm platforms
+if (
+    not current_platform.is_rocm()
+    and AttentionBackendEnum.ROCM_AITER_MLA in BACKENDS_TO_TEST
+):
+    BACKENDS_TO_TEST.remove(AttentionBackendEnum.ROCM_AITER_MLA)
 
 torch.manual_seed(42)
 

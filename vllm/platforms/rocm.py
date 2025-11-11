@@ -49,25 +49,8 @@ _ROCM_UNSUPPORTED_MODELS: list[str] = []
 
 # Models partially supported by ROCm.
 # Architecture -> Reason.
-_ROCM_SWA_REASON = (
-    "Sliding window attention (SWA) is not yet supported in "
-    "Triton flash attention. For half-precision SWA support, "
-    "please use CK flash attention by setting "
-    "`VLLM_USE_TRITON_FLASH_ATTN=0`"
-)
-_ROCM_PARTIALLY_SUPPORTED_MODELS: dict[str, str] = {
-    "Qwen2ForCausalLM": _ROCM_SWA_REASON,
-    "MistralForCausalLM": _ROCM_SWA_REASON,
-    "MixtralForCausalLM": _ROCM_SWA_REASON,
-    "PaliGemmaForConditionalGeneration": (
-        "ROCm flash attention does not yet fully support 32-bit precision on PaliGemma"
-    ),
-    "Phi3VForCausalLM": (
-        "ROCm Triton flash attention may run into compilation errors due to "
-        "excessive use of shared memory. If this happens, disable Triton FA "
-        "by setting `VLLM_USE_TRITON_FLASH_ATTN=0`"
-    ),
-}
+_ROCM_SWA_REASON = ()
+_ROCM_PARTIALLY_SUPPORTED_MODELS: dict[str, str] = {}
 _ROCM_DEVICE_ID_NAME_MAP: dict[str, str] = {
     "0x74a0": "AMD_Instinct_MI300A",
     "0x74a1": "AMD_Instinct_MI300X",
@@ -349,6 +332,8 @@ class RocmPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        from vllm.attention.backends.registry import _Backend
+        from vllm.attention.selector import get_env_variable_attn_backend
         from vllm.config.compilation import CUDAGraphMode
 
         cache_config = vllm_config.cache_config
@@ -361,7 +346,16 @@ class RocmPlatform(Platform):
         )
 
         if cache_config and cache_config.block_size is None:
-            cache_config.block_size = 16
+            if (
+                os.environ.get("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION")
+                or get_env_variable_attn_backend() == _Backend.ROCM_AITER_UNIFIED_ATTN
+            ):
+                cache_config.block_size = 64
+                logger.warning(
+                    "[ROCM_AITER_UNIFIED_ATTN]: Setting kv cache block size to 64."
+                )
+            else:
+                cache_config.block_size = 16
 
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"

@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
-    VLLM_USE_TRITON_FLASH_ATTN: bool = True
     VLLM_V1_USE_PREFILL_DECODE_ATTENTION: bool = False
     VLLM_FLASH_ATTN_VERSION: int | None = None
     LOCAL_RANK: int = 0
@@ -521,10 +520,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when `VLLM_NCCL_SO_PATH` is not set, vllm will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": lambda: os.environ.get("LD_LIBRARY_PATH", None),
-    # flag to control if vllm should use triton flash attention
-    "VLLM_USE_TRITON_FLASH_ATTN": lambda: (
-        os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "True").lower() in ("true", "1")
-    ),
     # Use separate prefill and decode kernels for V1 attention instead of
     # the unified triton kernel.
     "VLLM_V1_USE_PREFILL_DECODE_ATTENTION": lambda: (
@@ -617,7 +612,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Useful for debugging
     "VLLM_TRACE_FUNCTION": lambda: int(os.getenv("VLLM_TRACE_FUNCTION", "0")),
     # Backend for attention computation
-    # Example options:
+    # Example options (for NVIDIA):
     # - "TORCH_SDPA": use torch.nn.MultiheadAttention
     # - "FLASH_ATTN": use FlashAttention
     # - "XFORMERS": use XFormers
@@ -626,6 +621,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # - "FLASH_ATTN_MLA": use FlashAttention for MLA
     # - "FLASHINFER_MLA": use FlashInfer for MLA
     # - "CUTLASS_MLA": use CUTLASS for MLA
+    # Example options (for AMD):
+    # - "FLASH_ATTN": Standard FlashAttention
+    # - "TRITON_ATTN": Pure Triton unified attention
+    # - "ROCM_ATTN": ROCm prefill-decode attention with AITER ops
+    # - "ROCM_AITER_MLA": AITER Multi-head Latent Attention for DeepSeek
+    # - "ROCM_AITER_FA": AITER Flash Attention for vision transformers
+    # - "ROCM_AITER_UNIFIED_ATTN": AITER unified kernel for prefill+decode
+    # - "TRITON_MLA": Triton MLA for DeepSeek models
     # All possible options loaded dynamically from AttentionBackendEnum
     "VLLM_ATTENTION_BACKEND": env_with_choices(
         "VLLM_ATTENTION_BACKEND",
@@ -1562,7 +1565,6 @@ def compute_hash() -> str:
         "VLLM_PP_LAYER_PARTITION",
         "VLLM_MLA_DISABLE",
         "VLLM_FLASH_ATTN_MAX_NUM_SPLITS_FOR_CUDA_GRAPH",
-        "VLLM_USE_TRITON_FLASH_ATTN",
         "VLLM_USE_TRITON_AWQ",
         "VLLM_DP_RANK",
         "VLLM_DP_SIZE",
