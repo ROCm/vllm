@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from transformers import Qwen3MoeConfig
 
+from vllm import envs
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -54,6 +55,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
@@ -63,6 +65,13 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 
 logger = init_logger(__name__)
+
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE
+else:
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE = False
+
+logger.info(f"[Aiter] {VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE=}")
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -242,6 +251,7 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -250,6 +260,8 @@ class Qwen3MoeAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
+            rotary_emb=self.rotary_emb
+            if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE else None,
             **{
                 "layer_idx": extract_layer_index(prefix),
                 "dual_chunk_attention_config": dual_chunk_attention_config,
@@ -276,8 +288,11 @@ class Qwen3MoeAttention(nn.Module):
                            self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        if envs.VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE:
+            attn_output = self.attn(q, k, v, positions=positions)
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 
