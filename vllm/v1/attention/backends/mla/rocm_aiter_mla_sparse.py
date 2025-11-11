@@ -62,10 +62,10 @@ def fetch_id_to_ragged_kernel(
     if row_offset >= token_num:
         return
     in_tensor_offset = seq_id * in_tensor_ptr_stride + row_offset + offset
-    in_tensor_mask = (row_offset + offset) < token_num
+    in_tensor_mask = (row_offset + offset) < TOPK
     in_tensor_val = tl.load(in_tensor_ptr + in_tensor_offset, mask=in_tensor_mask)
     out_tensor_offset = token_start + row_offset + offset
-    out_tensor_mask = out_tensor_offset < token_end
+    out_tensor_mask = (out_tensor_offset < token_end) & in_tensor_mask
     tl.store(out_tensor_ptr + out_tensor_offset, in_tensor_val, mask=out_tensor_mask)
 
 
@@ -139,6 +139,10 @@ class ROCMAiterMLASparseMetadata:
     paged_kv_last_page_len: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_indptr: torch.Tensor
+    paged_kv_indptr_rest: torch.Tensor
+
+    # buffer_for_paged_kv_indices: torch.Tensor
+    # buffer_for_paged_kv_indptr: torch.Tensor
 
     block_size: int = 1
     topk_tokens: int = 2048
@@ -151,6 +155,9 @@ class ROCMAiterMLASparseMetadataBuilder(
     cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
+    buffer_for_paged_kv_indices: torch.Tensor = None
+    buffer_for_paged_kv_indptr: torch.Tensor = None
+
 
     def __init__(
         self,
@@ -159,6 +166,7 @@ class ROCMAiterMLASparseMetadataBuilder(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+
         self.kv_cache_spec = kv_cache_spec
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
@@ -202,6 +210,15 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.paged_kv_indptr = torch.zeros(
             [max_num_seqs + 1], dtype=torch.int32, device=device
         )
+        if ROCMAiterMLASparseMetadataBuilder.buffer_for_paged_kv_indices is None:
+            ROCMAiterMLASparseMetadataBuilder.buffer_for_paged_kv_indices = torch.zeros(
+                                                                                [max_num_batched_tokens * self.topk_tokens],
+                                                                                dtype=torch.int32,
+                                                                                device=device,
+                                                                            )
+            ROCMAiterMLASparseMetadataBuilder.buffer_for_paged_kv_indptr = torch.zeros(
+                                                                                [max_num_seqs + 1], dtype=torch.int32, device=device
+                                                                            )
 
     def build(
         self,
@@ -210,6 +227,7 @@ class ROCMAiterMLASparseMetadataBuilder(
         fast_build: bool = False,
     ) -> ROCMAiterMLASparseMetadata:
         num_tokens = common_attn_metadata.num_actual_tokens
+        num_batches = common_attn_metadata.num_reqs
         starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
@@ -220,12 +238,16 @@ class ROCMAiterMLASparseMetadataBuilder(
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             torch.from_numpy(req_id_per_token), non_blocking=True
         )
+        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indptr.fill_(0)
+
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
-        paged_kv_indices = self.paged_kv_indices
-        paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-
+        paged_kv_indices = self.paged_kv_indices[:num_tokens * self.topk_tokens]
+        paged_kv_indptr = self.paged_kv_indptr[:num_tokens + 1]
+        paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1:]
+        # print("paged kv indptr shape: ", paged_kv_indptr.shape)
         metadata = ROCMAiterMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -241,6 +263,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
+            paged_kv_indptr_rest=paged_kv_indptr_rest
         )
         return metadata
 
@@ -316,6 +339,7 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
         topk_indices: torch.Tensor,  # [sq, topk]
         attn_metadata: ROCMAiterMLASparseMetadata,
     ) -> torch.Tensor:
+        # print("into sparse mla", flush=True)
         num_tokens = q.shape[0]
         output = torch.empty(
             [num_tokens, self.num_heads, self.kv_lora_rank],
@@ -323,15 +347,26 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
             device=q.device,
         )
         # We assume the block size is 1
-        seq_len = (topk_indices == -1).int().argmax(dim=-1)
+        # seq_len = (topk_indices == -1).int().argmax(dim=-1)
+        # torch.cumsum(seq_len, dim=0, out=attn_metadata.paged_kv_indptr[1:])
+        seq_len = (topk_indices != -1).sum(dim=-1)
+        # print("seqlens: ", seq_len, flush=True)
+        # print("topk shape: ", topk_indices.shape)
         torch.cumsum(seq_len, dim=0, out=attn_metadata.paged_kv_indptr[1:])
-
+        attn_metadata.paged_kv_indptr_rest.fill_(attn_metadata.paged_kv_indptr[-1])
+        # print("paged kv indptr shape: ", attn_metadata.paged_kv_indptr.shape)
+        # print("topk indices: ", topk_indices, flush=True)
         fetch_id_to_ragged_triton(
             topk_indices,
             attn_metadata.paged_kv_indptr,
             attn_metadata.paged_kv_indices,
             attn_metadata.topk_tokens,
         )
+        # attn_metadata.buffer_for_paged_kv_indices.copy_(attn_metadata.paged_kv_indices)
+        # attn_metadata.buffer_for_paged_kv_indptr.copy_(attn_metadata.paged_kv_indptr)
+        # if attn_metadata.max_query_len == 1:
+        #     torch.cuda.synchronize()
+        #     print("in decode end of fetch_id_to_ragged_triton ", flush=True)
 
         aiter_mla_decode_fwd(
             q,
@@ -344,6 +379,9 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
             attn_metadata.paged_kv_indices,
             attn_metadata.paged_kv_last_page_len,
         )
+        # if attn_metadata.max_query_len == 1:
+        #     torch.cuda.synchronize()
+        #     print("in decode end of mla decode ", flush=True)
 
         return output[:, : self.num_heads, :]
 

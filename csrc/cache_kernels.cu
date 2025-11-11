@@ -552,7 +552,7 @@ __global__ void indexer_k_quant_and_cache_kernel(
 #ifndef USE_ROCM
   __syncwarp();
 #endif
-#if HIP_FP8_TYPE_OCP
+#if defined(__gfx942__)
   float scale = fmaxf(amax, 1e-4) / 224.0f;
 #else
   float scale = fmaxf(amax, 1e-4) / 448.0f;
