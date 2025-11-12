@@ -7,13 +7,32 @@ import pytest
 import torch
 
 from tests.utils import get_attn_backend_list_based_on_platform, large_gpu_mark
+from tests.v1.attention.utils import (
+    try_get_attention_backend,
+)
 from vllm import LLM, SamplingParams
 from vllm.assets.base import VLLM_S3_BUCKET_URL
 from vllm.assets.image import VLM_IMAGES_DIR
+from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.mla.common import QueryLenSupport
 
 MTP_SIMILARITY_RATE = 0.8
+
+_ROCM_SPEC_DECODE_BACKENDS = [
+    AttentionBackendEnum.FLASH_ATTN,
+    AttentionBackendEnum.TRITON_ATTN,
+    AttentionBackendEnum.ROCM_AITER_FA,
+    AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN,
+]
+for backend in _ROCM_SPEC_DECODE_BACKENDS:
+    builder_cls, _ = try_get_attention_backend(backend)
+    query_len_support = getattr(
+        builder_cls, "query_len_support", QueryLenSupport.SINGLE_ONLY
+    )
+    if query_len_support == QueryLenSupport.SINGLE_ONLY:
+        _ROCM_SPEC_DECODE_BACKENDS.remove(backend)
 
 
 def get_test_prompts(mm_enabled: bool):
@@ -385,9 +404,12 @@ def test_eagle_correctness(
             m.setenv("VLLM_MLA_DISABLE", "1")
             m.setenv("VLLM_ATTENTION_BACKEND", attn_backend)
 
-        if attn_backend == "TRITON_ATTN" and not current_platform.is_rocm():
+        if (
+            attn_backend in ["TRITON_ATTN", "ROCM_AITER_FA", "ROCM_AITER_UNIFIED_ATTN"]
+            and not current_platform.is_rocm()
+        ):
             pytest.skip(
-                "TRITON_ATTN does not support "
+                f"{attn_backend} does not support "
                 "multi-token eagle spec decode on current platform"
             )
 
@@ -396,6 +418,14 @@ def test_eagle_correctness(
             and current_platform.is_rocm()
         ):
             m.setenv("VLLM_ROCM_USE_AITER", "1")
+
+        if (
+            current_platform.is_rocm()
+            and AttentionBackendEnum[attn_backend] not in _ROCM_SPEC_DECODE_BACKENDS
+        ):
+            pytest.skip(
+                f"Speculative decoding with {attn_backend} is not supported on ROCm"
+            )
 
         method, model_name, spec_model_name, tp_size = model_setup
         max_model_len = 2048

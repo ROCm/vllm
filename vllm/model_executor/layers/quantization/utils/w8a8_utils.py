@@ -347,7 +347,11 @@ def torch_channelwise_w8a8_scaled_mm(
         output = output[0]
     # Unpad (undo num_token_padding)
     output = torch.narrow(output, 0, 0, qinput.shape[0])
-    x_scale = torch.narrow(scale_a, 0, 0, qinput.shape[0])
+    # Handle per-tensor vs per-token activation scales
+    if scale_a.numel() > 1:
+        x_scale = torch.narrow(scale_a, 0, 0, qinput.shape[0])
+    else:
+        x_scale = scale_a
 
     # DQ
     # C = sw * sx * (X * W) + bias

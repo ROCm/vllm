@@ -31,7 +31,7 @@ _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 
 if current_platform.is_rocm():
     import aiter
-    from aiter.ops.triton.utils.device_info import get_num_sms
+    from aiter.ops.triton.utils.arch_info import get_num_sms
 
     from vllm.triton_utils import tl, triton
 
