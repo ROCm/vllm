@@ -26,7 +26,6 @@
 import typing
 from collections.abc import Callable, Iterable
 from typing import Any, Optional, Union
-
 import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
@@ -63,6 +62,7 @@ import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 from vllm.logger import init_logger
+from vllm.forward_context import get_forward_context
 logger = init_logger(__name__)
 from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
     is_rocm_aiter_moe_enabled)
@@ -88,10 +88,111 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
     if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_a16w16 import fused_gemm_a8w8_blockscale_a16w16
         from aiter.ops.triton.fused_fp8_quant import fused_reduce_act_mul_fp8_group_quant
+
         import aiter as rocm_aiter
         rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
         rocm_aiter_fp8_quant_group_size = 128
-        
+
+       # alt_stream = 
+
+        # @torch._dynamo.disable
+        # def streams_breaks(dummy_input: torch.Tensor) -> torch.Tensor:
+        #     device = torch.device("cuda")
+        #     current_stream = torch.cuda.current_stream(device=device)
+        #     alt_stream = torch.cuda.Stream(device=device)
+
+        #     alt_stream.wait_stream(current_stream)
+
+        #     with torch.cuda.stream(alt_stream):
+        #         a = torch.randn(256, 256, device=device)
+        #         b = torch.randn(256, 256, device=device)
+        #         mm = a @ b                
+        #         y  = torch.tanh(mm)        
+        #         z  = y * 1.0001 + y.sin()  
+
+        #     current_stream.wait_stream(alt_stream)
+
+          
+        #     out = z.sum().reshape(1)
+        #     return out
+
+
+        # def streams_breaks_fake(dummy_input: torch.Tensor) -> torch.Tensor:
+        #     """
+        #     Fake implementation for compile-time shape inference.
+        #     Returns a meta tensor with the same shape/dtype contract as runtime.
+        #     """
+        #     return torch.empty((1,), device="meta", dtype=torch.float32)
+
+        @torch._dynamo.disable
+        def streams_breaks(
+            layer_prefix: str,                 
+            routed_scaling_factor: float,      
+            hidden_states: torch.Tensor,
+            shared_output_q: torch.Tensor,
+            shared_output_s: torch.Tensor,     
+            router_logits: torch.Tensor,      
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+
+            #assert not torch.cuda.graphs.is_current_stream_capturing(), "OMAR OMAR OMAR OMAR"
+            ctx = get_forward_context()
+            m = ctx.no_compile_layers[layer_prefix]   # DeepseekV2MoE instance
+            if m is None:
+                m = get_current_vllm_config().compilation_config.static_forward_context[layer_prefix]
+
+            # if torch.cuda.graphs.is_current_stream_capturing():
+            #     print("WE ARE WE ARE WE ARE")
+            print(m)
+            print("[DEBUG] m above")
+            #current_stream = torch.cuda.current_stream() #change to m.curr
+            #m.alt_stream.wait_stream(current_stream)
+            assert m.experts is not None, "[DEBUG OMAR] m.experts is None"
+            assert m.shared_experts.down_proj is not None, "[DEBUG OMAR] m.down_proj is None"
+            assert m.shared_experts.down_proj is not None, "[DEBUG OMAR] m.fusedmuladd is None"
+
+            #with torch.cuda.stream(m.alt_stream):
+            final_hidden_states = m.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+            shared_output, _ = m.shared_experts.down_proj(
+                shared_output_q, x_quant_scales=shared_output_s
+            )
+
+            #current_stream.wait_stream(m.alt_stream)
+            
+            final_hidden_states = fused_mul_add(
+                final_hidden_states,
+                routed_scaling_factor, shared_output
+            )
+            print("[DEBUG] WE ARE ABOUT TO RETURN< AKA STREAMS WORKED AND RAN")
+            print(shared_output)
+            print(final_hidden_states)
+            return shared_output, final_hidden_states
+
+
+        # minimal fake impl for compile-time (shape-only)
+        def streams_breaks_fake(
+            layer_prefix: str,
+            routed_scaling_factor: float,
+            hidden_states: torch.Tensor,
+            shared_output_q: torch.Tensor,
+            shared_output_s: torch.Tensor,
+            router_logits: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Shape-only fake: outputs mirror hidden_states (M, H)
+            # print("[DEBUG] WE ARE IN FAKE")
+            M, H = hidden_states.shape
+            device = hidden_states.device
+            dtype = hidden_states.dtype
+            shared_out = torch.empty((M, H), device=device, dtype=dtype)
+            final_out  = torch.empty((M, H), device=device, dtype=dtype)            
+            # print("[DEBUG] WE ARE OUT OF FAKE")
+
+            return shared_out, final_out
+
+
+
         def rocm_aiter_triton_fused_shared_expert_impl(
             hidden_states_shared: torch.Tensor,
             hidden_states_shared_scale: torch.Tensor,
@@ -102,6 +203,7 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             bias_shared: torch.Tensor,
             bias_moe_gate: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            #assert not torch.cuda.graphs.is_current_stream_capturing(), "fused code"
             shared_output, router_logits = fused_gemm_a8w8_blockscale_a16w16(hidden_states_shared, weight_gate_up, hidden_states_shared_scale, weight_scale_gate_up, hidden_states_moe_gate, weight_moe_gate, 
                                             bias_fp8=bias_shared, bias_bf16=bias_moe_gate, dtype=hidden_states_moe_gate.dtype, skip_reduce=True)
             if shared_output.dim() == 3:
@@ -132,6 +234,15 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             shared_output_s = torch.empty((M, (N_half + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size), dtype=torch.float32, device=device)
             router_logits = torch.empty((M, N_moe), dtype=hidden_states_moe_gate.dtype, device=device)
             return shared_output_q, shared_output_s, router_logits
+        
+        # register as torch.ops.vllm.streams_breaks
+        direct_register_custom_op(
+            op_name="streams_breaks",
+            op_func=streams_breaks,
+            mutates_args=[],
+            fake_impl=streams_breaks_fake,
+            dispatch_key=current_platform.dispatch_key,  # use platform's key
+        )
         
         direct_register_custom_op(
             op_name="rocm_aiter_triton_fused_shared_expert",
@@ -198,6 +309,7 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+
 class DeepseekV2MoE(nn.Module):
 
     def __init__(
@@ -206,12 +318,13 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         enable_eplb: bool = False,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[torch.cuda.Stream] = None, 
+        #add current stream = curr
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
-
+        self.prefix = prefix
         self.ep_group = get_ep_group().device_group
         self.ep_rank = self.ep_group.rank()
         self.ep_size = self.ep_group.size()
@@ -283,9 +396,11 @@ class DeepseekV2MoE(nn.Module):
                 ),
                 prefix=f"{prefix}.shared_experts",
             )
+    
 
-    @torch._dynamo.disable
-    def forward_shared_experts(self, hidden_states: torch.Tensor, hidden_states_shared: torch.Tensor) -> torch.Tensor:
+
+    # @torch._dynamo.disable
+    def forward_shared_experts(self, hidden_states: torch.Tensor, hidden_states_shared: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
         shared_output_q, shared_output_s, router_logits = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
             hidden_states_shared = hidden_states_shared,
@@ -308,7 +423,7 @@ class DeepseekV2MoE(nn.Module):
             # if hasattr(torch.cuda, "nvtx"):
             #     torch.cuda.nvtx.range_push("deepseek_alt_downproj")
 
-
+            
             with torch.cuda.stream(self.alt_stream):
                 shared_output, _ = self.shared_experts.down_proj(
                     shared_output_q, x_quant_scales = shared_output_s
@@ -317,14 +432,14 @@ class DeepseekV2MoE(nn.Module):
                 # e1.record(self.alt_stream)
 
 
-            # if hasattr(torch.cuda, "nvtx"):
-            #     torch.cuda.nvtx.range_pop()
+                # if hasattr(torch.cuda, "nvtx"):
+                #     torch.cuda.nvtx.range_pop()
 
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits
             )
-            
+                
             current_stream.wait_stream(self.alt_stream)
             
             final_hidden_states = fused_mul_add(
@@ -346,12 +461,33 @@ class DeepseekV2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        did_fma = False
+        did_fma = True
         if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and self.n_shared_experts is not None:
+            hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
+            shared_output_q, shared_output_s, router_logits = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
+                hidden_states_shared = hidden_states_shared,
+                hidden_states_shared_scale = hidden_states_shared_scale,
+                weight_gate_up = self.shared_experts.gate_up_proj.weight,
+                weight_scale_gate_up = self.shared_experts.gate_up_proj.weight_scale_inv,
+                hidden_states_moe_gate = hidden_states,
+                weight_moe_gate = self.gate.weight,
+                bias_shared = self.shared_experts.gate_up_proj.bias if not self.shared_experts.gate_up_proj.skip_bias_add else None,
+                bias_moe_gate = self.gate.bias if not self.gate.skip_bias_add else None,
+            )
 
-            # if hasattr(torch._dynamo, "is_compiling") and torch._dynamo.is_compiling():
-            #     torch._dynamo.graph_break() 
-            shared_output, final_hidden_states = self.forward_shared_experts(hidden_states, hidden_states_shared)
+            if self.alt_stream is not None and VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16:
+                shared_output, final_hidden_states = torch.ops.vllm.streams_breaks(
+                    layer_prefix=self.prefix,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                    hidden_states=hidden_states,
+                    shared_output_q=shared_output_q,
+                    shared_output_s=shared_output_s, 
+                    router_logits=router_logits,
+                )
+
+            #ignoreThis = torch.ops.vllm.streams_breaks(hidden_states[0])
+
+            #shared_output, final_hidden_states = self.forward_shared_experts(hidden_states, hidden_states_shared)
             did_fma = True
             # hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
             # shared_output_q, shared_output_s, router_logits = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
@@ -369,34 +505,6 @@ class DeepseekV2MoE(nn.Module):
             # #Guard to prevent repeated lines
             # did_fma = False
             # if self.alt_stream is not None: #and VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16: #Commented out for debugging purposes
-            #     current_stream = torch.cuda.current_stream()
-            #     self.alt_stream.wait_stream(current_stream)
-
-            #     # if hasattr(torch.cuda, "nvtx"):
-            #     #     torch.cuda.nvtx.range_push("deepseek_alt_downproj")
-
-
-            #     with torch.cuda.stream(self.alt_stream):
-            #         shared_output, _ = self.shared_experts.down_proj(
-            #             shared_output_q, x_quant_scales = shared_output_s
-            #         )
-
-
-            #     # if hasattr(torch.cuda, "nvtx"):
-            #     #     torch.cuda.nvtx.range_pop()
-
-            #     final_hidden_states = self.experts(
-            #         hidden_states=hidden_states,
-            #         router_logits=router_logits
-            #     )
-                
-            #     current_stream.wait_stream(self.alt_stream)
-                
-            #     final_hidden_states = fused_mul_add(
-            #         final_hidden_states, self.routed_scaling_factor, shared_output
-            #     )
-
-            #     did_fma = True
             # else:
             #     shared_output, _ = self.shared_experts.down_proj(shared_output_q, x_quant_scales = shared_output_s)
         else:
@@ -432,7 +540,9 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1:
             final_hidden_states = (
                 self.experts.maybe_all_reduce_tensor_model_parallel(
-                    final_hidden_states))
+                    final_hidden_states
+                    )
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -855,6 +965,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
+
+        if isinstance(self.mlp, DeepseekV2MoE):
+            compilation_config = get_current_vllm_config().compilation_config
+            name = self.mlp.prefix  # e.g., "model.layers.12.mlp"
+            if name in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name in static_forward_context: {name}")
+            compilation_config.static_forward_context[name] = self.mlp
+
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
@@ -978,6 +1096,12 @@ class DeepseekV2Model(nn.Module):
             ),
             prefix=f"{prefix}.layers")
 
+        self._moe_modules = []
+        for layer in self.layers:
+            mlp = getattr(layer, "mlp", None)
+            if isinstance(mlp, DeepseekV2MoE):
+                self._moe_modules.append(mlp)
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
@@ -996,6 +1120,16 @@ class DeepseekV2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        #torch.ops.vllm.streams_break()
+        # One-time registration of no-compile MoE layers
+        # if self not in _registered_models:
+        #     from vllm.forward_context import get_forward_context
+        #     ctx = get_forward_context()  # valid now (we're in a real forward)
+        #     for m in self._moe_modules:
+        #         # register by name -> module object; streams_break will honor these
+        #         ctx.no_compile_layers[m.prefix] = m
+        #     _registered_models.add(self)
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds

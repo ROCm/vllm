@@ -223,7 +223,7 @@ class CompilationConfig:
     constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
 
     # CudaGraph compilation
-    cudagraph_mode: Optional[CUDAGraphMode] = CUDAGraphMode.FULL
+    cudagraph_mode: Optional[CUDAGraphMode] = CUDAGraphMode.PIECEWISE #Hard coding this but will return it back later
     """
     The mode of the cudagraph:
 
@@ -340,6 +340,7 @@ class CompilationConfig:
         "vllm.mamba_mixer",
         "vllm.short_conv",
         "vllm.linear_attention",
+        "vllm.streams_breaks",
     ]
 
     def compute_hash(self) -> str:
@@ -569,6 +570,10 @@ class CompilationConfig:
                     "any problems.")
                 self.cudagraph_mode = CUDAGraphMode.FULL
             self.splitting_ops = []
+        if "vllm.streams_breaks" not in self.splitting_ops:
+            self.splitting_ops.append("vllm.streams_breaks")
+        print(f"[compile][DEBUGOMAR] final splitting_ops={self.splitting_ops} "
+                f"mode={self.cudagraph_mode} level={self.level}")
 
     def splitting_ops_contain_attention(self) -> bool:
         return self.splitting_ops is not None and all(
