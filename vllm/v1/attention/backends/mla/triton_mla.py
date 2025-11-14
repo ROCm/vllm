@@ -129,14 +129,20 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 q, k, v, softmax_scale=softmax_scale, **kwargs
             )
         else:
-            return super()._flash_attn_varlen_diff_headdims(
-                q,
-                k,
-                v,
-                return_softmax_lse=return_softmax_lse,
+            from aiter.ops.triton.mha import flash_attn_varlen_func
+            result =  flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                return_lse=return_softmax_lse,
                 softmax_scale=softmax_scale,
                 **kwargs,
             )
+            if type(result) is tuple and return_softmax_lse:
+                output, lse = result
+                lse = lse.T.contiguous()
+                return (output, lse)
+            return result
 
     def _forward_decode(
         self,
