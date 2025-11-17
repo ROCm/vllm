@@ -28,6 +28,7 @@ export SAFETENSORS_FAST_GPU=1
 model_path=/data/pretrained-models/amd/DeepSeek-R1-MXFP4-Preview
 echo "running $model_path"
 
+# FIXME: for now use 0.8 for memory utilization
 vllm serve $model_path \
   --host localhost \
   --port 9000 \
@@ -37,7 +38,7 @@ vllm serve $model_path \
   --no-enable-prefix-caching \
   --disable-log-requests \
   --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
-  --gpu_memory_utilization 0.9 \
+  --gpu_memory_utilization 0.8 \
   --block-size 1 \
   --seed 123 2>&1 | tee log.server.log &
 
