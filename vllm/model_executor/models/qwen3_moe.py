@@ -74,6 +74,7 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+import aiter
 
 logger = init_logger(__name__)
 
@@ -300,16 +301,30 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        
+        qw = self.q_norm.weight.data
+        kw = self.k_norm.weight.data
+        is_neox_style = self.rotary_emb.is_neox_style
+        mrope_section = self.rotary_emb.mrope_section
+        is_interleaved = self.rotary_emb.mrope_interleaved
+        cos_sin = self.rotary_emb.cos_sin_cache
+        eps = 1e-6
+        num_tokens = qkv.numel() // (self.num_heads + self.num_kv_heads * 2) // self.head_dim
+        aiter.fused_mrope_3d_rms(qkv, qw, kw, cos_sin, positions, num_tokens, 
+            self.num_heads, self.num_kv_heads, self.num_kv_heads, self.head_dim, is_neox_style, mrope_section,
+            is_interleaved, eps)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        # Add qk-norm
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
+        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # # Add qk-norm
+        # q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+        # q_by_head = self.q_norm(q_by_head)
+        # q = q_by_head.view(q.shape)
+
+        # k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+        # k_by_head = self.k_norm(k_by_head)
+        # k = k_by_head.view(k.shape)
+        # q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
