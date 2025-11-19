@@ -68,6 +68,7 @@ ARG PYTORCH_BRANCH
 ARG PYTORCH_VISION_BRANCH
 ARG PYTORCH_REPO
 ARG PYTORCH_VISION_REPO
+RUN apt-get install -y pkg-config
 RUN git clone ${PYTORCH_REPO} pytorch
 RUN cd pytorch && git checkout ${PYTORCH_BRANCH} && \
     pip install -r requirements.txt && git submodule update --init --recursive \
