@@ -31,17 +31,18 @@ echo "running $model_path"
 # FIXME: for now use 0.8 for memory utilization
 vllm serve $model_path \
   --host localhost \
-  --port 6789 \
+  --port 9000 \
   --tensor-parallel-size 8 \
   --max-num-batched-tokens 32768 \
   --trust-remote-code \
   --no-enable-prefix-caching \
   --disable-log-requests \
-  --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
+  --enforce-eager \
   --gpu_memory_utilization 0.7 \
   --async-scheduling \
+  --block-size 16 \
   --load-format fastsafetensors \
   --seed 123 2>&1 | tee log.server.log &
 
-  # --enforce-eager \
+# --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
   # --enable-expert-parallel \
