@@ -17,9 +17,9 @@ export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 rm -rf /root/.cache/
 
 # BF16 model
-# model_path=/data/pretrained-models/Qwen3-235B-A22B-Instruct-2507
+# model_path=Qwen/Qwen3-235B-A22B-Instruct-2507
 # FP8 model, pure TP8 unsupported due to MoE weight not being divisible by 8, so run with TP8 + EP8 first
-model_path=/data/pretrained-models/Qwen3-235B-A22B-Instruct-2507-FP8
+model_path=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8
 vllm serve $model_path \
     --tensor-parallel-size 8 \
     --max-num-batched-tokens 32768 \
