@@ -46,6 +46,28 @@ Qwen/Qwen3-Next-80B-A3B-Instruct
 |     |       |strict-match    |     5|exact_match|_  |0.8135|_  |0.0107|
 ```
 
+### Qwen3-235B-A22B
+
+Qwen/Qwen3-235B-A22B-Instruct-2507
+
+```shell
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9022|±  |0.0082|
+|     |       |strict-match    |     5|exact_match|↑  |0.8946|±  |0.0085|
+```
+
+### Qwen3-235B-A22B-FP8
+
+Qwen/Qwen3-235B-A22B-Instruct-2507-FP8
+
+```shell
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9022|±  |0.0082|
+|     |       |strict-match    |     5|exact_match|↑  |0.8901|±  |0.0086|
+```
+
 ## VLMs and Omni Models (mistral-eval on chartqa)
 
 ### Qwen2.5-VL-72B
@@ -93,6 +115,18 @@ Metrics:
 {
     "explicit_prompt_relaxed_correctness": 0.8724,
     "anywhere_in_answer_relaxed_correctness": 0.874
+}
+```
+
+### Qwen3-VL-235B Block Scale FP8
+
+Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+
+```shell
+Metrics:
+{
+    "explicit_prompt_relaxed_correctness": 0.868,
+    "anywhere_in_answer_relaxed_correctness": 0.8688
 }
 ```
 
