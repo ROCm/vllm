@@ -130,7 +130,8 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             )
         else:
             from aiter.ops.triton.mha import flash_attn_varlen_func
-            result =  flash_attn_varlen_func(
+
+            result = flash_attn_varlen_func(
                 q=q,
                 k=k,
                 v=v,
