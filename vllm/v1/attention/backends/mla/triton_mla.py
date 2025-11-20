@@ -128,7 +128,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             return self._flash_attn_varlen_diff_headdims_rocm(
                 q, k, v, softmax_scale=softmax_scale, **kwargs
             )
-        else:
+        elif current_platform.is_rocm():
             from aiter.ops.triton.mha import flash_attn_varlen_func
             result =  flash_attn_varlen_func(
                 q=q,
@@ -143,6 +143,15 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                 lse = lse.T.contiguous()
                 return (output, lse)
             return result
+        else:
+            return super()._flash_attn_varlen_diff_headdims(
+                q,
+                k,
+                v,
+                return_softmax_lse=return_softmax_lse,
+                softmax_scale=softmax_scale,
+                **kwargs,
+            )
 
     def _forward_decode(
         self,
