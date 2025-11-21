@@ -55,6 +55,10 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     paged_kv_last_page_len: torch.Tensor | None = None
     # The query indptr, shape : [num_decode + 1]
     qo_indptr: torch.Tensor | None = None
+    # The num_kv_splits indptr, shape : [num_decode + 1]
+    num_kv_splits_indptr: torch.Tensor | None = None
+    # Number of kv splits
+    num_kv_splits: int | None = 16
 
 
 class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
@@ -199,6 +203,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr,
+            num_kv_splits_indptr=num_kv_splits_indptr,
+            num_kv_splits=self.num_kv_splits,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
         )
 
@@ -298,6 +304,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             attn_metadata.decode.paged_kv_indptr,
             attn_metadata.decode.paged_kv_indices,
             attn_metadata.decode.paged_kv_last_page_len,
+            num_kv_splits=attn_metadata.decode.num_kv_splits,
+            num_kv_splits_indptr=attn_metadata.decode.num_kv_splits_indptr,
         )
 
         return o, None
