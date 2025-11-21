@@ -513,6 +513,20 @@ def mxfp4_w4a4_moe_quant_config(
     )
 
 
+def biased_moe_quant_config(
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+) -> FusedMoEQuantConfig:
+    """
+    Construct a quant config for unquantized activations with biases.
+    """
+    return FusedMoEQuantConfig(
+        _a1=FusedMoEQuantDesc(),
+        _a2=FusedMoEQuantDesc(),
+        _w1=FusedMoEQuantDesc(bias=w1_bias),
+        _w2=FusedMoEQuantDesc(bias=w2_bias),
+    )
+
 # A FusedMoEQuantConfig constant for an unquantized MoE op.
 FUSED_MOE_UNQUANTIZED_CONFIG: FusedMoEQuantConfig = FusedMoEQuantConfig.make()
 
