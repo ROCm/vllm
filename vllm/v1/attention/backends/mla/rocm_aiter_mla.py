@@ -87,6 +87,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         max_num_pages_per_req = cdiv(
             vllm_config.model_config.max_model_len, self.kv_cache_spec.block_size
         )
+        self.num_kv_splits = 16
+        # kernel block size is always 1.
+        max_num_pages_per_req = vllm_config.model_config.max_model_len
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
 
@@ -112,6 +115,13 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
             self.qo_indptr = torch.arange(
                 0, max_num_reqs + 1, dtype=torch.int32, device=device
+            )
+            self.num_kv_splits_indptr = torch.arange(
+                0,
+                (max_num_reqs + 1) * self.num_kv_splits,
+                self.num_kv_splits,
+                dtype=torch.int32,
+                device=device,
             )
 
     def _build_decode(
@@ -189,11 +199,20 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self.paged_kv_last_page_len[num_reqs:].fill_(1)
             paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
+            num_kv_splits_indptr = self.num_kv_splits_indptr[: num_reqs + 1]
+
             qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
         else:
             qo_indptr = torch.arange(
                 0, num_reqs + 1, step=1, dtype=torch.int32, device=device
+            )
+            num_kv_splits_indptr = torch.arange(
+                0,
+                (num_reqs + 1) * self.num_kv_splits,
+                step=self.num_kv_splits,
+                dtype=torch.int32,
+                device=device,
             )
 
         attn_metadata = AiterMLADecodeMetadata(
