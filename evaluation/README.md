@@ -98,6 +98,7 @@
     export VLLM_TORCH_PROFILER_DIR="deepseek_in3k_out1k"
     export VLLM_TORCH_PROFILER_WITH_STACK=1
     export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
+    export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1
 
     model_path="/path-to-model/deepseek-r1-FP8-Dynamic/"
     vllm serve $model_path \
@@ -108,7 +109,6 @@
     --disable-log-requests \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --gpu_memory_utilization 0.9 \
-    --block-size 1 \
     --async-scheduling
     ```
 
