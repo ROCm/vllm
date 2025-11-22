@@ -84,12 +84,10 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         )
 
         self.compilation_config = vllm_config.compilation_config
+        self.num_kv_splits = 16
         max_num_pages_per_req = cdiv(
             vllm_config.model_config.max_model_len, self.kv_cache_spec.block_size
         )
-        self.num_kv_splits = 16
-        # kernel block size is always 1.
-        max_num_pages_per_req = vllm_config.model_config.max_model_len
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
 
