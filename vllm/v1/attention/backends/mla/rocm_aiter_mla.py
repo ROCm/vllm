@@ -55,6 +55,10 @@ class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
     paged_kv_last_page_len: torch.Tensor | None = None
     # The query indptr, shape : [num_decode + 1]
     qo_indptr: torch.Tensor | None = None
+    # The num_kv_splits indptr, shape : [num_decode + 1]
+    num_kv_splits_indptr: torch.Tensor | None = None
+    # Number of kv splits
+    num_kv_splits: int | None = 16
 
 
 class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
@@ -80,6 +84,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         )
 
         self.compilation_config = vllm_config.compilation_config
+        self.num_kv_splits = 16
         max_num_pages_per_req = cdiv(
             vllm_config.model_config.max_model_len, self.kv_cache_spec.block_size
         )
@@ -108,6 +113,13 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
             self.qo_indptr = torch.arange(
                 0, max_num_reqs + 1, dtype=torch.int32, device=device
+            )
+            self.num_kv_splits_indptr = torch.arange(
+                0,
+                (max_num_reqs + 1) * self.num_kv_splits,
+                self.num_kv_splits,
+                dtype=torch.int32,
+                device=device,
             )
 
     def _build_decode(
@@ -185,11 +197,20 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self.paged_kv_last_page_len[num_reqs:].fill_(1)
             paged_kv_last_page_len = self.paged_kv_last_page_len[:num_reqs]
 
+            num_kv_splits_indptr = self.num_kv_splits_indptr[: num_reqs + 1]
+
             qo_indptr = self.qo_indptr[: 1 + num_reqs]
 
         else:
             qo_indptr = torch.arange(
                 0, num_reqs + 1, step=1, dtype=torch.int32, device=device
+            )
+            num_kv_splits_indptr = torch.arange(
+                0,
+                (num_reqs + 1) * self.num_kv_splits,
+                step=self.num_kv_splits,
+                dtype=torch.int32,
+                device=device,
             )
 
         attn_metadata = AiterMLADecodeMetadata(
@@ -199,6 +220,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_indices=paged_kv_indices,
             paged_kv_last_page_len=paged_kv_last_page_len,
             qo_indptr=qo_indptr,
+            num_kv_splits_indptr=num_kv_splits_indptr,
+            num_kv_splits=self.num_kv_splits,
             dcp_tot_seq_lens=dcp_tot_seq_lens_device,
         )
 
@@ -298,6 +321,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             attn_metadata.decode.paged_kv_indptr,
             attn_metadata.decode.paged_kv_indices,
             attn_metadata.decode.paged_kv_last_page_len,
+            num_kv_splits=attn_metadata.decode.num_kv_splits,
+            num_kv_splits_indptr=attn_metadata.decode.num_kv_splits_indptr,
         )
 
         return o, None
