@@ -99,11 +99,11 @@ class PassConfig:
     don't all have access to full configuration - that would create a cycle as
     the `PassManager` is set as a property of config."""
 
-    enable_fusion: bool = False
+    enable_fusion: bool = True
     """Whether to enable the custom fusion (RMSNorm/SiluMul+quant) pass."""
-    enable_attn_fusion: bool = False
+    enable_attn_fusion: bool = True
     """Whether to enable the custom attention+quant fusion pass."""
-    enable_noop: bool = False
+    enable_noop: bool = True
     """Whether to enable the custom no-op elimination pass."""
     enable_sequence_parallelism: bool = False
     """Whether to enable sequence parallelism."""
@@ -409,7 +409,7 @@ class CompilationConfig:
     constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
 
     # CudaGraph compilation
-    cudagraph_mode: CUDAGraphMode | None = None
+    cudagraph_mode: CUDAGraphMode | None = CUDAGraphMode.FULL
     """
     The mode of the cudagraph:
 
@@ -683,6 +683,17 @@ class CompilationConfig:
         count_all = self.custom_ops.count("all")
         assert count_none + count_all <= 1, "Can only specify 'none' or 'all'"
 
+        def add_default_custom_op(op_name: str):
+            if (
+                f"+{op_name}" not in self.custom_ops
+                and f"-{op_name}" not in self.custom_ops
+            ):
+                self.custom_ops.append(f"+{op_name}")
+
+        add_default_custom_op("rms_norm")
+        add_default_custom_op("silu_and_mul")
+        add_default_custom_op("quant_fp8")
+
         # TODO(zou3519/luka): There are 2 issues with auto-functionalization V2:
         # 1. A bug in PyTorch, fixed in 2.7:
         #    https://github.com/pytorch/pytorch/issues/147924
@@ -914,6 +925,15 @@ class CompilationConfig:
             "attention ops should not be in splitting_ops "
             "when enable_attn_fusion is True"
         )
+
+    def add_missing_attention_splitting_ops(self):
+        if self.splitting_ops is None:
+            self.splitting_ops = list(self._attention_ops)
+            return
+
+        for op in self._attention_ops:
+            if op not in self.splitting_ops:
+                self.splitting_ops.append(op)
 
     def splitting_ops_contain_attention(self) -> bool:
         return self.splitting_ops is not None and all(
