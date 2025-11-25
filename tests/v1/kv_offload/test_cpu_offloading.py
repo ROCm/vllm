@@ -20,6 +20,9 @@ ATTN_BACKENDS = ["FLASH_ATTN"]
 
 if current_platform.is_cuda():
     ATTN_BACKENDS.append("FLASHINFER")
+elif current_platform.is_rocm():
+    # ATTN_BACKENDS = ["ROCM_AITER_FA"]
+    ATTN_BACKENDS = ["ROCM_ATTN"]
 
 
 class MockSubscriber:
@@ -161,6 +164,7 @@ def test_cpu_offloading(cpu_block_size: int, attn_backend: str) -> None:
         kv_role="kv_both",
         kv_connector_extra_config={
             "num_cpu_blocks": 1000,
+            # "num_cpu_blocks": 2000,
             "block_size": cpu_block_size,
         },
     )
