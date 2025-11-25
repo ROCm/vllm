@@ -1,5 +1,4 @@
 export VLLM_USE_V1=1
-export VLLM_USE_TRITON_FLASH_ATTN=0
 # export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_RPC_TIMEOUT=1800000
 export VLLM_ROCM_USE_AITER=1
@@ -10,7 +9,7 @@ export VLLM_ROCM_USE_AITER_TRITON_ROPE=1 # add for acc
 export VLLM_DISABLE_COMPILE_CACHE=1
 # FIXME: for now disable fp4 asm gemm because of running issue
 export VLLM_ROCM_USE_AITER_FP4_ASM_GEMM=0
-#export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0 # for now disable
+export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0 # disable for acc
 
 export TRITON_HIP_ASYNC_COPY_BYPASS_PERMUTE=1
 export TRITON_HIP_USE_ASYNC_COPY=1
@@ -28,7 +27,6 @@ export SAFETENSORS_FAST_GPU=1
 model_path=/data/pretrained-models/amd/DeepSeek-R1-MXFP4-Preview
 echo "running $model_path"
 
-# FIXME: for now use 0.8 for memory utilization
 vllm serve $model_path \
   --host localhost \
   --port 9000 \

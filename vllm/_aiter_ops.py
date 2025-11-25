@@ -344,6 +344,8 @@ def _rocm_aiter_mla_decode_fwd_impl(
     logit_cap: float = 0.0,
     q_scale: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+    num_kv_splits_indptr: torch.Tensor | None = None,
 ) -> None:
     from aiter.mla import mla_decode_fwd
 
@@ -360,6 +362,8 @@ def _rocm_aiter_mla_decode_fwd_impl(
         logit_cap=logit_cap,
         q_scale=q_scale,
         kv_scale=kv_scale,
+        num_kv_splits=num_kv_splits,
+        num_kv_splits_indptr=num_kv_splits_indptr,
     )
 
 
@@ -376,6 +380,8 @@ def _rocm_aiter_mla_decode_fwd_fake(
     logit_cap: float = 0.0,
     q_scale: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
+    num_kv_splits_indptr: torch.Tensor | None = None,
 ) -> None:
     pass
 
@@ -875,6 +881,8 @@ class rocm_aiter_ops:
         logit_cap: float = 0.0,
         q_scale: torch.Tensor | None = None,
         kv_scale: torch.Tensor | None = None,
+        num_kv_splits: int | None = None,
+        num_kv_splits_indptr: torch.Tensor | None = None,
     ):
         torch.ops.vllm.rocm_aiter_mla_decode_fwd(
             q,
@@ -889,6 +897,8 @@ class rocm_aiter_ops:
             logit_cap=logit_cap,
             q_scale=q_scale,
             kv_scale=kv_scale,
+            num_kv_splits=num_kv_splits,
+            num_kv_splits_indptr=num_kv_splits_indptr,
         )
 
     @staticmethod
