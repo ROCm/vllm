@@ -244,10 +244,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from aiter.ops.shuffle import shuffle_weight
 
             import vllm._aiter_ops as aiter_ops
+            import torch.nn.functional as F
 
             layout = (16, 16)
 
             weight = layer.weight
+            
+            # Pad weight K dimension to multiples of 32
+            num_pad = aiter_ops.calc_padding_to_multiples_of_32(weight.shape[-1])
+            weight = F.pad(weight, (0, num_pad), "constant", 0)
 
             if aiter_ops.can_shuffle(weight.shape[0], weight.shape[1], layout):
                 shuffled_weight = shuffle_weight(weight, layout).t()

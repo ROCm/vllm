@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
+import torch.nn.functional as F
 
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -10,6 +11,10 @@ def can_shuffle(n: int, k: int, layout: tuple[int, int]) -> bool:
     IN, IK = layout
     BK = IK * 2
     return (n % IN == 0) and (k % BK == 0)
+
+
+def calc_padding_to_multiples_of_32(k: int) -> int:
+    return -k % 32
 
 
 def rocm_aiter_per_tensor_quant_impl(
@@ -141,6 +146,11 @@ class aiter_ops:
             f"hip_bpreshuffle_gemm only supports bfloat16 output dtype"
             f", you have passed in {out_dtype}"
         )
+        
+        # Pad input K dimension to multiples of 32
+        num_pad = calc_padding_to_multiples_of_32(input.shape[-1])
+        input = F.pad(input, (0, num_pad), "constant", 0)
+        
         if input.dim() >= 3:
             inp_view = input.view(-1, input.size(-1))
             batched = True

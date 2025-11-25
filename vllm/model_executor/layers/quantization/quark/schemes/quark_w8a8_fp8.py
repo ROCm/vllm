@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     Fp8LinearOp,
     normalize_e4m3fn_to_e4m3fnuz,
     requantize_with_max_scale,
+    is_rocm_aiter_swizzle_hipb_mm_enabled,
 )
 from vllm.model_executor.parameter import (
     ChannelQuantScaleParameter,
@@ -104,7 +105,13 @@ class QuarkW8A8Fp8(QuarkScheme):
             if self.act_quant_group_shape == GroupShape.PER_TOKEN:
                 weight_scale = weight_scale.view(-1, 1)
 
-            from vllm._aiter_ops import can_shuffle
+            from vllm._aiter_ops import can_shuffle, calc_padding_to_multiples_of_32
+            import torch.nn.functional as F
+            
+            if is_rocm_aiter_swizzle_hipb_mm_enabled():
+                # Pad weight K dimension to multiples of 32
+                num_pad = calc_padding_to_multiples_of_32(weight.shape[-1])
+                weight = F.pad(weight, (0, num_pad), "constant", 0)
 
             layout = (16, 16)
             use_swizzle_gemm = can_shuffle(*weight.shape, layout=layout)

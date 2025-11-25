@@ -27,6 +27,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     Fp8LinearOp,
     cutlass_block_fp8_supported,
     maybe_create_device_identity,
+    is_rocm_aiter_swizzle_hipb_mm_enabled,
 )
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
@@ -150,7 +151,13 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 layer.weight, layer.weight_scale, getattr(layer, "input_scale", None)
             )
 
-            from vllm._aiter_ops import can_shuffle
+            from vllm._aiter_ops import can_shuffle, calc_padding_to_multiples_of_32
+            import torch.nn.functional as F
+            
+            if is_rocm_aiter_swizzle_hipb_mm_enabled():
+                # Pad weight K dimension to multiples of 32
+                num_pad = calc_padding_to_multiples_of_32(weight.shape[-1])
+                weight = F.pad(weight, (0, num_pad), "constant", 0)
 
             layout = (16, 16)
             use_swizzle_gemm = can_shuffle(*weight.shape, layout=layout)
