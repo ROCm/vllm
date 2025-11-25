@@ -104,10 +104,10 @@ class QuarkW8A8Fp8(QuarkScheme):
             if self.act_quant_group_shape == GroupShape.PER_TOKEN:
                 weight_scale = weight_scale.view(-1, 1)
 
-            from vllm._aiter_ops import can_shuffle
+            from vllm._aiter_ops import rocm_aiter_ops
 
             layout = (16, 16)
-            use_swizzle_gemm = can_shuffle(*weight.shape, layout=layout)
+            use_swizzle_gemm = rocm_aiter_ops.can_shuffle(*weight.shape, layout=layout)
             self.use_aiter_and_is_supported = (
                 self.use_aiter_and_is_supported and use_swizzle_gemm
             )

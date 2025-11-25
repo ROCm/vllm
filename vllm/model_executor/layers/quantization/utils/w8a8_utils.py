@@ -8,13 +8,14 @@ from packaging import version
 
 from vllm import _custom_ops as ops
 from vllm import envs
-from vllm._aiter_ops import aiter_ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm, has_flashinfer
+from vllm.utils.platform_utils import get_cu_count
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -220,7 +221,7 @@ def rocm_aiter_per_tensor_w8a8_scaled_mm(
     bias: torch.Tensor,
     output_shape: list,
 ) -> torch.Tensor:
-    output = aiter_ops.rocm_aiter_tuned_gemm(
+    output = rocm_aiter_ops.rocm_aiter_tuned_gemm(
         qinput,
         weight.t(),
         out_dtype=out_dtype,
@@ -271,7 +272,7 @@ def rocm_per_tensor_w8a8_scaled_mm_impl(
             out_dtype,
             scale_a,
             scale_b,
-            current_platform.get_cu_count(),
+            get_cu_count(),
             bias,
         )
     else:
@@ -587,6 +588,7 @@ class Fp8LinearOp:
         # Example:
         # When the number of token is 1, per-token scale is [[1]]
         # When per-tensor scale is [1] or ().
+        per_tensor_weights = weight_scale.numel() == 1
         per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
         if self.use_aiter_and_is_supported and not (

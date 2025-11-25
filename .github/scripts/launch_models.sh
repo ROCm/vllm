@@ -33,7 +33,7 @@ case "$MODEL_NAME" in
     export NCCL_DEBUG=WARN
     #export VLLM_LOGGING_LEVEL=DEBUG
     export VLLM_ROCM_USE_AITER_MHA=0
-    export VLLM_ROCM_USE_TRITON_ROPE=1
+    export VLLM_ROCM_USE_AITER_TRITON_ROPE=1
     
     export VLLM_TORCH_PROFILER_DIR="deepseek_in3k_out1k"
     export VLLM_TORCH_PROFILER_WITH_STACK=1
@@ -63,7 +63,7 @@ case "$MODEL_NAME" in
     export NCCL_DEBUG=WARN
     export VLLM_RPC_TIMEOUT=1800000
     export VLLM_ROCM_USE_AITER_MHA=0
-    export VLLM_ROCM_USE_TRITON_ROPE=1 # add for acc
+    export VLLM_ROCM_USE_AITER_TRITON_ROPE=1 # add for acc
     export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 
     
     MODEL_PATH="${MODEL_PATH_OVERRIDE:-deepseek-ai/DeepSeek-R1}"

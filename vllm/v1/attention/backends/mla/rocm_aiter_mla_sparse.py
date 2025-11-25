@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from vllm import _custom_ops as ops
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionLayer,
@@ -18,7 +19,9 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import (
     MLACommonBaseImpl,
-    is_rocm_aiter_fp8bmm_enabled,
+)
+from vllm.v1.attention.backends.mla.flashmla_sparse import (
+    triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
@@ -31,28 +34,13 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 logger = init_logger(__name__)
 
-if is_rocm_aiter_fp8bmm_enabled():
-    from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501
-        batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as aiter_triton_fp8_bmm,  # noqa: E501
-    )
-
-    def dynamic_per_batched_tensor_quant(
-        x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
-    ):
-        DTYPE_MAX = torch.finfo(dtype).max
-        min_val, max_val = x.aminmax()
-        amax = torch.maximum(min_val.abs(), max_val.abs()).clamp(min=1e-10)
-        scale = DTYPE_MAX / amax
-        x_scl_sat = (x * scale).clamp(min=-DTYPE_MAX, max=DTYPE_MAX)
-        return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
-
 
 class ROCMAiterMLASparseBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @staticmethod
     def get_name() -> str:
-        return "ROCMAITERMLA_SPARSE"
+        return "ROCM_AITER_MLA_SPARSE"
 
     @staticmethod
     def get_metadata_cls() -> type[AttentionMetadata]:
@@ -97,50 +85,15 @@ class ROCMAiterMLASparseMetadata:
 
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
-    block_size: int = 64
+    block_size: int = 1
     topk_tokens: int = 2048
-
-
-def ref_convert_to_global(
-    req_id: torch.Tensor,
-    block_table: torch.Tensor,
-    token_indices: torch.Tensor,
-    block_size: int,
-) -> torch.Tensor:
-    # Ensure contiguous
-    req_id_c = req_id.contiguous()
-    block_table_c = block_table.contiguous()
-    token_indices_c = token_indices.contiguous()
-    max_num_blocks = block_table_c.size(-1)
-
-    # Compute block index and intra-block offset
-    idxs_in = token_indices_c // block_size
-    idxs_out = token_indices_c % block_size
-
-    block_table_indexed = block_table_c[req_id_c]
-
-    invalid = (idxs_in < 0) | (idxs_in >= max_num_blocks)
-
-    idxs_in_clamped = idxs_in.masked_fill(invalid, 0)
-
-    num_tokens = idxs_in_clamped.size(0)
-    rest = idxs_in_clamped.numel() // num_tokens
-    gathered = torch.gather(
-        block_table_indexed, 1, idxs_in_clamped.view(num_tokens, rest)
-    ).view_as(idxs_in_clamped)
-
-    # Compute global indices and apply invalid mask
-    out = gathered * block_size + idxs_out
-    out = out.masked_fill(invalid, -1)
-
-    return out
 
 
 @dataclass
 class ROCMAiterMLASparseMetadataBuilder(
     AttentionMetadataBuilder[ROCMAiterMLASparseMetadata]
 ):
-    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
     def __init__(
         self,
@@ -212,7 +165,7 @@ class ROCMAiterMLASparseMetadataBuilder(
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/test_flash_mla_prefill.py#L72
 def reference_mla_sparse_prefill(
     q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sm_scale: float, d_v: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     import math
 
     def log2sumexp2(a: torch.Tensor, dim: int) -> torch.Tensor:
@@ -224,20 +177,17 @@ def reference_mla_sparse_prefill(
     dqk = q.shape[-1]
     indices = indices[:, 0, :]  # [s_q, topk]
     invalid_indices_mask = (indices < 0) | (indices >= skv)
-    qs = q.float()  # [s_q, h_q, d_qk]
-    kvs = kv[:, 0, :].float()  # [s_kv, d_qk]
+    indices[invalid_indices_mask] = 0
+    qs = q  # [s_q, h_q, d_qk]
+    kvs = kv[:, 0, :][indices].view(sq, topk, dqk)  # [s_q, topk, d_qk]
 
-    kvs = torch.index_select(
-        kvs, 0, indices.masked_fill(invalid_indices_mask, 0).flatten()
-    ).view(sq, topk, dqk)  # [s_q, topk, d_qk]
-    attn_score = qs @ kvs.transpose(1, 2)  # [s_q, h_q, topk]
+    attn_score = (qs @ kvs.transpose(1, 2)).float()  # [s_q, h_q, topk]
     attn_score.masked_fill_(invalid_indices_mask.unsqueeze(1), float("-inf"))
     attn_score *= sm_scale * math.log2(math.e)
-    max_logits = torch.max(attn_score, dim=-1)[0]  # [s_q, h_q]
     lse = log2sumexp2(attn_score, dim=-1)  # [s_q, h_q]
     attn_score = torch.exp2(attn_score - lse.unsqueeze(-1))  # [s_q, h_q, topk]
-    result = attn_score @ kvs[:, :, :d_v]
-    return (result.to(q.dtype), max_logits, lse)
+    result = attn_score.to(q.dtype) @ kvs[:, :, :d_v]
+    return (result, lse)
 
 
 class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
@@ -274,6 +224,7 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
         self.softmax_scale = scale
         assert indexer is not None
         self.topk_indices_buffer = indexer.topk_indices_buffer
+        self.is_fp8bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
 
     def _forward_bf16_kv(
         self,
@@ -312,7 +263,7 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
 
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
-                "fused output quantization is not yet supported for MLACommonImpl"
+                "fused output quantization is not yet supported for ROCMAiterMLASparse"
             )
 
         if attn_metadata is None:
@@ -332,9 +283,9 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         # Convert from (B, N, P) to (N, B, P)
         q_nope = q_nope.transpose(0, 1)
-        if is_rocm_aiter_fp8bmm_enabled():
+        if self.is_fp8bmm_enabled:
             # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
-            ql_nope = aiter_triton_fp8_bmm(
+            ql_nope = rocm_aiter_ops.triton_fp8_bmm(
                 q_nope, self.W_K, self.W_K_scale, group_size=128, transpose_bm=True
             )
         else:
@@ -345,14 +296,12 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
 
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
-        # Note: the above triton kernel may triggers some strange unexpected
-        # crush on Mi300, although the code looks fine on memory access pattern,
-        # this ref torch  impl can help to alleviate this issue.
-        topk_indices_global = ref_convert_to_global(
+        topk_indices_global = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
             attn_metadata.block_table,
             topk_indices,
-            attn_metadata.block_size,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
 
         q = torch.cat([ql_nope, q_pe], dim=-1)

@@ -9,7 +9,7 @@ export VLLM_USE_V1=1 # default v1
 #export VLLM_LOGGING_LEVEL=DEBUG
 #export VLLM_RPC_TIMEOUT=1800000
 #export VLLM_ROCM_USE_AITER_MHA=0
-#export VLLM_ROCM_USE_TRITON_ROPE=1 # add for acc
+#export VLLM_ROCM_USE_AITER_TRITON_ROPE=1 # add for acc
 export VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=1 # need tuning for different scenarios
 
 # for profiling

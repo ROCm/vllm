@@ -100,7 +100,7 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm._aiter_ops import aiter_ops
+        from vllm._aiter_ops import rocm_aiter_ops
 
         use_aiter_quant = (
             not self.is_group_quant
@@ -116,9 +116,9 @@ class QuantFP8(CustomOp):
         )
 
         if use_aiter_per_tensor_quant:
-            return aiter_ops.rocm_aiter_per_tensor_quant(x, scale, _FP8_DTYPE)
+            return rocm_aiter_ops.rocm_aiter_per_tensor_quant(x, scale, _FP8_DTYPE)
         if use_aiter_per_token_quant:
-            return aiter_ops.rocm_aiter_per_token_quant(x, scale, _FP8_DTYPE)
+            return rocm_aiter_ops.rocm_aiter_per_token_quant(x, scale, _FP8_DTYPE)
         # Fallback to CUDA implementation
         return self.forward_cuda(x, scale, scale_ub)
 
