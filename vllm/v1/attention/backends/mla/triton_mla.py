@@ -128,6 +128,21 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             return self._flash_attn_varlen_diff_headdims_rocm(
                 q, k, v, softmax_scale=softmax_scale, **kwargs
             )
+        elif current_platform.is_rocm():
+            from aiter.ops.triton.mha import flash_attn_varlen_func
+            result =  flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                return_lse=return_softmax_lse,
+                softmax_scale=softmax_scale,
+                **kwargs,
+            )
+            if type(result) is tuple and return_softmax_lse:
+                output, lse = result
+                lse = lse.T.contiguous()
+                return (output, lse)
+            return result
         else:
             from aiter.ops.triton.mha import flash_attn_varlen_func
 
