@@ -332,7 +332,7 @@ class LlamaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        scale = self.self_attn.qkv_proj.input_scale
+        scale = getattr(self.self_attn.qkv_proj, "input_scale", None)
         if scale is not None and VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
             # Static FP8 quantization
             weight = self.input_layernorm.weight
@@ -359,7 +359,7 @@ class LlamaDecoderLayer(nn.Module):
                                        hidden_states=hidden_states)
 
         # Fully Connected
-        scale = self.mlp.gate_up_proj.input_scale
+        scale = getattr(self.mlp.gate_up_proj, "input_scale", None)
         if scale is not None and VLLM_ROCM_USE_AITER_TRITON_FUSED_RMSNORM_FP8_QUANT:
             # Static FP8 quantization
             weight = self.post_attention_layernorm.weight
