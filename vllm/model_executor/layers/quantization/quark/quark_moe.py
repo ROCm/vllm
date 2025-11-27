@@ -623,6 +623,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         if not self.emulate:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
                 rocm_aiter_fused_experts,
+                QuantMethod
             )
 
             if hasattr(torch, "float4_e2m1fn_x2"):
@@ -639,7 +640,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 activation=activation,
-                quant_config=self.moe_quant_config,
+                quant_config=self.get_fused_moe_quant_config(layer),
             )
         else:
             from vllm.model_executor.layers.fused_moe import fused_experts
