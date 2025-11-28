@@ -458,6 +458,7 @@ class FusedMoEQuantConfig:
             "mxfp6_e3m2",
             "mxfp6_e2m3",
         }
+
         if weight_dtype is None:
             weight_dtype = quant_dtype
 
