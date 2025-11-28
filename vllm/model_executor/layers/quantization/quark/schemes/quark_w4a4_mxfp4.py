@@ -68,6 +68,7 @@ try:
                 gemm_afp4wfp4_preshuffled_weight_scales(x_q.view(torch.uint8), weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
                         x_s, weight_scale.view(torch.uint8).view(weight_scale.shape[0] // 32, -1), out_dtype, y)
             else:
+                
                 if x_scales is None:
                     # use hip quant kernel for performance
                     x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)
@@ -90,6 +91,7 @@ try:
                           bpreshuffle=True)
             return y[:M]
         else:
+
             if x_scales is None:
                 x_q, x_s = dynamic_mxfp4_quant(x)
             else:

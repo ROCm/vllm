@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from enum import Enum
 from typing import Callable, Optional
 
 import torch
@@ -11,6 +12,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (FusedMoE, FusedMoEConfig,
                                                   FusedMoEMethodBase)
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEQuantConfig, mxfp4_w4a4_moe_quant_config,
+    mxfp4_w4a16_moe_quant_config)
 from vllm.model_executor.layers.fused_moe.trtllm_moe import TrtLlmGenExperts
 from vllm.model_executor.layers.linear import (LinearBase,
                                                UnquantizedLinearMethod)
@@ -31,6 +35,82 @@ from vllm.utils import (has_triton_kernels, is_torch_equal_or_newer,
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
+
+
+# enum for mxfp4 backend
+class Mxfp4Backend(Enum):
+    NONE = 0
+
+    # FlashInfer Backend
+    SM100_FI_MXFP4_MXFP8_TRTLLM = 1
+    SM100_FI_MXFP4_MXFP8_CUTLASS = 2
+    SM100_FI_MXFP4_BF16 = 3
+    SM90_FI_MXFP4_BF16 = 4
+
+    # Marlin Backend
+    MARLIN = 5
+
+    # Triton Backend
+    TRITON = 6
+
+    # CK Backend
+    CK = 7
+
+
+def get_mxfp4_backend():
+    # Backend Selection
+    if current_platform.is_cuda():
+        if (current_platform.is_device_capability(90) and has_flashinfer()
+                and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16):
+            logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM90")
+            return Mxfp4Backend.SM90_FI_MXFP4_BF16
+        elif (current_platform.is_device_capability(100) and has_flashinfer()
+              and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS):
+            logger.info_once(
+                "Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100")
+            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+        elif (current_platform.is_device_capability(100) and has_flashinfer()
+              and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8):
+            logger.info_once(
+                "Using FlashInfer MXFP4 MXFP8 TRTLLM backend for SM100, "
+                "for high concurrency throughput workloads consider setting "
+                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1 for better "
+                "performance")
+            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
+        elif current_platform.is_device_capability(100) and has_flashinfer():
+            logger.info_once(
+                "Using FlashInfer MXFP4 BF16 backend for SM100, "
+                "For faster performance on SM100, consider setting "
+                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1, though this may impact "
+                "accuracy.")
+            return Mxfp4Backend.SM100_FI_MXFP4_BF16
+        elif ((current_platform.is_device_capability(100)
+               or current_platform.is_device_capability(90))
+              and not has_flashinfer()):
+            logger.warning_once(
+                "MXFP4 MoE is enabled on Hopper/Blackwell but FlashInfer "
+                "is not available. This may result in degraded performance. "
+                "Please `pip install vllm[flashinfer]` for best results.")
+
+        # If FlashInfer is not available, try either Marlin or Triton
+        if current_platform.get_device_capability(
+        )[0] < 9 or not has_triton_kernels() or not is_torch_equal_or_newer(
+                "2.8.0"):
+            logger.info_once("Using Marlin backend")
+            return Mxfp4Backend.MARLIN
+        else:
+            logger.info_once("Using Triton backend")
+            return Mxfp4Backend.TRITON
+    elif current_platform.is_rocm():
+        if envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+            logger.info_once("Using CK backend")
+            return Mxfp4Backend.CK
+        else:
+            logger.info_once("Using Triton backend")
+            return Mxfp4Backend.TRITON
+
+    return Mxfp4Backend.NONE
+
 
 
 def _should_use_flashinfer_mxfp4_bf16():
@@ -64,7 +144,7 @@ def should_use_flashinfer_mxfp4():
 if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
     import aiter
     from aiter.fused_moe import fused_topk, moe_sorting
-    from aiter.ops.shuffle import shuffle_mxfp4_weight, shuffle_mxfp4_scale
+    from aiter.ops.shuffle import shuffle_weight_a16w4, shuffle_scale_a16w4
     
 class Mxfp4Config(QuantizationConfig):
 
@@ -117,6 +197,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         super().__init__(moe)
         self.topk_indices_dtype = None
         self.moe = moe
+        self.mxfp4_backend = get_mxfp4_backend()
         self.use_marlin = self._should_use_marlin()
         self.max_capture_size = get_current_vllm_config(
         ).compilation_config.max_capture_size
@@ -417,11 +498,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 e, n, k = w13_aiter_weight.shape
                 w13_aiter_weight = w13_aiter_weight.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
                 w13_aiter_scale = w13_aiter_scale.view(e, n // 2, 2, -1).permute(0, 2, 1, 3).contiguous().view(e, n, -1)
+
+                w13_aiter_weight = w13_aiter_weight.view(torch.float4_e2m1fn_x2)
+                w13_aiter_scale = w13_aiter_scale.view(-1, w13_aiter_scale.shape[-1])
+                w2_aiter_weight = w2_aiter_weight.view(torch.float4_e2m1fn_x2)
+                w2_aiter_scale = w2_aiter_scale.view(-1, w2_aiter_scale.shape[-1])
                 
-                self.w13_weight_aiter_tensor = shuffle_mxfp4_weight(w13_aiter_weight, 16, True)
-                self.w13_scale_aiter_tensor = shuffle_mxfp4_scale(w13_aiter_scale, True)
-                self.w2_weight_aiter_tensor = shuffle_mxfp4_weight(w2_aiter_weight, 16, False)
-                self.w2_scale_aiter_tensor = shuffle_mxfp4_scale(w2_aiter_scale, False)
+                self.w13_weight_aiter_tensor = shuffle_weight_a16w4(w13_aiter_weight, 16, True)
+                self.w13_scale_aiter_tensor = shuffle_scale_a16w4(w13_aiter_scale, self.num_experts, True)
+                self.w2_weight_aiter_tensor = shuffle_weight_a16w4(w2_aiter_weight, 16, False)
+                self.w2_scale_aiter_tensor = shuffle_scale_a16w4(w2_aiter_scale, self.num_experts, False)
                 self.w13_bias_aiter_tensor = layer.w13_bias.view(-1, n // 2, 2).permute(0, 2, 1).contiguous().view(-1, n)
             else: 
                 w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
@@ -467,6 +553,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
 
         return tile_tokens_dim
+
+    def get_fused_moe_quant_config(
+            self, layer: torch.nn.Module) -> Optional[FusedMoEQuantConfig]:
+
+        if self.mxfp4_backend == Mxfp4Backend.MARLIN:
+            return None
+
+        if self.mxfp4_backend == Mxfp4Backend.TRITON:
+            w1_scale = self.w13_precision_config
+            w2_scale = self.w2_precision_config
+            return mxfp4_w4a16_moe_quant_config(
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+            )
+        else:
+            w1_scale = layer.w13_weight_scale
+            w2_scale = layer.w2_weight_scale
+            return mxfp4_w4a4_moe_quant_config(
+                w1_bias=layer.w13_bias,
+                w2_bias=layer.w2_bias,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+            )
 
     def select_gemm_impl(
         self,
@@ -567,6 +678,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",

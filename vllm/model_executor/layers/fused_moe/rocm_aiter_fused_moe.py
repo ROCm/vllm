@@ -33,6 +33,13 @@ class ActivationMethod(IntEnum):
     SILU = 0
     GELU = 1
 
+@cache
+def use_mxfp4_aiter_moe() -> bool:
+    return (
+        current_platform.is_rocm()
+        and envs.VLLM_ROCM_USE_CK_MXFP4_MOE
+        and envs.VLLM_ROCM_USE_AITER
+    )
 
 @cache
 def is_rocm_aiter_moe_enabled() -> bool:
@@ -267,7 +274,8 @@ def rocm_aiter_grouped_topk(
     num_expert_group: int = 0,
     topk_group: int = 0,
     scoring_func: str = "softmax",
-    e_score_correction_bias: Optional[torch.Tensor] = None
+    routed_scaling_factor: float = 1.0,  # mul to topk_weights
+    e_score_correction_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = hidden_states.shape[0]
     device = hidden_states.device
@@ -296,6 +304,7 @@ def rocm_aiter_grouped_topk(
             topk_group,
             renormalize,
             scoring_func,
+            routed_scaling_factor
         )
 
     return topk_weights, topk_ids

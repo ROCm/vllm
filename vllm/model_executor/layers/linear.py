@@ -225,7 +225,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
 
@@ -363,11 +362,15 @@ class ReplicatedLinear(LinearBase):
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-        from vllm.model_executor.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
-        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkW4A4MXFP4):
+        from vllm.model_executor.layers.quantization.quark.quark import QuarkLinearMethod
+        if (
+            isinstance(self.quant_method, Fp8LinearMethod)
+            or isinstance(self.quant_method, QuarkLinearMethod)
+        ):
             output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
         else:
-            assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
+            #skipping because we need to support unquantized linear method for bf16 weights
+            #assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"
             output = self.quant_method.apply(self, x, bias)
 
         output_bias = self.bias if self.skip_bias_add else None
@@ -1383,8 +1386,8 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod
-        from vllm.model_executor.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import QuarkW4A4MXFP4
-        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkW4A4MXFP4):
+        from vllm.model_executor.layers.quantization.quark.quark import QuarkLinearMethod
+        if isinstance(self.quant_method, Fp8LinearMethod) or isinstance(self.quant_method, QuarkLinearMethod):
             output_parallel = self.quant_method.apply(self, input_parallel, bias_, x_quant_scales=x_quant_scales)
         else:
             assert x_quant_scales is None, f"x_quant_scales input is not supported for {self.quant_method.__class__}"

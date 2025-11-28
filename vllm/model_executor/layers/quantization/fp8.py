@@ -17,6 +17,8 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE, FusedMoEActivationFormat, FusedMoEConfig, FusedMoEMethodBase,
     FusedMoEPermuteExpertsUnpermute, FusedMoEPrepareAndFinalize,
     FusedMoeWeightScaleSupported)
+from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEQuantConfig, fp8_w8a8_moe_quant_config)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -553,18 +555,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 "platform.")
 
     def maybe_make_prepare_finalize(
-        self,
-        moe: FusedMoEConfig,
-    ) -> Optional[mk.FusedMoEPrepareAndFinalize]:
-        if self.flashinfer_moe_backend != FlashinferMoeBackend.CUTLASS:
-            return super().maybe_make_prepare_finalize(moe)
-
-        prepare_finalize = build_flashinfer_fp8_cutlass_moe_prepare_finalize(
-            moe,
-            layer=self.layer,
-        )
-        logger.debug_once("%s", prepare_finalize.__class__.__name__)
-        return prepare_finalize
+            self) -> Optional[mk.FusedMoEPrepareAndFinalize]:
+        if (self.rocm_aiter_moe_enabled or self.use_marlin
+                or self.flashinfer_moe_backend
+                == FlashinferMoeBackend.TENSORRT_LLM):
+            return None
+        elif self.flashinfer_moe_backend == FlashinferMoeBackend.CUTLASS:
+            prepare_finalize = (
+                build_flashinfer_fp8_cutlass_moe_prepare_finalize(self.moe))
+            logger.debug_once("%s", prepare_finalize.__class__.__name__)
+            return prepare_finalize
+        else:
+            return super().maybe_make_prepare_finalize()
 
     def _maybe_pad_rocm_aiter_block_scaled_fused_moe_weights(
             self,
@@ -1071,6 +1073,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_shape=self.quant_config.weight_block_size,
                 allow_deep_gemm=self.allow_deep_gemm,
             )
+        
+    def get_fused_moe_quant_config(
+            self, layer: torch.nn.Module) -> Optional[FusedMoEQuantConfig]:
+        if self.use_marlin:
+            return None
+
+        return fp8_w8a8_moe_quant_config(
+            w1_scale=(layer.w13_weight_scale_inv
+                      if self.block_quant else layer.w13_weight_scale),
+            w2_scale=(layer.w2_weight_scale_inv
+                      if self.block_quant else layer.w2_weight_scale),
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=self.quant_config.weight_block_size,
+        )
 
     def apply(
         self,
@@ -1086,6 +1103,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -1125,7 +1143,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     expert_offset=layer.ep_rank * layer.local_num_experts,
                     local_num_experts=layer.local_num_experts,
                     block_shape=self.quant_config.weight_block_size,
-                    routed_scaling=1.0,
+                    routed_scaling=routed_scaling_factor,
                 )
             else:
                 assert (not renormalize
@@ -1151,6 +1169,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype,
             enable_eplb=enable_eplb,

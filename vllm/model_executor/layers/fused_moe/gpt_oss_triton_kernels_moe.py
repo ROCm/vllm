@@ -6,25 +6,16 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG, FusedMoEQuantConfig)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate)
-from vllm.utils import has_triton_kernels
+from aiter.ops.triton.moe_routing.routing import routing
+from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4
+from aiter.ops.triton.quant_moe import downcast_to_static_fp8
+
 
 logger = init_logger(__name__)
-
-if has_triton_kernels():
-    try:
-        import triton_kernels.swiglu
-        from triton_kernels.matmul_ogs import (FnSpecs, FusedActivation,
-                                               matmul_ogs)
-        from triton_kernels.routing import routing
-    except ModuleNotFoundError:
-        logger.error(
-            "Failed to import Triton kernels. Please make sure your triton "
-            "version is compatible.")
-
-if TYPE_CHECKING:
-    from triton_kernels.matmul_ogs import PrecisionConfig
 
 
 def triton_kernel_moe_forward(
@@ -35,25 +26,17 @@ def triton_kernel_moe_forward(
     topk: int,
     renormalize: bool,
     activation: str = "silu",
+    quant_config: Optional[FusedMoEQuantConfig] = None,
     apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    per_channel_quant: bool = False,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-    w1_precision: Optional["PrecisionConfig"] = None,
-    w2_precision: Optional["PrecisionConfig"] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
+    unpadded_N_w1 = None,
+    unpadded_K_w1 = None,
+    unpadded_N_w2 = None,
+    unpadded_K_w2 = None
 ) -> torch.Tensor:
 
-    routing_data, gather_idx, scatter_idx = routing(gating_output,
-                                                    topk,
-                                                    sm_first=not renormalize)
+    routing_data, gather_idx, scatter_idx = routing(gating_output, topk, sm_first=not renormalize)
 
     return triton_kernel_fused_experts(
         None,
@@ -64,20 +47,14 @@ def triton_kernel_moe_forward(
         gather_idx,
         scatter_idx,
         activation=activation,
+        quant_config=quant_config,
         apply_router_weight_on_input=apply_router_weight_on_input,
-        use_fp8_w8a8=use_fp8_w8a8,
-        per_channel_quant=per_channel_quant,
         global_num_experts=global_num_experts,
         expert_map=expert_map,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        w1_bias=w1_bias,
-        w2_bias=w2_bias,
-        w1_precision=w1_precision,
-        w2_precision=w2_precision,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape)
+        unpadded_N_w1=unpadded_N_w1,
+        unpadded_K_w1=unpadded_K_w1,
+        unpadded_N_w2=unpadded_N_w2,
+        unpadded_K_w2=unpadded_K_w2)
 
 
 # This is a triton implementation of the fused_experts function
@@ -90,28 +67,27 @@ def triton_kernel_fused_experts(
     gather_indx,  # GatherIndx
     scatter_indx,  # ScatterIndx
     activation: str = "silu",
+    quant_config: Optional[FusedMoEQuantConfig] = None,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
     apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    per_channel_quant: bool = False,
     global_num_experts: int = -1,
     expert_map: Optional[torch.Tensor] = None,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    w1_bias: Optional[torch.Tensor] = None,
-    w2_bias: Optional[torch.Tensor] = None,
-    w1_precision: Optional["PrecisionConfig"] = None,
-    w2_precision: Optional["PrecisionConfig"] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
+    a1q_scale: Optional[torch.Tensor] = None,
+    unpadded_N_w1 = None,
+    unpadded_K_w1 = None,
+    unpadded_N_w2 = None,
+    unpadded_K_w2 = None
 ) -> torch.Tensor:
+    if quant_config is None:
+        quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
 
     # type check, uint8 means mxfp4
     assert hidden_states.dtype == torch.bfloat16
-    assert w1_bias is None or w1_bias.dtype == torch.float32
-    assert w2_bias is None or w2_bias.dtype == torch.float32
+    assert (quant_config.w1_bias is None
+            or quant_config.w1_bias.dtype == torch.float32)
+    assert (quant_config.w2_bias is None
+            or quant_config.w2_bias.dtype == torch.float32)
 
     # Shape check, only check non-mxfp4
     assert hidden_states.shape[-1] == w1.shape[-2]
@@ -122,31 +98,41 @@ def triton_kernel_fused_experts(
     if global_num_experts == -1:
         global_num_experts = E
 
-    act = FusedActivation(
-        FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
-        (swiglu_alpha, swiglu_limit), 2)
     gammas = routing_data.gate_scal if routing_data else None
 
-    intermediate_cache1 = matmul_ogs(
-        hidden_states,
-        w1,
-        w1_bias,
-        routing_data,
-        gather_indx=gather_indx,
-        precision_config=w1_precision,
-        gammas=gammas if apply_router_weight_on_input else None,
-        fused_activation=act)
+    hidden_states = downcast_to_static_fp8(hidden_states, quant_config.w1_precision.flex_ctx.lhs_data.scale)
 
-    intermediate_cache3 = matmul_ogs(
-        intermediate_cache1,
-        w2,
-        w2_bias,
-        routing_data,
-        scatter_indx=scatter_indx,
-        precision_config=w2_precision,
-        gammas=None if apply_router_weight_on_input else gammas,
-        y=output_tensor,
-    )
+    intermediate_cache1 = moe_gemm_a8w4(hidden_states, 
+        w1.storage.data, 
+        None, 
+        quant_config.w1_precision.weight_scale.storage.data, 
+        quant_config.w1_precision.flex_ctx.lhs_data.scale, 
+        quant_config.w2_precision.flex_ctx.lhs_data.scale, 
+        quant_config.w1_bias, routing_data, 
+        gather_indx=gather_indx, 
+        gammas=gammas if apply_router_weight_on_input else None, 
+        swizzle_mx_scale="CDNA4_SCALE", 
+        out_dtype=torch.float8_e4m3fn, 
+        apply_swiglu=True, 
+        alpha=swiglu_alpha, 
+        limit=swiglu_limit,
+        unpadded_N=unpadded_N_w1,
+        unpadded_K=unpadded_K_w1)
+
+    intermediate_cache3 = moe_gemm_a8w4(intermediate_cache1, 
+        w2.storage.data, 
+        None, 
+        quant_config.w2_precision.weight_scale.storage.data, 
+        quant_config.w2_precision.flex_ctx.lhs_data.scale, 
+        None, 
+        quant_config.w2_bias, 
+        routing_data, 
+        scatter_indx=scatter_indx, 
+        gammas=None if apply_router_weight_on_input else gammas, 
+        swizzle_mx_scale="CDNA4_SCALE",
+        unpadded_N=unpadded_N_w2,
+        unpadded_K=unpadded_K_w2)
+
     return intermediate_cache3
 
 
@@ -154,21 +140,13 @@ class BatchedOAITritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
 
     def __init__(
         self,
-        quant_config,
         max_num_tokens: int,
         num_dispatchers: int,
-        w1_precision: "PrecisionConfig",
-        w2_precision: "PrecisionConfig",
-        w1_bias: Optional[torch.Tensor],
-        w2_bias: Optional[torch.Tensor],
+        quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(quant_config)
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
-        self.w1_precision = w1_precision
-        self.w2_precision = w2_precision
-        self.w1_bias = w1_bias
-        self.w2_bias = w2_bias
 
     @property
     def activation_formats(
@@ -212,12 +190,7 @@ class BatchedOAITritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         activation: str,
         global_num_experts: int,
         expert_map: Optional[torch.Tensor],
-        w1_scale: Optional[torch.Tensor],
-        w2_scale: Optional[torch.Tensor],
-        w1_zp: Optional[torch.Tensor],
-        w2_zp: Optional[torch.Tensor],
         a1q_scale: Optional[torch.Tensor],
-        a2_scale: Optional[torch.Tensor],
         workspace13: torch.Tensor,
         workspace2: torch.Tensor,
         expert_tokens_meta: Optional[mk.ExpertTokensMetadata],
@@ -228,20 +201,12 @@ class BatchedOAITritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             hidden_states,
             w1,
             w2,
-            None,
-            None,
-            None,
+            routing_data=None,
+            gather_indx=None,
+            scatter_indx=None,
             activation=activation,
+            quant_config=self.quant_config,
             apply_router_weight_on_input=False,
-            use_fp8_w8a8=False,
-            per_channel_quant=False,
             global_num_experts=global_num_experts,
             expert_map=expert_map,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            w1_bias=self.w1_bias,
-            w2_bias=self.w2_bias,
-            w1_precision=self.w1_precision,
-            w2_precision=self.w2_precision,
-            a1_scale=a1q_scale,
-            a2_scale=a2_scale)
+            a1q_scale=a1q_scale)

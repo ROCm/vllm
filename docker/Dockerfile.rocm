@@ -2,7 +2,7 @@
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
 ARG BASE_IMAGE=rocm/vllm-private:355_wip_base_image_1020
-ARG AITER_BRANCH="355_wip"
+ARG AITER_BRANCH="main"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
 FROM ${BASE_IMAGE} AS base
@@ -40,6 +40,15 @@ RUN mkdir -p /app/install && cp /app/rccl/build/release/*.deb /app/install
 # --------------
 # DLL: TEMP since aiter is volatile.  When base is locked still build aiter
 FROM base AS build_aiter
+
+# Rebuild LLVM before AITER
+ENV FLATMM_HIP_CLANG_PATH=/app/git/llvm-project/build/bin/
+RUN mkdir -p /app/git && cd /app/git && git clone https://github.com/jrbyrnes/llvm-project.git \
+    && cd llvm-project && git checkout c7e653b3343f7757920e7581a10b2015b98af647 \
+    && mkdir build && cd build \
+    && cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=1 -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" -DLLVM_ENABLE_PROJECTS="clang;lld;" -DLLVM_ENABLE_RUNTIMES="compiler-rt" ../llvm \
+    && make -j64
+
 ARG AITER_BRANCH
 ARG AITER_REPO
 # RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
@@ -117,12 +126,7 @@ RUN cd /vllm-workspace \
 # -----------------------
 # Final vLLM image
 FROM base AS final
-ENV FLATMM_HIP_CLANG_PATH=/app/git/llvm-project/build/bin/
-RUN mkdir -p /app/git && cd /app/git && git clone https://github.com/jrbyrnes/llvm-project.git \
-    && cd llvm-project && git checkout c7e653b3343f7757920e7581a10b2015b98af647 \
-    && mkdir build && cd build \
-    && cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_ASSERTIONS=1 -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" -DLLVM_ENABLE_PROJECTS="clang;lld;" -DLLVM_ENABLE_RUNTIMES="compiler-rt" ../llvm \
-    && make -j64
+
 RUN python3 -m pip install --upgrade pip && rm -rf /var/lib/apt/lists/*
 # Error related to odd state for numpy 1.20.3 where there is no METADATA etc, but an extra LICENSES_bundled.txt.
 # Manually remove it so that later steps of numpy upgrade can continue
