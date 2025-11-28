@@ -844,7 +844,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         if isinstance(self.mlp, DeepseekV2MoE):
             compilation_config = get_current_vllm_config().compilation_config
-            name = self.mlp.prefix  # e.g., "model.layers.12.mlp"
+            name = self.mlp.prefix  
             if name in compilation_config.static_forward_context:
                 raise ValueError(f"Duplicate layer name in static_forward_context: {name}")
             compilation_config.static_forward_context[name] = self.mlp
@@ -996,15 +996,6 @@ class DeepseekV2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        #torch.ops.vllm.streams_break()
-        # One-time registration of no-compile MoE layers
-        # if self not in _registered_models:
-        #     from vllm.forward_context import get_forward_context
-        #     ctx = get_forward_context()  # valid now (we're in a real forward)
-        #     for m in self._moe_modules:
-        #         # register by name -> module object; streams_break will honor these
-        #         ctx.no_compile_layers[m.prefix] = m
-        #     _registered_models.add(self)
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
