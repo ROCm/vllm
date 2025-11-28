@@ -449,12 +449,11 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         if self.emulate:
             logger.warning_once(
                 f"The current mode (supports_mx={current_platform.supports_mx()}, "
-                f"use_mxfp4_aiter_moe={self.use_rocm_aiter_moe}, "
-                f"ocp_mx_scheme={self.ocp_mx_scheme}) "
+                f"use_mxfp4_aiter_moe={self.use_rocm_aiter_moe}",
                 "does not support native MXFP4/MXFP6 "
                 "computation. Simulated weight dequantization and activation "
                 "QDQ (quantize and dequantize) will be used, with the linear "
-                "layers computed in high precision."
+                "layers computed in high precision.",
             )
         else:
             logger.warning_once(
@@ -571,8 +570,11 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
-        return mxfp4_w4a16_moe_quant_config(layer.w13_weight_scale,
-                                            layer.w2_weight_scale)
+        # The default mxfp4 recipe is with a16 dynamic quantzied
+        # and wmxfp4.
+        return mxfp4_w4a16_moe_quant_config(
+            layer.w13_weight_scale, layer.w2_weight_scale
+        )
 
     @property
     def allow_inplace(self) -> bool:
@@ -608,7 +610,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
         if not self.emulate:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-                rocm_aiter_fused_experts
+                rocm_aiter_fused_experts,
             )
 
             if hasattr(torch, "float4_e2m1fn_x2"):
