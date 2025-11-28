@@ -223,7 +223,7 @@ class CompilationConfig:
     constructor, e.g. `CompilationConfig(inductor_passes={"a": func})`."""
 
     # CudaGraph compilation
-    cudagraph_mode: Optional[CUDAGraphMode] = CUDAGraphMode.PIECEWISE #Hard coding this but will return it back later
+    cudagraph_mode: Optional[CUDAGraphMode] = CUDAGraphMode.FULL
     """
     The mode of the cudagraph:
 
