@@ -358,20 +358,31 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         did_fma = False
-        if VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS and self.n_shared_experts is not None:
+        if (
+            self.use_triton_fused_shared_expert
+            and self.n_shared_experts is not None
+        ):
             hidden_states_shared, hidden_states_shared_scale = hidden_states_shared
 
-            shared_output_q, shared_output_s, router_logits = torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
-                hidden_states_shared = hidden_states_shared,
-                hidden_states_shared_scale = hidden_states_shared_scale,
-                weight_gate_up = self.shared_experts.gate_up_proj.weight,
-                weight_scale_gate_up = self.shared_experts.gate_up_proj.weight_scale_inv,
-                hidden_states_moe_gate = hidden_states,
-                weight_moe_gate = self.gate.weight,
-                bias_shared = self.shared_experts.gate_up_proj.bias if not self.shared_experts.gate_up_proj.skip_bias_add else None,
-                bias_moe_gate = self.gate.bias if not self.gate.skip_bias_add else None,
+            shared_output_q, shared_output_s, router_logits = (
+                torch.ops.vllm.rocm_aiter_triton_fused_shared_expert(
+                    hidden_states_shared=hidden_states_shared,
+                    hidden_states_shared_scale=hidden_states_shared_scale,
+                    weight_gate_up=self.shared_experts.gate_up_proj.weight,
+                    weight_scale_gate_up=self.shared_experts.gate_up_proj.weight_scale_inv,
+                    hidden_states_moe_gate=hidden_states,
+                    weight_moe_gate=self.gate.weight,
+                    bias_shared=(
+                        self.shared_experts.gate_up_proj.bias
+                        if not self.shared_experts.gate_up_proj.skip_bias_add
+                        else None
+                    ),
+                    bias_moe_gate=(
+                        self.gate.bias if not self.gate.skip_bias_add else None
+                    ),
+                )
             )
-
+            
             if VLLM_ROCM_USE_AITER_TRITON_FUSED_MUL_ADD and hidden_states.dtype != torch.float16: #self.alt_stream is not None and
                 shared_output, final_hidden_states = torch.ops.vllm.streams_breaks(
                     hidden_states=hidden_states,
