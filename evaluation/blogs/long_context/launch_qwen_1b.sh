@@ -31,7 +31,7 @@ export VLLM_ROCM_USE_AITER_MHA=0
 export VLLM_CUSTOM_SCOPES_FOR_PROFILING=1
 export VLLM_TORCH_PROFILER_WITH_STACK=1
 export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
-export VLLM_TORCH_PROFILER_DIR=/root/profiler
+export VLLM_TORCH_PROFILER_DIR=/home/hatwu/profiler
 
 # cache dirs
 export VLLM_CACHE_ROOT=/root/.cache/vllm
@@ -45,11 +45,12 @@ rm -rf /root/.cache/
 model_path=/mnt/raid0/pretrained_model/Qwen/Qwen2-1.5B-Instruct/
 vllm serve $model_path \
     --tensor-parallel-size 1 \
-    --max-num-batched-tokens 32768 \
+    --max-num-batched-tokens 8192 \
     --trust-remote-code \
     --no-enable-prefix-caching \
     --disable-log-requests \
-    --gpu_memory_utilization 0.9 \
+    --gpu_memory_utilization 0.1 \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --async-scheduling \
+    --port 1234 \
     2>&1 | tee qwen3_235b_server.log
