@@ -343,7 +343,7 @@ class FusedMoEQuantConfig:
 
     @property
     def use_mxfp4_w4a16(self) -> bool:
-        return  self._w1.dtype == "mxfp4"
+        return self._a1.dtype is None and self._w1.dtype == "mxfp4"
 
     @property
     def use_nvfp4_w4a4(self) -> bool:
@@ -458,7 +458,6 @@ class FusedMoEQuantConfig:
             "mxfp6_e3m2",
             "mxfp6_e2m3",
         }
-
         if weight_dtype is None:
             weight_dtype = quant_dtype
 
