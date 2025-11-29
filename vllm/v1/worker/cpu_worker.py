@@ -3,6 +3,7 @@
 import os
 import platform
 from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -37,6 +38,9 @@ class CPUWorker(Worker):
 
         self.parallel_config.disable_custom_all_reduce = True
 
+        # Torch profiler. Enabled and configured through env vars:
+        # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
+        self.profiler: Any | None = None
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
             worker_name = f"{vllm_config.instance_id}-rank-{self.rank}"
@@ -69,24 +73,26 @@ class CPUWorker(Worker):
                 self.local_omp_cpuid = self._get_autobind_cpu_ids(
                     lambda cpus: [cpu for cpu in cpus if cpu.id % 8 < 4]
                 )
-            elif current_platform.get_cpu_architecture() == CpuArchEnum.X86:
+            elif cpu_arch == CpuArchEnum.X86:
                 # For x86 SMT-2, use 1 CPU per core
                 self.local_omp_cpuid = self._get_autobind_cpu_ids(
                     lambda cpus: cpus[-1:]
                 )
             else:
-                self.local_omp_cpuid = "all"
+                self.local_omp_cpuid = "nobind"
+        elif omp_cpuids == "nobind":
+            self.local_omp_cpuid = "nobind"
         else:
             local_dp_rank = self.parallel_config.data_parallel_rank_local
-            omp_cpuids = omp_cpuids.split("|")
+            omp_cpuids_list = omp_cpuids.split("|")
             if local_dp_rank is not None:
                 world_size = self.parallel_config.world_size
-                omp_cpuids = omp_cpuids[
+                omp_cpuids_list = omp_cpuids_list[
                     local_dp_rank * world_size : (local_dp_rank + 1) * world_size
                 ]
-            self.local_omp_cpuid = omp_cpuids[self.rank]
+            self.local_omp_cpuid = omp_cpuids_list[self.rank]
 
-        if self.local_omp_cpuid != "all":
+        if self.local_omp_cpuid != "nobind":
             ret = torch.ops._C_utils.init_cpu_threads_env(self.local_omp_cpuid)
             if ret:
                 logger.info(ret)
@@ -118,7 +124,7 @@ class CPUWorker(Worker):
         pass
 
     def determine_available_memory(self) -> int:
-        return self.cache_config.cpu_kvcache_space_bytes  # type: ignore
+        return self.cache_config.cpu_kvcache_space_bytes or 0
 
     def compile_or_warm_up_model(self) -> None:
         # Reset the seed to ensure that the random state is not affected by

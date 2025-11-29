@@ -7,13 +7,11 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
-from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
-    is_rocm_aiter_fusion_shared_expert_enabled,
-)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -146,7 +144,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -210,8 +208,8 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                 self.moe_layers.append(layer.mlp.experts)
         self.extract_moe_parameters(example_moe)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids)
 
     def forward(
         self,
@@ -235,6 +233,9 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        rocm_aiter_moe_shared_expert_enabled = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        )
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -249,7 +250,7 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             num_experts=self.config.n_routed_experts
             + (
                 self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
+                if rocm_aiter_moe_shared_expert_enabled
                 else 0
             ),
         )
@@ -262,9 +263,8 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
-            is_fuse_shared_experts_layer = (
-                is_rocm_aiter_fusion_shared_expert_enabled()
-                and ("mlp.shared_experts" in name)
+            is_fusion_moe_shared_experts_layer = (
+                rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
             )
             name = self._rewrite_spec_layer_name(spec_layer, name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -279,7 +279,7 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
-                if is_fuse_shared_experts_layer:
+                if is_fusion_moe_shared_experts_layer:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
 
@@ -310,7 +310,7 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                 # appended expert slots mlp.experts.{n_routed_experts + j}.*
                 # accordingly.
                 num_chunks = 1
-                if is_fuse_shared_experts_layer:
+                if is_fusion_moe_shared_experts_layer:
                     num_chunks = getattr(self.config, "n_shared_experts", 1) or 1
                     # Determine split axis based on op type
                     # gate/up: ColumnParallel → split along dim 0
@@ -323,22 +323,11 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                     )
                     chunk_size = total // num_chunks
 
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-
-                    # According to DeepSeek-V3 Technical Report, MTP modules
-                    # shares embedding layer. We only load the first weights.
-                    if (
-                        spec_layer != self.model.mtp_start_layer_idx
-                        and ".layers" not in name
-                    ):
-                        continue
                 for j in range(num_chunks):
                     chunk_name = name
                     weight_to_load = loaded_weight
 
-                    if is_fuse_shared_experts_layer:
+                    if is_fusion_moe_shared_experts_layer:
                         if split_dim == 0:
                             weight_to_load = loaded_weight[
                                 j * chunk_size : (j + 1) * chunk_size, :
@@ -382,7 +371,7 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                             return_success=True,
                         )
                         if success:
-                            if not is_fuse_shared_experts_layer:
+                            if not is_fusion_moe_shared_experts_layer:
                                 name = name_mapped
                             else:
                                 loaded_params.add(name_mapped)
@@ -409,7 +398,7 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
-            if not is_fuse_shared_experts_layer:
+            if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
         return loaded_params
 

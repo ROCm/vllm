@@ -7,6 +7,7 @@ import torch.nn as nn
 from packaging import version
 
 from vllm import envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config.model import LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
@@ -66,7 +67,24 @@ class TopKTopPSampler(nn.Module):
                 self.forward = self.forward_native
             else:
                 self.forward = self.forward_cpu
+        elif (
+            logprobs_mode not in ("processed_logits", "processed_logprobs")
+            and rocm_aiter_ops.is_enabled()
+        ):
+            try:
+                import aiter.ops.sampling  # noqa: F401
 
+                self.aiter_ops = torch.ops.aiter
+                logger.info_once(
+                    "Using aiter sampler on ROCm (lazy import, sampling-only)."
+                )
+                self.forward = self.forward_hip
+            except ImportError:
+                logger.warning_once(
+                    "aiter.ops.sampling is not available on ROCm. "
+                    "Falling back to forward_native implementation."
+                )
+                self.forward = self.forward_native
         else:
             self.forward = self.forward_native
 
@@ -140,15 +158,6 @@ class TopKTopPSampler(nn.Module):
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
 
-        # Note: this is a workaround for
-        # https://github.com/pytorch/pytorch/pull/151218
-        @torch.compile(dynamic=True)
-        def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
-            probs = logits.softmax(dim=-1, dtype=torch.float32)
-            q = torch.empty_like(probs)
-            q.exponential_()
-            return probs.div(q).argmax(dim=-1).view(-1)
-
         if len(generators) != logits.shape[0]:
             return compiled_random_sample(logits), logits_to_return
         else:
@@ -217,6 +226,16 @@ class TopKTopPSampler(nn.Module):
             )
             return torch.multinomial(renorm_probs, num_samples=1).view(-1)
         raise RuntimeError("aiter_sample was called with no active top-k or top-p.")
+
+
+# Note: this is a workaround for
+# https://github.com/pytorch/pytorch/pull/151218
+@torch.compile(dynamic=True)
+def compiled_random_sample(logits: torch.Tensor) -> torch.Tensor:
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
+    q = torch.empty_like(probs)
+    q.exponential_()
+    return probs.div(q).argmax(dim=-1).view(-1)
 
 
 def apply_top_k_top_p(
