@@ -182,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP8_SPLIT_CAT: bool = True
     ROCM_TRITON_MOE_PRESHUFFLE_SCALES: bool = True
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
     VLLM_ROCM_USE_AITER_TRITON_FUSED_SHARED_EXPERTS: bool = True
@@ -1289,6 +1290,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER Triton MLA
     "VLLM_ROCM_USE_AITER_TRITON_MLA":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MLA", "0"))),
+    
+    # Use AITER Triton fused FP8 GEMM + split + cat
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP8_SPLIT_CAT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP8_SPLIT_CAT", "1"))),
 
     # If set, enables CK fp4 MoE
     "VLLM_ROCM_USE_CK_MXFP4_MOE": lambda: (
