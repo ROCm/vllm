@@ -1,9 +1,10 @@
 export VLLM_USE_V1=1
 # export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_RPC_TIMEOUT=1800000
+export VLLM_USE_TRITON_FLASH_ATTN=1
 export VLLM_ROCM_USE_AITER=1
 export VLLM_ROCM_USE_AITER_MHA=0
-export VLLM_ROCM_USE_AITER_MLA=1
+export VLLM_ROCM_USE_AITER_MLA=0
 export VLLM_ROCM_USE_AITER_MOE=1
 export VLLM_ROCM_USE_AITER_TRITON_ROPE=1 # add for acc
 export VLLM_DISABLE_COMPILE_CACHE=1
@@ -40,6 +41,7 @@ vllm serve $model_path \
   --gpu_memory_utilization 0.8 \
   --async-scheduling \
   --load-format fastsafetensors \
+  --block-size 16 \
   --seed 123 2>&1 | tee log.server.log &
 
   # --enforce-eager \
