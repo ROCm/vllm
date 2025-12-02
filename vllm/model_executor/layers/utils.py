@@ -17,6 +17,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+rocm_aiter_ops.initialize_hipblaslt()
+
+
 def shuffle_weight(w: torch.Tensor) -> torch.Tensor:
     # Shuffle weight along the last dimension so that
     # we folded the weights to adjance location
@@ -183,6 +186,18 @@ direct_register_custom_op(
 )
 
 
+def rocm_aiter_swizzle_hipb_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    output = rocm_aiter_ops.hip_bpreshuffle_gemm(x, weight, bias=None)
+    if bias is not None:
+        output = output + bias
+    return output
+
+
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     return (
         torch._C._cpu._is_amx_tile_supported()
@@ -288,17 +303,16 @@ def rocm_unquantized_gemm_wrapper():
     return inner_function
 
 
-def dispatch_unquantized_gemm() -> Callable[
+def dispatch_unquantized_gemm(
+    use_swizzle: bool = False,
+) -> Callable[
     [torch.nn.Module, torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor
 ]:
     from vllm.platforms.rocm import on_gfx9
 
-    if (
-        current_platform.is_rocm()
-        and envs.VLLM_ROCM_USE_AITER
-        and envs.VLLM_ROCM_USE_AITER_LINEAR
-        and on_gfx9()
-    ):
+    if current_platform.is_rocm() and rocm_aiter_ops.is_linear_enabled() and on_gfx9():
+        if use_swizzle:
+            return rocm_aiter_swizzle_hipb_unquantized_gemm
         return rocm_unquantized_gemm_wrapper()
     if current_platform.is_rocm():
         return rocm_unquantized_gemm

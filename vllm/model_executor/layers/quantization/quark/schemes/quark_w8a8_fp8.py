@@ -112,12 +112,12 @@ class QuarkW8A8Fp8(QuarkScheme):
                 self.use_aiter_and_is_supported and use_swizzle_gemm
             )
             if self.use_aiter_and_is_supported:
-                from aiter.ops.shuffle import shuffle_weight
-
-                # keep the weight as (N, K)
+                # keep the weight as (K, N)
                 layer.weight = Parameter(
-                    shuffle_weight(weight, layout=layout), requires_grad=False
+                    rocm_aiter_ops.shuffle_weight(weight, layout=layout).t(),
+                    requires_grad=False,
                 )
+                weight_scale = weight_scale.t()
             else:
                 # keep the weight as (K, N)
                 layer.weight = Parameter(weight.t(), requires_grad=False)
