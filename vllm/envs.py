@@ -203,6 +203,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_SILU_MUL_FP8_QUANT: bool = True
     VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD: bool = True
     VLLM_ROCM_USE_AITER_TRITON_BF16_GEMM: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP4_SPLIT_CAT: bool = True
     ROCM_TRITON_MOE_PRESHUFFLE_SCALES: bool = True
     VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4: bool = False
     VLLM_GPT_OSS_USE_CONTAINER_TOOL: bool = False
@@ -1448,6 +1449,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Apply preshuffling for mxfp4 scales for ROCm backend
     "VLLM_ROCM_USE_AITER_TRITON_MLA":
     lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_MLA", "1"))),
+
+    # Use AITER Triton fused FP4 GEMM + split + cat
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP4_SPLIT_CAT":
+    lambda: bool(int(os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP4_SPLIT_CAT", "1"))),
     }
 # --8<-- [end:env-vars-definition]
 
