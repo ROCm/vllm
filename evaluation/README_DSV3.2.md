@@ -1,6 +1,6 @@
 # ENV Setup
 
-aiter branch: `ganyi/test_mqa_gluon`
+aiter branch: `main`
 
 vllm branch: `ROCm/vllm: ganyi/optimize_dsv3.2_metadata`
 
