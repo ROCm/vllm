@@ -1586,7 +1586,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert self.dcp_world_size is not None
 
         has_context = attn_metadata.prefill.chunked_context is not None
-        # print(f"entry {VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP4_SPLIT_CAT} {self.kv_b_proj.bias is None or self.kv_b_proj.skip_bias_add} {self.kv_b_proj.quant_method is not None} {isinstance(self.kv_b_proj.quant_method, QuarkLinearMethod)} {not self.kv_b_proj.gather_output}")
         if (
             VLLM_ROCM_USE_AITER_TRITON_FUSED_GEMM_FP4_SPLIT_CAT
             and (self.kv_b_proj.bias is None
