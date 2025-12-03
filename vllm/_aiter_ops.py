@@ -438,6 +438,59 @@ def _rocm_aiter_rmsnorm2d_fwd_with_add_fake(
     return torch.empty_like(x), torch.empty_like(residual)
 
 
+def _rocm_aiter_rmsnorm_mrope_fusion_impl(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim:int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    mrope_section: list[int],
+    mrope_interleaved: bool,
+) -> torch.Tensor:
+    from aiter import fused_mrope_3d_rms
+    num_tokens = qkv.shape[0]
+
+    fused_mrope_3d_rms(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        position_ids,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        is_neox,
+        mrope_section,
+        mrope_interleaved,
+        eps,
+    )
+    return qkv
+
+def _rocm_aiter_rmsnorm_mrope_fusion_fake(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim:int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    mrope_section: list[int],
+    mrope_interleaved: bool,
+ ) -> torch.Tensor:
+    return qkv
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -636,6 +689,14 @@ class rocm_aiter_ops:
                 dispatch_key=current_platform.dispatch_key,
             )
 
+            direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_mrope_fusion",
+                op_func=_rocm_aiter_rmsnorm_mrope_fusion_impl,
+                mutates_args=["qkv"],
+                fake_impl=_rocm_aiter_rmsnorm_mrope_fusion_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
             _OPS_REGISTERED = True
 
     @staticmethod
@@ -654,6 +715,38 @@ class rocm_aiter_ops:
         x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_rms_norm(x, weight, variance_epsilon)
+
+    @staticmethod
+    def rms_norm_mrope(
+        qkv: torch.Tensor,
+        num_heads_q: int,
+        num_heads_k: int,
+        num_heads_v: int,
+        head_dim:int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        position_ids: torch.Tensor,
+        mrope_section: list[int],
+        mrope_interleaved: bool,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_mrope_fusion(
+            qkv,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_dim,
+            eps,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            is_neox,
+            position_ids,
+            mrope_section,
+            mrope_interleaved,
+        )
 
     @staticmethod
     def gemm_a8w8(

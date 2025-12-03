@@ -10,6 +10,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
 from vllm.attention.layer import Attention
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
@@ -22,6 +23,8 @@ from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 logger = init_logger(__name__)
 
 FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
+if rocm_aiter_ops.is_enabled():
+    FUSED_QK_MROPE_OP = torch.ops.vllm.rocm_aiter_rmsnorm_mrope_fusion.default
 
 
 class QkNormRopePattern:
@@ -53,6 +56,9 @@ class QkNormRopePattern:
         num_kv_heads: int,
         eps: float,
         is_neox: bool,
+        mrope_section: list[int] | None = None,
+        mrope_interleaved: bool = False,
+        use_mrope: bool = False,
         rope_flashinfer: bool = False,
     ) -> None:
         self.num_heads = num_heads
@@ -64,19 +70,30 @@ class QkNormRopePattern:
         self.rmsnorm_matcher = MatcherRMSNorm(eps)
         self.is_neox = is_neox
         self.rope_flashinfer = rope_flashinfer
+        self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
+        self.use_mrope = use_mrope
+        print(f"use_mrope: {use_mrope}, mrope_section: {mrope_section}, mrope_interleaved: {mrope_interleaved}", flush=True)
         self.rope_matcher = MatcherRotaryEmbedding(
             is_neox=is_neox,
             head_size=self.head_dim,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
+            mrope_section=mrope_section,
+            mrope_interleaved=mrope_interleaved,
+            use_mrope=use_mrope,
             use_flashinfer=self.rope_flashinfer,
+            enabled=False,
         )
 
     def get_inputs(self):
         # Sample inputs to help pattern tracing
         T = 5
         qkv = empty_bf16(T, self.q_size + 2 * self.kv_size)
-        positions = empty_i64(T)
+        if self.use_mrope:
+            positions = empty_i64(3, T)
+        else:
+            positions = empty_i64(T)
         q_weight = empty_bf16(1, self.head_dim)
         k_weight = empty_bf16(1, self.head_dim)
         if self.rope_flashinfer:
@@ -144,6 +161,30 @@ class QkNormRopePattern:
             k_weight: torch.Tensor,
             cos_sin_cache: torch.Tensor,
         ):
+            if self.use_mrope:
+                # Run fused qk_norm_mrope op
+                result = auto_functionalized(
+                    FUSED_QK_MROPE_OP,
+                    qkv=qkv,
+                    num_heads_q=self.num_heads,
+                    num_heads_k=self.num_kv_heads,
+                    num_heads_v=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    eps=self.eps,
+                    q_weight=q_weight,
+                    k_weight=k_weight,
+                    cos_sin_cache=cos_sin_cache,
+                    is_neox=self.is_neox,
+                    mrope_section=self.mrope_section,
+                    mrope_interleaved=self.mrope_interleaved,
+                    position_ids=positions.view(-1),
+                )
+                result_qkv = result[1]
+
+                # Split back to q,k,v and return
+                return result_qkv.split(
+                    [self.q_size, self.kv_size, self.kv_size], dim=-1
+                )
             # Run fused qk_norm_rope op
             result = auto_functionalized(
                 FUSED_QK_ROPE_OP,
@@ -195,6 +236,17 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             )
             return
 
+        use_mrope = False
+        mrope_section = None
+        mrope_interleaved = False
+        if hasattr(config.model_config, "hf_text_config") and hasattr(
+            config.model_config.hf_text_config, "rope_parameters"
+        ):
+            rope_parameter = config.model_config.hf_text_config.rope_parameters
+            if "mrope_section" in rope_parameter:
+                use_mrope = True
+                mrope_section = rope_parameter["mrope_section"]
+                mrope_interleaved = rope_parameter.get("mrope_interleaved", False)
         # use one attn layer to get meta (such as head_dim) for QkNormRopePattern
         attn_layers: dict[str, Attention] = get_layers_from_vllm_config(
             config, Attention
@@ -206,33 +258,49 @@ class QKNormRoPEFusionPass(VllmPatternMatcherPass):
             return
         layer = next(iter(attn_layers.values()))
 
-        for epsilon in [1e-5, 1e-6]:
-            for neox in [True, False]:
-                if RotaryEmbedding.enabled():
-                    for rope_flashinfer in [False, True]:
+        for mrope in [True, False]:
+            # Disable mRoPE patterns if not using mRoPE or if ROCm AIter ops are not enabled
+            if not (use_mrope and rocm_aiter_ops.is_enabled()) and mrope:
+                continue
+            for epsilon in [1e-5, 1e-6]:
+                for neox in [True, False]:
+                    if RotaryEmbedding.enabled():
+                        logger.info("rope enabled, register fusion")
+                        for rope_flashinfer in [False, True]:
+                            # prevent duplicate pattern registered
+                            if mrope and rope_flashinfer:
+                                continue
+                            QkNormRopePattern(
+                                head_dim=layer.head_size,
+                                num_heads=layer.num_heads,
+                                num_kv_heads=layer.num_kv_heads,
+                                eps=epsilon,
+                                is_neox=neox,
+                                mrope_section=mrope_section,
+                                mrope_interleaved=mrope_interleaved,
+                                use_mrope=mrope,
+                                rope_flashinfer=rope_flashinfer,
+                            ).register(self.patterns)
+                    else:
+                        logger.info("rope not enabled, register naive")
                         QkNormRopePattern(
                             head_dim=layer.head_size,
                             num_heads=layer.num_heads,
                             num_kv_heads=layer.num_kv_heads,
                             eps=epsilon,
                             is_neox=neox,
-                            rope_flashinfer=rope_flashinfer,
+                            mrope_section=mrope_section,
+                            mrope_interleaved=mrope_interleaved,
+                            use_mrope=mrope,
                         ).register(self.patterns)
-                else:
-                    QkNormRopePattern(
-                        head_dim=layer.head_size,
-                        num_heads=layer.num_heads,
-                        num_kv_heads=layer.num_kv_heads,
-                        eps=epsilon,
-                        is_neox=neox,
-                    ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        print("matched qk norm rope fusion pattern", flush=True)
         self.matched_count = self.patterns.apply(graph)
-        logger.debug("Fused QK Norm+RoPE on %s sites", self.matched_count)
+        print("Fused QK Norm+RoPE on %s sites", self.matched_count, flush=True)
 
     def uuid(self):
         return VllmInductorPass.hash_source(self, QkNormRopePattern)

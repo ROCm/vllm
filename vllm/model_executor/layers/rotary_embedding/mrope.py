@@ -6,8 +6,10 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
-
-from .base import RotaryEmbeddingBase
+from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
+from .base import RotaryEmbeddingBase, RotaryEmbedding
 from .common import apply_rotary_emb_dispatch
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding, yarn_get_mscale
 
@@ -187,6 +189,29 @@ def triton_mrope(
     )
     return q, k
 
+def triton_mrope_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    mrope_section: list[int],
+    head_size: int,
+    rotary_dim: int,
+    mrope_interleaved: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q.contiguous()
+    k.contiguous()
+    return q, k
+
+
+direct_register_custom_op(
+    op_name="triton_mrope",
+    op_func=triton_mrope,
+    mutates_args=[],
+    fake_impl=triton_mrope_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     """Apply interleaved MRoPE to 3D rotary embeddings.
@@ -198,7 +223,7 @@ def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.T
     x_t[..., 2 : mrope_section[2] * 3 : 3] = x[2, ..., 2 : mrope_section[2] * 3 : 3]
     return x_t
 
-
+@CustomOp.register("mrotary_embedding")
 class MRotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Embedding with Multimodal Sections."""
 
@@ -248,6 +273,7 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         self.mrope_interleaved = mrope_interleaved
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
+        print(f"in the model: {self.mrope_section}, mrope interleave: {self.mrope_interleaved}", flush=True)
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         if self.scaling_factor is None:
@@ -259,12 +285,56 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
             return super()._compute_cos_sin_cache()
         return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
 
+    @staticmethod
+    def forward_static(
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        head_size: int,
+        rotary_dim: int,
+        cos_sin_cache: torch.Tensor,
+        is_neox_style: bool,
+        mrope_section: list[int],
+        mrope_interleaved: bool,
+    ):
+        num_tokens = positions.shape[-1]
+        cos_sin = cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.ndim == 2:
+            assert mrope_section
+            if mrope_interleaved:
+                cos = apply_interleaved_rope(cos, mrope_section)
+                sin = apply_interleaved_rope(sin, mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(mrope_section, dim=-1))],
+                    dim=-1,
+                )
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, head_size)
+        query_rot = query[..., : rotary_dim]
+        query_pass = query[..., rotary_dim :]
+        query_rot = apply_rotary_emb_dispatch(query_rot, cos, sin, is_neox_style)
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, head_size)
+        key_rot = key[..., : rotary_dim]
+        key_pass = key[..., rotary_dim :]
+        key_rot = apply_rotary_emb_dispatch(key_rot, cos, sin, is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+
+        return query, key
+
     def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor | None = None,
-        offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """PyTorch-native implementation equivalent to forward().
 
@@ -279,38 +349,49 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         assert key is not None
 
         self._match_cos_sin_cache_dtype(query)
-        num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if positions.ndim == 2:
-            assert self.mrope_section
-            if self.mrope_interleaved:
-                cos = apply_interleaved_rope(cos, self.mrope_section)
-                sin = apply_interleaved_rope(sin, self.mrope_section)
-            else:
-                cos = torch.cat(
-                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
-                sin = torch.cat(
-                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
+        return MRotaryEmbedding.forward_static(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.rotary_dim,
+            self.cos_sin_cache,
+            self.is_neox_style,
+            self.mrope_section,
+            self.mrope_interleaved,
+        )
+        # num_tokens = positions.shape[-1]
+        # cos_sin = self.cos_sin_cache[positions]
+        # cos, sin = cos_sin.chunk(2, dim=-1)
+        # if positions.ndim == 2:
+        #     assert self.mrope_section
+        #     if self.mrope_interleaved:
+        #         cos = apply_interleaved_rope(cos, self.mrope_section)
+        #         sin = apply_interleaved_rope(sin, self.mrope_section)
+        #     else:
+        #         cos = torch.cat(
+        #             [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+        #             dim=-1,
+        #         )
+        #         sin = torch.cat(
+        #             [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+        #             dim=-1,
+        #         )
 
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = apply_rotary_emb_dispatch(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+        # query_shape = query.shape
+        # query = query.view(num_tokens, -1, self.head_size)
+        # query_rot = query[..., : self.rotary_dim]
+        # query_pass = query[..., self.rotary_dim :]
+        # query_rot = apply_rotary_emb_dispatch(query_rot, cos, sin, self.is_neox_style)
+        # query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = apply_rotary_emb_dispatch(key_rot, cos, sin, self.is_neox_style)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        return query, key
+        # key_shape = key.shape
+        # key = key.view(num_tokens, -1, self.head_size)
+        # key_rot = key[..., : self.rotary_dim]
+        # key_pass = key[..., self.rotary_dim :]
+        # key_rot = apply_rotary_emb_dispatch(key_rot, cos, sin, self.is_neox_style)
+        # key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        # return query, key
 
     def forward_cuda(
         self,
@@ -331,7 +412,17 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         if positions.ndim == 2:
             assert self.mrope_section
 
-            q, k = triton_mrope(
+            # q, k = triton_mrope(
+            #     query,
+            #     key,
+            #     cos,
+            #     sin,
+            #     self.mrope_section,
+            #     self.head_size,
+            #     self.rotary_dim,
+            #     self.mrope_interleaved,
+            # )
+            q, k = torch.ops.vllm.triton_mrope(
                 query,
                 key,
                 cos,

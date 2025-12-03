@@ -9,6 +9,7 @@ from torch._ops import OpOverload
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -19,10 +20,12 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Quant,
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.platforms import current_platform
 
 RMS_OP = torch.ops._C.rms_norm.default
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
+MROPE_OP = torch.ops.vllm.triton_mrope.default
 ROTARY_OP = torch.ops._C.rotary_embedding.default
 FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
 
@@ -36,6 +39,10 @@ if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Quant] = torch.ops._C.scaled_fp4_quant.default  # noqa: E501
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+
+if rocm_aiter_ops.is_enabled() and rocm_aiter_ops._RMSNORM_ENABLED:
+    RMS_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
+    RMS_ADD_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
 
 
 class MatcherCustomOp(ABC):
@@ -79,13 +86,18 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         head_size: int,
         num_heads: int,
         num_kv_heads: int,
+        mrope_section: list[int] | None = None,
+        mrope_interleaved: bool = False,
+        use_mrope: bool = False,
         use_flashinfer: bool = False,
         enabled: bool | None = None,
     ) -> None:
         if enabled is None:
             enabled = RotaryEmbedding.enabled()
 
+        # assert not (use_mrope and use_flashinfer), "Cannot use both MRoPE and FlashInfer Rotary Embedding. For vLLM don't have such path yet."
         super().__init__(enabled)
+        print(f"inside the matcher: enabled: {self.enabled}")
         self.is_neox = is_neox
         self.head_size = head_size
         self.num_heads = num_heads
@@ -93,7 +105,12 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         self.q_size = self.num_heads * self.head_size
         self.kv_size = self.num_kv_heads * self.head_size
         self.rotary_dim = head_size
-        if use_flashinfer:
+        self.mrope_section = mrope_section
+        self.mrope_interleaved = mrope_interleaved
+        self.use_mrope = use_mrope
+        if use_mrope:
+            self.rotary_op = MROPE_OP
+        elif use_flashinfer:
             self.rotary_op = FLASHINFER_ROTARY_OP
         else:
             self.rotary_op = ROTARY_OP
@@ -105,6 +122,43 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         cos_sin_cache = self.empty(4096, self.rotary_dim)
         return [positions, query, key, cos_sin_cache]
 
+    def forward_custom_mrope(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert self.mrope_section is not None
+        cos_sin = cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        query_shape = query.shape
+        key_shape = key.shape
+        q, k = self.rotary_op(
+            q=query,
+            k=key,
+            cos=cos,
+            sin=sin,
+            mrope_section=self.mrope_section,
+            head_size=self.head_size,
+            rotary_dim=self.rotary_dim,
+            mrope_interleaved=self.mrope_interleaved,
+        )
+        # result = auto_functionalized(
+        #     self.rotary_op,
+        #     q=query,
+        #     k=key,
+        #     cos=cos,
+        #     sin=sin,
+        #     mrope_section=self.mrope_section,
+        #     head_size=self.head_size,
+        #     rotary_dim=self.rotary_dim,
+        #     mrope_interleaved=self.mrope_interleaved,
+        # )
+        query_out = q.view(query_shape)
+        key_out = k.view(key_shape) if key is not None else None
+        return query_out, key_out
+
     def forward_custom(
         self,
         positions: torch.Tensor,
@@ -112,6 +166,10 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         key: torch.Tensor | None,
         cos_sin_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.use_mrope:
+            return self.forward_custom_mrope(
+                positions, query, key, cos_sin_cache
+            )
         result = auto_functionalized(
             self.rotary_op,
             positions=positions,
@@ -132,6 +190,19 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         key: torch.Tensor | None,
         cos_sin_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.use_mrope:
+            assert self.mrope_section is not None
+            return MRotaryEmbedding.forward_static(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.rotary_dim,
+                cos_sin_cache,
+                self.is_neox,
+                self.mrope_section,
+                self.mrope_interleaved,
+            )
         return RotaryEmbedding.forward_static(
             positions,
             query,
@@ -161,6 +232,9 @@ class MatcherRMSNorm(MatcherCustomOp):
         input: torch.Tensor,
         weight: torch.Tensor,
     ) -> torch.Tensor:
+        if rocm_aiter_ops.is_enabled() and rocm_aiter_ops._RMSNORM_ENABLED:
+            return torch.ops.vllm.rocm_aiter_rms_norm.default(
+                input, weight, self.epsilon)
         result = torch.empty_like(input)
         _, result = auto_functionalized(
             RMS_OP,
