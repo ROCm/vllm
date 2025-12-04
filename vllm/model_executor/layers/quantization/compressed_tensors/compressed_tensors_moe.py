@@ -11,6 +11,7 @@ from compressed_tensors.quantization import (ActivationOrdering,
                                              QuantizationStrategy)
 
 import vllm.envs as envs
+from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig, fp8_w8a8_moe_quant_config
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
@@ -795,6 +796,25 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     self.input_quant.strategy == QuantizationStrategy.TOKEN),
             )
 
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        if self.use_marlin:
+            return None
+
+        per_act_token = self.input_quant.strategy == QuantizationStrategy.TOKEN
+        per_channel_quant = self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+
+        return fp8_w8a8_moe_quant_config(
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a1_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            per_act_token_quant=per_act_token,
+            per_out_ch_quant=per_channel_quant,
+            block_shape=layer.weight_block_size,
+        )
+    
     def apply(
         self,
         layer: torch.nn.Module,
@@ -809,6 +829,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -1057,6 +1078,7 @@ class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -1361,6 +1383,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -1592,6 +1615,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
         e_score_correction_bias: Optional[torch.Tensor] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
