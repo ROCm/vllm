@@ -1,11 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Tests for ROCm AITER fused all-reduce + RMSNorm fusion pass.
-
-These tests verify that the fusion pass correctly matches and replaces
-patterns of all_reduce + aiter rmsnorm operations with the fused kernel.
-"""
 
 from importlib.util import find_spec
 
@@ -41,10 +35,6 @@ from ..backend import TestBackend
 
 
 class AiterRMSNormModel(torch.nn.Module):
-    """
-    Test model with all_reduce -> rocm_aiter_rms_norm pattern (without residual).
-    """
-
     def __init__(self, hidden_size=16, token_num=16, eps=1e-6):
         super().__init__()
         self.hidden_size = hidden_size
@@ -53,7 +43,6 @@ class AiterRMSNormModel(torch.nn.Module):
         self.w = [torch.rand(hidden_size, hidden_size) for _ in range(2)]
 
     def forward(self, x):
-        # avoid having graph input be an arg to a pattern directly
         z = torch.relu(x)
         x = tensor_model_parallel_all_reduce(z)
         y = torch.ops.vllm.rocm_aiter_rms_norm(x, self.weight[0], self.eps)
@@ -72,14 +61,6 @@ class AiterRMSNormModel(torch.nn.Module):
 
 
 class AiterRMSNormWithAddModel(torch.nn.Module):
-    """
-    Test model with all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add pattern.
-
-    The model has 4 all_reduce + rmsnorm patterns:
-    - 1st: all_reduce -> rocm_aiter_rms_norm (without residual)
-    - 2nd-4th: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add (with residual)
-    """
-
     def __init__(self, hidden_size=16, token_num=16, eps=1e-6):
         super().__init__()
         self.hidden_size = hidden_size
@@ -88,30 +69,29 @@ class AiterRMSNormWithAddModel(torch.nn.Module):
         self.w = [torch.rand(hidden_size, hidden_size) for _ in range(3)]
 
     def forward(self, x):
-        # avoid having graph input be an arg to a pattern directly
         z = torch.relu(x)
         x = tensor_model_parallel_all_reduce(z)
-        # First pattern: all_reduce -> rocm_aiter_rms_norm (no residual)
+        # all_reduce -> rocm_aiter_rms_norm (no residual)
         y = torch.ops.vllm.rocm_aiter_rms_norm(x, self.weight[0], self.eps)
         resid = x.clone()
 
         z2 = torch.mm(y, self.w[0])
         x2 = tensor_model_parallel_all_reduce(z2)
-        # Second pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
+        # all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
         y2, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
             x2, resid, self.weight[1], self.eps
         )
 
         z3 = torch.mm(y2, self.w[1])
         x3 = tensor_model_parallel_all_reduce(z3)
-        # Third pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
+        # all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
         y3, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
             x3, resid, self.weight[2], self.eps
         )
 
         z4 = torch.mm(y3, self.w[2])
         x4 = tensor_model_parallel_all_reduce(z4)
-        # Fourth pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
+        # all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
         y4, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
             x4, resid, self.weight[3], self.eps
         )
@@ -130,12 +110,9 @@ class AiterRMSNormWithAddModel(torch.nn.Module):
 
 
 def is_rocm_aiter_available():
-    """Check if ROCm AITER is available for testing."""
     if not current_platform.is_rocm():
         return False
-    if find_spec("aiter") is None:
-        return False
-    return True
+    return find_spec("aiter") is not None
 
 
 @multi_gpu_test(num_gpus=2)
@@ -162,10 +139,6 @@ def test_rocm_aiter_allreduce_rmsnorm_fusion_pass_replace(
     hidden_size: int,
     dtype: torch.dtype,
 ):
-    """
-    Test that the ROCm AITER all-reduce + RMSNorm fusion pass correctly
-    matches and replaces the patterns in the test models.
-    """
     num_processes = 2
 
     def run_torch_spawn(fn, nprocs):
@@ -196,7 +169,6 @@ def rocm_aiter_allreduce_rmsnorm_fusion_pass_on_test_model(
     hidden_size: int,
     dtype: torch.dtype,
 ):
-    """Worker function that runs the fusion pass test in each process."""
     current_platform.seed_everything(0)
 
     device = torch.device(f"cuda:{local_rank}")
@@ -220,7 +192,6 @@ def rocm_aiter_allreduce_rmsnorm_fusion_pass_on_test_model(
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-    # Register aiter ops
     from vllm._aiter_ops import rocm_aiter_ops
 
     rocm_aiter_ops.register_ops_once()
@@ -257,14 +228,11 @@ def rocm_aiter_allreduce_rmsnorm_fusion_pass_on_test_model(
         compiled_model(hidden_states)
 
         # Verify that patterns were matched
-        if test_model_cls == AiterRMSNormModel:
-            # 2 all_reduce + rms_norm patterns (both without residual)
-            min_expected_matches = 2
-        else:
-            # 4 all_reduce + rmsnorm patterns:
-            # - 1 without residual (rocm_aiter_rms_norm)
-            # - 3 with residual (rocm_aiter_rmsnorm2d_fwd_with_add)
-            min_expected_matches = 4
+        # 2 all_reduce + rms_norm patterns (both without residual)
+        # 4 all_reduce + rmsnorm patterns:
+        # - 1 without residual (rocm_aiter_rms_norm)
+        # - 3 with residual (rocm_aiter_rmsnorm2d_fwd_with_add)
+        min_expected_matches = 2 if test_model_cls == AiterRMSNormModel else 4
 
         assert fusion_pass.matched_count >= min_expected_matches, (
             f"Expected at least {min_expected_matches} matches but got "
@@ -293,10 +261,6 @@ def test_rocm_aiter_allreduce_rmsnorm_fusion_correctness(
     hidden_size: int,
     dtype: torch.dtype,
 ):
-    """
-    Test that the fused operation produces correct results compared to
-    the unfused implementation.
-    """
     num_processes = 2
 
     def run_torch_spawn(fn, nprocs):
@@ -323,7 +287,6 @@ def rocm_aiter_allreduce_rmsnorm_correctness_test(
     hidden_size: int,
     dtype: torch.dtype,
 ):
-    """Worker function that tests correctness of the fused operation."""
     current_platform.seed_everything(0)
 
     device = torch.device(f"cuda:{local_rank}")
@@ -347,7 +310,6 @@ def rocm_aiter_allreduce_rmsnorm_correctness_test(
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-    # Register aiter ops
     from vllm._aiter_ops import rocm_aiter_ops
 
     rocm_aiter_ops.register_ops_once()
@@ -358,22 +320,18 @@ def rocm_aiter_allreduce_rmsnorm_correctness_test(
     token_num = batch_size * seq_len
     eps = 1e-6
 
-    # Create test tensors
     input_tensor = torch.randn((token_num, hidden_size), dtype=dtype, device=device)
     residual = torch.randn((token_num, hidden_size), dtype=dtype, device=device)
     weight = torch.randn(hidden_size, dtype=dtype, device=device)
 
-    # Make copies for comparison
     input_copy = input_tensor.clone()
     residual_copy = residual.clone()
 
-    # Reference implementation (unfused): all_reduce + rocm_aiter_rmsnorm2d_fwd_with_add
     ar_out_ref = tensor_model_parallel_all_reduce(input_copy)
     rms_out_ref, residual_out_ref = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
         ar_out_ref, residual_copy, weight, eps
     )
 
-    # Fused implementation
     rms_out_fused, residual_out_fused = (
         torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm(
             input_tensor,
@@ -384,7 +342,6 @@ def rocm_aiter_allreduce_rmsnorm_correctness_test(
         )
     )
 
-    # Compare results
     ATOL, RTOL = (1e-2, 1e-2)
     torch.testing.assert_close(rms_out_fused, rms_out_ref, atol=ATOL, rtol=RTOL)
     torch.testing.assert_close(
