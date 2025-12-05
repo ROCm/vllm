@@ -133,6 +133,9 @@ class PassConfig:
     """Whether to enable the fused Q/K RMSNorm + RoPE pass."""
     enable_aiter_allreduce_rmsnorm_fusion: bool = False
     """Whether to enable the fused AITER all-reduce + RMSNorm pass."""
+    enable_aiter_trtllm_allreduce_fusion: bool = False
+    """Whether to enable the fused AITER TRTLLM all-reduce + RMSNorm + optional
+    per-token quant pass. This uses the TRTLLM fusion kernel from aiter."""
 
     # TODO(luka) better pass enabling system.
 
@@ -206,6 +209,14 @@ class PassConfig:
             #         "Disabling RMSNorm + quant (fp8) fusion."
             #     )
             #     self.enable_fusion = False
+
+        if self.enable_aiter_trtllm_allreduce_fusion:
+            if not current_platform.is_rocm():
+                logger.warning_once(
+                    "AITER TRTLLM all-reduce + RMSNorm fusion enabled but the "
+                    "current platform is not ROCm. The fusion will be disabled."
+                )
+                self.enable_aiter_trtllm_allreduce_fusion = False
 
 
 class DynamicShapesType(str, enum.Enum):

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import contextmanager
 from functools import cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.distributed import ProcessGroup
@@ -33,6 +34,11 @@ if TYPE_CHECKING:
     except ImportError:
         AITERCustomAllreduce = CustomAllreduce  # type: ignore
 
+    try:
+        from aiter.ops.trtllm_all_reduce_fusion import AiterDistEnv as VllmTRTLLMDistEnvType  # noqa: F401
+    except ImportError:
+        VllmTRTLLMDistEnvType = Any  # type: ignore
+
 logger = init_logger(__name__)
 
 
@@ -46,9 +52,28 @@ def is_rocm_aiter_custom_allreduce_enabled() -> bool:
     )
 
 
+@cache
+def is_rocm_aiter_trtllm_dist_env_enabled() -> bool:
+    """Check if TRTLLM VllmTRTLLMDistEnv is enabled for ROCm platform."""
+    if not current_platform.is_rocm():
+        return False
+    if not envs.VLLM_ROCM_USE_AITER:
+        return False
+    # Check if aiter is available with trtllm fusion support
+    try:
+        from aiter.ops.trtllm_all_reduce_fusion import (
+            AiterDistEnv,  # noqa: F401
+        )
+
+        return True
+    except ImportError:
+        return False
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     if TYPE_CHECKING:
         ca_comm: CustomAllreduce | AITERCustomAllreduce | None
+        trtllm_dist_env: VllmTRTLLMDistEnvType | None
 
     def __init__(
         self,
@@ -62,14 +87,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # custom allreduce or torch symm mem can be used only by tp
             use_custom_allreduce = False
             use_torch_symm_mem = False
+            use_aiter_trtllm_dist_env = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
+            use_aiter_trtllm_dist_env = is_rocm_aiter_trtllm_dist_env_enabled()
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
+        self.use_aiter_trtllm_dist_env = use_aiter_trtllm_dist_env
 
         self.use_aiter_custom_allreduce = is_rocm_aiter_custom_allreduce_enabled()
         # lazy import to avoid documentation build error
@@ -133,6 +161,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # If it's a rocm, 'use_custom_allreduce==True' means it must
                 # currently be an MI300 series.
                 self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+            
+        if self.use_aiter_trtllm_dist_env and self.world_size > 1:
+            from vllm.distributed.device_communicators.trtllm_allreduce_fusion import (
+                AiterCommManager,
+            )
+            self.aiter_trtllm_comm = AiterCommManager()
+            device_id = self.device.index if self.device.index is not None else 0
+            # Initialize with dummy dtype - doesn't seem it's used
+            self.aiter_trtllm_comm.initialize(
+                group=self.device_group,
+                device_id=device_id,
+                dtype=torch.bfloat16,
+            )
+            logger.info(
+                "Initialized VllmTRTLLMDistEnv for group %s (device_id=%d, world_size=%d)",
+                unique_name,
+                device_id,
+                self.world_size,
+            )
+        else:
+            self.aiter_trtllm_comm = None
 
         if self.use_all2all:
             if self.all2all_backend == "naive":

@@ -29,6 +29,10 @@ if current_platform.is_rocm():
         RMSNormAiterQuantFusionPass,
         is_rocm_aiter_enabled,
     )
+    from .rocm_aiter_trtllm_allreduce_fusion import (
+        ROCmAiterTRTLLMAllReduceFusionPass,
+        is_rocm_aiter_trtllm_fusion_enabled,
+    )
 
 if current_platform.is_cuda():
     from .collective_fusion import AllReduceFusionPass, AsyncTPPass
@@ -126,6 +130,14 @@ class PostGradPassManager(CustomGraphPass):
                 and is_rocm_aiter_allreduce_rmsnorm_enabled()
             ):
                 self.passes += [ROCmAiterAllReduceRMSNormFusionPass(config)]
+
+            # ROCm AITER TRTLLM all-reduce + RMSNorm + optional quant fusion
+            if (
+                current_platform.is_rocm()
+                and self.pass_config.enable_aiter_trtllm_allreduce_fusion
+                and is_rocm_aiter_trtllm_fusion_enabled()
+            ):
+                self.passes += [ROCmAiterTRTLLMAllReduceFusionPass(config)]
 
             if self.pass_config.enable_attn_fusion:
                 self.passes += [AttnFusionPass(config)]
