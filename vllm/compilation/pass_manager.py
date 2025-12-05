@@ -21,6 +21,10 @@ if current_platform.is_cuda_alike():
     from .sequence_parallelism import SequenceParallelismPass
 
 if current_platform.is_rocm():
+    from .rocm_aiter_allreduce_rmsnorm_fusion import (
+        ROCmAiterAllReduceRMSNormFusionPass,
+        is_rocm_aiter_allreduce_rmsnorm_enabled,
+    )
     from .rocm_aiter_rmsnorm_fusion import (
         RMSNormAiterQuantFusionPass,
         is_rocm_aiter_enabled,
@@ -114,6 +118,14 @@ class PostGradPassManager(CustomGraphPass):
                     self.passes += [RMSNormAiterQuantFusionPass(config)]
                 self.passes += [RMSNormQuantFusionPass(config)]
                 self.passes += [ActivationQuantFusionPass(config)]
+
+            # ROCm AITER all-reduce + RMSNorm fusion
+            if (
+                current_platform.is_rocm()
+                and self.pass_config.enable_aiter_allreduce_rmsnorm_fusion
+                and is_rocm_aiter_allreduce_rmsnorm_enabled()
+            ):
+                self.passes += [ROCmAiterAllReduceRMSNormFusionPass(config)]
 
             if self.pass_config.enable_attn_fusion:
                 self.passes += [AttnFusionPass(config)]
