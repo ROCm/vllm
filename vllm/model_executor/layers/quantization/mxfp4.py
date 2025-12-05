@@ -859,9 +859,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 renormalize=renormalize,
                 global_num_experts=global_num_experts,
                 expert_map=expert_map,
-                w1_bias=layer.w13_bias,
-                w2_bias=layer.w2_bias,
-                w1_precision=self.w13_precision_config,
-                w2_precision=self.w2_precision_config,
+                quant_config=self.moe_quant_config,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
