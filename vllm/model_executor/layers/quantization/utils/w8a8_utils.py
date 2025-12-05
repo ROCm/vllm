@@ -387,21 +387,9 @@ def rocm_aiter_per_token_w8a8_scaled_mm(
     bias: torch.Tensor,
     output_shape: list,
 ) -> torch.Tensor:
-    # Experimentation Feature: Will be replaced with dispatching logic
-    # Whether to use swizzle hipb_mm for PTPC fp8 GEMM, use ck_bpreshuffle_gemm
-    # if disabled.
-    if rocm_aiter_ops.is_linear_fp8_hipb_enabled():
-        output = rocm_aiter_ops.hip_bpreshuffle_gemm(
-            qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b
-        )
-    else:
-        output = torch.ops.vllm.rocm_aiter_gemm_a8w8_bpreshuffle(
-            qinput,
-            weight.t(),
-            out_dtype=out_dtype,
-            scale_a=scale_a,
-            scale_b=scale_b.t() if scale_b is not None else None,
-        )
+    output = torch.ops.vllm.rocm_aiter_gemm_a8w8_bpreshuffle(
+        qinput, weight, out_dtype=out_dtype, scale_a=scale_a, scale_b=scale_b
+    )
     if bias is not None:
         output = output + bias
 
@@ -606,8 +594,8 @@ class Fp8LinearOp:
         if self.use_aiter_and_is_supported and not (
             per_tensor_weights and per_tensor_activations
         ):
-            # weight is in (K, N)
-            output_shape = [*input.shape[:-1], weight.shape[1]]
+            # weight is in (N, K)
+            output_shape = [*input.shape[:-1], weight.shape[0]]
 
         # TODO(luka) do this dispatch during init (after ScaledMM refactor)
         w8a8_scaled_mm_func = dispatch_w8a8_scaled_mm(

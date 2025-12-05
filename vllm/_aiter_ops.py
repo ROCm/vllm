@@ -499,8 +499,6 @@ _OPS_REGISTERED = False
 class rocm_aiter_ops:
     _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
-    _LINEAR_SHUFFLE_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_SHUFFLE
-    _LINEAR_FP8HIPB_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_FP8HIPB
     _RMSNORM_ENABLED = envs.VLLM_ROCM_USE_AITER_RMSNORM
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
@@ -512,8 +510,6 @@ class rocm_aiter_ops:
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
-
-    _HIPBLASLT_INITIALIZED = False
 
     @classmethod
     @if_aiter_supported
@@ -532,18 +528,6 @@ class rocm_aiter_ops:
     def is_linear_fp8_enaled(cls) -> bool:
         """ "Verifies device specs and availability of env variable."""
         return cls.is_linear_enabled() and current_platform.is_fp8_fnuz()
-
-    @classmethod
-    @if_aiter_supported
-    def is_linear_shuffle_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
-        return cls.is_linear_enabled() and cls._LINEAR_SHUFFLE_ENABLED
-
-    @classmethod
-    @if_aiter_supported
-    def is_linear_fp8_hipb_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
-        return cls.is_linear_fp8_enaled() and cls._LINEAR_FP8HIPB_ENABLED
 
     @classmethod
     @if_aiter_supported
@@ -1072,7 +1056,7 @@ class rocm_aiter_ops:
 
     @staticmethod
     def shuffle_weight(
-        tensor: torch.Tensor, layout: tuple[int, int] = (16, 16)
+        self, tensor: torch.Tensor, layout: tuple[int, int] = (16, 16)
     ) -> torch.Tensor:
         from aiter.ops.shuffle import shuffle_weight
 
@@ -1143,63 +1127,6 @@ class rocm_aiter_ops:
         return aiter_tgemm.mm(
             input, weight, otype=out_dtype, scale_a=scale_a, scale_b=scale_b, bias=bias
         )
-
-    @classmethod
-    def initialize_hipblaslt(cls) -> None:
-        # Add a safeguard so that
-        # aiter_ops can still be imported
-        # on non-ROCm platforms and called
-        # without causing errors
-        if not current_platform.is_rocm():
-            return
-        if cls._HIPBLASLT_INITIALIZED:
-            return
-        from aiter import hipb_create_extension
-
-        hipb_create_extension()
-        cls._HIPBLASLT_INITIALIZED = True
-
-    @staticmethod
-    def hip_bpreshuffle_gemm(
-        input: torch.Tensor,  # [M, K]
-        weight: torch.Tensor,  # [K, N]
-        bias: torch.Tensor | None = None,
-        out_dtype: torch.dtype | None = None,
-        scale_a: torch.Tensor | None = None,
-        scale_b: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if out_dtype is None:
-            out_dtype = torch.bfloat16
-
-        assert out_dtype == torch.bfloat16, (
-            f"hip_bpreshuffle_gemm only supports bfloat16 output dtype"
-            f", you have passed in {out_dtype}"
-        )
-        if input.dim() >= 3:
-            inp_view = input.view(-1, input.size(-1))
-            batched = True
-        else:
-            inp_view = input
-            batched = False
-
-        from aiter import hipb_mm
-
-        output = hipb_mm(
-            inp_view,
-            weight,
-            solution_index=-1,
-            bias=bias,
-            out_dtype=out_dtype,
-            scaleA=scale_a,
-            scaleB=scale_b,
-            scaleOut=None,
-            bpreshuffle=True,
-        )
-
-        if batched:
-            output = output.view(*input.shape[:-1], weight.shape[1])
-
-        return output
 
 
 rocm_aiter_ops.register_ops_once()

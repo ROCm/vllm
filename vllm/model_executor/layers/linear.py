@@ -8,7 +8,6 @@ from typing import Any
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -235,18 +234,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
-
-        if current_platform.is_rocm() and rocm_aiter_ops.is_linear_shuffle_enabled():
-            layout = (16, 16)
-            weight = layer.weight
-
-            if rocm_aiter_ops.can_shuffle(weight.shape[0], weight.shape[1], layout):
-                shuffled_weight = rocm_aiter_ops.shuffle_weight(weight, layout).t()
-                self._gemm_func = dispatch_unquantized_gemm(use_swizzle=True)
-            else:
-                shuffled_weight = weight
-
-            layer.weight = Parameter(shuffled_weight.data, requires_grad=False)
 
     def apply(
         self,
