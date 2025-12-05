@@ -1,17 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-ROCm AITER fused all-reduce + RMSNorm fusion pass.
-
-This pass fuses the following patterns:
-1. all_reduce(x) -> rocm_aiter_rms_norm(ar_out) -> fused_allreduce_rmsnorm
-2. all_reduce(x) -> rocm_aiter_rmsnorm2d_fwd_with_add(ar_out, residual)
-   -> fused_allreduce_rmsnorm
-
-The fused operation leverages aiter's fused_allreduce_rmsnorm kernel which
-performs both operations in a single kernel launch, reducing memory bandwidth
-and kernel launch overhead.
-"""
 
 from typing import Any
 
@@ -36,7 +24,6 @@ logger = init_logger(__name__)
 
 
 def is_rocm_aiter_allreduce_rmsnorm_enabled() -> bool:
-    """Check if ROCm AITER fused all-reduce + RMSNorm is enabled."""
     if not current_platform.is_rocm():
         return False
     if not envs.VLLM_ROCM_USE_AITER:
@@ -53,7 +40,7 @@ def is_rocm_aiter_allreduce_rmsnorm_enabled() -> bool:
 
 
 def _can_use_fused_ar_rms(input_: torch.Tensor, world_size: int) -> bool:
-    """Check if the fused all-reduce + RMSNorm kernel can be used."""
+    """Taken from condition checks in aiter"""
     n = input_.shape[-1]
     return (
         n <= 16384
@@ -111,38 +98,17 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
             and _can_use_fused_ar_rms(input_, device_comm.world_size)
             and hasattr(ca_comm, "custom_fused_ar_rms")
         ):
-            # Use AITER's fused all-reduce + RMSNorm kernel
             out, res_out = ca_comm.custom_fused_ar_rms(
                 input_, residual, weight, epsilon
             )
             return out, res_out
 
-        print(
-            f"!!!!!!!!!!!! Using fallback !!!!!!!!!!!! Reason: {use_aiter_ca}, {ca_comm is not None}, {not ca_comm.disabled}, {ca_comm.should_custom_ar(input_)}, {_can_use_fused_ar_rms(input_, device_comm.world_size)}, {hasattr(ca_comm, 'custom_fused_ar_rms')}"
-        )
-
-    print("!!!!!!!!!!!! Using fallback !!!!!!!!!!!! Reason: device_comm is None")
-
-    # Fallback: perform all-reduce and rmsnorm separately using aiter
+    # Fallback: launch all-reduce and rmsnorm separately
     ar_out = group._all_reduce_out_place(input_)
 
     out, residual_out = rocm_aiter_ops.rms_norm2d_with_add(
         ar_out, residual, weight, epsilon
     )
-
-    # from aiter import rmsnorm2d_fwd_with_add
-
-    # out = torch.empty_like(ar_out)
-    # residual_out = torch.empty_like(ar_out)
-    # rmsnorm2d_fwd_with_add(
-    #     out,
-    #     ar_out,
-    #     residual,
-    #     residual_out,
-    #     weight,
-    #     epsilon,
-    #     0,  # quant_scale_mode = 0 (no quantization)
-    # )
     return out, residual_out
 
 
@@ -153,7 +119,6 @@ def _rocm_aiter_fused_allreduce_rmsnorm_fake(
     epsilon: float,
     group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fake implementation for tracing."""
     return torch.empty_like(input_), torch.empty_like(residual)
 
 
@@ -163,26 +128,6 @@ def _rocm_aiter_fused_allreduce_rmsnorm_no_residual_impl(
     epsilon: float,
     group_name: str,
 ) -> torch.Tensor:
-    """
-    Implementation of the fused all-reduce + RMSNorm operation without residual.
-
-    This variant is used when the pattern is all_reduce -> rmsnorm (without
-    fused add). We create a zero residual tensor internally so we can still
-    use the fused kernel.
-
-    The fused kernel (custom_fused_ar_rms) performs all-reduce and RMSNorm
-    in a single kernel launch, which reduces memory bandwidth and kernel
-    launch overhead.
-
-    Args:
-        input_: Input tensor to all-reduce
-        weight: RMSNorm weight tensor
-        epsilon: Epsilon for numerical stability
-        group_name: The name of the tensor parallel group
-
-    Returns:
-        The RMSNorm output tensor
-    """
     from vllm.distributed.parallel_state import _groups
 
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -190,12 +135,8 @@ def _rocm_aiter_fused_allreduce_rmsnorm_no_residual_impl(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
 
-    # Create a zero residual for the no-residual case
-    # This allows us to use the same fused kernel
-    # res_out = ar_out + residual = ar_out + 0 = ar_out
     residual = torch.zeros_like(input_)
 
-    # Try to use the fused kernel via the custom allreduce communicator
     device_comm = group.device_communicator
     if device_comm is not None:
         ca_comm = getattr(device_comm, "ca_comm", None)
@@ -213,15 +154,9 @@ def _rocm_aiter_fused_allreduce_rmsnorm_no_residual_impl(
             out, _ = ca_comm.custom_fused_ar_rms(input_, residual, weight, epsilon)
             return out
 
-        print(
-            f"!!!!!!!!!!!! Using fallback !!!!!!!!!!!! Reason: {use_aiter_ca}, {ca_comm is not None}, {ca_comm.disabled}, {ca_comm.should_custom_ar(input_)}, {_can_use_fused_ar_rms(input_, device_comm.world_size)}, {hasattr(ca_comm, 'custom_fused_ar_rms')}"
-        )
-
-    print("!!!!!!!!!!!! Using fallback !!!!!!!!!!!! Reason: device_comm is None")
-    # Fallback: perform all-reduce and rmsnorm separately using aiter
+    # Fallback: launch all-reduce and rmsnorm separately
     ar_out = group._all_reduce_out_place(input_)
 
-    # Use aiter's rms_norm (without add)
     out = rocm_aiter_ops.rms_norm(ar_out, weight, epsilon)
     return out
 
@@ -232,7 +167,6 @@ def _rocm_aiter_fused_allreduce_rmsnorm_no_residual_fake(
     epsilon: float,
     group_name: str,
 ) -> torch.Tensor:
-    """Fake implementation for tracing."""
     return torch.empty_like(input_)
 
 
@@ -256,15 +190,6 @@ if current_platform.is_rocm():
 
 
 class AllReduceAiterRMSNormWithAddPattern:
-    """
-    Pattern for fusing all_reduce + rocm_aiter_rmsnorm2d_fwd_with_add.
-
-    Pattern:
-        all_reduce(x) -> rocm_aiter_rmsnorm2d_fwd_with_add(ar_out, residual, weight, eps)
-    Replacement:
-        fused_allreduce_rmsnorm(x, residual, weight, eps) -> (y, residual_out)
-    """
-
     def __init__(
         self,
         epsilon: float,
@@ -312,48 +237,8 @@ class AllReduceAiterRMSNormWithAddPattern:
             pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
 
-        # # Also register pattern that only returns the first output
-        # # (helpful for end of graph where residual is not used again)
-        # def pattern_first_only(
-        #     input_: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-        # ):
-        #     allreduce_output = tensor_model_parallel_all_reduce(input_)
-        #     rms_out, _ = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-        #         allreduce_output, residual, weight, self.epsilon
-        #     )
-        #     return rms_out
-
-        # def replacement_first_only(
-        #     input_: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-        # ):
-        #     rms_out, _ = torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm(
-        #         input_,
-        #         residual,
-        #         weight,
-        #         self.epsilon,
-        #         self.tp.unique_name,
-        #     )
-        #     return rms_out
-
-        # pm.register_replacement(
-        #     pattern_first_only,
-        #     replacement_first_only,
-        #     self.get_inputs(),
-        #     pm.fwd_only,
-        #     pm_pass,
-        # )
-
 
 class AllReduceAiterRMSNormPattern:
-    """
-    Pattern for fusing all_reduce + rocm_aiter_rms_norm (without residual).
-
-    Pattern:
-        all_reduce(x) -> rocm_aiter_rms_norm(ar_out, weight, eps)
-    Replacement:
-        fused_allreduce_rmsnorm_no_residual(x, weight, eps) -> y
-    """
-
     def __init__(
         self,
         epsilon: float,
@@ -367,14 +252,12 @@ class AllReduceAiterRMSNormPattern:
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def get_inputs(self):
-        # Create example tensors for pattern matching
         input_tensor = torch.empty(5, 16, dtype=self.dtype, device=self.device)
         weight = torch.empty(16, dtype=self.dtype, device=self.device)
         return [input_tensor, weight]
 
     def register(self, pm_pass: PatternMatcherPass):
         def pattern(input_: torch.Tensor, weight: torch.Tensor):
-            # Pattern: all_reduce -> rocm_aiter_rms_norm
             allreduce_output = tensor_model_parallel_all_reduce(input_)
             rms_out = torch.ops.vllm.rocm_aiter_rms_norm(
                 allreduce_output, weight, self.epsilon
@@ -396,16 +279,6 @@ class AllReduceAiterRMSNormPattern:
 
 
 class ROCmAiterAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
-    """
-    Fusion pass for ROCm AITER fused all-reduce + RMSNorm.
-
-    This pass fuses:
-    - all_reduce + rocm_aiter_rmsnorm2d_fwd_with_add (with residual)
-    - all_reduce + rocm_aiter_rms_norm (without residual)
-
-    into a single fused operation using aiter's fused_allreduce_rmsnorm kernel.
-    """
-
     def __init__(self, config: VllmConfig):
         super().__init__(config)
         self.disabled = True
@@ -433,14 +306,14 @@ class ROCmAiterAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
     @enable_fake_mode
     def register_patterns(self):
         for epsilon in [1e-5, 1e-6]:
-            # Fuse all_reduce + rocm_aiter_rmsnorm2d_fwd_with_add (with residual)
+            # with residual
             AllReduceAiterRMSNormWithAddPattern(
                 epsilon,
                 self.model_dtype,
                 self.device,
             ).register(self.patterns)
 
-            # Fuse all_reduce + rocm_aiter_rms_norm (without residual)
+            # without residual
             AllReduceAiterRMSNormPattern(
                 epsilon,
                 self.model_dtype,
@@ -457,12 +330,10 @@ class ROCmAiterAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
     def __call__(self, graph: fx.Graph):
         if self.disabled:
             logger.debug("ROCmAiterAllReduceRMSNormFusionPass disabled")
-            logger.info("!!!!!!!!!!!! ROCmAiterAllReduceRMSNormFusionPass disabled")
             return
 
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
-        logger.info("!!!!!!!!!!!! Replaced %s patterns", self.matched_count)
 
     def uuid(self) -> Any:
         return self.hash_source(
