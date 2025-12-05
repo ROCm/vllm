@@ -624,6 +624,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
                 rocm_aiter_fused_experts,
             )
+
             out = rocm_aiter_fused_experts(
                 x,
                 layer.w13_weight,
