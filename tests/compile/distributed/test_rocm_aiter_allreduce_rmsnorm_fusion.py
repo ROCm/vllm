@@ -43,7 +43,6 @@ class AiterRMSNormModel(torch.nn.Module):
         self.w = [torch.rand(hidden_size, hidden_size) for _ in range(2)]
 
     def forward(self, x):
-        # avoid having graph input be an arg to a pattern directly
         z = torch.relu(x)
         x = tensor_model_parallel_all_reduce(z)
         y = torch.ops.vllm.rocm_aiter_rms_norm(x, self.weight[0], self.eps)
@@ -70,30 +69,29 @@ class AiterRMSNormWithAddModel(torch.nn.Module):
         self.w = [torch.rand(hidden_size, hidden_size) for _ in range(3)]
 
     def forward(self, x):
-        # avoid having graph input be an arg to a pattern directly
         z = torch.relu(x)
         x = tensor_model_parallel_all_reduce(z)
-        # First pattern: all_reduce -> rocm_aiter_rms_norm (no residual)
+        # all_reduce -> rocm_aiter_rms_norm (no residual)
         y = torch.ops.vllm.rocm_aiter_rms_norm(x, self.weight[0], self.eps)
         resid = x.clone()
 
         z2 = torch.mm(y, self.w[0])
         x2 = tensor_model_parallel_all_reduce(z2)
-        # Second pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
+        # all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
         y2, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
             x2, resid, self.weight[1], self.eps
         )
 
         z3 = torch.mm(y2, self.w[1])
         x3 = tensor_model_parallel_all_reduce(z3)
-        # Third pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
+        # all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
         y3, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
             x3, resid, self.weight[2], self.eps
         )
 
         z4 = torch.mm(y3, self.w[2])
         x4 = tensor_model_parallel_all_reduce(z4)
-        # Fourth pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
+        # all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
         y4, resid = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
             x4, resid, self.weight[3], self.eps
         )
@@ -194,7 +192,6 @@ def rocm_aiter_allreduce_rmsnorm_fusion_pass_on_test_model(
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-    # Register aiter ops
     from vllm._aiter_ops import rocm_aiter_ops
 
     rocm_aiter_ops.register_ops_once()

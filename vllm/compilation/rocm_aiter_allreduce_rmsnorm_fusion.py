@@ -28,7 +28,7 @@ def is_rocm_aiter_allreduce_rmsnorm_enabled() -> bool:
         return False
     if not envs.VLLM_ROCM_USE_AITER:
         return False
-    # Check if aiter is available
+
     try:
         from importlib.util import find_spec
 
@@ -56,27 +56,6 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     epsilon: float,
     group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Implementation of the fused all-reduce + RMSNorm operation.
-
-    This function first tries to use aiter's fused all-reduce + RMSNorm kernel
-    (custom_fused_ar_rms) directly. If the fused kernel is not available or
-    conditions are not met, it falls back to separate all-reduce and aiter's
-    rmsnorm operations.
-
-    The fused kernel performs all-reduce and RMSNorm in a single kernel launch,
-    which reduces memory bandwidth and kernel launch overhead.
-
-    Args:
-        input_: Input tensor to all-reduce
-        residual: Residual tensor for the fused add operation
-        weight: RMSNorm weight tensor
-        epsilon: Epsilon for numerical stability
-        group_name: The name of the tensor parallel group
-
-    Returns:
-        A tuple of (rms_norm_output, residual_output)
-    """
     from vllm.distributed.parallel_state import _groups
 
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -84,7 +63,6 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
 
-    # Try to use the fused kernel via the custom allreduce communicator
     device_comm = group.device_communicator
     if device_comm is not None:
         ca_comm = getattr(device_comm, "ca_comm", None)
@@ -170,7 +148,6 @@ def _rocm_aiter_fused_allreduce_rmsnorm_no_residual_fake(
     return torch.empty_like(input_)
 
 
-# Register custom ops for ROCm
 if current_platform.is_rocm():
     direct_register_custom_op(
         op_name="rocm_aiter_fused_allreduce_rmsnorm",
