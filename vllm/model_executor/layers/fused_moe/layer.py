@@ -867,6 +867,8 @@ class FusedMoE(CustomOp):
         self._is_mxfp4 = self.is_mxfp4_quant(quant_config=quant_config)
         unpadded_hidden_size = hidden_size
         if self._is_mxfp4:
+            if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+                hidden_pad = round_up(hidden_size, 256) - hidden_size
             from vllm.model_executor.layers.quantization.mxfp4 import (
                 Mxfp4Backend, get_mxfp4_backend)
             current_mxfp4_backend = get_mxfp4_backend()
@@ -1019,6 +1021,11 @@ class FusedMoE(CustomOp):
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod")):
             moe_quant_params["intermediate_size_full"] = intermediate_size
+
+        # need pad hidden_size for ROCM mxfp4
+        if (self.quant_method.__class__.__name__ == "MXFP4MoEMethod"
+            and current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4):
+            moe_quant_params["hidden_pad"] = hidden_pad
 
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 

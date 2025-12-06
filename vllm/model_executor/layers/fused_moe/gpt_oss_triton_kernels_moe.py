@@ -10,12 +10,25 @@ from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG, FusedMoEQuantConfig)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate)
-from aiter.ops.triton.moe_routing.routing import routing
+from vllm.utils import has_triton_kernels
+
+from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
 from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4
 from aiter.ops.triton.quant_moe import downcast_to_static_fp8
 
 
 logger = init_logger(__name__)
+
+if has_triton_kernels():
+    try:
+        import triton_kernels.swiglu
+        from triton_kernels.matmul_ogs import (FnSpecs, FusedActivation,
+                                               matmul_ogs)
+        from triton_kernels.routing import routing
+    except (ModuleNotFoundError, AttributeError) as e:
+        logger.error(
+            "Failed to import Triton kernels. Please make sure your triton "
+            "version is compatible. Error: %s", e)
 
 
 def triton_kernel_moe_forward(
@@ -35,8 +48,16 @@ def triton_kernel_moe_forward(
     unpadded_N_w2 = None,
     unpadded_K_w2 = None
 ) -> torch.Tensor:
+    
+    if quant_config.use_mxfp4_w4a16:
+        routing_data, gather_idx, scatter_idx = routing(
+            gating_output, topk, sm_first=not renormalize
+        )
 
-    routing_data, gather_idx, scatter_idx = routing(gating_output, topk, sm_first=not renormalize)
+    elif quant_config.use_mxfp4_w4a4:
+        routing_data, gather_idx, scatter_idx = aiter_routing(
+            gating_output, topk, sm_first=not renormalize
+        )
 
     return triton_kernel_fused_experts(
         None,
@@ -100,38 +121,62 @@ def triton_kernel_fused_experts(
 
     gammas = routing_data.gate_scal if routing_data else None
 
-    hidden_states = downcast_to_static_fp8(hidden_states, quant_config.w1_precision.flex_ctx.lhs_data.scale)
+    if quant_config.use_mxfp4_w4a16:
+        act = FusedActivation(
+                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
+                (swiglu_alpha, swiglu_limit), 2)
+        intermediate_cache1 = matmul_ogs(
+            hidden_states,
+            w1,
+            quant_config.w1_bias,
+            routing_data,
+            gather_indx=gather_indx,
+            precision_config=quant_config.w1_precision,
+            gammas=gammas if apply_router_weight_on_input else None,
+            fused_activation=act)
+        intermediate_cache3 = matmul_ogs(
+            intermediate_cache1,
+            w2,
+            quant_config.w2_bias,
+            routing_data,
+            scatter_indx=scatter_indx,
+            precision_config=quant_config.w2_precision,
+            gammas=None if apply_router_weight_on_input else gammas,
+            y=output_tensor)
 
-    intermediate_cache1 = moe_gemm_a8w4(hidden_states, 
-        w1.storage.data, 
-        None, 
-        quant_config.w1_precision.weight_scale.storage.data, 
-        quant_config.w1_precision.flex_ctx.lhs_data.scale, 
-        quant_config.w2_precision.flex_ctx.lhs_data.scale, 
-        quant_config.w1_bias, routing_data, 
-        gather_indx=gather_indx, 
-        gammas=gammas if apply_router_weight_on_input else None, 
-        swizzle_mx_scale="CDNA4_SCALE", 
-        out_dtype=torch.float8_e4m3fn, 
-        apply_swiglu=True, 
-        alpha=swiglu_alpha, 
-        limit=swiglu_limit,
-        unpadded_N=unpadded_N_w1,
-        unpadded_K=unpadded_K_w1)
+    elif quant_config.use_mxfp4_w4a4:
+        hidden_states = downcast_to_static_fp8(hidden_states, quant_config.w1_precision.flex_ctx.lhs_data.scale)
 
-    intermediate_cache3 = moe_gemm_a8w4(intermediate_cache1, 
-        w2.storage.data, 
-        None, 
-        quant_config.w2_precision.weight_scale.storage.data, 
-        quant_config.w2_precision.flex_ctx.lhs_data.scale, 
-        None, 
-        quant_config.w2_bias, 
-        routing_data, 
-        scatter_indx=scatter_indx, 
-        gammas=None if apply_router_weight_on_input else gammas, 
-        swizzle_mx_scale="CDNA4_SCALE",
-        unpadded_N=unpadded_N_w2,
-        unpadded_K=unpadded_K_w2)
+        intermediate_cache1 = moe_gemm_a8w4(hidden_states, 
+            w1.storage.data, 
+            None, 
+            quant_config.w1_precision.weight_scale.storage.data, 
+            quant_config.w1_precision.flex_ctx.lhs_data.scale, 
+            quant_config.w2_precision.flex_ctx.lhs_data.scale, 
+            quant_config.w1_bias, routing_data, 
+            gather_indx=gather_indx, 
+            gammas=gammas if apply_router_weight_on_input else None, 
+            swizzle_mx_scale="CDNA4_SCALE", 
+            out_dtype=torch.float8_e4m3fn, 
+            apply_swiglu=True, 
+            alpha=swiglu_alpha, 
+            limit=swiglu_limit,
+            unpadded_N=unpadded_N_w1,
+            unpadded_K=unpadded_K_w1)
+
+        intermediate_cache3 = moe_gemm_a8w4(intermediate_cache1, 
+            w2.storage.data, 
+            None, 
+            quant_config.w2_precision.weight_scale.storage.data, 
+            quant_config.w2_precision.flex_ctx.lhs_data.scale, 
+            None, 
+            quant_config.w2_bias, 
+            routing_data, 
+            scatter_indx=scatter_indx, 
+            gammas=None if apply_router_weight_on_input else gammas, 
+            swizzle_mx_scale="CDNA4_SCALE",
+            unpadded_N=unpadded_N_w2,
+            unpadded_K=unpadded_K_w2)
 
     return intermediate_cache3
 
