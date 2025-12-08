@@ -1,4 +1,6 @@
-# ENV Setup
+# Guidelines for DeepSeek v3.2
+
+## ENV Setup
 
 aiter branch: `ganyi/test_mqa_gluon`
 
@@ -6,15 +8,16 @@ vllm branch: `ROCm/vllm: ganyi/optimize_dsv3.2_metadata`
 
 triton: 3.5+ (need to update to 3.5 or higher version)
 
-pull the aot gluon kernel to local 
-```bash 
+pull the aot gluon kernel to local
+
+```bash
 git clone -b aiter_aot https://github.com/ROCm/triton-kernels.git
 # copy the aot version of kernel from triton-kernels to aiter
 cp -r ~/triton-kernels/kernels/configs/paged_mqa_logits/aot ~/aiter/ops/triton/configs/paged_mqa_logits
 
 ```
 
-# Deepseek V3.2 launch script 
+## Deepseek V3.2 launch script
 
 ```bash
 export VLLM_USE_V1=1
@@ -47,10 +50,12 @@ vllm serve $model_path \
   --block-size 64 \
 ```
 
-# Accuracy verification
+## Accuracy verification
+
 Following the upper step, you may reproduce this accuarcy resutl on dsv3.2
 
-```
+```bash
+
 # verification script
 
 lm_eval --model local-completions  \
@@ -71,4 +76,5 @@ lm_eval --model local-completions  \
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|    20|exact_match|↑  |0.9507|±  |0.0060|
 |     |       |strict-match    |    20|exact_match|↑  |0.9515|±  |0.0059|
+
 ```
