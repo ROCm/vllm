@@ -193,16 +193,20 @@ class PassConfig:
             )
             self.enable_qk_norm_rope_fusion = False
 
-        if self.enable_aiter_allreduce_rmsnorm_fusion:
-            if not current_platform.is_rocm():
-                logger.warning_once(
-                    "AITER all-reduce + RMSNorm fusion enabled but the current platform"
-                    "is not ROCm. The fusion will be disabled."
-                )
-                self.enable_aiter_allreduce_rmsnorm_fusion = False
+        if (
+            self.enable_aiter_allreduce_rmsnorm_fusion
+            and not current_platform.is_rcom()
+        ):
+            logger.warning_once(
+                "AITER all-reduce + RMSNorm fusion enabled but the current platform"
+                "is not ROCm. The fusion will be disabled."
+            )
+            self.enable_aiter_allreduce_rmsnorm_fusion = False
             # if self.enable_fusion:
             #     logger.warning_once(
-            #         "AITER all-reduce + RMSNorm fusion enabled which contains the RMSNorm + quant (fp8) fusion. "
+            #         "AITER all-reduce + RMSNorm fusion "
+            #         "enabled which contains the RMSNorm + "
+            #         "quant (fp8) fusion. "
             #         "Disabling RMSNorm + quant (fp8) fusion."
             #     )
             #     self.enable_fusion = False
