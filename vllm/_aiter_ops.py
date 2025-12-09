@@ -492,6 +492,72 @@ def _rocm_aiter_rmsnorm2d_fwd_with_add_fake(
     return torch.empty_like(x), torch.empty_like(residual)
 
 
+@functools.lru_cache(maxsize=1)
+def _initialize_hipblaslt():
+    from aiter import hipb_create_extension
+
+    hipb_create_extension()
+
+
+def _gemm_weight_bpreshuffle_impl(
+    input: torch.Tensor,  # [M, K]
+    weight: torch.Tensor,  # [K, N]
+    bias: torch.Tensor | None = None,  # [N]
+    out_dtype: torch.dtype | None = None,
+    scale_a: torch.Tensor | None = None,  # None, (1,) or (M,1)
+    scale_b: torch.Tensor | None = None,  # None, (1,) or (1,N)
+) -> torch.Tensor:
+    _initialize_hipblaslt()
+
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+
+    assert out_dtype == torch.bfloat16, (
+        f"hip_bpreshuffle_gemm only supports bfloat16 output dtype"
+        f", you have passed in {out_dtype}"
+    )
+    if input.dim() >= 3:
+        inp_view = input.view(-1, input.size(-1))
+        batched = True
+    else:
+        inp_view = input
+        batched = False
+
+    from aiter import hipb_mm
+
+    output = hipb_mm(
+        inp_view,
+        weight,
+        solution_index=-1,
+        bias=bias,
+        out_dtype=out_dtype,
+        scaleA=scale_a,
+        scaleB=scale_b,
+        scaleOut=None,
+        bpreshuffle=True,
+    )
+
+    if batched:
+        output = output.view(*input.shape[:-1], weight.shape[1])
+
+    return output
+
+
+def _gemm_weight_bpreshuffle_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    scale_a: torch.Tensor | None = None,
+    scale_b: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if out_dtype is None:
+        out_dtype = torch.bfloat16
+    return torch.empty(
+        *input.shape[:-1], weight.shape[1], dtype=out_dtype, device=input.device
+    )
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -716,6 +782,14 @@ class rocm_aiter_ops:
                 op_func=_rocm_aiter_rmsnorm2d_fwd_with_add_impl,
                 mutates_args=[],
                 fake_impl=_rocm_aiter_rmsnorm2d_fwd_with_add_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
+                op_name="gemm_weight_bpreshuffle",
+                op_func=_gemm_weight_bpreshuffle_impl,
+                mutates_args=[],
+                fake_impl=_gemm_weight_bpreshuffle_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
 
@@ -1144,21 +1218,6 @@ class rocm_aiter_ops:
             input, weight, otype=out_dtype, scale_a=scale_a, scale_b=scale_b, bias=bias
         )
 
-    @classmethod
-    def initialize_hipblaslt(cls) -> None:
-        # Add a safeguard so that
-        # aiter_ops can still be imported
-        # on non-ROCm platforms and called
-        # without causing errors
-        if not current_platform.is_rocm():
-            return
-        if cls._HIPBLASLT_INITIALIZED:
-            return
-        from aiter import hipb_create_extension
-
-        hipb_create_extension()
-        cls._HIPBLASLT_INITIALIZED = True
-
     @staticmethod
     def hip_bpreshuffle_gemm(
         input: torch.Tensor,  # [M, K]
@@ -1168,38 +1227,14 @@ class rocm_aiter_ops:
         scale_a: torch.Tensor | None = None,
         scale_b: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if out_dtype is None:
-            out_dtype = torch.bfloat16
-
-        assert out_dtype == torch.bfloat16, (
-            f"hip_bpreshuffle_gemm only supports bfloat16 output dtype"
-            f", you have passed in {out_dtype}"
-        )
-        if input.dim() >= 3:
-            inp_view = input.view(-1, input.size(-1))
-            batched = True
-        else:
-            inp_view = input
-            batched = False
-
-        from aiter import hipb_mm
-
-        output = hipb_mm(
-            inp_view,
-            weight,
-            solution_index=-1,
+        return torch.ops.vllm.gemm_weight_bpreshuffle(
+            input=input,
+            weight=weight,
             bias=bias,
             out_dtype=out_dtype,
-            scaleA=scale_a,
-            scaleB=scale_b,
-            scaleOut=None,
-            bpreshuffle=True,
+            scale_a=scale_a,
+            scale_b=scale_b,
         )
-
-        if batched:
-            output = output.view(*input.shape[:-1], weight.shape[1])
-
-        return output
 
 
 rocm_aiter_ops.register_ops_once()

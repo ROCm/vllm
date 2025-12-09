@@ -17,9 +17,6 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
-rocm_aiter_ops.initialize_hipblaslt()
-
-
 def shuffle_weight(w: torch.Tensor) -> torch.Tensor:
     # Shuffle weight along the last dimension so that
     # we folded the weights to adjance location
