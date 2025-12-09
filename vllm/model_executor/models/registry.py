@@ -769,7 +769,10 @@ class _ModelRegistry:
             )
             raise TypeError(msg)
 
+        print('[zejun][vllm] model_arch = ', model_arch, '. model = ', model, flush=True)
         self.models[model_arch] = model
+        for key in self.models.keys():
+            print('[zejun][vllm] key = ', key, '. value model = ', self.models[key], flush=True)
 
     def _raise_for_unsupported(self, architectures: list[str]):
         all_supported_archs = self.get_supported_archs()
