@@ -531,6 +531,7 @@ class Qwen3MoeModel(nn.Module):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
+
                 if name not in params_dict:
                     continue
 
@@ -599,6 +600,7 @@ class Qwen3MoeModel(nn.Module):
                         continue
                     # Remapping the name of FP8 kv-scale.
                     if name.endswith("kv_scale"):
+                        # print("mark 0 name:", name)
                         remapped_kv_scale_name = name.replace(
                             ".kv_scale", ".attn.kv_scale"
                         )
@@ -611,11 +613,15 @@ class Qwen3MoeModel(nn.Module):
                             continue
                         else:
                             name = remapped_kv_scale_name
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                    try:
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                    except KeyError:
+                        pass
+
             loaded_params.add(name)
         return loaded_params
 
