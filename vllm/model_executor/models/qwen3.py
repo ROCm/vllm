@@ -274,6 +274,7 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         self.model = Qwen3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        print('[zejun][vllm] Qwen3ForCausalLM init = ', self.model, flush=True)
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
@@ -311,6 +312,7 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        print('[zejun][vllm] Qwen3ForCausalLM forward = ', flush=True)
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )

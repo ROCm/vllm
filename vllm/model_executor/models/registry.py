@@ -771,10 +771,11 @@ class _ModelRegistry:
 
         print('[zejun][vllm] model_arch = ', model_arch, '. model = ', model, flush=True)
         self.models[model_arch] = model
-        ccnt = 0
-        for key in self.models.keys():
-            print('[zejun][vllm][', ccnt, '] key = ', key, '. value model = ', self.models[key], flush=True)
-            ccnt += 1
+        # ccnt = 0
+        # for key in self.models.keys():
+        #     print('[zejun][vllm][', ccnt, '] key = ', key, '. value model = ', self.models[key], flush=True)
+        #     ccnt += 1
+        print('[zejun][vllm] models[', model_arch, '] = ', self.models[model_arch], flush=True)
 
     def _raise_for_unsupported(self, architectures: list[str]):
         all_supported_archs = self.get_supported_archs()
