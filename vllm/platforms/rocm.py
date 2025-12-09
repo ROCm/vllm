@@ -431,7 +431,7 @@ class RocmPlatform(Platform):
                     "or disable the plugin by setting "
                     "VLLM_ROCM_USE_ATOM_PLUGIN=0."
                 ) from e
-            vllm.logger.info("Using atom plugin for ROCm platform.")
+            logger.info("Using atom plugin for ROCm platform.")
 
         from vllm._aiter_ops import rocm_aiter_ops
         from vllm.config.compilation import CUDAGraphMode
