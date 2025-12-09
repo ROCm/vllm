@@ -312,7 +312,7 @@ class Qwen3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        print('[zejun][vllm] Qwen3ForCausalLM forward = ', flush=True)
+        print('[zejun][vllm] Qwen3ForCausalLM forward', flush=True)
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )

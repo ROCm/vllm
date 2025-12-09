@@ -578,6 +578,7 @@ class _RegisteredModel(_BaseRegisteredModel):
         return self.interfaces
 
     def load_model_cls(self) -> type[nn.Module]:
+        print('[zejun] _RegisteredModel, load_model_cls = ', self.model_cls, flush=True)
         return self.model_cls
 
 
@@ -687,6 +688,8 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)
+        print('[zejun] _LazyRegisteredModel, load_model_cls, mod = ', mod, flush=True)
+        print('[zejun] _LazyRegisteredModel, load_model_cls, mod.class_name = ', getattr(mod, self.class_name), flush=True)
         return getattr(mod, self.class_name)
 
 
@@ -699,6 +702,7 @@ def _try_load_model_cls(
 
     current_platform.verify_model_arch(model_arch)
     try:
+        print('[zejun] _try_load_model_cls, model_arch = ', model_arch, '. model = ', model, flush=True)
         return model.load_model_cls()
     except Exception:
         logger.exception("Error in loading model architecture '%s'", model_arch)
