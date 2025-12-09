@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_CUSTOM_PAGED_ATTN: bool = True
+    VLLM_ROCM_USE_ATOM_PLUGIN: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1021,6 +1022,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # communication.
     "VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB": lambda: maybe_convert_int(
         os.environ.get("VLLM_ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", None)
+    ),
+    # Whether to use atom plugin for ROCm platform.
+    # By default is disabled.
+    "VLLM_ROCM_USE_ATOM_PLUGIN": lambda: (
+        os.getenv("VLLM_ROCM_USE_ATOM_PLUGIN", "False").lower() in ("true", "1")
     ),
     # Divisor for dynamic query scale factor calculation for FP8 KV Cache
     "Q_SCALE_CONSTANT": lambda: int(os.getenv("Q_SCALE_CONSTANT", "200")),
