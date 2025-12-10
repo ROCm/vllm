@@ -105,7 +105,7 @@ class Worker(WorkerBase):
         if envs.VLLM_ROCM_USE_ATOM_PLUGIN:
             try:
                 import atom
-                print('')
+                print('[zejun] register the model in worker', flush=True)
             except ImportError as e:
                 raise ImportError(
                     "The 'atom' package is required when "
