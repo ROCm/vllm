@@ -688,8 +688,8 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)
-        print('[zejun] _LazyRegisteredModel, load_model_cls, mod = ', mod, flush=True)
-        print('[zejun] _LazyRegisteredModel, load_model_cls, mod.class_name = ', getattr(mod, self.class_name), flush=True)
+        print('[zejun][important] _LazyRegisteredModel, load_model_cls, mod = ', mod, flush=True)
+        print('[zejun][important] _LazyRegisteredModel, load_model_cls, mod.class_name = ', getattr(mod, self.class_name), flush=True)
         return getattr(mod, self.class_name)
 
 
@@ -807,9 +807,12 @@ class _ModelRegistry:
         )
 
     def _try_load_model_cls(self, model_arch: str) -> type[nn.Module] | None:
+        print('[zejun] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, flush=True)
+        print('[zejun] _ModelRegistry, _try_load_model_cls, model_arch not in self.models = ', bool(model_arch not in self.models), flush=True)
         if model_arch not in self.models:
             return None
 
+        print('[zejun] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, '. self.models[model_arch] = ', self.models[model_arch], flush=True)
         return _try_load_model_cls(model_arch, self.models[model_arch])
 
     def _try_inspect_model_cls(self, model_arch: str) -> _ModelInfo | None:
