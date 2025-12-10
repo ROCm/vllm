@@ -766,6 +766,7 @@ class ModelConfig:
                 cls += "ForSequenceClassification"
         else:
             cls += "ForCausalLM"
+        print('[zejun] _get_transformers_backend_cls, cls = ', cls, flush=True)
         return cls
 
     def using_transformers_backend(self) -> bool:

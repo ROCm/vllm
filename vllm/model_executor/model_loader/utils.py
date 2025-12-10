@@ -32,6 +32,7 @@ def initialize_model(
     model_class: type[nn.Module] | None = None,
     model_config: ModelConfig | None = None,
 ) -> nn.Module:
+    print('[zejun] initialize_model', flush=True)
     """Initialize a model with the given configurations."""
     if model_config is None:
         model_config = vllm_config.model_config
@@ -221,7 +222,7 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
 
 
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
-    print('[zejun] get_model_architecture = ', flush=True)
+    print('[zejun] get_model_architecture', flush=True)
     key = hash(
         (
             model_config.model,

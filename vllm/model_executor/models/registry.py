@@ -714,6 +714,7 @@ def _try_inspect_model_cls(
     model_arch: str,
     model: _BaseRegisteredModel,
 ) -> _ModelInfo | None:
+    print('[zejun] _try_inspect_model_cls, model_arch = ', model_arch, '. model = ', model, flush=True)
     try:
         return model.inspect_model_cls()
     except Exception:
@@ -813,7 +814,7 @@ class _ModelRegistry:
             return None
 
         print('[zejun] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, '. self.models[model_arch] = ', self.models[model_arch], flush=True)
-        
+
         print('[zejun] ------------------ ', flush=True)
         ccnt = 0
         for key in self.models.keys():
@@ -900,6 +901,7 @@ class _ModelRegistry:
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
+        print('[zejun] _normalize_arch, architecture = ', architecture, flush=True)
         if architecture in self.models:
             return architecture
 
@@ -926,6 +928,7 @@ class _ModelRegistry:
         architectures: str | list[str],
         model_config: ModelConfig,
     ) -> tuple[_ModelInfo, str]:
+        print('[zejun] _ModelRegistry, inspect_model_cls', flush=True)
         if isinstance(architectures, str):
             architectures = [architectures]
         if not architectures:
