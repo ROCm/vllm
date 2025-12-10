@@ -420,19 +420,6 @@ class RocmPlatform(Platform):
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
 
-        if envs.VLLM_ROCM_USE_ATOM_PLUGIN:
-            try:
-                import atom
-            except ImportError as e:
-                raise ImportError(
-                    "The 'atom' package is required when "
-                    "VLLM_ROCM_USE_ATOM_PLUGIN is enabled, but it is not "
-                    "installed in the Python environment. Please install it "
-                    "or disable the plugin by setting "
-                    "VLLM_ROCM_USE_ATOM_PLUGIN=0."
-                ) from e
-            logger.info("Using atom plugin for ROCm platform.")
-
         from vllm._aiter_ops import rocm_aiter_ops
         from vllm.config.compilation import CUDAGraphMode
 

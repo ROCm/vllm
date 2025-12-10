@@ -102,6 +102,20 @@ class Worker(WorkerBase):
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        if envs.VLLM_ROCM_USE_ATOM_PLUGIN:
+            try:
+                import atom
+                print('')
+            except ImportError as e:
+                raise ImportError(
+                    "The 'atom' package is required when "
+                    "VLLM_ROCM_USE_ATOM_PLUGIN is enabled, but it is not "
+                    "installed in the Python environment. Please install it "
+                    "or disable the plugin by setting "
+                    "VLLM_ROCM_USE_ATOM_PLUGIN=0."
+                ) from e
+            logger.info("Using atom plugin for ROCm platform.")
+
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator
 
