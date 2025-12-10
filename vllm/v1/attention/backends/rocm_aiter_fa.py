@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+from vllm import envs
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -29,7 +30,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
-USING_SHUFFLE_LAYOUT = False
+USING_SHUFFLE_LAYOUT = envs.VLLM_ROCM_USE_AITER_SHUFFLE_MHA
 
 if current_platform.is_rocm():
     import aiter
