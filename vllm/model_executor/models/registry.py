@@ -815,12 +815,12 @@ class _ModelRegistry:
 
         print('[zejun] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, '. self.models[model_arch] = ', self.models[model_arch], flush=True)
 
-        print('[zejun] ------------------ ', flush=True)
-        ccnt = 0
-        for key in self.models.keys():
-            print('[zejun][', ccnt, '] key = ', key, '. model = ', self.models[key], flush=True)
-            ccnt += 1
-        print('[zejun] ------------------ ', flush=True)
+        # print('[zejun] ------------------ ', flush=True)
+        # ccnt = 0
+        # for key in self.models.keys():
+        #     print('[zejun][', ccnt, '] key = ', key, '. model = ', self.models[key], flush=True)
+        #     ccnt += 1
+        # print('[zejun] ------------------ ', flush=True)
 
         return _try_load_model_cls(model_arch, self.models[model_arch])
 
@@ -1002,6 +1002,9 @@ class _ModelRegistry:
                 return (model_cls, arch)
 
         # Fallback to transformers impl (after resolving convert_type)
+        print('[zejun] _ModelRegistry, resolve_model_cls, all(arch not in self.models for arch in architectures) = ', all(arch not in self.models for arch in architectures), flush=True)
+        print('[zejun] _ModelRegistry, resolve_model_cls, getattr(model_config, "convert_type", "none") == "none" = ', bool(getattr(model_config, "convert_type", "none") == "none"), flush=True)
+
         if (
             all(arch not in self.models for arch in architectures)
             and model_config.model_impl == "auto"
@@ -1011,12 +1014,14 @@ class _ModelRegistry:
             if arch is not None:
                 model_cls = self._try_load_model_cls(arch)
                 if model_cls is not None:
+                    print('[zejun] 1, return (model_cls, arch) = ', model_cls, arch, flush=True)
                     return (model_cls, arch)
 
         for arch in architectures:
             normalized_arch = self._normalize_arch(arch, model_config)
             model_cls = self._try_load_model_cls(normalized_arch)
             if model_cls is not None:
+                print('[zejun] 2, return (model_cls, arch) = ', model_cls, arch, flush=True)
                 return (model_cls, arch)
 
         # Fallback to transformers impl (before resolving runner_type)
@@ -1028,6 +1033,7 @@ class _ModelRegistry:
             if arch is not None:
                 model_cls = self._try_load_model_cls(arch)
                 if model_cls is not None:
+                    print('[zejun] 3, return (model_cls, arch) = ', model_cls, arch, flush=True)
                     return (model_cls, arch)
 
         return self._raise_for_unsupported(architectures)
