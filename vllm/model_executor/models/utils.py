@@ -344,6 +344,7 @@ def init_vllm_registered_model(
     hf_config: PretrainedConfig | None = None,
     architectures: list[str] | None = None,
 ) -> nn.Module:
+    print('[zejun] init_vllm_registered_model', flush=True)
     """
     Helper function to initialize an inner model registered to vLLM,
     based on the arguments passed to the outer vLLM model.

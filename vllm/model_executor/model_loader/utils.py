@@ -175,10 +175,13 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
 
     architectures = getattr(model_config.hf_config, "architectures", [])
 
+    print('[zejun] _get_model_architecture', flush=True)
+
     model_cls, arch = model_config.registry.resolve_model_cls(
         architectures,
         model_config=model_config,
     )
+    print('[zejun] after model_config.registry.resolve_model_cls, model_cls = ', model_cls, '. arch = ', arch, flush=True)
 
     if arch == model_config._get_transformers_backend_cls():
         assert model_config.model_impl != "vllm"
@@ -218,6 +221,7 @@ def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module],
 
 
 def get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:
+    print('[zejun] get_model_architecture = ', flush=True)
     key = hash(
         (
             model_config.model,

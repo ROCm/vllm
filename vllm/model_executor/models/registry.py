@@ -813,6 +813,14 @@ class _ModelRegistry:
             return None
 
         print('[zejun] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, '. self.models[model_arch] = ', self.models[model_arch], flush=True)
+        
+        print('[zejun] ------------------ ', flush=True)
+        ccnt = 0
+        for key in self.models.keys():
+            print('[zejun][', ccnt, '] key = ', key, '. model = ', self.models[key], flush=True)
+            ccnt += 1
+        print('[zejun] ------------------ ', flush=True)
+
         return _try_load_model_cls(model_arch, self.models[model_arch])
 
     def _try_inspect_model_cls(self, model_arch: str) -> _ModelInfo | None:
@@ -974,6 +982,8 @@ class _ModelRegistry:
             architectures = [architectures]
         if not architectures:
             raise ValueError("No model architectures are specified")
+
+        print('[zejun] _ModelRegistry, resolve_model_cls, model_config.model_impl = ', model_config.model_impl, flush=True)
 
         # Require transformers impl
         if model_config.model_impl == "transformers":

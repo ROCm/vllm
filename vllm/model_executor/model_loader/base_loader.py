@@ -44,6 +44,7 @@ class BaseModelLoader(ABC):
             device_config.device if load_config.device is None else load_config.device
         )
         target_device = torch.device(load_device)
+        print('[zejun] BaseModelLoader, load_model', flush=True)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(
