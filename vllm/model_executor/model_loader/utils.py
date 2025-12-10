@@ -77,6 +77,8 @@ def initialize_model(
     if "scheduler_config" in all_params:
         kwargs["scheduler_config"] = vllm_config.scheduler_config
     with set_current_vllm_config(vllm_config, check_compile=True, prefix=prefix):
+        print('[zejun][vllm] initialize_model model_class = ', model_class, flush=True)
+        print('[zejun][vllm] initialize_model **kwargs = ', **kwargs, flush=True)
         return model_class(**kwargs)
 
 
