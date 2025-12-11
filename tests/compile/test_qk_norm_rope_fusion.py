@@ -10,8 +10,8 @@ from vllm.compilation.matcher_utils import FLASHINFER_ROTARY_OP, RMS_OP, ROTARY_
 from vllm.compilation.noop_elimination import NoOpEliminationPass
 from vllm.compilation.post_cleanup import PostCleanupPass
 from vllm.compilation.qk_norm_rope_fusion import (
-    FUSED_QK_ROPE_OP,
     QKNormRoPEFusionPass,
+    get_fused_qknorm_rope_op,
 )
 from vllm.config import (
     CompilationConfig,
@@ -104,7 +104,7 @@ class QKNormRoPETestModel(torch.nn.Module):
         return ops
 
     def ops_in_model_after(self) -> list[torch._ops.OpOverload]:
-        return [FUSED_QK_ROPE_OP]
+        return [get_fused_qknorm_rope_op()]
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-6])
@@ -119,8 +119,14 @@ class QKNormRoPETestModel(torch.nn.Module):
 def test_qk_norm_rope_fusion(
     eps, is_neox, enable_rms_norm_custom_op, enable_rope_custom_op, dtype
 ):
-    if not hasattr(torch.ops._C, "fused_qk_norm_rope"):
-        pytest.skip("fused_qk_norm_rope custom op not available")
+    has_vllm_cuda_kernel = hasattr(torch.ops._C, "fused_qk_norm_rope")
+    has_aiter_kernel = hasattr(torch.ops.vllm, "rocm_aiter_fused_qk_norm_rope")
+
+    if not has_vllm_cuda_kernel and not has_aiter_kernel:
+        pytest.skip(
+            "Neither fused_qk_norm_rope (CUDA) nor rocm_aiter_fused_qk_norm_rope "
+            "(AITER) custom op is available"
+        )
 
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)
@@ -180,10 +186,12 @@ def test_qk_norm_rope_fusion(
         model_unfused = torch.compile(model, backend=backend_baseline)
         q_unfused, k_unfused, v_unfused = model_unfused(qkv_unfused, pos_unfused)
 
+        # AITER kernel may have slightly different numerical behavior
+        # Use the tolerances from the AITER test suite
         if dtype == torch.float16:
-            ATOL, RTOL = (2e-3, 2e-3)
+            ATOL, RTOL = (5e-2, 1e-2)
         else:
-            ATOL, RTOL = (1e-2, 1e-2)
+            ATOL, RTOL = (5e-2, 1e-2)
 
         torch.testing.assert_close(q_unfused, q_fused, atol=ATOL, rtol=RTOL)
         torch.testing.assert_close(k_unfused, k_fused, atol=ATOL, rtol=RTOL)

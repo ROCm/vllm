@@ -9,10 +9,12 @@ from torch import fx
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.attention import Attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.platforms import current_platform
 
 from .fusion import empty_bf16, empty_fp32, empty_i64
 from .inductor_pass import enable_fake_mode
@@ -21,7 +23,18 @@ from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 logger = init_logger(__name__)
 
-FUSED_QK_ROPE_OP = torch.ops._C.fused_qk_norm_rope.default
+
+def get_fused_qknorm_rope_op():
+    use_aiter = (
+        current_platform.is_rocm()
+        and rocm_aiter_ops.is_fused_qk_norm_rope_enabled()
+        and hasattr(torch.ops.vllm, "rocm_aiter_fused_qk_norm_rope")
+    )
+
+    if use_aiter:
+        return torch.ops.vllm.rocm_aiter_fused_qk_norm_rope.default
+    else:
+        return torch.ops._C.fused_qk_norm_rope.default
 
 
 class QkNormRopePattern:
@@ -71,6 +84,8 @@ class QkNormRopePattern:
             num_kv_heads=self.num_kv_heads,
             use_flashinfer=self.rope_flashinfer,
         )
+
+        self.fused_qk_norm_rope_op = get_fused_qknorm_rope_op()
 
     def get_inputs(self):
         # Sample inputs to help pattern tracing
@@ -146,7 +161,7 @@ class QkNormRopePattern:
         ):
             # Run fused qk_norm_rope op
             result = auto_functionalized(
-                FUSED_QK_ROPE_OP,
+                self.fused_qk_norm_rope_op,
                 qkv=qkv,
                 num_heads_q=self.num_heads,
                 num_heads_k=self.num_kv_heads,

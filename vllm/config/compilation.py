@@ -195,7 +195,7 @@ class PassConfig:
 
         if (
             self.enable_aiter_allreduce_rmsnorm_fusion
-            and not current_platform.is_rcom()
+            and not current_platform.is_rocm()
         ):
             logger.warning_once(
                 "AITER all-reduce + RMSNorm fusion enabled but the current platform"

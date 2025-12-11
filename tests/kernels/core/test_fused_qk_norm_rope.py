@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from tests.kernels.utils import opcheck
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
@@ -135,6 +136,94 @@ def test_fused_qk_norm_rope_matches_reference(
 
     torch.testing.assert_close(
         qkv_fused,
+        ref_result,
+        atol=ATOL,
+        rtol=RTOL,
+    )
+
+
+@pytest.mark.skipif(
+    not (
+        current_platform.is_rocm()
+        and rocm_aiter_ops.is_enabled()
+        and rocm_aiter_ops.is_fused_qk_norm_rope_enabled()
+    ),
+    reason="aiter fused_qk_norm_rope requires rocm platform and "
+    "VLLM_ROCM_USE_AITER_FUSED_QK_NORM_ROPE=1",
+)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("is_neox", IS_NEOX)
+@pytest.mark.parametrize("eps", EPS_VALUES)
+@pytest.mark.parametrize("seed", SEEDS)
+@torch.inference_mode()
+def test_aiter_fused_qk_norm_rope_matches_reference(
+    device: str,
+    dtype: torch.dtype,
+    is_neox: bool,
+    eps: float,
+    seed: int,
+):
+    torch.set_default_device(device)
+    current_platform.seed_everything(seed)
+    num_heads, num_kv_heads, head_dim = 16, 4, 128
+    num_tokens = 4
+
+    total_dim = (num_heads + 2 * num_kv_heads) * head_dim
+    qkv_base = torch.randn(num_tokens, total_dim, dtype=dtype, device=device)
+    qkv_aiter = qkv_base.clone()
+    positions = torch.arange(num_tokens, dtype=torch.long, device=device)
+
+    q_norm = RMSNorm(head_dim, eps=eps).to(device=device, dtype=dtype)
+    k_norm = RMSNorm(head_dim, eps=eps).to(device=device, dtype=dtype)
+    q_norm.weight.data.normal_(mean=1.0, std=0.1)
+    k_norm.weight.data.normal_(mean=1.0, std=0.1)
+    q_weight = q_norm.weight.data
+    k_weight = k_norm.weight.data
+
+    rope = RotaryEmbedding(
+        head_size=head_dim,
+        rotary_dim=head_dim,
+        max_position_embeddings=4096,
+        base=10000.0,
+        is_neox_style=is_neox,
+        dtype=dtype,
+    ).to(device)
+
+    ref_result = _apply_qk_norm_rope(
+        qkv=qkv_base,
+        positions=positions,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        rope=rope,
+        num_heads_q=num_heads,
+        num_heads_kv=num_kv_heads,
+        head_dim=head_dim,
+    )
+
+    # Test aiter kernel
+    rocm_aiter_ops.fused_qk_norm_rope(
+        qkv=qkv_aiter,
+        num_heads_q=num_heads,
+        num_heads_k=num_kv_heads,
+        num_heads_v=num_kv_heads,
+        head_dim=head_dim,
+        eps=eps,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        cos_sin_cache=rope.cos_sin_cache,
+        is_neox=is_neox,
+        position_ids=positions.view(-1),
+    )
+
+    # Use relaxed tolerances similar to aiter's test suite
+    if dtype == torch.float16:
+        ATOL, RTOL = (5e-2, 1e-2)
+    else:
+        ATOL, RTOL = (5e-2, 1e-2)
+
+    torch.testing.assert_close(
+        qkv_aiter,
         ref_result,
         atol=ATOL,
         rtol=RTOL,
