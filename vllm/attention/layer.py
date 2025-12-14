@@ -273,6 +273,7 @@ class Attention(nn.Module, AttentionLayerBase):
 
         impl_cls = self.attn_backend.get_impl_cls()
         print('[zejun] vllm Attention, get impl_cls = ', impl_cls, flush=True)
+        print('[zejun] vllm Attention, kv_cache_dtype = ', kv_cache_dtype, flush=True)
         self.impl = impl_cls(
             num_heads,
             head_size,
