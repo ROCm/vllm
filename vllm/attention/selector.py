@@ -45,6 +45,10 @@ def get_env_variable_attn_backend() -> AttentionBackendEnum | None:
             "Attention backend 'XFORMERS' has been removed (See PR #29262 for "
             "details). Please select a supported attention backend."
         )
+
+    answer = AttentionBackendEnum[backend_name]
+    print('[zejun] vllm get_env_variable_attn_backend AttentionBackendEnum[backend_name]: ', answer, flush=True)
+
     return AttentionBackendEnum[backend_name]
 
 

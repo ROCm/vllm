@@ -263,6 +263,7 @@ class RocmPlatform(Platform):
         use_sparse,
         attn_type: str | None = None,
     ) -> str:
+        print('[zejun] vllm call RocmPlatform.get_attn_backend_cls: ', selected_backend, flush=True)
         from vllm._aiter_ops import rocm_aiter_ops
         from vllm.attention.backends.registry import AttentionBackendEnum
 
