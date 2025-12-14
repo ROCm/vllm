@@ -266,6 +266,13 @@ class RocmPlatform(Platform):
         from vllm._aiter_ops import rocm_aiter_ops
         from vllm.attention.backends.registry import AttentionBackendEnum
 
+        from vllm.attention.selector import get_env_variable_attn_backend
+        forced_selected_backend: AttentionBackendEnum | None = get_env_variable_attn_backend()
+        print('[zejun] vllm get_attn_backend_cls forced_selected_backend: ', forced_selected_backend, flush=True)
+        if forced_selected_backend is not None:
+            print('[zejun] vllm get_attn_backend_cls forced_selected_backend.get_path(): ', forced_selected_backend.get_path(), flush=True)
+            return forced_selected_backend.get_path()
+
         if use_sparse:
             if kv_cache_dtype.startswith("fp8"):
                 raise ValueError(

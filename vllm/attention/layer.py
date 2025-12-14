@@ -272,6 +272,7 @@ class Attention(nn.Module, AttentionLayerBase):
             self.attn_backend = attn_backend
 
         impl_cls = self.attn_backend.get_impl_cls()
+        print('[zejun] vllm Attention, get impl_cls = ', impl_cls, flush=True)
         self.impl = impl_cls(
             num_heads,
             head_size,
@@ -385,6 +386,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                print('[zejun] vllm Attention, forward, call impl.forward', flush=True)
                 self.impl.forward(
                     self, query, key, value, self_kv_cache, attn_metadata, output=output
                 )

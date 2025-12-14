@@ -91,6 +91,8 @@ def get_attn_backend(
 ) -> type[AttentionBackend]:
     """Selects which attention backend to use and lazily imports it."""
 
+    print('[zejun] vllm get_attn_backend', flush=True)
+
     if kv_cache_dtype is not None:
         valid_cache_dtypes = get_args(CacheDType)
         assert kv_cache_dtype in valid_cache_dtypes, (
@@ -187,6 +189,9 @@ def _cached_get_attn_backend(
             use_sparse,
             attn_type,
         )
+    
+    print('[zejun] vllm _cached_get_attn_backend attention_cls: ', attention_cls, flush=True)
+
     if not attention_cls:
         raise ValueError(
             f"Invalid attention backend for {current_platform.device_name}"
