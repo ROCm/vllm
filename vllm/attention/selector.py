@@ -36,6 +36,8 @@ def get_env_variable_attn_backend() -> AttentionBackendEnum | None:
     * None otherwise
     """
     backend_name = os.environ.get(STR_BACKEND_ENV_VAR)
+    print('[zejun] vllm get_env_variable_attn_backend STR_BACKEND_ENV_VAR: ', STR_BACKEND_ENV_VAR, flush=True)
+    print('[zejun] vllm get_env_variable_attn_backend backend_name: ', backend_name, flush=True)
     if backend_name is None:
         return None
     if backend_name == "XFORMERS":

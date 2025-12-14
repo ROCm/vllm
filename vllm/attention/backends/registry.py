@@ -204,6 +204,7 @@ def register_backend(
     is_mamba: bool = False,
     class_path: str | None = None,
 ) -> Callable[[type], type]:
+    print('[zejun] vllm register_backend backend: ', backend, '. class_path: ', class_path, flush=True)
     """Register or override a backend implementation.
 
     Args:
