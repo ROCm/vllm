@@ -42,10 +42,10 @@ rm -rf /root/.cache/
 # BF16 model
 # model_path=Qwen/Qwen3-235B-A22B-Instruct-2507
 # FP8 model, pure TP8 unsupported due to MoE weight not being divisible by 8, so run with TP8 + EP8 first
-model_path=/mnt/raid0/pretrained_model/Qwen/Qwen2-1.5B-Instruct/
+model_path=/mnt/data/pretrained_model/Qwen/Qwen2-1.5B-Instruct/
 vllm serve $model_path \
     --tensor-parallel-size 1 \
-    --max-num-batched-tokens 8192 \
+    --max-num-batched-tokens 16384 \
     --trust-remote-code \
     --no-enable-prefix-caching \
     --disable-log-requests \
