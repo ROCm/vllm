@@ -21,7 +21,8 @@ Pull the latest validated Docker image with `docker pull rocm/vllm:latest`
 
 ## Known issues and workarounds
 
-- There is a known regression with AITER for MoE models such as Mixtral and DeepSeek-R1.
+- There is a known regression with AITER for MoE models such as Mixtral and DeepSeek-R1. Regression with Mixtral models also due to new Mixtral tokenizer.
+- AITER must be explicitly disabled on GPU architectures other than gfx942 and gfx950.
 
 ## Performance results
 
