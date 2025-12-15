@@ -8,7 +8,7 @@ The prebuilt image includes:
 
 - ROCm™ 7.0.0
 - HipBLASLt 1.0.0
-- vLLM 0.11.1 RC
+- vLLM 0.11.2
 - PyTorch 2.9
 
 ## Pull the latest Docker image
@@ -17,15 +17,12 @@ Pull the latest validated Docker image with `docker pull rocm/vllm:latest`
 
 ## What is new
 
-- Added support for Llama 4 FP4 and Granite 4 models.
-- Updated to vLLM 0.11.1 RC.
-- Enabled AITER by default.
+- Improved performance on Llama 3 MXFP4 through AITER optimizations and improved kernel fusion.
 
 ## Known issues and workarounds
 
+- There is a known regression with AITER for MoE models such as Mixtral and DeepSeek-R1. Regression with Mixtral models also due to new Mixtral tokenizer.
 - AITER must be explicitly disabled on GPU architectures other than gfx942 and gfx950.
-- Disable AITER for Llama 3.1 405B FP8 for better performance with a batch size of 1 (BS=1).
-- Performance drops may occur with an input and output sequence length of 128/128 on the Llama4 Maverick 17B 128E FP8 model.
 
 ## Performance results
 
@@ -37,18 +34,18 @@ The table below shows performance data where a local inference client receives r
 
 | Model | Precision | TP Size | Input | Output | Num Prompts | Max Num Seqs | Throughput (tokens/s) |
 |-------|-----------|---------|-------|--------|-------------|--------------|-----------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13279.6  |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 11449.7               |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 11347.4               |
-|       |           |         | 2048  | 2048   | 1500        | 1500         | 7651.7                |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3816.8 |
-|       |           |         | 128   | 4096   | 1500        | 1500         | 3099.6                |
-|       |           |         | 500   | 2000   | 2000        | 2000         | 3026.1                |
-|       |           |         | 2048  | 2048   | 500         | 500          | 2196.4                |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 3200 | 3200 | 13562.4  |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 11800.9               |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 11249.5               |
+|       |           |         | 2048  | 2048   | 1500        | 1500         | 7753.1                |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 128 | 2048 | 1500 | 1500 | 3822.8 |
+|       |           |         | 128   | 4096   | 1500        | 1500         | 3085.8                |
+|       |           |         | 500   | 2000   | 2000        | 2000         | 3059.9                |
+|       |           |         | 2048  | 2048   | 500         | 500          | 2192.3                |
 
 *TP stands for Tensor Parallelism.*
 
-Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 processors, 2.25 TiB RAM, 8x AMD Instinct MI300X GPUs (192GiB, 750W), Ubuntu 22.04, and amdgpu driver 6.8.5
+Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 processors, 2.25 TiB RAM, 8x AMD Instinct MI300X GPUs (192GiB, 750W), Ubuntu 22.04, and amdgpu driver 6.14.14
 
 ### Latency measurements
 
@@ -56,42 +53,42 @@ The table below shows latency measurements, which capture the time from when the
 
 | Model | Precision | TP Size | Batch Size | Input | Output | MI300X Latency (sec) |
 |-------|-----------|----------|------------|--------|---------|-------------------|
-| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 16.154 |
-| | | | 2 | 128 | 2048 | 18.041 |
-| | | | 4 | 128 | 2048 | 18.322 |
-| | | | 8 | 128 | 2048 | 20.800 |
-| | | | 16 | 128 | 2048 | 21.850 |
-| | | | 32 | 128 | 2048 | 25.513 |
-| | | | 64 | 128 | 2048 | 32.539 |
-| | | | 128 | 128 | 2048 | 45.193 |
-| | | | 1 | 2048 | 2048 | 16.256 |
-| | | | 2 | 2048 | 2048 | 18.084 |
-| | | | 4 | 2048 | 2048 | 18.851 |
-| | | | 8 | 2048 | 2048 | 20.930 |
-| | | | 16 | 2048 | 2048 | 23.079 |
-| | | | 32 | 2048 | 2048 | 26.873 |
-| | | | 64 | 2048 | 2048 | 34.585 |
-| | | | 128 | 2048 | 2048 | 51.856 |
-| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 48.138 |
-| | | | 2 | 128 | 2048 | 48.366 |
-| | | | 4 | 128 | 2048 | 49.790 |
-| | | | 8 | 128 | 2048 | 53.546 |
-| | | | 16 | 128 | 2048 | 55.685 |
-| | | | 32 | 128 | 2048 | 67.445 |
-| | | | 64 | 128 | 2048 | 86.597 |
-| | | | 128 | 128 | 2048 | 120.387 |
-| | | | 1 | 2048 | 2048 | 48.555 |
-| | | | 2 | 2048 | 2048 | 48.348 |
-| | | | 4 | 2048 | 2048 | 49.828 |
-| | | | 8 | 2048 | 2048 | 53.415 |
-| | | | 16 | 2048 | 2048 | 57.398 |
-| | | | 32 | 2048 | 2048 | 68.519 |
-| | | | 64 | 2048 | 2048 | 90.234 |
-| | | | 128 | 2048 | 2048 | 130.518 |
+| Llama 3.1 70B (amd/Llama-3.1-70B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 16.015 |
+| | | | 2 | 128 | 2048 | 18.683 |
+| | | | 4 | 128 | 2048 | 19.245 |
+| | | | 8 | 128 | 2048 | 20.468 |
+| | | | 16 | 128 | 2048 | 22.137 |
+| | | | 32 | 128 | 2048 | 25.571 |
+| | | | 64 | 128 | 2048 | 32.987 |
+| | | | 128 | 128 | 2048 | 46.426 |
+| | | | 1 | 2048 | 2048 | 16.421 |
+| | | | 2 | 2048 | 2048 | 19.035 |
+| | | | 4 | 2048 | 2048 | 20.221 |
+| | | | 8 | 2048 | 2048 | 21.483 |
+| | | | 16 | 2048 | 2048 | 24.350 |
+| | | | 32 | 2048 | 2048 | 29.776 |
+| | | | 64 | 2048 | 2048 | 40.625 |
+| | | | 128 | 2048 | 2048 | 63.671 |
+| Llama 3.1 405B (amd/Llama-3.1-405B-Instruct-FP8-KV) | FP8 | 8 | 1 | 128 | 2048 | 48.618 |
+| | | | 2 | 128 | 2048 | 50.980 |
+| | | | 4 | 128 | 2048 | 52.760 |
+| | | | 8 | 128 | 2048 | 55.864 |
+| | | | 16 | 128 | 2048 | 58.795 |
+| | | | 32 | 128 | 2048 | 69.482 |
+| | | | 64 | 128 | 2048 | 89.384 |
+| | | | 128 | 128 | 2048 | 122.601 |
+| | | | 1 | 2048 | 2048 | 49.106 |
+| | | | 2 | 2048 | 2048 | 51.664 |
+| | | | 4 | 2048 | 2048 | 54.220 |
+| | | | 8 | 2048 | 2048 | 58.904 |
+| | | | 16 | 2048 | 2048 | 65.389 |
+| | | | 32 | 2048 | 2048 | 83.387 |
+| | | | 64 | 2048 | 2048 | 115.575 |
+| | | | 128 | 2048 | 2048 | 177.779 |
 
 *TP stands for Tensor Parallelism.*
 
-Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 processors, 2.25 TiB RAM, 8x AMD Instinct MI300X (192GiB, 750W) GPUs, Ubuntu 22.04, and amdgpu driver 6.8.5
+Supermicro AS-8125GS-TNMR2 with 2x AMD EPYC 9554 processors, 2.25 TiB RAM, 8x AMD Instinct MI300X (192GiB, 750W) GPUs, Ubuntu 22.04, and amdgpu driver 6.14.14
 
 ## Reproducing benchmark results
 
@@ -287,7 +284,7 @@ Then use the following command to build the image directly from the specified co
      docker build -f docker/Dockerfile.rocm \
     --build-arg REMOTE_VLLM=1 \
     --build-arg VLLM_REPO=https://github.com/ROCm/vllm \
-    --build-arg VLLM_BRANCH="38f225c2abeadc04c2cc398814c2f53ea02c3c72" \
+    --build-arg VLLM_BRANCH="8398684622109c806a35d660647060b0b9910663" \
     -t vllm-rocm .
 ```
 
@@ -362,6 +359,9 @@ This step is optional if you want to quantize your own model instead of using AM
     > **Note:** The `--multi_gpu` parameter can be omitted for small models that fit on a single GPU.
 
 ## Changelog
+
+rocm7.0.0_vllm_0.11.2_20251210:
+- Improved performance on Llama 3 MXFP4 through AITER optimizations and improved kernel fusion.
 
 rocm7.0.0_vllm_0.11.1_20251103:
 - Support for Llama4 FP4 & Granite4 model
