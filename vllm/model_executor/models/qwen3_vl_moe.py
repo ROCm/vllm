@@ -401,6 +401,7 @@ class Qwen3VLMoeMixtureOfExperts(MixtureOfExperts):
 class Qwen3VLMoeForConditionalGeneration(
     Qwen3VLForConditionalGeneration, Qwen3VLMoeMixtureOfExperts
 ):
+    is_3d_moe_weight: bool = True
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -417,7 +418,6 @@ class Qwen3VLMoeForConditionalGeneration(
 
         self.config = config
         self.multimodal_config = multimodal_config
-        self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
 
         if not multimodal_config.get_limit_per_prompt(
             "image"
@@ -428,8 +428,8 @@ class Qwen3VLMoeForConditionalGeneration(
                 config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
+                multimodal_config=multimodal_config,
                 prefix=maybe_prefix(prefix, "visual"),
-                use_data_parallel=self.use_data_parallel,
             )
 
         self.language_model = Qwen3MoeLLMForCausalLM(

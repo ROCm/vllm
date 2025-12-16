@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
-from vllm import envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
@@ -46,10 +46,12 @@ class QuantFP8(CustomOp):
         super().__init__()
         self.static = static
         self.group_shape = group_shape
+        self.use_per_token_if_dynamic = group_shape == GroupShape.PER_TOKEN
         self.num_token_padding = num_token_padding
         self.column_major_scales = column_major_scales
         self.use_ue8m0 = use_ue8m0
-        self.use_aiter = envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_LINEAR
+
+        self.use_aiter = rocm_aiter_ops.is_linear_fp8_enaled()
 
         self.is_group_quant = group_shape.is_per_group()
         if self.is_group_quant:
@@ -100,8 +102,6 @@ class QuantFP8(CustomOp):
         scale: torch.Tensor | None = None,
         scale_ub: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm._aiter_ops import rocm_aiter_ops
-
         use_aiter_quant = (
             not self.is_group_quant
             and self.use_aiter
@@ -116,9 +116,10 @@ class QuantFP8(CustomOp):
         )
 
         if use_aiter_per_tensor_quant:
-            return rocm_aiter_ops.rocm_aiter_per_tensor_quant(x, scale, _FP8_DTYPE)
+            return rocm_aiter_ops.per_tensor_quant(x, _FP8_DTYPE, scale)
         if use_aiter_per_token_quant:
-            return rocm_aiter_ops.rocm_aiter_per_token_quant(x, scale, _FP8_DTYPE)
+            return rocm_aiter_ops.per_token_quant(x, _FP8_DTYPE, scale)
+
         # Fallback to CUDA implementation
         return self.forward_cuda(x, scale, scale_ub)
 

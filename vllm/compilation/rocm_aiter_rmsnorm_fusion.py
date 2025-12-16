@@ -11,8 +11,6 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch._ops import OpOverload
 
-import vllm.envs as envs
-
 # add this import to make sure the custom ops are registered
 import vllm.model_executor.layers.layernorm  # noqa: F401
 from vllm.config import VllmConfig
@@ -37,10 +35,6 @@ from .inductor_pass import enable_fake_mode
 from .vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 logger = init_logger(__name__)
-
-
-def is_rocm_aiter_enabled() -> bool:
-    return current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER
 
 
 def rocm_aiter_rmsnorm_fused_dynamic_quant_impl(
