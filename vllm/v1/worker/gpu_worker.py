@@ -107,7 +107,7 @@ class Worker(WorkerBase):
             try:
                 import atom
                 atom.register_custom_model()
-                print(f'[zejun][pid={os.getpid()}] import atom when init worker', flush=True)
+                # print(f'[zejun][pid={os.getpid()}] import atom when init worker', flush=True)
             except ImportError as e:
                 raise ImportError(
                     "The 'atom' package is required when "

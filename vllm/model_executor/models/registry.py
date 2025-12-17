@@ -578,7 +578,7 @@ class _RegisteredModel(_BaseRegisteredModel):
         return self.interfaces
 
     def load_model_cls(self) -> type[nn.Module]:
-        print(f'[zejun][pid={os.getpid()}] _RegisteredModel, load_model_cls = ', self.model_cls, flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _RegisteredModel, load_model_cls = ', self.model_cls, flush=True)
         return self.model_cls
 
 
@@ -688,8 +688,8 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 
     def load_model_cls(self) -> type[nn.Module]:
         mod = importlib.import_module(self.module_name)
-        print(f'[zejun][pid={os.getpid()}][important] _LazyRegisteredModel, load_model_cls, mod = ', mod, flush=True)
-        print(f'[zejun][pid={os.getpid()}][important] _LazyRegisteredModel, load_model_cls, mod.class_name = ', getattr(mod, self.class_name), flush=True)
+        # print(f'[zejun][pid={os.getpid()}][important] _LazyRegisteredModel, load_model_cls, mod = ', mod, flush=True)
+        # print(f'[zejun][pid={os.getpid()}][important] _LazyRegisteredModel, load_model_cls, mod.class_name = ', getattr(mod, self.class_name), flush=True)
         return getattr(mod, self.class_name)
 
 
@@ -702,7 +702,7 @@ def _try_load_model_cls(
 
     current_platform.verify_model_arch(model_arch)
     try:
-        print(f'[zejun][pid={os.getpid()}] _try_load_model_cls, model_arch = ', model_arch, '. model = ', model, flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _try_load_model_cls, model_arch = ', model_arch, '. model = ', model, flush=True)
         return model.load_model_cls()
     except Exception:
         logger.exception("Error in loading model architecture '%s'", model_arch)
@@ -714,7 +714,7 @@ def _try_inspect_model_cls(
     model_arch: str,
     model: _BaseRegisteredModel,
 ) -> _ModelInfo | None:
-    print(f'[zejun][pid={os.getpid()}] _try_inspect_model_cls, model_arch = ', model_arch, '. model = ', model, flush=True)
+    # print(f'[zejun][pid={os.getpid()}] _try_inspect_model_cls, model_arch = ', model_arch, '. model = ', model, flush=True)
     try:
         return model.inspect_model_cls()
     except Exception:
@@ -774,13 +774,13 @@ class _ModelRegistry:
             )
             raise TypeError(msg)
 
-        print(f'[zejun][pid={os.getpid()}][vllm] model_arch = ', model_arch, '. model = ', model, flush=True)
+        # print(f'[zejun][pid={os.getpid()}][vllm] model_arch = ', model_arch, '. model = ', model, flush=True)
         self.models[model_arch] = model
         # ccnt = 0
         # for key in self.models.keys():
         #     print('[zejun][vllm][', ccnt, '] key = ', key, '. value model = ', self.models[key], flush=True)
         #     ccnt += 1
-        print(f'[zejun][pid={os.getpid()}][vllm] models[', model_arch, '] = ', self.models[model_arch], flush=True)
+        # print(f'[zejun][pid={os.getpid()}][vllm] models[', model_arch, '] = ', self.models[model_arch], flush=True)
 
     def _raise_for_unsupported(self, architectures: list[str]):
         all_supported_archs = self.get_supported_archs()
@@ -808,12 +808,12 @@ class _ModelRegistry:
         )
 
     def _try_load_model_cls(self, model_arch: str) -> type[nn.Module] | None:
-        print(f'[zejun][pid={os.getpid()}] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, flush=True)
-        print(f'[zejun][pid={os.getpid()}] _ModelRegistry, _try_load_model_cls, model_arch not in self.models = ', bool(model_arch not in self.models), flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _ModelRegistry, _try_load_model_cls, model_arch not in self.models = ', bool(model_arch not in self.models), flush=True)
         if model_arch not in self.models:
             return None
 
-        print(f'[zejun][pid={os.getpid()}] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, '. self.models[model_arch] = ', self.models[model_arch], flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _ModelRegistry, _try_load_model_cls, model_arch = ', model_arch, '. self.models[model_arch] = ', self.models[model_arch], flush=True)
 
         # print('[zejun] ------------------ ', flush=True)
         # ccnt = 0
@@ -901,7 +901,7 @@ class _ModelRegistry:
         architecture: str,
         model_config: ModelConfig,
     ) -> str:
-        print(f'[zejun][pid={os.getpid()}] _normalize_arch, architecture = ', architecture, flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _normalize_arch, architecture = ', architecture, flush=True)
         if architecture in self.models:
             return architecture
 
@@ -928,7 +928,7 @@ class _ModelRegistry:
         architectures: str | list[str],
         model_config: ModelConfig,
     ) -> tuple[_ModelInfo, str]:
-        print(f'[zejun][pid={os.getpid()}] _ModelRegistry, inspect_model_cls', flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _ModelRegistry, inspect_model_cls', flush=True)
         if isinstance(architectures, str):
             architectures = [architectures]
         if not architectures:
@@ -986,7 +986,7 @@ class _ModelRegistry:
         if not architectures:
             raise ValueError("No model architectures are specified")
 
-        print(f'[zejun][pid={os.getpid()}] _ModelRegistry, resolve_model_cls, model_config.model_impl = ', model_config.model_impl, flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _ModelRegistry, resolve_model_cls, model_config.model_impl = ', model_config.model_impl, flush=True)
 
         # Require transformers impl
         if model_config.model_impl == "transformers":
@@ -1002,8 +1002,8 @@ class _ModelRegistry:
                 return (model_cls, arch)
 
         # Fallback to transformers impl (after resolving convert_type)
-        print(f'[zejun][pid={os.getpid()}] _ModelRegistry, resolve_model_cls, all(arch not in self.models for arch in architectures) = ', all(arch not in self.models for arch in architectures), flush=True)
-        print(f'[zejun][pid={os.getpid()}] _ModelRegistry, resolve_model_cls, getattr(model_config, "convert_type", "none") == "none" = ', bool(getattr(model_config, "convert_type", "none") == "none"), flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _ModelRegistry, resolve_model_cls, all(arch not in self.models for arch in architectures) = ', all(arch not in self.models for arch in architectures), flush=True)
+        # print(f'[zejun][pid={os.getpid()}] _ModelRegistry, resolve_model_cls, getattr(model_config, "convert_type", "none") == "none" = ', bool(getattr(model_config, "convert_type", "none") == "none"), flush=True)
 
         if (
             all(arch not in self.models for arch in architectures)
@@ -1014,14 +1014,14 @@ class _ModelRegistry:
             if arch is not None:
                 model_cls = self._try_load_model_cls(arch)
                 if model_cls is not None:
-                    print(f'[zejun][pid={os.getpid()}] 1, return (model_cls, arch) = ', model_cls, arch, flush=True)
+                    # print(f'[zejun][pid={os.getpid()}] 1, return (model_cls, arch) = ', model_cls, arch, flush=True)
                     return (model_cls, arch)
 
         for arch in architectures:
             normalized_arch = self._normalize_arch(arch, model_config)
             model_cls = self._try_load_model_cls(normalized_arch)
             if model_cls is not None:
-                print(f'[zejun][pid={os.getpid()}] 2, return (model_cls, arch) = ', model_cls, arch, flush=True)
+                # print(f'[zejun][pid={os.getpid()}] 2, return (model_cls, arch) = ', model_cls, arch, flush=True)
                 return (model_cls, arch)
 
         # Fallback to transformers impl (before resolving runner_type)
@@ -1033,7 +1033,7 @@ class _ModelRegistry:
             if arch is not None:
                 model_cls = self._try_load_model_cls(arch)
                 if model_cls is not None:
-                    print(f'[zejun][pid={os.getpid()}] 3, return (model_cls, arch) = ', model_cls, arch, flush=True)
+                    # print(f'[zejun][pid={os.getpid()}] 3, return (model_cls, arch) = ', model_cls, arch, flush=True)
                     return (model_cls, arch)
 
         return self._raise_for_unsupported(architectures)

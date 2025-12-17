@@ -169,6 +169,7 @@ class CUDAGraphWrapper:
                 else:
                     set_graph_pool_id(current_platform.graph_pool_handle())
                 # mind-exploding: carefully manage the reference and memory.
+                print('[zejun] vllm begin cuda graph capture', flush=True)
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)
