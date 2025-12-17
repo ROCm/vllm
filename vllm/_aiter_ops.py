@@ -410,6 +410,31 @@ def _rocm_aiter_gemm_a8w8_blockscale_fake(
     return Y
 
 
+def _rocm_aiter_triton_gemm_a8w8_blockscale_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+
+    return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
+
+
+def _rocm_aiter_triton_gemm_a8w8_blockscale_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    M = A.shape[0]
+    N = B.shape[0]
+    Y = torch.empty(M, N, dtype=output_dtype, device=A.device)
+    return Y
+
+
 def _rocm_aiter_rms_norm_impl(
     x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
 ) -> torch.Tensor:
@@ -811,6 +836,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_triton_gemm_a8w8_blockscale",
+                op_func=_rocm_aiter_triton_gemm_a8w8_blockscale_impl,
+                fake_impl=_rocm_aiter_triton_gemm_a8w8_blockscale_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_rms_norm",
                 op_func=_rocm_aiter_rms_norm_impl,
                 fake_impl=_rocm_aiter_rms_norm_fake,
@@ -1187,9 +1218,9 @@ class rocm_aiter_ops:
         block_size: list[int],
         output_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
-        from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-
-        return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
+        return torch.ops.vllm.rocm_aiter_triton_gemm_a8w8_blockscale(
+            A, B, As, Bs, output_dtype
+        )
 
     @staticmethod
     def group_fp8_quant(
