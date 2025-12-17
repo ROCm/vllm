@@ -82,9 +82,8 @@ class SiluAndMul(CustomOp):
 
         self.fp8_dtype = current_platform.fp8_dtype()
 
-    def forward_native(
-        self, x: torch.Tensor, scale: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    @staticmethod
+    def forward_native(x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
