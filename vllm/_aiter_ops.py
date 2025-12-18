@@ -675,6 +675,7 @@ class rocm_aiter_ops:
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
     _PG_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_PAGED_ATTN
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
+    _MHA_SHUFFLE_ENABLED = envs.VLLM_ROCM_USE_AITER_SHUFFLE_MHA
     _TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
     _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
     _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
@@ -728,6 +729,12 @@ class rocm_aiter_ops:
     def is_mha_enabled(cls) -> bool:
         """ "Verifies device specs and availability of env variable."""
         return cls._AITER_ENABLED and cls._MHA_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def is_shuffle_mha_enabled(cls) -> bool:
+        """ "Verifies device specs and availability of env variable."""
+        return cls.is_mha_enabled() and cls._MHA_SHUFFLE_ENABLED
 
     @classmethod
     @if_aiter_supported
