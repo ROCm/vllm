@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_AITER_SHUFFLE_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_ALL_REDUCE: bool = True
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = True
@@ -958,6 +959,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Whether to use aiter asm paged attention kernel.
+    # It shuffles kv cache layout for better performance.
+    # By default is enabled.
+    "VLLM_ROCM_USE_AITER_SHUFFLE_MHA": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_SHUFFLE_MHA", "True").lower() in ("true", "1")
     ),
     # Whether to use aiter custom allreduce for ROCm platform.
     # By default is disabled, uses vLLM built-in custom allreduce.
