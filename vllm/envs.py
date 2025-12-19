@@ -115,6 +115,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
+    VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = False
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
@@ -207,7 +208,7 @@ if TYPE_CHECKING:
     VLLM_USE_TRTLLM_RAGGED_DEEPSEEK_PREFILL: bool = False
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
     VLLM_LOOPBACK_IP: str = ""
-    VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = False
+    VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_USE_TRTLLM_ATTENTION: str | None = None
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
@@ -244,6 +245,7 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
+    VLLM_DEBUG_MFU_METRICS: bool = False
 
 
 def get_default_cache_root():
@@ -956,6 +958,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_RMSNORM", "True").lower() in ("true", "1")
     ),
+    # Whether to use fused add+rmsnorm+pad kernel for gpt-oss
+    "VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_TRITON_FUSED_ADD_RMSNORM_PAD", "True").lower()
+        in ("true", "1")
+    ),
     # Whether to use aiter mla ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MLA": lambda: (
@@ -1437,7 +1444,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kv-cache memory usage and enable longer contexts)
     # TODO(lucas): Remove this flag once latency regression is resolved.
     "VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE": lambda: bool(
-        int(os.getenv("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "0"))
+        int(os.getenv("VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE", "1"))
     ),
     # Enables support for the "store" option in the OpenAI Responses API.
     # When set to 1, vLLM's OpenAI server will retain the input and output
@@ -1572,6 +1579,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
     ),
+    # Debug logging for --enable-mfu-metrics
+    "VLLM_DEBUG_MFU_METRICS": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
+    ),
 }
 
 # --8<-- [end:env-vars-definition]
@@ -1661,6 +1672,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CI_USE_S3",
         "VLLM_MODEL_REDIRECT_PATH",
         "VLLM_HOST_IP",
+        "VLLM_FORCE_AOT_LOAD",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",
         "S3_ENDPOINT_URL",
