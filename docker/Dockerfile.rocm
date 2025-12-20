@@ -1,7 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base_upstream_triton_torch_torch_2.9_test_20251212_tuned_20251215
+ARG BASE_IMAGE=rocm/vllm-dev:base_triton_test_dockerfile_update_20251219_tuned_20251219
 
 FROM ${BASE_IMAGE} AS base
 
