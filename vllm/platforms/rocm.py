@@ -89,26 +89,34 @@ def with_amdsmi_context(fn):
 
 
 @cache
+@with_amdsmi_context
+def _get_gpu_arch() -> str:
+    h = amdsmi_get_processor_handles()[0]
+    asic = amdsmi_get_gpu_asic_info(h)
+    return asic["target_graphics_version"]
+
+
+@cache
 def on_gfx1x() -> bool:
-    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    GPU_ARCH = _get_gpu_arch()
     return any(arch in GPU_ARCH for arch in ["gfx11", "gfx12"])
 
 
 @cache
 def on_mi3xx() -> bool:
-    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    GPU_ARCH = _get_gpu_arch()
     return any(arch in GPU_ARCH for arch in ["gfx942", "gfx950"])
 
 
 @cache
 def on_gfx9() -> bool:
-    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    GPU_ARCH = _get_gpu_arch()
     return any(arch in GPU_ARCH for arch in ["gfx90a", "gfx942", "gfx950"])
 
 
 @cache
 def on_gfx950() -> bool:
-    GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
+    GPU_ARCH = _get_gpu_arch()
     return any(arch in GPU_ARCH for arch in ["gfx950"])
 
 
@@ -399,6 +407,10 @@ class RocmPlatform(Platform):
         if device_name in _ROCM_DEVICE_ID_NAME_MAP:
             return _ROCM_DEVICE_ID_NAME_MAP[device_name]
         return asic_info["market_name"]
+
+    @classmethod
+    def get_device_uuid(cls, device_id: int = 0) -> str:
+        return str(torch.cuda.get_device_properties(device_id).uuid)
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
