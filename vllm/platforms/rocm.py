@@ -107,6 +107,15 @@ def on_gfx9() -> bool:
 
 
 @cache
+@with_amdsmi_context
+def on_gfx9_amdsmi() -> bool:
+    # Using amdsmi to get the arch circumvents torch caching CUDA_VISIBLE_DEVICES.
+    h = amdsmi_get_processor_handles()[0]
+    asic = amdsmi_get_gpu_asic_info(h)
+    return asic["target_graphics_version"]
+
+
+@cache
 def on_gfx942() -> bool:
     GPU_ARCH = torch.cuda.get_device_properties("cuda").gcnArchName
     return any(arch in GPU_ARCH for arch in ["gfx942"])
@@ -189,7 +198,7 @@ class RocmPlatform(Platform):
         "torchao",
     ]
     # bitsandbytes not supported on gfx9 (warp size 64 limitation)
-    if not on_gfx9():
+    if not on_gfx9_amdsmi():
         supported_quantization += ["bitsandbytes"]
 
     @classmethod
@@ -407,6 +416,10 @@ class RocmPlatform(Platform):
         if device_name in _ROCM_DEVICE_ID_NAME_MAP:
             return _ROCM_DEVICE_ID_NAME_MAP[device_name]
         return asic_info["market_name"]
+
+    @classmethod
+    def get_device_uuid(cls, device_id: int = 0) -> str:
+        return str(torch.cuda.get_device_properties(device_id).uuid)
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
