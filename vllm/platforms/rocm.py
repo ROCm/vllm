@@ -266,6 +266,10 @@ class RocmPlatform(Platform):
         from vllm._aiter_ops import rocm_aiter_ops
         from vllm.attention.backends.registry import AttentionBackendEnum
 
+        if selected_backend == AttentionBackendEnum.CUSTOM:
+            logger.info("Using CUSTOM backend.")
+            return AttentionBackendEnum.CUSTOM.get_path()
+
         if use_sparse:
             if kv_cache_dtype.startswith("fp8"):
                 raise ValueError(
