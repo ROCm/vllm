@@ -374,8 +374,8 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
-        if self.calculate_kv_scales:
-            torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+        # if self.calculate_kv_scales:
+        #     torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
         output_dtype = query.dtype
         if self.query_quant is not None:
             # quantizing with a simple torch operation enables

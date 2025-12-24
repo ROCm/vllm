@@ -244,11 +244,10 @@ class TritonAttentionImpl(AttentionImpl):
 
         TritonAttentionBackend.validate_head_size(head_size)
 
-        if attn_type != AttentionType.DECODER:
+        if attn_type not in [AttentionType.DECODER, AttentionType.ENCODER_DECODER]:
             raise NotImplementedError(
-                "Encoder self-attention and "
-                "encoder/decoder cross-attention "
-                "are not implemented for "
+                "Encoder self-attention "
+                "is not implemented for "
                 "TritonAttentionImpl"
             )
 

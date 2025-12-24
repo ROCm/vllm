@@ -12,9 +12,11 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-
+import aiter
 from .prefix_prefill import context_attention_fwd
-
+from aiter.ops.triton.gluon.pa_decode_gluon import (
+    pa_decode_gluon,
+)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
@@ -235,12 +237,14 @@ def chunked_prefill_paged_decode(
     max_query_len,
     k_scale,
     v_scale,
+    max_num_partitions,
     alibi_slopes=None,
     sliding_window=None,
     sm_scale=None,
     output_scale=None,
     # Optional tensor for sinks
     sinks=None,
+    page_size=None,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[1] ** 0.5)
@@ -312,46 +316,70 @@ def chunked_prefill_paged_decode(
         alibi_slopes,
         sinks,
     )
-    if use_custom:
-        _PARTITION_SIZE_ROCM = 256
-        max_num_partitions = (
-            max_seq_len + _PARTITION_SIZE_ROCM - 1
-        ) // _PARTITION_SIZE_ROCM
-        assert _PARTITION_SIZE_ROCM % block_size == 0
+    # use_custom = True
+    if use_custom and max_query_len == 1:
         total_num_seq = block_table.shape[0]
         tmp_output = torch.empty(
-            size=(total_num_seq, num_query_heads, max_num_partitions, head_size),
+            size=(total_num_seq, num_kv_heads, max_num_partitions, num_queries_per_kv, head_size),
             dtype=query.dtype,
             device=output.device,
         )
         exp_sums = torch.empty(
-            size=(total_num_seq, num_query_heads, max_num_partitions),
+            size=(total_num_seq, num_kv_heads, max_num_partitions, num_queries_per_kv),
             dtype=torch.float32,
             device=output.device,
         )
         max_logits = torch.empty_like(exp_sums)
 
-        ops.paged_attention_rocm(
-            output,
-            exp_sums,
-            max_logits,
-            tmp_output,
-            query,
-            key_cache,
-            value_cache,
-            num_kv_heads,
-            scale=sm_scale,
+        pa_decode_gluon(
+            output=output,
+            output_gluon=output,
+            query=query,
+            query_gluon=query,
+            query_scale_gluon=None,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            context_lengths=seq_lens,
             block_tables=block_table,
-            seq_lens=seq_lens,
-            query_start_loc=query_start_loc,
-            block_size=block_size,
-            max_seq_len=max_seq_len,
+            softmax_scale=sm_scale,
+            query_length=max_query_len,
+            max_context_length=max_seq_len,
+            compute_type=torch.bfloat16,
+            query_scale=None,
+            key_scale=k_scale,
+            value_scale=v_scale,
+            exp_sums=exp_sums,
+            max_logits=max_logits,
+            temporary_output=tmp_output,
+            context_partition_size=128,
             alibi_slopes=alibi_slopes,
-            kv_cache_dtype=kv_cache_dtype,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            fp8_out_scale=output_scale,
+            sinks=sinks,
+            sliding_window=sliding_window,
+            ps=True,
+            page_size=page_size,
         )
+        # return
+        # ops.paged_attention_rocm(
+        #     output,
+        #     exp_sums,
+        #     max_logits,
+        #     tmp_output,
+        #     query,
+        #     key_cache,
+        #     value_cache,
+        #     num_kv_heads,
+        #     scale=sm_scale,
+        #     block_tables=block_table,
+        #     seq_lens=seq_lens,
+        #     query_start_loc=query_start_loc,
+        #     block_size=block_size,
+        #     max_seq_len=max_seq_len,
+        #     alibi_slopes=alibi_slopes,
+        #     kv_cache_dtype=kv_cache_dtype,
+        #     k_scale=k_scale,
+        #     v_scale=v_scale,
+        #     fp8_out_scale=output_scale,
+        # )
     else:
         kernel_paged_attention_2d[
             (

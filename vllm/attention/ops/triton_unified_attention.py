@@ -101,6 +101,7 @@ def kernel_unified_attention_2d(
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
+    CROSS_ATTN: tl.constexpr = False,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -280,9 +281,14 @@ def kernel_unified_attention_2d(
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
 
-        S = tl.where(
-            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
-        )
+        if CROSS_ATTN:
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+            )
+        else:
+            S = tl.where(
+                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+            )
 
         if SLIDING_WINDOW > 0:
             S = tl.where(

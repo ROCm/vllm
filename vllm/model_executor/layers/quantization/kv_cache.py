@@ -89,6 +89,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
                 layer._q_scale_float = k_scale
 
             # These are used in the final Attention.forward()
+            k_scale = 1
+            v_scale = 1
             layer._k_scale.copy_(k_scale)
             layer._v_scale.copy_(v_scale)
             layer._k_scale_float = k_scale
