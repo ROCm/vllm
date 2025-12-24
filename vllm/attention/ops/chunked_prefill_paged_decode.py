@@ -303,21 +303,7 @@ def chunked_prefill_paged_decode(
 
     num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
 
-    from vllm.platforms.rocm import use_rocm_custom_paged_attention
-
-    use_custom = use_rocm_custom_paged_attention(
-        query.dtype,
-        head_size,
-        block_size,
-        num_queries_per_kv,
-        max_seq_len,
-        sliding_window,
-        kv_cache_dtype,
-        alibi_slopes,
-        sinks,
-    )
-    # use_custom = True
-    if use_custom and max_query_len == 1:
+    if max_query_len == 1:
         total_num_seq = block_table.shape[0]
         tmp_output = torch.empty(
             size=(total_num_seq, num_kv_heads, max_num_partitions, num_queries_per_kv, head_size),
