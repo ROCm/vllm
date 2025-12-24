@@ -136,7 +136,6 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             suffix_kv_lens = None
             prefix_scheduler_metadata = None
         max_context_partition_num = get_recommended_splits(seq_lens.numel(), self.num_heads_kv)
-        # max_context_partition_num = 1
         page_size = get_recommended_page_size(seq_lens, max_context_partition_num, 128)
         attn_metadata = RocmAttentionMetadata(
             num_actual_tokens=num_actual_tokens,

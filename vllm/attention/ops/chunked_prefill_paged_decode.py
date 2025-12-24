@@ -14,9 +14,6 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 import aiter
 from .prefix_prefill import context_attention_fwd
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    pa_decode_gluon,
-)
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
@@ -317,7 +314,7 @@ def chunked_prefill_paged_decode(
         )
         max_logits = torch.empty_like(exp_sums)
 
-        pa_decode_gluon(
+        torch.ops.aiter.pa_decode_gluon(
             output=output,
             output_gluon=output,
             query=query,
