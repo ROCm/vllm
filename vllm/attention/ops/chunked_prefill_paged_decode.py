@@ -343,7 +343,7 @@ def chunked_prefill_paged_decode(
             block_tables=block_table,
             softmax_scale=sm_scale,
             query_length=max_query_len,
-            max_context_length=max_seq_len,
+            max_context_partition_num=max_num_partitions,
             compute_type=torch.bfloat16,
             query_scale=None,
             key_scale=k_scale,
