@@ -208,7 +208,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         # Padding the weight for better performance on ROCm
         layer.w13_weight.data.copy_(self._maybe_pad_weight(layer.w13_weight.data))
-        layer.w2_weight.data.copy_(self._maybe_pad_weight(layer.w2_weight.data)）
+        layer.w2_weight.data.copy_(self._maybe_pad_weight(layer.w2_weight.data))
 
         if self.rocm_aiter_moe_enabled:
             shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
