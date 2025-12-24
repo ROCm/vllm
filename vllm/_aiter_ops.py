@@ -1311,9 +1311,11 @@ class rocm_aiter_ops:
 
     @staticmethod
     def can_shuffle(n: int, k: int, layout: tuple[int, int]) -> bool:
-        IN, IK = layout
-        BK = IK * 2
-        return (n % IN == 0) and (k % BK == 0)
+        # TODO: change this back after 355 tuning has been validated
+        # IN, IK = layout
+        # BK = IK * 2
+        # return (n % IN == 0) and (k % BK == 0)
+        return (n % 128 == 0) and (k % 128 == 0)
 
     @staticmethod
     def rocm_aiter_tuned_gemm(
