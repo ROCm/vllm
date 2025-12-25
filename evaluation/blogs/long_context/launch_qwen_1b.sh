@@ -1,13 +1,13 @@
 #!/bin/bash
 
 export SAFETENSORS_FAST_GPU=1
-export VLLM_ROCM_USE_AITER=1
 export VLLM_RPC_TIMEOUT=1800000
 
 # Triton Unified Attention
-export VLLM_ROCM_USE_AITER=0
-export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=0
-export VLLM_ROCM_USE_AITER_MHA=0
+#export VLLM_ATTENTION_BACKEND=TRITON_ATTN
+#export VLLM_ROCM_USE_AITER=0
+#export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=0
+#export VLLM_ROCM_USE_AITER_MHA=0
 
 
 # Aiter Unified Attention
@@ -17,11 +17,13 @@ export VLLM_ROCM_USE_AITER_MHA=0
 #export VLLM_ROCM_USE_AITER_MHA=0
 
 # Triton Prefill-Decode Attention
-#export VLLM_ROCM_USE_AITER=1
-#export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1
-#export VLLM_ROCM_USE_AITER_MHA=0
+export VLLM_ATTENTION_BACKEND=ROCM_ATTN
+# export VLLM_ROCM_USE_AITER=1
+# export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=1
+# export VLLM_ROCM_USE_AITER_MHA=0
 
 # AITER Multi-head Attention
+# export VLLM_ATTENTION_BACKEND=ROCM_AITER_FA
 #export VLLM_ROCM_USE_AITER=1
 #export VLLM_V1_USE_PREFILL_DECODE_ATTENTION=0
 #export VLLM_ROCM_USE_AITER_MHA=1
@@ -45,7 +47,7 @@ rm -rf /root/.cache/
 model_path=/mnt/data/pretrained_model/Qwen/Qwen2-1.5B-Instruct/
 vllm serve $model_path \
     --tensor-parallel-size 1 \
-    --max-num-batched-tokens 16384 \
+    --max-num-batched-tokens 32768 \
     --trust-remote-code \
     --no-enable-prefix-caching \
     --disable-log-requests \

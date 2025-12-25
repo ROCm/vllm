@@ -6,7 +6,7 @@ vllm bench serve \
   --port 1234 \
   --model ${model} \
   --dataset-name random \
-  --random-input-len 20000 \
+  --random-input-len 80000 \
   --random-output-len 1 \
   --max-concurrency 1 \
   --num-prompts 3 \

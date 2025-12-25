@@ -26,8 +26,8 @@ rm -rf /root/.cache/
 # FP8 model, pure TP8 unsupported due to MoE weight not being divisible by 8, so run with TP8 + EP8 first
 model_path=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8
 vllm serve $model_path \
-    --tensor-parallel-size 4 \
-    --max-num-batched-tokens 16384 \
+    --tensor-parallel-size 8 \
+    --max-num-batched-tokens 32768 \
     --trust-remote-code \
     --no-enable-prefix-caching \
     --disable-log-requests \

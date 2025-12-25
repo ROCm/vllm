@@ -28,7 +28,7 @@ rm -rf /root/.cache/
 model_path=deepseek-ai/DeepSeek-R1-0528
 vllm serve $model_path \
     --tensor-parallel-size 8 \
-    --max-num-batched-tokens 16384 \
+    --max-num-batched-tokens 32768 \
     --trust-remote-code \
     --no-enable-prefix-caching \
     --disable-log-requests \
