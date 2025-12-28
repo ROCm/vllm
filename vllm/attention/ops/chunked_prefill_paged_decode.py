@@ -303,6 +303,7 @@ def chunked_prefill_paged_decode(
     if max_query_len == 1:
         # max_num_partitions = 1
         total_num_seq = block_table.shape[0]
+        max_num_partitions = triton.cdiv(max_seq_len, 128)
         tmp_output = torch.empty(
             size=(total_num_seq, num_kv_heads, max_num_partitions, num_queries_per_kv, head_size),
             dtype=query.dtype,
@@ -327,8 +328,8 @@ def chunked_prefill_paged_decode(
             block_tables=block_table,
             softmax_scale=sm_scale,
             query_length=max_query_len,
-            max_context_partition_num=max_num_partitions,
-            compute_type=torch.bfloat16,
+            max_context_length=max_seq_len,
+            compute_type=tl.bfloat16,
             query_scale=None,
             key_scale=k_scale,
             value_scale=v_scale,
@@ -339,8 +340,8 @@ def chunked_prefill_paged_decode(
             alibi_slopes=alibi_slopes,
             sinks=sinks,
             sliding_window=sliding_window+1 if sliding_window>0 else sliding_window,
-            ps=False,
-            page_size=page_size,
+            # ps=True,
+            # page_size=page_size,
         )
         # return
         # ops.paged_attention_rocm(
