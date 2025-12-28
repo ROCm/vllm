@@ -13,6 +13,7 @@ from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 import aiter
+from aiter.ops.triton.gluon.pa_decode_gluon import pa_decode_gluon
 from .prefix_prefill import context_attention_fwd
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -316,7 +317,7 @@ def chunked_prefill_paged_decode(
         )
         max_logits = torch.empty_like(exp_sums)
 
-        torch.ops.aiter.pa_decode_gluon(
+        pa_decode_gluon(
             output=output,
             output_gluon=output,
             query=query,
@@ -340,6 +341,7 @@ def chunked_prefill_paged_decode(
             alibi_slopes=alibi_slopes,
             sinks=sinks,
             sliding_window=sliding_window+1 if sliding_window>0 else sliding_window,
+            # one_shot=True
             # ps=True,
             # page_size=page_size,
         )

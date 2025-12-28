@@ -14,7 +14,7 @@ from vllm.attention.backends.abstract import (
     AttentionType,
 )
 from vllm.attention.ops.chunked_prefill_paged_decode import chunked_prefill_paged_decode
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_page_size, get_recommended_splits
+# from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_page_size, get_recommended_splits
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
