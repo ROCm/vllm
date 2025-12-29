@@ -38,6 +38,7 @@ from vllm.distributed import (
     get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    is_local_first_rank,
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
@@ -501,10 +502,26 @@ class Qwen3MoeModel(nn.Module):
             "_input_scale",
         )
 
+        from inspect import currentframe, getframeinfo
+
+        do_dump = is_local_first_rank()
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         for name, loaded_weight in weights:
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                assert loaded_weight.numel() == 1, (
+                    f"KV scale numel {loaded_weight.numel()} != 1"
+                )
+                loaded_weight = loaded_weight.squeeze()
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
@@ -528,10 +545,23 @@ class Qwen3MoeModel(nn.Module):
                     continue
                 if name.endswith("scale"):
                     # Remapping the name of FP8 kv-scale.
+                    if do_dump:
+                        print(
+                            "At line:",
+                            getframeinfo(currentframe()).lineno,
+                            " name:",
+                            name,
+                        )
                     name = maybe_remap_kv_scale_name(name, params_dict)
+                    if do_dump:
+                        print(
+                            "At line:",
+                            getframeinfo(currentframe()).lineno,
+                            " name:",
+                            name,
+                        )
                     if name is None:
                         continue
-
                 if name not in params_dict:
                     continue
 
@@ -600,7 +630,6 @@ class Qwen3MoeModel(nn.Module):
                         continue
                     # Remapping the name of FP8 kv-scale.
                     if name.endswith("kv_scale"):
-                        # print("mark 0 name:", name)
                         remapped_kv_scale_name = name.replace(
                             ".kv_scale", ".attn.kv_scale"
                         )
@@ -613,15 +642,11 @@ class Qwen3MoeModel(nn.Module):
                             continue
                         else:
                             name = remapped_kv_scale_name
-                    try:
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    except KeyError:
-                        pass
-
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
 

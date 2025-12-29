@@ -281,10 +281,27 @@ class LinearBase(CustomOp):
         self.params_dtype = params_dtype
         self.quant_config = quant_config
         self.prefix = prefix
+
+        # print(
+        #     "In linear base line:",
+        #     getframeinfo(currentframe()).lineno,
+        #     "quant_config:",
+        #     quant_config,
+        # )
+        # print(
+        #     "quant config, packed_modules_mapping",
+        #       quant_config.packed_modules_mapping
+        # )
         if quant_config is None:
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        # print(
+        #     "In linear base line:",
+        #     getframeinfo(currentframe()).lineno,
+        #     "quant_method",
+        #     self.quant_method,
+        # )
         self.return_bias = return_bias
         self.disable_tp = disable_tp
         self.tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
@@ -948,6 +965,12 @@ class QKVParallelLinear(ColumnParallelLinear):
             return_bias=return_bias,
             disable_tp=disable_tp,
         )
+
+        # print("self.quant_method:", self.quant_method)
+        # print(
+        #     "self.quant_method.packed_modules_mapping",
+        #     self.quant_method.packed_modules_mapping,
+        # )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
         shard_offset_mapping = {
