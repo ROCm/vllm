@@ -33,7 +33,15 @@ AITER_RMS_ADD_OP = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
 AITER_GROUP_FP8_QUANT_OP = torch.ops.vllm.rocm_aiter_group_fp8_quant.default
 TRITON_GROUP_FP8_QUANT_OP = torch.ops.vllm.triton_per_token_group_quant_fp8.default
 
-FUSED_SILU_MUL_QUANT_OP = torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant.default
+FUSED_SILU_MUL_GROUP_QUANT_OP = (
+    torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant.default
+)
+FUSED_SILU_MUL_PER_TOKEN_QUANT_OP = (
+    torch.ops.vllm.rocm_aiter_fused_silu_mul_per_token_quant.default
+)
+
+AITER_PER_TOKEN_QUANT_OP = torch.ops.vllm.rocm_aiter_per_token_quant.default
+VLLM_PER_TOKEN_QUANT_OP = torch.ops._C.dynamic_per_token_scaled_fp8_quant.default
 
 
 class AiterRMSFp8GroupQuantPattern:
@@ -196,8 +204,78 @@ class AiterSiluMulFp8GroupQuantPattern(ActivationQuantPattern):
         def replacement(
             input: torch.Tensor,
         ):
-            at = FUSED_SILU_MUL_QUANT_OP(x=input, group_size=128)
+            at = FUSED_SILU_MUL_GROUP_QUANT_OP(x=input, group_size=128)
             return at[0], at[1]
+
+        inputs = [
+            self.silu_and_mul_matcher.inputs()[0],
+        ]
+
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only, pm_pass)
+
+
+class AiterSiluMulFp8PerTokenQuantPattern(ActivationQuantPattern):
+    """
+    This pattern fuses aiter silu_and_mul and per-token fp8 quant custom
+    ops into an aiter fused_silu_mul_per_token_quant op.
+    """
+
+    def __init__(self, quant_op: OpOverload):
+        self.silu_and_mul_matcher = MatcherSiluAndMul()
+        self.quant_op = quant_op
+
+    def register(self, pm_pass: PatternMatcherPass):
+        from torch._higher_order_ops.auto_functionalize import auto_functionalized
+
+        def pattern(
+            input: torch.Tensor,
+        ):
+            at1 = self.silu_and_mul_matcher(input)
+
+            d = input.shape[-1] // 2
+            out_shape = input.shape[:-1] + (d,)
+            out = torch.empty(out_shape, dtype=FP8_DTYPE, device=input.device)
+
+            if self.quant_op == AITER_PER_TOKEN_QUANT_OP:
+                scale_shape = out_shape[:-1] + (1,)
+                scale = torch.empty(
+                    scale_shape, dtype=torch.float32, device=input.device
+                )
+                at2 = auto_functionalized(
+                    self.quant_op,
+                    out=out,
+                    x=at1,
+                    scale=scale,
+                )
+                return at2[1], at2[2]  # return out, scale
+            else:
+                scale = torch.empty(1, dtype=torch.float32, device=input.device)
+                at2 = auto_functionalized(
+                    self.quant_op,
+                    result=out,
+                    input=at1,
+                    scale=scale,
+                    scale_ub=None,
+                )
+                return at2[1], at2[2]  # return result, scale
+
+        def replacement(
+            input: torch.Tensor,
+        ):
+            d = input.shape[-1] // 2
+            out_shape = input.shape[:-1] + (d,)
+            out = torch.empty(out_shape, dtype=FP8_DTYPE, device=input.device)
+
+            scale_shape = out_shape[:-1] + (1,)
+            scales = torch.empty(scale_shape, dtype=torch.float32, device=input.device)
+
+            at = auto_functionalized(
+                FUSED_SILU_MUL_PER_TOKEN_QUANT_OP,
+                out=out,
+                scales=scales,
+                input=input,
+            )
+            return at[1], at[2]  # return out, scales
 
         inputs = [
             self.silu_and_mul_matcher.inputs()[0],
@@ -238,5 +316,37 @@ class RocmAiterSiluMulFp8GroupQuantFusionPass(VllmPatternMatcherPass):
         fusion_patterns = [
             ActivationQuantPattern,
             AiterSiluMulFp8GroupQuantPattern,
+        ]
+        return VllmInductorPass.hash_source(self, *fusion_patterns)
+
+
+class RocmAiterSiluMulFp8PerTokenQuantFusionPass(VllmPatternMatcherPass):
+    """
+    This pass fuses SiLUAndMul with per-token FP8 quantization.
+    """
+
+    @enable_fake_mode
+    def __init__(self, config: VllmConfig):
+        super().__init__(config)
+
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="rocm_aiter_silu_mul_fp8_per_token_quant_fusion_pass"
+        )
+
+        # Register patterns for both aiter and vllm per-token quant ops
+        for quant_op in [AITER_PER_TOKEN_QUANT_OP, VLLM_PER_TOKEN_QUANT_OP]:
+            AiterSiluMulFp8PerTokenQuantPattern(quant_op).register(self.patterns)
+
+        self.dump_patterns(config, self.patterns)
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: torch.fx.Graph):
+        self.matched_count = self.patterns.apply(graph)
+        logger.debug("Replaced %s patterns", self.matched_count)
+
+    def uuid(self):
+        fusion_patterns = [
+            ActivationQuantPattern,
+            AiterSiluMulFp8PerTokenQuantPattern,
         ]
         return VllmInductorPass.hash_source(self, *fusion_patterns)

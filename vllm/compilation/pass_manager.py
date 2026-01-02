@@ -18,6 +18,7 @@ if rocm_aiter_ops.is_enabled():
     from vllm.compilation.rocm_aiter_fusion import (
         RocmAiterRMSNormFp8GroupQuantFusionPass,
         RocmAiterSiluMulFp8GroupQuantFusionPass,
+        RocmAiterSiluMulFp8PerTokenQuantFusionPass,
     )
 
 if current_platform.is_cuda_alike():
@@ -132,6 +133,7 @@ class PostGradPassManager(CustomGraphPass):
                 self.passes += [ActivationQuantFusionPass(config)]
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterSiluMulFp8GroupQuantFusionPass(config)]
+                    self.passes += [RocmAiterSiluMulFp8PerTokenQuantFusionPass(config)]
 
             # ROCm AITER all-reduce + RMSNorm fusion
             if (

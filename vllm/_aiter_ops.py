@@ -663,6 +663,20 @@ def _rocm_aiter_act_mul_and_fp8_group_quant_fake(
     return x_fp8, out_bs
 
 
+def _rocm_aiter_fused_silu_mul_per_token_quant_impl(
+    out: torch.Tensor, scales: torch.Tensor, input: torch.Tensor
+) -> None:
+    from aiter.ops.activation import fused_silu_mul_per_token_quant
+
+    fused_silu_mul_per_token_quant(out, scales, input)
+
+
+def _rocm_aiter_fused_silu_mul_per_token_quant_fake(
+    out: torch.Tensor, scales: torch.Tensor, input: torch.Tensor
+) -> None:
+    pass
+
+
 # Global flag to ensure ops are registered only once
 _OPS_REGISTERED = False
 
@@ -901,6 +915,14 @@ class rocm_aiter_ops:
                 dispatch_key=current_platform.dispatch_key,
             )
 
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_silu_mul_per_token_quant",
+                op_func=_rocm_aiter_fused_silu_mul_per_token_quant_impl,
+                mutates_args=["out", "scales"],
+                fake_impl=_rocm_aiter_fused_silu_mul_per_token_quant_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
             _OPS_REGISTERED = True
 
     @staticmethod
@@ -1124,6 +1146,24 @@ class rocm_aiter_ops:
 
         torch.ops.vllm.rocm_aiter_per_token_quant(out, x, scale)
         return out, scale
+
+    @staticmethod
+    def fused_silu_mul_per_token_quant(
+        input: torch.Tensor,
+        quant_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert quant_dtype in [torch.int8, _FP8_DTYPE]
+        assert input.ndim == 2, "Input must be 2D tensor (num_tokens, 2*d)"
+        assert input.shape[-1] % 2 == 0, "Input last dimension must be even"
+
+        num_tokens, input_dim = input.shape
+        d = input_dim // 2
+
+        out = torch.empty((num_tokens, d), dtype=quant_dtype, device=input.device)
+        scales = torch.empty((num_tokens, 1), dtype=torch.float32, device=input.device)
+
+        torch.ops.vllm.rocm_aiter_fused_silu_mul_per_token_quant(out, scales, input)
+        return out, scales
 
     @staticmethod
     def triton_fp4_gemm_dynamic_qaunt(
