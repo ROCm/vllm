@@ -32,14 +32,13 @@ from typing import Any, cast
 
 import numpy as np
 from PIL import Image
-from transformers import PreTrainedTokenizerBase
 from typing_extensions import deprecated
 
 from vllm.lora.request import LoRARequest
 from vllm.lora.utils import get_adapter_absolute_path
 from vllm.multimodal import MultiModalDataDict
 from vllm.multimodal.image import convert_image_mode
-from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.tokenizers import TokenizerLike
 from vllm.utils.import_utils import PlaceholderModule
 
 try:
@@ -189,7 +188,7 @@ class BenchmarkDataset(ABC):
     @abstractmethod
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         request_id_prefix: str = "",
         no_oversample: bool = False,
@@ -201,7 +200,7 @@ class BenchmarkDataset(ABC):
         for generating a list of SampleRequest objects.
 
         Args:
-            tokenizer (PreTrainedTokenizerBase): The tokenizer to be used
+            tokenizer (TokenizerLike): The tokenizer to be used
                 for processing the dataset's text.
             num_requests (int): The number of sample requests to generate.
             request_id_prefix (str): The prefix of request_id.
@@ -293,7 +292,7 @@ def lora_path_on_disk(lora_path: str) -> str:
 
 
 # Global cache for LoRA tokenizers.
-lora_tokenizer_cache: dict[int, AnyTokenizer] = {}
+lora_tokenizer_cache: dict[int, TokenizerLike] = {}
 
 
 def process_image(image: Any) -> Mapping[str, Any]:
@@ -380,7 +379,7 @@ def process_video(video: Any) -> Mapping[str, Any]:
 
 
 def gen_prompt_decode_to_target_len(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: TokenizerLike,
     token_sequence: list[int],
     target_token_len: int,
     max_retry: int = 10,
@@ -468,7 +467,7 @@ class RandomDataset(BenchmarkDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         request_id_prefix: str = "",
         no_oversample: bool = False,
@@ -580,7 +579,7 @@ class RandomDataset(BenchmarkDataset):
         range_ratio: float,
         input_len: int,
         output_len: int,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Get the sampling parameters for the dataset.
@@ -626,7 +625,7 @@ class RandomDataset(BenchmarkDataset):
     def generate_token_sequence(
         self,
         *,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         prefix_token_ids: list[int],
         prefix_len: int,
         vocab_size: int,
@@ -686,7 +685,7 @@ class RandomDatasetForReranking(RandomDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         request_id_prefix: str = "",
         range_ratio: float = RandomDataset.DEFAULT_RANGE_RATIO,
@@ -716,7 +715,11 @@ class RandomDatasetForReranking(RandomDataset):
         doc_lens, _, doc_offsets = self.get_sampling_params(
             num_requests, range_ratio, doc_len_param, 0, tokenizer
         )
+
         vocab_size = tokenizer.vocab_size
+        prohibited_tokens = tokenizer.all_special_ids
+        all_tokens = np.arange(vocab_size)
+        allowed_tokens = np.array(list(set(all_tokens) - set(prohibited_tokens)))
 
         query_prompt, query_input_len, token_mismatch_total = (
             self.generate_token_sequence(
@@ -727,6 +730,7 @@ class RandomDatasetForReranking(RandomDataset):
                 input_len=query_len,
                 offset=int(query_offsets[0]),
                 index=0,
+                allowed_tokens=allowed_tokens,
             )
         )
 
@@ -740,6 +744,7 @@ class RandomDatasetForReranking(RandomDataset):
                 input_len=int(doc_lens[i]),
                 offset=int(doc_offsets[i]),
                 index=i + 1,
+                allowed_tokens=allowed_tokens,
             )
             token_mismatch_total += token_mismatch
             requests.append((prompt, total_input_len))
@@ -1077,7 +1082,7 @@ class RandomMultiModalDataset(RandomDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         request_id_prefix: str = "",
         no_oversample: bool = False,
@@ -1231,7 +1236,7 @@ class ShareGPTDataset(BenchmarkDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         lora_path: str | None = None,
         max_loras: int | None = None,
@@ -1432,148 +1437,12 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
     )
 
     random_group = parser.add_argument_group("random dataset options")
-    random_group.add_argument(
-        "--random-input-len",
-        type=int,
-        default=1024,
-        help="Number of input tokens per request, used only for random sampling.",
-    )
-    random_group.add_argument(
-        "--random-output-len",
-        type=int,
-        default=128,
-        help="Number of output tokens per request, used only for random sampling.",
-    )
-    random_group.add_argument(
-        "--random-range-ratio",
-        type=float,
-        default=0.0,
-        help="Range ratio for sampling input/output length, "
-        "used only for random sampling. Must be in the range [0, 1) to define "
-        "a symmetric sampling range"
-        "[length * (1 - range_ratio), length * (1 + range_ratio)].",
-    )
-    random_group.add_argument(
-        "--random-prefix-len",
-        type=int,
-        default=0,
-        help=(
-            "Number of fixed prefix tokens before the random context "
-            "in a request. "
-            "The total input length is the sum of `random-prefix-len` and "
-            "a random "
-            "context length sampled from [input_len * (1 - range_ratio), "
-            "input_len * (1 + range_ratio)]."
-        ),
-    )
-    random_group.add_argument(
-        "--random-batch-size",
-        type=int,
-        default=1,
-        help=("Batch size for random sampling. Only used for embeddings benchmark."),
-    )
-    random_group.add_argument(
-        "--no-reranker",
-        action="store_true",
-        help=(
-            "Whether the model supports reranking natively."
-            " Only used for reranker benchmark."
-        ),
-    )
+    add_random_dataset_base_args(random_group)
 
-    # random multimodal dataset options
     random_mm_group = parser.add_argument_group(
         "random multimodal dataset options extended from random dataset"
     )
-    random_mm_group.add_argument(
-        "--random-mm-base-items-per-request",
-        type=int,
-        default=RandomMultiModalDataset.DEFAULT_BASE_ITEMS_PER_REQUEST,
-        help=(
-            "Base number of multimodal items per request for random-mm. "
-            "Actual per-request count is sampled around this base using "
-            "--random-mm-num-mm-items-range-ratio."
-        ),
-    )
-    random_mm_group.add_argument(
-        "--random-mm-num-mm-items-range-ratio",
-        type=float,
-        default=RandomMultiModalDataset.DEFAULT_NUM_MM_ITEMS_RANGE_RATIO,
-        help=(
-            "Range ratio r in [0, 1] for sampling items per request. "
-            "We sample uniformly from the closed integer range "
-            "[floor(n*(1-r)), ceil(n*(1+r))] "
-            "where n is the base items per request. "
-            "r=0 keeps it fixed; r=1 allows 0 items. The maximum is clamped "
-            "to the sum of per-modality limits from "
-            "--random-mm-limit-mm-per-prompt. "
-            "An error is raised if the computed min exceeds the max."
-        ),
-    )
-    random_mm_group.add_argument(
-        "--random-mm-limit-mm-per-prompt",
-        type=json.loads,
-        default=RandomMultiModalDataset.DEFAULT_LIMIT_MM_PER_PROMPT,
-        help=(
-            "Per-modality hard caps for items attached per request, e.g. "
-            '\'{"image": 3, "video": 0}\'. The sampled per-request item '
-            "count is clamped to the sum of these limits. When a modality "
-            "reaches its cap, its buckets are excluded and probabilities are "
-            "renormalized."
-            "OBS.: Only image sampling is supported for now."
-        ),
-    )
-
-    def _parse_mm_bucket_config(v: object) -> dict[tuple[int, int, int], float]:
-        # If already a dict (e.g., programmatic call), normalize keys
-        def normalize(d: dict) -> dict[tuple[int, int, int], float]:
-            out: dict[tuple[int, int, int], float] = {}
-            for k, val in d.items():
-                key = k
-                if isinstance(key, str):
-                    with suppress(Exception):
-                        key = ast.literal_eval(key)
-                if not (
-                    isinstance(key, tuple)
-                    and len(key) == 3
-                    and all(isinstance(x, int) for x in key)
-                ):
-                    raise ValueError(
-                        f"Invalid bucket key {k!r}. Expected tuple (H, W, T)."
-                    )
-                out[(int(key[0]), int(key[1]), int(key[2]))] = float(val)
-            return out
-
-        if isinstance(v, dict):
-            return normalize(v)
-        if isinstance(v, str):
-            # Python literal (supports tuple keys)
-            parsed = ast.literal_eval(v)
-            if not isinstance(parsed, dict):
-                raise ValueError("Bucket config must parse to a dict.")
-            return normalize(parsed)
-        raise ValueError("Unsupported value for --random-mm-bucket-config.")
-
-    random_mm_group.add_argument(
-        "--random-mm-bucket-config",
-        type=_parse_mm_bucket_config,
-        default=RandomMultiModalDataset.DEFAULT_MM_ITEM_BUCKET_CONFIG,
-        help=(
-            "The bucket config is a dictionary mapping a multimodal item"
-            "sampling configuration to a probability."
-            "Currently allows for 2 modalities: images and videos. "
-            "An bucket key is a tuple of (height, width, num_frames)"
-            "The value is the probability of sampling that specific item. "
-            "Example: "
-            "--random-mm-bucket-config "
-            "{(256, 256, 1): 0.5, (720, 1280, 1): 0.4, (720, 1280, 16): 0.10} "
-            "First item: images with resolution 256x256 w.p. 0.5"
-            "Second item: images with resolution 720x1280 w.p. 0.4 "
-            "Third item: videos with resolution 720x1280 and 16 frames w.p. 0.1"
-            "OBS.: If the probabilities do not sum to 1, they are normalized."
-            "OBS bis.: Only image sampling is supported for now."
-        ),
-    )
+    add_random_multimodal_dataset_args(random_mm_group)
 
     hf_group = parser.add_argument_group("hf dataset options")
     hf_group.add_argument(
@@ -1633,7 +1502,172 @@ def add_dataset_parser(parser: FlexibleArgumentParser):
     )
 
 
-def get_samples(args, tokenizer) -> list[SampleRequest]:
+def add_random_dataset_base_args(
+    parser_or_group: FlexibleArgumentParser | argparse._ArgumentGroup,
+) -> None:
+    """Add CLI arguments for base random dataset options.
+
+    This function adds arguments needed for:
+    - random (random dataset)
+    - random-mm (random multimodal dataset)
+    - random-rerank (random dataset for reranking)
+
+    Args:
+        parser_or_group: Either a parser or an argument group to add arguments to.
+    """
+    parser_or_group.add_argument(
+        "--random-input-len",
+        type=int,
+        default=1024,
+        help="Number of input tokens per request, used only for random sampling.",
+    )
+    parser_or_group.add_argument(
+        "--random-output-len",
+        type=int,
+        default=128,
+        help="Number of output tokens per request, used only for random sampling.",
+    )
+    parser_or_group.add_argument(
+        "--random-range-ratio",
+        type=float,
+        default=0.0,
+        help="Range ratio for sampling input/output length, "
+        "used only for random sampling. Must be in the range [0, 1) to define "
+        "a symmetric sampling range"
+        "[length * (1 - range_ratio), length * (1 + range_ratio)].",
+    )
+    parser_or_group.add_argument(
+        "--random-prefix-len",
+        type=int,
+        default=0,
+        help=(
+            "Number of fixed prefix tokens before the random context "
+            "in a request. "
+            "The total input length is the sum of `random-prefix-len` and "
+            "a random "
+            "context length sampled from [input_len * (1 - range_ratio), "
+            "input_len * (1 + range_ratio)]."
+        ),
+    )
+    parser_or_group.add_argument(
+        "--random-batch-size",
+        type=int,
+        default=1,
+        help=("Batch size for random sampling. Only used for embeddings benchmark."),
+    )
+    parser_or_group.add_argument(
+        "--no-reranker",
+        action="store_true",
+        help=(
+            "Whether the model supports reranking natively."
+            " Only used for reranker benchmark."
+        ),
+    )
+
+
+def add_random_multimodal_dataset_args(
+    parser_or_group: FlexibleArgumentParser | argparse._ArgumentGroup,
+) -> None:
+    """Add CLI arguments for random multimodal dataset options.
+
+    This function adds arguments needed for:
+    - random-mm (random multimodal dataset)
+
+    Args:
+        parser_or_group: Either a parser or an argument group to add arguments to.
+    """
+    parser_or_group.add_argument(
+        "--random-mm-base-items-per-request",
+        type=int,
+        default=RandomMultiModalDataset.DEFAULT_BASE_ITEMS_PER_REQUEST,
+        help=(
+            "Base number of multimodal items per request for random-mm. "
+            "Actual per-request count is sampled around this base using "
+            "--random-mm-num-mm-items-range-ratio."
+        ),
+    )
+    parser_or_group.add_argument(
+        "--random-mm-num-mm-items-range-ratio",
+        type=float,
+        default=RandomMultiModalDataset.DEFAULT_NUM_MM_ITEMS_RANGE_RATIO,
+        help=(
+            "Range ratio r in [0, 1] for sampling items per request. "
+            "We sample uniformly from the closed integer range "
+            "[floor(n*(1-r)), ceil(n*(1+r))] "
+            "where n is the base items per request. "
+            "r=0 keeps it fixed; r=1 allows 0 items. The maximum is clamped "
+            "to the sum of per-modality limits from "
+            "--random-mm-limit-mm-per-prompt. "
+            "An error is raised if the computed min exceeds the max."
+        ),
+    )
+    parser_or_group.add_argument(
+        "--random-mm-limit-mm-per-prompt",
+        type=json.loads,
+        default=RandomMultiModalDataset.DEFAULT_LIMIT_MM_PER_PROMPT,
+        help=(
+            "Per-modality hard caps for items attached per request, e.g. "
+            '\'{"image": 3, "video": 0}\'. The sampled per-request item '
+            "count is clamped to the sum of these limits. When a modality "
+            "reaches its cap, its buckets are excluded and probabilities are "
+            "renormalized."
+            "OBS.: Only image sampling is supported for now."
+        ),
+    )
+
+    def _parse_mm_bucket_config(v: object) -> dict[tuple[int, int, int], float]:
+        # If already a dict (e.g., programmatic call), normalize keys
+        def normalize(d: dict) -> dict[tuple[int, int, int], float]:
+            out: dict[tuple[int, int, int], float] = {}
+            for k, val in d.items():
+                key = k
+                if isinstance(key, str):
+                    with suppress(Exception):
+                        key = ast.literal_eval(key)
+                if not (
+                    isinstance(key, tuple)
+                    and len(key) == 3
+                    and all(isinstance(x, int) for x in key)
+                ):
+                    raise ValueError(
+                        f"Invalid bucket key {k!r}. Expected tuple (H, W, T)."
+                    )
+                out[(int(key[0]), int(key[1]), int(key[2]))] = float(val)
+            return out
+
+        if isinstance(v, dict):
+            return normalize(v)
+        if isinstance(v, str):
+            # Python literal (supports tuple keys)
+            parsed = ast.literal_eval(v)
+            if not isinstance(parsed, dict):
+                raise ValueError("Bucket config must parse to a dict.")
+            return normalize(parsed)
+        raise ValueError("Unsupported value for --random-mm-bucket-config.")
+
+    parser_or_group.add_argument(
+        "--random-mm-bucket-config",
+        type=_parse_mm_bucket_config,
+        default=RandomMultiModalDataset.DEFAULT_MM_ITEM_BUCKET_CONFIG,
+        help=(
+            "The bucket config is a dictionary mapping a multimodal item"
+            "sampling configuration to a probability."
+            "Currently allows for 2 modalities: images and videos. "
+            "An bucket key is a tuple of (height, width, num_frames)"
+            "The value is the probability of sampling that specific item. "
+            "Example: "
+            "--random-mm-bucket-config "
+            "{(256, 256, 1): 0.5, (720, 1280, 1): 0.4, (720, 1280, 16): 0.10} "
+            "First item: images with resolution 256x256 w.p. 0.5"
+            "Second item: images with resolution 720x1280 w.p. 0.4 "
+            "Third item: videos with resolution 720x1280 and 16 frames w.p. 0.1"
+            "OBS.: If the probabilities do not sum to 1, they are normalized."
+            "OBS bis.: Only image sampling is supported for now."
+        ),
+    )
+
+
+def get_samples(args, tokenizer: TokenizerLike) -> list[SampleRequest]:
     if not hasattr(args, "request_id_prefix"):
         args.request_id_prefix = ""
 
@@ -1711,6 +1745,11 @@ def get_samples(args, tokenizer) -> list[SampleRequest]:
         ):
             dataset_class = MTBenchDataset
             args.hf_split = "train"
+        elif (
+            args.dataset_path in MultiModalConversationDataset.SUPPORTED_DATASET_PATHS
+            or args.hf_name in MultiModalConversationDataset.SUPPORTED_DATASET_PATHS
+        ):
+            dataset_class = MultiModalConversationDataset
         elif (
             args.dataset_path in ConversationDataset.SUPPORTED_DATASET_PATHS
             or args.hf_name in ConversationDataset.SUPPORTED_DATASET_PATHS
@@ -1965,7 +2004,7 @@ class CustomDataset(BenchmarkDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         lora_path: str | None = None,
         max_loras: int | None = None,
@@ -2095,7 +2134,7 @@ class SonnetDataset(BenchmarkDataset):
 
     def sample(
         self,
-        tokenizer,
+        tokenizer: TokenizerLike,
         num_requests: int,
         prefix_len: int = DEFAULT_PREFIX_LEN,
         input_len: int = DEFAULT_INPUT_LEN,
@@ -2196,7 +2235,7 @@ class BurstGPTDataset(BenchmarkDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         max_loras: int | None = None,
         lora_path: str | None = None,
@@ -2272,17 +2311,76 @@ class HuggingFaceDataset(BenchmarkDataset):
 
 
 class ConversationDataset(HuggingFaceDataset):
-    """Dataset for conversation data with multimodal support."""
+    """Dataset for text-only conversation data."""
+
+    SUPPORTED_DATASET_PATHS = {
+        "Aeala/ShareGPT_Vicuna_unfiltered",
+    }
+    IS_MULTIMODAL = False
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        output_len: int | None = None,
+        enable_multimodal_chat: bool = False,
+        request_id_prefix: str = "",
+        no_oversample: bool = False,
+        **kwargs,
+    ) -> list:
+        # Filter examples with at least 2 conversations
+        filtered_data = self.data.filter(lambda x: len(x["conversations"]) >= 2)
+        sampled_requests = []
+        ind = 0
+        dynamic_output = output_len is None
+
+        for item in filtered_data:
+            if len(sampled_requests) >= num_requests:
+                break
+            conv = item["conversations"]
+            prompt, completion = conv[0]["value"], conv[1]["value"]
+
+            prompt_ids = tokenizer(prompt).input_ids
+            completion_ids = tokenizer(completion).input_ids
+            prompt_len = len(prompt_ids)
+            completion_len = len(completion_ids)
+            output_len = completion_len if dynamic_output else output_len
+            assert isinstance(output_len, int) and output_len > 0
+            if dynamic_output and not is_valid_sequence(prompt_len, completion_len):
+                continue
+            mm_content = process_image(item["image"]) if "image" in item else None
+            if enable_multimodal_chat:
+                # Note: when chat is enabled the request prompt_len is no longer
+                # accurate and we will be using request output to count the
+                # actual prompt len and output len
+                prompt = self.apply_multimodal_chat_transformation(prompt, mm_content)
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                    multi_modal_data=mm_content,
+                    request_id=request_id_prefix + str(ind),
+                )
+            )
+            ind += 1
+        self.maybe_oversample_requests(
+            sampled_requests, num_requests, request_id_prefix, no_oversample
+        )
+        return sampled_requests
+
+
+class MultiModalConversationDataset(HuggingFaceDataset):
+    """Dataset for multimodal conversation data."""
 
     SUPPORTED_DATASET_PATHS = {
         "lmms-lab/LLaVA-OneVision-Data",
-        "Aeala/ShareGPT_Vicuna_unfiltered",
     }
     IS_MULTIMODAL = True
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
@@ -2351,7 +2449,7 @@ class VisionArenaDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
@@ -2405,7 +2503,7 @@ class MMVUDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
@@ -2466,7 +2564,7 @@ class InstructCoderDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
@@ -2530,7 +2628,7 @@ class MTBenchDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
@@ -2596,7 +2694,7 @@ class BlazeditDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         skip_chat_template: bool = False,
@@ -2677,7 +2775,7 @@ class AIMODataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         request_id_prefix: str = "",
@@ -2787,7 +2885,7 @@ class NextEditPredictionDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         request_id_prefix: str = "",
         no_oversample: bool = False,
@@ -2859,7 +2957,7 @@ class ASRDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         request_id_prefix: str = "",
@@ -2937,7 +3035,7 @@ class MLPerfDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         request_id_prefix: str = "",
@@ -3016,7 +3114,7 @@ class PrefixRepetitionRandomDataset(BenchmarkDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         prefix_len: int = DEFAULT_PREFIX_LEN,
         suffix_len: int = DEFAULT_SUFFIX_LEN,
@@ -3102,7 +3200,7 @@ class MMStarDataset(HuggingFaceDataset):
 
     def sample(
         self,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: TokenizerLike,
         num_requests: int,
         output_len: int | None = None,
         enable_multimodal_chat: bool = False,
