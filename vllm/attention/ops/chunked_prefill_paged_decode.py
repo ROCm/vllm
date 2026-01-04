@@ -314,7 +314,7 @@ def chunked_prefill_paged_decode(
             device=output.device,
         )
         max_logits = torch.empty_like(exp_sums)
-
+        context_partition_size = (256 if sliding_window > 128 else 128) if sliding_window > 0 else 256
         torch.ops.aiter.pa_decode_gluon(
             output=output,
             output_gluon=output,
@@ -335,7 +335,7 @@ def chunked_prefill_paged_decode(
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=tmp_output,
-            context_partition_size=256,
+            context_partition_size=context_partition_size,
             alibi_slopes=alibi_slopes,
             sinks=sinks,
             sliding_window=sliding_window+1 if sliding_window>0 else sliding_window,
