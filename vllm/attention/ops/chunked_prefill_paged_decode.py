@@ -301,20 +301,23 @@ def chunked_prefill_paged_decode(
     
 
     if max_query_len == 1:
-        max_num_partitions = 1 if sliding_window > 0 else max_num_partitions
-        total_num_seq = block_table.shape[0]
-        tmp_output = torch.empty(
-            size=(total_num_seq, num_kv_heads, max_num_partitions, num_queries_per_kv, head_size),
-            dtype=query.dtype,
-            device=output.device,
-        )
-        exp_sums = torch.empty(
-            size=(total_num_seq, num_kv_heads, max_num_partitions, num_queries_per_kv),
-            dtype=torch.float32,
-            device=output.device,
-        )
-        max_logits = torch.empty_like(exp_sums)
-        context_partition_size = (256 if sliding_window > 128 else 128) if sliding_window > 0 else 256
+        if sliding_window > 0:
+            sliding_window = sliding_window + 1
+            max_num_partitions = 1
+            context_partition_size = (256 if sliding_window > 128 else 128)
+        else:
+            tmp_output = torch.empty(
+                size=(num_seqs, num_kv_heads, max_num_partitions, num_queries_per_kv, head_size),
+                dtype=query.dtype,
+                device=output.device,
+            )
+            exp_sums = torch.empty(
+                size=(num_seqs, num_kv_heads, max_num_partitions, num_queries_per_kv),
+                dtype=torch.float32,
+                device=output.device,
+            )
+            max_logits = torch.empty_like(exp_sums)
+            context_partition_size = 256
         
         torch.ops.aiter.pa_decode_gluon(
             output=output,
@@ -339,7 +342,7 @@ def chunked_prefill_paged_decode(
             context_partition_size=context_partition_size,
             alibi_slopes=alibi_slopes,
             sinks=sinks,
-            sliding_window=sliding_window+1 if sliding_window>0 else sliding_window,
+            sliding_window=sliding_window,
             ps=True,
         )
         # return
