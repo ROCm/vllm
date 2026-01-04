@@ -305,23 +305,20 @@ def chunked_prefill_paged_decode(
             sliding_window = sliding_window + 1
             max_num_partitions = 1
             context_partition_size = (256 if sliding_window > 128 else 128)
-            tmp_output = None
-            exp_sums = None
-            max_logits = None
         else:
-            tmp_output = torch.empty(
-                size=(num_seqs, num_kv_heads, max_num_partitions, num_queries_per_kv, head_size),
-                dtype=query.dtype,
-                device=output.device,
-            )
-            exp_sums = torch.empty(
-                size=(num_seqs, num_kv_heads, max_num_partitions, num_queries_per_kv),
-                dtype=torch.float32,
-                device=output.device,
-            )
-            max_logits = torch.empty_like(exp_sums)
             context_partition_size = 256
-        
+            
+        tmp_output = torch.empty(
+            size=(num_seqs, num_kv_heads, max_num_partitions, num_queries_per_kv, head_size),
+            dtype=query.dtype,
+            device=output.device,
+        )
+        exp_sums = torch.empty(
+            size=(num_seqs, num_kv_heads, max_num_partitions, num_queries_per_kv),
+            dtype=torch.float32,
+            device=output.device,
+        )
+        max_logits = torch.empty_like(exp_sums)
         torch.ops.aiter.pa_decode_gluon(
             output=output,
             output_gluon=output,
