@@ -13,7 +13,7 @@ from vllm.attention.backends.abstract import (
     AttentionType,
 )
 from vllm.attention.ops.chunked_prefill_paged_decode import chunked_prefill_paged_decode
-from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_page_size, get_recommended_splits
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from vllm.attention.ops.paged_attn import PagedAttention
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -62,7 +62,7 @@ class RocmAttentionMetadata:
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
     max_context_partition_num: int = 0
-    page_size: torch.Tensor | None = None
+    # page_size: torch.Tensor | None = None
 
 
 class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadata]):
@@ -135,7 +135,7 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             suffix_kv_lens = None
             prefix_scheduler_metadata = None
         max_context_partition_num = get_recommended_splits(seq_lens.numel(), self.num_heads_kv)
-        page_size = get_recommended_page_size(seq_lens, max_context_partition_num)
+        # page_size = get_recommended_page_size(seq_lens, max_context_partition_num)
         attn_metadata = RocmAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
@@ -151,7 +151,7 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             max_context_partition_num=max_context_partition_num,
-            page_size=page_size,
+            # page_size=page_size,
         )
         return attn_metadata
 
@@ -364,7 +364,7 @@ class RocmAttentionImpl(AttentionImpl):
             sm_scale=self.scale,
             output_scale=output_scale,
             sinks=self.sinks,
-            page_size=attn_metadata.page_size,
+            # page_size=attn_metadata.page_size,
             max_num_partitions=attn_metadata.max_context_partition_num,
         )
 

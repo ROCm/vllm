@@ -241,7 +241,7 @@ def chunked_prefill_paged_decode(
     output_scale=None,
     # Optional tensor for sinks
     sinks=None,
-    page_size=None,
+    # page_size=None,
 ):
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[1] ** 0.5)
@@ -340,7 +340,7 @@ def chunked_prefill_paged_decode(
             sinks=sinks,
             sliding_window=sliding_window+1 if sliding_window>0 else sliding_window,
             ps=False,
-            page_size=page_size,
+            # page_size=page_size,
         )
         # return
         # ops.paged_attention_rocm(
