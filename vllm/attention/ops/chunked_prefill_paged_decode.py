@@ -304,7 +304,7 @@ def chunked_prefill_paged_decode(
         if sliding_window > 0:
             sliding_window = sliding_window + 1
             max_num_partitions = 1
-            context_partition_size = (256 if sliding_window > 128 else 128)
+            context_partition_size = 128
         else:
             context_partition_size = 256
             
@@ -345,28 +345,6 @@ def chunked_prefill_paged_decode(
             sliding_window=sliding_window,
             ps=True,
         )
-        # return
-        # ops.paged_attention_rocm(
-        #     output,
-        #     exp_sums,
-        #     max_logits,
-        #     tmp_output,
-        #     query,
-        #     key_cache,
-        #     value_cache,
-        #     num_kv_heads,
-        #     scale=sm_scale,
-        #     block_tables=block_table,
-        #     seq_lens=seq_lens,
-        #     query_start_loc=query_start_loc,
-        #     block_size=block_size,
-        #     max_seq_len=max_seq_len,
-        #     alibi_slopes=alibi_slopes,
-        #     kv_cache_dtype=kv_cache_dtype,
-        #     k_scale=k_scale,
-        #     v_scale=v_scale,
-        #     fp8_out_scale=output_scale,
-        # )
     else:
         num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
         kernel_paged_attention_2d[
