@@ -177,7 +177,7 @@ class TestSiluMulPerTokenQuantModel(torch.nn.Module):
         self.fp8_linear = Fp8LinearOp(
             act_quant_static=False,
             act_quant_group_shape=GroupShape.PER_TOKEN,
-            pad_output=False,
+            pad_output=True,
         )
 
         self.use_aiter_quant = (
@@ -256,11 +256,6 @@ def test_fusion_silu_and_mul_quant(
         pytest.skip("AITER is not supported on this GPU.")
     if model_class is TestSiluMulPerTokenQuantModel and not IS_AITER_FOUND:
         pytest.skip("AITER is not supported on this GPU.")
-
-    if model_class is TestSiluMulPerTokenQuantModel and hidden_size < 256:
-        pytest.skip(
-            "Hidden size must be at least 256 for per-token quantization fusion."
-        )
 
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)

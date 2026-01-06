@@ -267,27 +267,6 @@ class AiterSiluMulFp8PerTokenQuantPattern(ActivationQuantPattern):
             scale_shape = out_shape[:-1] + (1,)
             scales = torch.empty(scale_shape, dtype=torch.float32, device=input.device)
 
-            # NOTE: aiter fused_silu_mul_per_token_quant requires d >= 256
-            # Fall back to the unfused pattern otherwise
-            if isinstance(d, int) and d < 256:
-                at1 = self.silu_and_mul_matcher(input)
-                if self.quant_op == AITER_PER_TOKEN_QUANT_OP:
-                    at2 = auto_functionalized(
-                        self.quant_op,
-                        out=out,
-                        x=at1,
-                        scale=scales,
-                    )
-                    return at2[1], at2[2]
-                at2 = auto_functionalized(
-                    self.quant_op,
-                    result=out,
-                    input=at1,
-                    scale=scales,
-                    scale_ub=None,
-                )
-                return at2[1], at2[2]
-
             at = auto_functionalized(
                 FUSED_SILU_MUL_PER_TOKEN_QUANT_OP,
                 out=out,
