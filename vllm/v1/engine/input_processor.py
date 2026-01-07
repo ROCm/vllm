@@ -3,6 +3,7 @@
 
 import os
 import time
+from collections import UserDict
 from collections.abc import Mapping
 from typing import Any, Literal, cast
 
@@ -539,6 +540,9 @@ class InputProcessor:
             prompt_embeds = decoder_inputs["prompt_embeds"]
         else:
             prompt_token_ids = decoder_inputs["prompt_token_ids"]
+            if isinstance(prompt_token_ids, UserDict):
+                # For transformers v5 compatibility
+                prompt_token_ids = prompt_token_ids["input_ids"]
             prompt_embeds = None
 
         sampling_params = None
@@ -626,6 +630,9 @@ class InputProcessor:
             if prompt_inputs["type"] == "embeds"
             else prompt_inputs["prompt_token_ids"]
         )
+        if isinstance(prompt_ids, UserDict):
+            # For transformers v5 compatibility
+            prompt_ids = prompt_ids["input_ids"]
         prompt_embeds = (
             prompt_inputs["prompt_embeds"]
             if prompt_inputs["type"] == "embeds"
@@ -644,8 +651,8 @@ class InputProcessor:
         if tokenizer is not None:
             max_input_id = max(prompt_ids or (), default=0)
 
-            # NOTE: tokenizer.max_token_id is the tokenizer’s vocab size while
-            # self.model_config.get_vocab_size() is the model’s vocab size.
+            # NOTE: tokenizer.max_token_id is the tokenizer's vocab size while
+            # self.model_config.get_vocab_size() is the model's vocab size.
             # For Qwen3 models, the language model has extra tokens that do
             # not exist in the tokenizer, and vice versa for multimodal
             # placeholder tokens in some multimodal models.
