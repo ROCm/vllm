@@ -51,7 +51,7 @@ class QuarkW8A8Fp8(QuarkScheme):
             current_platform.is_rocm()
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_LINEAR
-            and current_platform.is_fp8_fnuz()
+            and current_platform.has_device_capability(94)
         )
 
     @classmethod
