@@ -9,7 +9,6 @@
 
 import torch
 
-from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 import aiter
@@ -298,8 +297,6 @@ def chunked_prefill_paged_decode(
         key_cache = key_cache.view(target_dtype)
         value_cache = value_cache.view(target_dtype)
 
-    
-
     if max_query_len == 1:
         if sliding_window > 0:
             sliding_window = sliding_window + 1
@@ -320,26 +317,23 @@ def chunked_prefill_paged_decode(
         )
         max_logits = torch.empty_like(exp_sums)
         torch.ops.aiter.pa_decode_gluon(
-            output=output,
-            output_gluon=output,
-            query=query,
-            query_gluon=query,
-            query_scale_gluon=None,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            context_lengths=seq_lens,
-            block_tables=block_table,
-            softmax_scale=sm_scale,
-            query_length=max_query_len,
-            max_context_partition_num=max_num_partitions,
-            compute_type=torch.bfloat16,
-            query_scale=None,
-            key_scale=k_scale,
-            value_scale=v_scale,
+            output,
+            query,
+            key_cache,
+            value_cache,
+            seq_lens,
+            block_table,
+            sm_scale,
+            max_query_len,
+            max_num_partitions,
+            context_partition_size,
+            query.dtype,
+            None,
+            k_scale,
+            v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=tmp_output,
-            context_partition_size=context_partition_size,
             alibi_slopes=alibi_slopes,
             sinks=sinks,
             sliding_window=sliding_window,
