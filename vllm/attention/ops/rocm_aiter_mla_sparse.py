@@ -281,6 +281,7 @@ def rocm_fp8_paged_mqa_logits(
         `torch.float32`.
     """
     from vllm._aiter_ops import rocm_aiter_ops
+    # print("qfp8 shape: ", q_fp8.shape)
 
     if rocm_aiter_ops.is_enabled():
         batch_size, next_n, heads, head_dim = q_fp8.shape
@@ -443,6 +444,8 @@ def rocm_aiter_sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
 ) -> torch.Tensor:
+    # torch.cuda.synchronize()
+    # print("into sparsed indexer", flush=True)
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
@@ -470,6 +473,8 @@ def rocm_aiter_sparse_attn_indexer(
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
 
+    # print("num decode tokens: ", attn_metadata.num_decode_tokens)
+    # print("indexer slot_mapping: ", slot_mapping)
     indexer_k_quant_and_cache_triton(
         k,
         kv_cache,
@@ -548,6 +553,8 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
+        # print("indexer context len: ", decode_metadata.seq_lens)
+        # print("indexer block table: ", decode_metadata.block_table)
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -557,6 +564,7 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
         )
+        # print("logits output: ", logits[:10, :10], flush=True)
 
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
@@ -579,8 +587,9 @@ def rocm_aiter_sparse_attn_indexer(
                 topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
                 decode_lens,
             )
-            topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
+            topk_indices_buffer[: topk_indices.shape[0], : topk_indices.shape[-1]] = (
                 topk_indices
             )
-
+    # torch.cuda.synchronize()
+    # print("leave the sparse attn indexer", flush=True)
     return topk_indices_buffer

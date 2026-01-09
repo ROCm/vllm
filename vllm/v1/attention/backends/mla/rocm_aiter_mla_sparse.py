@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.attention.backends.abstract import (
@@ -16,6 +17,10 @@ from vllm.attention.backends.abstract import (
 )
 from vllm.attention.backends.utils import get_mla_dims
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.common import (
@@ -60,7 +65,8 @@ def _convert_req_index_to_global_index_kernel(
 
     # Load request id for this token (no mask: grid is exact)
     req = tl.load(req_id_ptr + token_id)
-
+    if req < 0:
+        return
     # Load cumulative sequence lengths to get starting index of this request
     seq_start = tl.load(cu_seqlens_ptr + token_id)
     seq_end = tl.load(cu_seqlens_ptr + token_id + 1)
@@ -192,9 +198,11 @@ def generate_sparse_seqlen_triton(
     topk_token: int,
     num_tokens: int,
     max_query_len: int,
+    out: torch.Tensor | None = None,
 ):
     num_seqs = query_lens.size(0)
-    out = torch.empty([num_tokens], dtype=torch.int32, device=query_lens.device)
+    if out is None:
+        out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)
     block_size = 64
     num_block_per_row = triton.cdiv(max_query_len, block_size)
     grid = (
@@ -378,42 +386,93 @@ class ROCMAiterMLASparseMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> ROCMAiterMLASparseMetadata:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
         num_tokens = common_attn_metadata.num_actual_tokens
+        sdp_start_token = num_tokens // tp_size * tp_rank
+        sdp_end_token = num_tokens // tp_size * (tp_rank + 1)
         starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
+
+        # starts[-1] = num_tokens
+
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
             np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
         )
+        req_id_per_token_padded = np.full([num_tokens], -1, dtype=np.int32)
+        req_id_per_token_padded[: req_id_per_token.shape[0]] = req_id_per_token
+        req_id_per_token = req_id_per_token_padded
+        # print("num tokens: ", num_tokens)
+        # print("req id per token shape: ", req_id_per_token.shape)
+
         # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
         self.paged_kv_indices.fill_(0)
         self.paged_kv_indptr.fill_(0)
-        self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
-            torch.from_numpy(req_id_per_token), non_blocking=True
-        )
+
         query_lens = (
             common_attn_metadata.query_start_loc[1:]
             - common_attn_metadata.query_start_loc[:-1]
         )
         seq_lens = common_attn_metadata.seq_lens
-        sparse_seqlen = generate_sparse_seqlen_triton(
+        sparse_seqlen = torch.zeros([num_tokens], dtype=torch.int32, device=self.device)
+        generate_sparse_seqlen_triton(
             query_lens,
             seq_lens,
             common_attn_metadata.query_start_loc,
             self.topk_tokens,
             num_tokens,
             common_attn_metadata.max_query_len,
+            sparse_seqlen,
         )
-
-        torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
-        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
-
-        req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
-        qo_indptr = self.qo_indptr[: num_tokens + 1]
-        paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
-        paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-        paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
-
+        # print("cu_seqlen_q: ", common_attn_metadata.query_start_loc)
+        # print("sparse seqlen after triton", sparse_seqlen)
+        # print("sdp start end token: ", sdp_start_token, sdp_end_token)
+        if envs.VLLM_SDP:
+            sparse_seqlen = sparse_seqlen[sdp_start_token:sdp_end_token]
+            req_id_per_token_sliced = req_id_per_token[sdp_start_token:sdp_end_token]
+            # we assume the token already padding to the multiple of tp_size
+            num_tokens = max(num_tokens // tp_size, 1)
+            self.req_id_per_token_buffer[: req_id_per_token.shape[0] // tp_size].copy_(
+                torch.from_numpy(req_id_per_token_sliced), non_blocking=True
+            )
+            torch.cumsum(
+                sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1]
+            )
+            self.paged_kv_indptr[num_tokens + 1 :].fill_(
+                self.paged_kv_indptr[num_tokens]
+            )
+            paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
+            paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
+            paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+            qo_indptr = self.qo_indptr[: num_tokens + 1]
+            req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+        else:
+            self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
+                torch.from_numpy(req_id_per_token), non_blocking=True
+            )
+            torch.cumsum(
+                sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1]
+            )
+            self.paged_kv_indptr[num_tokens + 1 :].fill_(
+                self.paged_kv_indptr[num_tokens]
+            )
+            req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
+            qo_indptr = self.qo_indptr[: num_tokens + 1]
+            paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
+            paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
+            paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
+        # tp_rank = get_tensor_model_parallel_rank()
+        # torch.save(paged_kv_indices, f"paged_kv_indices_rank_{tp_rank}.pt")
+        # torch.save(paged_kv_indptr, f"paged_kv_indptr_rank_{tp_rank}.pt")
+        # torch.save(qo_indptr, f"qo_indptr_rank_{tp_rank}.pt")
+        # torch.save(paged_kv_last_page_len, f"paged_kv_last_page_len_rank_{tp_rank}.pt")
+        # print("req_id_per_token_buffer: ", self.req_id_per_token_buffer, flush=True)
+        # print("sparse seqlen: ", sparse_seqlen, flush=True)
+        # print("paged_kv indptr: ", paged_kv_indptr, flush=True)
+        # print("qo indptr: ", qo_indptr, flush=True)
+        # print("paged_kv last page len: ", paged_kv_last_page_len, flush=True)
+        # print("paged_kv indices: ", paged_kv_indices, flush=True)
         metadata = ROCMAiterMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -510,7 +569,20 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
             dtype=q.dtype,
             device=q.device,
         )
-
+        # print("q shape: ", q.shape)
+        # print("outpout shape: ", output.shape)
+        # rank_id = torch.distributed.get_rank()
+        # torch.save(attn_metadata.paged_kv_indices[:100], f"paged_kv_indices_{rank_id}.pt")
+        # torch.save(attn_metadata.paged_kv_indptr, f"paged_kv_indptr_{rank_id}.pt")
+        # torch.save(attn_metadata.qo_indptr, f"qo_indptr_{rank_id}.pt")
+        # torch.save(attn_metadata.paged_kv_last_page_len, f"paged_kv_last_page_len_{rank_id}.pt")
+        # print("q shape: ", q.shape)
+        # print("out shape: ", output.shape)
+        # print("kv cache shape: ", kv_c_and_k_pe_cache.shape)
+        # print("paged_kv_indices: ", attn_metadata.paged_kv_indices)
+        # print("paged kv indptr: ", attn_metadata.paged_kv_indptr)
+        # print("qo indptr: ", attn_metadata.qo_indptr)
+        # print("last page len: ", attn_metadata.paged_kv_last_page_len)
         rocm_aiter_ops.mla_decode_fwd(
             q,
             kv_c_and_k_pe_cache,
@@ -537,6 +609,8 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # torch.cuda.synchronize()
+        # print("into the sparse mla", flush=True)
         # NOTE(lucas): for the sparse FlashMLA kernels the kernels want to use
         # MQA 576/512 approach for both prefill and decode
 
@@ -590,6 +664,17 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
             q = torch.cat([ql_nope, q_pe], dim=-1)
 
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        # print("topk indices before slice: ", topk_indices[:10], flush=True)
+
+        if envs.VLLM_SDP:
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tensor_model_parallel_rank()
+            # num_actual_toks = num_actual_toks * tp_rank
+            topk_indices = self.topk_indices_buffer[
+                num_actual_toks // tp_size * tp_rank : num_actual_toks
+                // tp_size
+                * (tp_rank + 1)
+            ]
 
         triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token,
@@ -600,7 +685,8 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
             BLOCK_SIZE=attn_metadata.block_size,
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
-
+        # print("topk indices: ", topk_indices, flush=True)
+        # print("paged_kv_indices: ", attn_metadata.paged_kv_indices[:20], flush=True)
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
             ops.concat_and_cache_mla(
@@ -611,8 +697,12 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
                 kv_cache_dtype=self.kv_cache_dtype,
                 scale=layer._k_scale,
             )
-
+        # torch.cuda.synchronize()
+        # print("before mla kernel", flush=True)
         attn_out = self._forward_bf16_kv(q, kv_cache, attn_metadata)
 
         self._v_up_proj(attn_out, out=output[:num_actual_toks])
+        # torch.cuda.synchronize()
+        # print("end of rocm aiter mla sparse impl forward", flush=True)
+        # print("attn out shape: ", output.shape, flush=True)
         return output

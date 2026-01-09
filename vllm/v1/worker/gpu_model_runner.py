@@ -477,6 +477,10 @@ class GPUModelRunner(
             self.cudagraph_batch_sizes = sorted(
                 self.compilation_config.cudagraph_capture_sizes
             )
+            if envs.VLLM_SDP:
+                self.cudagraph_batch_sizes = [
+                    i for i in self.cudagraph_batch_sizes if i >= 8
+                ]
 
         # Cache the device properties.
         self._init_device_properties()
@@ -2520,7 +2524,9 @@ class GPUModelRunner(
         # Pad tokens to multiple of tensor_parallel_size when
         # enabled collective fusion for SP
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if self.compilation_config.pass_config.enable_sp and tp_size > 1:
+        if (
+            self.compilation_config.pass_config.enable_sp or envs.VLLM_SDP
+        ) and tp_size > 1:
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
@@ -2895,6 +2901,10 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        num_reqs_padded = num_reqs
+        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
+        if max_num_scheduled_tokens == self.uniform_decode_query_len:
+            num_reqs_padded = num_tokens_padded
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -2902,6 +2912,10 @@ class GPUModelRunner(
             num_reqs=num_reqs,
             force_uniform_decode=force_uniform_decode,
         )
+        # print("is uniform decode: ", uniform_decode)
+        # print("num tokens_padded: ", num_tokens_padded)
+        # print("num_reqs_padded: ", num_reqs_padded)
+
         # Encoder-decoder models only support CG for decoder_step > 0 (no enc_output
         # is present). Also, chunked-prefill is disabled, so batch are uniform.
         has_encoder_output = (
@@ -2914,16 +2928,19 @@ class GPUModelRunner(
             else force_has_lora
         )
 
-        num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         dispatch_cudagraph = (
             lambda num_tokens, disable_full: self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 disable_full=disable_full,
+                num_reqs_padded=num_reqs_padded,
             )
             if not force_eager
-            else (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
+            else (
+                CUDAGraphMode.NONE,
+                BatchDescriptor(num_tokens_padded, num_reqs=num_reqs_padded),
+            )
         )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
@@ -3148,6 +3165,7 @@ class GPUModelRunner(
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )
+            # print("batch desc num reqs: ", batch_desc.num_reqs)
             ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
                 should_ubatch,
                 num_scheduled_tokens_np,
@@ -3170,9 +3188,9 @@ class GPUModelRunner(
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_tokens_padded=num_tokens_padded,
                     num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    num_reqs_padded=num_reqs_padded,
                     max_query_len=max_num_scheduled_tokens,
                     ubatch_slices=ubatch_slices_attn,
                     logits_indices=logits_indices,
@@ -4280,7 +4298,7 @@ class GPUModelRunner(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs_padded,
                 max_query_len=max_query_len,
-                ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
+                ubatch_slices=ubatch_slices_padded,
                 for_cudagraph_capture=is_graph_capturing,
             )
 

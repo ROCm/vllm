@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from itertools import product
 
+from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
@@ -107,9 +108,19 @@ class CudagraphDispatcher:
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
         if cudagraph_mode.mixed_mode() != CUDAGraphMode.NONE:
-            for bs, has_lora in product(
-                self.compilation_config.cudagraph_capture_sizes, lora_cases
-            ):
+            print(
+                "original capture sizes: ",
+                self.compilation_config.cudagraph_capture_sizes,
+            )
+            if envs.VLLM_SDP:
+                cudagraph_capture_sizes_for_mix = [
+                    i for i in self.compilation_config.cudagraph_capture_sizes if i >= 8
+                ]
+            else:
+                cudagraph_capture_sizes_for_mix = (
+                    self.compilation_config.cudagraph_capture_sizes
+                )
+            for bs, has_lora in product(cudagraph_capture_sizes_for_mix, lora_cases):
                 self.add_cudagraph_key(
                     cudagraph_mode.mixed_mode(),
                     self._create_padded_batch_descriptor(
@@ -132,6 +143,10 @@ class CudagraphDispatcher:
                 for x in self.compilation_config.cudagraph_capture_sizes
                 if x <= max_num_tokens and x >= uniform_decode_query_len
             ]
+            if envs.VLLM_SDP:
+                cudagraph_capture_sizes_for_decode = [
+                    i for i in cudagraph_capture_sizes_for_decode if i >= 8
+                ]
             for bs, has_lora in product(cudagraph_capture_sizes_for_decode, lora_cases):
                 self.add_cudagraph_key(
                     CUDAGraphMode.FULL,
@@ -146,6 +161,7 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         disable_full: bool = False,
+        num_reqs_padded: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using cascade attention),
@@ -158,11 +174,14 @@ class CudagraphDispatcher:
             or self.cudagraph_mode == CUDAGraphMode.NONE
             or num_tokens > self.compilation_config.max_cudagraph_capture_size
         ):
-            return CUDAGraphMode.NONE, BatchDescriptor(num_tokens)
+            return CUDAGraphMode.NONE, BatchDescriptor(
+                num_tokens, num_reqs=num_reqs_padded
+            )
 
         batch_desc = self._create_padded_batch_descriptor(
             num_tokens, uniform_decode, has_lora
         )
+        print("batch desc reqs: ", batch_desc.num_reqs)
         relaxed_batch_desc = batch_desc.relax_for_mixed_batch_cudagraphs()
 
         if not disable_full:

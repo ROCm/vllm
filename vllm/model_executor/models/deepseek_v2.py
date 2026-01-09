@@ -32,6 +32,7 @@ import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.layer import Attention
@@ -115,7 +116,10 @@ class DeepseekAttention(nn.Module):
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        if not envs.VLLM_SDP:
+            self.num_heads = self.total_num_heads // tp_size
+        else:
+            self.num_heads = self.total_num_heads
         self.total_num_kv_heads = config.num_key_value_heads
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
@@ -125,7 +129,10 @@ class DeepseekAttention(nn.Module):
             # Number of KV heads is less than TP size, so we replicate
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        if not envs.VLLM_SDP:
+            self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        else:
+            self.num_kv_heads = self.total_num_kv_heads
         self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -372,6 +379,11 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states, 0
             )
             final_hidden_states = final_hidden_states[:num_tokens]
+        # elif envs.VLLM_SDP:
+        #     # In SDP, each TP rank has partial hidden states.
+        #     # We need to reduce-scatter across all TP ranks to get the final output.
+        #     final_hidden_states = get_tp_group().reduce_scatterv(final_hidden_states, dim=0)
+        #     num_tokens = num_tokens // get_tensor_model_parallel_world_size()
         elif self.tp_size > 1:
             final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(
                 final_hidden_states
@@ -739,7 +751,10 @@ class DeepseekV2MLAAttention(nn.Module):
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
         assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
+        if envs.VLLM_SDP:
+            self.num_local_heads = num_heads
+        else:
+            self.num_local_heads = num_heads // tp_size
 
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
@@ -770,6 +785,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_b_proj",
+                disable_tp=True if envs.VLLM_SDP else False,
             )
         else:
             self.q_proj = ColumnParallelLinear(
@@ -778,6 +794,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=f"{prefix}.q_proj",
+                disable_tp=True if envs.VLLM_SDP else False,
             )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.kv_b_proj = ColumnParallelLinear(
@@ -786,6 +803,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_b_proj",
+            disable_tp=True if envs.VLLM_SDP else False,
         )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -793,6 +811,7 @@ class DeepseekV2MLAAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=True if envs.VLLM_SDP else False,
         )
 
         if config.rope_parameters["rope_type"] != "default":
@@ -1115,6 +1134,8 @@ class DeepseekV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        # if envs.VLLM_SDP:
+        #     hidden_states = get_tp_group().all_gatherv(hidden_states, dim=0)
         return hidden_states
 
 
