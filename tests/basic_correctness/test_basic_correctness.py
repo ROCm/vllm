@@ -225,3 +225,4 @@ def v1_test_failed_model_execution(vllm_model):
         vllm_model.generate_greedy(prompts, 200, use_tqdm=False)
     assert isinstance(exc_info.value, RuntimeError)
     assert "Mocked Critical Error" in str(exc_info.value)
+# random
