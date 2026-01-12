@@ -9,7 +9,7 @@ FROM ${BASE_IMAGE} AS base
 
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
-ENV AITER_ROCM_ARCH=gfx942;gfx950
+ENV AITER_ROCM_ARCH=gfx942
 
 # Install some basic utilities
 RUN apt-get update -q -y && apt-get install -q -y \

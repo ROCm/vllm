@@ -19,9 +19,9 @@ FROM ${BASE_IMAGE} AS base
 ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV ROCM_PATH=/opt/rocm
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
-ARG PYTORCH_ROCM_ARCH=gfx942;gfx950
+ARG PYTORCH_ROCM_ARCH=gfx942
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
-# ENV AITER_ROCM_ARCH=gfx942;gfx950
+# ENV AITER_ROCM_ARCH=gfx942
 
 ARG PYTHON_VERSION=3.12
 
@@ -70,7 +70,7 @@ RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cyth
 #       -DCMAKE_INSTALL_PREFIX="/opt/rocm"                                                      \
 #       -DROCM_SYMLINK_LIBS=OFF                                                                        \
 #       -DROCM_PATH="/opt/rocm"                                                                  \
-#       -DGPU_TARGETS="gfx950;gfx942"                                                                  \
+#       -DGPU_TARGETS="gfx942"                                                                  \
 #       -DCMAKE_BUILD_TYPE=Release                                                                     \
 #       -DHIPBLASLT_ENABLE_FETCH=ON                                                                    \
 #       -DCMAKE_INSTALL_LIBDIR=lib                                                                     \
