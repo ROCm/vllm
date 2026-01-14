@@ -48,6 +48,7 @@ def test_concat_and_cache_mla_rope_fused(
 ) -> None:
     set_random_seed(seed)
     torch.set_default_device(device)
+    torch.cuda.set_device(device)
 
     rope = RotaryEmbedding(
         qk_rope_head_dim,
@@ -104,7 +105,7 @@ def test_concat_and_cache_mla_rope_fused(
         ref_temp[block_idx, block_offset] = torch.cat((kv_c[i], ref_k_rope[i]), -1)
 
     if kv_cache_dtype == "fp8":
-        ref_kv_cache = torch.empty_like(ref_temp, dtype=kv_cache.dtype)
+        ref_kv_cache = torch.zeros_like(ref_temp, dtype=kv_cache.dtype)
         ops.convert_fp8(
             ref_kv_cache, ref_temp, kv_cache_scale.item(), kv_dtype=kv_cache_dtype
         )
@@ -140,23 +141,33 @@ def test_concat_and_cache_mla_rope_fused(
         kv_cache_dtype,
         kv_cache_scale,
     )
-
-    if kv_cache_dtype == "fp8":
-        result_temp = torch.empty_like(kv_cache, dtype=torch.float16)
-        ops.convert_fp8(
-            result_temp,
-            kv_cache.contiguous(),
-            kv_cache_scale.item(),
-            kv_dtype=kv_cache_dtype,
-        )
-        expected_temp = torch.empty_like(ref_kv_cache, dtype=torch.float16)
-        ops.convert_fp8(
-            expected_temp, ref_kv_cache, kv_cache_scale.item(), kv_dtype=kv_cache_dtype
-        )
-        torch.testing.assert_close(result_temp, expected_temp, atol=0.001, rtol=0.1)
-    else:
-        torch.testing.assert_close(kv_cache, ref_kv_cache)
+    torch.cuda.synchronize()
 
     torch.testing.assert_close(
         query, ref_q_pe, atol=get_default_atol(query), rtol=get_default_rtol(query)
     )
+    torch.testing.assert_close(
+        k_pe, ref_k_pe, atol=get_default_atol(k_pe), rtol=get_default_rtol(k_pe)
+    )
+
+    if kv_cache_dtype == "fp8":
+        result_temp = torch.zeros_like(kv_cache, dtype=dtype)
+        ops.convert_fp8(
+            result_temp,
+            kv_cache,
+            kv_cache_scale.item(),
+            kv_dtype=kv_cache_dtype,
+        )
+        torch.testing.assert_close(result_temp, ref_temp, atol=0.001, rtol=0.1)
+        expected_temp = torch.zeros_like(ref_kv_cache, dtype=dtype)
+        ops.convert_fp8(
+            expected_temp, ref_kv_cache, kv_cache_scale.item(), kv_dtype=kv_cache_dtype
+        )
+        torch.testing.assert_close(expected_temp, ref_temp, atol=0.001, rtol=0.1)
+    else:
+        torch.testing.assert_close(
+            kv_cache,
+            ref_kv_cache,
+            atol=get_default_atol(kv_cache),
+            rtol=get_default_rtol(kv_cache),
+        )
