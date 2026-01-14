@@ -126,6 +126,8 @@ def test_models(
 
     if use_rocm_aiter and (model in AITER_MODEL_LIST):
         monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER_MHA", "0")
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER_RMSNORM", "0")
     elif use_rocm_aiter and model not in AITER_MODEL_LIST:
         # Skip model that are not using AITER tests.
         # When more AITER kernels are added, this list will not be
