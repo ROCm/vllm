@@ -19,8 +19,8 @@ ARG COMMON_WORKDIR
 WORKDIR ${COMMON_WORKDIR}
 
 FROM base AS build_fa
-ARG FA_BRANCH
-ARG FA_REPO
+ARG FA_BRANCH="0e60e394"
+ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN git clone ${FA_REPO}
