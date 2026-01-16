@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
@@ -520,6 +521,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w2_weight", w2_weight)
 
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        print(f'/////////////////////////{self.weight_dtype=}')
 
         # WEIGHT_SCALES
         w13_weight_scale = torch.nn.Parameter(
@@ -546,10 +548,105 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
+    def _maybe_pad_weight(self, layer):
+        # Pad the weight tensor. This is an optimization on ROCm platform, which
+        # can benefit from tensors located far enough from one another in memory
+
+        fp4_num_per_byte = 2
+        intermediate_alignment = 256
+        scale_alignment = intermediate_alignment // 32
+        moe_intermediate_shape = layer.w2_weight.shape[-1]* fp4_num_per_byte
+
+        if (envs.VLLM_ROCM_MOE_PADDING
+            and current_platform.is_rocm()
+            and moe_intermediate_shape % intermediate_alignment != 0):
+                intermedia_padding_sz = (intermediate_alignment - (moe_intermediate_shape % intermediate_alignment))
+                scale_padding_sz = (scale_alignment - ((moe_intermediate_shape//32) % scale_alignment))
+                
+                org_w13_weight_shape = layer.w13_weight.shape
+                org_w2_weight_shape = layer.w2_weight.shape
+                org_w13_weight_scale_shape = layer.w13_weight_scale.shape
+                org_w2_weight_scale_shape = layer.w2_weight_scale.shape
+                
+                w1 = layer.w13_weight.data[
+                    :, :moe_intermediate_shape, :
+                ]  # part1: [1..192]，shape: [128, 192, 512]
+                w3 = layer.w13_weight.data[
+                    :, moe_intermediate_shape:, :
+                ]  # part2: [193..384]，shape: [128, 192, 512]
+
+                # 1. pad part1
+                w1_padded = torch.nn.functional.pad(
+                    w1, (0, 0, 0, intermedia_padding_sz, 0, 0), mode="constant", value=0
+                )
+
+                # 2. pad part2
+                w3_padded = torch.nn.functional.pad(
+                    w3, (0, 0, 0, intermedia_padding_sz, 0, 0), mode="constant", value=0
+                )
+
+                # 3. concate
+                padded_w13_weight = torch.cat([w1_padded, w3_padded], dim=1)
+
+                layer.w13_weight = torch.nn.Parameter(
+                        padded_w13_weight,
+                        requires_grad=False,
+                )
+                padded_w2_weight  = torch.nn.functional.pad(
+                        layer.w2_weight.data,
+                        (0, intermedia_padding_sz//fp4_num_per_byte, 0, 0, 0, 1),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                )
+                layer.w2_weight = torch.nn.Parameter(
+                        padded_w2_weight,
+                        requires_grad=False,
+                )
+    
+                w1_scale = layer.w13_weight_scale.data[
+                    :, :moe_intermediate_shape, :
+                ]  # part1: [1..192]，shape: [128, 192, 512]
+                w3_scale = layer.w13_weight_scale.data[
+                    :, moe_intermediate_shape:, :
+                ]  # part2: [193..384]，shape: [128, 192, 512]
+
+                # 1. pad part1
+                w1_scale_padded = torch.nn.functional.pad(
+                    w1_scale, (0, 0, 0, intermedia_padding_sz, 0, 0), mode="constant", value=0
+                )
+
+                # 2. pad part2
+                w3_scale_padded = torch.nn.functional.pad(
+                    w3_scale, (0, 0, 0, intermedia_padding_sz, 0, 0), mode="constant", value=0
+                )
+
+                # 3. concate
+                padded_w13_weight_scale = torch.cat([w1_scale_padded, w3_scale_padded], dim=1)
+                
+                layer.w13_weight_scale = torch.nn.Parameter(
+                        padded_w13_weight_scale,
+                        requires_grad=False,
+                )    
+                padded_w2_weight_scale  = torch.nn.functional.pad(
+                        layer.w2_weight_scale.data,
+                        (0, scale_padding_sz, 0, 0, 0, 0),  # pad on right on dim 1
+                        mode="constant",
+                        value=0,
+                )
+                layer.w2_weight_scale = torch.nn.Parameter(
+                        padded_w2_weight_scale,
+                        requires_grad=False,
+                )
+                print(f"{intermedia_padding_sz=}, {scale_padding_sz=}")
+                print(f"===============w2 weight: {org_w2_weight_shape}->{layer.w2_weight.shape}, w13_weight:{org_w13_weight_shape}->{layer.w13_weight.shape}")
+                print(f"***************w2 scale: {org_w2_weight_scale_shape}->{layer.w2_weight_scale.shape}, w13_scale:{org_w13_weight_scale_shape}->{layer.w13_weight_scale.shape}")
+
+                torch.cuda.empty_cache()
+
     def process_weights_after_loading(self, layer):
         if self.emulate:
             return
-
+        self._maybe_pad_weight(layer)
         from aiter.utility.fp4_utils import e8m0_shuffle
 
         # Pre-shuffle weight scales
