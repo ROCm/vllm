@@ -1,3 +1,11 @@
+#ifndef __HIP_NO_HALF_OPERATORS__
+  #define __HIP_NO_HALF_OPERATORS__
+#endif
+
+#ifndef __HIP_NO_HALF_CONVERSIONS__
+  #define __HIP_NO_HALF_CONVERSIONS__
+#endif
+
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -746,8 +754,23 @@ __global__ void convert_fp8_kernel(const Tin* __restrict__ src_cache,
   const int64_t block_idx = blockIdx.x;
   for (int i = threadIdx.x; i < block_stride; i += blockDim.x) {
     int64_t idx = block_idx * block_stride + i;
-    dst_cache[idx] =
-        fp8::scaled_convert<Tout, Tin, kv_dt>(src_cache[idx], scale);
+    if constexpr (std::is_same_v<Tout, fp8::fp8_type>) {
+      float prom = [&] {
+        if constexpr (std::is_same_v<Tin, __half>) {
+          return __half2float(src_cache[idx]);
+        } else {
+          return static_cast<float>(src_cache[idx]);
+        }
+      }();
+      dst_cache[idx] = prom / scale;
+    } else {
+      float tmp = static_cast<float>(src_cache[idx]) * scale;
+      if constexpr (std::is_same_v<Tout, __half>) {
+        dst_cache[idx] = __float2half_rn(tmp);
+      } else {
+        dst_cache[idx] = tmp;
+      }
+    }
   }
 }
 
@@ -778,32 +801,42 @@ void convert_fp8(torch::Tensor& dst_cache, torch::Tensor& src_cache,
 
   if (kv_cache_dtype == "auto") {
     if (src_cache.dtype() == at::ScalarType::Float) {
-      CALL_CONVERT_FP8(uint8_t, float, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(vllm::fp8::fp8_type, float,
+                       vllm::Fp8KVCacheDataType::kAuto);
     } else if (src_cache.dtype() == at::ScalarType::Half) {
-      CALL_CONVERT_FP8(uint8_t, uint16_t, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(vllm::fp8::fp8_type, __half,
+                       vllm::Fp8KVCacheDataType::kAuto);
     } else if (src_cache.dtype() == at::ScalarType::BFloat16) {
-      CALL_CONVERT_FP8(uint8_t, __nv_bfloat16, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(vllm::fp8::fp8_type, __nv_bfloat16,
+                       vllm::Fp8KVCacheDataType::kAuto);
     } else if (dst_cache.dtype() == at::ScalarType::Float) {
-      CALL_CONVERT_FP8(float, uint8_t, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(float, vllm::fp8::fp8_type,
+                       vllm::Fp8KVCacheDataType::kAuto);
     } else if (dst_cache.dtype() == at::ScalarType::Half) {
-      CALL_CONVERT_FP8(uint16_t, uint8_t, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(__half, vllm::fp8::fp8_type,
+                       vllm::Fp8KVCacheDataType::kAuto);
     } else if (dst_cache.dtype() == at::ScalarType::BFloat16) {
-      CALL_CONVERT_FP8(__nv_bfloat16, uint8_t, vllm::Fp8KVCacheDataType::kAuto);
+      CALL_CONVERT_FP8(__nv_bfloat16, vllm::fp8::fp8_type,
+                       vllm::Fp8KVCacheDataType::kAuto);
     }
   } else if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
     if (src_cache.dtype() == at::ScalarType::Float) {
-      CALL_CONVERT_FP8(uint8_t, float, vllm::Fp8KVCacheDataType::kFp8E4M3);
+      CALL_CONVERT_FP8(vllm::fp8::fp8_type, float,
+                       vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else if (src_cache.dtype() == at::ScalarType::Half) {
-      CALL_CONVERT_FP8(uint8_t, uint16_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+      CALL_CONVERT_FP8(vllm::fp8::fp8_type, __half,
+                       vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else if (src_cache.dtype() == at::ScalarType::BFloat16) {
-      CALL_CONVERT_FP8(uint8_t, __nv_bfloat16,
+      CALL_CONVERT_FP8(vllm::fp8::fp8_type, __nv_bfloat16,
                        vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else if (dst_cache.dtype() == at::ScalarType::Float) {
-      CALL_CONVERT_FP8(float, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+      CALL_CONVERT_FP8(float, vllm::fp8::fp8_type,
+                       vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else if (dst_cache.dtype() == at::ScalarType::Half) {
-      CALL_CONVERT_FP8(uint16_t, uint8_t, vllm::Fp8KVCacheDataType::kFp8E4M3);
+      CALL_CONVERT_FP8(__half, vllm::fp8::fp8_type,
+                       vllm::Fp8KVCacheDataType::kFp8E4M3);
     } else if (dst_cache.dtype() == at::ScalarType::BFloat16) {
-      CALL_CONVERT_FP8(__nv_bfloat16, uint8_t,
+      CALL_CONVERT_FP8(__nv_bfloat16, vllm::fp8::fp8_type,
                        vllm::Fp8KVCacheDataType::kFp8E4M3);
     }
   } else {

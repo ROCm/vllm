@@ -16,6 +16,7 @@ namespace fp8 {
 // Use hardware cvt instruction for fp8 on rocm
 template <typename fp8_type>
 __device__ __forceinline__ fp8_type cvt_c10(float const r) {
+  static_assert(false);
   return {};
 }
 
@@ -49,16 +50,20 @@ __device__ __forceinline__ c10::Float8_e4m3fnuz cvt_c10(float const r) {
 
 template <typename Tout, typename Tin>
 __inline__ __device__ Tout vec_conversion(const Tin& x) {
+  if constexpr (!std::is_same_v<Tout, Tin>) {
+    static_assert(false);
+  }
   return x;
 }
 
 template <typename Tout, typename Tin>
 __inline__ __device__ Tout scaled_vec_conversion(const Tin& x,
                                                  const float scale) {
-  return x;
+  // There should never be a use of unspecialized scaled_vec_conversion
+  static_assert(false);
 }
 
-    #if HIP_FP8_TYPE_OCP
+    #if 0
 using fp8_type = __hip_fp8_e4m3;
 using fp8x2_type = __hip_fp8x2_e4m3;
     #else
@@ -159,8 +164,9 @@ __inline__ __device__ bf16_8_t vec_conversion<bf16_8_t, uint2>(const uint2& a) {
 // fp8 -> float
 template <>
 __inline__ __device__ float vec_conversion<float, uint8_t>(const uint8_t& a) {
-  __half_raw res = __hip_cvt_fp8_to_halfraw(a, fp8_type::__default_interpret);
-  return __half2float(res);
+  fp8_type f8;
+  f8.__x = a;
+  return static_cast<float>(f8);
 }
 
 // fp8x2 -> float2
@@ -385,8 +391,9 @@ scaled_vec_conversion<bf16_8_t, uint2>(const uint2& a, float scale) {
 template <>
 __inline__ __device__ float scaled_vec_conversion<float, uint8_t>(
     const uint8_t& a, float scale) {
-  __half_raw res = __hip_cvt_fp8_to_halfraw(a, fp8_type::__default_interpret);
-  return __half2float(res) * scale;
+  fp8_type f8;
+  f8.__x = a;
+  return static_cast<float>(f8) * scale;
 }
 
 // fp8x2 -> float2
@@ -435,8 +442,8 @@ scaled_vec_conversion<Float8_, uint2>(const uint2& a, float scale) {
 template <>
 __inline__ __device__ uint16_t
 scaled_vec_conversion<uint16_t, uint8_t>(const uint8_t& a, float scale) {
-  __half_raw tmp = __hip_cvt_fp8_to_halfraw(a, fp8_type::__default_interpret);
-  return __half_as_ushort(__float2half_rn(__half2float(tmp) * scale));
+  float tmp = scaled_vec_conversion<float, uint8_t>(a, scale);
+  return __half_as_ushort(__float2half_rn(tmp));
 }
 
 // fp8x2 -> half2
@@ -444,12 +451,13 @@ template <>
 __inline__ __device__ uint32_t
 scaled_vec_conversion<uint32_t, uint16_t>(const uint16_t& a, float scale) {
   union {
+    __half h[2];
     __half2_raw h2r;
     uint32_t ui32;
   } tmp;
   tmp.h2r = __hip_cvt_fp8x2_to_halfraw2(a, fp8_type::__default_interpret);
-  tmp.h2r.x.data = __float2half_rn(__half2float(tmp.h2r.x.data) * scale);
-  tmp.h2r.y.data = __float2half_rn(__half2float(tmp.h2r.y.data) * scale);
+  tmp.h[0] = __float2half_rn(__half2float(tmp.h[0]) * scale);
+  tmp.h[1] = __float2half_rn(__half2float(tmp.h[1]) * scale);
   return tmp.ui32;
 }
 
@@ -480,13 +488,41 @@ __inline__ __device__ uint4 scaled_vec_conversion<uint4, uint2>(const uint2& a,
   return tmp.u64x2;
 }
 
+// float -> fp8
+template <>
+__inline__ __device__ uint8_t
+scaled_vec_conversion<uint8_t, float>(const float& a, float scale) {
+  return __hip_cvt_float_to_fp8(a / scale, fp8_type::__default_saturation,
+                                fp8_type::__default_interpret);
+}
+
+// floatx2 -> fp8x2
+template <>
+__inline__ __device__ uint16_t
+scaled_vec_conversion<uint16_t, float2>(const float2& a, float scale) {
+  return __hip_cvt_float2_to_fp8x2(a / scale, fp8_type::__default_saturation,
+                                   fp8_type::__default_interpret);
+}
+
+// floatx4 -> fp8x4
+template <>
+__inline__ __device__ uint32_t
+scaled_vec_conversion<uint32_t, float4>(const float4& a, float scale) {
+  union {
+    uint16_t ui16[2];
+    uint32_t ui32;
+  } tmp;
+  tmp.ui16[0] = scaled_vec_conversion<uint16_t, float2>({a.x, a.y}, scale);
+  tmp.ui16[1] = scaled_vec_conversion<uint16_t, float2>({a.z, a.w}, scale);
+  return tmp.ui32;
+}
+
 // half -> fp8
 template <>
 __inline__ __device__ uint8_t
 scaled_vec_conversion<uint8_t, uint16_t>(const uint16_t& a, float scale) {
-  float tmp = __half2float(__ushort_as_half(a)) / scale;
-  return __hip_cvt_float_to_fp8(tmp, fp8_type::__default_saturation,
-                                fp8_type::__default_interpret);
+  float tmp = __half2float(__ushort_as_half(a));
+  return scaled_vec_conversion<uint8_t, float>(tmp, scale);
 }
 
 // halfx2 -> fp8x2
@@ -498,10 +534,8 @@ scaled_vec_conversion<uint16_t, uint32_t>(const uint32_t& a, float scale) {
     __half2_raw h2r;
   } tmp;
   tmp.ui32 = a;
-  tmp.h2r.x.data = __float2half_rn(__half2float(tmp.h2r.x.data) / scale);
-  tmp.h2r.y.data = __float2half_rn(__half2float(tmp.h2r.y.data) / scale);
-  return __hip_cvt_halfraw2_to_fp8x2(tmp.h2r, fp8_type::__default_saturation,
-                                     fp8_type::__default_interpret);
+  float2 tmp2f = __half22float2(tmp.h2r);
+  return scaled_vec_conversion<uint16_t, float2>(tmp2f, scale);
 }
 
 // half2x2 -> fp8x4
@@ -575,35 +609,6 @@ scaled_vec_conversion<uint2, bf16_8_t>(const bf16_8_t& a, float scale) {
   res.x = scaled_vec_conversion<uint32_t, bf16_4_t>({a.x, a.y}, scale);
   res.y = scaled_vec_conversion<uint32_t, bf16_4_t>({a.z, a.w}, scale);
   return res;
-}
-
-// float -> fp8
-template <>
-__inline__ __device__ uint8_t
-scaled_vec_conversion<uint8_t, float>(const float& a, float scale) {
-  return __hip_cvt_float_to_fp8(a / scale, fp8_type::__default_saturation,
-                                fp8_type::__default_interpret);
-}
-
-// floatx2 -> fp8x2
-template <>
-__inline__ __device__ uint16_t
-scaled_vec_conversion<uint16_t, float2>(const float2& a, float scale) {
-  return __hip_cvt_float2_to_fp8x2(a / scale, fp8_type::__default_saturation,
-                                   fp8_type::__default_interpret);
-}
-
-// floatx4 -> fp8x4
-template <>
-__inline__ __device__ uint32_t
-scaled_vec_conversion<uint32_t, float4>(const float4& a, float scale) {
-  union {
-    uint16_t ui16[2];
-    uint32_t ui32;
-  } tmp;
-  tmp.ui16[0] = scaled_vec_conversion<uint16_t, float2>({a.x, a.y}, scale);
-  tmp.ui16[1] = scaled_vec_conversion<uint16_t, float2>({a.z, a.w}, scale);
-  return tmp.ui32;
 }
   #endif  // ENABLE_FP8
 
