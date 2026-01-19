@@ -124,8 +124,8 @@ function (get_torch_gpu_compiler_flags OUT_GPU_FLAGS GPU_LANG)
       "-U__HIP_NO_HALF_OPERATORS__"
       "-Werror=unused-variable"
       "-fno-gpu-rdc"
-      "--save-temps"
-      "-O0"
+      #"--save-temps"
+      "-O3"
       "-g")
       #"-mllvm"
       #"-opt-bisect-limit=100000")

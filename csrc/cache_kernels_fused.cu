@@ -1,9 +1,11 @@
-#ifndef __HIP_NO_HALF_OPERATORS__
-  #define __HIP_NO_HALF_OPERATORS__
-#endif
+#if 0
+  #ifndef __HIP_NO_HALF_OPERATORS__
+    #define __HIP_NO_HALF_OPERATORS__
+  #endif
 
-#ifndef __HIP_NO_HALF_CONVERSIONS__
-  #define __HIP_NO_HALF_CONVERSIONS__
+  #ifndef __HIP_NO_HALF_CONVERSIONS__
+    #define __HIP_NO_HALF_CONVERSIONS__
+  #endif
 #endif
 
 #include <torch/all.h>
@@ -75,8 +77,8 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
 
     // NOTE: Would be nice to have interleaved sin/cos so we could just load
     // both at the same time.
-    qk_t cos = VLLM_LDG(cos_sin_ptr + pair_idx);
-    qk_t sin = VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim);
+    float cos = VLLM_LDG(cos_sin_ptr + pair_idx);
+    float sin = VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim);
 
     qk_t* q_pe_head_ptr =
         q_pe + token_idx * q_pe_stride_token + head_idx * q_pe_stride_head;
@@ -92,23 +94,13 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
       pair_idx_y = pair_idx * 2 + 1;
     }
 
-    qk_t x_src = q_pe_head_ptr[pair_idx_x];
-    qk_t y_src = q_pe_head_ptr[pair_idx_y];
+    float x_src = q_pe_head_ptr[pair_idx_x];
+    float y_src = q_pe_head_ptr[pair_idx_y];
 
-    qk_t x_dst = [&]() {
-      if constexpr (std::is_same_v<qk_t, __half>) {
-        return __hsub(__hmul(x_src, cos), __hmul(y_src, sin));
-      } else {
-        return x_src * cos - y_src * sin;
-      }
-    }();
-    qk_t y_dst = [&]() {
-      if constexpr (std::is_same_v<qk_t, __half>) {
-        return __hadd(__hmul(y_src, cos), __hmul(x_src, sin));
-      } else {
-        return y_src * cos + x_src * sin;
-      }
-    }();
+    qk_t x_dst =
+        static_cast<qk_t>(x_src * cos) - static_cast<qk_t>(y_src * sin);
+    qk_t y_dst =
+        static_cast<qk_t>(y_src * cos) + static_cast<qk_t>(x_src * sin);
 
     q_pe_head_ptr[pair_idx_x] = x_dst;
     q_pe_head_ptr[pair_idx_y] = y_dst;
@@ -127,8 +119,8 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
   for (int i = threadIdx.x; i < embed_dim; i += blockDim.x) {
     int pair_idx = i;
 
-    qk_t cos = VLLM_LDG(cos_sin_ptr + pair_idx);
-    qk_t sin = VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim);
+    float cos = VLLM_LDG(cos_sin_ptr + pair_idx);
+    float sin = VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim);
 
     qk_t* k_pe_head_ptr = k_pe + token_idx * k_pe_stride;
 
@@ -143,23 +135,13 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
       pair_idx_y = pair_idx * 2 + 1;
     }
 
-    qk_t x_src = k_pe_head_ptr[pair_idx_x];
-    qk_t y_src = k_pe_head_ptr[pair_idx_y];
+    float x_src = k_pe_head_ptr[pair_idx_x];
+    float y_src = k_pe_head_ptr[pair_idx_y];
 
-    qk_t x_dst = [&]() {
-      if constexpr (std::is_same_v<qk_t, __half>) {
-        return __hsub(__hmul(x_src, cos), __hmul(y_src, sin));
-      } else {
-        return x_src * cos - y_src * sin;
-      }
-    }();
-    qk_t y_dst = [&]() {
-      if constexpr (std::is_same_v<qk_t, __half>) {
-        return __hadd(__hmul(y_src, cos), __hmul(x_src, sin));
-      } else {
-        return y_src * cos + x_src * sin;
-      }
-    }();
+    qk_t x_dst =
+        static_cast<qk_t>(x_src * cos) - static_cast<qk_t>(y_src * sin);
+    qk_t y_dst =
+        static_cast<qk_t>(y_src * cos) + static_cast<qk_t>(x_src * sin);
 
     k_pe_head_ptr[pair_idx_x] = x_dst;
     k_pe_head_ptr[pair_idx_y] = y_dst;
@@ -183,38 +165,14 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
         kv_cache_ptr[pair_idx_x] = x_dst;
         kv_cache_ptr[pair_idx_y] = y_dst;
       } else {
-        float x_dst_f = [&]() {
-          if constexpr (std::is_same_v<qk_t, __half>) {
-            return __half2float(x_dst);
-          } else {
-            return x_dst;
-          }
-        }();
-        float y_dst_f = [&]() {
-          if constexpr (std::is_same_v<qk_t, __half>) {
-            return __half2float(y_dst);
-          } else {
-            return y_dst;
-          }
-        }();
+        float x_dst_f = x_dst;
+        float y_dst_f = y_dst;
         kv_cache_ptr[pair_idx_x] = static_cast<cache_t>(x_dst_f);
         kv_cache_ptr[pair_idx_y] = static_cast<cache_t>(y_dst_f);
       }
     } else {
-      float x_dst_f = [&]() {
-        if constexpr (std::is_same_v<qk_t, __half>) {
-          return __half2float(x_dst);
-        } else {
-          return x_dst;
-        }
-      }();
-      float y_dst_f = [&]() {
-        if constexpr (std::is_same_v<qk_t, __half>) {
-          return __half2float(y_dst);
-        } else {
-          return y_dst;
-        }
-      }();
+      float x_dst_f = x_dst;
+      float y_dst_f = y_dst;
       fp8::fp8_type x_fp8 = x_dst_f / *kv_cache_quant_scale;
       fp8::fp8_type y_fp8 = y_dst_f / *kv_cache_quant_scale;
       kv_cache_ptr[pair_idx_x] = x_fp8.__x;
@@ -240,23 +198,11 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
       } else if constexpr (std::is_same_v<cache_t, qk_t>) {
         kv_cache_ptr[i] = src_value;
       } else {
-        float src_value_f = [&]() {
-          if constexpr (std::is_same_v<qk_t, __half>) {
-            return __half2float(src_value);
-          } else {
-            return src_value;
-          }
-        }();
+        float src_value_f = src_value;
         kv_cache_ptr[i] = src_value_f;
       }
     } else {
-      float src_value_f = [&]() {
-        if constexpr (std::is_same_v<qk_t, __half>) {
-          return __half2float(src_value);
-        } else {
-          return src_value;
-        }
-      }();
+      float src_value_f = src_value;
       fp8::fp8_type src_fp8 = src_value_f / *kv_cache_quant_scale;
       kv_cache_ptr[i] = src_fp8.__x;
     }

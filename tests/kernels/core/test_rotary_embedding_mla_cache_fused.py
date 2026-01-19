@@ -14,18 +14,19 @@ from tests.kernels.utils import DEFAULT_OPCHECK_TEST_UTILS, opcheck
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 
-@pytest.mark.parametrize("dtype", [torch.half])  # , torch.bfloat16, torch.float])
-@pytest.mark.parametrize("is_neox_style", [False])  # , True])
-@pytest.mark.parametrize("seq_len", [11])  # , 42])
-@pytest.mark.parametrize("qk_rope_head_dim", [64])  # , 128])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16, torch.float])
+@pytest.mark.parametrize("is_neox_style", [False, True])
+@pytest.mark.parametrize("seq_len", [11, 42])
+@pytest.mark.parametrize("qk_rope_head_dim", [64, 128])
 @pytest.mark.parametrize("num_q_heads", [128])
-@pytest.mark.parametrize("kv_cache_dtype", ["auto"])  # , "fp8"])
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 @pytest.mark.parametrize("kv_lora_rank", [512])
 @pytest.mark.parametrize("num_blocks", [64])
-@pytest.mark.parametrize("block_size", [16])  # , 64, 256])
+@pytest.mark.parametrize("block_size", [16, 64, 256])
 @pytest.mark.parametrize("seed", [0])
 @pytest.mark.parametrize(
     "device",
@@ -71,9 +72,13 @@ def test_concat_and_cache_mla_rope_fused(
     k_pe = torch.flatten(key[..., :qk_rope_head_dim], start_dim=1).to(device=device)
     kv_c = torch.flatten(key[..., qk_rope_head_dim:], start_dim=1).to(device=device)
 
-    # NOTE(woosuk): The reference implementation should be executed first
-    # because the custom kernel is in-place.
-    ref_q_pe, ref_k_pe = rope.forward_native(positions, query, k_pe)
+    if current_platform.is_rocm():
+        # Clone the tensors because the implementation modifies them in-place
+        ref_q_pe, ref_k_pe = rope.forward_hip(positions, query.clone(), k_pe.clone())
+    else:
+        # NOTE(woosuk): The reference implementation should be executed first
+        # because the custom kernel is in-place.
+        ref_q_pe, ref_k_pe = rope.forward_native(positions, query, k_pe)
     assert ref_k_pe is not None
 
     ref_k_pe = torch.flatten(ref_k_pe, start_dim=1).to(device=device)
