@@ -10,6 +10,7 @@ import torch
 import vllm.envs as envs
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
+from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_open_port
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import cuda_device_count_stateless
@@ -29,6 +30,7 @@ class _CUDADeviceCountStatelessTestActor:
         return envs.CUDA_VISIBLE_DEVICES
 
 
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for ROCm")
 def test_cuda_device_count_stateless():
     """Test that cuda_device_count_stateless changes return value if
     CUDA_VISIBLE_DEVICES is changed."""
