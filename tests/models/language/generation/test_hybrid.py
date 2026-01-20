@@ -558,10 +558,6 @@ def test_apc_multiple_prompts_all_cached_outputs(
     except ValueError:
         pass
 
-    if current_platform.is_rocm():
-        monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
-        monkeypatch.setenv("VLLM_ROCM_USE_AITER_MHA", "0")
-
     compare_operator: Callable = (
         check_logprobs_close if num_logprobs > 0 else check_outputs_equal  # type: ignore
     )
@@ -574,6 +570,10 @@ def test_apc_multiple_prompts_all_cached_outputs(
         model, max_model_len, tensor_parallel_size=tensor_parallel_size
     )
     vllm_runner_kwargs["mamba_ssm_cache_dtype"] = "float32"
+    # Reduce the effects of batch variance on ROCm since batch invariance is not
+    # yet supported. See: https://github.com/vllm-project/vllm/issues/27433
+    if current_platform.is_rocm():
+        vllm_runner_kwargs["max_num_seqs"] = 4
 
     vllm_outputs_no_cache, _ = _get_vLLM_output(
         vllm_runner, vllm_runner_kwargs, generated_prompts, max_tokens, num_logprobs
