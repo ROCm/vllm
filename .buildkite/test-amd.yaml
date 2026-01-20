@@ -901,7 +901,7 @@ steps:
 
 - label: Language Models Tests (Hybrid) %N
   timeout_in_minutes: 75
-  mirror_hardwares: [amdexperimental]
+  mirror_hardwares: [amdexperimental, amdproduction]
   agent_pool: mi325_8
   # grade: Blocking
   torch_nightly: true
