@@ -76,7 +76,7 @@ mkdir -p "${HF_CACHE}"
 HF_MOUNT="/root/.cache/huggingface"
 
 commands=$@
-echo "Commands:$commands"
+echo "Raw commands: $commands"
 
 commands=${commands//"pytest -v -s basic_correctness/test_basic_correctness.py"/"pytest -v -s basic_correctness/test_basic_correctness.py"}
 
@@ -157,6 +157,9 @@ if [[ $commands == *" entrypoints/llm "* ]]; then
   --ignore=entrypoints/llm/test_init.py \
   --ignore=entrypoints/llm/test_prompt_validation.py "}
 fi
+
+commands=$(echo $commands | sed 's/ \\ / /g')
+echo "Final commands: $commands"
 
 # --ignore=entrypoints/openai/test_encoder_decoder.py \
 # --ignore=entrypoints/openai/test_embedding.py \
