@@ -8,6 +8,7 @@ import pytest
 from tests.models.registry import HF_EXAMPLE_MODELS
 from tests.utils import multi_gpu_test
 from vllm.engine.arg_utils import EngineArgs
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
 
 from ...utils import check_logprobs_close, check_outputs_equal
@@ -556,6 +557,10 @@ def test_apc_multiple_prompts_all_cached_outputs(
         model_info.check_transformers_version(on_fail="skip")
     except ValueError:
         pass
+
+    if current_platform.is_rocm():
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
+        monkeypatch.setenv("VLLM_ROCM_USE_AITER_MHA", "0")
 
     compare_operator: Callable = (
         check_logprobs_close if num_logprobs > 0 else check_outputs_equal  # type: ignore
