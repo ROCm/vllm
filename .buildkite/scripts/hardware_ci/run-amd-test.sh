@@ -131,8 +131,7 @@ fi
 if [[ $commands == *" kernels/moe"* ]]; then
   commands="${commands} \
   --ignore=kernels/moe/test_moe.py \
-  --ignore=kernels/moe/test_cutlass_moe.py \
-  --ignore=kernels/moe/test_triton_moe_ptpc_fp8.py"
+  --ignore=kernels/moe/test_cutlass_moe.py"
 fi
 
 #ignore certain Entrypoints/openai tests
