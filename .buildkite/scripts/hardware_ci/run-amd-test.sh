@@ -176,69 +176,19 @@ if [[ -z "$render_gid" ]]; then
   exit 1
 fi
 
-# check if the command contains shard flag, we will run all shards in parallel because the host have 8 GPUs.
-if [[ $commands == *"--shard-id="* ]]; then
-  # assign job count as the number of shards used
-  commands=$(echo "$commands" | sed -E "s/--num-shards[[:blank:]]*=[[:blank:]]*[0-9]*/--num-shards=${PARALLEL_JOB_COUNT} /g" | sed 's/ \\ / /g')
-  for GPU in $(seq 0 $(($PARALLEL_JOB_COUNT-1))); do
-    # assign shard-id for each shard
-    commands_gpu=$(echo "$commands" | sed -E "s/--shard-id[[:blank:]]*=[[:blank:]]*[0-9]*/--shard-id=${GPU} /g" | sed 's/ \\ / /g')
-    echo "Shard ${GPU} commands:$commands_gpu"
-    echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
-    docker run \
+echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
+docker run \
         --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
         --network=host \
         --shm-size=16gb \
         --group-add "$render_gid" \
         --rm \
-        -e HIP_VISIBLE_DEVICES="${GPU}" \
         -e HF_TOKEN \
         -e AWS_ACCESS_KEY_ID \
         -e AWS_SECRET_ACCESS_KEY \
         -v "${HF_CACHE}:${HF_MOUNT}" \
         -e "HF_HOME=${HF_MOUNT}" \
         -e "PYTHONPATH=${MYPYTHONPATH}" \
-        --name "${container_name}_${GPU}" \
+        --name "${container_name}" \
         "${image_name}" \
-        /bin/bash -c "${commands_gpu}" \
-        |& while read -r line; do echo ">>Shard $GPU: $line"; done &
-    PIDS+=($!)
-  done
-  #wait for all processes to finish and collect exit codes
-  for pid in "${PIDS[@]}"; do
-    wait "${pid}"
-    STATUS+=($?)
-  done
-  at_least_one_shard_with_tests=0
-  for st in "${STATUS[@]}"; do
-    if [[ ${st} -ne 0 ]] && [[ ${st} -ne 5 ]]; then
-      echo "One of the processes failed with $st"
-      exit "${st}"
-    elif [[ ${st} -eq 5 ]]; then
-      echo "Shard exited with status 5 (no tests collected) - treating as success"
-    else # This means st is 0
-      at_least_one_shard_with_tests=1
-    fi
-  done
-  if [[ ${#STATUS[@]} -gt 0 && ${at_least_one_shard_with_tests} -eq 0 ]]; then
-    echo "All shards reported no tests collected. Failing the build."
-    exit 1
-  fi
-else
-  echo "Render devices: $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES"
-  docker run \
-          --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
-          --network=host \
-          --shm-size=16gb \
-          --group-add "$render_gid" \
-          --rm \
-          -e HF_TOKEN \
-          -e AWS_ACCESS_KEY_ID \
-          -e AWS_SECRET_ACCESS_KEY \
-          -v "${HF_CACHE}:${HF_MOUNT}" \
-          -e "HF_HOME=${HF_MOUNT}" \
-          -e "PYTHONPATH=${MYPYTHONPATH}" \
-          --name "${container_name}" \
-          "${image_name}" \
-          /bin/bash -c "${commands}"
-fi
+        /bin/bash -c "${commands}"
