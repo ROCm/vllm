@@ -507,6 +507,7 @@ def test_eagle_correctness(
             max_model_len=max_model_len,
             tensor_parallel_size=tp_size,
             attention_config=attention_config,
+            enforce_eager=current_platform.is_rocm(),
         )
         ref_outputs = ref_llm.chat(test_prompts, sampling_config)
         del ref_llm
@@ -528,6 +529,7 @@ def test_eagle_correctness(
             enable_chunked_prefill=enable_chunked_prefill,
             model_impl=model_impl,
             attention_config=attention_config,
+            enforce_eager=current_platform.is_rocm(),
         )
         spec_outputs = spec_llm.chat(test_prompts, sampling_config)
         matches = 0
