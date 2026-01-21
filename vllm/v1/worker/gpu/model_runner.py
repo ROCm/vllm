@@ -28,6 +28,7 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
+    build_slot_mappings_by_layer,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
@@ -971,6 +972,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.uses_mrope:
                 assert input_batch.mrope_positions is not None
                 positions = input_batch.mrope_positions
+            slot_mappings = self.block_tables.compute_slot_mappings(
+                input_batch.query_start_loc,
+                input_batch.positions[: input_batch.num_tokens],
+            )
+            slot_mappings_by_layer = build_slot_mappings_by_layer(
+                slot_mappings, self.kv_cache_config
+            )
             with set_forward_context(
                 input_batch.attn_metadata,
                 self.vllm_config,
@@ -978,6 +986,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 # TODO(woosuk): Support piecewise CUDA graph.
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
                 num_tokens_across_dp=num_tokens_across_dp,
+                slot_mapping=slot_mappings_by_layer,
             ):
                 hidden_states = self.model(
                     input_ids=input_batch.input_ids,
