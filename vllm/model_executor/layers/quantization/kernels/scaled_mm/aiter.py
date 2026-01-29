@@ -2,65 +2,52 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from collections.abc import Sequence
+
 import torch
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.platforms import current_platform
 
-from .cutlass import CutlassScaledMMLinearKernel
-from .ScaledMMLinearKernel import ScaledMMLinearLayerConfig
+from .cutlass import CutlassInt8ScaledMMLinearKernel
+from .ScaledMMLinearKernel import (
+    FP8ScaledMMLinearKernel,
+    FP8ScaledMMLinearLayerConfig,
+    Int8ScaledMMLinearLayerConfig,
+)
 
 
-class AiterScaledMMLinearKernel(CutlassScaledMMLinearKernel):
+class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
     @classmethod
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
         if not current_platform.is_rocm():
-            return (
-                False,
-                "AiterScaledMMLinearKernel requires `aiter` which is not "
-                + "currently supported on non-ROCm platform.",
-            )
-        if compute_capability is None:
-            _cc = current_platform.get_device_capability()
-            if _cc is not None:
-                compute_capability = _cc.major * 10 + _cc.minor
+            return False, "Requires ROCm."
+
         if compute_capability is not None and compute_capability < 90:
-            return False, f"requires capability 90, got {compute_capability}"
+            return False, "requires compute capability 90 and above."
 
         try:
             import aiter  # noqa: F401 # deliberately attempt to import aiter
         except Exception:
-            return (
-                False,
-                "AiterScaledMMLinearKernel requires `aiter` which is not "
-                + "installed on ROCm.",
-            )
+            return False, "requires `aiter` to be installed."
 
         if not rocm_aiter_ops.is_linear_enabled():
             return (
                 False,
-                "AiterScaledMMLinearKernel is disabled. "
-                + "Enable by setting `VLLM_ROCM_USE_AITER=1` "
+                "requires setting `VLLM_ROCM_USE_AITER=1` "
                 + "and `VLLM_ROCM_USE_AITER_LINEAR=1`. "
                 + "`VLLM_ROCM_USE_AITER_LINEAR` default is True.",
             )
-
         return True, None
 
     @classmethod
-    def can_implement(cls, c: ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+    def can_implement(cls, c: Int8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
         if not c.input_symmetric:
-            return (
-                False,
-                "AiterScaledMMLinearKernel only supports symmetric " + "quantization.",
-            )
+            return False, "supports symmetric quantization only."
         return True, None
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        super().process_weights_after_loading(layer)
 
     def apply_weights(
         self,
@@ -69,28 +56,28 @@ class AiterScaledMMLinearKernel(CutlassScaledMMLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        `AiterScaledMMLinearKernel` implements a fused version of
+        `AiterInt8ScaledMMLinearKernel` implements a fused version of
             `output = torch.mm((scale_a * a), (scale_b * b)).to(out_dtype)`
         where scale_a * a and scale_b * b are implemented using numpy-style
         broadcasting.
         Currently only support per-tensor-per-tensor GEMM
         and per-token-per-channel GEMM through AITER
-        w8a8 scaled gemm. `AiterScaledMMLinearKernel` also does not support
+        w8a8 scaled gemm. `AiterInt8ScaledMMLinearKernel` also does not support
         ATIER block scaled GEMM and mix-precision GEMM.
         """
-        w_q, w_s, i_s, i_zp, azp_adj = self._get_weight_params(layer)
+        w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
 
         # ops.scaled_int8_quant supports both dynamic and static quant:
         # * dynamic, i_s is None and x_s computed from x.
         # * static, i_s is scalar and x_s is i_s.
         symmetric = azp_adj is None
         assert symmetric, (
-            "AiterScaledMMLinearKernel only supports symmetric quantization."
+            "AiterInt8ScaledMMLinearKernel only supports symmetric quantization."
         )
         x_q, x_s, x_zp = ops.scaled_int8_quant(x, i_s, i_zp, symmetric=symmetric)
 
         assert x_zp is None, (
-            "AiterScaledMMLinearKernel only supports symmetric quantization."
+            "AiterInt8ScaledMMLinearKernel only supports symmetric quantization."
         )
         out_dtype = x.dtype
 
@@ -117,12 +104,149 @@ class AiterScaledMMLinearKernel(CutlassScaledMMLinearKernel):
         ), (
             "Currently only support per-tensor-per-tensor GEMM "
             + " and per-token-per-channel GEMM through AITER"
-            " w8a8 scaled gemm. `AiterScaledMMLinearKernel` "
+            " w8a8 scaled gemm. `AiterInt8ScaledMMLinearKernel` "
             + "does not support AITER block scaled GEMM."
         )
 
         # gemm_a8w8_CK(a, b, scale_a, scale_b, bias) expects
         # a to be [M, K]
         # b to be [N, K]
-        # CutlassScaledMMLinearKernel prepare weight `w_q` in [K, N] format
+        # CutlassInt8ScaledMMLinearKernel prepare weight `w_q` in [K, N] format
         return rocm_aiter_ops.gemm_a8w8(x_q, w_q.t(), x_s, w_s, bias, out_dtype)
+
+
+class AiterFP8RowWiseShuffledScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    def __init__(
+        self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
+    ) -> None:
+        super().__init__(c, layer_param_names)
+        self.gemm_kernel = self._scaled_mm_fallback
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not current_platform.is_rocm():
+            return False, "requires ROCm."
+
+        from vllm.platforms.rocm import on_mi3xx
+
+        if not on_mi3xx():
+            return False, "requires MI3xx."
+
+        if compute_capability is not None and compute_capability < 94:
+            return False, "requires compute capability 94 and above."
+
+        try:
+            import aiter  # noqa: F401 # deliberately attempt to import aiter
+        except Exception:
+            return False, "requires `aiter` to be installed."
+
+        if not rocm_aiter_ops.is_linear_enabled():
+            return (
+                False,
+                "requires setting `VLLM_ROCM_USE_AITER=1` "
+                + "and `VLLM_ROCM_USE_AITER_LINEAR=1`. "
+                + "`VLLM_ROCM_USE_AITER_LINEAR` default is True.",
+            )
+
+        return True, None
+
+    @classmethod
+    def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        per_tensor_activation_scales = (
+            c.activation_quant_key.scale.group_shape.is_per_tensor()
+        )
+        per_tensor_weight_scales = c.weight_quant_key.scale.group_shape.is_per_tensor()
+
+        if c.out_dtype == torch.float16:
+            # hipblaslt rowwise _scaled_mm only supports BFloat16
+            return False, "supports BFloat16 output data type only."
+
+        if per_tensor_activation_scales or per_tensor_weight_scales:
+            return False, "cannot be used with per tensor activation and weight scales."
+
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layout = (16, 16)
+        use_swizzle_gemm = rocm_aiter_ops.can_shuffle(
+            *layer.weight.shape, layout=layout
+        )
+        weight = layer.weight
+        if use_swizzle_gemm:
+            weight = torch.nn.Parameter(
+                rocm_aiter_ops.shuffle_weight(weight, layout=layout),
+                requires_grad=False,
+            )
+            self.gemm_kernel = self._scaled_mm_shuffled
+        else:
+            # keep the weight as (K, N)
+            weight = torch.nn.Parameter(weight.t(), requires_grad=False)
+            self.gemm_kernel = self._scaled_mm_fallback
+
+        layer.weight = torch.nn.Parameter(weight.data, requires_grad=False)
+
+    def _scaled_mm_fallback(
+        self,
+        *,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_shape: list,
+    ) -> torch.Tensor:
+        output = torch._scaled_mm(
+            A,
+            B,
+            out_dtype=out_dtype,
+            scale_a=As,
+            scale_b=Bs.t(),
+            bias=bias,
+        )
+        return torch.narrow(output, 0, 0, output_shape[0]).view(*output_shape)
+
+    def _scaled_mm_shuffled(
+        self,
+        *,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_shape: list,
+    ) -> torch.Tensor:
+        output = rocm_aiter_ops.gemm_a8w8_bpreshuffle(
+            A,
+            B,
+            out_dtype=out_dtype,
+            scale_a=As,
+            scale_b=Bs,
+        )
+        if bias is not None:
+            output = output + bias
+        return output.view(*output_shape)
+
+    def apply_scaled_mm(
+        self,
+        *,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_shape: list,
+    ) -> torch.Tensor:
+        return self.gemm_kernel(
+            A=A,
+            B=B,
+            out_dtype=out_dtype,
+            As=As,
+            Bs=Bs,
+            bias=bias,
+            output_shape=output_shape,
+        )

@@ -8,11 +8,7 @@ import torch.nn as nn
 from torch.nn import LayerNorm
 from transformers.models.qwen2_vl import Qwen2VLProcessor
 
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.layers.mm_encoder_attention import (
-    MMEncoderAttention,
-)
-from vllm.config import MultiModalConfig, VllmConfig
+from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import utils as dist_utils
 from vllm.distributed.parallel_state import (
@@ -20,6 +16,9 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.attention.mm_encoder_attention import (
+    MMEncoderAttention,
+)
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -29,6 +28,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding.common import (
+    ApplyRotaryEmb,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -56,8 +58,9 @@ from vllm.multimodal.inputs import MultiModalDataDict
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.dotsocr import DotsOCRConfig, DotsVisionConfig
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from .vision import run_dp_sharded_mrope_vision_model
+from .vision import is_vit_use_data_parallel, run_dp_sharded_mrope_vision_model
 
 IMAGE_TOKEN = "<|imgpad|>"
 
@@ -158,32 +161,6 @@ class DotsOCRProcessingInfo(Qwen2VLProcessingInfo):
         return processor
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb_vision(
-    tensor: torch.Tensor, freqs: torch.Tensor
-) -> torch.Tensor:
-    orig_dtype = tensor.dtype
-    tensor = tensor.float()
-
-    cos = freqs.cos()
-    sin = freqs.sin()
-
-    cos = cos.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-    sin = sin.unsqueeze(1).repeat(1, 1, 2).unsqueeze(0).float()
-
-    output = (tensor * cos) + (rotate_half(tensor) * sin)
-
-    output = output.to(orig_dtype)
-
-    return output
-
-
 class VisionRotaryEmbedding(nn.Module):
     def __init__(self, dim: int, theta: float = 10000.0) -> None:
         super().__init__()
@@ -206,9 +183,9 @@ class PatchMerger(nn.Module):
         spatial_merge_size: int = 2,
         pre_norm="layernorm",
         prefix: str = "",
-        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
+        use_data_parallel = is_vit_use_data_parallel()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.pre_norm = pre_norm
         if self.pre_norm == "layernorm":
@@ -253,15 +230,10 @@ class DotsVisionAttention(nn.Module):
         bias: bool = True,
         *,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        use_data_parallel = (
-            multimodal_config.mm_encoder_tp_mode == "data"
-            if multimodal_config
-            else False
-        )
+        use_data_parallel = is_vit_use_data_parallel()
 
         self.embed_dim = dim
         self.tp_size = (
@@ -294,8 +266,13 @@ class DotsVisionAttention(nn.Module):
         self.attn = MMEncoderAttention(
             num_heads=self.num_attention_heads_per_partition,
             head_size=self.hidden_size_per_attention_head,
-            multimodal_config=multimodal_config,
+            scale=self.hidden_size_per_attention_head**-0.5,
             prefix=f"{prefix}.attn",
+        )
+
+        self.apply_rotary_emb = ApplyRotaryEmb(
+            enforce_enable=True,
+            enable_fp32_compute=True,
         )
 
     def forward(
@@ -318,7 +295,11 @@ class DotsVisionAttention(nn.Module):
 
         if rotary_pos_emb is not None:
             qk_concat = torch.cat([q, k], dim=0)
-            qk_rotated = apply_rotary_pos_emb_vision(qk_concat, rotary_pos_emb)
+            qk_rotated = self.apply_rotary_emb(
+                qk_concat,
+                rotary_pos_emb.cos(),
+                rotary_pos_emb.sin(),
+            )
             q, k = torch.chunk(qk_rotated, 2, dim=0)
 
         context_layer = self.attn(
@@ -342,7 +323,6 @@ class DotsSwiGLUFFN(nn.Module):
         config,
         *,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -350,11 +330,7 @@ class DotsSwiGLUFFN(nn.Module):
         in_features = config.embed_dim
         bias = config.use_bias
 
-        use_data_parallel = (
-            multimodal_config.mm_encoder_tp_mode == "data"
-            if multimodal_config
-            else False
-        )
+        use_data_parallel = is_vit_use_data_parallel()
         # Referenced aimv2.py AIMv2SwiGLUFFN
         self.fc13 = MergedColumnParallelLinear(
             in_features,
@@ -460,7 +436,6 @@ class DotsVisionBlock(nn.Module):
         config,
         *,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -471,14 +446,12 @@ class DotsVisionBlock(nn.Module):
             num_heads=config.num_attention_heads,
             bias=config.use_bias,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             prefix=f"{prefix}.attn",
         )
         self.norm1 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
         self.mlp = DotsSwiGLUFFN(
             config,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             prefix=f"{prefix}.mlp",
         )
         self.norm2 = RMSNorm(config.embed_dim, eps=config.rms_norm_eps)
@@ -506,7 +479,6 @@ class DotsVisionTransformer(nn.Module):
         self,
         config: DotsVisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         *,
         num_hidden_layers_override: int | None = None,
         require_post_norm: bool | None = None,
@@ -520,15 +492,9 @@ class DotsVisionTransformer(nn.Module):
 
         head_dim = config.embed_dim // config.num_attention_heads
         self.rotary_pos_emb = VisionRotaryEmbedding(head_dim // 2)
-        attn_backend_override = (
-            multimodal_config.mm_encoder_attn_backend
-            if multimodal_config is not None
-            else None
-        )
         self.attn_backend = get_vit_attn_backend(
             head_size=head_dim,
             dtype=torch.get_default_dtype(),
-            attn_backend_override=attn_backend_override,
         )
         self.out_hidden_size = config.hidden_size
         # Keep blocks for compatibility with other vision towers
@@ -542,7 +508,6 @@ class DotsVisionTransformer(nn.Module):
                 DotsVisionBlock(
                     config,
                     quant_config=quant_config,
-                    multimodal_config=multimodal_config,
                     prefix=f"{prefix}.blocks.{i}",
                 )
                 for i in range(num_layers)
@@ -555,16 +520,10 @@ class DotsVisionTransformer(nn.Module):
         else:
             self.post_trunk_norm = None
 
-        use_data_parallel = (
-            multimodal_config.mm_encoder_tp_mode == "data"
-            if multimodal_config
-            else False
-        )
         self.merger = PatchMerger(
             dim=config.hidden_size,
             context_dim=config.embed_dim,
             spatial_merge_size=config.spatial_merge_size,
-            use_data_parallel=use_data_parallel,
         )
 
     @property
@@ -702,18 +661,20 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
         else:
             vision_config = self.config.vision_config
 
-        self.vision_tower = DotsVisionTransformer(
-            vision_config,
-            quant_config=self.quant_config,
-            multimodal_config=multimodal_config,
-            prefix=maybe_prefix(prefix, "vision_tower"),
-        )
-        self.language_model: Qwen2ForCausalLM = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=self.config,
-            prefix=maybe_prefix(prefix, "language_model"),
-            architectures=["Qwen2ForCausalLM"],
-        )
+        with self._mark_tower_model(vllm_config, "image"):
+            self.vision_tower = DotsVisionTransformer(
+                vision_config,
+                quant_config=self.quant_config,
+                prefix=maybe_prefix(prefix, "vision_tower"),
+            )
+
+        with self._mark_language_model(vllm_config):
+            self.language_model: Qwen2ForCausalLM = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=self.config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["Qwen2ForCausalLM"],
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
@@ -776,8 +737,13 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
 
         return image_embeds.split(sizes)
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
+    def get_num_mm_encoder_tokens(self, num_image_tokens: int) -> int:
+        merge_size = self.vision_tower.spatial_merge_size
+        return num_image_tokens * (merge_size**2)
+
+    def get_num_mm_connector_tokens(self, num_vision_tokens: int) -> int:
+        merge_size = self.vision_tower.spatial_merge_size
+        return num_vision_tokens // (merge_size**2)
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
@@ -796,14 +762,6 @@ class DotsOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
     ) -> torch.Tensor | IntermediateTensors:
         if intermediate_tensors is not None:
             inputs_embeds = None
-        elif inputs_embeds is None:
-            vision_embeddings = self.embed_multimodal(**kwargs)
-            inputs_embeds = self.embed_input_ids(
-                input_ids,
-                vision_embeddings,
-                is_multimodal=input_ids == self.config.image_token_id,
-            )
-            input_ids = None
 
         hidden_states = self.language_model(
             input_ids=input_ids,
