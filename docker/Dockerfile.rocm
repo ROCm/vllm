@@ -74,7 +74,7 @@ FROM base AS fetch_vllm_0
 ONBUILD COPY ./ vllm/
 FROM base AS fetch_vllm_1
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_BRANCH="main"
+ARG VLLM_BRANCH="v0.15.0"
 ENV VLLM_REPO=${VLLM_REPO}
 ENV VLLM_BRANCH=${VLLM_BRANCH}
 ONBUILD RUN git clone ${VLLM_REPO} \
