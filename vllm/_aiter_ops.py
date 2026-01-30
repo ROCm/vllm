@@ -1518,7 +1518,7 @@ class rocm_aiter_ops:
         rotary_dim: int,
         is_neox_style: bool,
     ):
-        from aiter.ops.triton.rope import rope_cached_thd_positions_2c_fwd_inplace
+        from aiter.ops.triton.rope.rope import rope_cached_thd_positions_2c_fwd_inplace
 
         num_tokens = positions.numel()
         cos, sin = cos_sin_cache.chunk(2, dim=-1)

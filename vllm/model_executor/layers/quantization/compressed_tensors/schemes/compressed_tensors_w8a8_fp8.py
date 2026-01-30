@@ -159,6 +159,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             weight, weight_scale, input_scale = process_fp8_weight_channel_strategy(
                 layer.weight, layer.weight_scale, getattr(layer, "input_scale", None)
             )
+            weight = weight.t()
 
             # from vllm._aiter_ops import rocm_aiter_ops
 

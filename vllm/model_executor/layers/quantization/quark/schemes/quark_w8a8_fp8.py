@@ -143,6 +143,7 @@ class QuarkW8A8Fp8(QuarkScheme):
             #         pad_output=not use_swizzle_gemm,
             #     )
 
+            layer.weight = Parameter(weight.t(), requires_grad=False)
             # required by torch.compile to be torch.nn.Parameter
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
 

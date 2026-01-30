@@ -171,18 +171,18 @@ class AiterFP8RowWiseShuffledScaledMMLinearKernel(FP8ScaledMMLinearKernel):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layout = (16, 16)
         use_swizzle_gemm = rocm_aiter_ops.can_shuffle(
-            *layer.weight.shape, layout=layout
+            *layer.weight.shape, layout=(128, 64)
         )
         weight = layer.weight
         if use_swizzle_gemm:
             weight = torch.nn.Parameter(
-                rocm_aiter_ops.shuffle_weight(weight, layout=layout),
+                rocm_aiter_ops.shuffle_weight(weight.t(), layout=layout),
                 requires_grad=False,
             )
             self.gemm_kernel = self._scaled_mm_shuffled
         else:
             # keep the weight as (K, N)
-            weight = torch.nn.Parameter(weight.t(), requires_grad=False)
+            weight = torch.nn.Parameter(weight, requires_grad=False)
             self.gemm_kernel = self._scaled_mm_fallback
 
         layer.weight = torch.nn.Parameter(weight.data, requires_grad=False)
@@ -219,6 +219,7 @@ class AiterFP8RowWiseShuffledScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         bias: torch.Tensor | None,
         output_shape: list,
     ) -> torch.Tensor:
+        output_shape = [*A.shape[:-1], B.shape[0]]
         output = rocm_aiter_ops.gemm_a8w8_bpreshuffle(
             A,
             B,
