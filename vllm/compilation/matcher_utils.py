@@ -26,13 +26,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
 
-_USE_AITER_RMS_NORM = current_platform.is_rocm() and rocm_aiter_ops.is_rmsnorm_enabled()
-
 RMS_OP = torch.ops._C.rms_norm.default
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
-if _USE_AITER_RMS_NORM:
-    RMS_OP = rocm_aiter_ops.rms_norm
-    RMS_ADD_OP = rocm_aiter_ops.rms_norm2d_with_add
 ROTARY_OP = torch.ops._C.rotary_embedding.default
 FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
 
