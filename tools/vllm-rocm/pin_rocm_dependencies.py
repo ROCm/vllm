@@ -14,7 +14,7 @@ instead of allowing pip to download different versions from PyPI.
 import sys
 from pathlib import Path
 
-import regex as re
+import re
 
 
 def extract_version_from_wheel(wheel_name: str) -> str:
