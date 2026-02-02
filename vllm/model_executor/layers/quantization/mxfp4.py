@@ -78,6 +78,8 @@ class Mxfp4Backend(Enum):
     # Triton Backend
     TRITON = 6
 
+    CK = 7
+
 
 def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
     """
@@ -168,11 +170,19 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         logger.info_once("Using ipex marlin backend on XPU")
         return Mxfp4Backend.MARLIN
     elif current_platform.is_rocm() and has_triton_kernels():
-        logger.info_once("Using Triton backend")
-        return Mxfp4Backend.TRITON
+        if envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+            logger.info_once("Using CK backend")
+            return Mxfp4Backend.CK
+        else:
+            logger.info_once("Using Triton backend")
+            return Mxfp4Backend.TRITON
 
     return Mxfp4Backend.NONE
 
+if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+    import aiter
+    from aiter.fused_moe import fused_topk, moe_sorting
+    from aiter.ops.shuffle import shuffle_weight_a16w4, shuffle_scale_a16w4
 
 class Mxfp4Config(QuantizationConfig):
     def __init__(self, ignored_layers: list[str] | None = None):
@@ -331,6 +341,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.intermediate_size = intermediate_size_per_partition_after_pad
         self.hidden_size = hidden_size
+        self.hidden_pad = extra_weight_attrs.get("hidden_pad", 0)
+        self.intermediate_pad = (intermediate_size_per_partition_after_pad - intermediate_size_per_partition)
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.zeros(
@@ -743,7 +755,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale = torch.nn.Parameter(
                     w2_scales_interleaved, requires_grad=False
                 )
-        elif self.mxfp4_backend == Mxfp4Backend.TRITON:
+        elif self.mxfp4_backend == Mxfp4Backend.TRITON or self.mxfp4_backend == Mxfp4Backend.CK:
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_bias = layer.w13_bias.to(torch.float32)
@@ -762,23 +774,45 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 num_warps = 4 if envs.VLLM_MOE_DP_CHUNK_SIZE <= 512 else 8
             else:
                 num_warps = 8
+            if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+                w13_aiter_weight = layer.w13_weight.contiguous()
+                w13_aiter_scale = layer.w13_weight_scale.contiguous()
+                w2_aiter_weight = layer.w2_weight.contiguous()
+                w2_aiter_scale = layer.w2_weight_scale.contiguous()
+                
+                e, n, k = w13_aiter_weight.shape
+                w13_aiter_weight = w13_aiter_weight.view(e, n // 2, 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
+                w13_aiter_scale = w13_aiter_scale.view(e, n // 2, 2, -1).permute(0, 2, 1, 3).contiguous().view(e, n, -1)
 
-            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-                layer.w13_weight, layer.w13_weight_scale, num_warps
-            )
-            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight, layer.w2_weight_scale, num_warps
-            )
+                w13_aiter_weight = w13_aiter_weight.view(torch.float4_e2m1fn_x2)
+                w13_aiter_scale = w13_aiter_scale.view(-1, w13_aiter_scale.shape[-1])
+                w2_aiter_weight = w2_aiter_weight.view(torch.float4_e2m1fn_x2)
+                w2_aiter_scale = w2_aiter_scale.view(-1, w2_aiter_scale.shape[-1])
+                
+                w13_weight = None
+                w2_weight = None
+                self.w13_weight_aiter_tensor = shuffle_weight_a16w4(w13_aiter_weight, 16, True)
+                self.w13_scale_aiter_tensor = shuffle_scale_a16w4(w13_aiter_scale, self.num_experts, True)
+                self.w2_weight_aiter_tensor = shuffle_weight_a16w4(w2_aiter_weight, 16, False)
+                self.w2_scale_aiter_tensor = shuffle_scale_a16w4(w2_aiter_scale, self.num_experts, False)
+                self.w13_bias_aiter_tensor = layer.w13_bias.view(-1, n // 2, 2).permute(0, 2, 1).contiguous().view(-1, n)
+            else: 
+                w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+                    layer.w13_weight, layer.w13_weight_scale, num_warps
+                )
+                w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+                    layer.w2_weight, layer.w2_weight_scale, num_warps
+                )
 
-            self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-            )
-            self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-            )
+                self.w13_precision_config = PrecisionConfig(
+                    weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                )
+                self.w2_precision_config = PrecisionConfig(
+                    weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                )
 
-            self.w13_weight = w13_weight
-            self.w2_weight = w2_weight
+                self.w13_weight = w13_weight
+                self.w2_weight = w2_weight
             del layer.w13_weight
             del layer.w2_weight
             layer.w13_weight = w13_weight
@@ -1057,6 +1091,56 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
             return output
+
+        elif current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_FUSED_MOE_A16W4:
+            token_num = x.shape[0]
+            BLOCKM = 16 if token_num < 2048 else 32
+            topk_weights, topk_ids = fused_topk(x, router_logits, layer.top_k, True)
+            sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_out = moe_sorting(
+                topk_ids,
+                topk_weights,
+                self.num_experts,
+                x.shape[1],
+                torch.bfloat16,
+                BLOCKM
+            )
+            _, n1, k1 = self.w13_weight_aiter_tensor.shape
+            _, k2, n2 = self.w2_weight_aiter_tensor.shape
+            D = n2 if k2 == k1 else n2*2
+            cktile_moe_out1 = torch.empty((token_num, layer.top_k, D), dtype=torch.bfloat16, device=x.device)
+            aiter.moe_cktile2stages_gemm1(
+                x,
+                self.w13_weight_aiter_tensor,
+                cktile_moe_out1,
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                layer.top_k,
+                self.intermediate_pad // 64 * 64 * 2,
+                self.hidden_pad // 128 * 128, # k_pad_zeros
+                None, # sorted_weights
+                None,
+                self.w13_scale_aiter_tensor,
+                self.w13_bias_aiter_tensor,
+                BLOCKM, # block_size
+            )
+            aiter.moe_cktile2stages_gemm2(
+                cktile_moe_out1,
+                self.w2_weight_aiter_tensor,
+                moe_out,
+                sorted_ids,
+                sorted_expert_ids,
+                num_valid_ids,
+                layer.top_k,
+                self.hidden_pad // 64 * 64, # n_pad_zeros
+                self.intermediate_pad // 128 * 128,
+                sorted_weights, # sorted_weights
+                None,
+                self.w2_scale_aiter_tensor,
+                layer.w2_bias,
+                BLOCKM, # block_size
+            )
+            return moe_out
         elif self.mxfp4_backend == Mxfp4Backend.TRITON:
             from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (  # noqa: E501
                 triton_kernel_moe_forward,
