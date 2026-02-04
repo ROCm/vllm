@@ -161,34 +161,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
             )
             weight = weight.t()
 
-            # from vllm._aiter_ops import rocm_aiter_ops
-
-            # layout = (16, 16)
-            # use_swizzle_gemm = rocm_aiter_ops.can_shuffle(
-            #     *weight.shape,
-            #     layout=layout,
-            # )
-            # self.use_aiter_and_is_supported = (
-            #     self.use_aiter_and_is_supported and use_swizzle_gemm
-            # )
-            # if self.use_aiter_and_is_supported:
-            #     from aiter.ops.shuffle import shuffle_weight
-
-            #     # keep the weight as (N, K)
-            #     weight = Parameter(
-            #         shuffle_weight(weight, layout=layout), requires_grad=False
-            #     )
-            # else:
-            #     # keep the weight as (K, N)
-            #     weight = Parameter(weight.t(), requires_grad=False)
-
-            # if current_platform.is_rocm():
-            #     self.fp8_linear = Fp8LinearOp(
-            #         act_quant_static=self.is_static_input_scheme,
-            #         act_quant_group_shape=self.act_q_group_shape,
-            #         pad_output=not use_swizzle_gemm,
-            #     )
-
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
             weight, weight_scale = process_fp8_weight_block_strategy(

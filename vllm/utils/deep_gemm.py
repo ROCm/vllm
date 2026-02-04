@@ -274,8 +274,6 @@ def fp8_paged_mqa_logits_torch(
     block_tables: torch.Tensor,
     max_model_len: int,
 ):
-    from vllm.utils import cdiv
-
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
     kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]

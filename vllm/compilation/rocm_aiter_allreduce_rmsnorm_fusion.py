@@ -171,7 +171,7 @@ class AllReduceAiterRMSNormWithAddPattern:
         self,
         epsilon: float,
         dtype: torch.dtype,
-        device: str,
+        device: str | None,
     ):
         self.epsilon = epsilon
         self.dtype = dtype
@@ -179,7 +179,7 @@ class AllReduceAiterRMSNormWithAddPattern:
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    def get_inputs(self):
+    def get_inputs(self) -> list[torch.Tensor]:
         # Create example tensors for pattern matching
         # input tensor (goes through all-reduce)
         input_tensor = torch.empty(5, 16, dtype=self.dtype, device=self.device)
@@ -189,8 +189,10 @@ class AllReduceAiterRMSNormWithAddPattern:
         weight = torch.empty(16, dtype=self.dtype, device=self.device)
         return [input_tensor, residual, weight]
 
-    def register(self, pm_pass: PatternMatcherPass):
-        def pattern(input_: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor):
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            input_: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             # Pattern: all_reduce -> rocm_aiter_rmsnorm2d_fwd_with_add
             allreduce_output = tensor_model_parallel_all_reduce(input_)
             rms_out, residual_out = torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
@@ -200,7 +202,7 @@ class AllReduceAiterRMSNormWithAddPattern:
 
         def replacement(
             input_: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor
-        ):
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             rms_out, residual_out = torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm(
                 input_,
                 residual,
@@ -220,7 +222,7 @@ class AllReduceAiterRMSNormPattern:
         self,
         epsilon: float,
         dtype: torch.dtype,
-        device: str,
+        device: str | None,
     ):
         self.epsilon = epsilon
         self.dtype = dtype
@@ -228,20 +230,20 @@ class AllReduceAiterRMSNormPattern:
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
 
-    def get_inputs(self):
+    def get_inputs(self) -> list[torch.Tensor]:
         input_tensor = torch.empty(5, 16, dtype=self.dtype, device=self.device)
         weight = torch.empty(16, dtype=self.dtype, device=self.device)
         return [input_tensor, weight]
 
-    def register(self, pm_pass: PatternMatcherPass):
-        def pattern(input_: torch.Tensor, weight: torch.Tensor):
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             allreduce_output = tensor_model_parallel_all_reduce(input_)
             rms_out = torch.ops.vllm.rocm_aiter_rms_norm(
                 allreduce_output, weight, self.epsilon
             )
             return rms_out
 
-        def replacement(input_: torch.Tensor, weight: torch.Tensor):
+        def replacement(input_: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             rms_out = torch.ops.vllm.rocm_aiter_fused_allreduce_rmsnorm_no_residual(
                 input_,
                 weight,
@@ -281,7 +283,7 @@ class ROCmAiterAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
         self.dump_patterns(config, self.patterns)
 
     @enable_fake_mode
-    def register_patterns(self):
+    def register_patterns(self) -> None:
         for epsilon in [1e-5, 1e-6]:
             # with residual
             AllReduceAiterRMSNormWithAddPattern(
@@ -304,7 +306,7 @@ class ROCmAiterAllReduceRMSNormFusionPass(VllmPatternMatcherPass):
         self.disabled = False
 
     @VllmInductorPass.time_and_log
-    def __call__(self, graph: fx.Graph):
+    def __call__(self, graph: fx.Graph) -> None:
         if self.disabled:
             logger.debug("ROCmAiterAllReduceRMSNormFusionPass disabled")
             return
