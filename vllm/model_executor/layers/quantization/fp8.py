@@ -1005,18 +1005,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13, w13_scale = process_fp8_weight_tensor_strategy_moe(
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
-        # else:
-        #     # TODO: Do we need this for block quant??????
-        #     (w2, w2_scale, w13, w13_scale) = (
-        #         self._maybe_pad_rocm_aiter_block_scaled_fused_moe_weights(
-        #             w2,
-        #             w2_scale,
-        #             w13,
-        #             w13_scale,
-        #             block_n=self.quant_config.weight_block_size[0],
-        #             block_k=self.quant_config.weight_block_size[1],
-        #         )
-        #     )
+        else:
+            # TODO: Do we need this for block quant??????
+            assert self.quant_config.weight_block_size is not None
+            (w2, w2_scale, w13, w13_scale) = (
+                self._maybe_pad_rocm_aiter_block_scaled_fused_moe_weights(
+                    w2,
+                    w2_scale,
+                    w13,
+                    w13_scale,
+                    block_n=self.quant_config.weight_block_size[0],
+                    block_k=self.quant_config.weight_block_size[1],
+                )
+            )
 
         # Shuffle weights to runtime format and setup kernel.
         self._setup_kernel(
