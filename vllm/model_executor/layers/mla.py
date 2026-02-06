@@ -3,11 +3,86 @@
 from dataclasses import dataclass
 
 import torch
-
+from typing import Union
 from vllm.attention.layer import MLAAttention
 from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.platforms import current_platform
+from vllm._aiter_ops import rocm_aiter_ops
+from vllm.utils.torch_utils import direct_register_custom_op
+
+
+if current_platform.is_rocm() and rocm_aiter_ops.is_enabled():
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+        from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant, fused_reduce_rms_mxfp4_quant
+
+        def rocm_aiter_triton_qkv_a_proj_layernorm_impl(
+            hidden_states_quant: torch.Tensor,
+            hidden_states_quant_scale: torch.Tensor,
+            weight_qkv_a_proj: torch.Tensor,
+            weight_scale_qkv_a_proj: torch.Tensor,
+            q_a_layernorm_weight: torch.Tensor,
+            q_a_layernorm_variance_epsilon: float,
+            kv_a_layernorm_weight: torch.Tensor,
+            kv_a_layernorm_variance_epsilon: float,
+            q_lora_rank: int,
+            kv_lora_rank: int,
+            qk_rope_head_dim: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            qkv_lora = gemm_afp4wfp4(hidden_states_quant, weight_qkv_a_proj, hidden_states_quant_scale, weight_scale_qkv_a_proj.T, skip_reduce=True)
+            q_c, kv_c, k_pe = qkv_lora.split([q_lora_rank, kv_lora_rank, qk_rope_head_dim],
+                                                dim=-1,
+                                            )
+            k_pe_reduced = None
+            k_pe_reduced_out = None
+            if k_pe.dim() == 3:
+                M = hidden_states_quant.shape[0]
+                device = hidden_states_quant.device
+                k_pe_reduced = k_pe
+                k_pe_reduced_out = torch.empty((M, q_lora_rank + kv_lora_rank + qk_rope_head_dim), dtype=torch.bfloat16, device=device)[..., :qk_rope_head_dim]
+            (q_c, q_c_scale), _, kv_c_normed, _, k_pe_reduced_out = fused_reduce_rms_mxfp4_quant(q_c, q_a_layernorm_weight, q_a_layernorm_variance_epsilon, 
+                                                    kv_c, kv_a_layernorm_weight, kv_a_layernorm_variance_epsilon, k_pe_reduced,
+                                                    res1=None,
+                                                    shuffle=False,
+                                                    scale_shuffle_padding=False,
+                                                    dtype=torch.bfloat16,
+                                                    out3=k_pe_reduced_out)
+            
+            if k_pe_reduced_out is not None:
+                k_pe = k_pe_reduced_out
+            return q_c, q_c_scale, kv_c_normed, k_pe
+        
+        def rocm_aiter_triton_qkv_a_proj_layernorm_fake(
+            hidden_states_quant: torch.Tensor,
+            hidden_states_quant_scale: torch.Tensor,
+            weight_qkv_a_proj: torch.Tensor,
+            weight_scale_qkv_a_proj: torch.Tensor,
+            q_a_layernorm_weight: torch.Tensor,
+            q_a_layernorm_variance_epsilon: float,
+            kv_a_layernorm_weight: torch.Tensor,
+            kv_a_layernorm_variance_epsilon: float,
+            q_lora_rank: int,
+            kv_lora_rank: int,
+            qk_rope_head_dim: int,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            M = hidden_states_quant.shape[0]
+            device = hidden_states_quant.device
+            rocm_aiter_fp4_dtype = torch.uint8
+            rocm_aiter_fp4_quant_group_size = 32
+            q_c = torch.empty((M, q_lora_rank // 2), dtype=rocm_aiter_fp4_dtype, device=device)
+            q_c_scale = torch.empty((M, (q_lora_rank + rocm_aiter_fp4_quant_group_size - 1) // rocm_aiter_fp4_quant_group_size), dtype=torch.float32, device=device)
+            kv_c_normed = torch.empty((M, kv_lora_rank), dtype=torch.bfloat16, device=device)
+            k_pe = torch.empty((M, q_lora_rank + kv_lora_rank + qk_rope_head_dim), dtype=torch.bfloat16, device=device)[..., :qk_rope_head_dim]
+            return q_c, q_c_scale, kv_c_normed, k_pe
+        
+        direct_register_custom_op(
+            op_name="rocm_aiter_triton_qkv_a_proj_layernorm",
+            op_func=rocm_aiter_triton_qkv_a_proj_layernorm_impl,
+            mutates_args=[],
+            fake_impl=rocm_aiter_triton_qkv_a_proj_layernorm_fake,
+            dispatch_key=current_platform.dispatch_key,
+        )
 
 
 @dataclass
@@ -113,13 +188,32 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
     def forward_native(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]],
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
 
-        if self.q_lora_rank is not None:
+        hidden_states_scales = None
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scales = hidden_states
+
+        # If aiter is enabled and MXFP4 quantization is enabled, use the aiter implementation
+        if hidden_states.dtype == torch.uint8 and rocm_aiter_ops.is_enabled():
+            q_c, q_c_scale, kv_c_normed, k_pe = torch.ops.vllm.rocm_aiter_triton_qkv_a_proj_layernorm(
+                                                    hidden_states_quant=hidden_states,
+                                                    hidden_states_quant_scale=hidden_states_scales,
+                                                    weight_qkv_a_proj=self.fused_qkv_a_proj.weight,
+                                                    weight_scale_qkv_a_proj=self.fused_qkv_a_proj.weight_scale,
+                                                    q_a_layernorm_weight=self.q_a_layernorm.weight,
+                                                    q_a_layernorm_variance_epsilon=self.q_a_layernorm.variance_epsilon,
+                                                    kv_a_layernorm_weight=self.kv_a_layernorm.weight,
+                                                    kv_a_layernorm_variance_epsilon=self.kv_a_layernorm.variance_epsilon,
+                                                    q_lora_rank=self.q_lora_rank,
+                                                    kv_lora_rank=self.kv_lora_rank,
+                                                    qk_rope_head_dim=self.qk_rope_head_dim)
+            q = self.q_b_proj(q_c, x_quant_scales = q_c_scale)[0]
+        elif self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
                 "fused_qkv_a_proj is required when q_lora_rank is not None"
             )
@@ -129,13 +223,17 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
             assert self.q_b_proj is not None, (
                 "q_b_proj is required when q_lora_rank is not None"
             )
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+
+            qkv_lora = self.fused_qkv_a_proj(hidden_states, x_quant_scales=hidden_states_scales)[0]
+            #qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_lora = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
             q = self.q_b_proj(q_c)[0]
+            kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_c_normed = self.kv_a_layernorm(kv_c)
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -146,8 +244,8 @@ class MultiHeadLatentAttentionWrapper(CustomOp):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+            kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            kv_c_normed = self.kv_a_layernorm(kv_c)
 
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # Add head dim of 1 to k_pe

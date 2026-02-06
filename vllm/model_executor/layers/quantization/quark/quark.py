@@ -121,7 +121,7 @@ class QuarkConfig(QuantizationConfig):
         if should_ignore_layer(
             prefix, ignore=exclude_layers, fused_mapping=self.packed_modules_mapping
         ):
-            if prefix == "lm_head" or not self.dynamic_mxfp4_quant:
+            if prefix == "lm_head" or not getattr(self, "dynamic_mxfp4_quant", False):
                 return UnquantizedLinearMethod()
             scheme = self.get_scheme(layer=layer, layer_name=prefix, dynamic_mxfp4_quant=self.dynamic_mxfp4_quant)
             layer.scheme = scheme
@@ -579,6 +579,7 @@ class QuarkLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        x_quant_scales: torch.Tensor | None = None,
     ):
         """
         Use the output of create_weights and the CompressedTensorsScheme
@@ -590,7 +591,10 @@ class QuarkLinearMethod(LinearMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
 
-        return scheme.apply_weights(layer, x, bias=bias)
+        if isinstance(scheme, QuarkOCP_MX):
+            return scheme.apply_weights(layer, x, bias=bias, x_quant_scales=x_quant_scales)
+        else:
+            return scheme.apply_weights(layer, x, bias=bias)
 
 
 class QuarkKVCacheMethod(BaseKVCacheMethod):

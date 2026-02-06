@@ -143,13 +143,19 @@ try:
         x: torch.Tensor,
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
-        x_scales: torch.Tensor = None,
         rocm_use_aiter_fp4_asm_gemm: bool = False,
         out_dtype: torch.dtype | None = torch.bfloat16,
+        x_scales: torch.Tensor = None,
     ) -> torch.Tensor:
-        return torch.empty(
-            (*x.shape[:-1], weight.shape[0]), dtype=out_dtype, device=x.device
-        )
+        M = x.shape[0]
+        if rocm_use_aiter_fp4_asm_gemm:
+            return torch.empty(((M + 31) // 32 * 32, weight.shape[0]),
+                            dtype=out_dtype,
+                            device=x.device)[:M]
+        else:
+            return torch.empty((M, weight.shape[0]),
+                            dtype=out_dtype,
+                            device=x.device)
 
     direct_register_custom_op(
         op_name="gemm_with_dynamic_quant",
@@ -360,6 +366,7 @@ class QuarkOCP_MX(QuarkScheme):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        x_quant_scales: torch.Tensor = None,
     ) -> torch.Tensor:
         if self.emulate:
             dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
@@ -372,4 +379,5 @@ class QuarkOCP_MX(QuarkScheme):
                 layer.weight_scale,
                 self.rocm_use_aiter_fp4_asm_gemm,
                 self.out_dtype,
+                x_quant_scales
             )
