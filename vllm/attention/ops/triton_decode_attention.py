@@ -428,11 +428,11 @@ def _decode_grouped_att_m_fwd(
         # https://rocm.docs.amd.com/en/latest/how-to/rocm-for-ai/inference-optimization/workload.html#mi300x-triton-kernel-performance-optimization
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {
-            "waves_per_eu": 1,
+            "waves_per_eu": 0,
             "matrix_instr_nonkdim": 16,
-            "kpack": 2
+            "kpack": 1
         }
-        num_stages = 1
+        num_stages = 3
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -462,7 +462,7 @@ def _decode_grouped_att_m_fwd(
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         PAGE_SIZE=page_size,
         logit_cap=logit_cap,
-        num_warps=4,
+        num_warps=8,
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
