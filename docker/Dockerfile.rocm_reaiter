@@ -5,7 +5,7 @@ FROM base AS build_aiter
 RUN git clone https://github.com/ROCm/aiter.git \
     && cd aiter \
     && rm -rf /root/.aiter \
-    && git checkout v0.1.10 \
+    && git checkout v0.1.10.post2 \
     && git submodule update --init \
     && pip install -r requirements.txt \
     && python3 setup.py bdist_wheel --dist-dir=dist 
@@ -14,4 +14,4 @@ RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 FROM base AS final
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
     pip install /install/*.whl
-RUN perl -p -i -e 's/6af8b687/v0.1.10/g' /app/versions.txt
+RUN perl -p -i -e 's/6af8b687/v0.1.10.post2/g' /app/versions.txt
