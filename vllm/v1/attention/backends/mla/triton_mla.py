@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional, Union
+from dataclasses import dataclass
+from typing import ClassVar, Optional, Union
 
 import torch
 
@@ -14,8 +15,11 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
+                                                   MLACommonDecodeMetadata,
                                                    MLACommonImpl,
-                                                   MLACommonMetadata)
+                                                   MLACommonMetadata,
+                                                   MLACommonMetadataBuilder)
+from vllm.v1.attention.backends.utils import AttentionCGSupport
 
 logger = init_logger(__name__)
 
@@ -30,8 +34,28 @@ class TritonMLABackend(MLACommonBackend):
     def get_impl_cls() -> type["TritonMLAImpl"]:
         return TritonMLAImpl
 
+    @staticmethod
+    def get_builder_cls() -> type["TritonMLAMetadataBuilder"]:
+        return TritonMLAMetadataBuilder
 
-class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
+
+@dataclass
+class TritonMLADecodeMetadata(MLACommonDecodeMetadata):
+    pass
+
+
+class TritonMLAMetadata(MLACommonMetadata[TritonMLADecodeMetadata]):
+    pass
+
+
+class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[TritonMLAMetadata]):
+    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    #query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+
+    pass
+
+
+class TritonMLAImpl(MLACommonImpl[TritonMLAMetadata]):
 
     def __init__(
             self,
@@ -145,7 +169,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
                         dtype=q.dtype,
                         device=q.device)
 
-        num_kv_splits = 4  # TODO: heuristic
+        num_kv_splits = 32  # TODO: heuristic
 
         # TODO(lucas) Allocate ahead of time
         attn_logits = torch.empty(
