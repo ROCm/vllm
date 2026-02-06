@@ -68,6 +68,9 @@ class QuarkConfig(QuantizationConfig):
             if prefix == "lm_head":
                 return UnquantizedLinearMethod()
            # return UnquantizedLinearMethod()
+            # For Attention layers, always return QuarkKVCacheMethod even if ignored
+            if isinstance(layer, Attention):
+                return QuarkKVCacheMethod(self)
             scheme = self.get_scheme(layer=layer, layer_name=prefix, params_dtype=params_dtype)
             layer.scheme = scheme
             return QuarkLinearMethod(self)
