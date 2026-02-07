@@ -159,11 +159,12 @@ class TritonMLAImpl(MLACommonImpl[TritonMLAMetadata]):
             raise NotImplementedError("FP8 Triton MLA not yet supported")
 
         if type(q) is tuple:
+            # This is an issue. Need to fuse
             q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
-        o = torch.zeros(B,
+        o = torch.empty(B,
                         self.num_heads,
                         self.kv_lora_rank,
                         dtype=q.dtype,
