@@ -133,15 +133,20 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             bias_moe_gate: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             M = hidden_states_shared.shape[0]
+            # N is the gate+up output size (2 * intermediate_size)
             N = weight_gate_up.shape[0]
+            # N_moe is the number of routed experts
             N_moe = weight_moe_gate.shape[0]
             device = hidden_states_shared.device
-            assert N % 2 == 0
+            assert N % 2 == 0, f"weight_gate_up.shape[0]={N} must be divisible by 2"
+            # N_half is the intermediate size (gate+up output size / 2)
             N_half = N // 2
-            assert N_half == 256, f"{weight_gate_up.shape}"
-            assert N_half == N_moe, f"{weight_moe_gate.shape}"
+            # shared_output from fused_gemm has shape (M, N), and after FP8 quantization:
+            # - fused_reduce_act_mul_fp8_group_quant takes (M, N) where N = 2*N1, returns (M, N1)
+            # - So for input (M, N), output shape is (M, N_half)
             shared_output_q = torch.empty((M, N_half), dtype=rocm_aiter_fp8_dtype, device=device)
             shared_output_s = torch.empty((M, (N_half + rocm_aiter_fp8_quant_group_size - 1) // rocm_aiter_fp8_quant_group_size), dtype=torch.float32, device=device)
+            # router_logits from fused_gemm has shape (M, N_moe)
             router_logits = torch.empty((M, N_moe), dtype=hidden_states_moe_gate.dtype, device=device)
             return shared_output_q, shared_output_s, router_logits
         
@@ -200,15 +205,20 @@ if current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER:
             bias_moe_gate: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             M = hidden_states_shared.shape[0]
+            # N is the gate+up output size (2 * intermediate_size)
             N = weight_gate_up.shape[0]
+            # N_moe is the number of routed experts
             N_moe = weight_moe_gate.shape[0]
             device = hidden_states_shared.device
-            assert N % 4 == 0
+            assert N % 4 == 0, f"weight_gate_up.shape[0]={N} must be divisible by 4"
+            # N_half is the intermediate size (gate+up output size / 2)
             N_half = N // 2
-            assert N_half == 256, f"{weight_gate_up.shape}"
-            assert N_half == N_moe, f"{weight_moe_gate.shape}"
+            # shared_output from fused_gemm has shape (M, N), and after quantization:
+            # - fused_reduce_act_mul_and_mxfp4_quant takes (M, N) where N = 2*N1, computes N_half = N1 // 2
+            # - So for input (M, N), we have N1 = N, N_half = N // 2, output shape is (M, N_half // 2)
             shared_output_q = torch.empty((M, N_half // 2), dtype=rocm_aiter_fp4_dtype, device=device)
             shared_output_s = torch.empty((M, (N_half + rocm_aiter_fp4_quant_group_size - 1) // rocm_aiter_fp4_quant_group_size), dtype=torch.uint8, device=device)
+            # router_logits from fused_gemm has shape (M, N_moe)
             router_logits = torch.empty((M, N_moe), dtype=hidden_states_moe_gate.dtype, device=device)
             return shared_output_q, shared_output_s, router_logits
         
