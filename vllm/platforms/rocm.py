@@ -205,11 +205,11 @@ class RocmPlatform(Platform):
 
             if selected_backend is None:
                 selected_backend = (_Backend.ROCM_AITER_MLA if
-                                    is_aiter_mla_enabled() or block_size == 1
+                                    is_aiter_mla_enabled()
                                     else _Backend.TRITON_MLA)
 
             if selected_backend == _Backend.TRITON_MLA:
-                if block_size != 1:
+                if True:
                     logger.info_once("Using Triton MLA backend on V1 engine.")
                     return ("vllm.v1.attention.backends.mla."
                             "triton_mla.TritonMLABackend")

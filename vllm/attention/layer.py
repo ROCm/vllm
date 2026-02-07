@@ -626,7 +626,8 @@ def unified_attention_with_output(
 
     from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
     from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAImpl
-    if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and (isinstance(self.impl, TritonAttentionImpl) or isinstance(self.impl, AiterMLAImpl)):
+    from vllm.v1.attention.backends.mla.triton_mla import TritonMLAImpl
+    if VLLM_ROCM_USE_AITER_TRITON_FUSED_ROPE_ZEROS_KV_CACHE and (isinstance(self.impl, TritonAttentionImpl) or isinstance(self.impl, AiterMLAImpl) or isinstance(self.impl, TritonMLAImpl)):
         # fusing RoPE with flushing kv_cache operation
         assert hasattr(self.impl, "rotary_emb") and self.impl.rotary_emb is not None and positions is not None, f"rotary_emb not found in {self.impl=} and positions cannot be None"
         self.impl.forward(self,
