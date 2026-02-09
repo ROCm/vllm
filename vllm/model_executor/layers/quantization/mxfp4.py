@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from enum import Enum
 
 import torch
 from torch.nn.parameter import Parameter
 
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import get_current_vllm_config
+from vllm.config import (
+    Mxfp4Backend,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -60,23 +63,22 @@ from vllm.utils.math_utils import round_up
 logger = init_logger(__name__)
 
 
-# enum for mxfp4 backend
-class Mxfp4Backend(Enum):
-    NONE = 0
+def _get_user_specified_moe_backend() -> Mxfp4Backend | None:
+    """
+    Check if the user has explicitly specified a MoE backend.
+    Returns None if not specified or if unavailable
+    """
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return None
 
-    # FlashInfer Backend
-    SM100_FI_MXFP4_MXFP8_TRTLLM = 1
-    SM100_FI_MXFP4_MXFP8_CUTLASS = 2
-    SM100_FI_MXFP4_BF16 = 3
-    SM90_FI_MXFP4_BF16 = 4
-
-    # Marlin Backend
-    MARLIN = 5
-
-    # Triton Backend
-    TRITON = 6
-
-    CK = 7
+    backend = vllm_config.moe_config.backend
+    if backend is not None:
+        logger.info_once(
+            "Using user-specified MoE backend: %s (via --moe_config.backend)",
+            backend.name,
+        )
+    return backend
 
 
 def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
@@ -106,6 +108,12 @@ def get_mxfp4_backend_with_lora() -> Mxfp4Backend:
 def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
     # Backend Selection
 
+    # check if --moe_config.backend was used
+    user_backend = _get_user_specified_moe_backend()
+    if user_backend is not None:
+        return user_backend
+
+    # Fall back to auto-detection
     if with_lora_support:
         return get_mxfp4_backend_with_lora()
 
@@ -771,6 +779,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_aiter_scale = layer.w2_weight_scale.contiguous()
 
                 e, n, k = w13_aiter_weight.shape
+                w13_aiter_weight = (
+                    w13_aiter_weight.view(e, n // 2, 2, k)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                    .view(e, n, k)
+                )
+                w13_aiter_scale = (
+                    w13_aiter_scale.view(e, n // 2, 2, -1)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                    .view(e, n, -1)
+                )
                 w13_aiter_weight = (
                     w13_aiter_weight.view(e, n // 2, 2, k)
                     .permute(0, 2, 1, 3)

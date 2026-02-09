@@ -22,6 +22,7 @@ from vllm.config.model import (
     str_dtype_to_torch_dtype,
     try_match_architecture_defaults,
 )
+from vllm.config.moe import MoeConfig, Mxfp4Backend
 from vllm.config.multimodal import MultiModalConfig
 from vllm.config.observability import ObservabilityConfig
 from vllm.config.parallel import EPLBConfig, ParallelConfig
@@ -76,6 +77,9 @@ __all__ = [
     "LoadConfig",
     # From vllm.config.lora
     "LoRAConfig",
+    # From vllm.config.moe
+    "MoeConfig",
+    "Mxfp4Backend",
     # From vllm.config.model
     "ModelConfig",
     "iter_architecture_defaults",

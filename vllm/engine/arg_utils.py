@@ -46,6 +46,7 @@ from vllm.config import (
     LoadConfig,
     LoRAConfig,
     ModelConfig,
+    MoeConfig,
     MultiModalConfig,
     ObservabilityConfig,
     ParallelConfig,
@@ -538,6 +539,7 @@ class EngineArgs:
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
+    moe_config: MoeConfig = get_field(VllmConfig, "moe_config")
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
     enable_flashinfer_autotune: bool = get_field(
         KernelConfig, "enable_flashinfer_autotune"
@@ -601,6 +603,8 @@ class EngineArgs:
             self.compilation_config = CompilationConfig(**self.compilation_config)
         if isinstance(self.attention_config, dict):
             self.attention_config = AttentionConfig(**self.attention_config)
+        if isinstance(self.moe_config, dict):
+            self.moe_config = MoeConfig(**self.moe_config)
         if isinstance(self.kernel_config, dict):
             self.kernel_config = KernelConfig(**self.kernel_config)
         if isinstance(self.eplb_config, dict):
@@ -1211,6 +1215,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
+        vllm_group.add_argument("--moe-config", "-mc", **vllm_kwargs["moe_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
@@ -1699,9 +1704,11 @@ class EngineArgs:
                 lora_dtype=self.lora_dtype,
                 enable_tower_connector_lora=self.enable_tower_connector_lora,
                 specialize_active_lora=self.specialize_active_lora,
-                max_cpu_loras=self.max_cpu_loras
-                if self.max_cpu_loras and self.max_cpu_loras > 0
-                else None,
+                max_cpu_loras=(
+                    self.max_cpu_loras
+                    if self.max_cpu_loras and self.max_cpu_loras > 0
+                    else None
+                ),
             )
             if self.enable_lora
             else None
@@ -1802,6 +1809,7 @@ class EngineArgs:
             device_config=device_config,
             load_config=load_config,
             attention_config=attention_config,
+            moe_config=self.moe_config,
             kernel_config=kernel_config,
             lora_config=lora_config,
             speculative_config=speculative_config,
