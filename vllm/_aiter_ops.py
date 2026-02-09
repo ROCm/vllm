@@ -4,10 +4,15 @@ import functools
 from collections.abc import Callable
 
 import torch
+from torch._ops import OpOverload
 
 import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op, is_torch_equal_or_newer
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    rocm_aiter_sparse_attn_indexer,
+    rocm_aiter_sparse_attn_indexer_fake,
+)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 
@@ -24,14 +29,13 @@ def is_aiter_found() -> bool:
 # we keep this global outside to not cause torch compile breaks.
 IS_AITER_FOUND = is_aiter_found()
 
-# Can't use dtypes.fp8 directly inside an op
-# because it returns wrong result on gfx942.
-# This is a workaround to get the correct FP8 dtype.
-# This might because that the get_gfx() is wrapped as a custom op.
-if IS_AITER_FOUND:
-    from aiter import dtypes
 
-    AITER_FP8_DTYPE = dtypes.fp8
+def is_aiter_found_and_supported() -> bool:
+    if current_platform.is_rocm() and IS_AITER_FOUND:
+        from vllm.platforms.rocm import on_gfx9
+
+        return on_gfx9()
+    return False
 
 
 def if_aiter_supported(func: Callable) -> Callable:
@@ -43,15 +47,22 @@ def if_aiter_supported(func: Callable) -> Callable:
     def wrapper(*args, **kwargs):
         # checks the platform, device arch and aiter library existence.
 
-        if current_platform.is_rocm() and IS_AITER_FOUND:
-            from vllm.platforms.rocm import on_gfx9
-
-            if on_gfx9():
-                return func(*args, **kwargs)
+        if is_aiter_found_and_supported():
+            return func(*args, **kwargs)
 
         return None
 
     return wrapper
+
+
+# Can't use dtypes.fp8 directly inside an op
+# because it returns wrong result on gfx942.
+# This is a workaround to get the correct FP8 dtype.
+# This might because that the get_gfx() is wrapped as a custom op.
+if is_aiter_found_and_supported():
+    from aiter import dtypes
+
+    AITER_FP8_DTYPE = dtypes.fp8
 
 
 def _rocm_aiter_fused_moe_impl(
@@ -68,6 +79,8 @@ def _rocm_aiter_fused_moe_impl(
     w2_scale: torch.Tensor | None = None,
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -89,6 +102,8 @@ def _rocm_aiter_fused_moe_impl(
         w2_scale,
         a1_scale,
         a2_scale,
+        num_local_tokens=num_local_tokens,
+        dtype=output_dtype,
     )
 
 
@@ -106,7 +121,11 @@ def _rocm_aiter_fused_moe_fake(
     w2_scale: torch.Tensor | None = None,
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
+    num_local_tokens: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    if output_dtype is not None:
+        return torch.empty_like(hidden_states, dtype=output_dtype)
     return torch.empty_like(hidden_states)
 
 
@@ -193,6 +212,24 @@ if current_platform.is_rocm():
     from aiter.tuned_gemm import tgemm as aiter_tgemm
 else:
     aiter_tgemm = None
+
+
+def _rocm_aiter_topk_sigmoid_impl(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+) -> None:
+    from aiter import topk_sigmoid
+
+    topk_sigmoid(topk_weights, topk_indices, gating_output)
+
+
+def _rocm_aiter_topk_sigmoid_fake(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+) -> None:
+    pass
 
 
 def _rocm_aiter_biased_grouped_topk_impl(
@@ -287,7 +324,17 @@ def _check_aiter_mla_fp8_support() -> bool:
             _AITER_MLA_SUPPORTS_FP8 = (
                 "q_scale" in sig.parameters and "kv_scale" in sig.parameters
             )
-        except Exception:
+        except (
+            ImportError,
+            ModuleNotFoundError,
+            AttributeError,
+            ValueError,
+            TypeError,
+        ):
+            # ImportError/ModuleNotFoundError: aiter.mla module not available
+            # AttributeError: mla_decode_fwd doesn't exist
+            # ValueError: mla_decode_fwd has no signature (e.g., built-in)
+            # TypeError: mla_decode_fwd is not a callable
             _AITER_MLA_SUPPORTS_FP8 = False
     return _AITER_MLA_SUPPORTS_FP8
 
@@ -367,7 +414,7 @@ def _rocm_aiter_gemm_a8w8_impl(
     # gemm_a8w8_CK(a, b, scale_a, scale_b, bias) expects
     # a to be [M, K]
     # b to be [N, K]
-    # CutlassScaledMMLinearKernel prepare weight `w_q` in [K, N] format
+    # CutlassInt8ScaledMMLinearKernel prepare weight `w_q` in [K, N] format
     return gemm_a8w8_CK(A, B, As, Bs, bias, output_dtype)
 
 
@@ -377,6 +424,66 @@ def _rocm_aiter_gemm_a8w8_fake(
     As: torch.Tensor,
     Bs: torch.Tensor,
     bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    m = A.shape[0]
+    n = B.shape[0]
+    Y = torch.empty(m, n, dtype=output_dtype, device=A.device)
+    return Y
+
+
+def rocm_aiter_gemm_a8w8_bpreshuffle_impl(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
+    scale_a: torch.Tensor | None = None,
+    scale_b: torch.Tensor | None = None,
+) -> torch.Tensor:
+    # This AITER function can be used for
+    # - per-token activations + per-channel weights
+    # keep the weight as (N, K)
+    # NOTE: The weight has to be shuffled in the
+    # process_weights_after_loading of the CompressedTensorsW8A8Fp8 class
+    from aiter import gemm_a8w8_bpreshuffle_ck
+
+    m = input.shape[0]
+    n = weight.shape[0]
+    Y = torch.empty(m, n, dtype=out_dtype, device=input.device)
+    gemm_a8w8_bpreshuffle_ck(input, weight, scale_a, scale_b, Y)
+    return Y
+
+
+def rocm_aiter_gemm_a8w8_bpreshuffle_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out_dtype: torch.dtype | None = None,
+    scale_a: torch.Tensor | None = None,
+    scale_b: torch.Tensor | None = None,
+) -> torch.Tensor:
+    m = input.shape[0]
+    n = weight.shape[0]
+    if out_dtype is None:
+        out_dtype = input.dtype
+    return torch.empty((m, n), dtype=out_dtype, device=input.device)
+
+
+def _rocm_aiter_triton_gemm_a8w8_blockscale_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
+
+    return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
+
+
+def _rocm_aiter_triton_gemm_a8w8_blockscale_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
     m = A.shape[0]
@@ -410,31 +517,6 @@ def _rocm_aiter_gemm_a8w8_blockscale_fake(
     return Y
 
 
-def _rocm_aiter_triton_gemm_a8w8_blockscale_impl(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
-
-    return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
-
-
-def _rocm_aiter_triton_gemm_a8w8_blockscale_fake(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    output_dtype: torch.dtype = torch.float16,
-) -> torch.Tensor:
-    M = A.shape[0]
-    N = B.shape[0]
-    Y = torch.empty(M, N, dtype=output_dtype, device=A.device)
-    return Y
-
-
 def _rocm_aiter_rms_norm_impl(
     x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
 ) -> torch.Tensor:
@@ -464,16 +546,16 @@ def _rocm_aiter_rmsnorm2d_fwd_with_add_impl(
     from aiter import rmsnorm2d_fwd_with_add
 
     residual_out = torch.empty_like(residual)
-    output = torch.empty_like(x)
+    out = torch.empty_like(x)
     rmsnorm2d_fwd_with_add(
-        output,  # output
+        out,  # output
         x,  # input
         residual,  # residual input
         residual_out,  # residual output
         weight,
         variance_epsilon,
     )
-    return output, residual_out
+    return out, residual_out
 
 
 def _rocm_aiter_rmsnorm2d_fwd_with_add_fake(
@@ -482,7 +564,84 @@ def _rocm_aiter_rmsnorm2d_fwd_with_add_fake(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.empty_like(x), torch.empty_like(residual)
+    residual_out = torch.empty_like(residual)
+    out = torch.empty_like(x)
+    return out, residual_out
+
+
+def _rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    import aiter as rocm_aiter
+
+    assert quant_dtype in [torch.int8, _FP8_DTYPE]
+
+    y_scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+    out = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+    residual_out = torch.empty_like(x)
+
+    rocm_aiter.rmsnorm2d_fwd_with_add_dynamicquant(
+        out,
+        x,
+        residual,
+        residual_out,
+        y_scale,
+        weight,
+        epsilon,
+        use_model_sensitive_rmsnorm=0,
+    )
+
+    return out, residual_out, y_scale
+
+
+def _rocm_aiter_rmsnorm_fused_add_dynamic_quant_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    y_scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+    out = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+    residual_out = torch.empty_like(x)
+
+    return out, residual_out, y_scale
+
+
+def _rocm_aiter_rmsnorm_fused_dynamic_quant_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    import aiter as rocm_aiter
+
+    assert quant_dtype in [torch.int8, _FP8_DTYPE]
+
+    y_scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+    out = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+
+    rocm_aiter.rmsnorm2d_fwd_with_dynamicquant(
+        out, x, y_scale, weight, epsilon, use_model_sensitive_rmsnorm=0
+    )
+
+    return out, y_scale
+
+
+def _rocm_aiter_rmsnorm_fused_dynamic_quant_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    y_scale = torch.empty(x.shape[0], 1, dtype=torch.float32, device=x.device)
+    out = torch.empty(x.shape, dtype=quant_dtype, device=x.device)
+
+    return out, y_scale
 
 
 def _rocm_aiter_per_tensor_quant_impl(
@@ -506,10 +665,16 @@ def _rocm_aiter_per_tensor_quant_fake(
 
 
 def _rocm_aiter_per_token_quant_impl(
-    out: torch.Tensor, x: torch.Tensor, scale: torch.Tensor | None = None
-) -> None:
+    x: torch.Tensor, quant_dtype: torch.dtype, scale: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     from aiter.ops.quant import dynamic_per_token_scaled_quant
 
+    assert quant_dtype in [torch.int8, _FP8_DTYPE]
+
+    out_shape = x.shape
+    out = torch.empty(x.shape, dtype=_FP8_DTYPE, device=x.device)
+    if scale is None:
+        scale = torch.empty((*out_shape[:-1], 1), dtype=torch.float32, device=x.device)
     dynamic_per_token_scaled_quant(
         out,
         x,
@@ -519,12 +684,17 @@ def _rocm_aiter_per_token_quant_impl(
         num_rows=None,
         num_rows_factor=1,
     )
+    return out, scale
 
 
 def _rocm_aiter_per_token_quant_fake(
-    out: torch.Tensor, x: torch.Tensor, scale: torch.Tensor | None = None
-) -> None:
-    pass
+    x: torch.Tensor, quant_dtype: torch.dtype, scale: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_shape = x.shape
+    return (
+        torch.empty(x.shape, dtype=_FP8_DTYPE, device=x.device),
+        torch.empty((*out_shape[:-1], 1), dtype=torch.float32, device=x.device),
+    )
 
 
 def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
@@ -547,7 +717,11 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_impl(
         dtype_quant=AITER_FP8_DTYPE,
         res1=residual,
     )
-    return (x_quant, x_quant_scales, res)
+    return (
+        x_quant,
+        res,
+        x_quant_scales,
+    )
 
 
 def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake(
@@ -561,8 +735,8 @@ def _rocm_aiter_rmsnorm_with_add_fp8_group_quant_fake(
     scale_shape = (M, (N + group_size - 1) // group_size)
     return (
         torch.empty_like(x, dtype=AITER_FP8_DTYPE, device=x.device),
-        torch.empty(scale_shape, dtype=torch.float32, device=x.device),
         torch.empty_like(residual, device=residual.device),
+        torch.empty(scale_shape, dtype=torch.float32, device=x.device),
     )
 
 
@@ -668,49 +842,134 @@ _OPS_REGISTERED = False
 
 
 class rocm_aiter_ops:
+    """ROCm AITER operations wrapper for AMD GPU acceleration in vLLM.
+
+    This class centralizes the import and registration of AITER ops,
+    and provides a unified interface for checking if AITER is enabled.
+    Operations are only available on supported gfx9
+    architectures when aiter is installed.
+
+    The class uses environment variables to control which features are enabled,
+    allowing fine-grained control over which AITER optimizations are used.
+
+    Environment Variables:
+        VLLM_ROCM_USE_AITER: Main toggle for all AITER operations.
+        VLLM_ROCM_USE_AITER_LINEAR: Controls GEMM and quantization ops.
+        VLLM_ROCM_USE_AITER_RMSNORM: Controls RMSNorm operations.
+        VLLM_ROCM_USE_AITER_MOE: Controls MoE (Mixture of Experts) ops.
+        VLLM_ROCM_USE_AITER_MLA: Controls MLA (Multi-head Latent Attention) ops.
+        VLLM_ROCM_USE_AITER_MHA: Controls MHA ops including flash_attn_varlen.
+        VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: Controls Triton unified attention.
+        VLLM_ROCM_USE_AITER_FP8BMM: Controls FP8 batched matrix multiply.
+        VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: Controls FP4 assembly GEMM.
+        VLLM_ROCM_USE_AITER_TRITON_ROPE: Controls Triton rotary embeddings.
+        VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: Controls shared expert fusion.
+        VLLM_ROCM_USE_AITER_TRITON_GEMM: Controls Triton unquantized GEMM.
+
+    Note:
+        The environment variables are assigned when the module is imported,
+        so you can't change the environment variables after the module is imported.
+        This is done out of performance consideration. Accessing environment variables
+        is expensive as described in issue https://github.com/vllm-project/vllm/issues/17067
+        so we don't want to do it repeatedly, especially in the hot path (the forward pass).
+        You can call the refresh_env_variables() function to reload the env variables
+        after monkey patching the env variables in the unit test.
+
+    Check Functions:
+        All check functions (is_*_enabled) are decorated with @if_aiter_supported,
+        which verifies: (1) platform is ROCm, (2) device arch is gfx9, and
+        (3) aiter library is installed. The check function then also verifies
+        the corresponding environment variable is enabled.
+        i.e.                                             ___
+        is_enabled() == current_platform.is_rocm() and      |     checked by
+                        current_platform.is_on_gfx9() and   | @if_aiter_supported
+                        IS_AITER_FOUND and   _______________|
+                        cls._AITER_ENABLED   -----> Check by the logic in `is_enabled()`
+
+    Example:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        # Check if aiter is enabled before using operations
+        if rocm_aiter_ops.is_enabled():
+            result = rocm_aiter_ops.rms_norm(x, weight, epsilon)
+
+    Operations:
+        - RMS normalization: rms_norm, rms_norm2d_with_add
+        - GEMM operations: gemm_a8w8, gemm_a8w8_blockscale
+        - Fused MoE: fused_moe, asm_moe_tkw1
+        - Routing: topk_softmax, biased_grouped_topk, grouped_topk
+        - MLA decode: mla_decode_fwd
+        - Quantization: per_tensor_quant, per_token_quant, group_fp8_quant
+        - Triton ops: triton_rotary_embed, triton_fp8_bmm, triton_gemm_a8w8_blockscale
+    """
+
+    # Check if the env variable is set
     _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
     _RMSNORM_ENABLED = envs.VLLM_ROCM_USE_AITER_RMSNORM
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
-    _PG_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_PAGED_ATTN
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
-    _MHA_SHUFFLE_ENABLED = envs.VLLM_ROCM_USE_AITER_SHUFFLE_MHA
+    _SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
     _TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
+    # TODO: Consolidate under _LINEAR_ENABLED
     _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
+    _FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
+    # TODO: Consolidate under _LINEAR_ENABLED
     _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
+    # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
     _TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
     _MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+    # TODO: Consolidate under _LINEAR_ENABLED
     _TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
+
+    @classmethod
+    def refresh_env_variables(cls):
+        """
+        Since the environment variables are assigned when the module is imported,
+        This is a helper function to reload all the env variables from
+        the environment variables.
+        for example, after monkey patching the env variables in the unit test,
+        you can call this function to reload the env variables.
+        """
+        cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
+        cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
+        cls._RMSNORM_ENABLED = envs.VLLM_ROCM_USE_AITER_RMSNORM
+        cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
+        cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
+        cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
+        cls._SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
+        cls._TRITON_UNIFIED_ATTN_ENABLED = envs.VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION
+        cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
+        cls._FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
+        cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
+        cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
+        cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        cls._TRITON_UNQUANT_GEMM = envs.VLLM_ROCM_USE_AITER_TRITON_GEMM
 
     @classmethod
     @if_aiter_supported
     def is_enabled(cls) -> bool:
-        """Verifies device specs and availability of aiter main env variable."""
         return cls._AITER_ENABLED
 
     @classmethod
     @if_aiter_supported
     def is_linear_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
         return cls._AITER_ENABLED and cls._LINEAR_ENABLED
 
     @classmethod
     @if_aiter_supported
-    def is_linear_fp8_enaled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
+    def is_linear_fp8_enabled(cls) -> bool:
         return cls.is_linear_enabled()
 
     @classmethod
     @if_aiter_supported
     def is_rmsnorm_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
         return cls._AITER_ENABLED and cls._RMSNORM_ENABLED
 
     @classmethod
     @if_aiter_supported
     def is_fused_moe_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
         return cls._AITER_ENABLED and cls._FMOE_ENABLED
 
     @classmethod
@@ -721,37 +980,32 @@ class rocm_aiter_ops:
     @classmethod
     @if_aiter_supported
     def is_mla_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
         return cls._AITER_ENABLED and cls._MLA_ENABLED
 
     @classmethod
     @if_aiter_supported
     def is_mha_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
         return cls._AITER_ENABLED and cls._MHA_ENABLED
 
     @classmethod
     @if_aiter_supported
-    def is_shuffle_mha_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
-        return cls.is_mha_enabled() and cls._MHA_SHUFFLE_ENABLED
-
-    @classmethod
-    @if_aiter_supported
-    def is_pa_attn_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
-        return cls._AITER_ENABLED and cls._PG_ATTN_ENABLED
+    def is_shuffle_kv_cache_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._SHUFFLE_KV_CACHE_ENABLED
 
     @classmethod
     @if_aiter_supported
     def is_triton_unified_attn_enabled(cls) -> bool:
-        """ "Verifies device specs and availability of env variable."""
         return cls._AITER_ENABLED and cls._TRITON_UNIFIED_ATTN_ENABLED
 
     @classmethod
     @if_aiter_supported
     def is_fp8bmm_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._FP8BMM_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def is_fp4bmm_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._FP4BMM_ENABLED
 
     @classmethod
     @if_aiter_supported
@@ -805,6 +1059,14 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_topk_sigmoid",
+                op_func=_rocm_aiter_topk_sigmoid_impl,
+                mutates_args=["topk_weights", "topk_indices"],
+                fake_impl=_rocm_aiter_topk_sigmoid_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_biased_grouped_topk",
                 op_func=_rocm_aiter_biased_grouped_topk_impl,
                 mutates_args=["topk_weights", "topk_ids"],
@@ -837,15 +1099,23 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
-                op_name="rocm_aiter_gemm_a8w8_blockscale",
-                op_func=_rocm_aiter_gemm_a8w8_blockscale_impl,
-                fake_impl=_rocm_aiter_gemm_a8w8_blockscale_fake,
+                op_name="rocm_aiter_gemm_a8w8_bpreshuffle",
+                op_func=rocm_aiter_gemm_a8w8_bpreshuffle_impl,
+                mutates_args=[],
+                fake_impl=rocm_aiter_gemm_a8w8_bpreshuffle_fake,
+                dispatch_key=current_platform.dispatch_key,
             )
 
             direct_register_custom_op(
                 op_name="rocm_aiter_triton_gemm_a8w8_blockscale",
                 op_func=_rocm_aiter_triton_gemm_a8w8_blockscale_impl,
                 fake_impl=_rocm_aiter_triton_gemm_a8w8_blockscale_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_gemm_a8w8_blockscale",
+                op_func=_rocm_aiter_gemm_a8w8_blockscale_impl,
+                fake_impl=_rocm_aiter_gemm_a8w8_blockscale_fake,
             )
 
             direct_register_custom_op(
@@ -858,6 +1128,20 @@ class rocm_aiter_ops:
                 op_name="rocm_aiter_rmsnorm2d_fwd_with_add",
                 op_func=_rocm_aiter_rmsnorm2d_fwd_with_add_impl,
                 fake_impl=_rocm_aiter_rmsnorm2d_fwd_with_add_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_fused_dynamic_quant",
+                op_func=_rocm_aiter_rmsnorm_fused_dynamic_quant_impl,
+                fake_impl=_rocm_aiter_rmsnorm_fused_dynamic_quant_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_fused_add_dynamic_quant",
+                op_func=_rocm_aiter_rmsnorm_fused_add_dynamic_quant_impl,
+                fake_impl=_rocm_aiter_rmsnorm_fused_add_dynamic_quant_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
 
@@ -896,12 +1180,61 @@ class rocm_aiter_ops:
             direct_register_custom_op(
                 op_name="rocm_aiter_per_token_quant",
                 op_func=_rocm_aiter_per_token_quant_impl,
-                mutates_args=["out", "scale"],
                 fake_impl=_rocm_aiter_per_token_quant_fake,
                 dispatch_key=current_platform.dispatch_key,
             )
 
+            direct_register_custom_op(
+                op_name="rocm_aiter_sparse_attn_indexer",
+                op_func=rocm_aiter_sparse_attn_indexer,
+                mutates_args=["topk_indices_buffer"],
+                fake_impl=rocm_aiter_sparse_attn_indexer_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
             _OPS_REGISTERED = True
+
+    @staticmethod
+    def get_rmsnorm_fused_add_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add.default
+
+    @staticmethod
+    def get_rmsnorm_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rms_norm.default
+
+    @staticmethod
+    def get_rmsnorm_fused_add_dynamic_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_fused_add_dynamic_quant.default
+
+    @staticmethod
+    def get_rmsnorm_fused_dynamic_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_fused_dynamic_quant.default
+
+    @staticmethod
+    def get_rmsnorm_group_fused_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant.default
+
+    @staticmethod
+    def get_rmsnorm_group_add_fused_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_with_add_fp8_group_quant.default
+
+    @staticmethod
+    def get_per_token_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_per_token_quant.default
+
+    @staticmethod
+    def get_group_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_group_fp8_quant.default
+
+    @staticmethod
+    def get_act_mul_fused_fp8_group_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_act_mul_and_fp8_group_quant.default
+
+    @staticmethod
+    def rms_norm(
+        x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_rms_norm(x, weight, variance_epsilon)
 
     @staticmethod
     def rms_norm2d_with_add(
@@ -915,12 +1248,6 @@ class rocm_aiter_ops:
         )
 
     @staticmethod
-    def rms_norm(
-        x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_rms_norm(x, weight, variance_epsilon)
-
-    @staticmethod
     def gemm_a8w8(
         A: torch.Tensor,
         B: torch.Tensor,
@@ -930,6 +1257,31 @@ class rocm_aiter_ops:
         output_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8(A, B, As, Bs, bias, output_dtype)
+
+    @staticmethod
+    def gemm_a8w8_bpreshuffle(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        out_dtype: torch.dtype | None = None,
+        scale_a: torch.Tensor | None = None,
+        scale_b: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_gemm_a8w8_bpreshuffle(
+            input, weight, out_dtype, scale_a, scale_b
+        )
+
+    @staticmethod
+    def triton_gemm_a8w8_blockscale(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        block_size: list[int],
+        output_dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_triton_gemm_a8w8_blockscale(
+            A, B, As, Bs, output_dtype
+        )
 
     @staticmethod
     def gemm_a8w8_blockscale(
@@ -959,6 +1311,8 @@ class rocm_aiter_ops:
         w2_scale: torch.Tensor | None = None,
         a1_scale: torch.Tensor | None = None,
         a2_scale: torch.Tensor | None = None,
+        num_local_tokens: torch.Tensor | None = None,
+        output_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -974,6 +1328,8 @@ class rocm_aiter_ops:
             w2_scale,
             a1_scale,
             a2_scale,
+            num_local_tokens,
+            output_dtype,
         )
 
     @staticmethod
@@ -1018,6 +1374,19 @@ class rocm_aiter_ops:
     ) -> tuple[torch.Tensor, ...]:
         torch.ops.vllm.rocm_aiter_topk_softmax(
             topk_weights, topk_indices, token_expert_indices, gating_output, renormalize
+        )
+        return topk_weights, topk_indices
+
+    @staticmethod
+    def topk_sigmoid(
+        topk_weights: torch.Tensor,
+        topk_indices: torch.Tensor,
+        token_expert_indices: torch.Tensor,
+        gating_output: torch.Tensor,
+        renormalize: bool,
+    ) -> tuple[torch.Tensor, ...]:
+        torch.ops.vllm.rocm_aiter_topk_sigmoid(
+            topk_weights, topk_indices, gating_output
         )
         return topk_weights, topk_indices
 
@@ -1113,17 +1482,7 @@ class rocm_aiter_ops:
         quant_dtype: torch.dtype,
         scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert quant_dtype in [torch.int8, _FP8_DTYPE]
-
-        out_shape = x.shape
-        out = torch.empty(x.shape, dtype=_FP8_DTYPE, device=x.device)
-        if scale is None:
-            scale = torch.empty(
-                (*out_shape[:-1], 1), dtype=torch.float32, device=x.device
-            )
-
-        torch.ops.vllm.rocm_aiter_per_token_quant(out, x, scale)
-        return out, scale
+        return torch.ops.vllm.rocm_aiter_per_token_quant(x, quant_dtype, scale)
 
     @staticmethod
     def triton_fp4_gemm_dynamic_qaunt(
@@ -1159,7 +1518,7 @@ class rocm_aiter_ops:
         rotary_dim: int,
         is_neox_style: bool,
     ):
-        from aiter.ops.triton.rope import rope_cached_thd_positions_2c_fwd_inplace
+        from aiter.ops.triton.rope.rope import rope_cached_thd_positions_2c_fwd_inplace
 
         num_tokens = positions.numel()
         cos, sin = cos_sin_cache.chunk(2, dim=-1)
@@ -1173,17 +1532,40 @@ class rocm_aiter_ops:
         key_ = key[..., :rotary_dim]
         positions = positions.view(*query.shape[:1])
         rope_cached_thd_positions_2c_fwd_inplace(
-            positions,
-            sin,
-            cos,
             query_,
             key_,
+            cos,
+            sin,
+            positions,
             rotate_style,
             reuse_freqs_front_part=True,
-            is_nope_first=False,
+            nope_first=False,
         )
         query = query.view(query_shape)
         key = key.view(key_shape)
+
+    @staticmethod
+    def batched_gemm_a16wfp4(
+        X: torch.Tensor,
+        W: torch.Tensor,
+        w_scale: torch.Tensor,
+        Y: torch.Tensor,
+        transpose_bm: bool | None = False,
+        prequant: bool | None = False,
+        y_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # ruff: noqa: E501 # isort: skip
+        from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+
+        return batched_gemm_a16wfp4(
+            X,
+            W,
+            w_scale,
+            y=Y,
+            transpose_bm=transpose_bm,
+            prequant=prequant,
+            y_scale=y_scale,
+        )
 
     @staticmethod
     def triton_fp8_bmm(
@@ -1214,19 +1596,6 @@ class rocm_aiter_ops:
             YQ=YQ,
             transpose_bm=transpose_bm,
             config=config,
-        )
-
-    @staticmethod
-    def triton_gemm_a8w8_blockscale(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        As: torch.Tensor,
-        Bs: torch.Tensor,
-        block_size: list[int],
-        output_dtype: torch.dtype = torch.float16,
-    ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_triton_gemm_a8w8_blockscale(
-            A, B, As, Bs, output_dtype
         )
 
     @staticmethod
@@ -1280,7 +1649,7 @@ class rocm_aiter_ops:
 
     @staticmethod
     def shuffle_weight(
-        self, tensor: torch.Tensor, layout: tuple[int, int] = (16, 16)
+        tensor: torch.Tensor, layout: tuple[int, int] = (16, 16)
     ) -> torch.Tensor:
         from aiter.ops.shuffle import shuffle_weight
 

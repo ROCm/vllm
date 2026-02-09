@@ -6,17 +6,14 @@ within a vision language model."""
 from collections.abc import Iterable
 
 import torch
-from einops import rearrange, repeat
 from torch import nn
 from torch.nn import functional as F
 from transformers import Siglip2VisionConfig
 from transformers.configuration_utils import PretrainedConfig
 
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.layers.mm_encoder_attention import MMEncoderAttention
-from vllm.config import MultiModalConfig
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv2dLayer
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -26,8 +23,13 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding.common import (
+    ApplyRotaryEmb,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.platforms import current_platform
+
+from .vision import is_vit_use_data_parallel
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -146,57 +148,27 @@ class Siglip2VisionEmbeddings(nn.Module):
         return patch_embeds
 
 
-# copy from flash_attn/layers/rotary.py
-def rotate_half(x, interleaved=False):
-    if not interleaved:
-        x1, x2 = x.chunk(2, dim=-1)
-        return torch.cat((-x2, x1), dim=-1)
-    else:
-        x1, x2 = x[..., ::2], x[..., 1::2]
-        return rearrange(
-            torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2
-        )
-
-
-def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
-    """
-    x: (batch_size, seqlen, nheads, headdim)
-    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
-    """
-    ro_dim = cos.shape[-1] * 2
-    assert ro_dim <= x.shape[-1]
-    cos = repeat(
-        cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
-    )
-    sin = repeat(
-        sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)"
-    )
-    return torch.cat(
-        [
-            x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin,
-            x[..., ro_dim:],
-        ],
-        dim=-1,
-    )
-
-
 def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    is_flash_attn_backend: bool = False,
+    is_flash_attn_backend: bool,
+    apply_rotary_emb: ApplyRotaryEmb,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     cos = cos.chunk(2, dim=-1)[0].contiguous()
     sin = sin.chunk(2, dim=-1)[0].contiguous()
-    if is_flash_attn_backend and current_platform.is_cuda():
-        from vllm.vllm_flash_attn.layers.rotary import apply_rotary_emb
 
-        apply_rotary_emb_func = apply_rotary_emb
+    if is_flash_attn_backend and current_platform.is_cuda():
+        apply_rotary_emb_func = apply_rotary_emb.forward_cuda
+    elif is_flash_attn_backend and current_platform.is_rocm():
+        apply_rotary_emb_func = apply_rotary_emb.forward_hip
     else:
-        apply_rotary_emb_func = apply_rotary_emb_torch
-    q_embed = apply_rotary_emb_func(q.float(), cos.float(), sin.float()).type_as(q)
-    k_embed = apply_rotary_emb_func(k.float(), cos.float(), sin.float()).type_as(k)
+        apply_rotary_emb_func = apply_rotary_emb.forward_native
+
+    q_embed = apply_rotary_emb_func(q, cos, sin)
+    k_embed = apply_rotary_emb_func(k, cos, sin)
+
     return q_embed, k_embed
 
 
@@ -207,10 +179,7 @@ class Siglip2Attention(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
-        attn_backend_override: AttentionBackendEnum | None = None,
     ):
         super().__init__()
         self.config = config
@@ -220,18 +189,13 @@ class Siglip2Attention(nn.Module):
         if self.head_dim * self.num_heads != self.embed_dim:
             raise ValueError(
                 f"embed_dim must be divisible by num_heads "
-                f"(got `embed_dim`: {self.embed_dim} and `num_heads`:"
-                f" {self.num_heads})."
+                f"(got `embed_dim`: {self.embed_dim} and "
+                f"`num_heads`: {self.num_heads})."
             )
         self.scale = self.head_dim**-0.5
         self.dropout = config.attention_dropout
-        self.is_causal = False
 
-        use_data_parallel = (
-            multimodal_config.mm_encoder_tp_mode == "data"
-            if multimodal_config
-            else False
-        )
+        use_data_parallel = is_vit_use_data_parallel()
         self.qkv_proj = QKVParallelLinear(
             hidden_size=self.embed_dim,
             head_size=self.head_dim,
@@ -257,8 +221,13 @@ class Siglip2Attention(nn.Module):
         self.attn = MMEncoderAttention(
             num_heads=self.num_heads_per_partition,
             head_size=self.head_dim,
+            scale=self.scale,
             prefix=f"{prefix}.attn",
-            multimodal_config=multimodal_config,
+        )
+
+        self.apply_rotary_emb = ApplyRotaryEmb(
+            enforce_enable=True,
+            enable_fp32_compute=True,
         )
 
     def forward(
@@ -286,6 +255,7 @@ class Siglip2Attention(nn.Module):
                 cos,
                 sin,
                 self.attn.is_flash_attn_backend,
+                self.apply_rotary_emb,
             )
             queries = queries.squeeze(0)
             keys = keys.squeeze(0)
@@ -311,16 +281,11 @@ class Siglip2MLP(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
         self.config = config
-        use_data_parallel = (
-            multimodal_config.mm_encoder_tp_mode == "data"
-            if multimodal_config
-            else False
-        )
+        use_data_parallel = is_vit_use_data_parallel()
         self.activation_fn = get_act_fn(config.hidden_act)
         self.fc1 = ColumnParallelLinear(
             config.hidden_size,
@@ -349,7 +314,6 @@ class Siglip2EncoderLayer(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -358,14 +322,12 @@ class Siglip2EncoderLayer(nn.Module):
         self.self_attn = Siglip2Attention(
             config,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             prefix=f"{prefix}.self_attn",
         )
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = Siglip2MLP(
             config,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             prefix=f"{prefix}.mlp",
         )
 
@@ -411,7 +373,6 @@ class Siglip2Encoder(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -421,7 +382,6 @@ class Siglip2Encoder(nn.Module):
                 Siglip2EncoderLayer(
                     config,
                     quant_config=quant_config,
-                    multimodal_config=multimodal_config,
                     prefix=f"{prefix}.layers.{idx}",
                 )
                 for idx in range(config.num_hidden_layers)
@@ -595,7 +555,6 @@ class Siglip2VisionTransformer(nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -606,7 +565,6 @@ class Siglip2VisionTransformer(nn.Module):
         self.encoder = Siglip2Encoder(
             config,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             prefix=f"{prefix}.encoder",
         )
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
@@ -634,7 +592,6 @@ class Siglip2NavitModel(torch.nn.Module):
         self,
         config: Siglip2VisionConfig,
         quant_config: QuantizationConfig | None = None,
-        multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -642,7 +599,6 @@ class Siglip2NavitModel(torch.nn.Module):
         self.vision_model = Siglip2VisionTransformer(
             config,
             quant_config=quant_config,
-            multimodal_config=multimodal_config,
             prefix=f"{prefix}.vision_model",
         )
 
