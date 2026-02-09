@@ -36,6 +36,7 @@ from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
 from .load import LoadConfig
 from .lora import LoRAConfig
+from .moe import MoeConfig
 from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .parallel import ParallelConfig
@@ -196,6 +197,8 @@ class VllmConfig:
     """Load configuration."""
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """Attention configuration."""
+    moe_config: MoeConfig = Field(default_factory=MoeConfig)
+    """MoE (Mixture of Experts) configuration."""
     lora_config: LoRAConfig | None = None
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
@@ -287,6 +290,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.attention_config:
             vllm_factors.append(self.attention_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.moe_config:
+            vllm_factors.append(self.moe_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.lora_config:
