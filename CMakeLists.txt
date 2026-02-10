@@ -56,8 +56,8 @@ endif()
 # requirements.txt files and should be kept consistent.  The ROCm torch
 # versions are derived from docker/Dockerfile.rocm
 #
-set(TORCH_SUPPORTED_VERSION_CUDA "2.9.1")
-set(TORCH_SUPPORTED_VERSION_ROCM "2.9.1")
+set(TORCH_SUPPORTED_VERSION_CUDA "2.10.0")
+set(TORCH_SUPPORTED_VERSION_ROCM "2.10.0")
 
 #
 # Try to find python package with an executable that exactly matches
@@ -282,6 +282,7 @@ endif()
 set(VLLM_EXT_SRC
   "csrc/mamba/mamba_ssm/selective_scan_fwd.cu"
   "csrc/cache_kernels.cu"
+  "csrc/cache_kernels_fused.cu"
   "csrc/attention/paged_attention_v1.cu"
   "csrc/attention/paged_attention_v2.cu"
   "csrc/attention/merge_attn_states.cu"
@@ -292,6 +293,7 @@ set(VLLM_EXT_SRC
   "csrc/fused_qknorm_rope_kernel.cu"
   "csrc/layernorm_quant_kernels.cu"
   "csrc/sampler.cu"
+  "csrc/topk.cu"
   "csrc/cuda_view.cu"
   "csrc/quantization/gptq/q_gemm.cu"
   "csrc/quantization/w8a8/int8/scaled_quant.cu"
@@ -376,7 +378,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     # preselected input type pairs and schedules.
     # Generate sources:
     set(MARLIN_GEN_SCRIPT
-      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/gptq_marlin/generate_kernels.py)
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantization/marlin/generate_kernels.py)
     file(MD5 ${MARLIN_GEN_SCRIPT} MARLIN_GEN_SCRIPT_HASH)
     list(JOIN CUDA_ARCHS "," CUDA_ARCHS_STR)
     set(MARLIN_GEN_SCRIPT_HASH_AND_ARCH "${MARLIN_GEN_SCRIPT_HASH}(ARCH:${CUDA_ARCHS_STR})")
@@ -411,7 +413,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
 
     if (MARLIN_ARCHS)
-      file(GLOB MARLIN_TEMPLATE_KERNEL_SRC "csrc/quantization/gptq_marlin/sm80_kernel_*_float16.cu")
+      file(GLOB MARLIN_TEMPLATE_KERNEL_SRC "csrc/quantization/marlin/sm80_kernel_*_float16.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_TEMPLATE_KERNEL_SRC}"
         CUDA_ARCHS "${MARLIN_ARCHS}")
@@ -421,7 +423,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       endif()
       list(APPEND VLLM_EXT_SRC ${MARLIN_TEMPLATE_KERNEL_SRC})
 
-      file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC "csrc/quantization/gptq_marlin/sm80_kernel_*_bfloat16.cu")
+      file(GLOB MARLIN_TEMPLATE_BF16_KERNEL_SRC "csrc/quantization/marlin/sm80_kernel_*_bfloat16.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_TEMPLATE_BF16_KERNEL_SRC}"
         CUDA_ARCHS "${MARLIN_BF16_ARCHS}")
@@ -432,8 +434,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       list(APPEND VLLM_EXT_SRC ${MARLIN_TEMPLATE_BF16_KERNEL_SRC})
     endif()
 
-    if (MARLIN_SM75_ARCHS) 
-      file(GLOB MARLIN_TEMPLATE_SM75_KERNEL_SRC "csrc/quantization/gptq_marlin/sm75_kernel_*.cu")
+    if (MARLIN_SM75_ARCHS)
+      file(GLOB MARLIN_TEMPLATE_SM75_KERNEL_SRC "csrc/quantization/marlin/sm75_kernel_*.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_TEMPLATE_SM75_KERNEL_SRC}"
         CUDA_ARCHS "${MARLIN_SM75_ARCHS}")
@@ -444,8 +446,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       list(APPEND VLLM_EXT_SRC ${MARLIN_TEMPLATE_SM75_KERNEL_SRC})
     endif()
 
-    if (MARLIN_FP8_ARCHS) 
-      file(GLOB MARLIN_TEMPLATE_FP8_KERNEL_SRC "csrc/quantization/gptq_marlin/sm89_kernel_*.cu")
+    if (MARLIN_FP8_ARCHS)
+      file(GLOB MARLIN_TEMPLATE_FP8_KERNEL_SRC "csrc/quantization/marlin/sm89_kernel_*.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_TEMPLATE_FP8_KERNEL_SRC}"
         CUDA_ARCHS "${MARLIN_FP8_ARCHS}")
@@ -457,11 +459,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     endif()
 
     set(MARLIN_SRCS
-       "csrc/quantization/marlin/sparse/marlin_24_cuda_kernel.cu"
-       "csrc/quantization/gptq_marlin/gptq_marlin.cu"
-       "csrc/quantization/gptq_marlin/marlin_int4_fp8_preprocess.cu"
-       "csrc/quantization/gptq_marlin/gptq_marlin_repack.cu"
-       "csrc/quantization/gptq_marlin/awq_marlin_repack.cu")
+       "csrc/quantization/marlin/marlin.cu"
+       "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
+       "csrc/quantization/marlin/gptq_marlin_repack.cu"
+       "csrc/quantization/marlin/awq_marlin_repack.cu")
     set_gencode_flags_for_srcs(
       SRCS "${MARLIN_SRCS}"
       CUDA_ARCHS "${MARLIN_OTHER_ARCHS}")
@@ -799,24 +800,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   else()
     cuda_archs_loose_intersection(SCALED_MM_ARCHS "10.0a;10.1a;10.3a" "${CUDA_ARCHS}")
   endif()
-  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
-    set(SRCS "csrc/quantization/w8a8/cutlass/moe/blockwise_scaled_group_mm_sm100.cu")
-    set_gencode_flags_for_srcs(
-      SRCS "${SRCS}"
-      CUDA_ARCHS "${SCALED_MM_ARCHS}")
-    list(APPEND VLLM_EXT_SRC "${SRCS}")
-    list(APPEND VLLM_GPU_FLAGS "-DENABLE_CUTLASS_MOE_SM100=1")
-    message(STATUS "Building blockwise_scaled_group_mm_sm100 for archs: ${SCALED_MM_ARCHS}")
-  else()
-    if (NOT ${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND SCALED_MM_ARCHS)
-      message(STATUS "Not building blockwise_scaled_group_mm_sm100 kernels as CUDA Compiler version is "
-                     "not >= 12.8, we recommend upgrading to CUDA 12.8 or later "
-                     "if you intend on running FP8 quantized MoE models on Blackwell.")
-    else()
-      message(STATUS "Not building blockwise_scaled_group_mm_sm100 as no compatible archs found "
-                     "in CUDA target architectures")
-    endif()
-  endif()
 
   #
   # Machete kernels
@@ -1060,7 +1043,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       list(APPEND VLLM_MOE_EXT_SRC ${MARLIN_MOE_SRC})
     endif()
 
-    if (MARLIN_MOE_SM75_ARCHS) 
+    if (MARLIN_MOE_SM75_ARCHS)
       file(GLOB MARLIN_MOE_SM75_SRC "csrc/moe/marlin_moe_wna16/sm75_kernel_*.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_MOE_SM75_SRC}"

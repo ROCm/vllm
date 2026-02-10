@@ -6,11 +6,11 @@ from typing import Any
 
 import torch
 
-from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 logger = init_logger(__name__)
 
@@ -933,30 +933,26 @@ def enable_batch_invariant_mode():
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
-    # Batch invariant matmuls are no longer needed after cublas overrides
-    if not is_torch_equal_or_newer("2.10.0.dev"):
-        if (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability(80)
-            or current_platform.is_device_capability(89)
-        ):
-            # For PyTorch 2.9, B200 uses GEMV for bs=1
-            # Requires https://github.com/pytorch/pytorch/pull/166735
-            _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "CUDA")
-            _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "CUDA")
-            _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, "CUDA")
-            _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, "CUDA")
-        else:
-            # Only source of batch invariance for Hopper is split-k, can disable through
-            # cuBLAS workspace config
-            _original_cublas_workspace_cfg = os.environ.get(
-                "CUBLAS_WORKSPACE_CONFIG", None
-            )
-            _original_cublaslt_workspace_size = os.environ.get(
-                "CUBLASLT_WORKSPACE_SIZE", None
-            )
-            os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-            os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
+    if (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability(80)
+        or current_platform.is_device_capability(89)
+    ):
+        # For PyTorch 2.9, B200 uses GEMV for bs=1
+        # Requires https://github.com/pytorch/pytorch/pull/166735
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, "CUDA")
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, "CUDA")
+        _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, "CUDA")
+        _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, "CUDA")
+    else:
+        # Only source of batch invariance for Hopper is split-k, can disable through
+        # cuBLAS workspace config
+        _original_cublas_workspace_cfg = os.environ.get("CUBLAS_WORKSPACE_CONFIG", None)
+        _original_cublaslt_workspace_size = os.environ.get(
+            "CUBLASLT_WORKSPACE_SIZE", None
+        )
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+        os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
 
     _batch_invariant_LIB.impl(
         "aten::_log_softmax", _log_softmax_batch_invariant, "CUDA"
@@ -978,7 +974,7 @@ def enable_batch_invariant_mode():
     )
 
     reduced_precision_val = (
-        (False, False) if is_torch_equal_or_newer("2.10.0.dev") else False
+        (False, False) if is_torch_equal_or_newer("2.10.0") else False
     )
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
         reduced_precision_val
@@ -1007,9 +1003,14 @@ def vllm_is_batch_invariant() -> bool:
 def override_envs_for_invariance(
     attention_backend: AttentionBackendEnum | None,
 ):
-    supported_backends = [
+    decode_invariant_backends = [
         AttentionBackendEnum.FLASH_ATTN,  # best supported backend
-        AttentionBackendEnum.FLASHINFER,
+        AttentionBackendEnum.TRITON_ATTN,
+    ]
+    supported_backends = decode_invariant_backends + [
+        # FlashInfer temporarily disabled due to invariant CTA sizes.
+        # See FlashInfer issue #2424
+        # AttentionBackendEnum.FLASHINFER,
         AttentionBackendEnum.FLASH_ATTN_MLA,
         AttentionBackendEnum.TRITON_MLA,
         # Not yet supported MLA backends
@@ -1027,9 +1028,9 @@ def override_envs_for_invariance(
             "one of the supported backends before enabling batch_invariant."
         )
         raise RuntimeError(error)
-    if attention_backend != supported_backends[0]:
+    if attention_backend not in decode_invariant_backends:
         warning = (
-            "You are using a decode-invariant form of batch invariance. "
+            "You are using a non-decode-invariant form of batch invariance. "
             "This will not be invariant between prefill and decode."
         )
         logger.warning_once(warning, scope="local")
