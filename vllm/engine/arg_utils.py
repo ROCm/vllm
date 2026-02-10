@@ -182,9 +182,9 @@ def collection_to_kwargs(type_hints: set[TypeHint], type: TypeHint) -> dict[str,
     elem_type = types[0]
 
     # Handle Ellipsis
-    assert all(
-        t is elem_type for t in types if t is not Ellipsis
-    ), f"All non-Ellipsis elements must be of the same type. Got {types}."
+    assert all(t is elem_type for t in types if t is not Ellipsis), (
+        f"All non-Ellipsis elements must be of the same type. Got {types}."
+    )
 
     # Handle Union types
     if get_origin(elem_type) in {Union, UnionType}:
@@ -1174,9 +1174,7 @@ class EngineArgs:
         vllm_group.add_argument(
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
-        vllm_group.add_argument(
-            "--moe-config", "-mc", **vllm_kwargs["moe_config"]
-        )
+        vllm_group.add_argument("--moe-config", "-mc", **vllm_kwargs["moe_config"])
         vllm_group.add_argument(
             "--additional-config", **vllm_kwargs["additional_config"]
         )
@@ -1300,9 +1298,9 @@ class EngineArgs:
                     self.model_loader_extra_config.to_serializable()
                 )
             self.model_loader_extra_config["tensorizer_config"] = {}
-            self.model_loader_extra_config["tensorizer_config"][
-                "tensorizer_dir"
-            ] = self.model
+            self.model_loader_extra_config["tensorizer_config"]["tensorizer_dir"] = (
+                self.model
+            )
             self.validate_tensorizer_args()
 
         return LoadConfig(
@@ -1454,15 +1452,15 @@ class EngineArgs:
             # but we should not do this here.
             placement_group = ray.util.get_current_placement_group()
 
-        assert (
-            not headless or not self.data_parallel_hybrid_lb
-        ), "data_parallel_hybrid_lb is not applicable in headless mode"
-        assert not (
-            self.data_parallel_hybrid_lb and self.data_parallel_external_lb
-        ), "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
-        assert (
-            self.data_parallel_backend == "mp" or self.nnodes == 1
-        ), "nnodes > 1 is only supported with data_parallel_backend=mp"
+        assert not headless or not self.data_parallel_hybrid_lb, (
+            "data_parallel_hybrid_lb is not applicable in headless mode"
+        )
+        assert not (self.data_parallel_hybrid_lb and self.data_parallel_external_lb), (
+            "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
+        )
+        assert self.data_parallel_backend == "mp" or self.nnodes == 1, (
+            "nnodes > 1 is only supported with data_parallel_backend=mp"
+        )
         inferred_data_parallel_rank = 0
         if self.nnodes > 1:
             world_size = (
@@ -1474,12 +1472,12 @@ class EngineArgs:
                 self.pipeline_parallel_size * self.tensor_parallel_size
             )
             local_world_size = world_size // self.nnodes
-            assert (
-                world_size % self.nnodes == 0
-            ), f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
-            assert (
-                self.node_rank < self.nnodes
-            ), f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
+            assert world_size % self.nnodes == 0, (
+                f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
+            )
+            assert self.node_rank < self.nnodes, (
+                f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
+            )
             inferred_data_parallel_rank = (
                 self.node_rank * local_world_size
             ) // world_size_within_dp
@@ -1542,9 +1540,9 @@ class EngineArgs:
                     self.node_rank,
                 )
         else:
-            assert (
-                not self.data_parallel_hybrid_lb
-            ), "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
+            assert not self.data_parallel_hybrid_lb, (
+                "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
+            )
 
             if self.data_parallel_backend == "ray" and (
                 envs.VLLM_RAY_DP_PACK_STRATEGY == "span"
