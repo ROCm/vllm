@@ -1212,6 +1212,12 @@ class FusedMoE(CustomOp):
                 else:
                     dim1 = loaded_weight.shape[0]
                     dim2 = loaded_weight.shape[1]
+
+                    print(f"{weight_name=}")
+                    print(f"{dim1=} {dim2=}")
+                    print(f"{expert_data.shape=}")
+                    print(f"{loaded_weight.shape=}")
+
                     expert_data.data[:dim1, :dim2].copy_(loaded_weight)
                 return True if return_success else None
 
