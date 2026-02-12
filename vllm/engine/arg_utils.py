@@ -1825,6 +1825,13 @@ class EngineArgs:
             weight_transfer_config=self.weight_transfer_config,
         )
 
+        # Log MoE config being set
+        if config.moe_config.backend is not None:
+            logger.info_once(
+                "MoE backend set to %s (from --moe_config.backend).",
+                config.moe_config.backend.name,
+            )
+
         return config
 
     def _check_feature_supported(self, model_config: ModelConfig):

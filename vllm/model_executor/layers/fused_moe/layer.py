@@ -369,6 +369,13 @@ class FusedMoE(CustomOp):
         vllm_config = get_current_vllm_config()
         self.vllm_config = vllm_config
 
+        # Log MoE backend confirmation
+        if vllm_config.moe_config.backend is not None:
+            logger.info_once(
+                "MoE backend confirmed: %s (from --moe_config.backend).",
+                vllm_config.moe_config.backend.name,
+            )
+
         # FIXME (varun): We should have a better way of inferring the activation
         # datatype. This works for now as the tensor datatype entering the MoE
         # operation is typically unquantized (i.e. float16/bfloat16).
@@ -1725,14 +1732,8 @@ class FusedMoE(CustomOp):
                 batched_hidden_states = self.batched_hidden_states
                 batched_router_logits = self.batched_router_logits
 
-            assert (
-                batched_hidden_states.size(0)  # type: ignore
-                >= chunk_size
-            )
-            assert (
-                batched_router_logits.size(0)  # type: ignore
-                >= chunk_size
-            )
+            assert batched_hidden_states.size(0) >= chunk_size  # type: ignore
+            assert batched_router_logits.size(0) >= chunk_size  # type: ignore
             staged_hidden_states = batched_hidden_states[:chunk_size, :]  # type: ignore
             staged_router_logits = batched_router_logits[:chunk_size, :]  # type: ignore
             staged_hidden_states.copy_(hidden_states, non_blocking=True)
@@ -2022,9 +2023,11 @@ class FusedMoE(CustomOp):
         return [
             # (param_name, weight_name, expert_id, shard_id)
             (
-                f"experts.{base_layer}w13_"
-                if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
-                else f"experts.{base_layer}w2_",
+                (
+                    f"experts.{base_layer}w13_"
+                    if weight_name in [ckpt_gate_proj_name, ckpt_up_proj_name]
+                    else f"experts.{base_layer}w2_"
+                ),
                 f"experts.{physical_to_logical_map[expert_id]}.{weight_name}.{base_layer}",
                 expert_id,
                 shard_id,

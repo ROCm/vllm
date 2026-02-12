@@ -73,11 +73,6 @@ def _get_user_specified_moe_backend() -> Mxfp4Backend | None:
         return None
 
     backend = vllm_config.moe_config.backend
-    if backend is not None:
-        logger.info_once(
-            "Using user-specified MoE backend: %s (via --moe_config.backend)",
-            backend.name,
-        )
     return backend
 
 
@@ -111,6 +106,10 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
     # check if --moe_config.backend was used
     user_backend = _get_user_specified_moe_backend()
     if user_backend is not None:
+        logger.info_once(
+            "MoE backend being used: %s (from --moe_config.backend).",
+            user_backend.name,
+        )
         return user_backend
 
     # Fall back to auto-detection
