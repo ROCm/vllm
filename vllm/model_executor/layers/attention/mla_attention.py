@@ -261,6 +261,14 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+AITER_FP8_PREFILL = True
+from aiter import (
+        get_ps_metadata_info_v1,
+        get_ps_metadata_v1,
+        mla_prefill_ps_asm_fwd,
+        mla_reduce_v1,
+)
+
 logger = init_logger(__name__)
 
 
@@ -1342,6 +1350,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.device = device
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
+        self.num_kv_heads = self.model_config.get_num_kv_heads(vllm_config.parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
         self.aot_schedule = current_platform.is_cuda()
 
@@ -1560,6 +1569,97 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
 
         return self.build(0, m)
 
+    def make_mla_prefill_ps_meta_data_buffer(
+        self, batch_size: int, max_qlen: int, qlen_granularity: int
+    ):
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_size, work_info_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_ps_metadata_info_v1(
+            batch_size=batch_size,
+            num_head_k=self.num_heads, # In MLA, the non-latent num_qo_heads == num_kv_heads
+            max_qlen=max_qlen,
+            qlen_granularity=qlen_granularity,
+        )
+
+        device = self.device
+        work_metadata_ptrs = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        )
+        work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        )
+        work_info = torch.empty(work_info_size, dtype=work_info_type, device=device)
+        reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        )
+        reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        )
+        reduce_partial_map = torch.empty(
+            reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+        )
+
+        return (
+            work_metadata_ptrs,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+        )
+
+    def make_mla_prefill_ps_meta_data(
+        self,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        seq_lens: torch.Tensor,
+        work_metadata: torch.Tensor,
+        work_indptr: torch.Tensor,
+        work_info: torch.Tensor,
+        reduce_indptr: torch.Tensor,
+        reduce_final_map: torch.Tensor,
+        reduce_partial_map: torch.Tensor,
+        is_causal: bool = True,
+    ):
+        # In MLA, the non-latent num_qo_heads == num_kv_heads
+        num_heads_k = self.num_heads
+        gqa_ratio = self.num_heads // num_heads_k
+        tile_q = 256
+        qhead_granularity = gqa_ratio
+        qlen_granularity = tile_q // qhead_granularity
+        kvlen_granularity = max(128, self.kv_cache_spec.block_size)
+        block_size = self.kv_cache_spec.block_size
+        #print(f">>> {block_size=} {self.num_heads=} {self.num_kv_heads=}",flush=True)
+        #print(f"{self.kv_cache_spec.block_size=}")
+
+        qo_indptr_cpu = qo_indptr.to("cpu", dtype=torch.int32)
+        kv_indptr_cpu = kv_indptr.to("cpu", dtype=torch.int32)
+        seq_lens_cpu = seq_lens.to("cpu", dtype=torch.int32)
+
+        get_ps_metadata_v1(
+            qo_indptr_cpu,
+            kv_indptr_cpu,
+            seq_lens_cpu,
+            gqa_ratio,
+            num_heads_k,
+            work_metadata,
+            work_indptr,
+            work_info,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            qhead_granularity=qhead_granularity,
+            qlen_granularity=qlen_granularity,
+            kvlen_granularity=kvlen_granularity,
+            block_size=block_size,
+            is_causal=is_causal,
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -1771,14 +1871,79 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     <= self.chunked_prefill_workspace_size
                 )
 
-            prefill_metadata = self.prefill_metadata_cls(
-                block_table=block_table_tensor[reqs_start:, ...],
-                query_start_loc=prefill_query_start_loc,
-                max_query_len=max_query_len,
-                chunked_context=chunked_context_metadata,
-                output_dtype=self.model_config.dtype,
-                q_data_type=self.q_data_type,
-            )
+            #print(f"BUILDING PREFILL METADATA",flush=True)
+            if AITER_FP8_PREFILL:
+                max_q_len = max_query_len
+                qo_indptr = prefill_query_start_loc
+                query_seq_lens = (
+                    prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
+                )
+                bs = query_seq_lens.shape[0]
+
+                work_metadata = None
+                work_indptr = None
+                work_info_set = None
+                reduce_indptr = None
+                reduce_final_map = None
+                reduce_partial_map = None
+
+                tile_q = 256
+                # In MLA, the non-latent num_qo_heads == num_kv_heads
+                num_kv_heads = self.num_heads
+
+                qlen_granularity = tile_q // (self.num_heads // num_kv_heads)
+                (
+                    work_metadata,
+                    work_indptr,
+                    work_info_set,
+                    reduce_indptr,
+                    reduce_final_map,
+                    reduce_partial_map,
+                ) = self.make_mla_prefill_ps_meta_data_buffer(
+                    bs, max_q_len, qlen_granularity
+                )
+
+                #print(f">>> {bs=} {max_q_len=} {self.num_heads=} {self.num_kv_heads} {query_seq_lens=}",flush=True)
+
+                self.make_mla_prefill_ps_meta_data(
+                    qo_indptr,
+                    qo_indptr,
+                    query_seq_lens,
+                    work_metadata,
+                    work_indptr,
+                    work_info_set,
+                    reduce_indptr,
+                    reduce_final_map,
+                    reduce_partial_map,
+                    is_causal=True,
+                )
+
+                # TODO: Make its own prefill metadata class
+                prefill_metadata = self.prefill_metadata_cls(
+                    block_table=block_table_tensor[reqs_start:, ...],
+                    query_start_loc=prefill_query_start_loc,
+                    max_query_len=max_query_len,
+                    chunked_context=chunked_context_metadata,
+                    output_dtype=self.model_config.dtype,
+                    q_data_type=self.q_data_type,
+                )
+                prefill_metadata.qo_indptr = qo_indptr
+                prefill_metadata.reduce_indptr = reduce_indptr
+                prefill_metadata.reduce_final_map = reduce_final_map
+                prefill_metadata.reduce_partial_map = reduce_partial_map
+                prefill_metadata.work_indptr = work_indptr
+                prefill_metadata.work_info_set = work_info_set
+                prefill_metadata.max_q_len = max_q_len
+            else:
+
+                prefill_metadata = self.prefill_metadata_cls(
+                    block_table=block_table_tensor[reqs_start:, ...],
+                    query_start_loc=prefill_query_start_loc,
+                    max_query_len=max_query_len,
+                    chunked_context=chunked_context_metadata,
+                    output_dtype=self.model_config.dtype,
+                    q_data_type=self.q_data_type,
+                )
 
             if self._use_cudnn_prefill:
                 assert isinstance(prefill_metadata, CudnnPrefillMetadata)
@@ -2004,6 +2169,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             logger.info_once("Using FlashAttention prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fa
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fa
+            if AITER_FP8_PREFILL:
+                self._run_prefill_new_tokens = self._run_prefill_new_tokens_fa_aiter
 
             # Handle the differences between the flash_attn_varlen from
             # flash_attn and the one from vllm_flash_attn. The former is used on
@@ -2070,6 +2237,84 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             return attn_out, lse
         return attn_out
 
+    def _run_prefill_new_tokens_fa_aiter(
+        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+    ):
+        #print(f"_new tokens {return_softmax_lse=}", flush=True)
+        total_s = q.shape[0]
+        nhead = self.num_heads#layer.tp_q_head_num
+        v_head_dim = self.v_head_dim#layer.v_head_dim
+        #print(f">>> {q.dtype=} {k.dtype=} {v.dtype=} {nhead=} {v_head_dim=} {prefill.output_dtype=}")
+        if q.dtype != torch.float8_e4m3fn:
+            q = q.float().to(torch.float8_e4m3fn)
+        if k.dtype != torch.float8_e4m3fn:
+            k = k.float().to(torch.float8_e4m3fn)
+        if v.dtype != torch.float8_e4m3fn:
+            v = v.float().to(torch.float8_e4m3fn)
+        one_scale = torch.tensor(
+            1.0, dtype=torch.float32, device=q.device
+        )
+
+        kv_indptr_asm = prefill.qo_indptr
+        kv_indices_asm = torch.arange(
+            total_s, device=q.device, dtype=torch.int32
+        )
+
+        tile_q = 256
+        reduce_indptr = prefill.reduce_indptr
+        reduce_final_map = prefill.reduce_final_map
+        reduce_partial_map = prefill.reduce_partial_map
+
+        logits = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead, v_head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        attn_lse = torch.empty(
+            (reduce_partial_map.size(0) * tile_q, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        final_lse = torch.empty(
+            (total_s, nhead),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        output = q.new_empty(
+            (total_s, nhead, v_head_dim),
+            dtype=prefill.output_dtype,
+        )
+
+        mla_prefill_ps_asm_fwd(
+            q,
+            k,
+            v,
+            prefill.qo_indptr,
+            kv_indptr_asm,
+            kv_indices_asm,
+            prefill.work_indptr,
+            prefill.work_info_set,
+            prefill.max_q_len,
+            self.scale,
+            True,
+            logits,
+            attn_lse,
+            output,
+            one_scale,
+            one_scale,
+            one_scale,
+        )
+        mla_reduce_v1(
+            logits,
+            attn_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            tile_q,
+            output,
+            final_lse,
+        )
+        return output
     def _run_prefill_new_tokens_fa(
         self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
     ):
@@ -2134,6 +2379,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         self, prefill: MLACommonPrefillMetadata, chunk_idx: int, q, k, v
     ):
         assert prefill.chunked_context is not None
+        #print("JUANNNN chunk_fa", flush=True)
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,

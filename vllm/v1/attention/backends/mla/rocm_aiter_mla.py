@@ -230,6 +230,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
     def _flash_attn_varlen_diff_headdims(
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
+
+        print(f"flash attn 234", flush=True)
         output = self.flash_attn_varlen_func(  # type: ignore[call-arg]
             q=q,
             k=k,
