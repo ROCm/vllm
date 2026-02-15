@@ -487,6 +487,9 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         if envs.VLLM_ROCM_USE_CK_MXFP4_MOE:
             from aiter.utility.fp4_utils import e8m0_shuffle
 
+            from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa E501
+                shuffle_weights)
+
             # Pre-shuffle weight scales
             s0, s1, _ = layer.w13_weight_scale.shape
             w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
@@ -497,6 +500,17 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
             w2_weight_scale = e8m0_shuffle(w2_weight_scale)
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+
+            # Pre-shuffle weight
+            shuffled_w13, shuffled_w2 = shuffle_weights(
+                layer.w13_weight.data, layer.w2_weight.data)
+
+            layer.w13_weight = torch.nn.Parameter(shuffled_w13,
+                                                  requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(shuffled_w2,
+                                                 requires_grad=False)
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
             torch.cuda.empty_cache()
 
     def get_fused_moe_quant_config(
@@ -562,6 +576,8 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             else:
                 w13_weight = layer.w13_weight
                 w2_weight = layer.w2_weight
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
 
             out = fused_moe(
                 x,
