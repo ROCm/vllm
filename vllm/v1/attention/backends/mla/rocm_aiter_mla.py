@@ -231,7 +231,6 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         self, q, k, v, return_softmax_lse=False, softmax_scale=None, **kwargs
     ):
 
-        print(f"flash attn 234", flush=True)
         output = self.flash_attn_varlen_func(  # type: ignore[call-arg]
             q=q,
             k=k,

@@ -1871,8 +1871,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     <= self.chunked_prefill_workspace_size
                 )
 
-            #print(f"BUILDING PREFILL METADATA",flush=True)
             if AITER_FP8_PREFILL:
+
+                #print(f" >>>>>>>  BUILDING PREFILL METADATA",flush=True)
                 max_q_len = max_query_len
                 qo_indptr = prefill_query_start_loc
                 query_seq_lens = (
@@ -2241,21 +2242,29 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
     ):
         #print(f"_new tokens {return_softmax_lse=}", flush=True)
+        #with torch.autograd.profiler.record_function("preamble"):
         total_s = q.shape[0]
         nhead = self.num_heads#layer.tp_q_head_num
         v_head_dim = self.v_head_dim#layer.v_head_dim
         #print(f">>> {q.dtype=} {k.dtype=} {v.dtype=} {nhead=} {v_head_dim=} {prefill.output_dtype=}")
+
+        #with torch.autograd.profiler.record_function("quants"):
         if q.dtype != torch.float8_e4m3fn:
             q = q.float().to(torch.float8_e4m3fn)
         if k.dtype != torch.float8_e4m3fn:
             k = k.float().to(torch.float8_e4m3fn)
         if v.dtype != torch.float8_e4m3fn:
             v = v.float().to(torch.float8_e4m3fn)
+
+        #with torch.autograd.profiler.record_function("one scale"):
         one_scale = torch.tensor(
             1.0, dtype=torch.float32, device=q.device
         )
 
+        #with torch.autograd.profiler.record_function("copy qo_indptr"):
         kv_indptr_asm = prefill.qo_indptr
+
+        #with torch.autograd.profiler.record_function("arange"):
         kv_indices_asm = torch.arange(
             total_s, device=q.device, dtype=torch.int32
         )
@@ -2314,6 +2323,8 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             output,
             final_lse,
         )
+        if return_softmax_lse:
+            return output, final_lse
         return output
     def _run_prefill_new_tokens_fa(
         self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
@@ -2793,6 +2804,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         )
 
         if has_context:
+            #print(f"CONTEXT",flush=True)
             suffix_output, suffix_lse = output_prefill
             if self.dcp_world_size > 1:
                 context_output, context_lse = (
@@ -2823,6 +2835,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 suffix_lse=suffix_lse,
             )
         else:
+            #print(f"NO CONTEXT",flush=True)
             output_prefill = output_prefill[..., : v.shape[-1]].flatten(start_dim=-2)
             output.copy_(output_prefill)
 
