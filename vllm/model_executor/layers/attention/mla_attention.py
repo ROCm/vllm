@@ -1935,6 +1935,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 prefill_metadata.work_indptr = work_indptr
                 prefill_metadata.work_info_set = work_info_set
                 prefill_metadata.max_q_len = max_q_len
+
+                prefill_metadata.one_scale = torch.tensor(
+                    1.0, dtype=torch.float32, device=device
+                )
             else:
 
                 prefill_metadata = self.prefill_metadata_cls(
@@ -2256,11 +2260,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if v.dtype != torch.float8_e4m3fn:
             v = v.float().to(torch.float8_e4m3fn)
 
-        #with torch.autograd.profiler.record_function("one scale"):
-        one_scale = torch.tensor(
-            1.0, dtype=torch.float32, device=q.device
-        )
-
         #with torch.autograd.profiler.record_function("copy qo_indptr"):
         kv_indptr_asm = prefill.qo_indptr
 
@@ -2309,9 +2308,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             logits,
             attn_lse,
             output,
-            one_scale,
-            one_scale,
-            one_scale,
+            prefill.one_scale,
+            prefill.one_scale,
+            prefill.one_scale,
         )
         mla_reduce_v1(
             logits,
