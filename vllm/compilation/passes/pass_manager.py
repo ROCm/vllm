@@ -141,7 +141,8 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.fuse_rope_kvcache:
                 self.passes += [SplitCoalescingPass(config)]
                 self.passes += [ScatterSplitReplacementPass(config)]
-                self.passes += [ROCmAiterTritonRopeReshapeKVCacheFusionPass(config)]
+                if rocm_aiter_ops.is_enabled():
+                    self.passes += [ROCmAiterTritonRopeReshapeKVCacheFusionPass(config)]
 
             if self.pass_config.fuse_attn_quant:
                 self.passes += [AttnFusionPass(config)]
