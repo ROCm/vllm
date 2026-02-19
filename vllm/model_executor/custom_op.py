@@ -179,6 +179,7 @@ class CustomOp(nn.Module):
             compilation_config.disabled_custom_ops.update([self.__class__.name])
 
         if not enabled:
+            return self.forward_native
             # Compile forward_native to avoid eager torch ops if inside
             # opaque torch custom op (e.g. fused_moe, unified_attention, etc.)
             return self.maybe_compile(self.forward_native, enable=compile_native)
