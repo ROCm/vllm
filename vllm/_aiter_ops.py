@@ -857,9 +857,6 @@ def _rocm_aiter_qkv_proj_layernorm_impl(
     )
     if k_pe_reduced_out is not None:
         k_pe = k_pe_reduced_out
-    # Return q_c_scale with transposed strides to match mxfp4_quant's
-    # output layout, preventing PatternMatcherPass from inserting a
-    # stride-conversion copy node.
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 

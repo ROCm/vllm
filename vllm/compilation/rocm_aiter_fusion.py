@@ -24,7 +24,7 @@ from vllm.platforms import current_platform
 from .fusion import (
     FusedRMSQuantKey,
 )
-from .fx_utils import find_getitem, find_getitem_maybe, is_func
+
 from .inductor_pass import enable_fake_mode
 from .matcher_utils import (
     MatcherFusedAddRMSNorm,
@@ -530,11 +530,8 @@ class RocmAiterSiluMulFp8GroupQuantFusionPass(VllmPatternMatcherPass):
         return VllmInductorPass.hash_source(self, *fusion_patterns)
 
 
-class RocmAiterGemmReduceRMSNormMXFP4FusionPass(VllmInductorPass):
+class AiterGemmReduceRMSNormMXFP4Pattern:
     """
-    Graph rewrite pass that fuses a split-k GEMM's internal reduce with
-    downstream RMSNorm and MXFP4 quantization.
-
     Matches the MLA pattern:
       gemm_with_dynamic_quant -> split -> rmsnorm_mxfp4_quant(q_c)
                                        -> split -> rms_norm(kv_c)
@@ -552,259 +549,151 @@ class RocmAiterGemmReduceRMSNormMXFP4FusionPass(VllmInductorPass):
     )
     RMSNORM_OP = torch.ops.vllm.rocm_aiter_rms_norm.default
 
-    def __init__(self, config: VllmConfig):
+    def __init__(
+        self,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        epsilon: float,
+    ) -> None:
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.epsilon = epsilon
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        q_lora_rank = self.q_lora_rank
+        kv_lora_rank = self.kv_lora_rank
+        qk_rope_head_dim = self.qk_rope_head_dim
+        epsilon = self.epsilon
+        N = q_lora_rank + kv_lora_rank + qk_rope_head_dim
+
+        GEMM_OP = self.GEMM_OP
+        RMSNORM_MXFP4_QUANT_OP = self.RMSNORM_MXFP4_QUANT_OP
+        RMSNORM_OP = self.RMSNORM_OP
+        FUSED_OP = self.FUSED_OP
+
+        def pattern(
+            x_q: torch.Tensor,
+            x_s: torch.Tensor,
+            w: torch.Tensor,
+            ws: torch.Tensor,
+            q_weight: torch.Tensor,
+            kv_weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            qkv = GEMM_OP(x_q, w, ws, False, torch.bfloat16, x_s)
+            split1 = torch.ops.aten.split_with_sizes.default(
+                qkv, [q_lora_rank, kv_lora_rank + qk_rope_head_dim], -1
+            )
+            q_c = operator.getitem(split1, 0)
+            kv_lora = operator.getitem(split1, 1)
+            rms_result = RMSNORM_MXFP4_QUANT_OP(
+                q_c, q_weight, epsilon
+            )
+            q_cq = operator.getitem(rms_result, 0)
+            q_cs = operator.getitem(rms_result, 1)
+            split2 = torch.ops.aten.split_with_sizes.default(
+                kv_lora, [kv_lora_rank, qk_rope_head_dim], -1
+            )
+            kv_c = operator.getitem(split2, 0)
+            k_pe = operator.getitem(split2, 1)
+            kv_c_normed = RMSNORM_OP(kv_c, kv_weight, epsilon)
+            return q_cq, q_cs, kv_c_normed, k_pe
+
+        def replacement(
+            x_q: torch.Tensor,
+            x_s: torch.Tensor,
+            w: torch.Tensor,
+            ws: torch.Tensor,
+            q_weight: torch.Tensor,
+            kv_weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            result = FUSED_OP(
+                x_q, x_s, w, ws,
+                q_weight, epsilon,
+                kv_weight, epsilon,
+                q_lora_rank, kv_lora_rank, qk_rope_head_dim,
+            )
+            return (
+                operator.getitem(result, 0),
+                operator.getitem(result, 1),
+                operator.getitem(result, 2),
+                operator.getitem(result, 3),
+            )
+
+        M = 5
+        K = 128
+        x_q = torch.empty((M, K // 2), dtype=torch.uint8, device="cuda")
+        x_s = torch.empty(
+            (M, K // 32), dtype=torch.uint8, device="cuda"
+        )
+        w = torch.empty((N, K // 2), dtype=torch.uint8, device="cuda")
+        ws = torch.empty(
+            (N, K // 32), dtype=torch.uint8, device="cuda"
+        )
+        q_weight = torch.empty(
+            q_lora_rank, dtype=torch.bfloat16, device="cuda"
+        )
+        kv_weight = torch.empty(
+            kv_lora_rank, dtype=torch.bfloat16, device="cuda"
+        )
+
+        inputs = [x_q, x_s, w, ws, q_weight, kv_weight]
+        pm.register_replacement(
+            pattern, replacement, inputs, pm.fwd_only, pm_pass
+        )
+
+
+class RocmAiterGemmReduceRMSNormMXFP4FusionPass(VllmPatternMatcherPass):
+    """
+    Graph rewrite pass that fuses a split-k GEMM's internal reduce with
+    downstream RMSNorm and MXFP4 quantization.
+
+    Matches the MLA pattern:
+      gemm_with_dynamic_quant -> split -> rmsnorm_mxfp4_quant(q_c)
+                                       -> split -> rms_norm(kv_c)
+                                                 -> k_pe
+
+    Replaces with a single rocm_aiter_qkv_proj_layernorm op that calls
+    gemm_afp4wfp4(skip_reduce=True) followed by fused_reduce_rms_mxfp4_quant,
+    saving the separate reduce kernel launch.
+    """
+
+    @enable_fake_mode
+    def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
+
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="rocm_aiter_gemm_reduce_rmsnorm_mxfp4_fusion_pass"
+        )
+
+        hf_config = getattr(config.model_config, "hf_config", None)
+        if hf_config is None:
+            return
+
+        q_lora_rank = getattr(hf_config, "q_lora_rank", None)
+        kv_lora_rank = getattr(hf_config, "kv_lora_rank", None)
+        qk_rope_head_dim = getattr(hf_config, "qk_rope_head_dim", None)
+        rms_norm_eps = getattr(hf_config, "rms_norm_eps", None)
+
+        if not all(v is not None for v in [
+            q_lora_rank, kv_lora_rank, qk_rope_head_dim, rms_norm_eps
+        ]):
+            return
+
+        AiterGemmReduceRMSNormMXFP4Pattern(
+            q_lora_rank, kv_lora_rank, qk_rope_head_dim, rms_norm_eps
+        ).register(self.patterns)
+
+        self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        count = 0
-        for node in list(graph.nodes):
-            if not is_func(node, self.GEMM_OP):
-                continue
-
-            match = self._match_pattern(node)
-            if match is None:
-                continue
-
-            self._replace_pattern(graph, match)
-            count += 1
-
+        self.matched_count = self.patterns.apply(graph)
         logger.debug(
-            "Fused %d gemm+reduce+rmsnorm+mxfp4_quant patterns", count
+            "Fused %d gemm+reduce+rmsnorm+mxfp4_quant patterns",
+            self.matched_count,
         )
-
-    def _match_pattern(
-        self, gemm_node: fx.Node
-    ) -> dict[str, fx.Node | int] | None:
-        """
-        Match the MLA subgraph pattern starting from a gemm_with_dynamic_quant
-        node. Returns a dict of matched nodes, or None if no match.
-        """
-        split1_node = None
-        for user in gemm_node.users:
-            if is_func(user, torch.ops.aten.split_with_sizes.default):
-                split1_node = user
-                break
-
-        if split1_node is None:
-            return None
-
-        q_c_item = find_getitem_maybe(split1_node, 0)
-        kv_lora_item = find_getitem_maybe(split1_node, 1)
-
-        if q_c_item is None or kv_lora_item is None:
-            return None
-
-        rmsnorm_mxfp4_quant_node = None
-        for user in q_c_item.users:
-            if is_func(user, self.RMSNORM_MXFP4_QUANT_OP):
-                rmsnorm_mxfp4_quant_node = user
-                break
-
-        if rmsnorm_mxfp4_quant_node is None:
-            return None
-
-        split2_node = None
-        for user in kv_lora_item.users:
-            if is_func(user, torch.ops.aten.split_with_sizes.default):
-                split2_node = user
-                break
-
-        if split2_node is None:
-            return None
-
-        kv_c_item = find_getitem_maybe(split2_node, 0)
-        k_pe_item = find_getitem_maybe(split2_node, 1)
-
-        if kv_c_item is None or k_pe_item is None:
-            return None
-
-        rmsnorm_node = None
-        for user in kv_c_item.users:
-            if is_func(user, self.RMSNORM_OP):
-                rmsnorm_node = user
-                break
-
-        if rmsnorm_node is None:
-            return None
-
-        return {
-            "gemm": gemm_node,
-            "split1": split1_node,
-            "q_c_item": q_c_item,
-            "kv_lora_item": kv_lora_item,
-            "rmsnorm_mxfp4_quant": rmsnorm_mxfp4_quant_node,
-            "split2": split2_node,
-            "kv_c_item": kv_c_item,
-            "k_pe_item": k_pe_item,
-            "rmsnorm": rmsnorm_node,
-        }
-
-    def _replace_pattern(
-        self, graph: fx.Graph, match: dict[str, fx.Node | int]
-    ) -> None:
-        gemm_node = match["gemm"]
-        split1_node = match["split1"]
-        rmsnorm_mxfp4_quant_node = match["rmsnorm_mxfp4_quant"]
-        rmsnorm_node = match["rmsnorm"]
-        k_pe_item = match["k_pe_item"]
-
-        # gemm_with_dynamic_quant(x_q, w, ws, asm_flag, dtype, x_s)
-        x_q = gemm_node.args[0]
-        w = gemm_node.args[1]
-        ws = gemm_node.args[2]
-        x_s = gemm_node.args[5]
-
-        # rmsnorm_mxfp4_quant(q_c, weight, eps)
-        q_a_weight = rmsnorm_mxfp4_quant_node.args[1]
-        q_a_eps = rmsnorm_mxfp4_quant_node.args[2]
-
-        # rms_norm(kv_c, weight, eps)
-        kv_a_weight = rmsnorm_node.args[1]
-        kv_a_eps = rmsnorm_node.args[2]
-
-        # split dimensions
-        split1_sizes = split1_node.args[1]
-        split2_sizes = match["split2"].args[1]
-
-        q_lora_rank = split1_sizes[0]
-        kv_lora_rank = split2_sizes[0]
-        qk_rope_head_dim = split2_sizes[1]
-
-        # Insert fused op before the split
-        with graph.inserting_before(split1_node):
-            fused_node = graph.call_function(
-                self.FUSED_OP,
-                args=(
-                    x_q,
-                    x_s,
-                    w,
-                    ws,
-                    q_a_weight,
-                    q_a_eps,
-                    kv_a_weight,
-                    kv_a_eps,
-                    q_lora_rank,
-                    kv_lora_rank,
-                    qk_rope_head_dim,
-                ),
-            )
-            q_cq_node = graph.call_function(
-                operator.getitem, args=(fused_node, 0)
-            )
-            q_cs_node = graph.call_function(
-                operator.getitem, args=(fused_node, 1)
-            )
-            kv_c_normed_node = graph.call_function(
-                operator.getitem, args=(fused_node, 2)
-            )
-            k_pe_reduced_node = graph.call_function(
-                operator.getitem, args=(fused_node, 3)
-            )
-
-        # Compute FakeTensor metadata for the new nodes
-        self._set_meta(
-            gemm_node,
-            fused_node,
-            q_cq_node,
-            q_cs_node,
-            kv_c_normed_node,
-            k_pe_reduced_node,
-            x_q,
-            x_s,
-            w,
-            ws,
-            q_a_weight,
-            q_a_eps,
-            kv_a_weight,
-            kv_a_eps,
-            q_lora_rank,
-            kv_lora_rank,
-            qk_rope_head_dim,
-        )
-
-        # Rewire downstream users
-        rms_quant_q = find_getitem(rmsnorm_mxfp4_quant_node, 0)
-        rms_quant_s = find_getitem(rmsnorm_mxfp4_quant_node, 1)
-
-        rms_quant_q.replace_all_uses_with(q_cq_node)
-        rms_quant_s.replace_all_uses_with(q_cs_node)
-        rmsnorm_node.replace_all_uses_with(kv_c_normed_node)
-        k_pe_item.replace_all_uses_with(k_pe_reduced_node)
-
-        # Erase dead nodes in reverse dependency order
-        self._erase_dead_nodes(
-            graph,
-            [
-                rms_quant_q,
-                rms_quant_s,
-                rmsnorm_mxfp4_quant_node,
-                match["q_c_item"],
-                rmsnorm_node,
-                match["kv_c_item"],
-                k_pe_item,
-                match["split2"],
-                match["kv_lora_item"],
-                split1_node,
-                gemm_node,
-            ],
-        )
-
-    def _set_meta(
-        self,
-        gemm_node,
-        fused_node,
-        q_cq_node,
-        q_cs_node,
-        kv_c_normed_node,
-        k_pe_reduced_node,
-        x_q,
-        x_s,
-        w,
-        ws,
-        q_a_weight,
-        q_a_eps,
-        kv_a_weight,
-        kv_a_eps,
-        q_lora_rank,
-        kv_lora_rank,
-        qk_rope_head_dim,
-    ):
-        """Compute and set FakeTensor metadata for the new nodes."""
-        gemm_fake = gemm_node.meta["val"]
-        fake_mode = gemm_fake.fake_mode
-
-        def _get_val(arg):
-            return arg.meta["val"] if isinstance(arg, fx.Node) else arg
-
-        with fake_mode:
-            fake_out = self.FUSED_OP(
-                _get_val(x_q),
-                _get_val(x_s),
-                _get_val(w),
-                _get_val(ws),
-                _get_val(q_a_weight),
-                q_a_eps,
-                _get_val(kv_a_weight),
-                kv_a_eps,
-                q_lora_rank,
-                kv_lora_rank,
-                qk_rope_head_dim,
-            )
-
-        fused_node.meta["val"] = fake_out
-        q_cq_node.meta["val"] = fake_out[0]
-        q_cs_node.meta["val"] = fake_out[1]
-        kv_c_normed_node.meta["val"] = fake_out[2]
-        k_pe_reduced_node.meta["val"] = fake_out[3]
-
-    @staticmethod
-    def _erase_dead_nodes(
-        graph: fx.Graph, nodes: list[fx.Node]
-    ) -> None:
-        for node in nodes:
-            if len(node.users) == 0:
-                graph.erase_node(node)
 
     def uuid(self) -> str:
-        return self.hash_source(self)
+        return self.hash_source(self, AiterGemmReduceRMSNormMXFP4Pattern)
