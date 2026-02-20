@@ -366,18 +366,27 @@ class QuarkOCP_MX(QuarkScheme):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
-        x_quant_scales: torch.Tensor = None,
     ) -> torch.Tensor:
         if self.emulate:
             dq_w = self.dequant_func(layer.weight, layer.weight_scale, x.dtype)
             qdq_x = self.quant_dequant_func(x)
             return F.linear(qdq_x, dq_w, bias)
-        else:
+        elif self.rocm_use_aiter_fp4_asm_gemm:
             return torch.ops.vllm.gemm_with_dynamic_quant(
                 x,
                 layer.weight,
                 layer.weight_scale,
-                self.rocm_use_aiter_fp4_asm_gemm,
+                True,
                 self.out_dtype,
-                x_quant_scales
+                None,
+            )
+        else:
+            x_q, x_s = torch.ops.vllm.rocm_aiter_mxfp4_quant(x)
+            return torch.ops.vllm.gemm_with_dynamic_quant(
+                x_q,
+                layer.weight,
+                layer.weight_scale,
+                False,
+                self.out_dtype,
+                x_s,
             )

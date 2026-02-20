@@ -38,10 +38,6 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-X_QUANT_SCALES_SUPPORTED = [
-    "QuarkLinearMethod",
-]
-
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
     "CompressedTensorsLinearMethod",
@@ -68,11 +64,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "PetitNvFp4LinearMethod",
 ]
 
-def _supports_x_quant_scales(quant_method: QuantizeMethodBase) -> bool:
-    """Check if quantization method supports x_quant_scales parameter."""
-    if quant_method.__class__.__name__ in X_QUANT_SCALES_SUPPORTED:
-        return True
-    return False
 
 def adjust_bitblas_shard(param, shard_size, shard_offset):
     bitblas_tile_size = getattr(param, "bitblas_tile_size", None)
@@ -416,20 +407,11 @@ class ReplicatedLinear(LinearBase):
     def forward(
         self,
         x: torch.Tensor,
-        x_quant_scales: torch.Tensor = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
 
-        if _supports_x_quant_scales(self.quant_method):
-            output = self.quant_method.apply(self, x, bias, x_quant_scales=x_quant_scales)
-        else:
-            if x_quant_scales is not None:
-                raise ValueError(
-                    f"x_quant_scales is not supported for {self.quant_method.__class__.__name__}. "
-                    f"Only Fp8LinearMethod and QuarkLinearMethod support this parameter."
-                )
-            output = self.quant_method.apply(self, x, bias)
+        output = self.quant_method.apply(self, x, bias)
 
         if not self.return_bias:
             return output
@@ -615,20 +597,11 @@ class ColumnParallelLinear(LinearBase):
     def forward(
         self,
         input_,
-        x_quant_scales: torch.Tensor = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         bias = self.bias if not self.skip_bias_add else None
 
         assert self.quant_method is not None
-        if _supports_x_quant_scales(self.quant_method):
-            output_parallel = self.quant_method.apply(self, input_, bias, x_quant_scales=x_quant_scales)
-        else:
-            if x_quant_scales is not None:
-                raise ValueError(
-                    f"x_quant_scales is not supported for {self.quant_method.__class__.__name__}. "
-                    f"Only Fp8LinearMethod and QuarkLinearMethod support this parameter."
-                )
-            output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = self.quant_method.apply(self, input_, bias)
 
         if self.gather_output and self.tp_size > 1:
             # All-gather across the partitions.
@@ -1470,7 +1443,6 @@ class RowParallelLinear(LinearBase):
     def forward(
         self,
         input_,
-        x_quant_scales = None
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         if self.input_is_parallel:
             input_parallel = input_
@@ -1485,15 +1457,7 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        if _supports_x_quant_scales(self.quant_method):
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_, x_quant_scales=x_quant_scales)
-        else:
-            if x_quant_scales is not None:
-                raise ValueError(
-                    f"x_quant_scales is not supported for {self.quant_method.__class__.__name__}. "
-                    f"Only Fp8LinearMethod and QuarkLinearMethod support this parameter."
-                )
-            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)

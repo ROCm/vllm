@@ -699,6 +699,205 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
     )
 
 
+MXFP4_QUANT_GROUP_SIZE = 32
+
+
+def _rocm_aiter_mxfp4_quant_impl(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    return dynamic_mxfp4_quant(x)
+
+
+def _rocm_aiter_mxfp4_quant_fake(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    N_scales = (N + MXFP4_QUANT_GROUP_SIZE - 1) // MXFP4_QUANT_GROUP_SIZE
+    return (
+        torch.empty((M, N // 2), dtype=torch.uint8, device=x.device),
+        torch.empty(
+            (N_scales, M), dtype=torch.uint8, device=x.device
+        ).T,
+    )
+
+
+def _rocm_aiter_rmsnorm_mxfp4_quant_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+
+    (x_quant, x_quant_scales), _, _, _ = fused_rms_mxfp4_quant(
+        x,
+        weight,
+        variance_epsilon,
+        None,
+        None,
+        0,
+        res1=None,
+        shuffle=False,
+        scale_shuffle_padding=False,
+        output_unquantized_inp1=False,
+    )
+    return (x_quant, x_quant_scales)
+
+
+def _rocm_aiter_rmsnorm_mxfp4_quant_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    return (
+        torch.empty((M, N // 2), dtype=torch.uint8, device=x.device),
+        torch.empty(
+            (M, (N + MXFP4_QUANT_GROUP_SIZE - 1) // MXFP4_QUANT_GROUP_SIZE),
+            dtype=torch.uint8,
+            device=x.device,
+        ),
+    )
+
+
+def _rocm_aiter_rmsnorm_with_add_mxfp4_quant_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fused_mxfp4_quant import fused_rms_mxfp4_quant
+
+    (x_quant, x_quant_scales), _, _, res = fused_rms_mxfp4_quant(
+        x,
+        weight,
+        variance_epsilon,
+        None,
+        None,
+        0,
+        res1=residual,
+        shuffle=False,
+        scale_shuffle_padding=False,
+        output_unquantized_inp1=False,
+    )
+    return (x_quant, res, x_quant_scales)
+
+
+def _rocm_aiter_rmsnorm_with_add_mxfp4_quant_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    return (
+        torch.empty((M, N // 2), dtype=torch.uint8, device=x.device),
+        torch.empty_like(residual, device=residual.device),
+        torch.empty(
+            (M, (N + MXFP4_QUANT_GROUP_SIZE - 1) // MXFP4_QUANT_GROUP_SIZE),
+            dtype=torch.uint8,
+            device=x.device,
+        ),
+    )
+
+
+def _rocm_aiter_qkv_proj_layernorm_impl(
+    hidden_states_quant: torch.Tensor,
+    hidden_states_quant_scale: torch.Tensor,
+    weight_qkv_a_proj: torch.Tensor,
+    weight_scale_qkv_a_proj: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
+    from aiter.ops.triton.fused_mxfp4_quant import fused_reduce_rms_mxfp4_quant
+
+    qkv_lora = gemm_afp4wfp4(
+        hidden_states_quant,
+        weight_qkv_a_proj,
+        hidden_states_quant_scale,
+        weight_scale_qkv_a_proj.T,
+        skip_reduce=True,
+    )
+    q_c, kv_c, k_pe = qkv_lora.split(
+        [q_lora_rank, kv_lora_rank, qk_rope_head_dim], dim=-1
+    )
+    k_pe_reduced = None
+    k_pe_reduced_out = None
+    if k_pe.dim() == 3:
+        M = hidden_states_quant.shape[0]
+        device = hidden_states_quant.device
+        k_pe_reduced = k_pe
+        k_pe_reduced_out = torch.empty(
+            (M, q_lora_rank + kv_lora_rank + qk_rope_head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )[..., :qk_rope_head_dim]
+    (q_c, q_c_scale), _, kv_c_normed, _, k_pe_reduced_out = (
+        fused_reduce_rms_mxfp4_quant(
+            q_c,
+            q_a_layernorm_weight,
+            q_a_layernorm_variance_epsilon,
+            kv_c,
+            kv_a_layernorm_weight,
+            kv_a_layernorm_variance_epsilon,
+            k_pe_reduced,
+            res1=None,
+            shuffle=False,
+            scale_shuffle_padding=False,
+            dtype=torch.bfloat16,
+            out3=k_pe_reduced_out,
+        )
+    )
+    if k_pe_reduced_out is not None:
+        k_pe = k_pe_reduced_out
+    return q_c, q_c_scale, kv_c_normed, k_pe
+
+
+def _rocm_aiter_qkv_proj_layernorm_fake(
+    hidden_states_quant: torch.Tensor,
+    hidden_states_quant_scale: torch.Tensor,
+    weight_qkv_a_proj: torch.Tensor,
+    weight_scale_qkv_a_proj: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    M = hidden_states_quant.shape[0]
+    device = hidden_states_quant.device
+    q_c = torch.empty(
+        (M, q_lora_rank // 2), dtype=torch.uint8, device=device
+    )
+    q_c_scale = torch.empty(
+        (
+            M,
+            (q_lora_rank + MXFP4_QUANT_GROUP_SIZE - 1)
+            // MXFP4_QUANT_GROUP_SIZE,
+        ),
+        dtype=torch.uint8,
+        device=device,
+    )
+    kv_c_normed = torch.empty(
+        (M, kv_lora_rank), dtype=torch.bfloat16, device=device
+    )
+    k_pe = torch.empty(
+        (M, q_lora_rank + kv_lora_rank + qk_rope_head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )[..., :qk_rope_head_dim]
+    return q_c, q_c_scale, kv_c_normed, k_pe
+
+
 def _rocm_aiter_group_fp8_quant_impl(
     x: torch.Tensor,
     group_size: int,
@@ -1085,6 +1284,31 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_mxfp4_quant",
+                op_func=_rocm_aiter_mxfp4_quant_impl,
+                fake_impl=_rocm_aiter_mxfp4_quant_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_mxfp4_quant",
+                op_func=_rocm_aiter_rmsnorm_mxfp4_quant_impl,
+                fake_impl=_rocm_aiter_rmsnorm_mxfp4_quant_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_with_add_mxfp4_quant",
+                op_func=_rocm_aiter_rmsnorm_with_add_mxfp4_quant_impl,
+                fake_impl=_rocm_aiter_rmsnorm_with_add_mxfp4_quant_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_qkv_proj_layernorm",
+                op_func=_rocm_aiter_qkv_proj_layernorm_impl,
+                fake_impl=_rocm_aiter_qkv_proj_layernorm_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_per_tensor_quant",
                 op_func=_rocm_aiter_per_tensor_quant_impl,
                 mutates_args=[],
@@ -1132,6 +1356,18 @@ class rocm_aiter_ops:
     @staticmethod
     def get_group_quant_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_group_fp8_quant.default
+
+    @staticmethod
+    def get_mxfp4_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_mxfp4_quant.default
+
+    @staticmethod
+    def get_rmsnorm_mxfp4_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_mxfp4_quant.default
+
+    @staticmethod
+    def get_rmsnorm_with_add_mxfp4_quant_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_with_add_mxfp4_quant.default
 
     @staticmethod
     def get_act_mul_fused_fp8_group_quant_op() -> OpOverload:

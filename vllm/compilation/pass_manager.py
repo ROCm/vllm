@@ -18,7 +18,9 @@ from .vllm_inductor_pass import VllmInductorPass
 
 if rocm_aiter_ops.is_enabled():
     from vllm.compilation.rocm_aiter_fusion import (
+        RocmAiterGemmReduceRMSNormMXFP4FusionPass,
         RocmAiterRMSNormFusionPass,
+        RocmAiterRMSNormMXFP4FusionPass,
         RocmAiterSiluMulFp8GroupQuantFusionPass,
     )
 
@@ -124,6 +126,8 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [
                         RocmAiterRMSNormFusionPass(config),
+                        RocmAiterRMSNormMXFP4FusionPass(config),
+                        RocmAiterGemmReduceRMSNormMXFP4FusionPass(config),
                     ]
             if self.pass_config.fuse_act_quant:
                 self.passes += [ActivationQuantFusionPass(config)]
