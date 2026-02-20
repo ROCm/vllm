@@ -860,7 +860,6 @@ def _rocm_aiter_qkv_proj_layernorm_impl(
     # Return q_c_scale with transposed strides to match mxfp4_quant's
     # output layout, preventing PatternMatcherPass from inserting a
     # stride-conversion copy node.
-    q_c_scale = q_c_scale.T.contiguous().T
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
