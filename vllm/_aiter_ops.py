@@ -857,6 +857,10 @@ def _rocm_aiter_qkv_proj_layernorm_impl(
     )
     if k_pe_reduced_out is not None:
         k_pe = k_pe_reduced_out
+    # Return q_c_scale with transposed strides to match mxfp4_quant's
+    # output layout, preventing PatternMatcherPass from inserting a
+    # stride-conversion copy node.
+    q_c_scale = q_c_scale.T.contiguous().T
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
@@ -878,15 +882,11 @@ def _rocm_aiter_qkv_proj_layernorm_fake(
     q_c = torch.empty(
         (M, q_lora_rank // 2), dtype=torch.uint8, device=device
     )
+    N_scales = (q_lora_rank + MXFP4_QUANT_GROUP_SIZE - 1) \
+        // MXFP4_QUANT_GROUP_SIZE
     q_c_scale = torch.empty(
-        (
-            M,
-            (q_lora_rank + MXFP4_QUANT_GROUP_SIZE - 1)
-            // MXFP4_QUANT_GROUP_SIZE,
-        ),
-        dtype=torch.uint8,
-        device=device,
-    )
+        (N_scales, M), dtype=torch.uint8, device=device
+    ).T
     kv_c_normed = torch.empty(
         (M, kv_lora_rank), dtype=torch.bfloat16, device=device
     )
