@@ -104,6 +104,26 @@ ENV SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION_NAME}}
 ENV SCCACHE_S3_NO_CREDENTIALS=${USE_SCCACHE:+${SCCACHE_S3_NO_CREDENTIALS}}
 ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 
+RUN pip install cmake
+RUN git clone --no-checkout --filter=blob:none https://github.com/ROCm/rocm-systems.git \
+    && cd rocm-systems/ \
+    && git sparse-checkout init --cone \
+    && git sparse-checkout set projects/rocprofiler-sdk shared/rocprofiler-compute \
+    && git checkout develop \
+    && git checkout rocm-7.2.0 \
+    && git config --global user.email "you@example.com" \
+    && git config --global user.name "Your Name" \
+    && git cherry-pick a71cc3cc88ed68b24c40cefec77d764053044862
+RUN apt-get update && apt-get install -y libdw-dev libsqlite3-dev
+RUN cd rocm-systems/ \    
+    && cmake                                      \
+          -B rocprofiler-sdk-build                \
+          -DCMAKE_INSTALL_PREFIX=/opt/rocm        \
+          -DCMAKE_PREFIX_PATH=/opt/rocm           \
+          -DGPU_TARGETS="${PYTORCH_ROCM_ARCH}"    \
+          projects/rocprofiler-sdk \
+    && cmake --build rocprofiler-sdk-build --target all --parallel $(nproc) \
+    && cmake --build rocprofiler-sdk-build --target install
 
 ###
 ### Triton Build
