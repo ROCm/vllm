@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import operator
-
 import torch
 import torch._inductor.pattern_matcher as pm
 from torch import fx
@@ -561,12 +559,25 @@ class AiterGemmReduceRMSNormMXFP4Pattern:
         self.qk_rope_head_dim = qk_rope_head_dim
         self.epsilon = epsilon
 
+    def get_inputs(self) -> list[torch.Tensor]:
+        N = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        M, K = 5, 128
+        return [
+            torch.empty((M, K // 2), dtype=torch.uint8, device="cuda"),
+            torch.empty((M, K // 32), dtype=torch.uint8, device="cuda"),
+            torch.empty((N, K // 2), dtype=torch.uint8, device="cuda"),
+            torch.empty((N, K // 32), dtype=torch.uint8, device="cuda"),
+            torch.empty(self.q_lora_rank, dtype=torch.bfloat16,
+                        device="cuda"),
+            torch.empty(self.kv_lora_rank, dtype=torch.bfloat16,
+                        device="cuda"),
+        ]
+
     def register(self, pm_pass: PatternMatcherPass) -> None:
         q_lora_rank = self.q_lora_rank
         kv_lora_rank = self.kv_lora_rank
         qk_rope_head_dim = self.qk_rope_head_dim
         epsilon = self.epsilon
-        N = q_lora_rank + kv_lora_rank + qk_rope_head_dim
 
         GEMM_OP = self.GEMM_OP
         RMSNORM_MXFP4_QUANT_OP = self.RMSNORM_MXFP4_QUANT_OP
@@ -582,21 +593,15 @@ class AiterGemmReduceRMSNormMXFP4Pattern:
             kv_weight: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             qkv = GEMM_OP(x_q, w, ws, False, torch.bfloat16, x_s)
-            split1 = torch.ops.aten.split_with_sizes.default(
-                qkv, [q_lora_rank, kv_lora_rank + qk_rope_head_dim], -1
+            q_c, kv_lora = qkv.split(
+                [q_lora_rank, kv_lora_rank + qk_rope_head_dim], dim=-1
             )
-            q_c = operator.getitem(split1, 0)
-            kv_lora = operator.getitem(split1, 1)
-            rms_result = RMSNORM_MXFP4_QUANT_OP(
+            q_cq, q_cs = RMSNORM_MXFP4_QUANT_OP(
                 q_c, q_weight, epsilon
             )
-            q_cq = operator.getitem(rms_result, 0)
-            q_cs = operator.getitem(rms_result, 1)
-            split2 = torch.ops.aten.split_with_sizes.default(
-                kv_lora, [kv_lora_rank, qk_rope_head_dim], -1
+            kv_c, k_pe = kv_lora.split(
+                [kv_lora_rank, qk_rope_head_dim], dim=-1
             )
-            kv_c = operator.getitem(split2, 0)
-            k_pe = operator.getitem(split2, 1)
             kv_c_normed = RMSNORM_OP(kv_c, kv_weight, epsilon)
             return q_cq, q_cs, kv_c_normed, k_pe
 
@@ -614,33 +619,10 @@ class AiterGemmReduceRMSNormMXFP4Pattern:
                 kv_weight, epsilon,
                 q_lora_rank, kv_lora_rank, qk_rope_head_dim,
             )
-            return (
-                operator.getitem(result, 0),
-                operator.getitem(result, 1),
-                operator.getitem(result, 2),
-                operator.getitem(result, 3),
-            )
+            return result[0], result[1], result[2], result[3]
 
-        M = 5
-        K = 128
-        x_q = torch.empty((M, K // 2), dtype=torch.uint8, device="cuda")
-        x_s = torch.empty(
-            (M, K // 32), dtype=torch.uint8, device="cuda"
-        )
-        w = torch.empty((N, K // 2), dtype=torch.uint8, device="cuda")
-        ws = torch.empty(
-            (N, K // 32), dtype=torch.uint8, device="cuda"
-        )
-        q_weight = torch.empty(
-            q_lora_rank, dtype=torch.bfloat16, device="cuda"
-        )
-        kv_weight = torch.empty(
-            kv_lora_rank, dtype=torch.bfloat16, device="cuda"
-        )
-
-        inputs = [x_q, x_s, w, ws, q_weight, kv_weight]
         pm.register_replacement(
-            pattern, replacement, inputs, pm.fwd_only, pm_pass
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
 
 
