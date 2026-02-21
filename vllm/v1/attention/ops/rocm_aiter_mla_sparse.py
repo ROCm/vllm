@@ -97,6 +97,7 @@ def indexer_k_quant_and_cache_triton(
     kv_cache = kv_cache.view(num_blocks, -1)
     kv_cache_value = kv_cache[:, : block_size * head_dim]
     kv_cache_scale = kv_cache[:, block_size * head_dim :].view(torch.float32)
+    #print("Indexer:", kv_cache.shape, kv_cache_value.shape, kv_cache_scale.shape)
     head_tile_size = head_tile_size // kv_cache.element_size()
     grid = (num_tokens,)
     _indexer_k_quant_and_cache_kernel[grid](
@@ -196,6 +197,7 @@ def cp_gather_indexer_k_quant_cache_triton(
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_value = k_cache[:, : block_size * head_dim].view(fp8_dtype)
     k_cache_scale = k_cache[:, block_size * head_dim :].view(torch.float32)
+    #print("Indexer-gather:", k_cache.shape, k_cache_value.shape, k_cache_scale.shape)
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
     _cp_gather_indexer_quant_cache_kernel[grid](
@@ -227,12 +229,25 @@ def fp8_paged_mqa_logits_torch(
     max_model_len: int,
 ):
     from vllm.utils.math_utils import cdiv
-
+    #print(q.shape, q.dtype, kv_cache.shape, kv_cache.dtype, weights.shape, weights.dtype, context_lens.shape, context_lens.dtype, block_tables.shape, block_tables.dtype)
     fp8_dtype = current_platform.fp8_dtype()
     batch_size, next_n, _, dim = q.size()
-    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
+    block_size = kv_cache.shape[1]
+    N = kv_cache.shape[0]
+    #B = kv_cache.shape[2]
+    # kv_cache is [N, 16, 1, 132]
+    # = [N, 132*16] 
+    kv_cache = kv_cache.reshape([N, (dim+4)*block_size])
+    kv_cache, scale = kv_cache[:, :dim*block_size], kv_cache[:, dim*block_size:]
+    kv_cache = kv_cache.reshape([N, block_size, 1, dim])
+    scale = scale.reshape([N, block_size, 1, 4])
     scale = scale.contiguous().view(torch.float)
     q = q.float()
+    #block_idx_0 = block_tables[0,0]
+    indexed_scale = scale[block_tables[0]]
+    #if indexed_scale.shape[0]>10:
+    #  print("Scale", block_tables[0,:10], indexed_scale.flatten()[:10])
+    #print("Index", block_idx_0, "KV cache:", kv_cache.view(fp8_dtype)[block_idx_0,:,:,:4].float(), scale[block_idx_0,:,:])
     kv_cache = kv_cache.view(fp8_dtype).float() * scale
     num_block, block_size, _, dim = kv_cache.size()
     logits = torch.full(
@@ -262,10 +277,12 @@ def fp8_paged_mqa_logits_torch(
                 (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(
                     logits.dtype
                 ),
-                float("-inf"),
+                0.0, #float("-inf"),
             )
             s = torch.relu(s) * weight_slice[..., None]
             s = s.sum(dim=0)
+            #if torch.max(s)>1e10 and (block_rk+1)*block_size<=context_len:
+            #    print("Overflow", i, block_rk, context_len, s, torch.max(qx.to(torch.float32)), torch.max(kx.to(torch.float32)), torch.max(weight_slice.to(torch.float32)))
             logits[
                 i * next_n : (i + 1) * next_n,
                 block_rk * block_size : (block_rk + 1) * block_size,
@@ -281,6 +298,7 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    use_torch: bool
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -329,9 +347,29 @@ def rocm_fp8_paged_mqa_logits(
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
     # FIXME(ganyi): Temporarily disable the aiter path until nightly docker
     # update aiter to the fix PR.
-    aiter_paged_mqa_logits_module = None
-
+    if use_torch:
+       aiter_paged_mqa_logits_module = None
+    #rocm.qwerty()
     if aiter_paged_mqa_logits_module is not None:
+        #ref = fp8_paged_mqa_logits_torch(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len)
+        #return ref
+        #print("Maxvals:", torch.max(block_tables[:,0]), torch.max(weights)) 
+
+        dim = q_fp8.shape[3]
+        N = kv_cache_fp8.shape[0]
+        block_size = kv_cache_fp8.shape[1]
+        #B = kv_cache.shape[2]
+        # kv_cache is [N, 16, 1, 132]
+        # = [N, 132*16] 
+        if block_size > 1:
+           kv_cache_fp8_1 = kv_cache_fp8.reshape([N, (dim+4)*block_size])
+           kv_cache_fp8_1, scale = kv_cache_fp8_1[:, :dim*block_size], kv_cache_fp8[:, dim*block_size:]
+           kv_cache_fp8_1 = kv_cache_fp8_1.reshape([N, block_size, 1, dim])
+           scale = scale.reshape([N, block_size, 1, 4])
+           kv_cache_fp8_1 = torch.concatenate([kv_cache_fp8_1, scale], axis=3)
+        else:
+           kv_cache_fp8_1 = kv_cache_fp8
+
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
         )
@@ -342,16 +380,37 @@ def rocm_fp8_paged_mqa_logits(
             device="cuda",
             dtype=torch.float32,
         )
+        ChunkQ = 64
+        while (heads % ChunkQ):
+           ChunkQ = ChunkQ // 2
         deepgemm_fp8_paged_mqa_logits_stage1(
             q_fp8,
-            kv_cache_fp8,
+            kv_cache_fp8_1,
             weights,
             out_qk,
             context_lens,
             block_tables,
             max_model_len,
+            ChunkQ
         )
-        return out_qk.sum(dim=0)
+        testval = out_qk.sum(dim=0)
+        return testval
+        finite_mask1 = torch.isfinite(ref)
+        finite_mask2 = torch.isfinite(testval)
+        mismatch1 = (finite_mask1 != finite_mask2)
+        mismatch2 = torch.logical_and(torch.logical_and(finite_mask1, finite_mask2), torch.abs(ref-testval)>0.01*torch.maximum(torch.abs(ref), torch.abs(testval)))
+        s1 = torch.sum(mismatch1.to(torch.uint32))
+        s2 = torch.sum(mismatch2.to(torch.uint32))
+        print(ref.shape, testval.shape, s1, s2, ref.flatten()[:10], testval.flatten()[:10])
+        if s1>0:
+            w = torch.where(mismatch1)
+            pos = tuple(w[x][0] for x in range(len(ref.shape)))
+            print("First infinite mismatch", pos, ref[pos], testval[pos])
+        if s2>0:
+            w = torch.where(mismatch2)
+            pos = tuple(w[x][0] for x in range(len(ref.shape)))
+            print("First value mismatch", pos, ref[pos], testval[pos])
+        return ref
     else:
         return fp8_paged_mqa_logits_torch(
             q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len
@@ -385,20 +444,75 @@ def fp8_mqa_logits_torch(
     """
     kv, scale = kv
     seq_len_kv = kv.shape[0]
-    k = kv.to(torch.bfloat16)
+    k = (kv.to(torch.float32) * scale)
+    k = k.to(torch.bfloat16)
     q = q.to(torch.bfloat16)
+    M = q.shape[0]
+
+    min_seqlen = torch.min(cu_seqlen_ks)
+    max_seqlen = torch.max(cu_seqlen_ke)
+
+    dev = kv.device.index
+    silent = True #(dev != 0)
+
+    if not silent:
+        infs = torch.sum(torch.logical_not(torch.isfinite(k[min_seqlen:max_seqlen])).to(torch.int32)).item()
+        if infs>0:
+            print("WARNING: fp8_mqa_logits_torch: ", infs, "/", k[min_seqlen:max_seqlen].flatten().shape[0], "nonfinite in k")
+            pos_m, pos_n = torch.where(torch.logical_not(torch.isfinite(k[min_seqlen:max_seqlen])))
+            print("First inf:", pos_m[0].item()+min_seqlen.item(), pos_n[0].item(), k[pos_m[0]+min_seqlen, pos_n[0]].item()) 
+            if infs>1:
+                print("Second inf:", pos_m[1].item()+min_seqlen.item(), pos_n[1].item(), k[pos_m[1]+min_seqlen, pos_n[1]].item()) 
+        infs = torch.sum(torch.logical_not(torch.isfinite(q)).to(torch.int32)).item()
+        if infs>0:
+            print("WARNING: fp8_mqa_logits_torch: ", infs, "/", q.flatten().shape[0], "nonfinite in q")
+        infs = torch.sum(torch.logical_not(torch.isfinite(weights)).to(torch.int32)).item()
+        if infs>0:
+            print("WARNING: fp8_mqa_logits_torch: ", infs, "/", weights.flatten().shape[0], "nonfinite in weights")
+    do_padding = False
+    pad_left = 0
+    if do_padding:
+        print("Padding:", min_seqlen, max_seqlen, kv.shape[0])
+        max_seqlen = min(max_seqlen, kv.shape[0])
+        pad_left = min_seqlen
+        pad_right = kv.shape[0] - max_seqlen
+        k = k[pad_left:]
+        cu_seqlen_ks -= pad_left
+        cu_seqlen_ke -= pad_right
+
+        if pad_right>0:
+            k = k[:-pad_right]
 
     mask_lo = (
-        torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
+        torch.arange(0, seq_len_kv, device="cuda")[None, :] + pad_left >= cu_seqlen_ks[:, None]
     )
     mask_hi = (
-        torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
+        torch.arange(0, seq_len_kv, device="cuda")[None, :] + pad_left < cu_seqlen_ke[:, None]
     )
     mask = mask_lo & mask_hi
-
-    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
+    # call 1: torch.Size([876, 32, 128]) torch.Size([876, 128]) torch.Size([876, 1])
+    # call 2: torch.Size([473, 32, 128]) torch.Size([1331, 128]) torch.Size([1331, 1])
+    #print(q.shape, k.shape, scale.shape)
+    #print(cu_seqlen_ks, cu_seqlen_ke)
+    score = torch.einsum("mhd,nd->hmn", q, k).float()
     logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
     logits = logits.masked_fill(~mask, float("-inf"))
+    if do_padding:
+        if pad_left > 0:
+            logits = torch.concatenate([torch.full([M,pad_left], float("-inf"), device=logits.device, dtype=torch.float32), logits], axis=1)
+        if pad_right > 0:
+            logits = torch.concatenate([logits, torch.full([M,pad_right], float("-inf"), device=logits.device, dtype=torch.float32)], axis=1)
+
+    if not silent:
+        legal_logits = torch.where(mask, logits, float(0.0))
+        infs = torch.sum(torch.logical_not(torch.isfinite(legal_logits)).to(torch.int32)).item()
+        if infs>0:
+            print("WARNING: fp8_mqa_logits_torch:", infs, "/", torch.sum(mask.to(torch.int32)).item(), "nonfinite in output")
+            pos_m, pos_n = torch.where(torch.logical_not(torch.isfinite(legal_logits)))
+            x = pos_m[0]
+            y = pos_n[0]
+            score2 = torch.einsum("hd,d->h", q[x], k[y]).float()
+            print(x, y, score2, (score2.relu() * weights[x]).sum(dim=0))
 
     return logits
 
@@ -431,6 +545,8 @@ def rocm_fp8_mqa_logits(
     # TODO(ganyi): Temporarily workaround, will remove the module check and reference
     # path after aiter merge this kernel into main
     from vllm._aiter_ops import rocm_aiter_ops
+
+    #kv = (kv[0].reshape([kv[0].shape[0]*kv[0].shape[1], kv[0].shape[2]]), kv[1].flatten())
 
     @functools.lru_cache
     def mqa_logits_module():
@@ -490,6 +606,80 @@ def rocm_aiter_sparse_attn_indexer_fake(
     return topk_indices_buffer
 
 
+def compare_top_k_results(
+    logits: torch.Tensor,
+    cuda_indices: torch.Tensor,
+    torch_indices: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    top_k: int,
+    tolerance: float = 1e-5,
+) -> bool:
+    """
+    Compare results from CUDA top_k_per_row with torch.topk.
+    Both results should be sorted and contain the same top-k elements.
+    """
+    num_rows = cuda_indices.shape[0]
+    fail = False
+    for row_idx in range(num_rows):
+        # Get valid elements using row boundaries
+        row_start = row_starts[row_idx].item()
+        row_end = row_ends[row_idx].item()
+        row_length = row_end - row_start
+        num_valid = min(top_k, row_length)
+        cuda_row_indices = cuda_indices[row_idx][:num_valid].cpu()
+        torch_row_indices = torch_indices[row_idx][:num_valid].cpu()
+
+        # Compare the sets of indices first
+        cuda_set = set(cuda_row_indices.tolist())
+        torch_set = set(torch_row_indices.tolist())
+        if cuda_set == torch_set:
+            continue
+
+        # Any difference in elements, compare the values
+        logits_row = logits[row_idx]
+        cuda_row_values = [logits_row[i] for i in cuda_row_indices]
+        torch_row_values = [logits_row[i] for i in torch_row_indices]
+        if len(cuda_set) != len(torch_set):
+            print("Row", row_idx, "/", num_rows, "range", row_start, row_end, "unexpected logit counts", row_length, num_valid, len(cuda_set), len(torch_set))
+            print(row_starts[row_idx-2:row_idx+3])
+            print(row_ends[row_idx-2:row_idx+3])
+            for k in range(row_idx-2, row_idx+3):
+                logits_row_ = logits[k]
+                row_start_ = row_starts[k].item()
+                row_end_ = row_ends[k].item()
+                row_length_ = row_end_ - row_start_
+                num_valid_ = min(top_k, row_length_)
+                cuda_row_indices_ = cuda_indices[k][:num_valid_].cpu()
+                torch_row_indices_ = torch_indices[k][:num_valid_].cpu()
+                cuda_row_values_ = [logits_row_[i] for i in cuda_row_indices_]
+                torch_row_values_ = [logits_row_[i] for i in torch_row_indices_]
+                for j in range(num_valid_):
+                    print(k, j, cuda_row_indices_[j], torch_row_indices_[j], logits_row_[cuda_row_indices_[j]], logits_row_[torch_row_indices_[j]])
+
+        cuda_only_values, torch_only_values = [], []
+        for idx in cuda_set - torch_set:
+            cuda_pos = (cuda_row_indices == idx).nonzero(as_tuple=True)[0]
+            cuda_only_values.append(cuda_row_values[cuda_pos[0]])
+
+        for idx in torch_set - cuda_set:
+            torch_pos = (torch_row_indices == idx).nonzero(as_tuple=True)[0]
+            torch_only_values.append(torch_row_values[torch_pos[0]])
+
+        if len(cuda_only_values) != len(torch_only_values):
+            print(row_idx, "count mismatch:", len(cuda_only_values), len(torch_only_values))
+            #return False
+        if not torch.allclose(
+            torch.tensor(cuda_only_values),
+            torch.tensor(torch_only_values),
+            rtol=tolerance,
+            atol=tolerance,
+        ):
+            print(row_idx, "value mismatch")
+            #return False
+
+    return True
+
 def rocm_aiter_sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -503,11 +693,16 @@ def rocm_aiter_sparse_attn_indexer(
     head_dim: int,
     max_model_len: int,
     total_seq_lens: int,
-    topk_indices_buffer: torch.Tensor | None,
+    topk_indices_buffer: torch.Tensor | None
 ) -> torch.Tensor:
+    #print("rocm_aiter_sparse_attn_indexer", kv_cache.shape)
+    #W, B, X, H = kv_cache.shape
+    #kv_cache = kv_cache.reshape([W, 
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
+    dev = q_fp8.device.index
+    silent = True #(dev != 0)
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         return rocm_aiter_sparse_attn_indexer_fake(
@@ -531,7 +726,13 @@ def rocm_aiter_sparse_attn_indexer(
     has_decode = attn_metadata.num_decodes > 0
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
+    #if slot_mapping.shape[0]>10:
+    #  print("slot_mapping", slot_mapping[:10])
 
+    if not silent:
+        print("rocm_aiter_sparse_attn_indexer", k.shape, kv_cache.shape, slot_mapping[:5], num_decode_tokens)
+
+    # Store 'k' into long-term kv cache. slot_mapping maps from current tokens to locations in cache.
     ops.indexer_k_quant_and_cache(
         k,
         kv_cache,
@@ -539,11 +740,20 @@ def rocm_aiter_sparse_attn_indexer(
         quant_block_size,
         scale_fmt,
     )
+    #scales = kv_cache[..., -4:].view(float)
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
+    #topk_indices_buffer[:] = -1
     if has_prefill:
         prefill_metadata = attn_metadata.prefill
+        if not silent:
+            print("Prefilling", len(prefill_metadata.chunks), "chunks", sum([x.token_end-x.token_start for x in prefill_metadata.chunks]), "tokens")
         for chunk in prefill_metadata.chunks:
+            #print("prefill", chunk.total_seq_lens, chunk.token_start, chunk.token_end, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke)
+            uniform_rows = torch.all(chunk.cu_seqlen_ks == chunk.cu_seqlen_ks[0]) and torch.all(chunk.cu_seqlen_ke == chunk.cu_seqlen_ke[0])
+            if not silent:
+                print("prefill", chunk.total_seq_lens, chunk.token_start, chunk.token_end, chunk.cu_seqlen_ks[:3], chunk.cu_seqlen_ke[:3], uniform_rows)
+            block_size = kv_cache.shape[1]
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
                 device=k.device,
@@ -554,7 +764,6 @@ def rocm_aiter_sparse_attn_indexer(
                 device=k.device,
                 dtype=torch.uint8,
             )
-
             ops.cp_gather_indexer_k_quant_cache(
                 kv_cache,
                 k_fp8,
@@ -562,6 +771,12 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.block_table,
                 chunk.cu_seq_lens,
             )
+            if not silent:
+                print("kv_cache", kv_cache.shape, k_fp8.shape, chunk.block_table[0,:5])
+                col = chunk.block_table[0,0]
+                print("cp_gather_indexer_k_quant_cache", kv_cache[col,0], kv_cache[col,0,-4:].view(torch.float32), k_fp8[0].view(torch.uint8), k_scale[0].view(torch.float32))
+                col = chunk.block_table[0,1]
+                print("cp_gather_indexer_k_quant_cache", kv_cache[col,0], kv_cache[col,0,-4:].view(torch.float32), k_fp8[1].view(torch.uint8), k_scale[1].view(torch.float32))
 
             logits = rocm_fp8_mqa_logits(
                 q_fp8[chunk.token_start : chunk.token_end],
@@ -570,21 +785,79 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
             )
+            logits = torch.where(torch.isnan(logits), float("-inf"), logits)
+
             num_rows = logits.shape[0]
             assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            torch.ops._C.top_k_per_row_prefill(
-                logits,
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            if True:
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+                topk_indices = torch.where(topk_indices>=0, topk_indices+chunk.cu_seqlen_ks[:,None], -1)
+            else:
+                #torch_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+                #uniform_rows = torch.all(chunk.cu_seqlen_ks == chunk.cu_seqlen_ks[0]) and torch.all(chunk.cu_seqlen_ke == chunk.cu_seqlen_ke[0])
+                #print(chunk.cu_seqlen_ks[:3], chunk.cu_seqlen_ke[:3], uniform_rows)
+                if uniform_rows:
+                    row_start = int(chunk.cu_seqlen_ks[0])
+                    row_end = int(chunk.cu_seqlen_ke[0])
+                    k_i = min(topk_tokens, row_end-row_start)
+                    idx = logits[:, row_start:row_end].topk(k_i, dim=-1)[1]
+                    topk_indices[:, :k_i] = row_start + idx
+                    topk_indices[:, k_i:topk_tokens] = -1
+                else:
+                    for i in range(num_rows):
+                        row_start = int(chunk.cu_seqlen_ks[i])
+                        row_end = int(chunk.cu_seqlen_ke[i])
+                        k_i = min(topk_tokens, row_end-row_start)
+                        idx = logits[i, row_start:row_end].topk(k_i, dim=-1)[1]
+                        topk_indices[i, :k_i] = row_start + idx
+                        topk_indices[i, k_i:topk_tokens] = -1
+
+                topk_indices_2 = torch.zeros_like(topk_indices, dtype=topk_indices.dtype)
+                if not silent:
+                    print("top_k_per_row_prefill", logits.shape, chunk.cu_seqlen_ks.shape, 
+                                            chunk.cu_seqlen_ke.shape,
+                    topk_indices_2.shape,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens)
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices_2,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
+                topk_indices_2 = torch.where(topk_indices_2>=0, topk_indices_2+chunk.cu_seqlen_ks[:,None], -1)
+
+                if not silent:
+                    check = compare_top_k_results(logits, topk_indices, topk_indices_2, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke, topk_tokens)
+                """
+                topk_indices_1, _ = torch.sort(topk_indices)
+                topk_indices_2, _ = torch.sort(topk_indices_2)
+                mismatches = (topk_indices_1 != topk_indices_2).to(torch.int32)
+                print("top_k_per_row_prefill:", torch.sum(mismatches), "mismatches")
+                print("Shapes:", logits.shape, 
+                if torch.sum(mismatches)>0:
+                    mismatches = mismatches.flatten()
+                    pos = torch.where(mismatches)
+                    print(topk_indices.shape, pos[0], topk_indices_1.flatten()[pos[0]], topk_indices_2.flatten()[pos[0]])
+                """
 
     if has_decode:
         decode_metadata = attn_metadata.decode
@@ -618,6 +891,7 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            use_torch=False
         )
 
         num_rows = logits.shape[0]

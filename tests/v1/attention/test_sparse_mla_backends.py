@@ -24,17 +24,8 @@ from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.platforms import current_platform
 
-# TODO: Integrate ROCMAiterMLASparseBackend for ROCm.
-# The ROCm sparse MLA backend (rocm_aiter_mla_sparse.py) has a compatible
-# forward_mqa interface but needs validation on ROCm hardware.
-if not current_platform.is_cuda():
-    pytest.skip(
-        "Sparse MLA backend tests currently only support CUDA. "
-        "ROCm support requires integrating ROCMAiterMLASparseBackend.",
-        allow_module_level=True,
-    )
-
 from vllm.utils.math_utils import cdiv
+
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseBackend,
 )
@@ -42,6 +33,10 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+    ROCMAiterMLASparseBackend,
+)
+
 from vllm.v1.attention.backends.utils import split_prefill_chunks
 from vllm.v1.attention.ops import flashmla
 
@@ -171,7 +166,7 @@ def _quantize_dequantize_fp8_ds_mla(
 
 @pytest.mark.parametrize(
     "backend_cls",
-    [FlashMLASparseBackend, FlashInferMLASparseBackend],
+    [FlashMLASparseBackend, FlashInferMLASparseBackend] if current_platform.is_cuda() else [ROCMAiterMLASparseBackend],
     ids=["FlashMLA", "FlashInfer"],
 )
 @pytest.mark.parametrize("batch_name", list(SPARSE_BACKEND_BATCH_SPECS.keys()))
@@ -207,6 +202,9 @@ def test_sparse_backend_decode_correctness(
 
     batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
     use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
+    if backend_cls == ROCMAiterMLASparseBackend:
+        if use_fp8_ds_mla_quantization:
+            pytest.skip("use_fp8_ds_mla_quantization requires CUDA")
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -562,7 +560,7 @@ def _triton_convert_reference_impl(
 @pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("num_topk_tokens", [128, 256, 512])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() < (9, 0),
+    current_platform.is_cuda() and torch.cuda.get_device_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
 )
 def test_triton_convert_req_index_to_global_index_decode_only(
@@ -617,7 +615,7 @@ def test_triton_convert_req_index_to_global_index_decode_only(
 
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.skipif(
-    torch.cuda.get_device_capability() < (9, 0),
+    current_platform.is_cuda() and torch.cuda.get_device_capability() < (9, 0),
     reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
 )
 def test_triton_convert_req_index_to_global_index_with_prefill_workspace(block_size):

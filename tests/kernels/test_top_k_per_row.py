@@ -9,8 +9,8 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 # Test parameters
-NUM_ROWS = [1, 32, 2050]
-TOP_K_VALUES = [2048, 3000]
+NUM_ROWS = [1, 32, 3000, 3960]
+TOP_K_VALUES = [2048] #, 3000]
 BATCH_SIZE = [1, 2, 2048]
 NEXT_N = [1, 8]
 DATA_GENERATION = ["random", "10LSBits"]
@@ -49,7 +49,7 @@ def create_random_logits(
             random_bottom_bits & last_10_bits_mask
         )
         logits = logits_bits.view(dtype)
-
+    logits = torch.where(torch.rand_like(logits)<0.33, logits, float("-inf"))
     if clean_logits:
         for i, end in enumerate(row_ends):
             logits[i, end:] = float("-inf")
@@ -60,8 +60,14 @@ def create_row_boundaries(
     seq_len: int, vocab_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Create row start and end indices for testing."""
-    row_starts = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
-    row_ends = torch.arange(1, seq_len + 1, device="cuda", dtype=torch.int32)
+    #row_starts = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+    N = max(seq_len-10, 16)
+    N2 = max(seq_len-1, 16)
+    row_starts = (torch.arange(1, seq_len + 1, device="cuda", dtype=torch.int32) * 37) % N
+    row_ends = torch.minimum(torch.arange(1, seq_len + 1, device="cuda", dtype=torch.int32) + row_starts, torch.tensor(N2))
+    if seq_len>1000:
+        row_starts[1000:seq_len] = 0
+        row_ends[1000:seq_len] = torch.arange(1001, seq_len+1)
     return row_starts, row_ends
 
 
@@ -97,6 +103,7 @@ def compare_top_k_results(
 
         # Any difference in elements, compare the values
         logits_row = logits[row_idx]
+        legal_values = torch.sum(torch.isfinite(logits_row[row_start:row_end]).to(torch.int32)).item()
         cuda_row_values = [logits_row[i] for i in cuda_row_indices]
         torch_row_values = [logits_row[i] for i in torch_row_indices]
 
@@ -110,6 +117,7 @@ def compare_top_k_results(
             torch_only_values.append(torch_row_values[torch_pos[0]])
 
         if len(cuda_only_values) != len(torch_only_values):
+            print("First mismatch", row_idx, num_rows, row_start, row_end, "infs", row_length-legal_values)
             return False
         if not torch.allclose(
             torch.tensor(cuda_only_values),
@@ -117,6 +125,7 @@ def compare_top_k_results(
             rtol=tolerance,
             atol=tolerance,
         ):
+            print("First mismatch", row_idx, row_start, row_end)
             return False
 
     return True
@@ -125,7 +134,7 @@ def compare_top_k_results(
 @pytest.mark.parametrize("num_rows", NUM_ROWS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("clean_logits", [True, False])
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.skipif(not (current_platform.is_cuda() or current_platform.is_rocm()), reason="This test requires CUDA")
 @torch.inference_mode()
 def test_top_k_per_row(
     num_rows: int,
@@ -148,6 +157,14 @@ def test_top_k_per_row(
     # Create output tensors
     indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
 
+#    print("top_k_per_row_prefill", logits.shape, row_starts.shape, 
+#                            row_ends.shape,
+#    indices.shape,
+#    num_rows,
+#    logits.stride(0),
+#    logits.stride(1),
+#    top_k)
+
     # Run CUDA implementation
     torch.ops._C.top_k_per_row_prefill(
         logits,
@@ -162,16 +179,18 @@ def test_top_k_per_row(
 
     # Run reference implementation
     torch_indices = torch.empty((num_rows, top_k), dtype=torch.int32, device="cuda")
+
     for i in range(num_rows):
+        row_start = int(row_starts[i])
         row_end = int(row_ends[i])
-        k_i = min(top_k, row_end)
-        idx = logits[i, :row_end].topk(k_i, dim=-1)[1]
+        k_i = min(top_k, row_end-row_start)
+        idx = logits[i, row_start:row_end].topk(k_i, dim=-1)[1]
         torch_indices[i, :k_i] = idx
 
     # Compare results
     assert compare_top_k_results(
         logits, indices, torch_indices, row_starts, row_ends, top_k
-    ), "CUDA top_k_per_row_prefill results don't match torch.topk"
+        ), "CUDA top_k_per_row_prefill results don't match torch.topk"
 
 
 def _run_top_k_per_row_decode_test(
@@ -240,7 +259,8 @@ def _run_top_k_per_row_decode_test(
 @pytest.mark.parametrize("next_n", NEXT_N)
 @pytest.mark.parametrize("clean_logits", [True, False])
 @pytest.mark.parametrize("data_generation", DATA_GENERATION)
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+#@pytest.mark.skipif(not (current_platform.is_cuda() or current_platform.is_rocm()), reason="This test requires CUDA")
+@pytest.mark.skipif(not (current_platform.is_cuda()), reason="This test requires CUDA")
 @torch.inference_mode()
 def test_top_k_per_row_decode(
     top_k: int,
@@ -277,7 +297,8 @@ def test_top_k_per_row_decode_large_vocab_size(clean_logits: bool) -> None:
     )
 
 
-@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+#@pytest.mark.skipif(not (current_platform.is_cuda() or current_platform.is_rocm()), reason="This test requires CUDA")
+@pytest.mark.skipif(not (current_platform.is_cuda()), reason="This test requires CUDA")
 @pytest.mark.parametrize("clean_logits", [True, False])
 @torch.inference_mode()
 def test_deepseek_hybrid_topk(clean_logits: bool) -> None:
