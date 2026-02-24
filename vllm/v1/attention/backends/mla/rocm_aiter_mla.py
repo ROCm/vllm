@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 class AiterMLABackend(MLACommonBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1]
+        return [MultipleOf(1)]
 
     @staticmethod
     def get_name() -> str:
