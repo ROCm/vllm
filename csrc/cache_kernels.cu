@@ -535,6 +535,8 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
 
 #ifndef USE_ROCM
   __syncwarp();
+#else
+  __syncthreads();
 #endif
 
   if (head_idx >= head_dim || token_idx >= num_tokens) {
@@ -549,9 +551,20 @@ __global__ void cp_gather_indexer_k_quant_cache_kernel(
   const int64_t src_inblock_offset = src_block_offset + cache_inblock_offset;
   const int64_t dst_inblock_offset = token_idx * token_stride + head_idx;
 
-  reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
-      reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
-  ;
+  // Handle arbitrary block_stride (not necessarily aligned to 16 bytes).
+  // e.g., GLM-5 (DeepSeek-V2 arch) with cache_block_size=1 has block_stride=132
+  if (src_inblock_offset & (VEC_SIZE - 1)) {
+    // Unaligned: copy as float
+    float* p_dst = reinterpret_cast<float*>(dst_k) + dst_inblock_offset / 4;
+    const float* p_src =
+        reinterpret_cast<const float*>(kv_cache) + src_inblock_offset / 4;
+    for (int j = 0; j < 4; j++)
+      p_dst[j] = p_src[j];
+  } else {
+    // Aligned: copy as float4
+    reinterpret_cast<float4*>(dst_k)[dst_inblock_offset / VEC_SIZE] =
+        reinterpret_cast<const float4*>(kv_cache)[src_inblock_offset / VEC_SIZE];
+  }
   if (threadIdx.x == 0) {
     const int64_t src_scale_offset =
         src_block_offset + cache_block_size * head_dim +
