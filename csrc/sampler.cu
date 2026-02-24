@@ -272,17 +272,22 @@ __device__ bool processHistogramStep(
         }
       }
       if constexpr (step < 3) {
-        // Only fill the final items for sorting if the threshold bin fits
+        // Only fill the final items for sorting if the threshold bin fits.
+        // Check that existing items + threshold bin size won't overflow.
         if (binIdx == thresholdBinIdx &&
-            smemFinalBinSize[0] <= kNumFinalItems) {
+            smemFoundTopKValues[0] + smemFinalBinSize[0] <= kNumFinalItems) {
           int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
-          smemFinal.items.logits[dstIdx] = logit;
-          if constexpr (mergeBlocks) {
-            smemFinal.items.indices[dstIdx] = indices[idx];
-          } else if constexpr (multipleBlocksPerRow) {
-            smemFinal.items.indices[dstIdx] = idx + rowStart;
-          } else {
-            smemFinal.items.indices[dstIdx] = idx;
+          // Defensive bounds check: even with the condition above, use this
+          // to catch any edge cases with concurrent updates
+          if (dstIdx < kNumFinalItems) {
+            smemFinal.items.logits[dstIdx] = logit;
+            if constexpr (mergeBlocks) {
+              smemFinal.items.indices[dstIdx] = indices[idx];
+            } else if constexpr (multipleBlocksPerRow) {
+              smemFinal.items.indices[dstIdx] = idx + rowStart;
+            } else {
+              smemFinal.items.indices[dstIdx] = idx;
+            }
           }
         }
       } else {

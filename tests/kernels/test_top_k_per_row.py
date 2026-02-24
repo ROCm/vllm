@@ -9,8 +9,8 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 # Test parameters
-NUM_ROWS = [1, 32, 2050]
-TOP_K_VALUES = [2048, 3000]
+NUM_ROWS = [1, 32, 3000, 3960]
+TOP_K_VALUES = [2048]
 BATCH_SIZE = [1, 2, 2048]
 NEXT_N = [1, 8]
 DATA_GENERATION = ["random", "10LSBits"]
@@ -49,6 +49,7 @@ def create_random_logits(
             random_bottom_bits & last_10_bits_mask
         )
         logits = logits_bits.view(dtype)
+    logits = torch.where(torch.rand_like(logits) < 0.33, logits, float("-inf"))
 
     if clean_logits:
         for i, end in enumerate(row_ends):
