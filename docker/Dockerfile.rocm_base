@@ -157,6 +157,7 @@ RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 FROM base AS build_mori
 ARG MORI_BRANCH
 ARG MORI_REPO
+ENV CMAKE_PREFIX_PATH="$ROCM_PATH"
 RUN git clone ${MORI_REPO}
 RUN cd mori \
     && git checkout ${MORI_BRANCH} \
