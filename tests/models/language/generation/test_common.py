@@ -155,17 +155,30 @@ def test_models(
 
                 prompt_embeds.append(embed.squeeze(0))
 
+    # ROCm-specific vLLM runner overrides for deterministic results.
+    # Remove the effects of batch variance on ROCm since batch invariance
+    # is not yet supported.
+    # See: https://github.com/vllm-project/vllm/issues/27433
+    if current_platform.is_rocm():
+        vllm_kwargs = {
+            "max_num_seqs": 1,
+            "enforce_eager": True,
+            "seed": 0,
+            "enable_prefix_caching": False,
+        }
+    else:
+        vllm_kwargs = {
+            "max_num_seqs": 2,
+        }
+
     with vllm_runner(
         model,
         tokenizer_name=model_info.tokenizer or model,
         tokenizer_mode=model_info.tokenizer_mode,
         trust_remote_code=model_info.trust_remote_code,
-        # Remove the effects of batch variance on ROCm since batch invariance
-        # is not yet supported.
-        # See: https://github.com/vllm-project/vllm/issues/27433
-        max_num_seqs=1 if current_platform.is_rocm() else 2,
         enable_prompt_embeds=use_prompt_embeds,
         compilation_config={"cudagraph_capture_sizes": [1, 2]},
+        **vllm_kwargs,
     ) as vllm_model:
         vllm_outputs = vllm_model.generate_greedy_logprobs(
             example_prompts, max_tokens, num_logprobs
