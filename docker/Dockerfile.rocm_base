@@ -158,6 +158,7 @@ FROM base AS build_mori
 ARG MORI_BRANCH
 ARG MORI_REPO
 ENV CMAKE_PREFIX_PATH="$ROCM_PATH"
+RUN apt-get update && apt-get install -y libdrm-dev && rm -rf /var/lib/apt/lists/*
 RUN git clone ${MORI_REPO}
 RUN cd mori \
     && git checkout ${MORI_BRANCH} \
