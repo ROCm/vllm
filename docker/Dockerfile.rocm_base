@@ -100,8 +100,7 @@ RUN uv pip install --index-url ${PIP_EXTRA_INDEX_URL} "rocm[libraries,devel]==7.
 ENV SITE_PACKAGES=/opt/python/lib/python3.12/site-packages
 ENV ROCM_PATH="$SITE_PACKAGES/_rocm_sdk_devel"
 ENV HIP_DEVICE_LIB_PATH="$SITE_PACKAGES/_rocm_sdk_core/lib/llvm/amdgcn/bitcode"
-RUN cd $SITE_PACKAGES/_rocm_sdk_core/share/amd_smi && uv pip install . \
-    && sed -i 's/rtld_global: bool = True/rtld_global: bool = False/g' $SITE_PACKAGES/rocm_sdk/__init__.py
+RUN cd $SITE_PACKAGES/_rocm_sdk_core/share/amd_smi && uv pip install .
 ENV PYTHONPATH=$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi:$PYTHONPATH
 
 ###
