@@ -494,20 +494,13 @@ class RocmPlatform(Platform):
     @with_amdsmi_context
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
-        physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = amdsmi_get_processor_handles()[physical_device_id]
-        asic_info = amdsmi_get_gpu_asic_info(handle)
-        device_name: str = asic_info["device_id"]
-        if device_name in _ROCM_DEVICE_ID_NAME_MAP:
-            return _ROCM_DEVICE_ID_NAME_MAP[device_name]
-        return asic_info["market_name"]
+        return amdsmi_get_gpu_board_info()["product_name"]
 
     @classmethod
     @with_amdsmi_context
     def get_device_uuid(cls, device_id: int = 0) -> str:
-            device0 = amdsmi_get_processor_handles()[0]
-            return amdsmi_get_gpu_device_uuid(device0)
-        
+        device0 = amdsmi_get_processor_handles()[0]
+        return amdsmi_get_gpu_device_uuid(device0)
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
