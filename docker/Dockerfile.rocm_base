@@ -94,7 +94,7 @@ ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ###
 ARG PIP_EXTRA_INDEX_URL=https://rocm.nightlies.amd.com/v2-staging/gfx94X-dcgpu/
 ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
-RUN uv pip install --index-url ${PIP_EXTRA_INDEX_URL} "rocm[libraries,devel]==7.12.0a20260302" \
+RUN uv pip install --index-url ${PIP_EXTRA_INDEX_URL} "rocm[libraries,devel]==7.12.0a20260304" \
     && rocm-sdk init \
     && uv pip install --index-url ${PIP_EXTRA_INDEX_URL} 'torch==2.10.0' torchaudio torchvision triton
 ENV SITE_PACKAGES=/opt/python/lib/python3.12/site-packages
