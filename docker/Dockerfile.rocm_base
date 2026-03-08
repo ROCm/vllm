@@ -18,6 +18,7 @@ ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sb
 ARG PYTORCH_ROCM_ARCH=gfx942
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ARG AITER_ROCM_ARCH=gfx942;gfx950
+ENV AITER_ROCM_ARCH=${AITER_ROCM_ARCH}
 
 # Required for RCCL in ROCm7.1
 ENV HSA_NO_SCRATCH_RECLAIM=1
