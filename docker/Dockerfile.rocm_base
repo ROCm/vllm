@@ -126,26 +126,31 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
 
 ###
-### AITER Build
+### AITER Build (CDNA only -- skipped for RDNA targets)
 ###
 FROM base AS build_aiter
 ARG AITER_BRANCH
 ARG AITER_REPO
 ARG USE_SCCACHE
-RUN git clone --recursive ${AITER_REPO}
-RUN cd aiter \
-    && git checkout ${AITER_BRANCH} \
-    && git submodule update --init --recursive \
-    && uv pip install -r requirements.txt
-RUN uv pip install pyyaml && cd aiter \
-    && if [ "$USE_SCCACHE" = "1" ]; then \
-           export HIP_CLANG_PATH=/opt/sccache-wrappers \
-           && sccache --show-stats; \
-       fi \
-    && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
-    && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
-    && ls /app/aiter/dist/*.whl
-RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
+RUN mkdir -p /app/install && \
+    if [ -z "${AITER_ROCM_ARCH}" ] || echo "${AITER_ROCM_ARCH}" | grep -qvE "gfx9"; then \
+        echo "Skipping aiter build for RDNA target (AITER_ROCM_ARCH=${AITER_ROCM_ARCH})"; \
+    else \
+        git clone --recursive ${AITER_REPO} \
+        && cd aiter \
+        && git checkout ${AITER_BRANCH} \
+        && git submodule update --init --recursive \
+        && uv pip install -r requirements.txt \
+        && uv pip install pyyaml \
+        && if [ "$USE_SCCACHE" = "1" ]; then \
+               export HIP_CLANG_PATH=/opt/sccache-wrappers \
+               && sccache --show-stats; \
+           fi \
+        && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
+        && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
+        && ls /app/aiter/dist/*.whl \
+        && cp /app/aiter/dist/*.whl /app/install/; \
+    fi
 
 
 ###
@@ -159,14 +164,14 @@ RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+    cp /install/*.whl /app/debs 2>/dev/null || echo "No aiter wheels (RDNA build)"
 
 FROM base AS debs
 RUN mkdir /app/debs
 RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+    cp /install/*.whl /app/debs 2>/dev/null || echo "No aiter wheels (RDNA build)"
 
 FROM base AS final
 RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
