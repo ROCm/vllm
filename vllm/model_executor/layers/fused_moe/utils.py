@@ -13,9 +13,6 @@ from vllm.model_executor.layers.quantization.utils.int8_utils import (
     per_token_group_quant_int8,
     per_token_quant_int8,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
-    quant_dequant_mxfp4,
-)
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import (
     quant_dequant_mxfp6,
 )
@@ -180,6 +177,10 @@ def _mxfp4_quantize(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, None]:
+    from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+        quant_dequant_mxfp4,
+    )
+
     assert block_shape is None
     # TODO: native mxfp4 is currently not integrated in vllm,
     # so simulating even on devices supporting this data type natively.

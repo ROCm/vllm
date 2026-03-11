@@ -78,6 +78,17 @@ def fetch_id_to_ragged_triton(
 
 
 class ROCMAiterMLASparseBackend(AttentionBackend):
+    """Sparse MLA attention backend for ROCm using AITER/FlashMLA kernels.
+
+    Kernel constraints:
+    - block_size: always 1 (each page holds exactly 1 KV token).
+    - head_size (q_head_dim): unconstrained at backend level — any value accepted.
+    - num_heads: constrained by the underlying FlashMLA sparse kernel (not enforced
+      here; mismatches raise at kernel launch time).
+    - KV cache dtype: BF16 and auto only — no FP8 sparse MLA kernel available.
+    - No FP4 sparse MLA kernel exists; FP4 support in aiter is GEMM-only (gfx950).
+    """
+
     accept_output_buffer: bool = True
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -85,8 +96,14 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
         "bfloat16",
     ]
 
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        # head_size (q_head_dim) is not constrained at the backend level.
+        return []
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # block_size=1: each page holds exactly 1 KV token.
         return [1]
 
     @staticmethod

@@ -32,6 +32,33 @@
 # - If the test takes more than 10min, then it is okay to create a new step.
 #   Note that all steps execute in parallel.
 
+
+##### ROCm-specific kernel tests — MI250 (gfx90a) #####
+# These run via .buildkite/test_areas/kernels-rocm.yaml on mi250_1 pools.
+# No MI250 agent pools are configured in this file; listed here for reference.
+#
+# - Kernels ROCm Core Test (MI250)           | mi250_1 | 60min
+#     pytest -v -s kernels/core kernels/test_top_k_per_row.py kernels/test_concat_mla_q.py
+#
+# - Kernels ROCm Attention Test (MI250) %N   | mi250_1 | 60min | parallelism: 2
+#     pytest -v -s kernels/attention/test_rocm_attention_head_sizes.py
+#         kernels/attention/test_rocm_attention_selector.py
+#         --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+#     pytest -v -s kernels/attention/test_triton_decode_attention.py
+#         kernels/attention/test_triton_prefill_attention.py
+#         kernels/attention/test_triton_unified_attention.py
+#         --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+#
+# - Kernels ROCm Quantization Test (MI250)   | mi250_1 | 60min
+#     pytest -v -s kernels/quantization/test_int8_quant.py
+#         kernels/quantization/test_per_token_group_quant.py
+#     pytest -v -s kernels/rocm/test_rocm_misc_ops.py
+#         kernels/rocm/test_rocm_aiter_mla_variants.py
+#
+# - Kernels ROCm Quick Reduce Unit Test (MI250) | mi250_1 | 20min
+#     pytest -v -s kernels/rocm/test_rocm_quick_reduce.py
+#         -k "not two_gpu and not bf16_cast"
+
 steps:
 ##### fast check tests  #####
 
@@ -784,6 +811,128 @@ steps:
   commands:
     - pip install helion
     - pytest -v -s kernels/helion/
+
+#[BEGIN] ROCm-specific kernel tests (MI325X / gfx942) #####
+
+- label: Kernels ROCm Core Test (MI325X)
+  timeout_in_minutes: 60
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi325_1
+  optional: true
+  source_file_dependencies:
+  - csrc/
+  - vllm/_aiter_ops.py
+  - vllm/envs.py
+  - tests/kernels/core
+  - tests/kernels/test_top_k_per_row.py
+  - tests/kernels/test_concat_mla_q.py
+  - tests/kernels/rocm/
+  commands:
+    - pytest -v -s kernels/core kernels/test_top_k_per_row.py kernels/test_concat_mla_q.py
+    - pytest -v -s kernels/rocm/test_rocm_aiter_ops.py
+        kernels/rocm/test_rocm_misc_ops.py
+
+- label: Kernels ROCm Attention Test (MI325X) %N
+  timeout_in_minutes: 60
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi325_1
+  optional: true
+  parallelism: 2
+  source_file_dependencies:
+  - vllm/v1/attention/
+  - vllm/model_executor/layers/attention/
+  - vllm/envs.py
+  - tests/kernels/attention/
+  - tests/kernels/rocm/
+  - tests/v1/attention/
+  commands:
+    - pytest -v -s kernels/attention/test_rocm_attention_head_sizes.py
+        kernels/attention/test_rocm_attention_selector.py
+        kernels/attention/test_aiter_flash_attn.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+    - pytest -v -s kernels/rocm/test_rocm_aiter_mha.py
+        kernels/rocm/test_rocm_aiter_mla.py
+        kernels/rocm/test_rocm_aiter_mla_variants.py
+        kernels/rocm/test_rocm_aiter_unified_attention.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+    - pytest -v -s v1/attention/test_rocm_attention_backends_selection.py
+    - pytest -v -s kernels/attention/test_triton_decode_attention.py
+        kernels/attention/test_triton_prefill_attention.py
+        kernels/attention/test_triton_unified_attention.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+
+- label: Kernels ROCm Quantization Test (MI325X) %N
+  timeout_in_minutes: 90
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi325_1
+  optional: true
+  parallelism: 2
+  source_file_dependencies:
+  - csrc/quantization/
+  - vllm/model_executor/layers/quantization/
+  - vllm/envs.py
+  - tests/kernels/quantization/
+  - tests/kernels/rocm/
+  - tests/rocm/
+  commands:
+    - pytest -v -s kernels/quantization/test_rocm_skinny_gemms.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+    - pytest -v -s rocm/aiter/test_grouped_quant.py rocm/aiter/test_mla_fp8_support_check.py
+    - pytest -v -s kernels/rocm/test_rocm_fp8.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+    - pytest -v -s kernels/rocm/test_rocm_quark.py -k "not mxfp4 and not ocp_mx"
+    - pytest -v -s kernels/quantization/test_fp8_quant.py
+        kernels/quantization/test_int8_quant.py
+        kernels/quantization/test_per_token_group_quant.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+
+- label: Kernels ROCm MoE Test (MI325X) %N
+  timeout_in_minutes: 90
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi325_1
+  optional: true
+  parallelism: 2
+  source_file_dependencies:
+  - csrc/moe/
+  - vllm/model_executor/layers/fused_moe/
+  - vllm/envs.py
+  - tests/kernels/moe/
+  - tests/kernels/rocm/
+  commands:
+    - pytest -v -s kernels/moe/test_rocm_aiter_topk.py
+        kernels/rocm/test_rocm_aiter_moe.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+    - pytest -v -s kernels/moe/test_moe.py kernels/moe/test_fused_topk.py
+        kernels/moe/test_grouped_topk.py kernels/moe/test_batched_moe.py
+        kernels/moe/test_moe_align_block_size.py kernels/moe/test_moe_permute_unpermute.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+
+- label: Kernels ROCm Quick Reduce Test (MI325X)
+  timeout_in_minutes: 45
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi325_2
+  optional: true
+  source_file_dependencies:
+  - vllm/distributed/device_communicators/quick_all_reduce.py
+  - vllm/envs.py
+  - tests/kernels/rocm/test_rocm_quick_reduce.py
+  - tests/kernels/rocm/test_rocm_quick_reduce_ray.py
+  commands:
+    - pytest -v -s kernels/rocm/test_rocm_quick_reduce.py
+    - pytest -v -s kernels/rocm/test_rocm_quick_reduce_ray.py
+        -k "not variable_input"
+
+- label: Kernels ROCm FP8 MoE Test (MI325X)
+  timeout_in_minutes: 90
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi325_1
+  optional: true
+  commands:
+    - pytest -v -s kernels/rocm/test_rocm_aiter_moe.py -k fp8
+    - pytest -v -s kernels/moe/test_moe.py -k fp8
+    - pytest -v -s kernels/moe/test_block_int8.py
+
+#[  END] ROCm-specific kernel tests (MI325X / gfx942) #####
 
 - label: Model Executor Test # 23min
   timeout_in_minutes: 35
@@ -2515,6 +2664,60 @@ steps:
   commands:
     - pip install helion
     - pytest -v -s kernels/helion/
+
+#[BEGIN] ROCm-specific kernel tests (MI355X / gfx950) #####
+
+- label: Kernels ROCm Core Test (MI355X)
+  timeout_in_minutes: 60
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi355_1
+  optional: true
+  source_file_dependencies:
+  - csrc/
+  - vllm/_aiter_ops.py
+  - vllm/envs.py
+  - tests/kernels/core
+  - tests/kernels/test_top_k_per_row.py
+  - tests/kernels/rocm/
+  commands:
+    - pytest -v -s kernels/core kernels/test_top_k_per_row.py
+    - pytest -v -s kernels/rocm/test_rocm_aiter_ops.py
+        kernels/rocm/test_rocm_misc_ops.py
+        kernels/rocm/test_rocm_aiter_mla_variants.py
+
+- label: Kernels ROCm FP4 Test (MI355X) %N
+  timeout_in_minutes: 60
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi355_1
+  optional: true
+  parallelism: 2
+  source_file_dependencies:
+  - csrc/quantization/
+  - vllm/model_executor/layers/quantization/
+  - vllm/envs.py
+  - tests/kernels/rocm/
+  commands:
+    - pytest -v -s kernels/rocm/test_rocm_fp4.py
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+    - pytest -v -s kernels/rocm/test_rocm_quark.py -k "mxfp4 or ocp_mx"
+        --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
+
+- label: Kernels ROCm FP4 MoE Test (MI355X)
+  timeout_in_minutes: 60
+  mirror_hardwares: [amdexperimental, amdproduction]
+  agent_pool: mi355_1
+  optional: true
+  source_file_dependencies:
+  - csrc/moe/
+  - vllm/model_executor/layers/fused_moe/
+  - tests/kernels/moe/
+  - tests/kernels/rocm/
+  commands:
+    - pytest -v -s kernels/rocm/test_rocm_fp4.py
+    - pytest -v -s kernels/rocm/test_rocm_quark.py -k mxfp4
+    - pytest -v -s kernels/moe/test_ocp_mx_moe.py
+
+#[  END] ROCm-specific kernel tests (MI355X / gfx950) #####
 
 - label: Model Executor Test # 23min
   timeout_in_minutes: 35

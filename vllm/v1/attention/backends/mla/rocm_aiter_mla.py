@@ -22,6 +22,19 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 
 class AiterMLABackend(MLACommonBackend):
+    """AITER MLA attention backend for ROCm (gfx942/gfx950).
+
+    Kernel constraints (gfx942 precompiled ASM kernels):
+    - Decode num_heads: only 16 and 128 are natively supported.
+      (kernel files: mla_dec_stage1_bf16_a16w16_subQ16_mqa16.co and
+       mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co)
+      Other num_heads values will raise RuntimeError from the C++ kernel selector.
+    - Block size: always 1 (each page holds exactly 1 KV token).
+    - max_seqlen_qo: always 1 for decode (1 query token per sequence).
+    - No FP4 MLA kernel exists; FP4 support in aiter is GEMM-only (gfx950).
+    - head_size (q_head_dim): unconstrained at backend level.
+    """
+
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
@@ -33,10 +46,13 @@ class AiterMLABackend(MLACommonBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
+        # head_size (q_head_dim) is not constrained at the backend level;
+        # the C++ kernel accepts arbitrary head dimensions.
         return []
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # The MLA decode kernel uses block_size=1: each page holds exactly 1 token.
         return [1]
 
     @staticmethod

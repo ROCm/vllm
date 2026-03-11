@@ -39,7 +39,6 @@ from vllm.model_executor.layers.fused_moe.utils import (
     disable_inplace,
     moe_kernel_quantize_input,
 )
-from vllm.model_executor.layers.quantization.utils.mxfp4_utils import dequant_mxfp4
 from vllm.model_executor.layers.quantization.utils.mxfp6_utils import dequant_mxfp6
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -1761,6 +1760,10 @@ def fused_experts_impl(
         # and for which we have a native OCP mx fused MOE kernel,
         # this dequantization step should not be done.
         if ocp_mx_scheme.startswith("w_mxfp4"):
+            from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+                dequant_mxfp4,
+            )
+
             # Weight has to be dequantized for mxfp4 emulation.
             w1 = dequant_mxfp4(w1, w1_scale, hidden_states.dtype)
             w1_scale = None

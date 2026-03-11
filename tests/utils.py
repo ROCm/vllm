@@ -1067,20 +1067,21 @@ def multi_process_parallel(
     )
 
     distributed_init_port = get_open_port()
-    refs = []
-    for rank in range(tp_size * pp_size):
-        refs.append(
-            test_target.remote(
-                monkeypatch,
-                tp_size,
-                pp_size,
-                rank,
-                distributed_init_port,
-            ),
-        )
-    ray.get(refs)
-
-    ray.shutdown()
+    try:
+        refs = []
+        for rank in range(tp_size * pp_size):
+            refs.append(
+                test_target.remote(
+                    monkeypatch,
+                    tp_size,
+                    pp_size,
+                    rank,
+                    distributed_init_port,
+                ),
+            )
+        ray.get(refs)
+    finally:
+        ray.shutdown()
 
 
 @contextmanager
