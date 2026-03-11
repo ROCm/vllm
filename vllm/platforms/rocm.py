@@ -62,14 +62,6 @@ _ROCM_DEVICE_ID_NAME_MAP: dict[str, str] = {
     "0x744c": "AMD_Radeon_RX7900XTX",
 }
 
-# Prevent use of clashing `{CUDA/HIP}_VISIBLE_DEVICES`
-if "HIP_VISIBLE_DEVICES" in os.environ:
-    val = os.environ["HIP_VISIBLE_DEVICES"]
-    if cuda_val := os.environ.get("CUDA_VISIBLE_DEVICES", None):
-        assert val == cuda_val
-    else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = val
-
 # AMDSMI utils
 # Note that NVML is not affected by `{CUDA/HIP}_VISIBLE_DEVICES`,
 # all the related functions work on real physical device ids.
