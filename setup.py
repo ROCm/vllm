@@ -895,10 +895,11 @@ def get_vllm_version() -> str:
                 if "sdist" not in sys.argv:
                     version += f"{sep}cu{cuda_version_str}"
     elif _is_hip():
-        # Get the Rocm Version
+        # Get the Rocm Version - use full version (e.g., rocm7.12.0rc0)
+        # to match torch wheel naming convention
         rocm_version = get_rocm_version() or torch.version.hip
         if rocm_version and rocm_version != envs.VLLM_MAIN_CUDA_VERSION:
-            version += f"{sep}rocm{rocm_version.replace('.', '')[:3]}"
+            version += f"{sep}rocm{rocm_version}"
     elif _is_tpu():
         version += f"{sep}tpu"
     elif _is_cpu():
