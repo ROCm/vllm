@@ -96,9 +96,15 @@ ENV SCCACHE_IDLE_TIMEOUT=${USE_SCCACHE:+0}
 ###
 ARG PIP_EXTRA_INDEX_URL=https://rocm.nightlies.amd.com/v2-staging/gfx94X-dcgpu/
 ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
-RUN uv pip install --index-url ${PIP_EXTRA_INDEX_URL} "rocm[libraries,devel]" \
+ARG ROCM_SDK_VERSION
+ARG TORCH_VERSION=2.9.1
+ARG TORCHAUDIO_VERSION=2.9.0
+ARG TORCHVISION_VERSION=0.24.0
+RUN uv pip install --index-url ${PIP_EXTRA_INDEX_URL} \
+       "rocm[libraries,devel]${ROCM_SDK_VERSION:+==${ROCM_SDK_VERSION}}" \
     && rocm-sdk init \
-    && uv pip install --index-url ${PIP_EXTRA_INDEX_URL} 'torch==2.9.1' torchaudio torchvision triton
+    && uv pip install --index-url ${PIP_EXTRA_INDEX_URL} \
+       "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" "torchvision==${TORCHVISION_VERSION}"
 ENV SITE_PACKAGES=/opt/python/lib/python3.12/site-packages
 ENV ROCM_PATH="$SITE_PACKAGES/_rocm_sdk_devel"
 ENV HIP_DEVICE_LIB_PATH="$SITE_PACKAGES/_rocm_sdk_core/lib/llvm/amdgcn/bitcode"
