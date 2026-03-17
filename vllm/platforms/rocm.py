@@ -155,6 +155,10 @@ def on_gfx1250() -> bool:
     return _ON_GFX1250
 
 
+def on_gfx1250() -> bool:
+    return _ON_GFX1250
+
+
 @cache
 def use_rocm_custom_paged_attention(
     qtype: torch.dtype,
