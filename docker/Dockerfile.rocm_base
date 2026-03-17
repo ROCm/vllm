@@ -104,7 +104,9 @@ RUN uv pip install --index-url ${PIP_EXTRA_INDEX_URL} \
        "rocm[libraries,devel]${ROCM_SDK_VERSION:+==${ROCM_SDK_VERSION}}" \
     && rocm-sdk init \
     && uv pip install --index-url ${PIP_EXTRA_INDEX_URL} \
-       "torch==${TORCH_VERSION}" "torchaudio==${TORCHAUDIO_VERSION}" "torchvision==${TORCHVISION_VERSION}"
+       "torch==${TORCH_VERSION:-2.9.1}" \
+       "torchaudio==${TORCHAUDIO_VERSION:-2.9.0}" \
+       "torchvision==${TORCHVISION_VERSION:-0.24.0}"
 ENV SITE_PACKAGES=/opt/python/lib/python3.12/site-packages
 ENV ROCM_PATH="$SITE_PACKAGES/_rocm_sdk_devel"
 ENV HIP_DEVICE_LIB_PATH="$SITE_PACKAGES/_rocm_sdk_core/lib/llvm/amdgcn/bitcode"
