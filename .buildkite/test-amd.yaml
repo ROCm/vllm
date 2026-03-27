@@ -46,6 +46,7 @@ steps:
   agent_pool: mi325_1
   optional: true
   torch_nightly: true
+  grade: "Blocking"
   working_dir: "/vllm-workspace/tests"
   source_file_dependencies:
   - vllm/
@@ -60,6 +61,7 @@ steps:
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi325]
   agent_pool: mi325_1
   torch_nightly: true
+  grade: "Blocking"
   parallelism: 2
   working_dir: "/vllm-workspace/tests"
   source_file_dependencies:
@@ -75,6 +77,7 @@ steps:
   timeout_in_minutes: 55
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi325]
   agent_pool: mi325_1
+  grade: "Blocking"
   working_dir: "/vllm-workspace/tests"
   source_file_dependencies:
   - vllm/
