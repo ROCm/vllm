@@ -4,6 +4,10 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG ROCM_VERSION=7.13.0a20260330
 ARG PIP_EXTRA_INDEX_URL=https://rocm.nightlies.amd.com/v2-staging/gfx94X-dcgpu/
 ARG TORCH_VERSION=2.10
+ARG FA_BRANCH="0e60e394"
+ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
+ARG MORI_BRANCH="2d02c6a9"
+ARG MORI_REPO="https://github.com/ROCm/mori.git"
 
 # Sccache configuration (only used in release pipeline)
 ARG USE_SCCACHE
@@ -108,6 +112,42 @@ ENV HIP_DEVICE_LIB_PATH="$SITE_PACKAGES/_rocm_sdk_core/lib/llvm/amdgcn/bitcode"
 RUN cd $SITE_PACKAGES/_rocm_sdk_core/share/amd_smi && uv pip install .
 ENV PYTHONPATH=$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi:$PYTHONPATH
 
+
+###
+### MORI Build
+###
+FROM base AS build_mori
+ARG MORI_BRANCH
+ARG MORI_REPO
+RUN git clone ${MORI_REPO}
+RUN cd mori \
+    && git checkout ${MORI_BRANCH} \
+    && git submodule update --init --recursive \
+    && perl -pi -e 's/list\(APPEND CMAKE_PREFIX_PATH "\/opt\/rocm"\)/list(APPEND CMAKE_PREFIX_PATH \$ENV{ROCM_PATH})/g' CMakeLists.txt \
+    && python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl
+RUN mkdir -p /app/install && cp /app/mori/dist/*.whl /app/install
+
+
+###
+### FlashAttention Build
+###
+FROM base AS build_fa
+ARG FA_BRANCH
+ARG FA_REPO
+ARG USE_SCCACHE
+RUN git clone ${FA_REPO}
+RUN cd flash-attention \
+    && git checkout ${FA_BRANCH} \
+    && git submodule update --init \
+    && if [ "$USE_SCCACHE" = "1" ]; then \
+           export HIP_CLANG_PATH=/opt/sccache-wrappers \
+           && sccache --show-stats; \
+       fi \
+    && GPU_ARCHS=$(echo ${PYTORCH_ROCM_ARCH} | sed -e 's/;gfx1[0-9]\{3\}//g') python3 setup.py bdist_wheel --dist-dir=dist \
+    && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi
+RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
+
+
 ###
 ### AITER Build
 ###
@@ -125,19 +165,35 @@ RUN uv pip install pyyaml && cd aiter \
            export HIP_CLANG_PATH=/opt/sccache-wrappers \
            && sccache --show-stats; \
        fi \
-    && GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
+    && PREBUILD_KERNELS=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
     && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && ls /app/aiter/dist/*.whl
 RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
+
 
 ###
 ### Final Build
 ###
 
+# Wheel release stage - 
+# only includes dependencies used by wheel release pipeline
+FROM base AS debs_wheel_release
+RUN mkdir /app/debs
+RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+
 # Full debs stage - includes Mori (used by Docker releases)
 FROM base AS debs
 RUN mkdir /app/debs
+RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
+    cp /install/*.whl /app/debs
+RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 
 FROM base AS final
@@ -148,11 +204,19 @@ ARG BASE_IMAGE
 ARG ROCM_VERSION
 ARG PIP_EXTRA_INDEX_URL
 ARG TORCH_VERSION
+ARG FA_BRANCH
+ARG FA_REPO
 ARG AITER_BRANCH
 ARG AITER_REPO
+ARG MORI_BRANCH
+ARG MORI_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "ROCM_VERSION: ${ROCM_VERSION}" >> /app/versions.txt \
     && echo "PIP_EXTRA_INDEX_URL: ${PIP_EXTRA_INDEX_URL}" >> /app/versions.txt \
     && echo "TORCH_VERSION: ${TORCH_VERSION}" >> /app/versions.txt \
+    && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
+    && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
     && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
-    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt
+    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt \
+    && echo "MORI_BRANCH: ${MORI_BRANCH}" >> /app/versions.txt \
+    && echo "MORI_REPO: ${MORI_REPO}" >> /app/versions.txt
