@@ -120,7 +120,7 @@ FROM base AS build_mori
 ARG MORI_BRANCH
 ARG MORI_REPO
 RUN git clone ${MORI_REPO}
-RUN cd mori \
+RUN apt-get update && apt-get install -y libdrm-dev && cd mori \
     && git checkout ${MORI_BRANCH} \
     && git submodule update --init --recursive \
     && perl -pi -e 's/list\(APPEND CMAKE_PREFIX_PATH "\/opt\/rocm"\)/list(APPEND CMAKE_PREFIX_PATH \$ENV{ROCM_PATH})/g' CMakeLists.txt \
