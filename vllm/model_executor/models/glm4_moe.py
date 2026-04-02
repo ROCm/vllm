@@ -105,7 +105,9 @@ class Glm4MoeMLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
-        self.act_fn = SiluAndMul()
+        # self.act_fn = SiluAndMul()
+        from aiter.ops.triton.activation import act_mul
+        self.act_fn = lambda x: act_mul(x, "silu")
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
