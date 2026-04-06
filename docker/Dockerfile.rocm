@@ -14,7 +14,8 @@ ARG SCCACHE_S3_NO_CREDENTIALS=0
 FROM ${BASE_IMAGE} AS base
 
 ARG ARG_PYTORCH_ROCM_ARCH
-ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
+ENV PYTORCH_ROCM_ARCH=gfx950
+ENV OMPI_DIR=/usr/lib/x86_64-linux-gnu/openmpi
 
 # Install some basic utilities
 RUN apt-get update -q -y && apt-get install -q -y \
@@ -195,6 +196,7 @@ ARG DEEPEP_BRANCH="e84464ec"
 ARG DEEPEP_REPO="https://github.com/ROCm/DeepEP.git"
 ARG DEEPEP_NIC="cx7"
 ENV ROCSHMEM_DIR=/opt/rocshmem
+ENV ROCM_HOME=${ROCM_PATH}
 
 RUN git clone ${ROCSHMEM_REPO} \
  && cd rocm-systems \
