@@ -117,106 +117,6 @@ COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/docker/Dockerfile.rocm /docker/
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/.buildkite /.buildkite
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/vllm/v1 /vllm_v1
 
-# RIXL/UCX build stages
-FROM base AS build_rixl
-ARG RIXL_BRANCH="f33a5599"
-ARG RIXL_REPO="https://github.com/ROCm/RIXL.git"
-ARG UCX_BRANCH="da3fac2a"
-ARG UCX_REPO="https://github.com/ROCm/ucx.git"
-ENV ROCM_PATH=/opt/python/lib/python3.12/site-packages
-ENV UCX_HOME=/usr/local/ucx
-ENV RIXL_HOME=/usr/local/rixl
-ENV RIXL_BENCH_HOME=/usr/local/rixl_bench
-
-# RIXL build system dependences and RDMA support
-RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
-    libgrpc-dev \
-    libgrpc++-dev \
-    libprotobuf-dev \
-    protobuf-compiler-grpc \
-    libcpprest-dev \
-    libaio-dev \
-    librdmacm1 \
-    librdmacm-dev \
-    libibverbs1 \
-    libibverbs-dev \
-    ibverbs-utils \
-    rdmacm-utils \
-    ibverbs-providers \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN uv pip install --system meson auditwheel patchelf tomlkit
-
-RUN cd /usr/local/src && \
-    git clone ${UCX_REPO} &&  \
-    cd ucx  && \
-    git checkout ${UCX_BRANCH} && \
-    ./autogen.sh && \
-    mkdir build && cd build && \
-    ../configure \
-        --prefix=/usr/local/ucx \
-        --enable-shared \
-        --disable-static \
-        --disable-doxygen-doc \
-        --enable-optimizations \
-        --enable-devel-headers \
-        --with-rocm=/opt/rocm \
-        --with-verbs \
-        --with-dm \
-        --enable-mt && \
-    make -j && \
-    make install
-
-ENV PATH=/usr/local/ucx/bin:$PATH
-ENV LD_LIBRARY_PATH=${UCX_HOME}/lib:${LD_LIBRARY_PATH}
-
-RUN git clone ${RIXL_REPO} /opt/rixl && \
-    cd /opt/rixl && \
-    git checkout ${RIXL_BRANCH} && \
-    meson setup build --prefix=${RIXL_HOME} \
-                     -Ducx_path=${UCX_HOME} \
-                     -Drocm_path=${ROCM_PATH} && \
-    cd build && \
-    ninja && \
-    ninja install
-
-# Generate RIXL wheel
-RUN cd /opt/rixl && mkdir -p /app/install && \
-    ./contrib/build-wheel.sh \
-        --output-dir /app/install \
-        --rocm-dir ${ROCM_PATH} \
-        --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
-        --nixl-plugins-dir ${RIXL_HOME}/lib/x86_64-linux-gnu/plugins
-
-# DeepEP build stage
-FROM base AS build_deep
-ARG ROCSHMEM_BRANCH="769135f7"
-ARG ROCSHMEM_REPO="https://github.com/ROCm/rocm-systems.git"
-ARG DEEPEP_BRANCH="e84464ec"
-ARG DEEPEP_REPO="https://github.com/ROCm/DeepEP.git"
-ARG DEEPEP_NIC="cx7"
-ENV ROCSHMEM_DIR=/opt/rocshmem
-ENV ROCM_HOME=${ROCM_PATH}
-
-RUN git clone ${ROCSHMEM_REPO} \
- && cd rocm-systems \
- && git checkout ${ROCSHMEM_BRANCH} \
- && mkdir -p projects/rocshmem/build \
- && cd projects/rocshmem/build \
- && cmake .. \
-    -DCMAKE_INSTALL_PREFIX="${ROCSHMEM_DIR}" \
-    -DROCM_PATH=${ROCM_PATH} \
-    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DUSE_EXTERNAL_MPI=OFF \
- && make -j \
- && make install
-
-# Build DeepEP wheel.
-# DeepEP looks for rocshmem at ROCSHMEM_DIR.
-RUN git clone ${DEEPEP_REPO} \
- && cd DeepEP \
- && git checkout ${DEEPEP_BRANCH} \
- && python3 setup.py --variant rocm --nic ${DEEPEP_NIC} bdist_wheel --dist-dir=/app/deep_install
 
 # -----------------------
 # vLLM wheel release build stage (for building distributable wheels)
@@ -334,27 +234,6 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     && pip uninstall -y vllm \
     && uv pip install --system *.whl
 
-# Verify that PyTorch is the ROCm build, not CUDA
-RUN python3 -c "import torch; assert torch.version.hip is not None, \
-    f'Expected ROCm PyTorch but got CUDA (torch.version.cuda={torch.version.cuda}, torch.version.hip={torch.version.hip})'; \
-    print(f'Verified: PyTorch {torch.__version__} with ROCm (HIP {torch.version.hip})')"
-
-# Install RIXL wheel
-RUN --mount=type=bind,from=build_rixl,src=/app/install,target=/rixl_install \
-    uv pip install --system /rixl_install/*.whl
-
-# Install DeepEP wheel
-RUN --mount=type=bind,from=build_deep,src=/app/deep_install,target=/deep_install \
-    uv pip install --system /deep_install/*.whl
-COPY --from=build_deep /opt/rocshmem /opt/rocshmem
-
-# RIXL/MoRIIO runtime dependencies (RDMA userspace libraries)
-RUN apt-get update -q -y && apt-get install -q -y \
-    librdmacm1 \
-    libibverbs1 \
-    ibverbs-providers \
-    ibverbs-utils \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /vllm-workspace
 ARG COMMON_WORKDIR
