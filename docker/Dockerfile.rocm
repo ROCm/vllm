@@ -189,7 +189,7 @@ RUN cd /opt/rixl && mkdir -p /app/install && \
 
 # DeepEP build stage
 FROM base AS build_deep
-ARG ROCSHMEM_BRANCH="ba0bf0f3"
+ARG ROCSHMEM_BRANCH="769135f7"
 ARG ROCSHMEM_REPO="https://github.com/ROCm/rocm-systems.git"
 ARG DEEPEP_BRANCH="e84464ec"
 ARG DEEPEP_REPO="https://github.com/ROCm/DeepEP.git"
