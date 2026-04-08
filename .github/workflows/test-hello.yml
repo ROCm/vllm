@@ -8,7 +8,7 @@ on:
 
 jobs:
   hello:
-    runs-on: ubuntu-latest
+    runs-on: linux-strix-halo-gpu-rocm-oem
     steps:
       - name: Hello
         run: echo "Hello from gfx11! This is a test PR."
