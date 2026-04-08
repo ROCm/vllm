@@ -11,4 +11,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Hello
-        run: echo "Hello from gfx11!"
+        run: echo "Hello from gfx11! This is a test PR."
