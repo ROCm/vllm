@@ -12,3 +12,24 @@ jobs:
     steps:
       - name: Hello
         run: echo "Hello from gfx11! This is a test PR."
+
+      - name: Check kernel exports cwsr_size and ctl_stack_size
+        run: |
+          # Kernel commit 7445db6a7d5a (drm/amdkfd: export cwsr_size and ctl_stack_size)
+          # adds these properties to KFD topology sysfs nodes. Userspace needs them
+          # to avoid hardcoding VGPR size.
+          echo "Kernel: $(uname -r)"
+          found=false
+          for props in /sys/devices/virtual/kfd/kfd/topology/nodes/*/properties; do
+            if grep -q 'cwsr_size' "$props" 2>/dev/null; then
+              echo "Found cwsr_size in $props:"
+              grep 'cwsr_size\|ctl_stack_size' "$props"
+              found=true
+              break
+            fi
+          done
+          if [ "$found" = false ]; then
+            echo "ERROR: cwsr_size not found in any KFD topology node."
+            echo "The runner kernel is missing commit 7445db6a7d5a."
+            exit 1
+          fi
