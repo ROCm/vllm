@@ -37,8 +37,8 @@ jobs:
       - name: Fetch upstream tags for versioning
         run: |
           git remote add upstream https://github.com/vllm-project/vllm.git || true
-          git fetch upstream --tags
-          echo "Git describe: $(git describe --tags --always)"
+          git fetch upstream --tags || echo "Warning: could not fetch upstream tags"
+          git describe --tags --always || echo "Warning: git describe failed"
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
