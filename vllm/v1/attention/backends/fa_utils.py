@@ -31,7 +31,96 @@ elif current_platform.is_xpu():
     get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
 elif current_platform.is_rocm():
     try:
-        from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+        import torch
+        from flash_attn.flash_attn_interface import (
+            _wrapped_flash_attn_varlen_forward,
+        )
+
+        def flash_attn_varlen_func(  # type: ignore[no-redef,misc]
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            cu_seqlens_q: torch.Tensor,
+            max_seqlen_q: int,
+            max_seqlen_k: int,
+            softmax_scale: float,
+            causal: bool = True,
+            window_size: "list[int] | None" = None,
+            block_table: "torch.Tensor | None" = None,
+            softcap: float = 0.0,
+            alibi_slopes: "torch.Tensor | None" = None,
+            out: "torch.Tensor | None" = None,
+            seqused_k: "torch.Tensor | None" = None,
+            cu_seqlens_k: "torch.Tensor | None" = None,
+            return_softmax_lse: bool = False,
+            # vLLM-specific kwargs not supported by upstream, ignored:
+            scheduler_metadata: Any = None,
+            fa_version: Any = None,
+            q_descale: Any = None,
+            k_descale: Any = None,
+            v_descale: Any = None,
+            num_splits: Any = None,
+            s_aux: Any = None,
+        ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
+            """Wrapper that adapts vLLM's calling convention to upstream
+            flash-attn 2.x API on ROCm.
+
+            The upstream _wrapped_flash_attn_varlen_forward accepts both
+            cu_seqlens_k and seqused_k. When using paged KV cache
+            (block_table is set), seqused_k gives per-sequence K lengths
+            and cu_seqlens_k can be a dummy tensor.
+            """
+            if window_size is None:
+                window_size_left = -1
+                window_size_right = -1
+            else:
+                window_size_left = window_size[0]
+                window_size_right = window_size[1]
+
+            # Build cu_seqlens_k if not provided.
+            # For paged KV cache, cu_seqlens_k must be the cumulative
+            # sum of actual sequence lengths (seqused_k), NOT zeros.
+            if cu_seqlens_k is None:
+                if seqused_k is not None:
+                    cu_seqlens_k = torch.zeros(
+                        seqused_k.shape[0] + 1,
+                        dtype=torch.int32,
+                        device=q.device,
+                    )
+                    cu_seqlens_k[1:] = seqused_k.cumsum(0)
+                else:
+                    batch_size = cu_seqlens_q.shape[0] - 1
+                    cu_seqlens_k = torch.zeros(
+                        batch_size + 1, dtype=torch.int32, device=q.device
+                    )
+
+            out_padded, softmax_lse, _, _ = _wrapped_flash_attn_varlen_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                0.0,  # dropout_p
+                softmax_scale,
+                causal,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                return_softmax=False,
+                block_table=block_table,
+                seqused_k=seqused_k,
+            )
+            if out is not None:
+                out.copy_(out_padded)
+                result = out
+            else:
+                result = out_padded
+            if return_softmax_lse:
+                return result, softmax_lse
+            return result
 
         # Mark that upstream flash-attn is available on ROCm
         _ROCM_FLASH_ATTN_AVAILABLE = True
@@ -62,8 +151,8 @@ def get_flash_attn_version(
     if current_platform.is_xpu():
         return 2
     if current_platform.is_rocm():
-        # ROCm doesn't use vllm_flash_attn; return None to skip fa_version arg
-        return None
+        # ROCm uses upstream flash-attn which is FA2-compatible
+        return 2 if _ROCM_FLASH_ATTN_AVAILABLE else None
     try:
         from vllm.vllm_flash_attn.flash_attn_interface import (
             fa_version_unsupported_reason,
