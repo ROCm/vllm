@@ -188,10 +188,10 @@ jobs:
 
       - name: Configure AWS credentials via OIDC
         if: github.event_name == 'push' && github.repository_owner == 'ROCm'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
         with:
           role-to-assume: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
-          aws-region: us-east-1
+          aws-region: us-east-2
 
       - name: Upload wheel to S3
         if: github.event_name == 'push' && github.repository_owner == 'ROCm'
