@@ -30,6 +30,14 @@
 
 #define LDS_SIZE 64 * 1024
 
+inline int get_l2_cache_size_int4() {
+  static const int result = [] {
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    return dprops->l2CacheSize;
+  }();
+  return result;
+}
+
 static int get_lds_size_int4() {
   static bool is_cached = false;
   static int result;
@@ -882,23 +890,19 @@ static int mindiv_int4(int N, int div1, int div2) {
           __wvPrGrp, CuCount);                                               \
   }
 
-// Backwards-compatible wrapper: existing call sites get WvPrGrp=16, AC=16.
-#define WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
-  WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, 16, 16, _UNRL, _N, _GS, _HAS_ZP)
+#define WVSPLITK_INT4G(_YTILE, _AC, _UNRL, _N, _GS, _HAS_ZP)                 \
+  if (is_gfx1x_int4())                                                       \
+    WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, 16, _AC, _UNRL, _N, _GS, _HAS_ZP) \
+  else                                                                       \
+    WVSPLITK_INT4G_LAUNCH_W_AC(64, _YTILE, 16, _AC, _UNRL, _N, _GS, _HAS_ZP)
 
-#define WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
-  if (is_gfx1x_int4())                                         \
-    WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
-  else                                                         \
-    WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
-
-#define WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP) \
-  if (group_size == 32)                              \
-    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 32, _HAS_ZP)   \
-  else if (group_size == 64)                         \
-    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 64, _HAS_ZP)   \
-  else                                               \
-    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 128, _HAS_ZP)
+#define WVSPLIT_INT4G_GS(_YTILE, _AC, _UNRL, _N, _HAS_ZP) \
+  if (group_size == 32)                                   \
+    WVSPLITK_INT4G(_YTILE, _AC, _UNRL, _N, 32, _HAS_ZP)   \
+  else if (group_size == 64)                              \
+    WVSPLITK_INT4G(_YTILE, _AC, _UNRL, _N, 64, _HAS_ZP)   \
+  else                                                    \
+    WVSPLITK_INT4G(_YTILE, _AC, _UNRL, _N, 128, _HAS_ZP)
 
 // Like WVSPLIT_INT4G_GS but the caller also picks WvPrGrp and A_CHUNK.
 // Mirrors WVSPLIT_INT4G_GS's 3-way group_size demux so a tuned dispatch
@@ -917,19 +921,19 @@ static int mindiv_int4(int N, int div1, int div2) {
   {                                                                   \
     if (K_in * N_in > max_lds_len) {                                  \
       if (_sYT < 30)                                                  \
-        WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                          \
+        WVSPLIT_INT4G_GS(4, 16, 2, __N, _HAS_ZP)                      \
       else                                                            \
-        WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                          \
+        WVSPLIT_INT4G_GS(4, 16, 1, __N, _HAS_ZP)                      \
     } else if (__N >= 4 && _sYT >= 480)                               \
-      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                            \
+      WVSPLIT_INT4G_GS(4, 16, 1, __N, _HAS_ZP)                        \
     else if (__N >= 3 && _sYT >= 40)                                  \
-      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                            \
+      WVSPLIT_INT4G_GS(4, 16, 1, __N, _HAS_ZP)                        \
     else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096)) \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                            \
+      WVSPLIT_INT4G_GS(2, 16, 4, __N, _HAS_ZP)                        \
     else if (__N >= 3 && _sYT < 40)                                   \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                            \
+      WVSPLIT_INT4G_GS(2, 16, 2, __N, _HAS_ZP)                        \
     else if (__N >= 2)                                                \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                            \
+      WVSPLIT_INT4G_GS(2, 16, 2, __N, _HAS_ZP)                        \
     else if (is_gfx1x_int4() && __N == 1 && K_in == 4096)             \
       /* Tuned for gfx1151 (Qwen3.5 W4A16 decode: GDN out_proj at     \
          M=2048, K=4096, N=1).  AC=32 doubles per-thread global load  \
@@ -941,8 +945,13 @@ static int mindiv_int4(int N, int div1, int div2) {
          Verify per shape with                                        \
          benchmarks/kernels/sweep_int4g_kernel.py. */                 \
       WVSPLITK_INT4G_GS_W_AC(1, 4, 16, 32, __N, _HAS_ZP)              \
-    else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */   \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                            \
+    else { /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */ \
+      if (M_in * K_in / 2 > get_l2_cache_size_int4()) {               \
+        WVSPLIT_INT4G_GS(2, 32, 4, __N, _HAS_ZP)                      \
+      } else {                                                        \
+        WVSPLIT_INT4G_GS(2, 16, 4, __N, _HAS_ZP)                      \
+      }                                                               \
+    }                                                                 \
   }
 
 // Inner dispatch: shared by both symmetric and asymmetric paths
