@@ -1,0 +1,51 @@
+# CI image for gfx11 (RDNA 3.5 / Strix) vLLM wheel builds and kernel tests.
+# Pre-bakes ROCm SDK (from pip), PyTorch, sccache, and uv so that CI jobs
+# skip the 15-20 minute setup overhead.
+#
+# Build:
+#   docker build -f docker/Dockerfile.gfx11-ci .
+# Override ROCm nightly index or PyTorch version:
+#   docker build --build-arg ROCM_NIGHTLY_INDEX=https://... \
+#                --build-arg PYTORCH_VERSION=2.10.0 \
+#                -f docker/Dockerfile.gfx11-ci .
+
+FROM python:3.12-bookworm
+
+ARG ROCM_NIGHTLY_INDEX=https://rocm.nightlies.amd.com/v2/gfx1151
+ARG PYTORCH_VERSION=2.10.0
+ARG SCCACHE_VERSION=v0.8.1
+
+# System build tools
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    git curl cmake ninja-build gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# sccache
+RUN curl -L "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    | tar xz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache' \
+    && sccache --version
+
+# uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh \
+    && uv --version
+
+# ROCm SDK from pip nightly wheels
+RUN pip install --no-cache-dir "rocm[devel,libraries]" \
+    --extra-index-url ${ROCM_NIGHTLY_INDEX} \
+    && rocm-sdk init
+
+# ROCm environment variables (site-packages path is stable in official Python images)
+ENV ROCM_PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV HIP_DEVICE_LIB_PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_core/lib/llvm/amdgcn/bitcode
+ENV PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_devel/bin:$PATH
+ENV PYTHONPATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_core/share/amd_smi
+
+# Verify hipcc is functional
+RUN hipcc --version
+
+# Pre-install PyTorch ROCm nightly (largest dependency, ~2 GB)
+RUN pip install --no-cache-dir torch==${PYTORCH_VERSION} \
+    --extra-index-url ${ROCM_NIGHTLY_INDEX} \
+    && python -c "import torch; print(f'PyTorch {torch.__version__}, HIP: {torch.version.hip}')"
+
+LABEL org.opencontainers.image.description="gfx11 CI image for vLLM wheel builds and kernel tests"
