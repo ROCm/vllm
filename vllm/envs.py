@@ -487,6 +487,22 @@ def get_env_or_set_default(
 
 logger = logging.getLogger(__name__)
 
+
+def _is_rdna_for_moe_default() -> bool:
+    """Check if running on RDNA (gfx11/gfx12) for MoE kernel default.
+
+    On RDNA, the Triton WNA16 MoE kernel outperforms the Exllama MoE kernel
+    due to better handling of many-expert routing and avoiding atomicAdd
+    K-tiling overhead.
+    """
+    try:
+        from vllm.platforms.rocm import on_gfx1x
+
+        return on_gfx1x()
+    except (ImportError, Exception):
+        return False
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
@@ -943,8 +959,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use exllama 4-bit kernel for MoE GPTQ instead of Triton.
     # Requires exllama-native weight format [E, K/8, N] int32.
+    # Defaults to false on RDNA (gfx11/gfx12) where Triton MoE is faster.
     "VLLM_MOE_GPTQ_EXLLAMA": lambda: (
-        os.getenv("VLLM_MOE_GPTQ_EXLLAMA", "true").lower() in ("true", "1")
+        os.getenv(
+            "VLLM_MOE_GPTQ_EXLLAMA",
+            "false" if _is_rdna_for_moe_default() else "true",
+        ).lower()
+        in ("true", "1")
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.

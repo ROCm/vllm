@@ -1691,6 +1691,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         super().__init__(moe)
         self.weight_quant = weight_quant
         self.input_quant = input_quant
+        self.moe_mk = None
+        self.moe_quant_config = None
         # Extract properties from weight_quant
         self.num_bits = weight_quant.num_bits
         self.packed_factor = 32 // weight_quant.num_bits
@@ -1911,6 +1913,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
             layer.use_exllama_moe = False
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
 
     def _process_weights_awq_gemv(self, layer: torch.nn.Module) -> None:
         """AWQ GEMV MoE path: convert GPTQ [E, K/8, N] → AWQ [E, K, N/8]
