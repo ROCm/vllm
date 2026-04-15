@@ -66,6 +66,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    UNROLL_K: tl.constexpr,  # number of BLOCK_K tiles to unroll per loop iter
 ):
     """
     Fused W4A16 GEMM reading weights from skinny format [N, K//8].
@@ -79,6 +80,11 @@ def _triton_w4a16_skinny_fmt_kernel(
     When HAS_ZP=True, raw zero-points zp_raw are loaded from zp_ptr [N, K//G]
     and subtracted directly: (nibble - zp_raw) * scale.
     When HAS_ZP=False, only the constant ZP_BIAS is subtracted (symmetric).
+
+    UNROLL_K controls how many BLOCK_K tiles are statically unrolled per
+    outer loop iteration.  This amortises loop overhead and gives the
+    compiler more scheduling freedom.  BLOCK_K must not exceed group_size,
+    so UNROLL_K > 1 effectively processes multiple groups per iteration.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -99,48 +105,51 @@ def _triton_w4a16_skinny_fmt_kernel(
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
-        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < K
+    total_k_tiles = tl.cdiv(K, BLOCK_K)
+    num_outer = tl.cdiv(total_k_tiles, UNROLL_K)
 
-        # ---- Load activations A: [BLOCK_M, BLOCK_K] ----
-        a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
-        mask_a = (offs_m[:, None] < M) & mask_k[None, :]
-        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+    for outer in range(0, num_outer):
+        for u in tl.static_range(UNROLL_K):
+            k_start = outer * UNROLL_K + u
+            offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < K
 
-        # ---- Load packed weights B: [BLOCK_N, BLOCK_K//8] int32 ----
-        offs_k8 = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
-        b_ptrs = b_ptr + offs_n[:, None] * K8 + offs_k8[None, :]
-        mask_b = (offs_n[:, None] < N) & (offs_k8[None, :] < K8)
-        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
+            # ---- Load activations A: [BLOCK_M, BLOCK_K] ----
+            a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+            mask_a = (offs_m[:, None] < M) & mask_k[None, :]
+            a = tl.load(a_ptrs, mask=mask_a, other=0.0)
 
-        # ---- Unpack int4 weights with ExLlama unshuffle ----
-        b = tl.interleave(b_packed, b_packed)
-        b = tl.interleave(b, b)
-        b = tl.interleave(b, b)
-        b = (b >> shifts_full) & 0xF  # [BLOCK_N, BLOCK_K]
+            # ---- Load packed weights B: [BLOCK_N, BLOCK_K//8] int32 ----
+            offs_k8 = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
+            b_ptrs = b_ptr + offs_n[:, None] * K8 + offs_k8[None, :]
+            mask_b = (offs_n[:, None] < N) & (offs_k8[None, :] < K8)
+            b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
-        # ---- Load scales from [N, K//G] layout ----
-        g_idx = (k_start * BLOCK_K) // group_size
-        scale_ptrs = scales_ptr + offs_n * num_groups + g_idx
-        scale_mask = offs_n < N
-        scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
+            # ---- Unpack int4 weights with ExLlama unshuffle ----
+            b = tl.interleave(b_packed, b_packed)
+            b = tl.interleave(b, b)
+            b = tl.interleave(b, b)
+            b = (b >> shifts_full) & 0xF  # [BLOCK_N, BLOCK_K]
 
-        # ---- Dequantize ----
-        if HAS_ZP:
-            # Asymmetric: (nibble - zp_raw) * scale (single subtraction)
-            zp_ptrs = zp_ptr + offs_n * num_groups + g_idx
-            zp_raw = tl.load(zp_ptrs, mask=scale_mask, other=0.0)
-            b_fp = (b.to(scales.dtype) - zp_raw[:, None]) * scales[:, None]
-        else:
-            # Symmetric: (w - 8) * scale
-            b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
+            # ---- Load scales from [N, K//G] layout ----
+            g_idx = (k_start * BLOCK_K) // group_size
+            scale_ptrs = scales_ptr + offs_n * num_groups + g_idx
+            scale_mask = offs_n < N
+            scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
 
-        # ---- Transpose to [BLOCK_K, BLOCK_N] for matmul ----
-        b_fp_t = tl.trans(b_fp)
+            # ---- Dequantize ----
+            if HAS_ZP:
+                zp_ptrs = zp_ptr + offs_n * num_groups + g_idx
+                zp_raw = tl.load(zp_ptrs, mask=scale_mask, other=0.0)
+                b_fp = (b.to(scales.dtype) - zp_raw[:, None]) * scales[:, None]
+            else:
+                b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
 
-        # ---- Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] ----
-        accumulator += tl.dot(a, b_fp_t, out_dtype=tl.float32)
+            # ---- Transpose to [BLOCK_K, BLOCK_N] for matmul ----
+            b_fp_t = tl.trans(b_fp)
+
+            # ---- Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] ----
+            accumulator += tl.dot(a, b_fp_t, out_dtype=tl.float32)
 
     # ---- Store output C: [BLOCK_M, BLOCK_N] ----
     c = accumulator.to(c_ptr.type.element_ty)
@@ -233,6 +242,17 @@ def triton_w4a16_skinny_fmt_gemm(
     # a different group would get the wrong scale.
     BLOCK_K = min(BLOCK_K, group_size)
 
+    # Static K-loop unrolling: process multiple BLOCK_K tiles per outer
+    # loop iteration.  Reduces loop overhead and gives the compiler more
+    # scheduling freedom.  Use 4 for large prefills (M > 1024) where
+    # K-loop iterations dominate; 1 elsewhere to avoid register pressure.
+    UNROLL_K = 4 if M > 1024 else 1
+    # Ensure total K tiles are divisible by UNROLL_K (required for
+    # correctness since the last unrolled sub-tile guards with mask_k).
+    total_k_tiles = triton.cdiv(K, BLOCK_K)
+    if total_k_tiles % UNROLL_K != 0:
+        UNROLL_K = 1
+
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _triton_w4a16_skinny_fmt_kernel[grid](
@@ -252,6 +272,7 @@ def triton_w4a16_skinny_fmt_gemm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        UNROLL_K=UNROLL_K,
         num_warps=num_warps,
         num_stages=1,
     )
