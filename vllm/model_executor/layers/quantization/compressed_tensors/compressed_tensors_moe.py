@@ -1835,7 +1835,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import vllm.envs as envs
 
-        if envs.VLLM_MOE_AWQ_GEMV_HIP and self.num_bits == 4:
+        if envs.VLLM_MOE_HYBRID_W4A16 and self.num_bits == 4:
+            self._process_weights_hybrid_w4a16(layer)
+        elif envs.VLLM_MOE_AWQ_GEMV_HIP and self.num_bits == 4:
             self._process_weights_awq_gemv(layer)
         elif envs.VLLM_MOE_GPTQ_EXLLAMA and self.num_bits == 4:
             # Exllama MoE path: keep weights in [E, K/8, N] int32 format
@@ -1911,6 +1913,86 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
             layer.use_exllama_moe = False
+
+    def _process_weights_hybrid_w4a16(self, layer: torch.nn.Module) -> None:
+        """Hybrid W4A16 MoE path: convert GPTQ [E, K/8, N] → skinny
+        [E, N, K//8] int32 (ExLlama shuffle) and transpose scales to
+        [E, N, K//G].
+
+        For symmetric quantization (bias=8), zero_points are not needed;
+        the HIP skinny kernel uses HAS_ZERO_POINTS=false with hardcoded
+        bias=8, and the Triton kernel uses ZP_BIAS=8.
+        """
+        from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+            pack_int4_exllama_shuffle,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            unpack_quantized_values_into_int32,
+        )
+        from vllm.scalar_type import scalar_types
+
+        wtype = scalar_types.uint4
+
+        def convert_weights(w_packed: torch.Tensor) -> torch.Tensor:
+            """Convert [E, K/8, N] GPTQ → [E, N, K//8] skinny (ExLlama shuffle)."""
+            E_dim = w_packed.size(0)
+            experts = []
+            for e in range(E_dim):
+                # Unpack to [K, N] uint4 values
+                unpacked = unpack_quantized_values_into_int32(
+                    w_packed[e], wtype, packed_dim=0
+                )
+                # Transpose to [N, K] then pack into ExLlama shuffle
+                unpacked_t = unpacked.t().contiguous()
+                repacked = pack_int4_exllama_shuffle(unpacked_t)
+                experts.append(repacked)
+            return torch.stack(experts)
+
+        # Convert weights: [E, K/8, N] → [E, N, K//8] skinny
+        replace_parameter(
+            layer,
+            "w13_weight_packed",
+            torch.nn.Parameter(
+                convert_weights(layer.w13_weight_packed), requires_grad=False
+            ),
+        )
+        replace_parameter(
+            layer,
+            "w2_weight_packed",
+            torch.nn.Parameter(
+                convert_weights(layer.w2_weight_packed), requires_grad=False
+            ),
+        )
+
+        # Transpose scales: [E, K//G, N] → [E, N, K//G]
+        layer.w13_weight_scale = torch.nn.Parameter(
+            layer.w13_weight_scale.transpose(1, 2).contiguous(),
+            requires_grad=False,
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            layer.w2_weight_scale.transpose(1, 2).contiguous(),
+            requires_grad=False,
+        )
+
+        # No zero_points needed for symmetric quant (bias=8 hardcoded
+        # in both kernels).
+        layer.use_hybrid_w4a16_moe = True
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        layer.w13_weight = layer.w13_weight_packed
+        layer.w2_weight = layer.w2_weight_packed
+
+        from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+            HybridW4A16MoEExperts,
+        )
+
+        self.moe_mk = FusedMoEKernel(
+            fused_experts=HybridW4A16MoEExperts(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            ),
+            prepare_finalize=MoEPrepareAndFinalizeNoDPEPModular(),
+        )
 
     def _process_weights_awq_gemv(self, layer: torch.nn.Module) -> None:
         """AWQ GEMV MoE path: convert GPTQ [E, K/8, N] → AWQ [E, K, N/8]
@@ -2031,6 +2113,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         assert self.moe_quant_config is not None
         layer.w13_weight = layer.w13_weight_packed
         layer.w2_weight = layer.w2_weight_packed
+
+        use_hybrid = getattr(layer, "use_hybrid_w4a16_moe", False)
+        if use_hybrid:
+            from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+                HybridW4A16MoEExperts,
+            )
+
+            return HybridW4A16MoEExperts(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            )
 
         use_exllama = getattr(layer, "use_exllama_moe", False)
         if use_exllama:
