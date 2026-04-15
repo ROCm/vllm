@@ -1691,8 +1691,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         super().__init__(moe)
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        self.moe_mk = None
-        self.moe_quant_config = None
+        self.moe_mk: FusedMoEKernel | None = None
+        self.moe_quant_config: FusedMoEQuantConfig | None = None
         # Extract properties from weight_quant
         self.num_bits = weight_quant.num_bits
         self.packed_factor = 32 // weight_quant.num_bits
