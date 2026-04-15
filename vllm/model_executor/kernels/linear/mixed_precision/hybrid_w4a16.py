@@ -197,7 +197,7 @@ def triton_w4a16_skinny_fmt_gemm(
 
     if on_gfx1x():
         # Tuned on gfx1151 (Strix Halo, 40 CUs, 32-wide wavefronts)
-        # using Qwen3-4B weight shapes with group_size=128.
+        # using Qwen3-4B and Qwen2.5-7B weight shapes with group_size=128.
         if M <= 32:
             BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 32, 128, 4
         elif M <= 64:
@@ -217,10 +217,8 @@ def triton_w4a16_skinny_fmt_gemm(
             else:
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 32, 4
         else:
-            if K >= 2 * N:  # tall K (e.g. down_proj)
-                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 512, 32, 16
-            else:
-                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
+            # M > 1024: wider N-tiles improve occupancy and L2 reuse.
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 256, 64, 8
     else:
         num_warps = 4
         if M <= 32:
@@ -255,6 +253,7 @@ def triton_w4a16_skinny_fmt_gemm(
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
         num_warps=num_warps,
+        num_stages=1,
     )
     return c
 
