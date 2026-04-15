@@ -242,31 +242,6 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                     __hfma2(*(half2*)&hi1, *(const half2*)&SCALE16,
                             *(const half2*)&BIAS_HI);
               }
-
-              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                uint32_t group_idx = k_ / GROUP_SIZE;
-                scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK; b++) {
-                  cvtB.h[b] = cvtB.h[b] - zp;
-                }
-              }
-
-              if constexpr (GROUP_SIZE > 0) {
-                float partial = 0;
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                  DOT2C(partial, bigA[n][k2].f[b], cvtB.f[b])
-                }
-                uint32_t group_idx = k_ / GROUP_SIZE;
-                sum[n][y] += partial *
-                             __s2float(scale[(m + y) * num_groups + group_idx]);
-              } else {
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                  DOT2C(sum[n][y], bigA[n][k2].f[b], cvtB.f[b])
-                }
-              }
             } else {
               // Generic bf16 path: scalar int4 dequant
               constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
@@ -555,31 +530,6 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
                 *(half2*)&cvtB.f[w * 4 + 3] =
                     __hfma2(*(half2*)&hi1, *(const half2*)&SCALE16,
                             *(const half2*)&BIAS_HI);
-              }
-
-              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                uint32_t group_idx = k_ / GROUP_SIZE;
-                scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK; b++) {
-                  cvtB.h[b] = cvtB.h[b] - zp;
-                }
-              }
-
-              if constexpr (GROUP_SIZE > 0) {
-                float partial = 0;
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                  DOT2C(partial, bigA[n][k2].f[b], cvtB.f[b])
-                }
-                uint32_t group_idx = k_ / GROUP_SIZE;
-                sum[n][y] += partial *
-                             __s2float(scale[(m + y) * num_groups + group_idx]);
-              } else {
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                  DOT2C(sum[n][y], bigA[n][k2].f[b], cvtB.f[b])
-                }
               }
             } else {
               // Generic bf16 path: scalar int4 dequant
