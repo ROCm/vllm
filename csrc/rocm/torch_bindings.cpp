@@ -40,6 +40,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? in_bias, int CuCount) -> Tensor");
   rocm_ops.impl("wvSplitK_int8", torch::kCUDA, &wvSplitK_int8);
 
+  // W8A8 skinny GEMM: int8 weights, int8 activations,
+  // per-channel weight scale + per-tensor activation scale
+  rocm_ops.def(
+      "wvSplitK_w8a8(Tensor in_a, Tensor in_b, Tensor in_w_scale, "
+      "Tensor in_a_scale, Tensor? in_bias, int CuCount) -> Tensor");
+  rocm_ops.impl("wvSplitK_w8a8", torch::kCUDA, &wvSplitK_w8a8);
+
   // W4A16 grouped skinny GEMM: packed int4 weights, per-group scales,
   // optional zero points for asymmetric quantization
   rocm_ops.def(
