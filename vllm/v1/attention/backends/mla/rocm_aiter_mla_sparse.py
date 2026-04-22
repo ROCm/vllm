@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 if TYPE_CHECKING:
@@ -83,6 +84,7 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8",
     ]
 
     @staticmethod
@@ -308,6 +310,9 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
         self.softmax_scale = scale
         assert indexer is not None
         self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
+        self.fp8_kv = is_quantized_kv_cache(kv_cache_dtype)
+        if self.fp8_kv:
+            self.supports_quant_query_input = True
 
     def _forward_bf16_kv(
         self,
@@ -346,6 +351,46 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
 
         return output[:, : self.num_heads, :]
 
+    def _forward_fp8_kv(
+        self,
+        q: torch.Tensor,  # [sq, heads, d_qk], fp8
+        kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk], fp8
+        topk_indices: torch.Tensor,  # [sq, topk]
+        attn_metadata: ROCMAiterMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> torch.Tensor:
+        num_tokens = q.shape[0]
+        output = torch.empty(
+            [num_tokens, self.num_heads, self.kv_lora_rank],
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        seq_len = (topk_indices != -1).sum(dim=-1)
+        torch.cumsum(seq_len, dim=0, out=attn_metadata.paged_kv_indptr[1:])
+        attn_metadata.paged_kv_indptr_rest.fill_(attn_metadata.paged_kv_indptr[-1])
+        fetch_id_to_ragged_triton(
+            topk_indices,
+            attn_metadata.paged_kv_indptr,
+            attn_metadata.paged_kv_indices,
+            attn_metadata.topk_tokens,
+        )
+
+        rocm_aiter_ops.mla_decode_fwd(
+            q,
+            kv_c_and_k_pe_cache,
+            output,
+            self.scale,
+            attn_metadata.qo_indptr,
+            1,
+            attn_metadata.paged_kv_indptr,
+            attn_metadata.paged_kv_indices,
+            attn_metadata.paged_kv_last_page_len,
+            q_scale=layer._q_scale,
+            kv_scale=layer._k_scale,
+        )
+
+        return output[:, : self.num_heads, :]
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -374,8 +419,13 @@ class ROCMAiterMLASparseImpl(SparseMLAAttentionImpl[ROCMAiterMLASparseMetadata])
             NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
         )
 
-        attn_out = self._forward_bf16_kv(
-            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
-        )
+        if self.fp8_kv:
+            attn_out = self._forward_fp8_kv(
+                q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata, layer
+            )
+        else:
+            attn_out = self._forward_bf16_kv(
+                q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
+            )
 
         return attn_out, None
