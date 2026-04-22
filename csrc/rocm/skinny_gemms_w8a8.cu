@@ -438,12 +438,12 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   {                                              \
     if (is_low_bandwidth_gfx11_w8a8()) {         \
       /* Optimized for gfx1150/1152/1153/1103 */ \
-      if (K_in > 4096)                           \
+      if (K_in > 6000)                           \
         WVSPLITK_W8A8(2, 1, __N)                 \
-      else if (M_in >= 8192)                     \
-        WVSPLITK_W8A8(4, 1, __N)                 \
-      else if (K_in <= 2048 && M_in < 4096)      \
+      else if (M_in >= 19000)                    \
         WVSPLITK_W8A8(4, 4, __N)                 \
+      else if (K_in <= 2048 && M_in < 4096)      \
+        WVSPLITK_W8A8(4, 1, __N)                 \
       else                                       \
         WVSPLITK_W8A8(4, 1, __N)                 \
     } else {                                     \
