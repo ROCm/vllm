@@ -83,6 +83,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int wvprgrp) -> Tensor");
   rocm_ops.impl("wvSplitK_int4g_hf_sweep", torch::kCUDA,
                 &wvSplitK_int4g_hf_sweep);
+
+  // W8A8 skinny GEMM sweep: all tunable params as runtime args (benchmark only)
+  rocm_ops.def(
+      "wvSplitK_w8a8_sweep(Tensor in_a, Tensor in_b, Tensor in_w_scale, "
+      "Tensor in_a_scale, Tensor? in_bias, int CuCount, "
+      "int ytile, int unrl, int achunk, int wvprgrp) -> Tensor");
+  rocm_ops.impl("wvSplitK_w8a8_sweep", torch::kCUDA, &wvSplitK_w8a8_sweep);
 #endif  // VLLM_SKINNY_GEMM_SWEEP
 
   // Custom gemm op for skinny matrix-matrix multiplication

@@ -166,3 +166,75 @@ def test_rocm_wvsplitk_w8a8_kernel(xnorm, n, k, m, dtype, seed, bias_mode):
         # Accumulation error scales with sqrt(K) for fp16
         atol = torch.finfo(dtype).eps * math.sqrt(k)
         torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+
+
+# --- Sweep tests (requires build with -DVLLM_SKINNY_GEMM_SWEEP) ---
+
+SWEEP_HAS_OP = hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "wvSplitK_w8a8_sweep"
+)
+
+# Subset of shapes for sweep (keep test time manageable)
+SWEEP_NKM = [
+    (1, 256, 512),
+    (1, 4096, 4096),
+    (2, 4096, 4096),
+    (3, 1024, 1024),
+    (4, 4096, 4096),
+    (5, 2048, 2048),
+]
+
+SWEEP_PARAMS = [
+    # (ytile, unrl, achunk, wvprgrp)
+    (1, 1, 16, 16),  # baseline: matches production default for small M
+    (1, 4, 16, 16),  # production default for large M
+    (4, 1, 16, 16),  # production default for large M with N>=4
+    (2, 2, 16, 16),  # mid-range ytile/unrl
+    (1, 1, 8, 8),  # min achunk, min wvprgrp
+    (1, 1, 32, 8),  # max achunk, min wvprgrp
+    (4, 4, 8, 12),  # max ytile/unrl, different wvprgrp
+    (2, 1, 32, 12),  # mixed
+]
+
+
+@pytest.mark.parametrize("ytile,unrl,achunk,wvprgrp", SWEEP_PARAMS)
+@pytest.mark.parametrize("n,k,m", SWEEP_NKM)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
+@pytest.mark.skipif(not SWEEP_HAS_OP, reason="requires VLLM_SKINNY_GEMM_SWEEP build")
+@torch.inference_mode()
+def test_rocm_wvsplitk_w8a8_sweep(n, k, m, dtype, ytile, unrl, achunk, wvprgrp):
+    # Skip if M not divisible by ytile or K not divisible by achunk
+    if m % ytile != 0:
+        pytest.skip(f"M={m} not divisible by ytile={ytile}")
+    if k % achunk != 0:
+        pytest.skip(f"K={k} not divisible by achunk={achunk}")
+
+    torch.manual_seed(0)
+    cu_count = num_compute_units()
+
+    xavier = math.sqrt(2 / k)
+
+    W_fp = (torch.rand(m, k, dtype=torch.float32, device="cuda") * 2 - 1) * xavier
+    A_fp = (torch.rand(n, k, dtype=torch.float32, device="cuda") * 2 - 1) * xavier
+
+    W_int8, w_scale = quantize_symmetric(W_fp)
+    A_int8, a_scale = quantize_per_tensor(A_fp)
+    w_scale_typed = w_scale.to(dtype)
+
+    ref_out = ref_w8a8_gemm(W_int8, A_int8, w_scale_typed, a_scale, None, dtype)
+
+    out = ops.wvSplitK_w8a8_sweep(
+        W_int8,
+        A_int8,
+        w_scale_typed,
+        a_scale,
+        cu_count,
+        ytile,
+        unrl,
+        achunk,
+        wvprgrp,
+    )
+
+    atol = max(1e-3, torch.finfo(dtype).eps * math.sqrt(k))
+    torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)

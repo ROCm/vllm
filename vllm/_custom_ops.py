@@ -2694,6 +2694,23 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_w8a8")
         return torch.empty((N, M), dtype=in_w_scale.dtype, device=in_b.device)
 
 
+def wvSplitK_w8a8_sweep(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    w_scale: torch.Tensor,
+    a_scale: torch.Tensor,
+    cu_count: int,
+    ytile: int,
+    unrl: int,
+    achunk: int,
+    wvprgrp: int,
+    bias: torch.Tensor = None,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.wvSplitK_w8a8_sweep(
+        a, b, w_scale, a_scale, bias, cu_count, ytile, unrl, achunk, wvprgrp
+    )
+
+
 def wvSplitK_int8_sweep(
     a: torch.Tensor,
     b: torch.Tensor,

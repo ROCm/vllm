@@ -386,12 +386,14 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                          \
     WVSPLITK_W8A8_LAUNCH(64, _YTILE, _UNRL, _N)
 
-#define WVSPLIT_W8A8_TILE(_sYT, __N) \
-  {                                  \
-    if (__N >= 4 && _sYT >= 480)     \
-      WVSPLITK_W8A8(4, 1, __N)       \
-    else                             \
-      WVSPLITK_W8A8(1, 4, __N)       \
+#define WVSPLIT_W8A8_TILE(_sYT, __N)        \
+  {                                         \
+    if (__N >= 4 && _sYT >= 480)            \
+      WVSPLITK_W8A8(4, 1, __N)              \
+    else if (K_in <= 1024 && M_in % 2 == 0) \
+      WVSPLITK_W8A8(2, 1, __N)              \
+    else                                    \
+      WVSPLITK_W8A8(1, 4, __N)              \
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
@@ -439,3 +441,158 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
 
   return out_c;
 }
+
+// Sweep function disabled by default to reduce compile time.
+// Build with -DVLLM_SKINNY_GEMM_SWEEP to enable.
+#ifdef VLLM_SKINNY_GEMM_SWEEP
+torch::Tensor wvSplitK_w8a8_sweep(const at::Tensor& in_a,
+                                  const at::Tensor& in_b,
+                                  const at::Tensor& in_w_scale,
+                                  const at::Tensor& in_a_scale,
+                                  const std::optional<at::Tensor>& in_bias,
+                                  const int64_t CuCount, const int64_t ytile,
+                                  const int64_t unrl, const int64_t achunk,
+                                  const int64_t wvprgrp) {
+  auto M_in = in_a.size(0);
+  auto K_in = in_a.size(1);
+  auto N_in = in_b.size(0);
+  auto Bx_in =
+      (in_bias.has_value() && in_bias->numel() > 0)
+          ? (in_bias->sizes().size() == 2) ? in_bias->size(1) : in_bias->size(0)
+          : 1;
+  auto By_in = (in_bias.has_value() && in_bias->numel() > 0 &&
+                in_bias->sizes().size() == 2)
+                   ? in_bias->size(0)
+                   : 1;
+
+  TORCH_CHECK(in_a.dtype() == torch::kInt8, "Weight must be int8");
+  TORCH_CHECK(in_b.dtype() == torch::kInt8, "Activation must be int8");
+  TORCH_CHECK(in_a_scale.dtype() == torch::kFloat32,
+              "Activation scale must be float32");
+  TORCH_CHECK(in_w_scale.dtype() == torch::kFloat16 ||
+                  in_w_scale.dtype() == torch::kBFloat16,
+              "Weight scale must be float16 or bfloat16");
+  TORCH_CHECK(in_w_scale.size(0) == M_in, "Weight scale size must match M");
+  TORCH_CHECK(K_in % achunk == 0, "K must be divisible by achunk=", achunk);
+  TORCH_CHECK(M_in % ytile == 0, "M must be divisible by ytile=", ytile);
+
+  const int max_lds_ints = get_lds_size_w8a8();
+  TORCH_CHECK(K_in * N_in <= max_lds_ints, "K*N exceeds LDS capacity. K=", K_in,
+              " N=", N_in);
+
+  auto out_c = torch::empty(
+      {N_in, M_in},
+      torch::TensorOptions().dtype(in_w_scale.dtype()).device(in_b.device()));
+
+  dim3 grid(CuCount);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  const int8_t* wptr = in_a.data_ptr<int8_t>();
+  const int8_t* aptr = in_b.data_ptr<int8_t>();
+  const float* asptr = in_a_scale.data_ptr<float>();
+
+  const int THRDS = is_gfx11_w8a8() ? 32 : 64;
+
+  // AT_DISPATCH inside the launch macro so that #defines stay outside lambdas
+  // (hipify strips #define directives inside lambda bodies).
+  #define SWEEP_W8A8_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N)  \
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(                                    \
+        in_w_scale.scalar_type(), "wvSplitK_w8a8_sweep", [&] {             \
+          using fptype = typename scalar<scalar_t>::type;                  \
+          const fptype* wsptr =                                            \
+              reinterpret_cast<const fptype*>(in_w_scale.data_ptr());      \
+          const fptype* biasptr =                                          \
+              (in_bias.has_value() && in_bias->numel() > 0)                \
+                  ? reinterpret_cast<const fptype*>(in_bias->data_ptr())   \
+                  : nullptr;                                               \
+          fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());      \
+          dim3 block(_THRDS, _WVPRGRP);                                    \
+          int __wvPrGrp = mindiv_w8a8(M_in, CuCount * _YTILE, _WVPRGRP);   \
+          wvSplitK_w8a8_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, \
+                                _UNRL, _N><<<grid, block, 0, stream>>>(    \
+              K_in, M_in, Bx_in, By_in, wptr, aptr, wsptr, asptr, biasptr, \
+              cptr, __wvPrGrp, CuCount);                                   \
+        });
+
+  #define SWEEP_W8A8_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL)              \
+    switch (N_in) {                                                           \
+      case 1:                                                                 \
+        SWEEP_W8A8_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 1) break; \
+      case 2:                                                                 \
+        SWEEP_W8A8_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 2) break; \
+      case 3:                                                                 \
+        SWEEP_W8A8_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 3) break; \
+      case 4:                                                                 \
+        SWEEP_W8A8_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 4) break; \
+      case 5:                                                                 \
+        SWEEP_W8A8_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, 5) break; \
+      default:                                                                \
+        TORCH_CHECK(false, "Unsupported N=", N_in);                           \
+    }
+
+  #define SWEEP_W8A8_UNRL(_THRDS, _YTILE, _WVPRGRP, _ACHUNK) \
+    if (unrl == 1) {                                         \
+      SWEEP_W8A8_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 1)     \
+    } else if (unrl == 2) {                                  \
+      SWEEP_W8A8_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 2)     \
+    } else if (unrl == 4) {                                  \
+      SWEEP_W8A8_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, 4)     \
+    } else {                                                 \
+      TORCH_CHECK(false, "Unsupported unrl=", unrl);         \
+    }
+
+  #define SWEEP_W8A8_YTILE(_THRDS, _WVPRGRP, _ACHUNK)  \
+    if (ytile == 1) {                                  \
+      SWEEP_W8A8_UNRL(_THRDS, 1, _WVPRGRP, _ACHUNK)    \
+    } else if (ytile == 2) {                           \
+      SWEEP_W8A8_UNRL(_THRDS, 2, _WVPRGRP, _ACHUNK)    \
+    } else if (ytile == 4) {                           \
+      SWEEP_W8A8_UNRL(_THRDS, 4, _WVPRGRP, _ACHUNK)    \
+    } else {                                           \
+      TORCH_CHECK(false, "Unsupported ytile=", ytile); \
+    }
+
+  #define SWEEP_W8A8_WVPRGRP(_THRDS, _ACHUNK)              \
+    if (wvprgrp == 8) {                                    \
+      SWEEP_W8A8_YTILE(_THRDS, 8, _ACHUNK)                 \
+    } else if (wvprgrp == 12) {                            \
+      SWEEP_W8A8_YTILE(_THRDS, 12, _ACHUNK)                \
+    } else if (wvprgrp == 16) {                            \
+      SWEEP_W8A8_YTILE(_THRDS, 16, _ACHUNK)                \
+    } else {                                               \
+      TORCH_CHECK(false, "Unsupported wvprgrp=", wvprgrp); \
+    }
+
+  if (THRDS == 32) {
+    if (achunk == 8) {
+      SWEEP_W8A8_WVPRGRP(32, 8)
+    } else if (achunk == 16) {
+      SWEEP_W8A8_WVPRGRP(32, 16)
+    } else if (achunk == 32) {
+      SWEEP_W8A8_WVPRGRP(32, 32)
+    } else {
+      TORCH_CHECK(false, "Unsupported achunk=", achunk);
+    }
+  } else {
+    if (achunk == 8) {
+      SWEEP_W8A8_WVPRGRP(64, 8)
+    } else if (achunk == 16) {
+      SWEEP_W8A8_WVPRGRP(64, 16)
+    } else if (achunk == 32) {
+      SWEEP_W8A8_WVPRGRP(64, 32)
+    } else {
+      TORCH_CHECK(false, "Unsupported achunk=", achunk);
+    }
+  }
+
+  #undef SWEEP_W8A8_LAUNCH
+  #undef SWEEP_W8A8_N
+  #undef SWEEP_W8A8_UNRL
+  #undef SWEEP_W8A8_YTILE
+  #undef SWEEP_W8A8_WVPRGRP
+
+  return out_c;
+}
+#endif  // VLLM_SKINNY_GEMM_SWEEP
