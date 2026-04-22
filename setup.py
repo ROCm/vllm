@@ -279,7 +279,7 @@ class cmake_build_ext(build_ext):
 
         # Uncomment to enable skinny GEMM sweep kernels (all dtypes).
         # Increases compile time significantly.
-        cmake_args += ["-DVLLM_SKINNY_GEMM_SWEEP=1"]
+        # cmake_args += ["-DVLLM_SKINNY_GEMM_SWEEP=1"]
 
         subprocess.check_call(
             ["cmake", ext.cmake_lists_dir, *build_tool, *cmake_args],
