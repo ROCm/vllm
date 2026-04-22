@@ -434,7 +434,7 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                          \
     WVSPLITK_W8A8_LAUNCH(64, _YTILE, _UNRL, _N)
 
-#define WVSPLIT_W8A8_TILE(_sYT, __N)             \
+#define WVSPLIT_W8A8_TILE(__N)                   \
   {                                              \
     if (is_low_bandwidth_gfx11_w8a8()) {         \
       /* Optimized for gfx1150/1152/1153/1103 */ \
@@ -447,10 +447,8 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
       else                                       \
         WVSPLITK_W8A8(4, 1, __N)                 \
     } else {                                     \
-      /* Original heuristic for gfx1151, gfx9 */ \
-      if (__N >= 4 && _sYT >= 480)               \
-        WVSPLITK_W8A8(4, 1, __N)                 \
-      else if (K_in <= 1024 && M_in % 2 == 0)    \
+      /* Heuristic for gfx1151, gfx9 */          \
+      if (K_in <= 1024 && M_in % 2 == 0)         \
         WVSPLITK_W8A8(2, 1, __N)                 \
       else                                       \
         WVSPLITK_W8A8(1, 4, __N)                 \
@@ -471,23 +469,21 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
                 : nullptr;
         fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-        int sYT = (M_in + CuCount * 4 - 1) / (CuCount * 4);
-
         switch (N_in) {
           case 1:
-            WVSPLIT_W8A8_TILE(sYT, 1)
+            WVSPLIT_W8A8_TILE(1)
             break;
           case 2:
-            WVSPLIT_W8A8_TILE(sYT, 2)
+            WVSPLIT_W8A8_TILE(2)
             break;
           case 3:
-            WVSPLIT_W8A8_TILE(sYT, 3)
+            WVSPLIT_W8A8_TILE(3)
             break;
           case 4:
-            WVSPLIT_W8A8_TILE(sYT, 4)
+            WVSPLIT_W8A8_TILE(4)
             break;
           case 5:
-            WVSPLIT_W8A8_TILE(sYT, 5)
+            WVSPLIT_W8A8_TILE(5)
             break;
           default:
             throw std::runtime_error(
