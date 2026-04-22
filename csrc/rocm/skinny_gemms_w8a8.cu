@@ -41,6 +41,21 @@ bool is_gfx11_w8a8() {
   return result;
 }
 
+// Check if this is a low-bandwidth gfx11 variant (gfx1150, gfx1152, gfx1153)
+// or gfx1103, which benefit from optimized heuristics for lower bandwidth.
+// Excludes gfx1151 which has higher bandwidth similar to gfx9.
+bool is_low_bandwidth_gfx11_w8a8() {
+  static const bool result = [] {
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    std::string device_arch = dprops->gcnArchName;
+    return device_arch.find("gfx1150") != std::string::npos ||
+           device_arch.find("gfx1152") != std::string::npos ||
+           device_arch.find("gfx1153") != std::string::npos ||
+           device_arch.find("gfx1103") != std::string::npos;
+  }();
+  return result;
+}
+
 #if defined(NDEBUG)
   #undef NDEBUG
   #include <assert.h>
@@ -419,14 +434,27 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                          \
     WVSPLITK_W8A8_LAUNCH(64, _YTILE, _UNRL, _N)
 
-#define WVSPLIT_W8A8_TILE(_sYT, __N)        \
-  {                                         \
-    if (__N >= 4 && _sYT >= 480)            \
-      WVSPLITK_W8A8(4, 1, __N)              \
-    else if (K_in <= 1024 && M_in % 2 == 0) \
-      WVSPLITK_W8A8(2, 1, __N)              \
-    else                                    \
-      WVSPLITK_W8A8(1, 4, __N)              \
+#define WVSPLIT_W8A8_TILE(_sYT, __N)             \
+  {                                              \
+    if (is_low_bandwidth_gfx11_w8a8()) {         \
+      /* Optimized for gfx1150/1152/1153/1103 */ \
+      if (K_in > 4096)                           \
+        WVSPLITK_W8A8(2, 1, __N)                 \
+      else if (M_in >= 8192)                     \
+        WVSPLITK_W8A8(4, 1, __N)                 \
+      else if (K_in <= 2048 && M_in < 4096)      \
+        WVSPLITK_W8A8(4, 4, __N)                 \
+      else                                       \
+        WVSPLITK_W8A8(4, 1, __N)                 \
+    } else {                                     \
+      /* Original heuristic for gfx1151, gfx9 */ \
+      if (__N >= 4 && _sYT >= 480)               \
+        WVSPLITK_W8A8(4, 1, __N)                 \
+      else if (K_in <= 1024 && M_in % 2 == 0)    \
+        WVSPLITK_W8A8(2, 1, __N)                 \
+      else                                       \
+        WVSPLITK_W8A8(1, 4, __N)                 \
+    }                                            \
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
