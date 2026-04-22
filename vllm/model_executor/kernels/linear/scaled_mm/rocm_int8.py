@@ -45,14 +45,6 @@ class ROCmInt8SkinnyGemmLinearKernel(TritonInt8ScaledMMLinearKernel):
         if not envs.VLLM_ROCM_USE_SKINNY_GEMM:
             return False, "requires VLLM_ROCM_USE_SKINNY_GEMM to be enabled."
 
-        try:
-            if not hasattr(torch.ops, "_rocm_C") or not hasattr(
-                torch.ops._rocm_C, "wvSplitK_w8a8"
-            ):
-                return False, "wvSplitK_w8a8 op not available in this build."
-        except Exception:
-            return False, "ROCm ops not available."
-
         return True, None
 
     @classmethod

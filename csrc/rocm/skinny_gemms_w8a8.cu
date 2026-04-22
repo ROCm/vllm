@@ -105,6 +105,14 @@ struct scalar<c10::BFloat16> {
   }
 
 #if defined(__GFX11__)
+  // Int8x4 dot product for RDNA3/4: v_dot4_i32_iu8
+  // 4 signed int8 multiplies + int32 accumulate in one instruction.
+  #define DOT4_I8(V0, V2, V3)                                  \
+    V0 = __builtin_amdgcn_sudot4(true, *((int*)(&(V2))), true, \
+                                 *((int*)(&(V3))), V0, false);
+#endif
+
+#if defined(__GFX11__)
   #define REDUCE_SUM_WAVE32(val)  \
     do {                          \
       val += __shfl_xor(val, 1);  \
@@ -176,13 +184,21 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   // Load per-tensor activation scale once
   const float a_scale_val = *a_scale;
 
+  #if defined(__GFX11__)
+  int32_t sum[N][YTILE];
+  #else
   float sum[N][YTILE];
+  #endif
 
   while (m < M) {
     for (int i = 0; i < YTILE; i++)
       for (int n = 0; n < N; n++) sum[n][i] = 0;
 
+  #if defined(__GFX11__)
+    bigTypeA bigA[N][UNRL];
+  #else
     bigTypeAcvt bigA[N][UNRL];
+  #endif
     bigTypeW bigB[YTILE][UNRL];
 
     for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
@@ -195,6 +211,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
         const int8_t* B_ = &B[(m + 0) * K + k_];
         for (int y = 0; y < YTILE; y++) {
+          // Cast to float* for 4-byte non-temporal loads (not arithmetic).
           const float* src = (const float*)(&B_[y * K]);
   #pragma unroll
           for (int i = 0; i < A_CHUNK / 4; i++)
@@ -202,7 +219,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         }
       }
 
-      // Fetch int8 activations from LDS, convert to fp16/bf16
+      // Fetch int8 activations from LDS
   #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
@@ -210,16 +227,21 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         if (k_ >= K) break;
 
         for (int n = 0; n < N; n++) {
+  #if defined(__GFX11__)
+          // Direct int8 load (no conversion needed for int8 dot product)
+          bigA[n][k2] = *((const bigTypeA*)(&(s[k_ + K * n])));
+  #else
           bigTypeA rawA = *((const bigTypeA*)(&(s[k_ + K * n])));
-          // Convert int8 activations to fp16/bf16
-  #pragma unroll
+            // Convert int8 activations to fp16/bf16
+    #pragma unroll
           for (uint32_t b = 0; b < A_CHUNK; b++) {
             bigA[n][k2].h[b] = rawA.b[b];
           }
+  #endif
         }
       }
 
-      // Matrix multiply: convert int8 weight pairs to fp16, then DOT2C
+      // Matrix multiply
   #pragma unroll
       for (uint32_t k2 = 0; k2 < UNRL; k2++) {
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
@@ -230,16 +252,25 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         for (uint32_t n = 0; n < N; n++) {
   #pragma unroll
           for (int y = 0; y < YTILE; y++) {
-            // Convert int8 weights to fp16/bf16
+  #if defined(__GFX11__)
+              // Direct int8x int8 -> int32 dot product (4 elements per
+              // instruction)
+    #pragma unroll
+            for (uint32_t b = 0; b < A_CHUNK / 4; b++) {
+              DOT4_I8(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+            }
+  #else
+            // Convert int8 weights to fp16/bf16, then DOT2C
             bigTypeAcvt cvtB;
-  #pragma unroll
+    #pragma unroll
             for (uint32_t b = 0; b < A_CHUNK; b++) {
               cvtB.h[b] = bigB[y][k2].b[b];
             }
-  #pragma unroll
+    #pragma unroll
             for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
               DOT2C(sum[n][y], bigA[n][k2].f[b], cvtB.f[b])
             }
+  #endif
           }
         }
       }
@@ -253,9 +284,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     if (threadIdx.x == 0) {
       for (int n = 0; n < N; n++) {
         for (int i = 0; i < YTILE; i++) {
-          sum[n][i] *= __s2float(w_scale[m + i]) * a_scale_val;
-          if (BIAS) sum[n][i] += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
-          C[m + i + n * M] = __float2s<scalar_t>(sum[n][i]);
+          // Convert int32 accumulator to float for scaling
+          float sum_f = static_cast<float>(sum[n][i]);
+          sum_f *= __s2float(w_scale[m + i]) * a_scale_val;
+          if (BIAS) sum_f += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
+          C[m + i + n * M] = __float2s<scalar_t>(sum_f);
         }
       }
     }
