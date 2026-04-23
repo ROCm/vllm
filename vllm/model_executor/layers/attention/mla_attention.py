@@ -678,6 +678,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
             if fp8_attention and self.impl.supports_quant_query_input:
+                # if torch.distributed.get_rank() == 0:
+                #     print(f"rank {torch.distributed.get_rank()} mqa_ql_nope.shape: {mqa_ql_nope.shape}", flush=True)
+                #     print(f"rank {torch.distributed.get_rank()} mqa_q_pe.shape: {mqa_q_pe.shape}", flush=True)
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
@@ -1093,6 +1096,11 @@ class _DecodeConcatQuantFP8(QuantFP8):
             scale: torch.Tensor,
             scale_ub: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            # if torch.distributed.get_rank() == 0:
+            #     print(f"rank {torch.distributed.get_rank()} decode_ql_nope.shape: {decode_ql_nope.shape}")
+            #     print(f"rank {torch.distributed.get_rank()} decode_q_pe.shape: {decode_q_pe.shape}")
+            #     import traceback
+            #     traceback.print_stack()
             decode_q0 = torch.cat((decode_ql_nope, decode_q_pe), dim=-1)
             decode_q_flat = decode_q0.reshape(decode_q0.shape[0], -1)
             decode_q, _ = quant_fn(self, decode_q_flat, scale, scale_ub)

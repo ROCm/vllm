@@ -5,7 +5,7 @@
 import torch
 
 import vllm.envs as envs
-from vllm._aiter_ops import rocm_aiter_ops
+from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -369,7 +369,10 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
-        if rocm_aiter_ops.is_enabled():
+        # Sparse ROCm MLA is an explicitly selected backend. It should stay
+        # usable when the global AITER toggle is off, as long as the platform
+        # supports the ROCm AITER sparse custom op registration.
+        if is_aiter_found_and_supported():
             return torch.ops.vllm.rocm_aiter_sparse_attn_indexer(
                 hidden_states,
                 _encode_layer_name(self.k_cache.prefix),
@@ -388,5 +391,5 @@ class SparseAttnIndexer(CustomOp):
         else:
             raise RuntimeError(
                 "Sparse attention indexer ROCm custom op requires ROCm "
-                "Aiter ops to be enabled."
+                "AITER support on a supported MI3xx platform."
             )

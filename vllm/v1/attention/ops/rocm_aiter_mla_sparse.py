@@ -322,10 +322,13 @@ def rocm_fp8_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
-    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm._aiter_ops import is_aiter_found_and_supported
 
     aiter_paged_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    # This sparse ROCm backend is selected explicitly. Reuse the available AITER
+    # paged-MQA kernel whenever the platform supports it, even if the global
+    # VLLM_ROCM_USE_AITER toggle is off.
+    if is_aiter_found_and_supported():
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
@@ -450,10 +453,13 @@ def rocm_fp8_mqa_logits(
 
     # TODO(ganyi): Temporarily workaround, will remove the module check and reference
     # path after aiter merge this kernel into main
-    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm._aiter_ops import is_aiter_found_and_supported
 
     aiter_mqa_logits_module = None
-    if rocm_aiter_ops.is_enabled():
+    # This sparse ROCm backend is selected explicitly. Reuse the available AITER
+    # prefill MQA kernel whenever the platform supports it, even if the global
+    # VLLM_ROCM_USE_AITER toggle is off.
+    if is_aiter_found_and_supported():
         aiter_mqa_logits_module = mqa_logits_module()
 
     if aiter_mqa_logits_module is not None:
