@@ -8,23 +8,128 @@ activations fit in LDS. Falls back to the Triton scaled_mm kernel
 for larger batches.
 
 This mirrors the pattern used by HipW8A16LinearKernel for W8A16.
+The dispatch is wrapped in a torch.library custom op so torch.compile
+treats it as opaque, avoiding issues with data-dependent branches
+on symbolic batch sizes.
 """
 
+import os
 from contextlib import nullcontext
 
 import torch
 
 import vllm.envs as envs
-from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import num_compute_units
 
 from .ScaledMMLinearKernel import Int8ScaledMMLinearLayerConfig
 from .triton import TritonInt8ScaledMMLinearKernel
 
-# INT8 activations in LDS: 1 byte each, full LDS capacity
-# gfx9: 64KB, gfx95x: 160KB (kernel checks at runtime)
-LDS_CAPACITY_BYTES = 64 * 1024
+# INT8 activations in LDS: 1 byte each, minus 128 bytes reserved for
+# auxiliary shared memory (dynamic quant scales, reduction scratch).
+# gfx9: 64KB-128, gfx95x: 160KB-128 (kernel checks at runtime)
+LDS_CAPACITY_BYTES = 64 * 1024 - 128
+
+# Set VLLM_ROCM_FUSED_QUANT=0 to disable fused quantization in the
+# wvSplitK_w8a8 kernel (quantize activations separately, pass int8).
+# Useful for A/B profiling without rebuilding.
+_FUSED_QUANT = os.environ.get("VLLM_ROCM_FUSED_QUANT", "1") != "0"
+
+
+def _w8a8_apply_impl(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    i_s: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    cu_count: int,
+) -> torch.Tensor:
+    """Dispatch between wvSplitK_w8a8 and Triton scaled_mm.
+
+    Registered as a custom op so torch.compile treats it as opaque,
+    avoiding issues with the data-dependent m<=5 branch.
+    """
+    import vllm._custom_ops as ops
+
+    out_dtype = x.dtype
+    m = x.shape[0]
+    k = w_q.shape[0]  # weights are [K, N]
+    n = w_q.shape[1]
+
+    use_wvsplitk = (
+        m <= 5
+        and k % 16 == 0
+        and n % 16 == 0
+        and k * m <= LDS_CAPACITY_BYTES
+        and (i_s is None or i_s.numel() == 1)
+    )
+
+    if use_wvsplitk:
+        w_t = w_q.t()  # [K, N] -> [N, K]
+
+        if w_s.numel() == 1:
+            w_scale_chan = w_s.to(out_dtype).expand(n).contiguous()
+        else:
+            w_scale_chan = w_s.to(out_dtype).contiguous()
+
+        if i_s is not None:
+            a_scale = i_s.to(torch.float32).reshape(1)
+            if _FUSED_QUANT:
+                act = x.contiguous()
+            else:
+                act, _, _ = ops.scaled_int8_quant(
+                    x.contiguous(), i_s, None, symmetric=True
+                )
+        else:
+            a_scale = None
+            act = x.contiguous()
+
+        return ops.wvSplitK_w8a8(
+            w_t,
+            act,
+            w_scale_chan,
+            a_scale,
+            cu_count,
+            bias,
+        )
+
+    # Fallback: explicit quantize + Triton scaled_mm
+    x_q, x_s, x_zp = ops.scaled_int8_quant(x.contiguous(), i_s, None, symmetric=True)
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+        triton_scaled_mm,
+    )
+
+    return triton_scaled_mm(
+        x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=out_dtype, bias=bias
+    )
+
+
+def _w8a8_apply_fake(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    i_s: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    cu_count: int,
+) -> torch.Tensor:
+    m = x.size(0)
+    n = w_q.size(1)
+    return torch.empty((m, n), dtype=x.dtype, device=x.device)
+
+
+def _register_w8a8_op():
+    lib = torch.library.Library("_rocm_skinny_w8a8", "DEF")
+    lib.define(
+        "w8a8_apply(Tensor x, Tensor w_q, Tensor w_s, "
+        "Tensor? i_s, Tensor? bias, int cu_count) -> Tensor"
+    )
+    lib.impl("w8a8_apply", _w8a8_apply_impl, "CUDA")
+    lib.impl("w8a8_apply", _w8a8_apply_fake, "Meta")
+    return lib
+
+
+_W8A8_LIB = _register_w8a8_op()
 
 
 class ROCmInt8SkinnyGemmLinearKernel(TritonInt8ScaledMMLinearKernel):
@@ -33,6 +138,10 @@ class ROCmInt8SkinnyGemmLinearKernel(TritonInt8ScaledMMLinearKernel):
     Uses the wvSplitK_w8a8 kernel for small batch sizes where both
     int8 activations and weights fit the LDS constraint. Falls back
     to TritonInt8ScaledMMLinearKernel for larger batches.
+
+    Dispatch is wrapped in a torch.library custom op so torch.compile
+    sees a single opaque call, avoiding symbolic shape issues with
+    the m<=5 branch condition.
     """
 
     @classmethod
@@ -61,64 +170,26 @@ class ROCmInt8SkinnyGemmLinearKernel(TritonInt8ScaledMMLinearKernel):
     ) -> torch.Tensor:
         w_q, w_s, i_s, i_zp, _ = self._get_layer_params(layer)
 
-        # Quantize activations to int8 (static or dynamic)
-        x_q, x_s, x_zp = ops.scaled_int8_quant(
-            x.contiguous(), i_s, i_zp, symmetric=True
+        # i_zp is checked at can_implement time (symmetric only), but guard
+        # here so the fallback path still works if somehow reached.
+        if i_zp is not None:
+            return super().apply_weights(layer, x, bias)
+
+        m = x.shape[0]
+        k = w_q.shape[0]
+        n = w_q.shape[1]
+
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"w8a8_apply {m}x{n}x{k}")
         )
-        assert x_zp is None
-
-        out_dtype = x.dtype
-        m = x_q.shape[0]  # batch size
-        k = w_q.shape[0]  # K dimension (weights are [K, N] from Triton)
-        n = w_q.shape[1]  # output features
-
-        per_tensor_scale_a = x_s.numel() == 1
-
-        # Skinny GEMM fast path: small batch with per-tensor activation scale
-        if (
-            per_tensor_scale_a
-            and m <= 5
-            and k % 16 == 0
-            and n % 16 == 0
-            and k * m <= LDS_CAPACITY_BYTES
-        ):
-            # wvSplitK_w8a8 expects:
-            #   in_a = weights [N_out, K] int8
-            #   in_b = activations [batch, K] int8
-            #   w_scale = per-channel weight scale [N_out] fp16/bf16
-            #   a_scale = per-tensor activation scale (scalar) float32
-            w_t = w_q.t()  # [K, N] -> [N, K]
-
-            # Prepare per-channel weight scale in output dtype
-            per_tensor_scale_b = w_s.numel() == 1
-            if per_tensor_scale_b:
-                w_scale_chan = w_s.to(out_dtype).expand(n).contiguous()
-            else:
-                w_scale_chan = w_s.to(out_dtype).contiguous()
-
-            # Activation scale must be float32 scalar
-            a_scale = x_s.to(torch.float32).reshape(1)
-
-            ctx = (
-                nullcontext()
-                if torch.compiler.is_compiling()
-                else torch.profiler.record_function(f"wvSplitK_w8a8 {m}x{n}x{k}")
+        with ctx:
+            return torch.ops._rocm_skinny_w8a8.w8a8_apply(
+                x,
+                w_q,
+                w_s,
+                i_s,
+                bias,
+                num_compute_units(),
             )
-            with ctx:
-                return ops.wvSplitK_w8a8(
-                    w_t,
-                    x_q,
-                    w_scale_chan,
-                    a_scale,
-                    num_compute_units(),
-                    bias,
-                )
-
-        # Fallback to Triton for larger batches or per-token scales
-        from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
-            triton_scaled_mm,
-        )
-
-        return triton_scaled_mm(
-            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=out_dtype, bias=bias
-        )

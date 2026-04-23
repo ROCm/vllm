@@ -17,7 +17,12 @@
   #define __HIP__GFX9__
 #endif
 
-#define LDS_SIZE 64 * 1024
+// Total LDS budget per workgroup. We reserve LDS_AUX_BYTES at the end for
+// auxiliary shared-memory arrays (a_scales_dyn, warp_max) used by the dynamic
+// quantization path. The activation buffer s[] gets the remainder.
+#define LDS_TOTAL (64 * 1024)
+#define LDS_AUX_BYTES 128
+#define LDS_SIZE (LDS_TOTAL - LDS_AUX_BYTES)
 
 int get_lds_size_w8a8() {
   static bool is_cached = false;
@@ -26,7 +31,10 @@ int get_lds_size_w8a8() {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     std::string device_arch = dprops->gcnArchName;
     size_t substring = device_arch.find("gfx95");
-    result = (substring == std::string::npos ? 64 * 1024 : 160 * 1024);
+    // Subtract LDS_AUX_BYTES to leave room for auxiliary shared-memory arrays
+    // (a_scales_dyn, warp_max) used by the dynamic quantization path.
+    result = (substring == std::string::npos ? 64 * 1024 - LDS_AUX_BYTES
+                                             : 160 * 1024 - LDS_AUX_BYTES);
     is_cached = true;
   }
   return result;
@@ -136,10 +144,31 @@ struct scalar<c10::BFloat16> {
       val += __shfl_xor(val, 8);  \
       val += __shfl_xor(val, 16); \
     } while (0)
+
+  #define REDUCE_MAX_WAVE32(val)             \
+    do {                                     \
+      val = fmaxf(val, __shfl_xor(val, 1));  \
+      val = fmaxf(val, __shfl_xor(val, 2));  \
+      val = fmaxf(val, __shfl_xor(val, 4));  \
+      val = fmaxf(val, __shfl_xor(val, 8));  \
+      val = fmaxf(val, __shfl_xor(val, 16)); \
+    } while (0)
 #endif
 
 __device__ inline unsigned int min_w8a8(uint32_t a, uint32_t b) {
   return min(a, b);
+}
+
+// Round-to-nearest-even float→int8 with saturation.
+// Matches the ROCm implementation in scaled_quant.cu (uses nearbyint + clamp).
+static __device__ __forceinline__ int8_t float_to_int8_rn(float x) {
+  static constexpr auto i8_min =
+      static_cast<float>(std::numeric_limits<int8_t>::min());
+  static constexpr auto i8_max =
+      static_cast<float>(std::numeric_limits<int8_t>::max());
+  float dst = std::nearbyint(x);
+  dst = dst < i8_min ? i8_min : (dst > i8_max ? i8_max : dst);
+  return static_cast<int8_t>(dst);
 }
 
 // W8A8 skinny GEMM kernel: int8 weights, int8 activations
@@ -147,16 +176,22 @@ __device__ inline unsigned int min_w8a8(uint32_t a, uint32_t b) {
 // giving 2x the LDS capacity compared to the W8A16 variant.
 // Epilogue: result = sum * w_scale[m] * a_scale (per-channel weight, per-tensor
 // activation)
+//
+// Quantization modes for activations (quant_mode):
+//   0 = pre-quantized int8 (no fusion)
+//   1 = fused static quant (bf16 in, known a_scale)
+//   2 = fused dynamic quant (bf16 in, compute a_scale per row)
 #if defined(__HIP__GFX9__) || defined(__GFX11__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_w8a8_hf_sml_(const int K, const int M, const int Bx, const int By,
-                          const int8_t* B, const int8_t* __restrict__ A,
+                          const int8_t* B, const void* __restrict__ A_raw,
                           const scalar_t* w_scale,
                           const float* __restrict__ a_scale,
                           const scalar_t* __restrict__ BIAS, scalar_t* C,
-                          const int _WvPrGrp, const int CuCount) {
+                          const int _WvPrGrp, const int CuCount,
+                          const int quant_mode) {
   // LDS stores int8 activations: 1 byte each (vs 2 bytes for fp16 in W8A16)
   constexpr int max_lds_ints = LDS_SIZE;
 
@@ -179,25 +214,110 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   };
 
   __shared__ int8_t s[max_lds_ints];
+  // Per-row activation scales computed by dynamic quantization (mode 2).
+  // Max N=5 rows. Only written/read when quant_mode == 2.
+  __shared__ float a_scales_dyn[5];
+  // Scratch space for cross-warp max reduction (one float per warp).
+  __shared__ float warp_max[WvPrGrp];
 
-  // Fetch int8 activation matrix to LDS
-  // Each thread fetches A_CHUNK int8 elements = A_CHUNK bytes
-  for (uint32_t k = 0; k < min_w8a8(K * N, max_lds_ints);
-       k += THRDS * WvPrGrp * A_CHUNK) {
-    uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
+  // Fetch activation matrix to LDS as int8.
+  if (quant_mode == 2) {
+    // --- Mode 2: fused dynamic quantization ---
+    // Activations arrive in bf16/fp16. For each row, find absmax,
+    // compute scale, then quantize to int8.
+    const scalar_t* A_fp = (const scalar_t*)A_raw;
+    const uint32_t tid = threadIdx.y * THRDS + threadIdx.x;
+    const uint32_t stride = THRDS * WvPrGrp;
 
-    if (k_in >= min_w8a8(K * N, max_lds_ints)) break;
+    for (int n = 0; n < N; n++) {
+      const scalar_t* A_row = &A_fp[n * K];
 
-    *((bigTypeA*)(&s[k_in])) = *((bigTypeA*)(&A[k_in]));
+      // Phase 1: find per-thread absmax for this row
+      float tmax = 0.0f;
+      for (uint32_t k = tid; k < (uint32_t)K; k += stride) {
+        tmax = fmaxf(tmax, fabsf(__s2float(A_row[k])));
+      }
+
+      // Phase 2: warp-level max reduction
+  #if defined(__GFX11__)
+      REDUCE_MAX_WAVE32(tmax);
+  #else
+      // GFX9 wave64: DPP reduction for max (same shift pattern as sum
+      // reduction)
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 wave_shr:1 bound_ctrl:0"
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_bcast:15 bound_ctrl:0"
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_bcast:31 bound_ctrl:0"
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+  #endif
+
+      // Phase 3: cross-warp max reduction via LDS
+      if (threadIdx.x == 0) warp_max[threadIdx.y] = tmax;
+      __syncthreads();
+
+      float absmax = 0.0f;
+      for (int w = 0; w < WvPrGrp; w++) absmax = fmaxf(absmax, warp_max[w]);
+      float inv_s = (absmax > 0.0f) ? 127.0f / absmax : 0.0f;
+
+      // Store scale for epilogue
+      if (threadIdx.x == 0 && threadIdx.y == 0)
+        a_scales_dyn[n] = (absmax > 0.0f) ? absmax / 127.0f : 0.0f;
+      __syncthreads();
+
+      // Phase 4: quantize and store to LDS
+      int8_t* s_row = &s[n * K];
+      for (uint32_t k = tid; k < (uint32_t)K; k += stride) {
+        s_row[k] = float_to_int8_rn(__s2float(A_row[k]) * inv_s);
+      }
+      __syncthreads();
+    }
+  } else if (quant_mode == 1) {
+    // --- Mode 1: fused static quantization ---
+    // Activations arrive in bf16/fp16 with known per-tensor a_scale.
+    const scalar_t* A_fp = (const scalar_t*)A_raw;
+    const float inv_scale = 1.0f / (*a_scale);
+    for (uint32_t k = 0; k < min_w8a8(K * N, max_lds_ints);
+         k += THRDS * WvPrGrp * A_CHUNK) {
+      uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
+      if (k_in >= min_w8a8(K * N, max_lds_ints)) break;
+  #pragma unroll
+      for (int i = 0; i < A_CHUNK; i++) {
+        float val = __s2float(A_fp[k_in + i]);
+        s[k_in + i] = float_to_int8_rn(val * inv_scale);
+      }
+    }
+    __syncthreads();
+  } else {
+    // --- Mode 0: pre-quantized int8 ---
+    const int8_t* A = (const int8_t*)A_raw;
+    for (uint32_t k = 0; k < min_w8a8(K * N, max_lds_ints);
+         k += THRDS * WvPrGrp * A_CHUNK) {
+      uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
+      if (k_in >= min_w8a8(K * N, max_lds_ints)) break;
+      *((bigTypeA*)(&s[k_in])) = *((bigTypeA*)(&A[k_in]));
+    }
+    __syncthreads();
   }
-  __syncthreads();
 
   if (threadIdx.y >= _WvPrGrp) return;
 
   uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * YTILE;
 
-  // Load per-tensor activation scale once
-  const float a_scale_val = *a_scale;
+  // Load per-tensor activation scale once (modes 0 and 1)
+  const float a_scale_val = (quant_mode != 2) ? *a_scale : 0.0f;
 
   #if defined(__GFX11__)
   int32_t sum[N][YTILE];
@@ -298,10 +418,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
     if (threadIdx.x == 0) {
       for (int n = 0; n < N; n++) {
+        float a_s = (quant_mode == 2) ? a_scales_dyn[n] : a_scale_val;
         for (int i = 0; i < YTILE; i++) {
           // Convert int32 accumulator to float for scaling
           float sum_f = static_cast<float>(sum[n][i]);
-          sum_f *= __s2float(w_scale[m + i]) * a_scale_val;
+          sum_f *= __s2float(w_scale[m + i]) * a_s;
           if (BIAS) sum_f += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
           C[m + i + n * M] = __float2s<scalar_t>(sum_f);
         }
@@ -333,8 +454,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
     if (threadIdx.x == 63) {
       for (int n = 0; n < N; n++) {
+        float a_s = (quant_mode == 2) ? a_scales_dyn[n] : a_scale_val;
         for (int i = 0; i < YTILE; i++) {
-          sum[n][i] *= __s2float(w_scale[m + i]) * a_scale_val;
+          sum[n][i] *= __s2float(w_scale[m + i]) * a_s;
           if (BIAS) sum[n][i] += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
           C[m + i + n * M] = __float2s<scalar_t>(sum[n][i]);
         }
@@ -349,9 +471,9 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N>
 __global__ void wvSplitK_w8a8_hf_sml_(
     const int K, const int M, const int Bx, const int By, const int8_t* B,
-    const int8_t* __restrict__ A, const scalar_t* w_scale,
+    const void* __restrict__ A_raw, const scalar_t* w_scale,
     const float* __restrict__ a_scale, const scalar_t* __restrict__ BIAS,
-    scalar_t* C, const int _WvPrGrp, const int CuCount) {
+    scalar_t* C, const int _WvPrGrp, const int CuCount, const int quant_mode) {
   UNREACHABLE_CODE
 }
 #endif  // defined(__HIP__GFX9__) || defined(__GFX11__)
@@ -371,13 +493,14 @@ int mindiv_w8a8(int N, int div1, int div2) {
 
 torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
                             const at::Tensor& in_w_scale,
-                            const at::Tensor& in_a_scale,
+                            const std::optional<at::Tensor>& in_a_scale,
                             const std::optional<at::Tensor>& in_bias,
                             const int64_t CuCount) {
   // in_a: int8 weights [M, K]
-  // in_b: int8 activations [N, K]
+  // in_b: int8 or fp16/bf16 activations [N, K]
   // in_w_scale: per-channel weight scale [M] in fp16/bf16
-  // in_a_scale: per-tensor activation scale (scalar) in float32
+  // in_a_scale: per-tensor activation scale (scalar) in float32 — optional
+  //             (None for dynamic quantization)
   // in_bias: optional bias
   auto M_in = in_a.size(0);
   auto K_in = in_a.size(1);
@@ -392,9 +515,32 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
                    : 1;
 
   TORCH_CHECK(in_a.dtype() == torch::kInt8, "Weight must be int8");
-  TORCH_CHECK(in_b.dtype() == torch::kInt8, "Activation must be int8");
-  TORCH_CHECK(in_a_scale.dtype() == torch::kFloat32,
-              "Activation scale must be float32");
+
+  // Determine quantization mode:
+  //   0 = pre-quantized int8 (no fusion)
+  //   1 = fused static quant (bf16 in, known a_scale)
+  //   2 = fused dynamic quant (bf16 in, compute a_scale per row)
+  int quant_mode;
+  if (in_b.dtype() == torch::kInt8) {
+    quant_mode = 0;  // pre-quantized
+  } else if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
+    quant_mode = 1;  // fused static
+    TORCH_CHECK(in_b.dtype() == in_w_scale.dtype(),
+                "Fused quant: activation dtype must match weight scale dtype, "
+                "got ",
+                in_b.dtype(), " vs ", in_w_scale.dtype());
+  } else {
+    quant_mode = 2;  // fused dynamic
+    TORCH_CHECK(
+        in_b.dtype() == in_w_scale.dtype(),
+        "Dynamic quant: activation dtype must match weight scale dtype, "
+        "got ",
+        in_b.dtype(), " vs ", in_w_scale.dtype());
+  }
+  if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
+    TORCH_CHECK(in_a_scale->dtype() == torch::kFloat32,
+                "Activation scale must be float32");
+  }
   TORCH_CHECK(in_w_scale.dtype() == torch::kFloat16 ||
                   in_w_scale.dtype() == torch::kBFloat16,
               "Weight scale must be float16 or bfloat16");
@@ -425,7 +571,7 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
     wvSplitK_w8a8_hf_sml_<fptype, _THRDS, _YTILE, 16, 16, _UNRL, _N>          \
         <<<grid, block, 0, stream>>>(K_in, M_in, Bx_in, By_in, wptr, aptr,    \
                                      wsptr, asptr, biasptr, cptr, __wvPrGrp,  \
-                                     CuCount);                                \
+                                     CuCount, quant_mode);                    \
   }
 
 #define WVSPLITK_W8A8(_YTILE, _UNRL, _N)        \
@@ -459,10 +605,12 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
       in_w_scale.scalar_type(), "wvSplitK_w8a8", [&] {
         using fptype = typename scalar<scalar_t>::type;
         const int8_t* wptr = in_a.data_ptr<int8_t>();
-        const int8_t* aptr = in_b.data_ptr<int8_t>();
+        const void* aptr = in_b.data_ptr();
         const fptype* wsptr =
             reinterpret_cast<const fptype*>(in_w_scale.data_ptr());
-        const float* asptr = in_a_scale.data_ptr<float>();
+        const float* asptr = (in_a_scale.has_value() && in_a_scale->numel() > 0)
+                                 ? in_a_scale->data_ptr<float>()
+                                 : nullptr;
         const fptype* biasptr =
             (in_bias.has_value() && in_bias->numel() > 0)
                 ? reinterpret_cast<const fptype*>(in_bias->data_ptr())
@@ -505,7 +653,7 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
 torch::Tensor wvSplitK_w8a8_sweep(const at::Tensor& in_a,
                                   const at::Tensor& in_b,
                                   const at::Tensor& in_w_scale,
-                                  const at::Tensor& in_a_scale,
+                                  const std::optional<at::Tensor>& in_a_scale,
                                   const std::optional<at::Tensor>& in_bias,
                                   const int64_t CuCount, const int64_t ytile,
                                   const int64_t unrl, const int64_t achunk,
@@ -523,9 +671,23 @@ torch::Tensor wvSplitK_w8a8_sweep(const at::Tensor& in_a,
                    : 1;
 
   TORCH_CHECK(in_a.dtype() == torch::kInt8, "Weight must be int8");
-  TORCH_CHECK(in_b.dtype() == torch::kInt8, "Activation must be int8");
-  TORCH_CHECK(in_a_scale.dtype() == torch::kFloat32,
-              "Activation scale must be float32");
+  int quant_mode;
+  if (in_b.dtype() == torch::kInt8) {
+    quant_mode = 0;
+  } else if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
+    quant_mode = 1;
+    TORCH_CHECK(in_b.dtype() == in_w_scale.dtype(),
+                "Fused quant: activation dtype must match weight scale dtype");
+  } else {
+    quant_mode = 2;
+    TORCH_CHECK(
+        in_b.dtype() == in_w_scale.dtype(),
+        "Dynamic quant: activation dtype must match weight scale dtype");
+  }
+  if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
+    TORCH_CHECK(in_a_scale->dtype() == torch::kFloat32,
+                "Activation scale must be float32");
+  }
   TORCH_CHECK(in_w_scale.dtype() == torch::kFloat16 ||
                   in_w_scale.dtype() == torch::kBFloat16,
               "Weight scale must be float16 or bfloat16");
@@ -547,8 +709,10 @@ torch::Tensor wvSplitK_w8a8_sweep(const at::Tensor& in_a,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   const int8_t* wptr = in_a.data_ptr<int8_t>();
-  const int8_t* aptr = in_b.data_ptr<int8_t>();
-  const float* asptr = in_a_scale.data_ptr<float>();
+  const void* aptr = in_b.data_ptr();
+  const float* asptr = (in_a_scale.has_value() && in_a_scale->numel() > 0)
+                           ? in_a_scale->data_ptr<float>()
+                           : nullptr;
 
   const int THRDS = is_gfx11_w8a8() ? 32 : 64;
 
@@ -570,7 +734,7 @@ torch::Tensor wvSplitK_w8a8_sweep(const at::Tensor& in_a,
           wvSplitK_w8a8_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, \
                                 _UNRL, _N><<<grid, block, 0, stream>>>(    \
               K_in, M_in, Bx_in, By_in, wptr, aptr, wsptr, asptr, biasptr, \
-              cptr, __wvPrGrp, CuCount);                                   \
+              cptr, __wvPrGrp, CuCount, quant_mode);                       \
         });
 
   #define SWEEP_W8A8_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL)              \

@@ -40,11 +40,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? in_bias, int CuCount) -> Tensor");
   rocm_ops.impl("wvSplitK_int8", torch::kCUDA, &wvSplitK_int8);
 
-  // W8A8 skinny GEMM: int8 weights, int8 activations,
-  // per-channel weight scale + per-tensor activation scale
+  // W8A8 skinny GEMM: int8 weights, int8 or bf16/fp16 activations,
+  // per-channel weight scale + optional per-tensor activation scale.
+  // When a_scale is None, kernel computes dynamic per-row quantization.
   rocm_ops.def(
       "wvSplitK_w8a8(Tensor in_a, Tensor in_b, Tensor in_w_scale, "
-      "Tensor in_a_scale, Tensor? in_bias, int CuCount) -> Tensor");
+      "Tensor? in_a_scale, Tensor? in_bias, int CuCount) -> Tensor");
   rocm_ops.impl("wvSplitK_w8a8", torch::kCUDA, &wvSplitK_w8a8);
 
   // W4A16 grouped skinny GEMM: packed int4 weights, per-group scales,
@@ -87,7 +88,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // W8A8 skinny GEMM sweep: all tunable params as runtime args (benchmark only)
   rocm_ops.def(
       "wvSplitK_w8a8_sweep(Tensor in_a, Tensor in_b, Tensor in_w_scale, "
-      "Tensor in_a_scale, Tensor? in_bias, int CuCount, "
+      "Tensor? in_a_scale, Tensor? in_bias, int CuCount, "
       "int ytile, int unrl, int achunk, int wvprgrp) -> Tensor");
   rocm_ops.impl("wvSplitK_w8a8_sweep", torch::kCUDA, &wvSplitK_w8a8_sweep);
 #endif  // VLLM_SKINNY_GEMM_SWEEP

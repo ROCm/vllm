@@ -2671,9 +2671,9 @@ def wvSplitK_w8a8(
     a: torch.Tensor,
     b: torch.Tensor,
     w_scale: torch.Tensor,
-    a_scale: torch.Tensor,
+    a_scale: torch.Tensor | None,
     cu_count: int,
-    bias: torch.Tensor = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.wvSplitK_w8a8(a, b, w_scale, a_scale, bias, cu_count)
 
@@ -2685,7 +2685,7 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_w8a8")
         in_a: torch.Tensor,
         in_b: torch.Tensor,
         in_w_scale: torch.Tensor,
-        in_a_scale: torch.Tensor,
+        in_a_scale: torch.Tensor | None,
         in_bias: torch.Tensor | None,
         CuCount: int,
     ) -> torch.Tensor:
@@ -2698,13 +2698,13 @@ def wvSplitK_w8a8_sweep(
     a: torch.Tensor,
     b: torch.Tensor,
     w_scale: torch.Tensor,
-    a_scale: torch.Tensor,
+    a_scale: torch.Tensor | None,
     cu_count: int,
     ytile: int,
     unrl: int,
     achunk: int,
     wvprgrp: int,
-    bias: torch.Tensor = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.wvSplitK_w8a8_sweep(
         a, b, w_scale, a_scale, bias, cu_count, ytile, unrl, achunk, wvprgrp
