@@ -251,6 +251,17 @@ class Conv3dLayer(ConvLayerBase):
         else:
             return self._forward_conv(x)
 
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        # On ROCm, MIOpen's GemmFwdRest solver for 3D convolutions
+        # decomposes the batch into per-element im2col + GEMM loops,
+        # turning a single batched GEMM into thousands of tiny kernel
+        # launches. When kernel_size == stride (patch embeddings), this
+        # conv is mathematically a reshape + linear, so bypass MIOpen
+        # entirely and use the fused unfold + F.linear path.
+        if self.enable_linear:
+            return self._forward_mulmat(x)
+        return self._forward_conv(x)
+
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         # PyTorch2.9.0 disabled CUDNN's Conv3D, which caused a
         # significant performance regression.
