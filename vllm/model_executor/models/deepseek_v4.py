@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import sys
+import threading
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -57,6 +60,74 @@ from .utils import (
 
 SKIP_DEEPSEEK_V4_MOE = False
 SKIP_DEEPSEEK_V4_MHC = False
+
+
+# ---------------------------------------------------------------------------
+# Debug dump helpers (compare ROCm vs NVIDIA intermediate tensors).
+#
+# Activated by setting VLLM_DSV4_DUMP_DIR=<some path>. When set, the first
+# forward pass on the GPU common path saves every tagged intermediate tensor
+# to that directory and then aborts the process via os._exit(0) so that we
+# do not flood the disk with subsequent decode steps.
+#
+# Usage on each platform:
+#     VLLM_DSV4_DUMP_DIR=/tmp/dsv4_dump_rocm  python ... # on ROCm
+#     VLLM_DSV4_DUMP_DIR=/tmp/dsv4_dump_cuda  python ... # on NVIDIA
+# Then diff the two trees with torch.load + torch.allclose.
+# ---------------------------------------------------------------------------
+_DUMP_DIR = os.environ.get("VLLM_DSV4_DUMP_DIR", "")
+_DUMP_ENABLED = bool(_DUMP_DIR)
+_DUMP_LOCK = threading.Lock()
+_DUMP_COUNTER: dict[str, int] = {}
+_DUMP_DONE = False
+
+
+def _dsv4_dump(tag: str, tensor) -> None:
+    """Save a tensor (or tuple of tensors) under VLLM_DSV4_DUMP_DIR.
+
+    No-op if VLLM_DSV4_DUMP_DIR is not set.  A monotonically increasing
+    counter is prepended to each filename so the order of capture is
+    preserved (helpful when comparing two runs on different platforms).
+    """
+    if not _DUMP_ENABLED or _DUMP_DONE:
+        return
+    if isinstance(tensor, (tuple, list)):
+        for i, sub in enumerate(tensor):
+            _dsv4_dump(f"{tag}__{i}", sub)
+        return
+    if not isinstance(tensor, torch.Tensor):
+        return
+    with _DUMP_LOCK:
+        idx = _DUMP_COUNTER.get("_n", 0)
+        _DUMP_COUNTER["_n"] = idx + 1
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    safe_tag = tag.replace("/", "_")
+    path = os.path.join(_DUMP_DIR, f"{idx:05d}__{safe_tag}.pt")
+    try:
+        # detach + cpu + clone to be safe with custom / fp8 storages.
+        torch.save(tensor.detach().to("cpu", copy=True), path)
+    except Exception as exc:  # pragma: no cover - debug only
+        sys.stderr.write(f"[dsv4_dump] failed to save {path}: {exc}\n")
+
+
+def _dsv4_dump_finish_and_abort() -> None:
+    """Mark the dump as complete and abort the process.
+
+    Called once after the first full forward pass so that the second token
+    is never produced.  os._exit(0) bypasses Python finalizers; this is
+    intentional because we are inside torch.compile/cudagraph contexts and
+    a clean shutdown is unreliable.
+    """
+    global _DUMP_DONE
+    if not _DUMP_ENABLED or _DUMP_DONE:
+        return
+    _DUMP_DONE = True
+    sys.stderr.write(
+        f"[dsv4_dump] wrote {_DUMP_COUNTER.get('_n', 0)} tensors to "
+        f"{_DUMP_DIR}; aborting after first forward pass.\n"
+    )
+    sys.stderr.flush()
+    os._exit(0)
 
 
 class DeepseekV4MoEBypass(nn.Module):
@@ -210,6 +281,7 @@ class DeepseekV4MoE(nn.Module):
 
         _, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        _dsv4_dump(f"{self.prefix}.moe.input", hidden_states)
 
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
@@ -221,6 +293,7 @@ class DeepseekV4MoE(nn.Module):
         else:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
+            _dsv4_dump(f"{self.prefix}.moe.router_logits", router_logits)
             fused_moe_out = self.experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -228,6 +301,9 @@ class DeepseekV4MoE(nn.Module):
             )
 
         shared_output, final_hidden_states = fused_moe_out
+        _dsv4_dump(f"{self.prefix}.moe.routed_out", final_hidden_states)
+        if shared_output is not None:
+            _dsv4_dump(f"{self.prefix}.moe.shared_out", shared_output)
 
         if self.shared_experts is None:
             assert shared_output is None
@@ -241,6 +317,7 @@ class DeepseekV4MoE(nn.Module):
                 final_hidden_states
             )
 
+        _dsv4_dump(f"{self.prefix}.moe.output", final_hidden_states)
         return final_hidden_states.view(org_shape)
 
 
@@ -257,6 +334,7 @@ class DeepseekV4Attention(nn.Module):
         quant_config = vllm_config.quant_config
         layer_id = extract_layer_index(prefix)
 
+        self.prefix = prefix
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
@@ -412,7 +490,55 @@ class DeepseekV4Attention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
     ):
-        return self.mla_attn(positions, hidden_states, llama_4_scaling)
+        # ----- Begin attention dump (heavy coverage) -----
+        # The MLA attention path is complex (fused_wqa_wkv -> qr/kv split ->
+        # rmsnorm -> wq_b -> RoPE -> sparse FlashMLA -> inv-RoPE -> wo_a/wo_b),
+        # so we capture as many internal handles as we can reach from this
+        # outer frame. For more granular dumps inside the FP8 / RoPE fused
+        # ops, instrument deepseek_v4_attention.py directly.
+        _dsv4_dump(f"{self.prefix}.attn.input.positions", positions)
+        _dsv4_dump(f"{self.prefix}.attn.input.hidden_states", hidden_states)
+
+        if _DUMP_ENABLED:
+            # Reproduce the wrapper's pre-attention projections in fp32 so we
+            # can also see the qr / kv split before the custom op overwrites
+            # them inside attention_impl.
+            with torch.no_grad():
+                qr_kv_dbg, _ = self.mla_attn.fused_wqa_wkv(hidden_states)
+                qr_dbg, kv_dbg = qr_kv_dbg.split(
+                    [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1
+                )
+                _dsv4_dump(f"{self.prefix}.attn.fused_wqa_wkv_out", qr_kv_dbg)
+                _dsv4_dump(f"{self.prefix}.attn.qr_pre_norm", qr_dbg)
+                _dsv4_dump(f"{self.prefix}.attn.kv_pre_norm", kv_dbg)
+                _dsv4_dump(
+                    f"{self.prefix}.attn.q_norm.weight",
+                    self.mla_attn.q_norm.weight.data,
+                )
+                _dsv4_dump(
+                    f"{self.prefix}.attn.kv_norm.weight",
+                    self.mla_attn.kv_norm.weight.data,
+                )
+                # Post-RMSNorm Q (mirror of fused_q_kv_rmsnorm Q output).
+                qr_norm_dbg = self.mla_attn.q_norm(qr_dbg)
+                kv_norm_dbg = self.mla_attn.kv_norm(kv_dbg)
+                _dsv4_dump(f"{self.prefix}.attn.qr_post_norm", qr_norm_dbg)
+                _dsv4_dump(f"{self.prefix}.attn.kv_post_norm", kv_norm_dbg)
+                # Q after wq_b (per-head, before RoPE). This is the closest
+                # we can capture without reaching into the custom op.
+                q_after_wqb = self.mla_attn.wq_b(qr_norm_dbg).view(
+                    -1, self.mla_attn.n_local_heads, self.mla_attn.head_dim
+                )
+                _dsv4_dump(f"{self.prefix}.attn.q_after_wq_b", q_after_wqb)
+                # Per-head Q norm output (matches q_head_norm inside MLA).
+                _dsv4_dump(
+                    f"{self.prefix}.attn.q_after_head_norm",
+                    self.mla_attn.q_head_norm(q_after_wqb),
+                )
+
+        out = self.mla_attn(positions, hidden_states, llama_4_scaling)
+        _dsv4_dump(f"{self.prefix}.attn.output", out)
+        return out
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -426,6 +552,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.prefix = prefix
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4Attention(
@@ -539,21 +666,31 @@ class DeepseekV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
+        _dsv4_dump(f"{self.prefix}.layer.input", x)
+
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
+        _dsv4_dump(f"{self.prefix}.layer.attn_hc_pre_out", x)
         x = self.attn_norm(x)
+        _dsv4_dump(f"{self.prefix}.layer.attn_norm_out", x)
         x = self.attn(positions, x, None)
+        _dsv4_dump(f"{self.prefix}.layer.attn_block_out", x)
         x = self.hc_post(x, residual, post, comb)
+        _dsv4_dump(f"{self.prefix}.layer.attn_hc_post_out", x)
 
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
+        _dsv4_dump(f"{self.prefix}.layer.ffn_hc_pre_out", x)
         x = self.ffn_norm(x)
+        _dsv4_dump(f"{self.prefix}.layer.ffn_norm_out", x)
         x = self.ffn(x, input_ids)
+        _dsv4_dump(f"{self.prefix}.layer.ffn_block_out", x)
         x = self.hc_post(x, residual, post, comb)
+        _dsv4_dump(f"{self.prefix}.layer.output", x)
         return x
 
 
@@ -646,8 +783,13 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        _dsv4_dump("model.input.input_ids", input_ids)
+        _dsv4_dump("model.input.positions", positions)
+
         hidden_states = self.embed_input_ids(input_ids)
+        _dsv4_dump("model.embed_tokens_out", hidden_states)
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        _dsv4_dump("model.embed_after_hc_repeat", hidden_states)
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(
@@ -655,6 +797,8 @@ class DeepseekV4Model(nn.Module):
                 positions,
                 input_ids,
             )
+
+        _dsv4_dump("model.post_decoder_stack", hidden_states)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -668,7 +812,11 @@ class DeepseekV4Model(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
+        _dsv4_dump("model.post_hc_head", hidden_states)
         hidden_states = self.norm(hidden_states)
+        _dsv4_dump("model.final_norm_out", hidden_states)
+        # First forward done — flush + abort so we capture exactly one token.
+        _dsv4_dump_finish_and_abort()
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
