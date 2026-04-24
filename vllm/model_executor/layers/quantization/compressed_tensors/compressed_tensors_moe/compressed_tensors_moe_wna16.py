@@ -213,6 +213,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
             pack_int4_exllama_shuffle,
         )
+        from vllm.model_executor.layers.fused_moe.all2all_utils import (
+            maybe_make_prepare_finalize,
+        )
+        from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+            HybridW4A16MoEExperts,
+        )
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
             unpack_quantized_values_into_int32,
         )
@@ -265,6 +271,26 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.w13_weight = layer.w13_weight_packed
         layer.w2_weight = layer.w2_weight_packed
 
+        # Build the modular kernel directly so the runner uses the hybrid
+        # experts even on single-GPU deployments (no DP/EP), where the
+        # legacy select_gemm_impl path is not invoked.
+        prepare_finalize = maybe_make_prepare_finalize(
+            moe=self.moe,
+            quant_config=self.moe_quant_config,
+            routing_tables=layer._maybe_init_expert_routing_tables(),
+            allow_new_interface=True,
+            use_monolithic=False,
+        )
+        assert prepare_finalize is not None
+        self.moe_kernel = mk.FusedMoEKernel(
+            prepare_finalize,
+            HybridW4A16MoEExperts(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            ),
+            shared_experts=None,
+            inplace=not self.moe.disable_inplace,
+        )
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -288,15 +314,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         prepare_finalize: mk.FusedMoEPrepareAndFinalizeModular,
         layer: torch.nn.Module,
     ) -> mk.FusedMoEExpertsModular:
-        if getattr(layer, "use_hybrid_w4a16_moe", False):
-            from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
-                HybridW4A16MoEExperts,
-            )
-
-            return HybridW4A16MoEExperts(
-                moe_config=self.moe, quant_config=self.moe_quant_config
-            )
-
         if self.moe.is_lora_enabled:
             assert self.moe_quant_config is not None
             from vllm.triton_utils import HAS_TRITON
@@ -325,6 +342,20 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self.moe_kernel is not None:
+            return self.moe_kernel.apply(
+                hidden_states=x,
+                w1=layer.w13_weight_packed,
+                w2=layer.w2_weight_packed,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=layer.activation,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                shared_experts_input=shared_experts_input,
+            )
+
         from vllm.model_executor.layers.fused_moe import fused_experts
 
         return fused_experts(
