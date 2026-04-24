@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+from vllm.platforms import current_platform as _current_platform
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )

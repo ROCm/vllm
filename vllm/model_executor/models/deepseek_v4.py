@@ -86,6 +86,7 @@ class DeepseekV4FP8Config(Fp8Config):
         return None
 
     def get_quant_method(self, layer, prefix):
+        from vllm.platforms import current_platform
         if isinstance(layer, FusedMoE):
             if is_layer_skipped(
                 prefix=prefix,
@@ -93,10 +94,17 @@ class DeepseekV4FP8Config(Fp8Config):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
+            if current_platform.is_rocm():
+                # On ROCm, use Mxfp4MoEMethod for loading but override
+                # process_weights to dequantize to bf16 + apply swiglu_limit.
+                return _Mxfp4DequantMoEMethod(layer.moe_config)
             return Mxfp4MoEMethod(layer.moe_config)
         return super().get_quant_method(layer, prefix)
 
     def is_mxfp4_quant(self, prefix, layer):
+        from vllm.platforms import current_platform
+        if current_platform.is_rocm():
+            return False  # dequantized to bf16
         return isinstance(layer, FusedMoE)
 
 
@@ -579,6 +587,9 @@ class DeepseekV4Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        # Tag each layer with its index for debug logging
+        for i, layer in enumerate(self.layers):
+            layer._layer_idx = i
 
         self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
 

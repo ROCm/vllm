@@ -974,6 +974,9 @@ class ModelConfig:
                     quant_cfg, self.quantization, hf_config=self.hf_config
                 )
                 if quantization_override is not None:
+                    print("quantization override: ", quantization_override)
+                    print("override: ", overrides)
+                    print("get args: ", get_args(me_quant.QuantizationMethods))
                     # Raise error if the override is not custom (custom would
                     # be in QUANTIZATION_METHODS but not QuantizationMethods)
                     # and hasn't been added to the overrides list.

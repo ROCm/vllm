@@ -162,6 +162,17 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         else:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale
 
+        # AITER CK kernel requires matching scale dtypes.
+        # DeepSeek V4 uses float8_e8m0fnu weight scales with float32 input
+        # scales. When dtypes mismatch, fall back to a torch reference:
+        # dequantize both operands and use standard matmul.
+        if As.dtype != Bs.dtype:
+            from vllm.utils.deep_gemm import _dequant_fp8_block_scaled
+            block_k = self.weight_group_shape[1]  # typically 128
+            A_deq = _dequant_fp8_block_scaled(A, As, block_k)
+            B_deq = _dequant_fp8_block_scaled(B, Bs, block_k)
+            # A: [M, K], B: [N, K] → output: [M, N]
+            return (A_deq @ B_deq.T).to(out_dtype)
         return gemm_a8w8_blockscale_op(
             A, B, As, Bs, list(self.weight_group_shape), output_dtype=out_dtype
         )

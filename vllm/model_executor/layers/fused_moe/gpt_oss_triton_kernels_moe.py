@@ -648,6 +648,7 @@ class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
         p = current_platform
         if not p.is_cuda_alike():
             return False
+        return True
         cap = p.get_device_capability()
         if cap is None:
             return False
@@ -1013,6 +1014,7 @@ class OAITritonMxfp4ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         p = current_platform
         if not p.is_cuda_alike():
             return False
+        return True
         cap = p.get_device_capability()
         if cap is None:
             return False

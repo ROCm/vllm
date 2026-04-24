@@ -224,8 +224,11 @@ def fused_inv_rope_fp8_quant(
         HALF_ROPE=rope_dim // 2,
         TMA_ALIGNED_SCALES=tma_aligned_scales,
         num_stages=1,
-        launch_pdl=False,
     )
+    # launch_pdl is NVIDIA Triton-only; skip on ROCm
+    from vllm.platforms import current_platform
+    if not current_platform.is_rocm():
+        common_args["launch_pdl"] = False
 
     grid = (tma_aligned_T, n_groups * heads_per_group)
     _fused_inv_rope_fp8_quant_per_head[grid](

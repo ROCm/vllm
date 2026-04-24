@@ -303,6 +303,9 @@ def cublas_gemm_bf16_bf16_fp32(
     x: torch.Tensor,
     weight: torch.Tensor,
 ):
+    if not current_platform.is_cuda():
+        # Fallback for ROCm: use standard matmul with float32 output
+        return torch.nn.functional.linear(x.float(), weight.float())
     return ops.router_gemm_bf16_fp32(x, weight)
 
 

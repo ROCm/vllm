@@ -310,6 +310,14 @@ class DeepseekCompressor(nn.Module):
         # state_cache from this kernel) but neither emits/waits on PDL grid
         # dependency primitives, so launch_pdl=True caused a read-after-write
         # race and non-deterministic output.
+        _save_kwargs = dict(
+            HEAD_SIZE=kv.shape[-1],
+            TRITON_BLOCK_SIZE=triton.next_power_of_2(kv.shape[-1]),
+            STATE_WIDTH=state_width,
+            COMPRESS_RATIO=self.compress_ratio,
+        )
+        if not current_platform.is_rocm():
+            _save_kwargs["launch_pdl"] = False
         _save_partial_states_kernel[(num_actual,)](
             kv,
             kv.stride(0),
@@ -323,11 +331,7 @@ class DeepseekCompressor(nn.Module):
             state_cache.stride(1),
             slot_mapping,
             block_size,
-            HEAD_SIZE=kv.shape[-1],
-            TRITON_BLOCK_SIZE=triton.next_power_of_2(kv.shape[-1]),
-            STATE_WIDTH=state_width,
-            COMPRESS_RATIO=self.compress_ratio,
-            launch_pdl=False,
+            **_save_kwargs,
         )
 
         # Fused: compress → RMSNorm → RoPE → FP8 quant → KV cache write.
@@ -341,6 +345,22 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = attn_metadata[self.k_cache_prefix]
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
+        _fused_kwargs = dict(
+            HEAD_SIZE=self.head_dim,
+            TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
+            STATE_WIDTH=state_width,
+            COMPRESS_RATIO=self.compress_ratio,
+            OVERLAP=self.overlap,
+            ROPE_HEAD_DIM=self.rope_head_dim,
+            FP8_MAX=448.0,
+            QUANT_BLOCK=self._quant_block,
+            TOKEN_STRIDE=self._token_stride,
+            SCALE_DIM=self._scale_dim,
+            KV_BLOCK_STRIDE=kv_cache.stride(0),
+            num_warps=self._num_warps,
+        )
+        if not current_platform.is_rocm():
+            _fused_kwargs["launch_pdl"] = False
         self._fused_kernel[(num_actual,)](
             # state cache
             state_cache,
@@ -363,20 +383,7 @@ class DeepseekCompressor(nn.Module):
             kv_cache,
             k_cache_metadata.slot_mapping,
             kv_cache.shape[1],  # paged KV cache block size (tokens per block)
-            # constexprs
-            HEAD_SIZE=self.head_dim,
-            TRITON_BLOCK_SIZE=triton.next_power_of_2(self.head_dim),
-            STATE_WIDTH=state_width,
-            COMPRESS_RATIO=self.compress_ratio,
-            OVERLAP=self.overlap,
-            ROPE_HEAD_DIM=self.rope_head_dim,
-            FP8_MAX=448.0,
-            QUANT_BLOCK=self._quant_block,
-            TOKEN_STRIDE=self._token_stride,
-            SCALE_DIM=self._scale_dim,
-            KV_BLOCK_STRIDE=kv_cache.stride(0),
-            num_warps=self._num_warps,
-            launch_pdl=False,
+            **_fused_kwargs,
         )
 
 

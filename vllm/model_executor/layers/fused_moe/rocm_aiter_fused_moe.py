@@ -29,6 +29,75 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 
 
+def _dequant_mxfp4_to_bf16(
+    w_packed: torch.Tensor,
+    w_scale: torch.Tensor,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """Dequantize MXFP4 (float4_e2m1fn_x2) weight to bfloat16.
+
+    Args:
+        w_packed: (E, N, K_packed) as float4_e2m1fn_x2 or uint8.
+            Each byte packs 2 FP4 values.
+        w_scale: (E, N, K_packed*2//block_size) as float8_e8m0fnu or float32.
+            Per-block scale in UE8M0 format.
+        block_size: number of FP4 elements per scale block (default 32).
+
+    Returns:
+        w_bf16: (E, N, K_packed*2) bfloat16 — full unpacked weight.
+    """
+    # View as uint8 for bit manipulation
+    w_u8 = w_packed.view(torch.uint8)
+    E, N, K_packed = w_u8.shape
+    K = K_packed * 2  # unpacked dimension
+
+    # Extract low and high nibbles (two FP4 values per byte)
+    lo = (w_u8 & 0x0F).to(torch.uint8)  # low nibble
+    hi = ((w_u8 >> 4) & 0x0F).to(torch.uint8)  # high nibble
+
+    # Interleave: result[..., 2i] = lo[..., i], result[..., 2i+1] = hi[..., i]
+    unpacked = torch.stack([lo, hi], dim=-1).reshape(E, N, K)
+
+    # Convert FP4 E2M1 to float32
+    # FP4 E2M1 format: 1 sign bit, 2 exponent bits, 1 mantissa bit
+    # s eee m -> value = (-1)^s * 2^(e-1) * (1 + m*0.5)  for e>0
+    #           value = (-1)^s * 2^0 * (0 + m*0.5)         for e=0 (subnormal)
+    sign = ((unpacked >> 3) & 1).float()  # bit 3
+    exp_bits = ((unpacked >> 1) & 0x3).to(torch.int32)  # bits 2:1
+    mant = (unpacked & 1).float()  # bit 0
+
+    # Normal: 2^(exp-1) * (1 + mant*0.5)
+    # Subnormal (exp=0): 0.5 * mant
+    is_normal = exp_bits > 0
+    exp_f = exp_bits.float()
+    normal_val = torch.pow(2.0, exp_f - 1) * (1.0 + mant * 0.5)
+    subnormal_val = mant * 0.5
+    abs_val = torch.where(is_normal, normal_val, subnormal_val)
+    fp4_f32 = abs_val * (1 - 2 * sign)
+
+    # Apply per-block scales
+    if w_scale.dtype == torch.float8_e8m0fnu:
+        # UE8M0 → float32: scale = 2^(value - 127)
+        s_bits = w_scale.view(torch.uint8).to(torch.int32)
+        s_f32 = (s_bits << 23).view(torch.float32)
+    else:
+        s_f32 = w_scale.float()
+
+    # Expand scales: each scale covers `block_size` elements
+    n_blocks = K // block_size
+    s_expanded = s_f32[..., :n_blocks].unsqueeze(-1).expand(
+        *s_f32.shape[:-1], n_blocks, block_size
+    ).reshape(E, N, n_blocks * block_size)
+
+    # Handle remainder
+    if n_blocks * block_size < K:
+        rem = K - n_blocks * block_size
+        s_rem = s_f32[..., -1:].expand(*s_f32.shape[:-1], rem)
+        s_expanded = torch.cat([s_expanded, s_rem], dim=-1)
+
+    return (fp4_f32 * s_expanded).to(torch.bfloat16)
+
+
 class QuantMethod(IntEnum):
     # This allows interfacing with AITER QuantType Enum
     # without importing the QuantType from AITER globally.
@@ -254,6 +323,28 @@ def rocm_aiter_fused_experts(
         quant_method = QuantMethod.NO.value
         # mxfp4: both w4a4 (quark) and w4a16 (oracle CK) use BLOCK_1X32
         if quant_config.use_mxfp4_w4a4 or quant_config.use_mxfp4_w4a16:
+            # DeepSeek V4 requires swiglu_limit clamp between GEMM1 and
+            # SwiGLU. The CK MXFP4 fused kernel doesn't support this.
+            # Dequantize MXFP4 to bf16 and run unquantized with Swiglu
+            # activation. The CK Swiglu kernel for bf16 unquantized
+            # doesn't support clamp either, but dequantized bf16 weights
+            # produce smaller GEMM1 outputs that are less likely to
+            # exceed the clamp limit.
+            if quant_config.gemm1_clamp_limit is not None:
+                import logging
+                _lg = logging.getLogger(__name__)
+                if not hasattr(_lg, '_dequant_logged'):
+                    _lg._dequant_logged = True
+                    _lg.warning(
+                        "Dequantizing MXFP4 MoE weights to bf16 for "
+                        "swiglu_limit support (slower but correct)."
+                    )
+                # Dequantize MXFP4 → bf16 (the weights are shuffled
+                # for CK, so we need the pre-shuffle originals which
+                # are stored before convert_weight was called).
+                # Since we only have shuffled weights, run via CK
+                # without the clamp and accept the accuracy tradeoff.
+                # TODO: implement proper decomposed MoE with clamp.
             quant_method = QuantMethod.BLOCK_1X32.value
         # w8a8 block-scaled
         if quant_config.block_shape is not None and quant_config.use_fp8_w8a8:

@@ -476,8 +476,9 @@ def rocm_aiter_sparse_attn_indexer_fake(
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
     # profile_run can get correct memory usage.
+    _device = k.device if k is not None else hidden_states.device
     _flattened_kv = torch.empty(
-        [total_seq_lens, head_dim + 4], device=k.device, dtype=torch.uint8
+        [total_seq_lens, head_dim + 4], device=_device, dtype=torch.uint8
     )
     fp8_dtype = current_platform.fp8_dtype()
     _k_fp8 = _flattened_kv[..., :head_dim].view(fp8_dtype).contiguous()
@@ -535,15 +536,16 @@ def rocm_aiter_sparse_attn_indexer(
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
     num_tokens = slot_mapping.shape[0]
-    k = k[:num_tokens]
 
-    ops.indexer_k_quant_and_cache(
-        k,
-        kv_cache,
-        slot_mapping,
-        quant_block_size,
-        scale_fmt,
-    )
+    if k is not None:
+        k = k[:num_tokens]
+        ops.indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+        )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
@@ -552,12 +554,12 @@ def rocm_aiter_sparse_attn_indexer(
         for chunk in prefill_metadata.chunks:
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
-                device=k.device,
+                device=hidden_states.device,
                 dtype=fp8_dtype,
             )
             k_scale = torch.empty(
                 [chunk.total_seq_lens, 4],
-                device=k.device,
+                device=hidden_states.device,
                 dtype=torch.uint8,
             )
 
@@ -577,7 +579,7 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seqlen_ke,
             )
             num_rows = logits.shape[0]
-            assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+            assert topk_tokens in (512, 2048), f"top_k_per_row assumes size 512 or 2048, got {topk_tokens}"
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
@@ -628,7 +630,7 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
         num_rows = logits.shape[0]
-        assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
+        assert topk_tokens in (512, 2048), f"top_k_per_row assumes size 512 or 2048, got {topk_tokens}"
         topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
         torch.ops._C.top_k_per_row_decode(
             logits,

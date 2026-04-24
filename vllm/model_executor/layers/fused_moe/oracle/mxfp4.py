@@ -211,6 +211,8 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
         # TRITON_UNFUSED has bug with MTP support
         # TODO re-enable after kernel is fixed
         # TRITON_UNFUSED
+        Mxfp4MoeBackend.AITER,
+        Mxfp4MoeBackend.TRITON_UNFUSED,
         Mxfp4MoeBackend.MARLIN,
         Mxfp4MoeBackend.BATCHED_MARLIN,
     ]
@@ -474,6 +476,7 @@ def select_mxfp4_moe_backend(
     for backend in _get_priority_backends():
         activation_key = _backend_activation_key(backend)
         for k_cls in backend_to_kernel_cls(backend):
+            print("kcls: ", k_cls)
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, kMxfp4Static, activation_key, activation_format
             )
@@ -1082,6 +1085,51 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    elif mxfp4_backend == Mxfp4MoeBackend.AITER:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        if w13_bias is not None:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32)
+
+        e, n, k = w13_weight.shape
+
+        # Note: Mxfp4MoEMethod stores w13 as [w1(gate); w3(up)] contiguously
+        # (not interleaved). No de-interleaving needed.
+
+        # View as native FP4 dtype for AITER shuffle
+        w13_weight.data = w13_weight.data.view(torch.float4_e2m1fn_x2)
+        w2_weight.data = w2_weight.data.view(torch.float4_e2m1fn_x2)
+
+        # Shuffle weights and scales for AITER CK kernel layout
+        w13_weight.data = rocm_aiter_ops.shuffle_weight_a16w4(
+            w13_weight, 16, True
+        )
+        shuffled_w13_scale = rocm_aiter_ops.shuffle_scale_a16w4(
+            w13_weight_scale.view(-1, w13_weight_scale.shape[-1]),
+            num_experts,
+            True,
+        )
+
+        w2_weight.data = rocm_aiter_ops.shuffle_weight_a16w4(
+            w2_weight, 16, False
+        )
+        shuffled_w2_scale = rocm_aiter_ops.shuffle_scale_a16w4(
+            w2_weight_scale.view(-1, w2_weight_scale.shape[-1]),
+            num_experts,
+            False,
+        )
+
+        return (
+            w13_weight,
+            w2_weight,
+            shuffled_w13_scale,
+            shuffled_w2_scale,
+            w13_bias,
+            w2_bias,
+        )
+
     elif mxfp4_backend in TRITON_BACKENDS:
         from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
@@ -1137,7 +1185,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM or Triton backend."
+            f"Expected TRTLLM, Triton, or AITER backend."
         )
 
 

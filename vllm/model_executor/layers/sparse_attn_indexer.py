@@ -497,9 +497,8 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
-        assert not self.skip_k_cache_insert, (
-            "AMD platform doesn't support skip cache insert yet"
-        )
+        # V4 compressor already inserts K into cache, so skip_k_cache_insert
+        # may be True. In that case we skip the k_quant_and_cache call below.
         assert not self.use_fp4_cache, "AMD platform doesn't support fp4 cache yet"
         assert isinstance(q_quant, torch.Tensor), (
             "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"

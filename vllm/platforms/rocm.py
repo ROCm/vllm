@@ -415,6 +415,7 @@ class RocmPlatform(Platform):
         "torchao",
         "bitsandbytes",
         "modelopt_fp4",
+        "deepseek_v4_fp8"
     ]
 
     @classmethod

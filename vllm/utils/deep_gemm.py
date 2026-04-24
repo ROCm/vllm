@@ -297,10 +297,115 @@ def fp8_gemm_nt(*args, **kwargs):
     return _fp8_gemm_nt_impl(*args, disable_ue8m0_cast=not use_ue8m0, **kwargs)
 
 
+def _dequant_fp8_block_scaled(
+    x_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize block-scaled FP8 tensor to float32.
+
+    Handles both 1D block scales (per-group along last dim) and 2D block
+    scales (per-block across two dims, e.g. weight_block_size=[128, 128]).
+
+    Args:
+        x_fp8: FP8 tensor, shape (*, R) or (N, K) etc.
+        scale: Per-block scales. Can be:
+            - float32: raw scale values
+            - float8_e8m0fnu / uint8: UE8M0 encoded, scale = 2^(val - 127)
+        block_size: elements per block along the last dimension
+    Returns:
+        Dequantized float32 tensor, same shape as x_fp8.
+    """
+    x_f = x_fp8.to(torch.float32)
+
+    # Convert UE8M0 scales to float32
+    if scale.dtype in (torch.float8_e8m0fnu, torch.uint8):
+        exp_bits = scale.view(torch.uint8).to(torch.int32)
+        fp32_bits = exp_bits << 23
+        scale = fp32_bits.view(torch.float32)
+
+    # Determine how many dims the scale covers
+    if x_f.ndim == 2 and scale.ndim == 2:
+        # 2D block-quantized: x is [N, K], scale is [N//bN, K//bK]
+        N, K = x_f.shape
+        sN, sK = scale.shape
+        bN = N // sN if sN > 0 else N
+        bK = K // sK if sK > 0 else K
+        # Expand scale to [N, K] using repeat_interleave
+        s_expanded = scale.repeat_interleave(bN, dim=0).repeat_interleave(bK, dim=1)
+        # Trim to match x shape if needed
+        s_expanded = s_expanded[:N, :K]
+        return x_f * s_expanded
+    else:
+        # 1D block along last dim: scale shape (..., R // block_size)
+        R = x_f.shape[-1]
+        n_blocks = R // block_size
+        s = scale[..., :n_blocks]
+        s_expanded = s.unsqueeze(-1).expand(*s.shape, block_size)
+        s_expanded = s_expanded.reshape(*s.shape[:-1], n_blocks * block_size)
+        if n_blocks * block_size < R:
+            remainder = R - n_blocks * block_size
+            last_scale = s[..., -1:].expand(*s.shape[:-1], remainder)
+            s_expanded = torch.cat([s_expanded, last_scale], dim=-1)
+        return x_f * s_expanded
+
+
 def fp8_einsum(*args, **kwargs):
     _lazy_init()
     if _fp8_einsum_impl is None:
-        return _missing(*args, **kwargs)
+        # PyTorch reference: dequantize both FP8 operands using their
+        # per-block scales, then run a standard torch.einsum.
+        #
+        # Call convention:
+        #   fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=...)
+        #
+        # For DeepSeek V4 the call is:
+        #   equation = "bhr,hdr->bhd"
+        #   a (o_fp8):     (G, T, D)  float8_e4m3fn  (may have unusual strides)
+        #   a_scale:       (G, T, D//128)  float32
+        #   b (wo_a_fp8):  (o_lora_rank, G*D)  float8_e4m3fn  (2D weight)
+        #   b_scale:       block-scaled  float8_e8m0fnu
+        #   out:           (T, G, o_lora_rank)  bfloat16
+        equation = args[0]
+        a_pair = args[1]
+        b_pair = args[2]
+        out = args[3]
+        a, a_scale = a_pair
+        b, b_scale = b_pair
+
+        BLOCK = 128
+
+        # --- Dequantize A ---
+        # IMPORTANT: a may have non-standard strides (e.g. group-major).
+        # The scale must be made contiguous in the same order so that
+        # block-scale alignment is preserved after reordering.
+        a_contig = a.contiguous()
+        a_scale_contig = a_scale.contiguous()
+        a_f = _dequant_fp8_block_scaled(a_contig, a_scale_contig, BLOCK)
+
+        # --- Dequantize B ---
+        b_contig = b.contiguous()
+        b_scale_contig = b_scale.contiguous()
+        b_f = _dequant_fp8_block_scaled(b_contig, b_scale_contig, BLOCK)
+
+        # --- Parse einsum to determine expected dims ---
+        parts = equation.split("->")
+        inputs_spec = parts[0].split(",")
+        expected_a_ndim = len(inputs_spec[0])
+        expected_b_ndim = len(inputs_spec[1])
+
+        # Reshape if needed
+        if a_f.ndim < expected_a_ndim and expected_a_ndim == 3:
+            h = out.shape[1]
+            a_f = a_f.reshape(a_f.shape[0], h, -1)
+        if b_f.ndim < expected_b_ndim and expected_b_ndim == 3:
+            h = out.shape[1]
+            d = out.shape[2]
+            b_f = b_f.reshape(h, d, -1)
+
+        result = torch.einsum(equation, a_f, b_f)
+        out.copy_(result.to(out.dtype))
+        return
     return _fp8_einsum_impl(*args, **kwargs)
 
 
@@ -475,7 +580,20 @@ def tf32_hc_prenorm_gemm(
     """
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
-        return _missing()
+        # Fallback: standard PyTorch ops (for ROCm / non-DeepGEMM platforms).
+        # Semantics: out = x.float() @ fn.T, sqrsum = x.float().square().sum(-1)
+        # The DeepGEMM kernel uses split-k and writes partial sums per split.
+        # The downstream tilelang fuse kernel reduces across splits.
+        # For the fallback we compute the full result and put it in split 0,
+        # zeroing remaining splits so the reduction is correct.
+        x_f = x.float()
+        # Full GEMM: [num_tokens, M] @ [K, M].T => [num_tokens, K]
+        full_out = x_f @ fn.T  # fn shape [K, M], out shape [num_tokens, K]
+        out.zero_()
+        out[0] = full_out
+        sqrsum.zero_()
+        sqrsum[0] = x_f.square().sum(-1)
+        return out
     return _tf32_hc_prenorm_gemm_impl(
         x,
         fn,

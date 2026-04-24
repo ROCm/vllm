@@ -365,10 +365,9 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         if num_decode_tokens == 0:
             return out
         for layer_type in self._layer_types:
-            # get_mla_metadata() is the official FlashMLA entry point that
-            # returns a fresh empty FlashMLASchedMeta; using it keeps this
-            # call site aligned with the rest of the vLLM FlashMLA backends
-            # that already go through the same stub.
+            # get_mla_metadata() returns a fresh FlashMLASchedMeta.
+            # On CUDA this populates CUDA scheduling metadata lazily;
+            # on ROCm it returns a placeholder (the reference path ignores it).
             out[layer_type] = get_mla_metadata()[0]
         return out
 

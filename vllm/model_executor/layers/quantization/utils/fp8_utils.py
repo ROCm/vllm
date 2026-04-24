@@ -1284,6 +1284,13 @@ def process_fp8_weight_block_strategy(
             weight=weight, weight_scale=weight_scale
         )
 
+    # On ROCm, AITER CK kernel requires matching scale dtypes.
+    # Convert E8M0 weight scales to float32 so activation scales (float32)
+    # match and the CK kernel can be used directly.
+    if (current_platform.is_rocm()
+            and weight_scale.dtype == torch.float8_e8m0fnu):
+        weight_scale = _upcast_e8m0_to_fp32(weight_scale)
+
     weight = _maybe_pad_fp8_weight(weight)
     return weight, weight_scale
 

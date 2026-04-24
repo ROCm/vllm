@@ -3,8 +3,12 @@
 import math
 from functools import cache
 
-import tilelang
-import tilelang.language as T
+try:
+    import tilelang
+    import tilelang.language as T
+    _HAS_TILELANG = True
+except ImportError:
+    _HAS_TILELANG = False
 import torch
 
 from vllm.utils.math_utils import cdiv
@@ -164,6 +168,82 @@ def mhc_pre_big_fuse_tilelang(
         T.pdl_trigger()
 
 
+def _mhc_pre_pytorch_fallback(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure PyTorch fallback for mhc_pre (for ROCm / non-NVIDIA platforms)."""
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    hc_mult2 = hc_mult * hc_mult
+    hc_mult3 = hc_mult * 2 + hc_mult2
+    outer_shape = residual.shape[:-2]
+
+    residual_flat = residual.view(-1, hc_mult, hidden_size)
+    num_tokens = residual_flat.shape[0]
+
+    # x = residual flattened: [num_tokens, hc_mult * hidden_size]
+    x = residual_flat.view(num_tokens, hc_mult * hidden_size).float()
+
+    # GEMM: mixes_raw = x @ fn.T -> [num_tokens, hc_mult3]
+    mixes_raw = x @ fn.T
+
+    # RMS norm
+    rms = torch.rsqrt(x.square().sum(-1, keepdim=True) / (hc_mult * hidden_size) + rms_eps)
+    mixes = mixes_raw * rms  # [num_tokens, hc_mult3]
+
+    # Split mixes into pre, post, comb
+    pre_logits = mixes[:, :hc_mult]          # [num_tokens, hc_mult]
+    post_logits = mixes[:, hc_mult:2*hc_mult]  # [num_tokens, hc_mult]
+    comb_logits = mixes[:, 2*hc_mult:]        # [num_tokens, hc_mult2]
+
+    # Pre-mix: sigmoid(pre * scale + base) + eps
+    pre_mix = torch.sigmoid(
+        pre_logits * hc_scale[0] + hc_base[:hc_mult]
+    ) + hc_pre_eps
+
+    # Post-mix: sigmoid(post * scale + base) * alpha
+    post_mix = torch.sigmoid(
+        post_logits * hc_scale[1] + hc_base[hc_mult:2*hc_mult]
+    ) * hc_post_mult_value
+
+    # Comb-mix: scale and bias, then sinkhorn
+    cm = (
+        comb_logits * hc_scale[2] + hc_base[2*hc_mult:]
+    ).view(num_tokens, hc_mult, hc_mult)
+
+    # Sinkhorn normalization
+    # First: softmax along last dim + eps
+    cm = cm - cm.max(dim=-1, keepdim=True).values
+    cm = cm.exp()
+    cm = cm / cm.sum(dim=-1, keepdim=True)
+    cm = cm + hc_sinkhorn_eps
+    cm = cm / (cm.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+
+    for _ in range(sinkhorn_repeat - 1):
+        cm = cm / (cm.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+        cm = cm / (cm.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+
+    comb_mix = cm.view(num_tokens, hc_mult2)
+
+    # Layer input: weighted sum of residual heads using pre_mix
+    # pre_mix: [num_tokens, hc_mult], residual: [num_tokens, hc_mult, hidden_size]
+    layer_input = (pre_mix.unsqueeze(-1) * residual_flat.float()).sum(dim=-2).to(torch.bfloat16)
+
+    post_mix = post_mix.view(*outer_shape, hc_mult, 1)
+    comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)
+    layer_input = layer_input.view(*outer_shape, hidden_size)
+
+    return post_mix, comb_mix, layer_input
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -196,6 +276,13 @@ def mhc_pre(
         comb_mix: shape (..., hc_mult, hc_mult), dtype torch.float32
         layer_input: shape (..., hidden_size), dtype torch.bfloat16
     """
+    from vllm.platforms import current_platform
+    if current_platform.is_rocm():
+        return _mhc_pre_pytorch_fallback(
+            residual, fn, hc_scale, hc_base,
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+            hc_post_mult_value, sinkhorn_repeat,
+        )
 
     # Validate shapes
     assert residual.dtype == torch.bfloat16
@@ -400,6 +487,22 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    from vllm.platforms import current_platform
+    if current_platform.is_rocm():
+        # Pure PyTorch fallback for mhc_post.
+        # Tilelang kernel: out[hco, h] = c[hco]*d[h] + sum_hci(a[hci,hco]*b[hci,h])
+        # i.e. out = a^T @ b + c * d  (with appropriate broadcasting)
+        #
+        # comb_res_mix (a): [*, hc_mult, hc_mult]
+        # residual     (b): [*, hc_mult, hidden_size]
+        # post_layer_mix(c): [*, hc_mult, 1]
+        # x            (d): [*, hidden_size]
+        comb_t = comb_res_mix.transpose(-2, -1)  # [*, hc_mult, hc_mult]
+        out = (comb_t @ residual.float()
+               + post_layer_mix * x.unsqueeze(-2).float()
+               ).to(residual.dtype)
+        return out
+
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,
