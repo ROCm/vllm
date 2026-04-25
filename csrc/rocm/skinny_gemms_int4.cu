@@ -167,9 +167,9 @@ struct scalar<c10::BFloat16> {
     V0 = __builtin_amdgcn_fdot2(*((half2*)(&(V2))), *((half2*)(&(V3))), V0, \
                                 false);                                     \
   } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {          \
-    float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *           \
-               __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));            \
-    V0 += (s.x + s.y);                                                      \
+    typedef short __attribute__((ext_vector_type(2))) bf16x2_t;             \
+    V0 = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&(V2))),             \
+                                         *((bf16x2_t*)(&(V3))), V0, false); \
   }
 
 __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
