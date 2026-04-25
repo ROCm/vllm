@@ -237,11 +237,23 @@ def triton_w4a16_skinny_fmt_gemm(
         elif M <= 64:
             BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 32, 4
         elif M <= 128:
-            if K >= 2 * N:  # tall K (e.g. down_proj)
+            # Shape-specific carve-outs (tuned on Qwen3-Omni-30B, gs=32).
+            # Order matters: most specific first, fall through to generic.
+            # Note: BLOCK_K is clamped to min(BLOCK_K, group_size) below, so
+            # for gs=32 BK=32 is the practical max.
+            if (N, K) == (5120, 2048):
+                # Qwen3-Omni qkv_proj (5120 = 32·128 + 4·128 + 4·128).
+                # 1.29x vs generic wide-N (0.342 vs 0.439 ms @ gs=32).
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 32, 4
+            elif (N, K) == (2048, 4096):
+                # Qwen3-Omni o_proj (32 heads·128 head_dim → 2048 hidden).
+                # 1.23x vs generic tall-K (0.376 vs 0.461 ms @ gs=32).
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 128, 32, 2
+            elif K >= 2 * N:  # tall K (e.g. Qwen3-4B down_proj)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 16, 64, 1
-            elif N > K:  # wide N (e.g. qkv_proj, gate_up_proj)
+            elif N > K:  # wide N (e.g. Qwen3-4B qkv_proj, gate_up_proj)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
-            else:  # N ~= K (e.g. o_proj)
+            else:  # N ~= K (e.g. Qwen3-4B o_proj)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 4
         elif M <= 1024:
             if K >= 2 * N:  # tall K (e.g. down_proj)
