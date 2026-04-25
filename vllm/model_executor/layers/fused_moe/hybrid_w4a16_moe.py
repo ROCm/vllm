@@ -170,16 +170,48 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         output = (M, K)
         return (workspace1, workspace2, output)
 
-    def _triton_config(self, K: int) -> dict:
-        """Return Triton kernel config for shuffle-packed MoE prefill."""
-        BLOCK_SIZE_K = min(self._group_size, 32)
-        # Ensure BLOCK_K is a multiple of 8 for shuffle interleave
+    def _triton_config(self, K: int, N: int) -> dict:
+        """Return Triton kernel config for shuffle-packed MoE prefill.
+
+        Tuned on Strix Halo (gfx1151) for Qwen3-Omni-30B-A3B
+        (E=128, top_k=8, group_size=128) using a per-shape sweep over
+        BLOCK_M/N/K, num_warps, num_stages.  See P1 sweep results in
+        /scratch/mgehre/tmp/P1_sweep_*.log.
+
+        BLOCK_SIZE_M is shared between both GEMMs because the alignment
+        (moe_align_block_size) is computed once per layer and the kernel
+        index expert_ids[pid_m] requires kernel-BM == align-BM.
+        BN/BK/num_warps/num_stages are shape-tuned independently.
+        """
+        # BLOCK_K capped at min(group_size, 64) — must divide group_size,
+        # must be multiple of 8 for ExLlama shuffle interleave.
+        BLOCK_SIZE_K = min(self._group_size, 64)
         assert BLOCK_SIZE_K % 8 == 0
+
+        # Shape-binning: GEMM1 (gate_up, N ≈ moe_intermediate*2) has
+        # 2x larger N than expected from K but the tile sweep prefers
+        # narrow BLOCK_N=32 with 2 warps.  GEMM2 (down, N == hidden) wants
+        # wide BLOCK_N=128 with 4 warps.  Threshold at N=1792 splits the
+        # two shapes (1536 vs 2048 for Qwen3-Omni; will also work for
+        # other MoE topologies where down_proj N > gate_up N//2).
+        if N < 1792:
+            # GEMM1 / gate_up: -38% vs default config in microbench
+            return {
+                "BLOCK_SIZE_M": self.TRITON_BLOCK_SIZE_M,
+                "BLOCK_SIZE_N": 32,
+                "BLOCK_SIZE_K": BLOCK_SIZE_K,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 2,
+                "num_stages": 2,
+            }
+        # GEMM2 / down: wider BLOCK_N=128 amortizes the int4 unpack cost
         return {
             "BLOCK_SIZE_M": self.TRITON_BLOCK_SIZE_M,
-            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": BLOCK_SIZE_K,
             "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
         }
 
     def apply(
@@ -282,7 +314,11 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 if w1.dtype == torch.int32 and hidden_states.dtype == torch.float16
                 else tl.bfloat16
             )
-            config = self._triton_config(K)
+            # GEMM1: weights are w1 [E, N, K//8], so pass N for shape-tuning.
+            # GEMM2 (below): weights are w2 [E, K_hidden, K_inter//8], so pass
+            # w2.size(1) (= hidden_size, the GEMM2 N).
+            config_gemm1 = self._triton_config(K, N)
+            config_gemm2 = self._triton_config(w2.size(2) * 8, w2.size(1))
 
             # GEMM 1 (Triton prefill path)
             # The kernel gathers from hidden_states via
@@ -298,7 +334,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 num_tokens_post_padded=num_tokens_post_padded,
                 mul_routed_weight=apply_router_weight_on_input,
                 top_k=top_k_num,
-                config=config,
+                config=config_gemm1,
                 compute_type=compute_type,
                 group_size=self._group_size,
             )
@@ -325,7 +361,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 num_tokens_post_padded=num_tokens_post_padded,
                 mul_routed_weight=False,
                 top_k=1,
-                config=config,
+                config=config_gemm2,
                 compute_type=compute_type,
                 group_size=self._group_size,
             )
