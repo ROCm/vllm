@@ -1275,15 +1275,16 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
                 layer.w2_weight.view(self.fp4_dtype),
                 requires_grad=layer.w2_weight.requires_grad,
             )
-        # Pre-shuffle weight
-        shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
-            layer.w13_weight.data, layer.w2_weight.data
-        )
-
-        layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
-        layer.w13_weight.is_shuffled = True
-        layer.w2_weight.is_shuffled = True
+        # CK/cktile MoE expects block-shuffled weights. Triton MXFP4 MoE uses logical
+        # layout; set VLLM_ROCM_AITER_FUSED_MOE_TRITON_GEMM_A4W4=1 to skip shuffle.
+        if not envs.VLLM_ROCM_AITER_FUSED_MOE_TRITON_GEMM_A4W4:
+            shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
+                layer.w13_weight.data, layer.w2_weight.data
+            )
+            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
 
         # Build quant config for AITER path
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
