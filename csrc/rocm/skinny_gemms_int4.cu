@@ -243,26 +243,38 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                             *(const half2*)&BIAS_HI);
               }
             } else {
-              // Generic bf16 path: scalar int4 dequant
-              constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
+              // bf16 path: marlin-style magic-number trick.
+              // EX = 0x4300 is bf16(128.0); OR'ing nibble n into the low 4
+              // mantissa bits yields the bf16 value 128+n exactly. Unlike
+              // fp16 (10 mantissa bits), bf16 has only 7 mantissa bits, so
+              // the fp16 trick of masking 0x00F0 leaks into the exponent.
+              // Instead we mask 0x000F000F twice and shift qa by 4 between
+              // extractions, mirroring marlin's bf16 dequant (see
+              // csrc/quantization/marlin/dequant.h:174-188).
+              // HAS_ZERO_POINTS subtracts 128 (raw 0..15); symmetric int4
+              // subtracts 136 to fold the -8 bias.
+              constexpr uint32_t BF16_MAGIC = 0x43004300u;
+              constexpr uint32_t BIAS =
+                  HAS_ZERO_POINTS ? 0x43004300u : 0x43084308u;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 1] =
-                    (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 2] =
-                    (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 3] =
-                    (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 4] =
-                    (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 5] =
-                    (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 6] =
-                    (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 7] =
-                    (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
+                uint32_t v0 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                qa >>= 4;
+                uint32_t v1 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                qa >>= 4;
+                uint32_t v2 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                qa >>= 4;
+                uint32_t v3 = (qa & 0x000F000Fu) | BF16_MAGIC;
+
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 0] = __hsub2(
+                    *(__hip_bfloat162*)&v0, *(const __hip_bfloat162*)&BIAS);
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 1] = __hsub2(
+                    *(__hip_bfloat162*)&v1, *(const __hip_bfloat162*)&BIAS);
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 2] = __hsub2(
+                    *(__hip_bfloat162*)&v2, *(const __hip_bfloat162*)&BIAS);
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 3] = __hsub2(
+                    *(__hip_bfloat162*)&v3, *(const __hip_bfloat162*)&BIAS);
               }
             }
 
@@ -532,26 +544,38 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
                             *(const half2*)&BIAS_HI);
               }
             } else {
-              // Generic bf16 path: scalar int4 dequant
-              constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
+              // bf16 path: marlin-style magic-number trick.
+              // EX = 0x4300 is bf16(128.0); OR'ing nibble n into the low 4
+              // mantissa bits yields the bf16 value 128+n exactly. Unlike
+              // fp16 (10 mantissa bits), bf16 has only 7 mantissa bits, so
+              // the fp16 trick of masking 0x00F0 leaks into the exponent.
+              // Instead we mask 0x000F000F twice and shift qa by 4 between
+              // extractions, mirroring marlin's bf16 dequant (see
+              // csrc/quantization/marlin/dequant.h:174-188).
+              // HAS_ZERO_POINTS subtracts 128 (raw 0..15); symmetric int4
+              // subtracts 136 to fold the -8 bias.
+              constexpr uint32_t BF16_MAGIC = 0x43004300u;
+              constexpr uint32_t BIAS =
+                  HAS_ZERO_POINTS ? 0x43004300u : 0x43084308u;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 1] =
-                    (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 2] =
-                    (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 3] =
-                    (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 4] =
-                    (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 5] =
-                    (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 6] =
-                    (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
-                cvtB.h[w * 8 + 7] =
-                    (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
+                uint32_t v0 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                qa >>= 4;
+                uint32_t v1 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                qa >>= 4;
+                uint32_t v2 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                qa >>= 4;
+                uint32_t v3 = (qa & 0x000F000Fu) | BF16_MAGIC;
+
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 0] = __hsub2(
+                    *(__hip_bfloat162*)&v0, *(const __hip_bfloat162*)&BIAS);
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 1] = __hsub2(
+                    *(__hip_bfloat162*)&v1, *(const __hip_bfloat162*)&BIAS);
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 2] = __hsub2(
+                    *(__hip_bfloat162*)&v2, *(const __hip_bfloat162*)&BIAS);
+                *(__hip_bfloat162*)&cvtB.f[w * 4 + 3] = __hsub2(
+                    *(__hip_bfloat162*)&v3, *(const __hip_bfloat162*)&BIAS);
               }
             }
 
