@@ -8,6 +8,7 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <cstdlib>
 
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
@@ -43,6 +44,33 @@ static bool is_gfx1x_int4() {
     std::string device_arch = dprops->gcnArchName;
     return device_arch.find("gfx11") != std::string::npos ||
            device_arch.find("gfx12") != std::string::npos;
+  }();
+  return result;
+}
+
+// Tuning hook for the gfx1x N=1 MoE int4 kernel path.
+// Read once at first call. Returns the production default (2 = C2,
+// (THRDS=32, YTILE=2, WvPrGrp=4, A_CHUNK=16, UNRL=4)) when unset; the env
+// var overrides for autotune sweeps. See MOE_WVSPLITK_INT4G_TUNED_DISPATCH.
+//   0  : original baseline (WvPrGrp=16, UNRL=4)
+//   1  : C1  WvPrGrp=8
+//   2  : C2  WvPrGrp=4               <-- production default (-7% sweep total)
+//   3  : C3  WvPrGrp=8, UNRL=8
+//   4  : C4  WvPrGrp=8, UNRL=2
+//   5  : C5  WvPrGrp=8, YTILE=4
+//   6  : C6  WvPrGrp=4, YTILE=4
+//   7  : C7  WvPrGrp=8, A_CHUNK=8
+//   8  : C8  WvPrGrp=8, YTILE=1
+//   9  : C10 UNRL=8
+//   10 : C11 UNRL=2
+//   11 : reserved (== baseline)
+static int get_moe_int4_tune_idx() {
+  static const int result = [] {
+    const char* s = std::getenv("VLLM_MOE_INT4_TUNE_IDX");
+    if (!s) return 2;  // C2: production winner from O15/O16 sweep
+    int v = std::atoi(s);
+    if (v < 0 || v > 11) return 2;
+    return v;
   }();
   return result;
 }
@@ -968,6 +996,97 @@ __global__ void moe_wvSplitK_int4_hf_(
   else                                                             \
     MOE_WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
 
+// Fully-parameterized launch (all 6 axes exposed) used by the N=1 tuning
+// dispatcher. Mirrors MOE_WVSPLITK_INT4G_LAUNCH but allows non-default
+// WvPrGrp and A_CHUNK so the sweep can address occupancy + register
+// pressure trade-offs identified in O15/O16.
+#define MOE_WVSPLITK_INT4G_LAUNCH_TUNED(_THRDS, _YTILE, _WVPRGRP, _ACHUNK,    \
+                                        _UNRL, _N, _GS, _HAS_ZP)              \
+  {                                                                           \
+    int moe_cu = CuCount;                                                     \
+    dim3 block(_THRDS, _WVPRGRP);                                             \
+    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, _WVPRGRP);             \
+    dim3 grid(moe_cu, num_expert_blocks);                                     \
+    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                     \
+      moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK,    \
+                                _UNRL, _N, _GS, _HAS_ZP>                      \
+          <<<grid, block, 0, stream>>>(K_in, M_in, wptr, aptr, sptr, zpptr,   \
+                                       cptr, eidptr, stidptr, top_k_in,       \
+                                       expert_stride_w, expert_stride_s,      \
+                                       expert_stride_zp, __wvPrGrp, moe_cu);  \
+    else                                                                      \
+      moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, \
+                            _N, _GS, _HAS_ZP><<<grid, block, 0, stream>>>(    \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,         \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,       \
+          __wvPrGrp, moe_cu);                                                 \
+  }
+
+// N=1 tuning dispatcher for gfx1x. Switch on VLLM_MOE_INT4_TUNE_IDX (cached
+// via get_moe_int4_tune_idx()) to pick a template instantiation. Default
+// (case 0) matches the baseline MOE_WVSPLIT_INT4G_GS(2, 4, 1, _HAS_ZP) path.
+//   1: C1  WvPrGrp=8                 — direct fix for 2/16 wasted-warp
+//   2: C2  WvPrGrp=4                 — further halve waste
+//   3: C3  WvPrGrp=8, UNRL=8         — C1 + k-loop pipelining
+//   4: C4  WvPrGrp=8, UNRL=2         — C1 + reduce VGPR pressure
+//   5: C5  WvPrGrp=8, YTILE=4        — A3 retry on MoE
+//   6: C6  WvPrGrp=4, YTILE=4        — A3 + smaller WvPrGrp
+//   7: C7  WvPrGrp=8, A_CHUNK=8      — narrower vector
+//   8: C8  WvPrGrp=8, YTILE=1        — minimal YTILE
+//   9: C10 UNRL=8                    — UNRL only (control vs C3)
+//  10: C11 UNRL=2                    — UNRL only (control vs C4)
+//  11: reserved (currently == baseline)
+#define MOE_WVSPLITK_INT4G_TUNED_DISPATCH_GFX1X(_GS, _HAS_ZP)              \
+  {                                                                        \
+    switch (get_moe_int4_tune_idx()) {                                     \
+      case 1:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 2, 8, 16, 4, 1, _GS, _HAS_ZP)  \
+        break;                                                             \
+      case 2:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 2, 4, 16, 4, 1, _GS, _HAS_ZP)  \
+        break;                                                             \
+      case 3:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 2, 8, 16, 8, 1, _GS, _HAS_ZP)  \
+        break;                                                             \
+      case 4:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 2, 8, 16, 2, 1, _GS, _HAS_ZP)  \
+        break;                                                             \
+      case 5:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 4, 8, 16, 4, 1, _GS, _HAS_ZP)  \
+        break;                                                             \
+      case 6:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 4, 4, 16, 4, 1, _GS, _HAS_ZP)  \
+        break;                                                             \
+      case 7:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 2, 8, 8, 4, 1, _GS, _HAS_ZP)   \
+        break;                                                             \
+      case 8:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 1, 8, 16, 4, 1, _GS, _HAS_ZP)  \
+        break;                                                             \
+      case 9:                                                              \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 2, 16, 16, 8, 1, _GS, _HAS_ZP) \
+        break;                                                             \
+      case 10:                                                             \
+        MOE_WVSPLITK_INT4G_LAUNCH_TUNED(32, 2, 16, 16, 2, 1, _GS, _HAS_ZP) \
+        break;                                                             \
+      case 0:                                                              \
+      default:                                                             \
+        MOE_WVSPLITK_INT4G_LAUNCH(32, 2, 4, 1, _GS, _HAS_ZP)               \
+        break;                                                             \
+    }                                                                      \
+  }
+
+// N=1 tuning dispatcher: gfx1x branches on env idx; gfx9 keeps baseline.
+#define MOE_WVSPLIT_INT4G_TUNED_N1(_HAS_ZP)                 \
+  if (is_gfx1x_int4()) {                                    \
+    if (group_size == 32)                                   \
+      MOE_WVSPLITK_INT4G_TUNED_DISPATCH_GFX1X(32, _HAS_ZP)  \
+    else                                                    \
+      MOE_WVSPLITK_INT4G_TUNED_DISPATCH_GFX1X(128, _HAS_ZP) \
+  } else {                                                  \
+    MOE_WVSPLIT_INT4G_GS(2, 4, 1, _HAS_ZP)                  \
+  }
+
 #define MOE_WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP) \
   if (group_size == 32)                                  \
     MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, 32, _HAS_ZP)   \
@@ -992,7 +1111,7 @@ __global__ void moe_wvSplitK_int4_hf_(
     else if (__N >= 2)                                                \
       MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                        \
     else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */   \
-      MOE_WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                        \
+      MOE_WVSPLIT_INT4G_TUNED_N1(_HAS_ZP)                             \
   }
 
 #define MOE_WVSPLIT_INT4G_DISPATCH(_HAS_ZP)                \
