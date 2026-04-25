@@ -250,6 +250,52 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
 
+        # Per-instance cache for cos_sin_cache[positions] lookup.
+        # All decoder layers share this same MRotaryEmbedding instance via
+        # _ROPE_DICT and pass the same `positions` tensor, so we can avoid
+        # recomputing the gather (aten::index) and the chunk + contiguous
+        # clones for every layer in a forward pass.
+        self._cached_positions_key: tuple | None = None
+        self._cached_cos: torch.Tensor | None = None
+        self._cached_sin: torch.Tensor | None = None
+
+    def _lookup_cos_sin(
+        self,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cached lookup of (cos, sin) = chunk(cos_sin_cache[positions]).
+
+        Returns contiguous cos and sin so downstream `triton_mrope` calls'
+        internal `.contiguous()` becomes a no-op.
+
+        The cache is bypassed during torch.compile tracing: cache hits would
+        elide the underlying `aten::index` from the traced graph and break
+        graph consistency. Outside of tracing (eager and HIP-graph replay)
+        the Python-level guard resolves at capture time.
+        """
+        if torch.compiler.is_compiling():
+            cos_sin = cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            return cos, sin
+
+        key = (
+            positions.data_ptr(),
+            tuple(positions.shape),
+            cos_sin_cache.data_ptr(),
+            cos_sin_cache.dtype,
+        )
+        if key == self._cached_positions_key:
+            return self._cached_cos, self._cached_sin
+        cos_sin = cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+        self._cached_positions_key = key
+        self._cached_cos = cos
+        self._cached_sin = sin
+        return cos, sin
+
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
         if self.scaling_factor is None:
             return super()._compute_inv_freq(base)
@@ -281,8 +327,7 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
 
         cos_sin_cache = self._match_cos_sin_cache_dtype(query)
         num_tokens = positions.shape[-1]
-        cos_sin = cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos, sin = self._lookup_cos_sin(positions, cos_sin_cache)
         if positions.ndim == 2:
             assert self.mrope_section
             if self.mrope_interleaved:
@@ -333,8 +378,7 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
 
         cos_sin_cache = self._match_cos_sin_cache_dtype(query)
         num_tokens = positions.shape[-1]
-        cos_sin = cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos, sin = self._lookup_cos_sin(positions, cos_sin_cache)
         query_shape = query.shape
         key_shape = key.shape
         if positions.ndim == 2:
