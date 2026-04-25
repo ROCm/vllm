@@ -8,11 +8,39 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <cstdlib>
 
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
 #include "quantization/w8a8/fp8/common.cuh"
 #include "core/batch_invariant.hpp"
+
+// Tuning hook for the gfx1x N=1 bf16/fp16 dense wvSplitK_hf_sml path.
+// Read once at first call. Returns the production default (10 = N3 winner,
+// (THRDS=32, YTILE=2, WvPrGrp=4, A_CHUNK=16, UNRL=4)) when unset; the env
+// var overrides for autotune sweeps. See WVSPLITK_BF16_TUNED_DISPATCH.
+//   0  : baseline                  WvPrGrp=16, A_CHUNK= 8, UNRL=2
+//   1  : C2-style WvPrGrp=8        (direct C2 transfer, halve waste)
+//   2  : C2-style WvPrGrp=4        (further halve waste)
+//   3  : WvPrGrp=8,  UNRL=4        (C1 + UNRL pipeline)
+//   4  : WvPrGrp=8,  UNRL=8        (aggressive UNRL)
+//   5  : WvPrGrp=16, A_CHUNK=16    (larger vector load)
+//   6  : WvPrGrp=8,  A_CHUNK=16
+//   7  : WvPrGrp=4,  A_CHUNK=16    (both reduced)
+//   8  : WvPrGrp=16, A_CHUNK=16, UNRL=4
+//   9  : WvPrGrp=8,  A_CHUNK=16, UNRL=4
+//  10 : WvPrGrp=4,  A_CHUNK=16, UNRL=4   <-- production default (best both)
+//  11 : WvPrGrp=16, UNRL=4         (UNRL only control)
+static int get_bf16_sml_tune_idx() {
+  static const int result = [] {
+    const char* s = std::getenv("VLLM_BF16_SML_TUNE_IDX");
+    if (!s) return 10;  // N3 winner: WvPrGrp=4, A_CHUNK=16, UNRL=4
+    int v = std::atoi(s);
+    if (v < 0 || v > 11) return 10;
+    return v;
+  }();
+  return result;
+}
 
 // TODO(rasmith): The kernels in this file are susceptible to integer overflow
 // issues, do not take strides, and are unable to handle PyTorch tensors that
@@ -1173,15 +1201,18 @@ __global__ void wvSplitK_hf_big_(const int K, const int Kbp, const int Kap,
 }
 #endif
 
-// Find the min val of div2 that doesn't increase N/(div1*div2)
+// Find the min val of div2 that doesn't increase N/(div1*div2).
+// Caps the iteration count at div2 to avoid div-by-zero when div2 < 13
+// (mirrors the int4 mindiv variant).
 int mindiv(int N, int div1, int div2) {
   int nPrRnd = div1 * div2;
+  int limit = div2 < 13 ? div2 : 13;
   int rnds[13];
-  for (int i = 0; i < 13; i++) {
+  for (int i = 0; i < limit; i++) {
     rnds[i] = (N + nPrRnd - 1) / nPrRnd;
     nPrRnd -= div1;
   }
-  for (int i = 12; i >= 0; i--)
+  for (int i = limit - 1; i >= 0; i--)
     if (rnds[0] == rnds[i]) return (div2 - i);
   return 0;
 }
@@ -1237,6 +1268,67 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
                                        CuCount);                              \
+  }
+
+// Fully-parameterized launch (all 5 axes exposed) used by the bf16 N=1
+// tuning dispatcher. Mirrors WVSPLITK_CFG but allows non-default A_CHUNK.
+// This is the sml/big/_ trio-aware variant for N=1.
+#define WVSPLITK_BF16_TUNED_LAUNCH(_THRDS, _WVPRGRP, _YTILE, _ACHUNK, _UNRL,  \
+                                   _N)                                        \
+  {                                                                           \
+    dim3 block(_THRDS, _WVPRGRP);                                             \
+    int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, _WVPRGRP);                 \
+    if ((Kbp_in * _N <= max_lds_len) && (M_in % _YTILE == 0))                 \
+      wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N>  \
+          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
+                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
+                                       CuCount);                              \
+    else if (Kbp_in * _N <= max_lds_len * 1.2)                                \
+      wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N>      \
+          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
+                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
+                                       CuCount);                              \
+    else                                                                      \
+      wvSplitK_hf_big_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N>  \
+          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
+                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
+                                       CuCount);                              \
+  }
+
+// N=1 tuning dispatcher for the gfx1x dense bf16 wvSplitK path.
+// Switch on VLLM_BF16_SML_TUNE_IDX (cached via get_bf16_sml_tune_idx()) to
+// pick a template instantiation. Default (case 0) matches the baseline
+// WVSPLITK_CFG(32, 16, 2, 2, 1) path. Mirrors C2 sweep on int4 MoE path.
+#define WVSPLITK_BF16_TUNED_DISPATCH                           \
+  {                                                            \
+    switch (get_bf16_sml_tune_idx()) {                         \
+      case 1:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 8, 2, 8, 2, 1) break;   \
+      case 2:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 4, 2, 8, 2, 1) break;   \
+      case 3:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 8, 2, 8, 4, 1) break;   \
+      case 4:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 8, 2, 8, 8, 1) break;   \
+      case 5:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 16, 2, 16, 2, 1) break; \
+      case 6:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 8, 2, 16, 2, 1) break;  \
+      case 7:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 4, 2, 16, 2, 1) break;  \
+      case 8:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 16, 2, 16, 4, 1) break; \
+      case 9:                                                  \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 8, 2, 16, 4, 1) break;  \
+      case 10:                                                 \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 4, 2, 16, 4, 1) break;  \
+      case 11:                                                 \
+        WVSPLITK_BF16_TUNED_LAUNCH(32, 16, 2, 8, 4, 1) break;  \
+      case 0:                                                  \
+      default:                                                 \
+        WVSPLITK_CFG(32, 16, 2, 2, 1)                          \
+        break;                                                 \
+    }                                                          \
   }
 
 #define WVSPLIT_TILE_CFG(_THRDS, _WVPRGRP, _sYT, __N)     \
@@ -1303,10 +1395,23 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     const bool use_wave32 = on_gfx1x();
     switch (N_in) {
       case 1:
-        if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 1)
-        else
+        if (use_wave32) {
+          // N=1 gfx1x decode path: route the production
+          // WVSPLITK_CFG(32, 16, 2, 2, 1) instantiation through the tunable
+          // dispatcher (env: VLLM_BF16_SML_TUNE_IDX). This is the dense
+          // wvSplitK_hf_sml_<bf16,32,2,_,_,_,1> kernel hit by lm_head and
+          // router GEMMs in Qwen3-Omni decode. The tuned path is taken only
+          // when WVSPLIT_TILE_CFG would have selected the YTILE=2/UNRL=2
+          // branch (sYT > 1). For sYT <= 1, fall back to baseline (YTILE=1
+          // path is unchanged).
+          if (sYT > 1) {
+            WVSPLITK_BF16_TUNED_DISPATCH
+          } else {
+            WVSPLIT_TILE_CFG(32, 16, sYT, 1)
+          }
+        } else {
           WVSPLIT_TILE_CFG(64, 16, sYT, 1)
+        }
         break;
       case 2:
         if (use_wave32)
