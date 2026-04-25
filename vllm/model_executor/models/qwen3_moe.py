@@ -232,11 +232,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.is_sequence_parallel:
             hidden_states = sequence_parallel_chunk(hidden_states)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        shared_out, fused_out = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if self.experts.is_internal_router:
+            # In this case, the gate/router runs inside the FusedMoE class.
+            # Pass hidden_states as a placeholder router_logits to satisfy
+            # the custom op signature (the runner ignores it and recomputes).
+            shared_out, fused_out = self.experts(
+                hidden_states=hidden_states, router_logits=hidden_states
+            )
+        else:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states)
+            shared_out, fused_out = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
         final_hidden_states = (
             shared_out + fused_out if shared_out is not None else fused_out
         )
