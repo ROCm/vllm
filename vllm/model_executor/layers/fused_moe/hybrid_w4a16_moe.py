@@ -44,6 +44,10 @@ from vllm.utils.math_utils import round_up
 # default — see ``vllm.model_executor.layers.fused_moe.moe_megakernel`` for
 # the kernel and design notes.
 _USE_MOE_MEGAKERNEL = os.environ.get("VLLM_MOE_MEGAKERNEL", "0") == "1"
+# Experimental: fused HIP GEMM2 + topk-weighted reduce kernel.  Off by
+# default.  Replaces the GEMM2 launch + the moe_unpermute launch with a
+# single HIP kernel.  See ``csrc/rocm/moe_megakernel_hip.cu``.
+_USE_MOE_HIP_MEGAKERNEL = os.environ.get("VLLM_MOE_HIP_MEGAKERNEL", "0") == "1"
 
 
 class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
@@ -73,6 +77,10 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         self._cached_arange: torch.Tensor | None = None
         self._cached_inv_perm_buf: torch.Tensor | None = None
         self._cached_expert_ids_buf: torch.Tensor | None = None
+        # Scratch buffers for the HIP MoE megakernel (GEMM2+reduce).
+        self._mega_partial: torch.Tensor | None = None  # [top_k, K_hidden] fp32
+        self._mega_barrier: torch.Tensor | None = None  # [1] uint32
+        self._mega_topk_w_fp32: torch.Tensor | None = None  # [1, top_k] fp32
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -426,6 +434,67 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
 
             # Activation
             apply_moe_activation(activation, act_out, gemm1_out)
+
+            # ---- Experimental: fused HIP GEMM2 + topk-weighted reduce ----
+            # Only the M=1 scattered path with symmetric int4, no expert
+            # map, and topk_weights in fp32-friendly form.
+            use_hip_mega = (
+                _USE_MOE_HIP_MEGAKERNEL
+                and num_tokens == 1
+                and scattered
+                and expert_map is None
+                and self.quant_config.w2_zp is None
+                and not apply_router_weight_on_input
+                and act_out.shape[0] == top_k_num
+            )
+            if use_hip_mega:
+                # Allocate scratch lazily; size depends on top_k and K_hidden.
+                if (
+                    self._mega_partial is None
+                    or self._mega_partial.shape[0] != top_k_num
+                    or self._mega_partial.shape[1] != K
+                ):
+                    self._mega_partial = torch.empty(
+                        (top_k_num, K),
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    )
+                if self._mega_barrier is None:
+                    self._mega_barrier = torch.zeros(
+                        1, dtype=torch.int32, device=hidden_states.device
+                    )
+                # topk_weights may be fp16/bf16; the kernel wants fp32.
+                if (
+                    self._mega_topk_w_fp32 is None
+                    or self._mega_topk_w_fp32.shape != topk_weights.shape
+                ):
+                    self._mega_topk_w_fp32 = torch.empty(
+                        topk_weights.shape,
+                        dtype=torch.float32,
+                        device=hidden_states.device,
+                    )
+                self._mega_topk_w_fp32.copy_(topk_weights)
+
+                # Launch one block per CU (= 2 × WGP).  num_compute_units()
+                # returns the WGP count on RDNA3; 2 × that fills both CUs of
+                # every WGP, matching the 160-block grid the non-megakernel
+                # path uses to pipeline work across CUs.  All blocks stay
+                # resident (per-WG VGPR/LDS budget allows it), so the
+                # atomic-counter barrier remains deadlock-free.
+                mega_cu_count = self._cu_count * 2
+                torch.ops._rocm_C.moe_megakernel_int4_persistent(
+                    act_out,
+                    w2,
+                    self.w2_scale,
+                    topk_ids.to(torch.int32),
+                    self._mega_topk_w_fp32,
+                    output,
+                    self._mega_partial,
+                    self._mega_barrier,
+                    mega_cu_count,
+                    self._group_size,
+                )
+                return
 
             # GEMM 2 (HIP wvSplitK decode path)
             fused_moe_wvSplitK_int4_gemm(

@@ -28,6 +28,17 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   torch::Tensor sorted_token_ids,
                                   int64_t top_k);
 
+// Experimental: fused HIP MoE megakernel (GEMM2 + topk-weighted reduce)
+// for the M=1 decode case of AWQ-int4 quantized MoE on gfx11/gfx12.
+// Gated end-to-end by the env var VLLM_MOE_HIP_MEGAKERNEL=1.
+void moe_megakernel_int4_persistent(torch::Tensor act, torch::Tensor w2,
+                                    torch::Tensor w2_scale,
+                                    torch::Tensor topk_ids,
+                                    torch::Tensor topk_w, torch::Tensor out,
+                                    torch::Tensor partial,
+                                    torch::Tensor barrier, int64_t CuCount,
+                                    int64_t group_size);
+
 #ifdef VLLM_SKINNY_GEMM_SWEEP
 torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
                              const std::optional<at::Tensor>& in_bias,

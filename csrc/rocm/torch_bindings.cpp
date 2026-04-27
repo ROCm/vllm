@@ -57,6 +57,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("fused_moe_wvSplitK_int4_gemm", torch::kCUDA,
                 &fused_moe_wvSplitK_int4_gemm);
 
+  // Experimental: fused HIP MoE megakernel (GEMM2 + topk-weighted reduce).
+  rocm_ops.def(
+      "moe_megakernel_int4_persistent(Tensor act, Tensor w2, Tensor w2_scale, "
+      "Tensor topk_ids, Tensor topk_w, Tensor! out, Tensor! partial, "
+      "Tensor! barrier, int CuCount, int group_size) -> ()");
+  rocm_ops.impl("moe_megakernel_int4_persistent", torch::kCUDA,
+                &moe_megakernel_int4_persistent);
+
 #ifdef VLLM_SKINNY_GEMM_SWEEP
   rocm_ops.def(
       "wvSplitK_int8_sweep(Tensor in_a, Tensor in_b, Tensor in_scale, "
