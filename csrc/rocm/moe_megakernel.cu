@@ -154,14 +154,10 @@ __device__ __forceinline__ T loadnt(T* addr) {
 //
 // Each (cu) workgroup loops over slot in [0, top_k) and computes that
 // slot's GEMM2 partial result striped across M in YTILE-row chunks.
-// After all blocks have written partial[:, :], the last block to arrive
-// at the grid-wide barrier performs the per-M reduction across slots
-// and writes the bf16 output.
-//
-// Sizing the grid to exactly CuCount keeps occupancy ≤ 1 WG/CU
-// (modulo the device's actual resident limit, which is ≥1), so the
-// atomic-counter barrier is guaranteed not to deadlock waiting on
-// non-resident blocks.
+// Because the m-stripe owned by a workgroup is disjoint from every
+// other workgroup's stripe, the topk-weighted partials accumulate
+// entirely in LDS and the in-block reduction writes bf16 output
+// directly — no grid-wide barrier and no HBM scratch round-trip.
 //
 // We accept that this kernel is not bit-exact against the unfused chain
 // (the order of the topk-weighted sum differs slightly, and we use
@@ -171,6 +167,13 @@ __device__ __forceinline__ T loadnt(T* addr) {
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 
 constexpr int MEGA_LDS_ELEMS = 8192;
+// Upper bound on per-block partial slots × per-block m-elements stored in LDS.
+// Production: M=2048, CuCount=80 (40 CUs × 2), WvPrGrp=4, YTILE=2 →
+//   per-block m-elems = ceil(2048 / (80 × 4 × 2)) × 4 × 2 = 4 × 8 = 32.
+// Test:       M=2048, CuCount=20, top_k=8 → per-block = ceil(2048/160)×8 = 13×8
+// = 104. Allow up to top_k=16 × 128 m-elems = 2048 floats = 8 KB. Fits
+// trivially (combined with `s` activation LDS we stay well under 64 KB).
+constexpr int MEGA_PARTIAL_LDS_FLOATS = 2048;
 
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int GROUP_SIZE>
@@ -197,7 +200,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
   };
 
   __shared__ scalar_t s[max_lds_len];
-  __shared__ unsigned int sh_done;
+  // Per-block partial store: layout [slot][local_m_idx]. Each block owns a
+  // disjoint m-stripe, so partials never need cross-block reduction —
+  // keeping them in LDS removes the HBM scratch round-trip and the
+  // grid-wide atomic-counter barrier the original implementation used.
+  // Sized as a fixed compile-time upper bound; the host wrapper
+  // runtime-checks that actual usage fits.
+  __shared__ float lds_partials[MEGA_PARTIAL_LDS_FLOATS];
+
+  // Per-block m-element capacity (used to index lds_partials).
+  // = ceil(M / m_stride) * (WvPrGrp * YTILE), where m_stride = CuCount *
+  // WvPrGrp * YTILE.
+  const int m_stride = CuCount * _WvPrGrp * YTILE;
+  const int m_iters = (M + m_stride - 1) / m_stride;
+  const int per_block_m = m_iters * (_WvPrGrp * YTILE);
 
   // Outer slot loop: every block iterates all slots.
   for (int slot = 0; slot < top_k; slot++) {
@@ -205,7 +221,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
     const uint8_t* W = W_base + (long)expert_id * expert_stride_w;
     const scalar_t* S = scale_base + (long)expert_id * expert_stride_s;
     const scalar_t* A = act_base + (long)slot * K;
-    float* Cp = partial + (long)slot * M;
 
     // Stage activations for this slot into LDS.
     __syncthreads();
@@ -219,7 +234,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
 
     if (threadIdx.y < _WvPrGrp) {
       uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * YTILE;
+      // local_m_base: position of this wave's first m-element in this block's
+      // partial LDS slab (per-slot stride = per_block_m).
+      const int local_m_base = (threadIdx.y % _WvPrGrp) * YTILE;
       const int num_groups = K / GROUP_SIZE;
+      int local_iter = 0;
 
       float sum[N][YTILE];
       bigTypeA bigA[N][UNRL];
@@ -344,8 +363,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
           float w = topk_w[slot];
           for (int n = 0; n < N; n++) {
             for (int i = 0; i < YTILE; i++) {
-              // Write topk-weighted partial directly to scratch.
-              Cp[m + i + n * M] = sum[n][i] * w;
+              // Write topk-weighted partial into LDS instead of HBM scratch.
+              int local_m = local_m_base + i + local_iter * (_WvPrGrp * YTILE);
+              lds_partials[slot * per_block_m + local_m] = sum[n][i] * w;
             }
           }
         }
@@ -377,45 +397,41 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
           float w = topk_w[slot];
           for (int n = 0; n < N; n++) {
             for (int i = 0; i < YTILE; i++) {
-              Cp[m + i + n * M] = sum[n][i] * w;
+              int local_m = local_m_base + i + local_iter * (_WvPrGrp * YTILE);
+              lds_partials[slot * per_block_m + local_m] = sum[n][i] * w;
             }
           }
         }
   #endif
         m += CuCount * _WvPrGrp * YTILE;
+        local_iter++;
       }  // while (m < M)
     }  // if (threadIdx.y < _WvPrGrp)
   }  // for slot
 
-  // Grid-wide barrier.  We launch CuCount blocks, all guaranteed
-  // resident, so this can't deadlock.
-  __syncthreads();
-  __threadfence();
-
-  if (threadIdx.x == 0 && threadIdx.y == 0) {
-    unsigned int prev = atomicAdd(barrier, 1u);
-    sh_done = prev;
-  }
+  // Per-block LDS reduction across slots — m-stripes are disjoint across
+  // blocks, so no cross-block barrier or HBM scratch round-trip is needed.
   __syncthreads();
 
-  const unsigned int total_blocks = (unsigned int)CuCount;
-  // Last block to arrive performs the reduction.
-  if (sh_done != total_blocks - 1u) return;
-
-  // Reset barrier for next call (only one block reaches here).
-  *barrier = 0;
-  __threadfence();
-
-  // Tiny reducer: (THRDS * WvPrGrp) threads sum partial[:, :] -> out[:].
   const int linear_tid = threadIdx.y * THRDS + threadIdx.x;
   const int total_threads = THRDS * WvPrGrp;
-  for (int m = linear_tid; m < M; m += total_threads) {
+  const int wxy = _WvPrGrp * YTILE;  // m-elements per block per iter
+  for (int local_m = linear_tid; local_m < per_block_m;
+       local_m += total_threads) {
+    int iter = local_m / wxy;
+    int rem = local_m - iter * wxy;
+    int m_global = (int)blockIdx.x * wxy + rem + iter * m_stride;
+    if (m_global >= M) continue;
     float acc = 0.f;
+  #pragma unroll 1
     for (int sl = 0; sl < top_k; sl++) {
-      acc += partial[(long)sl * M + m];
+      acc += lds_partials[sl * per_block_m + local_m];
     }
-    out[m] = __float2s<scalar_t>(acc);
+    out[m_global] = __float2s<scalar_t>(acc);
   }
+  // Suppress unused-variable warnings on the now-vestigial scratch args.
+  (void)partial;
+  (void)barrier;
 }
 
 #else  // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
@@ -486,6 +502,24 @@ void moe_megakernel_int4_persistent(
 
   const long expert_stride_w = (long)M_in * (K_in / 2);
   const long expert_stride_s = (long)M_in * (K_in / group_size);
+
+  // LDS partial-store budget check (matches MEGA_PARTIAL_LDS_FLOATS in the
+  // device-side code). Tile constants are duplicated below; keep in sync.
+  {
+    constexpr int K_THRDS = 32;
+    constexpr int K_YTILE = 2;
+    constexpr int K_WvPrGrp = 4;
+    const int m_stride = (int)CuCount * K_WvPrGrp * K_YTILE;
+    const int m_iters = (M_in + m_stride - 1) / m_stride;
+    const int per_block_m = m_iters * (K_WvPrGrp * K_YTILE);
+    const int needed = per_block_m * top_k;
+    TORCH_CHECK(needed <= 2048,
+                "moe_megakernel_int4_persistent: LDS partial budget exceeded ",
+                "(per_block_m=", per_block_m, " * top_k=", top_k, " = ", needed,
+                " > MEGA_PARTIAL_LDS_FLOATS=2048). ",
+                "Reduce M, increase CuCount, or grow MEGA_PARTIAL_LDS_FLOATS.");
+    (void)K_THRDS;
+  }
 
   dim3 grid((unsigned)CuCount);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(act));
