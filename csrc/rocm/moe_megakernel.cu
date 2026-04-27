@@ -557,7 +557,7 @@ void moe_megakernel_int4_persistent(
         constexpr int THRDS = 32;
         constexpr int YTILE = 2;
         constexpr int WvPrGrp = 16;
-        constexpr int A_CHUNK = 16;
+        constexpr int A_CHUNK = 32;
         constexpr int UNRL = 4;
         dim3 block(THRDS, WvPrGrp);
         const int wvPrGrp = WvPrGrp;
