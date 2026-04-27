@@ -184,6 +184,7 @@ def _run_hybrid_moe(
         mk = FusedMoEKernelModularImpl(
             fused_experts=experts,
             prepare_finalize=MoEPrepareAndFinalizeNoDPEPModular(),
+            shared_experts=None,
         )
 
         init_workspace_manager(device)
