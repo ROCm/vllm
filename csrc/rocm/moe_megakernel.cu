@@ -508,7 +508,7 @@ void moe_megakernel_int4_persistent(
   {
     constexpr int K_THRDS = 32;
     constexpr int K_YTILE = 2;
-    constexpr int K_WvPrGrp = 8;
+    constexpr int K_WvPrGrp = 12;
     const int m_stride = (int)CuCount * K_WvPrGrp * K_YTILE;
     const int m_iters = (M_in + m_stride - 1) / m_stride;
     const int per_block_m = m_iters * (K_WvPrGrp * K_YTILE);
@@ -540,15 +540,19 @@ void moe_megakernel_int4_persistent(
             reinterpret_cast<unsigned int*>(barrier.data_ptr());
 
         // Tile config: mirror MoE_WVSPLITK_INT4G_TUNED case 2, but with
-        // WvPrGrp bumped from 4 to 8. The wider 256-thread WG hides more of
+        // WvPrGrp bumped from 4 to 12. The wider 384-thread WG hides more of
         // the per-slot LDS-staging latency (the megakernel re-stages
         // activations once per top_k slot) and absorbs more of the
         // launch-bounds-driven VGPR limit because each block does more
-        // arithmetic per launch. Empirically: 14.33 ms vs 15.13 ms TPOT on
-        // Strix Halo Qwen3-Omni-30B-AWQ-4bit (3-run median, --max-num-seqs 1).
+        // arithmetic per launch. Compiler keeps VGPR at 115/wave (limit
+        // 128 = 1536/12 at WvPrGrp=12), no spill. Empirically:
+        //   WvPrGrp=4  : 15.13 ms TPOT
+        //   WvPrGrp=8  : 14.33 ms TPOT
+        //   WvPrGrp=12 : 14.15 ms TPOT (3-run median, --max-num-seqs 1)
+        // on Strix Halo Qwen3-Omni-30B-AWQ-4bit.
         constexpr int THRDS = 32;
         constexpr int YTILE = 2;
-        constexpr int WvPrGrp = 8;
+        constexpr int WvPrGrp = 12;
         constexpr int A_CHUNK = 16;
         constexpr int UNRL = 4;
         dim3 block(THRDS, WvPrGrp);
