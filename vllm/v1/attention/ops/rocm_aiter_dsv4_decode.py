@@ -153,6 +153,56 @@ def aiter_sparse_attn_decode(
     d_v = head_dim
     device = q.device
 
+    # Head-split workaround for the AITER persistent ASM kernel
+    # `mla_a8w8_qh64_qseqlen4_gqaratio16_lse_ps` (selected when h_q==64, e.g.
+    # TP=2 on a 128-head model or TP=4 on a 256-head model). With
+    # `return_lse=True` on gfx950 it returns `lse=+inf` for some (batch, head)
+    # rows, which propagates NaN through the dual-scope LSE merge. The
+    # `qh16_qseqlen1` kernel selected for h_q<=32 is numerically clean
+    # (validated cosine > 0.999 vs PyTorch reference on TP4 / TP8). Recurse
+    # at the outer level here — split q + attn_sink in half, run a complete
+    # `aiter_sparse_attn_decode` per half, then concatenate the final outputs.
+    # Doing the split here (instead of inside `_aiter_decode_one_scope`) keeps
+    # each recursive call self-contained: LSE merging and sink correction
+    # never cross the h_q boundary, so the result does not depend on the
+    # kernel's `lse` shape convention (which has differed across aiter
+    # versions). 2x kernel launches per decode call in the split case, but
+    # those configs are rarely used in production; correctness first.
+    # TODO: drop once AITER fixes the qh64_qseqlen4_gqaratio16_lse_ps kernel.
+    if h_q > 32:
+        h_half = h_q // 2
+        sink_a = attn_sink[..., :h_half] if attn_sink is not None else None
+        sink_b = attn_sink[..., h_half:] if attn_sink is not None else None
+        out_a = aiter_sparse_attn_decode(
+            q=q[..., :h_half, :].contiguous(),
+            blocked_k=blocked_k,
+            indices_in_kvcache=indices_in_kvcache,
+            topk_length=topk_length,
+            attn_sink=sink_a,
+            scale=scale,
+            head_dim=head_dim,
+            extra_blocked_k=extra_blocked_k,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            extra_topk_length=extra_topk_length,
+            scratch=AiterSparseScratch(),
+            extra_scratch=AiterSparseScratch(),
+        )
+        out_b = aiter_sparse_attn_decode(
+            q=q[..., h_half:, :].contiguous(),
+            blocked_k=blocked_k,
+            indices_in_kvcache=indices_in_kvcache,
+            topk_length=topk_length,
+            attn_sink=sink_b,
+            scale=scale,
+            head_dim=head_dim,
+            extra_blocked_k=extra_blocked_k,
+            extra_indices_in_kvcache=extra_indices_in_kvcache,
+            extra_topk_length=extra_topk_length,
+            scratch=AiterSparseScratch(),
+            extra_scratch=AiterSparseScratch(),
+        )
+        return torch.cat([out_a, out_b], dim=-2)
+
     if scratch is None:
         scratch = AiterSparseScratch()
     if extra_scratch is None:
