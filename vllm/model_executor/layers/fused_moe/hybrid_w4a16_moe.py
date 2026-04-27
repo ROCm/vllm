@@ -10,6 +10,8 @@ shuffle packed).  Both kernels read from the same weight tensors:
 CUDA-graph compatible.
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -37,6 +39,11 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
+
+# Experimental: route M=1 decode through the fused MoE megakernel.  Off by
+# default — see ``vllm.model_executor.layers.fused_moe.moe_megakernel`` for
+# the kernel and design notes.
+_USE_MOE_MEGAKERNEL = os.environ.get("VLLM_MOE_MEGAKERNEL", "0") == "1"
 
 
 class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
@@ -242,6 +249,40 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
 
         if global_num_experts == -1:
             global_num_experts = E
+
+        # ---- Experimental: single-token MoE megakernel (M=1) ----
+        # Symmetric int4 only (no asymmetric zero points), no expert map,
+        # bf16/fp16 activations, group_size dividing both N1 and N2.
+        if (
+            _USE_MOE_MEGAKERNEL
+            and num_tokens == 1
+            and expert_map is None
+            and self.quant_config.w1_zp is None
+            and self.quant_config.w2_zp is None
+            and not apply_router_weight_on_input
+            and activation == MoEActivation.SILU
+            and hidden_states.dtype in (torch.bfloat16, torch.float16)
+            and 2 * w2.size(2) * 8 == N
+            and (w2.size(2) * 8) % self._group_size == 0
+        ):
+            from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+                moe_megakernel_post_router,
+            )
+
+            moe_megakernel_post_router(
+                hidden=hidden_states,
+                w1=w1,
+                w1_scale=self.w1_scale,
+                w2=w2,
+                w2_scale=self.w2_scale,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                output=output,
+                top_k=top_k_num,
+                group_size=self._group_size,
+                zp_bias=8,
+            )
+            return
 
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         block_size_m = self._select_block_size_m(
