@@ -176,7 +176,7 @@ constexpr int MEGA_LDS_ELEMS = 8192;
 constexpr int MEGA_PARTIAL_LDS_FLOATS = 2048;
 
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int GROUP_SIZE>
+          int UNRL, int GROUP_SIZE, bool FUSE_SILU>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
     const int K, const int M, const uint8_t* W_base,
     const scalar_t* __restrict__ act_base,
@@ -188,6 +188,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
   constexpr int N = 1;  // single token decode
   constexpr int max_lds_len = MEGA_LDS_ELEMS;
   const int K_packed = K / 2;
+  // FUSE_SILU=true: act has [top_k, 2*K] gate||up (silu_and_mul layout). On
+  // LDS staging we read both halves, compute silu(gate)*up on the fly, and
+  // store the K silu-mul result into LDS. Eliminates one kernel launch and
+  // one HBM round-trip ([top_k, K] silu output write+read).
+  const long act_row_stride = FUSE_SILU ? (long)2 * K : (long)K;
 
   union bigTypeA {
     scalar_t h[A_CHUNK];
@@ -220,15 +225,35 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
     int expert_id = topk_ids[slot];
     const uint8_t* W = W_base + (long)expert_id * expert_stride_w;
     const scalar_t* S = scale_base + (long)expert_id * expert_stride_s;
-    const scalar_t* A = act_base + (long)slot * K;
+    const scalar_t* A = act_base + (long)slot * act_row_stride;
+    const scalar_t* A_up = FUSE_SILU ? (A + K) : nullptr;
 
-    // Stage activations for this slot into LDS.
     __syncthreads();
-    for (uint32_t k = 0; k < (uint32_t)min(K * N, max_lds_len);
-         k += THRDS * WvPrGrp * A_CHUNK) {
-      uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
-      if (k_in >= (uint32_t)min(K * N, max_lds_len)) break;
-      *((bigTypeA*)(&s[k_in])) = *((bigTypeA*)(&A[k_in]));
+    if constexpr (FUSE_SILU) {
+      // Redistribute silu(gate)*up across ALL block threads (one element per
+      // thread per outer iteration). The original A_CHUNK-strided form left
+      // 488/512 threads idle and serialized expf+IEEE-divide on a single
+      // wave's critical path (~6 us/slot). Doing scalar work fanned out
+      // across the full 512-thread block gives 32x more parallel issue and
+      // lets the global gate+up loads pipeline with the expf/rcp ALU work.
+      // Use __builtin_amdgcn_rcpf for single-instruction reciprocal instead
+      // of the IEEE division sequence (9 vector-ALU ops -> 1).
+      const int linear_tid = threadIdx.y * THRDS + threadIdx.x;
+      const int total_threads = THRDS * WvPrGrp;
+      for (int k_in = linear_tid; k_in < K; k_in += total_threads) {
+        float g = __s2float(A[k_in]);
+        float u = __s2float(A_up[k_in]);
+        float sig = __builtin_amdgcn_rcpf(1.0f + __expf(-g));
+        s[k_in] = __float2s<scalar_t>(g * sig * u);
+      }
+    } else {
+      // Vectorized A_CHUNK staging — unchanged.
+      for (uint32_t k = 0; k < (uint32_t)min(K * N, max_lds_len);
+           k += THRDS * WvPrGrp * A_CHUNK) {
+        uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
+        if (k_in >= (uint32_t)min(K * N, max_lds_len)) break;
+        *((bigTypeA*)(&s[k_in])) = *((const bigTypeA*)(&A[k_in]));
+      }
     }
     __syncthreads();
 
@@ -437,7 +462,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
 #else  // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
 
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int GROUP_SIZE>
+          int UNRL, int GROUP_SIZE, bool FUSE_SILU>
 __global__ void moe_megakernel_int4_gemm2_(
     const int K, const int M, const uint8_t* W_base,
     const scalar_t* __restrict__ act_base,
@@ -468,7 +493,8 @@ static bool is_gfx1x_mega() {
 }
 
 void moe_megakernel_int4_persistent(
-    torch::Tensor act,       // [top_k, K] (silu output, slot-ordered)
+    torch::Tensor act,       // [top_k, K] silu-out, OR [top_k, 2*K] gate||up
+                             // when fuse_silu=true
     torch::Tensor w2,        // [E, M, K/8] int32 (skinny-packed)
     torch::Tensor w2_scale,  // [E, M, K/G] bf16/fp16
     torch::Tensor topk_ids,  // [1, top_k] int32
@@ -476,7 +502,7 @@ void moe_megakernel_int4_persistent(
     torch::Tensor out,       // [1, M] bf16/fp16  OUT
     torch::Tensor partial,   // [top_k, M] fp32   SCRATCH
     torch::Tensor barrier,   // [1] uint32        SCRATCH (zeroed)
-    int64_t CuCount, int64_t group_size) {
+    bool fuse_silu, int64_t CuCount, int64_t group_size) {
   TORCH_CHECK(is_gfx1x_mega(),
               "moe_megakernel_int4_persistent: only gfx11/gfx12 supported");
   TORCH_CHECK(w2.dtype() == torch::kInt32, "w2 must be int32 packed");
@@ -490,7 +516,10 @@ void moe_megakernel_int4_persistent(
               barrier.dtype() == torch::kInt32);
 
   const int top_k = act.size(0);
-  const int K_in = act.size(1);
+  // When fuse_silu, act last dim is 2*K (gate||up); the GEMM2 K is half.
+  TORCH_CHECK(!fuse_silu || (act.size(1) % 2 == 0),
+              "fuse_silu requires even act last dim (gate||up)");
+  const int K_in = fuse_silu ? (int)(act.size(1) / 2) : (int)act.size(1);
   const int M_in = w2.size(1);
   // K_packed_int32 = K/8; K bytes = K/2.
 
@@ -539,21 +568,23 @@ void moe_megakernel_int4_persistent(
         unsigned int* barptr =
             reinterpret_cast<unsigned int*>(barrier.data_ptr());
 
-        // Tile config: mirror MoE_WVSPLITK_INT4G_TUNED case 2, but with
-        // WvPrGrp bumped from 4 to 16 (a 512-thread WG). The wider WG
-        // hides more of the per-slot LDS-staging latency (the megakernel
-        // re-stages activations once per top_k slot) and exposes more
-        // thread-level parallelism per WG, which more than compensates
+        // Tile config: WvPrGrp=16 (512-thread WG, single block per CU). The
+        // wider WG hides more of the per-slot LDS-staging latency and
+        // exposes more thread-level parallelism, which more than compensates
         // for reduced wave-per-CU occupancy: VGPR holds at 115/wave
         // (single-block-per-CU regime — strict 96 VGPR limit at full
         // 16-wave occupancy is exceeded, so the driver allocates only one
         // block per CU instead of two, but the larger block still
-        // outperforms the higher-occupancy alternatives). Empirically:
-        //   WvPrGrp=4  : 15.13 ms TPOT
-        //   WvPrGrp=8  : 14.33 ms TPOT
-        //   WvPrGrp=12 : 14.15 ms TPOT
-        //   WvPrGrp=16 : 13.79 ms TPOT (3-run median, --max-num-seqs 1)
-        // on Strix Halo Qwen3-Omni-30B-AWQ-4bit.
+        // outperforms the higher-occupancy alternatives). A_CHUNK=32 widens
+        // DOT2 ops 2x per inner unroll (3 stalls/iter vs 5). Empirical TPOT
+        // on Strix Halo Qwen3-Omni-30B-AWQ-4bit:
+        //   WvPrGrp=4  : 15.13 ms
+        //   WvPrGrp=8  : 14.33 ms
+        //   WvPrGrp=12 : 14.15 ms
+        //   WvPrGrp=16 : 13.79 ms (A_CHUNK=16)
+        //   WvPrGrp=16 + A_CHUNK=32              : 13.59 ms baseline (silu
+        //   unfused)
+        //   + fuse_silu (parallel staging + rcpf): 13.50 ms (-0.66%)
         constexpr int THRDS = 32;
         constexpr int YTILE = 2;
         constexpr int WvPrGrp = 16;
@@ -562,17 +593,37 @@ void moe_megakernel_int4_persistent(
         dim3 block(THRDS, WvPrGrp);
         const int wvPrGrp = WvPrGrp;
         if (group_size == 32) {
-          moe_megakernel_int4_gemm2_<fptype, THRDS, YTILE, WvPrGrp, A_CHUNK,
-                                     UNRL, 32><<<grid, block, 0, stream>>>(
-              K_in, M_in, wptr, aptr, sptr, idsptr, wghptr, outptr, partptr,
-              barptr, top_k, expert_stride_w, expert_stride_s, wvPrGrp,
-              (int)CuCount);
+          if (fuse_silu) {
+            moe_megakernel_int4_gemm2_<fptype, THRDS, YTILE, WvPrGrp, A_CHUNK,
+                                       UNRL, 32, true>
+                <<<grid, block, 0, stream>>>(
+                    K_in, M_in, wptr, aptr, sptr, idsptr, wghptr, outptr,
+                    partptr, barptr, top_k, expert_stride_w, expert_stride_s,
+                    wvPrGrp, (int)CuCount);
+          } else {
+            moe_megakernel_int4_gemm2_<fptype, THRDS, YTILE, WvPrGrp, A_CHUNK,
+                                       UNRL, 32, false>
+                <<<grid, block, 0, stream>>>(
+                    K_in, M_in, wptr, aptr, sptr, idsptr, wghptr, outptr,
+                    partptr, barptr, top_k, expert_stride_w, expert_stride_s,
+                    wvPrGrp, (int)CuCount);
+          }
         } else {
-          moe_megakernel_int4_gemm2_<fptype, THRDS, YTILE, WvPrGrp, A_CHUNK,
-                                     UNRL, 128><<<grid, block, 0, stream>>>(
-              K_in, M_in, wptr, aptr, sptr, idsptr, wghptr, outptr, partptr,
-              barptr, top_k, expert_stride_w, expert_stride_s, wvPrGrp,
-              (int)CuCount);
+          if (fuse_silu) {
+            moe_megakernel_int4_gemm2_<fptype, THRDS, YTILE, WvPrGrp, A_CHUNK,
+                                       UNRL, 128, true>
+                <<<grid, block, 0, stream>>>(
+                    K_in, M_in, wptr, aptr, sptr, idsptr, wghptr, outptr,
+                    partptr, barptr, top_k, expert_stride_w, expert_stride_s,
+                    wvPrGrp, (int)CuCount);
+          } else {
+            moe_megakernel_int4_gemm2_<fptype, THRDS, YTILE, WvPrGrp, A_CHUNK,
+                                       UNRL, 128, false>
+                <<<grid, block, 0, stream>>>(
+                    K_in, M_in, wptr, aptr, sptr, idsptr, wghptr, outptr,
+                    partptr, barptr, top_k, expert_stride_w, expert_stride_s,
+                    wvPrGrp, (int)CuCount);
+          }
         }
       });
 }

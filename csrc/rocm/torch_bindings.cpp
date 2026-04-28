@@ -61,7 +61,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "moe_megakernel_int4_persistent(Tensor act, Tensor w2, Tensor w2_scale, "
       "Tensor topk_ids, Tensor topk_w, Tensor! out, Tensor! partial, "
-      "Tensor! barrier, int CuCount, int group_size) -> ()");
+      "Tensor! barrier, bool fuse_silu, int CuCount, int group_size) -> ()");
   rocm_ops.impl("moe_megakernel_int4_persistent", torch::kCUDA,
                 &moe_megakernel_int4_persistent);
 

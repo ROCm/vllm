@@ -36,8 +36,8 @@ void moe_megakernel_int4_persistent(torch::Tensor act, torch::Tensor w2,
                                     torch::Tensor topk_ids,
                                     torch::Tensor topk_w, torch::Tensor out,
                                     torch::Tensor partial,
-                                    torch::Tensor barrier, int64_t CuCount,
-                                    int64_t group_size);
+                                    torch::Tensor barrier, bool fuse_silu,
+                                    int64_t CuCount, int64_t group_size);
 
 #ifdef VLLM_SKINNY_GEMM_SWEEP
 torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,

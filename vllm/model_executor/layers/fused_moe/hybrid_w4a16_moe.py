@@ -432,9 +432,6 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 top_k_num,
             )
 
-            # Activation
-            apply_moe_activation(activation, act_out, gemm1_out)
-
             # ---- Experimental: fused HIP GEMM2 + topk-weighted reduce ----
             # Only the M=1 scattered path with symmetric int4, no expert
             # map, and topk_weights in fp32-friendly form.
@@ -445,7 +442,8 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 and expert_map is None
                 and self.quant_config.w2_zp is None
                 and not apply_router_weight_on_input
-                and act_out.shape[0] == top_k_num
+                and gemm1_out.shape[0] == top_k_num
+                and activation == MoEActivation.SILU
             )
             if use_hip_mega:
                 # Allocate scratch lazily; size depends on top_k and K_hidden.
@@ -481,9 +479,13 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 # path uses to pipeline work across CUs.  All blocks stay
                 # resident (per-WG VGPR/LDS budget allows it), so the
                 # atomic-counter barrier remains deadlock-free.
+                # fuse_silu=True: pass gemm1_out [P, 2*INTER] directly,
+                # silu(gate)*up is folded into the megakernel's per-slot LDS
+                # staging — eliminates the separate silu_and_mul launch and
+                # one [P, INTER] HBM round-trip.
                 mega_cu_count = self._cu_count * 2
                 torch.ops._rocm_C.moe_megakernel_int4_persistent(
-                    act_out,
+                    gemm1_out,
                     w2,
                     self.w2_scale,
                     topk_ids.to(torch.int32),
@@ -491,10 +493,14 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                     output,
                     self._mega_partial,
                     self._mega_barrier,
+                    True,  # fuse_silu
                     mega_cu_count,
                     self._group_size,
                 )
                 return
+
+            # Activation (unfused chain only)
+            apply_moe_activation(activation, act_out, gemm1_out)
 
             # GEMM 2 (HIP wvSplitK decode path)
             fused_moe_wvSplitK_int4_gemm(
