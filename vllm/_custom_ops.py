@@ -2745,6 +2745,76 @@ def fused_moe_wvSplitK_int4_gemm(
     )
 
 
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "fused_moe_wvSplitK_int4_megakernel"
+):
+
+    @register_fake("_rocm_C::fused_moe_wvSplitK_int4_megakernel")
+    def _fused_moe_wvSplitK_int4_megakernel_fake(
+        a: torch.Tensor,
+        w1: torch.Tensor,
+        s1: torch.Tensor,
+        w2: torch.Tensor,
+        s2: torch.Tensor,
+        gemm2_out: torch.Tensor,
+        expert_ids: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        top_k: int,
+        group_size: int,
+        cu_count: int,
+    ) -> torch.Tensor:
+        # In-place op: gemm2_out (`Tensor!` in the schema) is mutated;
+        # the C++ impl returns the same tensor so callers / FX traces
+        # see a real output.  The fake constructs an empty tensor
+        # matching gemm2_out's shape + dtype + device so FakeTensorMode
+        # propagates the right metadata downstream.
+        return torch.empty(
+            gemm2_out.shape,
+            dtype=gemm2_out.dtype,
+            device=gemm2_out.device,
+        )
+
+
+def fused_moe_wvSplitK_int4_megakernel(
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    s1: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    top_k: int,
+    group_size: int,
+    cu_count: int,
+) -> torch.Tensor:
+    """Fused GEMM1 + silu_and_mul + GEMM2 mega-kernel (Strategy C).
+
+    Replaces the 3-kernel pipeline (`fused_moe_wvSplitK_int4_gemm` x 2 +
+    `silu_and_mul`) when VLLM_MOE_HYBRID_W4A16_FUSED=1 on the W4A16 MoE
+    decode path.  Only valid for the decode shape (M=1, GS=128, fp16,
+    all groups share src_row); the caller is responsible for gating.
+
+    `gemm2_out` is mutated in-place; the same tensor is also returned
+    so the call composes cleanly with traced graphs.
+    """
+    if sorted_token_ids is None:
+        sorted_token_ids = torch.empty(0, dtype=torch.int32, device=a.device)
+    return torch.ops._rocm_C.fused_moe_wvSplitK_int4_megakernel(
+        a,
+        w1,
+        s1,
+        w2,
+        s2,
+        gemm2_out,
+        expert_ids,
+        sorted_token_ids,
+        top_k,
+        group_size,
+        cu_count,
+    )
+
+
 def wvSplitK_int4g_sweep(
     a: torch.Tensor,
     b: torch.Tensor,

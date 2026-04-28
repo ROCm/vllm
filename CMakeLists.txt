@@ -1222,6 +1222,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/skinny_gemms.cu"
     "csrc/rocm/skinny_gemms_int8.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
+    "csrc/rocm/skinny_gemms_int4_fused.cu"
     "csrc/rocm/attention.cu")
 
   define_extension_target(

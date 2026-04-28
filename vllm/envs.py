@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     VLLM_MOE_AWQ_GEMV_HIP: bool = False
     VLLM_MOE_GPTQ_EXLLAMA: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
+    VLLM_MOE_HYBRID_W4A16_FUSED: bool = False
     VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
@@ -1008,6 +1009,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Converts weights to skinny layout [E, N, K//8] int32 (ExLlama shuffle).
     "VLLM_MOE_HYBRID_W4A16": lambda: (
         os.getenv("VLLM_MOE_HYBRID_W4A16", "true").lower() in ("true", "1")
+    ),
+    # Use the fused GEMM1 + silu_and_mul + GEMM2 mega-kernel (Strategy
+    # C) on the W4A16 MoE decode path, replacing the existing 3-kernel
+    # pipeline (`fused_moe_wvSplitK_int4_gemm` x 2 + `silu_and_mul`).
+    # Only valid on gfx1151 with the bench/qwen3-omni decode shape
+    # (M=1, GS=128, fp16, all top_k routes share the same source row).
+    # Falls back to the 3-kernel path automatically if any precondition
+    # isn't met.  Default off; opt-in for the fused mega-kernel.
+    "VLLM_MOE_HYBRID_W4A16_FUSED": lambda: (
+        os.getenv("VLLM_MOE_HYBRID_W4A16_FUSED", "false").lower()
+        in ("true", "1")
     ),
     # Use exllama 4-bit kernel for MoE GPTQ instead of Triton.
     # Requires exllama-native weight format [E, K/8, N] int32.

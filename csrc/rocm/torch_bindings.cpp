@@ -57,6 +57,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("fused_moe_wvSplitK_int4_gemm", torch::kCUDA,
                 &fused_moe_wvSplitK_int4_gemm);
 
+  // Fused GEMM1 + silu_and_mul + GEMM2 mega-kernel (Strategy C) for the
+  // W4A16 MoE decode path on gfx1151.  Replaces the 3-kernel pipeline
+  // when VLLM_MOE_HYBRID_W4A16_FUSED=1.  See
+  // csrc/rocm/skinny_gemms_int4_fused.cu for shape preconditions.
+  // `Tensor!` on gemm2_out marks it as in-place mutated; the op
+  // returns the same tensor so PyTorch's alias analysis (used by
+  // torch.compile / FakeTensorMode) sees a real output to track.
+  // The matching @register_fake stub in vllm/_custom_ops.py returns
+  // `torch.empty_like(gemm2_out)` for shape inference under fake mode.
+  rocm_ops.def(
+      "fused_moe_wvSplitK_int4_megakernel(Tensor a, Tensor w1, Tensor s1, "
+      "Tensor w2, Tensor s2, Tensor! gemm2_out, Tensor expert_ids, "
+      "Tensor sorted_token_ids, int top_k, int group_size, "
+      "int cu_count) -> Tensor");
+  rocm_ops.impl("fused_moe_wvSplitK_int4_megakernel", torch::kCUDA,
+                &fused_moe_wvSplitK_int4_megakernel);
+
 #ifdef VLLM_SKINNY_GEMM_SWEEP
   rocm_ops.def(
       "wvSplitK_int8_sweep(Tensor in_a, Tensor in_b, Tensor in_scale, "
