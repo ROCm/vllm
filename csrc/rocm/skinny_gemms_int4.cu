@@ -82,6 +82,26 @@ __device__ __forceinline__ __hip_bfloat16 __float2s(float v) {
   return __float2bfloat16(v);
 }
 
+// bf16x2 subtract for int4 dequant magic-number trick. Inputs are in
+// [128.0, 143.0] and BIAS is 128.0 or 136.0, so result is in [-8, 7].
+// Bypasses NaN-quieting that LLVM emits for __hsub2(bf16x2) on gfx1151.
+// Truncation is bit-exact here because integers in [-8, 7] have zero
+// low 16 bits in their fp32 representation.
+__device__ __forceinline__ uint32_t
+bf16x2_dequant_sub_finite(uint32_t a_bits, uint32_t bias_bits) {
+  float a_lo = __uint_as_float((a_bits & 0xFFFFu) << 16);
+  float a_hi = __uint_as_float(a_bits & 0xFFFF0000u);
+  float b_lo = __uint_as_float((bias_bits & 0xFFFFu) << 16);
+  float b_hi = __uint_as_float(bias_bits & 0xFFFF0000u);
+
+  float r_lo = a_lo - b_lo;
+  float r_hi = a_hi - b_hi;
+
+  uint32_t lo_bits = __float_as_uint(r_lo);
+  uint32_t hi_bits = __float_as_uint(r_hi);
+  return (lo_bits >> 16) | (hi_bits & 0xFFFF0000u);
+}
+
 template <typename T>
 __device__ __forceinline__ T loadnt(T* addr) {
   return __builtin_nontemporal_load(addr);
@@ -105,9 +125,9 @@ struct scalar<c10::BFloat16> {
     V0 = __builtin_amdgcn_fdot2(*((half2*)(&(V2))), *((half2*)(&(V3))), V0, \
                                 false);                                     \
   } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {          \
-    float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *           \
-               __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));            \
-    V0 += (s.x + s.y);                                                      \
+    typedef short __attribute__((ext_vector_type(2))) bf16x2_t;             \
+    V0 = __builtin_amdgcn_fdot2_f32_bf16(*((bf16x2_t*)(&(V2))),             \
+                                         *((bf16x2_t*)(&(V3))), V0, false); \
   }
 
 __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
@@ -255,26 +275,29 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                               *(const half2*)&BIAS_HI);
                 }
               } else {
-                // Generic bf16 path: scalar int4 dequant
-                constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
+                // bf16 path: marlin-style magic-number trick
+                constexpr uint32_t BF16_MAGIC = 0x43004300u;
+                constexpr uint32_t BIAS =
+                    HAS_ZERO_POINTS ? 0x43004300u : 0x43084308u;
   #pragma unroll
                 for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                   uint32_t qa = bigB[y][k2].u32[w];
-                  cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 1] =
-                      (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 2] =
-                      (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 3] =
-                      (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 4] =
-                      (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 5] =
-                      (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 6] =
-                      (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 7] =
-                      (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
+                  uint32_t v0 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                  qa >>= 4;
+                  uint32_t v1 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                  qa >>= 4;
+                  uint32_t v2 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                  qa >>= 4;
+                  uint32_t v3 = (qa & 0x000F000Fu) | BF16_MAGIC;
+
+                  uint32_t r0 = bf16x2_dequant_sub_finite(v0, BIAS);
+                  uint32_t r1 = bf16x2_dequant_sub_finite(v1, BIAS);
+                  uint32_t r2 = bf16x2_dequant_sub_finite(v2, BIAS);
+                  uint32_t r3 = bf16x2_dequant_sub_finite(v3, BIAS);
+                  *(uint32_t*)&cvtB.f[w * 4 + 0] = r0;
+                  *(uint32_t*)&cvtB.f[w * 4 + 1] = r1;
+                  *(uint32_t*)&cvtB.f[w * 4 + 2] = r2;
+                  *(uint32_t*)&cvtB.f[w * 4 + 3] = r3;
                 }
               }
 
@@ -564,26 +587,29 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
                               *(const half2*)&BIAS_HI);
                 }
               } else {
-                // Generic bf16 path: scalar int4 dequant
-                constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
+                // bf16 path: marlin-style magic-number trick
+                constexpr uint32_t BF16_MAGIC = 0x43004300u;
+                constexpr uint32_t BIAS =
+                    HAS_ZERO_POINTS ? 0x43004300u : 0x43084308u;
   #pragma unroll
                 for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                   uint32_t qa = bigB[y][k2].u32[w];
-                  cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 1] =
-                      (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 2] =
-                      (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 3] =
-                      (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 4] =
-                      (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 5] =
-                      (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 6] =
-                      (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
-                  cvtB.h[w * 8 + 7] =
-                      (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
+                  uint32_t v0 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                  qa >>= 4;
+                  uint32_t v1 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                  qa >>= 4;
+                  uint32_t v2 = (qa & 0x000F000Fu) | BF16_MAGIC;
+                  qa >>= 4;
+                  uint32_t v3 = (qa & 0x000F000Fu) | BF16_MAGIC;
+
+                  uint32_t r0 = bf16x2_dequant_sub_finite(v0, BIAS);
+                  uint32_t r1 = bf16x2_dequant_sub_finite(v1, BIAS);
+                  uint32_t r2 = bf16x2_dequant_sub_finite(v2, BIAS);
+                  uint32_t r3 = bf16x2_dequant_sub_finite(v3, BIAS);
+                  *(uint32_t*)&cvtB.f[w * 4 + 0] = r0;
+                  *(uint32_t*)&cvtB.f[w * 4 + 1] = r1;
+                  *(uint32_t*)&cvtB.f[w * 4 + 2] = r2;
+                  *(uint32_t*)&cvtB.f[w * 4 + 3] = r3;
                 }
               }
 
@@ -1014,37 +1040,37 @@ __global__ void moe_wvSplitK_int4_hf_(
 //   expert_stride_w, expert_stride_s, expert_stride_zp, stream, max_lds_len
 // Required type: fptype, N_in (template constant via switch)
 
-#define MOE_WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP)  \
-  MOE_WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, 16, 16, _UNRL, _N, _GS,    \
-                                  _HAS_ZP)
+#define MOE_WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
+  MOE_WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, 16, 16, _UNRL, _N, _GS,   \
+                                 _HAS_ZP)
 
 // Like MOE_WVSPLITK_INT4G_LAUNCH but parameterizes WvPrGrp and A_CHUNK.
 // Used by the gfx1151 N=1, K<1024 heuristic to instantiate (Y4 U2 AC32);
 // all other call sites go through the (W=16, AC=16) wrapper above.
-#define MOE_WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, _W, _AC, _UNRL, _N,  \
-                                        _GS, _HAS_ZP)                       \
-  {                                                                         \
-    /* One workgroup per CU; expert-block iteration happens inside the      \
-       kernel (see moe_wvSplitK_int4_hf_sml_).  This restores the           \
-       'workgroups == CuCount' M-split invariant of wvSplitK_int4_hf_sml    \
-       and keeps the Strix Halo 20-CU / 8-active-expert tuning optimal. */  \
-    int moe_cu = CuCount;                                                   \
-    if (num_expert_blocks == 0) return;                                     \
-    dim3 block(_THRDS, _W);                                                 \
-    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, _W);                 \
-    dim3 grid(moe_cu);                                                      \
-    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                   \
-      moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, \
-                                _GS, _HAS_ZP><<<grid, block, 0, stream>>>(  \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,       \
-          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,     \
-          __wvPrGrp, moe_cu, num_expert_blocks);                            \
-    else                                                                    \
-      moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N,_GS, \
-                            _HAS_ZP><<<grid, block, 0, stream>>>(           \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,       \
-          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,     \
-          __wvPrGrp, moe_cu, num_expert_blocks);                            \
+#define MOE_WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, _W, _AC, _UNRL, _N,   \
+                                       _GS, _HAS_ZP)                         \
+  {                                                                          \
+    /* One workgroup per CU; expert-block iteration happens inside the       \
+       kernel (see moe_wvSplitK_int4_hf_sml_).  This restores the            \
+       'workgroups == CuCount' M-split invariant of wvSplitK_int4_hf_sml     \
+       and keeps the Strix Halo 20-CU / 8-active-expert tuning optimal. */   \
+    int moe_cu = CuCount;                                                    \
+    if (num_expert_blocks == 0) return;                                      \
+    dim3 block(_THRDS, _W);                                                  \
+    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, _W);                  \
+    dim3 grid(moe_cu);                                                       \
+    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                    \
+      moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N,  \
+                                _GS, _HAS_ZP><<<grid, block, 0, stream>>>(   \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,        \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,      \
+          __wvPrGrp, moe_cu, num_expert_blocks);                             \
+    else                                                                     \
+      moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS, \
+                            _HAS_ZP><<<grid, block, 0, stream>>>(            \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,        \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,      \
+          __wvPrGrp, moe_cu, num_expert_blocks);                             \
   }
 
 #define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
@@ -1063,17 +1089,17 @@ __global__ void moe_wvSplitK_int4_hf_(
 // because the (Y4 U2 AC32) win came from gfx1151's ATT trace.  GFX9
 // wave64 path is left at the defaults (W=16, AC=16) -- the 4-axis
 // sweep wasn't run there, so it keeps the original launch macro.
-#define MOE_WVSPLIT_INT4G_GS_W_AC(_YTILE, _W, _AC, _UNRL, _N, _HAS_ZP)        \
-  if (is_gfx1x_int4()) {                                                      \
-    if (group_size == 32)                                                     \
-      MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 32,      \
-                                      _HAS_ZP)                                \
-    else                                                                      \
-      MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 128,     \
-                                      _HAS_ZP)                                \
-  } else {                                                                    \
-    /* GFX9 fallback: original heuristic (W=AC=16). */                        \
-    MOE_WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP)                          \
+#define MOE_WVSPLIT_INT4G_GS_W_AC(_YTILE, _W, _AC, _UNRL, _N, _HAS_ZP)    \
+  if (is_gfx1x_int4()) {                                                  \
+    if (group_size == 32)                                                 \
+      MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 32,  \
+                                     _HAS_ZP)                             \
+    else                                                                  \
+      MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 128, \
+                                     _HAS_ZP)                             \
+  } else {                                                                \
+    /* GFX9 fallback: original heuristic (W=AC=16). */                    \
+    MOE_WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP)                      \
   }
 
 #define MOE_WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                    \
@@ -1093,7 +1119,7 @@ __global__ void moe_wvSplitK_int4_hf_(
       MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                        \
     else if (__N >= 2)                                                \
       MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                        \
-    else /* N=1 split per K, picked from a full 4-axis (Y, U, W, AC) \
+    else /* N=1 split per K, picked from a full 4-axis (Y, U, W, AC)  \
             Cartesian sweep on gfx1151.  Re-verified in fresh procs   \
             against the local kernel; the two K ranges land on        \
             different optima:                                         \
