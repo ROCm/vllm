@@ -305,6 +305,23 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
             if (k_ >= (uint32_t)K) break;
   #pragma unroll
             for (uint32_t n = 0; n < N; n++) {
+              // bf16-only fast path: precompute sum_act over the chunk so
+              // we can skip the per-pair bf16x2_dequant_sub_finite (4
+              // vector-ALU ops per pair) and apply a single -136*sum_act
+              // correction after each DOT2C accumulation. Sum_act is reused
+              // across y.
+              float sum_act_chunk = 0;
+              if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {
+                typedef short __attribute__((ext_vector_type(2))) bf16x2_t;
+                constexpr uint32_t ONES_BF16x2 = 0x3F803F80u;  // bf16(1,1)
+                bf16x2_t ones = *(const bf16x2_t*)&ONES_BF16x2;
+  #pragma unroll
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  sum_act_chunk = __builtin_amdgcn_fdot2_f32_bf16(
+                      *((bf16x2_t*)(&(bigA[n][k2].f[b]))), ones, sum_act_chunk,
+                      false);
+                }
+              }
   #pragma unroll
               for (int y = 0; y < YTILE; y++) {
                 bigTypeA cvtB;
@@ -333,26 +350,25 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
                                 *(const half2*)&BIAS_HI);
                   }
                 } else {
+                  // bf16 fast path: store magic-encoded (128 + nibble) bf16
+                  // pair directly. The IEEE subtract that produced
+                  // (nibble - 8) is folded into a single fma at the scale
+                  // step using the precomputed sum_act_chunk.
                   constexpr uint32_t BF16_MAGIC = 0x43004300u;
-                  constexpr uint32_t BIAS = 0x43084308u;  // sym (subtract 136)
   #pragma unroll
                   for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                     uint32_t qa = bigB[y][k2].u32[w];
-                    uint32_t v0 = (qa & 0x000F000Fu) | BF16_MAGIC;
-                    qa >>= 4;
-                    uint32_t v1 = (qa & 0x000F000Fu) | BF16_MAGIC;
-                    qa >>= 4;
-                    uint32_t v2 = (qa & 0x000F000Fu) | BF16_MAGIC;
-                    qa >>= 4;
-                    uint32_t v3 = (qa & 0x000F000Fu) | BF16_MAGIC;
                     *(uint32_t*)&cvtB.f[w * 4 + 0] =
-                        bf16x2_dequant_sub_finite(v0, BIAS);
+                        (qa & 0x000F000Fu) | BF16_MAGIC;
+                    qa >>= 4;
                     *(uint32_t*)&cvtB.f[w * 4 + 1] =
-                        bf16x2_dequant_sub_finite(v1, BIAS);
+                        (qa & 0x000F000Fu) | BF16_MAGIC;
+                    qa >>= 4;
                     *(uint32_t*)&cvtB.f[w * 4 + 2] =
-                        bf16x2_dequant_sub_finite(v2, BIAS);
+                        (qa & 0x000F000Fu) | BF16_MAGIC;
+                    qa >>= 4;
                     *(uint32_t*)&cvtB.f[w * 4 + 3] =
-                        bf16x2_dequant_sub_finite(v3, BIAS);
+                        (qa & 0x000F000Fu) | BF16_MAGIC;
                   }
                 }
 
@@ -362,8 +378,17 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_megakernel_int4_gemm2_(
                   DOT2C(partial_dot, bigA[n][k2].f[b], cvtB.f[b])
                 }
                 uint32_t group_idx = k_ / GROUP_SIZE;
-                sum[n][y] += partial_dot *
-                             __s2float(S[(m + y) * num_groups + group_idx]);
+                float scale_val =
+                    __s2float(S[(m + y) * num_groups + group_idx]);
+                if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {
+                  // partial_dot used (128 + nibble) weights.
+                  // True dot = sum((nibble - 8) * a) = partial_dot
+                  //                                 - (128 + 8) * sum_act.
+                  sum[n][y] +=
+                      scale_val * (partial_dot - 136.0f * sum_act_chunk);
+                } else {
+                  sum[n][y] += partial_dot * scale_val;
+                }
               }
             }
           }
