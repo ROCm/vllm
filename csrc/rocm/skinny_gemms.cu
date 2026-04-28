@@ -79,6 +79,29 @@ bool is_gfx11() {
   return result;
 }
 
+// Empty tag types used to thread the host-selected dispatch path into the
+// kernel template. Each launch site picks one tag; on the wrong-arch device
+// pass the tag mismatches the active __gfxNNNN__ macro and the kernel body
+// is discarded by `if constexpr` (no instantiation, no ISA emitted), saving
+// both compile time and binary size in fat-binary builds.
+struct Gfx11Tag {};
+struct Gfx9Tag {};
+
+template <typename ArchTag>
+__host__ __device__ constexpr bool tag_matches_device() {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1150__) || defined(__gfx1151__)
+  return std::is_same_v<ArchTag, Gfx11Tag>;
+#elif defined(__gfx90a__) || defined(__gfx940__) || defined(__gfx942__) || \
+    defined(__gfx950__)
+  return std::is_same_v<ArchTag, Gfx9Tag>;
+#else
+  // Host pass or unknown device arch — keep the body so parsing succeeds and
+  // the unused-arch fallbacks (UNREACHABLE_CODE) still trip if invoked.
+  return true;
+#endif
+}
+
 #if defined(NDEBUG)
   #undef NDEBUG
   #include <assert.h>
@@ -354,14 +377,15 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
 
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets cases where A[] fits LDS capacity
-template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+template <typename ArchTag, typename scalar_t, int THRDS, int YTILE,
+          int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap, const int M,
                      const int Bx, const int By, const scalar_t* B,
                      const scalar_t* __restrict__ A,
                      const scalar_t* __restrict__ BIAS, scalar_t* C,
                      const int _WvPrGrp, const int CuCount) {
+  if constexpr (!tag_matches_device<ArchTag>()) return;
   constexpr int max_lds_len = LDS_SIZE / 2;
   #if defined(__HIP__MI3XX__)
   constexpr bool use_mfma = (std::is_same_v<scalar_t, __hip_bfloat16>);
@@ -576,8 +600,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   }
 }
 #else
-template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+template <typename ArchTag, typename scalar_t, int THRDS, int YTILE,
+          int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap,
                                  const int M, const int Bx, const int By,
                                  const scalar_t* B,
@@ -590,14 +614,15 @@ __global__ void wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap,
 
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets cases where A[] marginally exceeds LDS capacity
-template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+template <typename ArchTag, typename scalar_t, int THRDS, int YTILE,
+          int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_(const int K, const int Kbp, const int Kap, const int M,
                  const int Bx, const int By, const scalar_t* B,
                  const scalar_t* __restrict__ A,
                  const scalar_t* __restrict__ BIAS, scalar_t* C,
                  const int _WvPrGrp, const int CuCount) {
+  if constexpr (!tag_matches_device<ArchTag>()) return;
   constexpr int max_lds_len = LDS_SIZE / 2;
   #if defined(__HIP__MI3XX__)
   constexpr bool use_mfma = (std::is_same_v<scalar_t, __hip_bfloat16>);
@@ -811,8 +836,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 }
 
 #else
-template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+template <typename ArchTag, typename scalar_t, int THRDS, int YTILE,
+          int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_(const int K, const int Kbp, const int Kap,
                              const int M, const int Bx, const int By,
                              const scalar_t* B, const scalar_t* __restrict__ A,
@@ -824,14 +849,15 @@ __global__ void wvSplitK_hf_(const int K, const int Kbp, const int Kap,
 
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets big A[] cases, where it is much larger than LDS capacity
-template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+template <typename ArchTag, typename scalar_t, int THRDS, int YTILE,
+          int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_big_(const int K, const int Kbp, const int Kap, const int M,
                      const int Bx, const int By, const scalar_t* B,
                      const scalar_t* __restrict__ A,
                      const scalar_t* __restrict__ BIAS, scalar_t* C,
                      const int _WvPrGrp, const int CuCount) {
+  if constexpr (!tag_matches_device<ArchTag>()) return;
   constexpr int max_lds_len = LDS_SIZE / 2;
   #if defined(__HIP__MI3XX__)
   constexpr bool use_mfma = (std::is_same_v<scalar_t, __hip_bfloat16>);
@@ -1161,8 +1187,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   }
 }
 #else
-template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+template <typename ArchTag, typename scalar_t, int THRDS, int YTILE,
+          int WvPrGrp, int A_CHUNK, int UNRL, int N>
 __global__ void wvSplitK_hf_big_(const int K, const int Kbp, const int Kap,
                                  const int M, const int Bx, const int By,
                                  const scalar_t* B,
@@ -1218,40 +1244,40 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int max_lds_len = get_lds_size() / 2;
 
-#define WVSPLITK_CFG(_THRDS, _WVPRGRP, _YTILE, _UNRL, _N)                     \
+#define WVSPLITK_CFG(_TAG, _THRDS, _WVPRGRP, _YTILE, _UNRL, _N)               \
   {                                                                           \
     dim3 block(_THRDS, _WVPRGRP);                                             \
     int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, _WVPRGRP);                 \
     if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))               \
-      wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>        \
+      wvSplitK_hf_sml_<_TAG, fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>  \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
                                        CuCount);                              \
     else if (Kbp_in * N_in <= max_lds_len * 1.2)                              \
-      wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>            \
+      wvSplitK_hf_<_TAG, fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>      \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
                                        CuCount);                              \
     else                                                                      \
-      wvSplitK_hf_big_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>        \
+      wvSplitK_hf_big_<_TAG, fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>  \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
                                        CuCount);                              \
   }
 
-#define WVSPLIT_TILE_CFG(_THRDS, _WVPRGRP, _sYT, __N)     \
-  {                                                       \
-    bool fit_lds = (Kbp_in * N_in <= max_lds_len);        \
-    if (_sYT <= 1)                                        \
-      WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)           \
-    else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2)) \
-      WVSPLITK_CFG(_THRDS, _WVPRGRP, 2, 2, __N)           \
-    else if (_sYT <= 4 * 3)                               \
-      WVSPLITK_CFG(_THRDS, _WVPRGRP, 3, 2, __N)           \
-    else if (__N == 4)                                    \
-      WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 1, __N)           \
-    else                                                  \
-      WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 2, __N)           \
+#define WVSPLIT_TILE_CFG(_TAG, _THRDS, _WVPRGRP, _sYT, __N) \
+  {                                                         \
+    bool fit_lds = (Kbp_in * N_in <= max_lds_len);          \
+    if (_sYT <= 1)                                          \
+      WVSPLITK_CFG(_TAG, _THRDS, _WVPRGRP, 1, 4, __N)       \
+    else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2))   \
+      WVSPLITK_CFG(_TAG, _THRDS, _WVPRGRP, 2, 2, __N)       \
+    else if (_sYT <= 4 * 3)                                 \
+      WVSPLITK_CFG(_TAG, _THRDS, _WVPRGRP, 3, 2, __N)       \
+    else if (__N == 4)                                      \
+      WVSPLITK_CFG(_TAG, _THRDS, _WVPRGRP, 4, 1, __N)       \
+    else                                                    \
+      WVSPLITK_CFG(_TAG, _THRDS, _WVPRGRP, 4, 2, __N)       \
   }
 
 #define WVSPLIT_TILE(_sYT, __N)                                      \
@@ -1259,30 +1285,21 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     bool fit_lds = (Kbp_in * N_in <= max_lds_len);                   \
     if (is_gfx11()) {                                                \
       if (_sYT <= 1)                                                 \
-        WVSPLITK_CFG(32, 16, 1, 4, __N)                              \
+        WVSPLITK_CFG(Gfx11Tag, 32, 16, 1, 4, __N)                    \
       else if (K_in < 1024)                                          \
-        WVSPLITK_CFG(32, 16, 2, 4, __N)                              \
+        WVSPLITK_CFG(Gfx11Tag, 32, 16, 2, 4, __N)                    \
       else if ((K_in % 1024 == 512) && (_sYT >= 40 || K_in >= 4096)) \
-        WVSPLITK_CFG(32, 16, 4, 1, __N)                              \
+        WVSPLITK_CFG(Gfx11Tag, 32, 16, 4, 1, __N)                    \
       else if (K_in <= 2048 && (__N >= 2 || _sYT <= 26))             \
-        WVSPLITK_CFG(32, 16, 1, 4, __N)                              \
+        WVSPLITK_CFG(Gfx11Tag, 32, 16, 1, 4, __N)                    \
       else if (__N >= 2 && !fit_lds)                                 \
-        WVSPLITK_CFG(32, 16, 1, 4, __N)                              \
+        WVSPLITK_CFG(Gfx11Tag, 32, 16, 1, 4, __N)                    \
       else if (__N == 1)                                             \
-        WVSPLITK_CFG(32, 16, 1, 2, __N)                              \
+        WVSPLITK_CFG(Gfx11Tag, 32, 16, 1, 2, __N)                    \
       else                                                           \
-        WVSPLITK_CFG(32, 16, 1, 1, __N)                              \
+        WVSPLITK_CFG(Gfx11Tag, 32, 16, 1, 1, __N)                    \
     } else {                                                         \
-      if (_sYT <= 1)                                                 \
-        WVSPLITK_CFG(64, 16, 1, 4, __N)                              \
-      else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2))          \
-        WVSPLITK_CFG(64, 16, 2, 2, __N)                              \
-      else if (_sYT <= 4 * 3)                                        \
-        WVSPLITK_CFG(64, 16, 3, 2, __N)                              \
-      else if (__N == 4)                                             \
-        WVSPLITK_CFG(64, 16, 4, 1, __N)                              \
-      else                                                           \
-        WVSPLITK_CFG(64, 16, 4, 2, __N)                              \
+      WVSPLIT_TILE_CFG(Gfx9Tag, 64, 16, _sYT, __N)                   \
     }                                                                \
   }
 
@@ -1304,27 +1321,27 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     switch (N_in) {
       case 1:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 1)
+          WVSPLIT_TILE_CFG(Gfx11Tag, 32, 16, sYT, 1)
         else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 1)
+          WVSPLIT_TILE_CFG(Gfx9Tag, 64, 16, sYT, 1)
         break;
       case 2:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 2)
+          WVSPLIT_TILE_CFG(Gfx11Tag, 32, 16, sYT, 2)
         else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 2)
+          WVSPLIT_TILE_CFG(Gfx9Tag, 64, 16, sYT, 2)
         break;
       case 3:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 3)
+          WVSPLIT_TILE_CFG(Gfx11Tag, 32, 16, sYT, 3)
         else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 3)
+          WVSPLIT_TILE_CFG(Gfx9Tag, 64, 16, sYT, 3)
         break;
       case 4:
         if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 4)
+          WVSPLIT_TILE_CFG(Gfx11Tag, 32, 16, sYT, 4)
         else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 4)
+          WVSPLIT_TILE_CFG(Gfx9Tag, 64, 16, sYT, 4)
         break;
       case 5:
         WVSPLIT_TILE(sYT, 5)
@@ -1375,61 +1392,61 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int max_lds_len = get_lds_size() / 2;
 
-  #define WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, _N)                  \
+  #define WVSPLITK_SWEEP_LAUNCH(_TAG, _THRDS, _YTILE, _UNRL, _N)            \
     {                                                                       \
       dim3 block(_THRDS, 16);                                               \
       int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, 16);                   \
       if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))           \
-        wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
+        wvSplitK_hf_sml_<_TAG, fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>    \
             <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
                                          By_in, af4, bf4, biasf4, c,        \
                                          __wvPrGrp, CuCount);               \
       else if (Kbp_in * N_in <= max_lds_len * 1.2)                          \
-        wvSplitK_hf_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>              \
+        wvSplitK_hf_<_TAG, fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>        \
             <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
                                          By_in, af4, bf4, biasf4, c,        \
                                          __wvPrGrp, CuCount);               \
       else                                                                  \
-        wvSplitK_hf_big_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
+        wvSplitK_hf_big_<_TAG, fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>    \
             <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
                                          By_in, af4, bf4, biasf4, c,        \
                                          __wvPrGrp, CuCount);               \
     }
 
-  #define WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL)              \
-    switch (N_in) {                                            \
-      case 1:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 1) break; \
-      case 2:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 2) break; \
-      case 3:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 3) break; \
-      case 4:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 4) break; \
-      default:                                                 \
-        TORCH_CHECK(false, "Unsupported N=", N_in);            \
+  #define WVSPLITK_SWEEP_N(_TAG, _THRDS, _YTILE, _UNRL)              \
+    switch (N_in) {                                                  \
+      case 1:                                                        \
+        WVSPLITK_SWEEP_LAUNCH(_TAG, _THRDS, _YTILE, _UNRL, 1) break; \
+      case 2:                                                        \
+        WVSPLITK_SWEEP_LAUNCH(_TAG, _THRDS, _YTILE, _UNRL, 2) break; \
+      case 3:                                                        \
+        WVSPLITK_SWEEP_LAUNCH(_TAG, _THRDS, _YTILE, _UNRL, 3) break; \
+      case 4:                                                        \
+        WVSPLITK_SWEEP_LAUNCH(_TAG, _THRDS, _YTILE, _UNRL, 4) break; \
+      default:                                                       \
+        TORCH_CHECK(false, "Unsupported N=", N_in);                  \
     }
 
-  #define WVSPLITK_SWEEP_UNRL(_THRDS, _YTILE)        \
+  #define WVSPLITK_SWEEP_UNRL(_TAG, _THRDS, _YTILE)  \
     if (unrl == 1) {                                 \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 1)            \
+      WVSPLITK_SWEEP_N(_TAG, _THRDS, _YTILE, 1)      \
     } else if (unrl == 2) {                          \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 2)            \
+      WVSPLITK_SWEEP_N(_TAG, _THRDS, _YTILE, 2)      \
     } else if (unrl == 4) {                          \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 4)            \
+      WVSPLITK_SWEEP_N(_TAG, _THRDS, _YTILE, 4)      \
     } else {                                         \
       TORCH_CHECK(false, "Unsupported unrl=", unrl); \
     }
 
-  #define WVSPLITK_SWEEP_YTILE(_THRDS)                 \
+  #define WVSPLITK_SWEEP_YTILE(_TAG, _THRDS)           \
     if (ytile == 1) {                                  \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 1)                   \
+      WVSPLITK_SWEEP_UNRL(_TAG, _THRDS, 1)             \
     } else if (ytile == 2) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 2)                   \
+      WVSPLITK_SWEEP_UNRL(_TAG, _THRDS, 2)             \
     } else if (ytile == 3) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 3)                   \
+      WVSPLITK_SWEEP_UNRL(_TAG, _THRDS, 3)             \
     } else if (ytile == 4) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 4)                   \
+      WVSPLITK_SWEEP_UNRL(_TAG, _THRDS, 4)             \
     } else {                                           \
       TORCH_CHECK(false, "Unsupported ytile=", ytile); \
     }
@@ -1445,9 +1462,9 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
     fptype* c = reinterpret_cast<fptype*>(out_c.data_ptr());
 
     if (is_gfx11()) {
-      WVSPLITK_SWEEP_YTILE(32)
+      WVSPLITK_SWEEP_YTILE(Gfx11Tag, 32)
     } else {
-      WVSPLITK_SWEEP_YTILE(64)
+      WVSPLITK_SWEEP_YTILE(Gfx9Tag, 64)
     }
   });
 
