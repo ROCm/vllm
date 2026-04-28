@@ -718,6 +718,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
+        # AITER MLA decode scratch buffers (lazy-init on first call)
+        self._aiter_scratch: "AiterSparseScratch | None" = None
+        self._aiter_extra_scratch: "AiterSparseScratch | None" = None
+
         # Determine padded head count for FlashMLA
         if num_heads not in self.SUPPORTED_HEAD_COUNTS:
             if num_heads < 64:
@@ -897,10 +901,11 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_metadata.decode_swa_lens
 
         if current_platform.is_rocm():
-            self._forward_decode_fallback(
+            # On ROCm, DeepSeek sparse attention is only supported via AITER,
+            # so we always dispatch to the AITER decode path.
+            self._forward_decode_aiter(
                 q=q,
                 kv_cache=kv_cache,
-                swa_metadata=swa_metadata,
                 swa_only=swa_only,
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
@@ -1131,6 +1136,103 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         rows = cache[slot_ids // block_size, slot_ids % block_size]
         return self._dequantize_cache_rows(rows).reshape(-1, self.head_dim)
 
+    def _forward_decode_aiter(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        swa_only: bool,
+        topk_indices: torch.Tensor | None,
+        topk_lens: torch.Tensor | None,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """AITER-accelerated sparse MLA decode (ROCm/MI355X).
+
+        Uses aiter.mla.mla_decode_fwd with FP8 persistent-mode ASM kernels
+        for ~2-3x decode speedup over the torch reference at high batch sizes.
+        This is the only sparse-attention decode path on ROCm.
+        """
+        from vllm.v1.attention.ops.rocm_aiter_dsv4_decode import (
+            AiterSparseScratch,
+            aiter_sparse_attn_decode,
+        )
+
+        if self._aiter_scratch is None:
+            self._aiter_scratch = AiterSparseScratch()
+        if self._aiter_extra_scratch is None:
+            self._aiter_extra_scratch = AiterSparseScratch()
+
+        # Route the per-layer-sized dequant + fp8-cast intermediates through
+        # the shared workspace manager so all 61 DSv4 layers reuse the same
+        # bf16 / fp8 buffers across each decode step. Without this, each layer
+        # allocates two ~kv-cache-sized fresh tensors per step, which inflates
+        # the cudagraph memory pool by ~60x. The buffer sizes only depend on
+        # static kv-cache shape (num_blocks, block_size, head_dim), so they
+        # reach their max on the first warmup call and stay stable through
+        # capture and lock_workspace().
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        fp8_dtype = current_platform.fp8_dtype()
+        swa_dequant_shape = (
+            swa_kv_cache.shape[0],
+            swa_kv_cache.shape[1],
+            1,
+            self.head_dim,
+        )
+        if swa_only:
+            swa_bf16, swa_fp8 = current_workspace_manager().get_simultaneous(
+                (swa_dequant_shape, torch.bfloat16),
+                (swa_dequant_shape, fp8_dtype),
+            )
+            extra_bf16 = None
+            extra_fp8 = None
+        else:
+            assert kv_cache is not None
+            extra_dequant_shape = (
+                kv_cache.shape[0],
+                kv_cache.shape[1],
+                1,
+                self.head_dim,
+            )
+            (
+                swa_bf16,
+                swa_fp8,
+                extra_bf16,
+                extra_fp8,
+            ) = current_workspace_manager().get_simultaneous(
+                (swa_dequant_shape, torch.bfloat16),
+                (swa_dequant_shape, fp8_dtype),
+                (extra_dequant_shape, torch.bfloat16),
+                (extra_dequant_shape, fp8_dtype),
+            )
+
+        blocked_swa = self._dequantize_blocked_k_cache(
+            swa_kv_cache, out=swa_bf16
+        )
+        blocked_extra = (
+            None
+            if swa_only
+            else self._dequantize_blocked_k_cache(kv_cache, out=extra_bf16)
+        )
+
+        attn_out = aiter_sparse_attn_decode(
+            q=q.unsqueeze(1),
+            blocked_k=blocked_swa,
+            indices_in_kvcache=swa_indices.unsqueeze(1),
+            topk_length=swa_lens,
+            attn_sink=self.attn_sink[:q.shape[1]],
+            scale=self.scale,
+            head_dim=self.head_dim,
+            extra_blocked_k=blocked_extra,
+            extra_indices_in_kvcache=topk_indices,
+            extra_topk_length=topk_lens,
+            scratch=self._aiter_scratch,
+            extra_scratch=self._aiter_extra_scratch,
+            kv_fp8_buf=swa_fp8,
+            extra_kv_fp8_buf=extra_fp8,
+        )
+        output.copy_(attn_out.to(output.dtype))
+
     def _forward_decode_fallback(
         self,
         q: torch.Tensor,
@@ -1157,7 +1259,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         )
         output.copy_(attn_out.to(output.dtype))
 
-    def _dequantize_blocked_k_cache(self, quant_k_cache: torch.Tensor) -> torch.Tensor:
+    def _dequantize_blocked_k_cache(
+        self,
+        quant_k_cache: torch.Tensor,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dequantize the packed FP8/bf16 paged K cache to a contiguous bf16 view.
+
+        Args:
+            quant_k_cache: (num_blocks, block_size, head_bytes) uint8 packed cache.
+            out: Optional preallocated bf16 buffer of shape
+                (num_blocks, block_size, 1, head_dim). When provided, the result
+                is written into this buffer in-place and returned. This lets the
+                caller route the output through `current_workspace_manager()` so
+                the buffer is shared across all 61 DSv4 layers instead of
+                allocating fresh per layer per step.
+        """
         fp8_dtype = current_platform.fp8_dtype()
         d = self.head_dim
         d_nope = self.nope_head_dim
@@ -1178,11 +1295,21 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             .view(torch.float8_e8m0fnu)
         )
 
-        result = torch.empty(
-            (num_blocks, block_size, 1, d),
-            dtype=torch.bfloat16,
-            device=quant_k_cache.device,
-        )
+        if out is None:
+            result = torch.empty(
+                (num_blocks, block_size, 1, d),
+                dtype=torch.bfloat16,
+                device=quant_k_cache.device,
+            )
+        else:
+            assert out.shape == (num_blocks, block_size, 1, d), (
+                f"out buffer shape {tuple(out.shape)} must match expected "
+                f"({num_blocks}, {block_size}, 1, {d})"
+            )
+            assert out.dtype == torch.bfloat16, (
+                f"out buffer dtype {out.dtype} must be bf16"
+            )
+            result = out
         result[..., d_nope:] = input_rope.unsqueeze(2)
         for tile_idx in range(num_tiles):
             cur_nope = input_nope[
