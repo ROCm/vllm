@@ -13,7 +13,6 @@ treats it as opaque, avoiding issues with data-dependent branches
 on symbolic batch sizes.
 """
 
-import os
 from contextlib import nullcontext
 
 import torch
@@ -29,11 +28,6 @@ from .triton import TritonInt8ScaledMMLinearKernel
 # auxiliary shared memory (dynamic quant scales, reduction scratch).
 # gfx9: 64KB-128, gfx95x: 160KB-128 (kernel checks at runtime)
 LDS_CAPACITY_BYTES = 64 * 1024 - 128
-
-# Set VLLM_ROCM_FUSED_QUANT=0 to disable fused quantization in the
-# wvSplitK_w8a8 kernel (quantize activations separately, pass int8).
-# Useful for A/B profiling without rebuilding.
-_FUSED_QUANT = os.environ.get("VLLM_ROCM_FUSED_QUANT", "1") != "0"
 
 
 def _w8a8_apply_impl(
@@ -73,17 +67,8 @@ def _w8a8_apply_impl(
         else:
             w_scale_chan = w_s.to(out_dtype).contiguous()
 
-        if i_s is not None:
-            a_scale = i_s.to(torch.float32).reshape(1)
-            if _FUSED_QUANT:
-                act = x.contiguous()
-            else:
-                act, _, _ = ops.scaled_int8_quant(
-                    x.contiguous(), i_s, None, symmetric=True
-                )
-        else:
-            a_scale = None
-            act = x.contiguous()
+        a_scale = i_s.to(torch.float32).reshape(1) if i_s is not None else None
+        act = x.contiguous()
 
         return ops.wvSplitK_w8a8(
             w_t,

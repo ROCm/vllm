@@ -6,8 +6,8 @@
 Sweeps YTILE x UNRL x A_CHUNK x WvPrGrp for all shapes and batch sizes,
 producing a CSV of results and summary tables.
 
-W8A8: int8 weights, int8 activations, per-channel weight scale (fp16/bf16),
-per-tensor activation scale (float32).
+W8A8: int8 weights, bf16/fp16 activations (fused quantization inside kernel),
+per-channel weight scale (fp16/bf16), per-tensor activation scale (float32).
 
 Usage:
     python sweep_w8a8_kernel.py
@@ -170,7 +170,7 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype):
                 skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
                 continue
 
-            # Generate int8 data
+            # Generate data: int8 weights, bf16/fp16 activations (fused quant)
             import math
 
             xavier = math.sqrt(2 / K)
@@ -182,8 +182,9 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype):
             ) * xavier
 
             W_int8, w_scale = quantize_symmetric(W_fp)
-            A_int8, a_scale = quantize_per_tensor(A_fp)
+            _, a_scale = quantize_per_tensor(A_fp)
             w_scale_typed = w_scale.to(dtype)
+            A_typed = A_fp.to(dtype)
 
             # Weight bytes: M * K * 1 (int8)
             weight_bytes = M * K
@@ -206,7 +207,7 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype):
                         ac=achunk,
                         wv=wvprgrp,
                         w=W_int8,
-                        a=A_int8,
+                        a=A_typed,
                         ws=w_scale_typed,
                         as_=a_scale: (
                             ops.wvSplitK_w8a8_sweep(
@@ -382,7 +383,6 @@ def analyze_results(csv_path, best_per_shape):
     print("YTILE/UNRL ANALYSIS (best per shape vs current heuristic)")
     print("=" * 100)
 
-    cu_count = get_cu_count()
     for sk in sorted(shape_keys):
         M, K, N, label = sk
         rows_for_shape = [
@@ -393,9 +393,11 @@ def analyze_results(csv_path, best_per_shape):
         best = min(rows_for_shape, key=lambda r: r["time_us"])
 
         # W8A8 production heuristic (from skinny_gemms_w8a8.cu WVSPLIT_W8A8_TILE)
-        sYT = (M + cu_count * 4 - 1) // (cu_count * 4)
-        if N >= 4 and sYT >= 480:
-            heur_yt, heur_ur = 4, 1
+        # Two device classes: low-bandwidth gfx11 vs gfx1151/gfx9.
+        # Detection would need the GPU; assume gfx9/gfx1151 path here
+        # (the sweep runs on the actual device, so results are valid either way).
+        if K <= 1024 and M % 2 == 0:
+            heur_yt, heur_ur = 2, 1
         else:
             heur_yt, heur_ur = 1, 4
 

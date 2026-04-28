@@ -178,7 +178,6 @@ static __device__ __forceinline__ int8_t float_to_int8_rn(float x) {
 // activation)
 //
 // Quantization modes for activations (quant_mode):
-//   0 = pre-quantized int8 (no fusion)
 //   1 = fused static quant (bf16 in, known a_scale)
 //   2 = fused dynamic quant (bf16 in, compute a_scale per row)
 #if defined(__HIP__GFX9__) || defined(__GFX11__)
@@ -284,7 +283,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       }
       __syncthreads();
     }
-  } else if (quant_mode == 1) {
+  } else {
     // --- Mode 1: fused static quantization ---
     // Activations arrive in bf16/fp16 with known per-tensor a_scale.
     const scalar_t* A_fp = (const scalar_t*)A_raw;
@@ -300,23 +299,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       }
     }
     __syncthreads();
-  } else {
-    // --- Mode 0: pre-quantized int8 ---
-    const int8_t* A = (const int8_t*)A_raw;
-    for (uint32_t k = 0; k < min_w8a8(K * N, max_lds_ints);
-         k += THRDS * WvPrGrp * A_CHUNK) {
-      uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
-      if (k_in >= min_w8a8(K * N, max_lds_ints)) break;
-      *((bigTypeA*)(&s[k_in])) = *((bigTypeA*)(&A[k_in]));
-    }
-    __syncthreads();
   }
 
   if (threadIdx.y >= _WvPrGrp) return;
 
   uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * YTILE;
 
-  // Load per-tensor activation scale once (modes 0 and 1)
+  // Load per-tensor activation scale once (mode 1 only; mode 2 uses
+  // a_scales_dyn)
   const float a_scale_val = (quant_mode != 2) ? *a_scale : 0.0f;
 
   #if defined(__GFX11__)
@@ -517,25 +507,18 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   TORCH_CHECK(in_a.dtype() == torch::kInt8, "Weight must be int8");
 
   // Determine quantization mode:
-  //   0 = pre-quantized int8 (no fusion)
   //   1 = fused static quant (bf16 in, known a_scale)
   //   2 = fused dynamic quant (bf16 in, compute a_scale per row)
+  TORCH_CHECK(in_b.dtype() != torch::kInt8,
+              "Pre-quantized int8 activations not supported; pass bf16/fp16");
+  TORCH_CHECK(in_b.dtype() == in_w_scale.dtype(),
+              "Activation dtype must match weight scale dtype, got ",
+              in_b.dtype(), " vs ", in_w_scale.dtype());
   int quant_mode;
-  if (in_b.dtype() == torch::kInt8) {
-    quant_mode = 0;  // pre-quantized
-  } else if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
+  if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
     quant_mode = 1;  // fused static
-    TORCH_CHECK(in_b.dtype() == in_w_scale.dtype(),
-                "Fused quant: activation dtype must match weight scale dtype, "
-                "got ",
-                in_b.dtype(), " vs ", in_w_scale.dtype());
   } else {
     quant_mode = 2;  // fused dynamic
-    TORCH_CHECK(
-        in_b.dtype() == in_w_scale.dtype(),
-        "Dynamic quant: activation dtype must match weight scale dtype, "
-        "got ",
-        in_b.dtype(), " vs ", in_w_scale.dtype());
   }
   if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
     TORCH_CHECK(in_a_scale->dtype() == torch::kFloat32,
@@ -671,18 +654,16 @@ torch::Tensor wvSplitK_w8a8_sweep(const at::Tensor& in_a,
                    : 1;
 
   TORCH_CHECK(in_a.dtype() == torch::kInt8, "Weight must be int8");
+  TORCH_CHECK(in_b.dtype() != torch::kInt8,
+              "Pre-quantized int8 activations not supported; pass bf16/fp16");
+  TORCH_CHECK(in_b.dtype() == in_w_scale.dtype(),
+              "Activation dtype must match weight scale dtype, got ",
+              in_b.dtype(), " vs ", in_w_scale.dtype());
   int quant_mode;
-  if (in_b.dtype() == torch::kInt8) {
-    quant_mode = 0;
-  } else if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
+  if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
     quant_mode = 1;
-    TORCH_CHECK(in_b.dtype() == in_w_scale.dtype(),
-                "Fused quant: activation dtype must match weight scale dtype");
   } else {
     quant_mode = 2;
-    TORCH_CHECK(
-        in_b.dtype() == in_w_scale.dtype(),
-        "Dynamic quant: activation dtype must match weight scale dtype");
   }
   if (in_a_scale.has_value() && in_a_scale->numel() > 0) {
     TORCH_CHECK(in_a_scale->dtype() == torch::kFloat32,

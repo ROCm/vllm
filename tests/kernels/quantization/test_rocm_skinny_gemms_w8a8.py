@@ -3,9 +3,10 @@
 """
 Tests for the W8A8 INT8 skinny GEMM kernel (wvSplitK_w8a8).
 
-This kernel handles int8 weights x int8 activations with:
+This kernel handles int8 weights with fused activation quantization:
+- Activations passed as bf16/fp16, quantized to int8 inside the kernel
 - Per-channel weight scale (fp16/bf16)
-- Per-tensor activation scale (float32)
+- Per-tensor activation scale (float32) for static quant, or None for dynamic
 - Optional bias
 """
 
@@ -131,16 +132,21 @@ def quantize_per_tensor(
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
 @torch.inference_mode()
 def test_rocm_wvsplitk_w8a8_kernel(xnorm, n, k, m, dtype, seed, bias_mode):
+    """Test fused static quantization: pass bf16/fp16 activations with a_scale.
+
+    The kernel quantizes activations to int8 internally using the provided
+    per-tensor scale, then performs the int8 GEMM.
+    """
     torch.manual_seed(seed)
     cu_count = num_compute_units()
 
     xavier = math.sqrt(2 / k) if xnorm else 1
 
-    # Generate random fp16 data, then quantize to int8
+    # Generate random data
     W_fp = (torch.rand(m, k, dtype=torch.float32, device="cuda") * 2 - 1) * xavier
     A_fp = (torch.rand(n, k, dtype=torch.float32, device="cuda") * 2 - 1) * xavier
 
-    # Quantize weights per-channel, activations per-tensor
+    # Quantize weights per-channel, activations per-tensor (for reference)
     W_int8, w_scale = quantize_symmetric(W_fp)
     A_int8, a_scale = quantize_per_tensor(A_fp)
 
@@ -156,16 +162,18 @@ def test_rocm_wvsplitk_w8a8_kernel(xnorm, n, k, m, dtype, seed, bias_mode):
     # Reference: dequantize and matmul in float32
     ref_out = ref_w8a8_gemm(W_int8, A_int8, w_scale_typed, a_scale, BIAS, dtype)
 
-    # Kernel under test
-    out = ops.wvSplitK_w8a8(W_int8, A_int8, w_scale_typed, a_scale, cu_count, BIAS)
+    # Kernel under test: pass bf16/fp16 activations (fused static quant)
+    A_typed = A_fp.to(dtype)
+    out = ops.wvSplitK_w8a8(W_int8, A_typed, w_scale_typed, a_scale, cu_count, BIAS)
 
+    # Slightly looser tolerance: fused path quantizes from fp16/bf16 (less
+    # precision than float32 quantization in the reference)
     if xnorm:
-        atol = max(1e-3, torch.finfo(dtype).eps * math.sqrt(k))
-        torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+        atol = max(2e-3, torch.finfo(dtype).eps * math.sqrt(k) * 2)
+        torch.testing.assert_close(out, ref_out, atol=atol, rtol=2e-2)
     else:
-        # Accumulation error scales with sqrt(K) for fp16
-        atol = torch.finfo(dtype).eps * math.sqrt(k)
-        torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+        atol = torch.finfo(dtype).eps * math.sqrt(k) * 2
+        torch.testing.assert_close(out, ref_out, atol=atol, rtol=2e-2)
 
 
 # --- Sweep tests (requires build with -DVLLM_SKINNY_GEMM_SWEEP) ---
@@ -204,6 +212,7 @@ SWEEP_PARAMS = [
 @pytest.mark.skipif(not SWEEP_HAS_OP, reason="requires VLLM_SKINNY_GEMM_SWEEP build")
 @torch.inference_mode()
 def test_rocm_wvsplitk_w8a8_sweep(n, k, m, dtype, ytile, unrl, achunk, wvprgrp):
+    """Sweep test with fused static quantization (bf16/fp16 activations)."""
     # Skip if M not divisible by ytile or K not divisible by achunk
     if m % ytile != 0:
         pytest.skip(f"M={m} not divisible by ytile={ytile}")
@@ -224,9 +233,11 @@ def test_rocm_wvsplitk_w8a8_sweep(n, k, m, dtype, ytile, unrl, achunk, wvprgrp):
 
     ref_out = ref_w8a8_gemm(W_int8, A_int8, w_scale_typed, a_scale, None, dtype)
 
+    # Pass bf16/fp16 activations (fused static quant)
+    A_typed = A_fp.to(dtype)
     out = ops.wvSplitK_w8a8_sweep(
         W_int8,
-        A_int8,
+        A_typed,
         w_scale_typed,
         a_scale,
         cu_count,
@@ -236,8 +247,8 @@ def test_rocm_wvsplitk_w8a8_sweep(n, k, m, dtype, ytile, unrl, achunk, wvprgrp):
         wvprgrp,
     )
 
-    atol = max(1e-3, torch.finfo(dtype).eps * math.sqrt(k))
-    torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+    atol = max(2e-3, torch.finfo(dtype).eps * math.sqrt(k) * 2)
+    torch.testing.assert_close(out, ref_out, atol=atol, rtol=2e-2)
 
 
 # --- Fused quantization tests (bf16/fp16 activations passed directly) ---
