@@ -1,0 +1,21 @@
+# config for cyankiwi/Qwen3-Omni-30B-A3B-Instruct-AWQ-4bit
+model:
+  num_layers: 40
+  num_q_heads: 16
+  num_kv_heads: 2
+  head_dim: 256
+  block_size: 16
+
+batch_specs:
+  - "q8ks128"
+  - "q8ks1"
+  - "q1s8k"
+
+backends:
+  - TRITON_ATTN
+  - ROCM_AITER_UNIFIED_ATTN
+
+device: "cuda:0"
+repeats: 100  # Reduced from 1000 due to large model size (40 layers)
+warmup_iters: 20  # Reduced from 100
+profile_memory: false

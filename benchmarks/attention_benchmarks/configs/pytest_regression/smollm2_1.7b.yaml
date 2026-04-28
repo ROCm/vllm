@@ -1,0 +1,21 @@
+# Config for trymirai/SmolLM2-1.7B-Instruct-AWQ
+model:
+  num_layers: 24
+  num_q_heads: 32
+  num_kv_heads: 32
+  head_dim: 64
+  block_size: 16
+
+batch_specs:
+  - "q8ks128"
+  - "q8ks1"
+  - "q1s8k"
+
+backends:
+  - TRITON_ATTN
+  - ROCM_AITER_UNIFIED_ATTN
+
+device: "cuda:0"
+repeats: 200
+warmup_iters: 100
+profile_memory: false
