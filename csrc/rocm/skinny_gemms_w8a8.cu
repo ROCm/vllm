@@ -135,26 +135,6 @@ struct scalar<c10::BFloat16> {
                                  *((int*)(&(V3))), V0, false);
 #endif
 
-#if defined(__GFX11__)
-  #define REDUCE_SUM_WAVE32(val)  \
-    do {                          \
-      val += __shfl_xor(val, 1);  \
-      val += __shfl_xor(val, 2);  \
-      val += __shfl_xor(val, 4);  \
-      val += __shfl_xor(val, 8);  \
-      val += __shfl_xor(val, 16); \
-    } while (0)
-
-  #define REDUCE_MAX_WAVE32(val)             \
-    do {                                     \
-      val = fmaxf(val, __shfl_xor(val, 1));  \
-      val = fmaxf(val, __shfl_xor(val, 2));  \
-      val = fmaxf(val, __shfl_xor(val, 4));  \
-      val = fmaxf(val, __shfl_xor(val, 8));  \
-      val = fmaxf(val, __shfl_xor(val, 16)); \
-    } while (0)
-#endif
-
 __device__ inline unsigned int min_w8a8(uint32_t a, uint32_t b) {
   return min(a, b);
 }
@@ -239,7 +219,24 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
       // Phase 2: warp-level max reduction
   #if defined(__GFX11__)
-      REDUCE_MAX_WAVE32(tmax);
+      // GFX11 wave32: row_shr DPP cascade for absmax (lanes 0-15),
+      // then __shfl_xor(16) to combine the two halves.
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_shr:8 bound_ctrl:0 "
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_shr:4 bound_ctrl:0 "
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_shr:2 bound_ctrl:0 "
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      asm("s_nop 0\n\tv_max_f32 %0, %2, %3 row_shr:1 bound_ctrl:0 "
+          : "=v"(tmax)
+          : "0"(tmax), "v"(tmax), "v"(tmax));
+      tmax = fmaxf(tmax, __shfl_xor(tmax, 16));
+      // Broadcast from lane (THRDS-1) so the LDS write at lane 0 below
+      // (shared with the GFX9 path) sees the reduced value.
+      tmax = __shfl(tmax, THRDS - 1);
   #else
       // GFX9 wave64: DPP reduction for max (same shift pattern as sum
       // reduction)
@@ -403,10 +400,21 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
     // Reduction
   #if defined(__GFX11__)
-    for (int n = 0; n < N; n++)
-      for (int y = 0; y < YTILE; y++) REDUCE_SUM_WAVE32(sum[n][y]);
+    for (int n = 0; n < N; n++) {
+      for (int y = 0; y < YTILE; y++) {
+        sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf,
+                                              1);  // row_shr8
+        sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x114, 0xf, 0xf,
+                                              1);  // row_shr4
+        sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x112, 0xf, 0xf,
+                                              1);  // row_shr2
+        sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x111, 0xf, 0xf,
+                                              1);  // row_shr1
+        sum[n][y] += __shfl_xor(sum[n][y], 16);
+      }
+    }
 
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == (THRDS - 1)) {
       for (int n = 0; n < N; n++) {
         float a_s = (quant_mode == 2) ? a_scales_dyn[n] : a_scale_val;
         for (int i = 0; i < YTILE; i++) {
