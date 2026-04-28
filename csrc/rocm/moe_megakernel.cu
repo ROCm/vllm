@@ -106,6 +106,11 @@ __device__ __forceinline__ __hip_bfloat16 __float2s(float v) {
 
 __device__ __forceinline__ uint32_t
 bf16x2_dequant_sub_finite(uint32_t a_bits, uint32_t bias_bits) {
+  // Truncating pack fp32 -> bf16: bit-exact equivalent to RTNE here
+  // because every possible result is an integer in [-8, 7] whose bf16
+  // representation has zero low 16 bits. Saves the ~4 vector-ALU
+  // round-half-to-even chain per pair vs RTNE. See the matching comment
+  // in skinny_gemms_int4.cu for the proof.
   float a_lo = __uint_as_float((a_bits & 0xFFFFu) << 16);
   float a_hi = __uint_as_float(a_bits & 0xFFFF0000u);
   float b_lo = __uint_as_float((bias_bits & 0xFFFFu) << 16);
@@ -114,9 +119,7 @@ bf16x2_dequant_sub_finite(uint32_t a_bits, uint32_t bias_bits) {
   float r_hi = a_hi - b_hi;
   uint32_t lo_bits = __float_as_uint(r_lo);
   uint32_t hi_bits = __float_as_uint(r_hi);
-  uint32_t lo_round = lo_bits + 0x7FFFu + ((lo_bits >> 16) & 1u);
-  uint32_t hi_round = hi_bits + 0x7FFFu + ((hi_bits >> 16) & 1u);
-  return (lo_round >> 16) | (hi_round & 0xFFFF0000u);
+  return (lo_bits >> 16) | (hi_bits & 0xFFFF0000u);
 }
 
 template <typename T>

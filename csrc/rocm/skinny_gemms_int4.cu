@@ -113,17 +113,18 @@ __device__ __forceinline__ __hip_bfloat16 __float2s(float v) {
 // Specialised bf16x2 - bf16x2 subtraction for the int4 dequant magic-number
 // trick. Inputs are constructed via `(nibble & 0x000F000F) | 0x43004300u`,
 // i.e. bf16(128.0)..bf16(143.0), and the BIAS is bf16(128.0) or bf16(136.0).
-// The result is provably finite in [-8, 7], so the IEEE-754 NaN-quieting
-// path that LLVM emits for `__hsub2(bf16x2,bf16x2)` on gfx1151 (no native
-// v_pk_sub_bf16) is dead code. We bypass it by:
+// The result is provably an integer in [-8, 7], all exactly representable
+// in bf16, so the IEEE-754 NaN-quieting path that LLVM emits for
+// `__hsub2(bf16x2,bf16x2)` on gfx1151 is dead code. We bypass it by:
 //   1) expanding each bf16 to fp32 via shift (high 16 bits == bf16 bits),
 //   2) doing a packed v_pk_add_f32 with the negated BIAS,
-//   3) packing back to bf16 with RTNE but no NaN canonicalisation
-//      (RTNE = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16).
-// Bit-exact for finite inputs vs `__hsub2`; saves ~7 vector-ALU ops per
-// call out of ~12 (eliminates the 130-element v_cmp_u_f32 / v_or 0x400000
-// / v_add3 chain in the K1 + K3 inner loop that otherwise consumes ~10%
-// of inner-loop vector-ALU work).
+//   3) packing back to bf16 by **truncation** (drop low 16 bits).
+// Truncation is bit-exact equivalent to RTNE here because every possible
+// result is an integer in [-8, 7] whose bf16 representation has zero
+// low 16 bits (no rounding can change the high half). This saves the
+// ~4 vector-ALU `bits + 0x7FFF + ((bits>>16)&1)` round-half-to-even chain per
+// pair. gfx11 has no native v_cvt_pk_bf16_f32 (gfx12+ only), so we're
+// already at the per-lane shuffle floor.
 __device__ __forceinline__ uint32_t
 bf16x2_dequant_sub_finite(uint32_t a_bits, uint32_t bias_bits) {
   // Expand bf16x2 -> 2 fp32 (low/high lanes).
@@ -136,12 +137,11 @@ bf16x2_dequant_sub_finite(uint32_t a_bits, uint32_t bias_bits) {
   float r_lo = a_lo - b_lo;
   float r_hi = a_hi - b_hi;
 
-  // RTNE pack fp32 -> bf16 without NaN-quieting. Safe because |r| <= 8.
+  // Truncating pack fp32 -> bf16. The low 16 bits of an integer in
+  // [-8, 7] cast to fp32 are always zero, so dropping them loses nothing.
   uint32_t lo_bits = __float_as_uint(r_lo);
   uint32_t hi_bits = __float_as_uint(r_hi);
-  uint32_t lo_round = lo_bits + 0x7FFFu + ((lo_bits >> 16) & 1u);
-  uint32_t hi_round = hi_bits + 0x7FFFu + ((hi_bits >> 16) & 1u);
-  return (lo_round >> 16) | (hi_round & 0xFFFF0000u);
+  return (lo_bits >> 16) | (hi_bits & 0xFFFF0000u);
 }
 
 template <typename T>
