@@ -204,6 +204,9 @@ jobs:
           # Nightly torchvision has operator ABI mismatch with nightly torch.
           # Our kernel tests don't need it; remove to prevent conftest crash.
           uv pip uninstall --system torchvision 2>/dev/null || true
+          # Pin aiter version for benchmark consistency
+          uv pip install --system amd-aiter==0.1.1.dev1553+gb4b75165f \
+            --index-url ${{ env.PYTORCH_INDEX_URL }}
 
       - name: Prepare test environment
         run: |
@@ -223,7 +226,7 @@ jobs:
           print(f'Platform: {type(current_platform).__name__}')
           "
 
-      - name: Run kernel tests
+      - name: Run kernel correctness tests
         run: |
           python -m pytest -v --timeout=300 \
             tests/kernels/moe/test_exllama_moe.py \
@@ -234,6 +237,13 @@ jobs:
             tests/kernels/quantization/test_rocm_compressed_tensors_w4a16.py \
             tests/kernels/quantization/test_rocm_skinny_gemms.py \
             tests/quantization/test_hip_w4a16_kernel.py
+
+      - name: Run attention benchmarks
+        run: |
+          # Let GPU cool before running benchmarks to avoid throttling
+          .github/workflows/scripts/gpu-coolodown.sh
+          python -m pytest -v --timeout=600 \
+            tests/kernels/attention/benchmark/test_benchmark_attention.py
 
   upload-wheel:
     runs-on: ubuntu-latest
