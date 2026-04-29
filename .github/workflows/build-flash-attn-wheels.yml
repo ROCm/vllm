@@ -1,6 +1,7 @@
 name: Build Flash Attn ROCm Wheels
 
-# This workflow builds flash_attn wheels with the Triton backend for ROCm.
+# This workflow builds flash_attn wheels with the Triton backend for ROCm and
+# uploads them to s3://aig-embd-gfx11-wheels/simple/flash-attn/ (PEP 503 index).
 #
 # IMPORTANT: Architecture Independence
 # ------------------------------------
@@ -11,46 +12,86 @@ name: Build Flash Attn ROCm Wheels
 #   2. The Triton kernels are compiled JIT (just-in-time) at runtime
 #   3. The resulting wheel is architecture-agnostic
 #
-# The PyTorch index is only used during build because setup.py imports torch
-# to detect IS_HIP_EXTENSION. The actual GPU target (gfx1150, gfx1151, etc.)
-# is determined at runtime when Triton compiles the attention kernels.
+# Versioning: the workflow tracks the `main` branch of
+# Dao-AILab/flash-attention. The wheel version is derived from `git describe`
+# against the latest v2.* tag, e.g.
+#   on a tag       → 2.8.3
+#   N commits past → 2.8.4.dev<N>+g<shortsha>
+# Once upstream tags v2.8.4, the dev-version override falls away automatically.
 #
-# This means users can install this wheel and use it on any gfx11 target
-# that Triton supports, regardless of which PyTorch index was used during build.
+# The check job skips the build when a wheel matching the upstream HEAD SHA
+# is already present in the S3 index.
 
 on:
-  workflow_dispatch:
-    inputs:
-      pytorch_index:
-        description: 'PyTorch index URL (only needed for build-time torch import)'
-        default: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
-        required: false
-      flash_attn_repo:
-        description: 'Flash Attention repository URL'
-        default: 'https://github.com/ROCm/flash-attention'
-        required: false
-      flash_attn_ref:
-        description: 'Flash Attention git ref (branch/tag/commit)'
-        default: 'main'
-        required: false
-      local_version:
-        description: 'Local version suffix for wheel (e.g., rocm.triton.gfx11)'
-        default: 'rocm.triton.gfx11'
-        required: false
+  push:
+    branches:
+      - gfx11
 
 env:
-  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2-staging/gfx1151' }}
-  FLASH_ATTN_REPO: ${{ github.event.inputs.flash_attn_repo || 'https://github.com/ROCm/flash-attention' }}
-  FLASH_ATTN_REF: ${{ github.event.inputs.flash_attn_ref || 'main' }}
-  # Enable Triton backend - this skips CK compilation and makes the wheel arch-agnostic
-  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
-  # Custom version suffix to indicate this is a ROCm Triton build
-  FLASH_ATTN_LOCAL_VERSION: ${{ github.event.inputs.local_version || 'rocm.triton.gfx11' }}
+  PYTORCH_INDEX_URL: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
+  FLASH_ATTN_REPO: 'Dao-AILab/flash-attention'
+  FLASH_ATTN_BRANCH: 'main'
+  S3_BUCKET: aig-embd-gfx11-wheels
+  S3_ROLE_ARN: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
+  AWS_REGION: us-east-1
 
 jobs:
-  build-wheel:
+  check:
     runs-on: ubuntu-latest
-    
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Resolve flash-attention HEAD
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ env.FLASH_ATTN_REPO }}
+          BRANCH: ${{ env.FLASH_ATTN_BRANCH }}
+        run: |
+          set -euo pipefail
+          SHA=$(gh api "repos/${REPO}/commits/${BRANCH}" -q '.sha' | cut -c1-8)
+          echo "Latest ${REPO}@${BRANCH} = ${SHA}"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ env.S3_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # `git describe` puts the SHA after `g` in the version string, so
+          # the wheel filename contains `+g${SHA}-` (or, on a tag, no SHA at
+          # all -- but then upstream has cut a release and we just want the
+          # next release-tracking workflow to fire).
+          MATCH=$(aws s3api list-objects-v2 \
+                    --bucket "$S3_BUCKET" \
+                    --prefix "simple/flash-attn/flash_attn-" \
+                    --query "Contents[?contains(Key, '+g${SHA}-')].Key" \
+                    --output text)
+          if [ -n "$MATCH" ] && [ "$MATCH" != "None" ]; then
+            echo "Already in S3: $MATCH"
+            SHOULD=false
+          else
+            echo "No wheel matching +g${SHA}- in S3; building"
+            SHOULD=true
+          fi
+          echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
+
+  build-wheel:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -58,11 +99,38 @@ jobs:
           fetch-depth: 1
 
       - name: Clone flash-attention repository
+        env:
+          REPO: ${{ env.FLASH_ATTN_REPO }}
+          BRANCH: ${{ env.FLASH_ATTN_BRANCH }}
         run: |
-          git clone --depth 1 --branch ${{ env.FLASH_ATTN_REF }} ${{ env.FLASH_ATTN_REPO }} flash-attention
+          # Need full history (or at least back to the latest v2.* tag) so
+          # `git describe` can compute commit count + short SHA.
+          git clone --branch "$BRANCH" "https://github.com/${REPO}" flash-attention
           cd flash-attention
-          echo "Flash Attention commit: $(git rev-parse HEAD)"
-          echo "Flash Attention ref: ${{ env.FLASH_ATTN_REF }}"
+          echo "Flash Attention HEAD: $(git rev-parse HEAD)"
+          git describe --tags --long --match 'v2.*'
+
+      - name: Compute wheel version from git describe
+        working-directory: flash-attention
+        run: |
+          set -euo pipefail
+          RAW=$(git describe --tags --long --match 'v2.*' --abbrev=8)
+          echo "git describe: $RAW"
+          # RAW looks like:  v2.8.3-42-gabc12345
+          TAG=${RAW#v}; TAG=${TAG%-*-*}                        # 2.8.3
+          COUNT=$(echo "$RAW" | awk -F- '{print $(NF-1)}')     # 42
+          SHA=$(echo "$RAW" | awk -F- '{print $NF}')           # gabc12345
+          if [ "$COUNT" -eq 0 ]; then
+            VERSION="$TAG"
+          else
+            NEXT=$(echo "$TAG" | awk -F. -v OFS=. '{ $NF=$NF+1; print }')
+            VERSION="${NEXT}.dev${COUNT}+${SHA}"
+          fi
+          echo "Computed VERSION=$VERSION"
+          # Upstream's setup.py reads __version__ from flash_attn/__init__.py;
+          # rewrite it so bdist_wheel produces the right filename.
+          sed -i "s/^__version__ = .*/__version__ = \"${VERSION}\"/" flash_attn/__init__.py
+          grep '^__version__' flash_attn/__init__.py
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -95,10 +163,7 @@ jobs:
 
       - name: Install PyTorch from ROCm nightly
         run: |
-          # Install PyTorch with ROCm support (needed for setup.py to detect HIP)
           pip install torch --index-url ${{ env.PYTORCH_INDEX_URL }}
-          
-          # Show what's installed
           pip list | grep -i -E "torch" || true
           python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}')"
 
@@ -109,13 +174,8 @@ jobs:
       - name: Build wheel
         env:
           FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
-          FLASH_ATTN_LOCAL_VERSION: ${{ env.FLASH_ATTN_LOCAL_VERSION }}
         working-directory: flash-attention
         run: |
-          echo "=== Environment ==="
-          echo "FLASH_ATTENTION_TRITON_AMD_ENABLE=$FLASH_ATTENTION_TRITON_AMD_ENABLE"
-          echo "FLASH_ATTN_LOCAL_VERSION=$FLASH_ATTN_LOCAL_VERSION"
-          echo ""
           echo "=== Building wheel ==="
           python setup.py bdist_wheel --dist-dir=dist
           ls -la dist/
@@ -140,172 +200,37 @@ jobs:
           path: flash-attention/dist/*.whl
           retention-days: 90
 
-  create-release:
+  upload-wheel:
     needs: build-wheel
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'ROCm'
     permissions:
-      contents: write
-    outputs:
-      release_tag: ${{ steps.create-tag.outputs.tag }}
+      id-token: write
+      contents: read
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/workflows/scripts
+          fetch-depth: 1
+
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
           name: flash-attn-rocm-wheel
           path: dist/
 
-      - name: Determine release tag
-        id: create-tag
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ env.S3_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload wheel to S3
         run: |
-          WHEEL=$(find dist -name '*.whl' -print -quit)
-          BASENAME=$(basename "$WHEEL" .whl)
-          VERSION=$(echo "$BASENAME" | sed 's/^flash_attn-//; s/-cp[0-9].*//')
-          TAG="wheels/flash-attn-${VERSION}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.create-tag.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: dist/*.whl
-          prerelease: true
-          body: |
-            ## Flash Attention ROCm Wheel (Triton backend)
-
-            Built with `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` (architecture-agnostic).
-
-            ### Installation
-            ```bash
-            pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
-            pip install flash-attn --extra-index-url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels
-            ```
-
-  publish-to-gh-pages:
-    needs: create-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pages: write
-
-    steps:
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: flash-attn-rocm-wheel
-          path: new-wheels/
-
-      - name: Generate index pointing to GitHub Releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BASE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels"
-          RELEASE_TAG: ${{ needs.create-release.outputs.release_tag }}
-        run: |
-          pip install packaging
-
-          cat > /tmp/generate_index.py << 'PYEOF'
-          import os, json, subprocess
-          from pathlib import Path
-          from datetime import datetime
-          from urllib.parse import quote
-
-          REPO = os.environ["REPO"]
-          BASE_URL = os.environ["BASE_URL"]
-          RELEASE_TAG = os.environ.get("RELEASE_TAG", "latest")
-
-          PACKAGE_INDEX_TEMPLATE = """<!DOCTYPE html>
-          <html>
-            <head><meta name="pypi:repository-version" content="1.0"><title>{package_name}</title></head>
-            <body>
-          {items}
-            </body>
-          </html>
-          """
-
-          def parse_wheel_name(filename):
-              base = filename.removesuffix(".whl")
-              parts = base.split("-")
-              for i, part in enumerate(parts):
-                  if part[0].isdigit():
-                      return "-".join(parts[:i]).replace("_", "-")
-              return parts[0].replace("_", "-")
-
-          result = subprocess.run(
-              ["gh", "release", "list", "--repo", REPO, "--limit", "100", "--json", "tagName"],
-              capture_output=True, text=True
-          )
-          releases = json.loads(result.stdout) if result.returncode == 0 else []
-          print(f"Found {len(releases)} releases")
-
-          wheels = {}
-          for rel in releases:
-              tag = rel["tagName"]
-              result = subprocess.run(
-                  ["gh", "release", "view", tag, "--repo", REPO, "--json", "assets"],
-                  capture_output=True, text=True
-              )
-              if result.returncode != 0:
-                  continue
-              assets = json.loads(result.stdout).get("assets", [])
-              for asset in assets:
-                  name = asset["name"]
-                  url = asset["url"]
-                  if name.endswith(".whl"):
-                      pkg = parse_wheel_name(name)
-                      wheels.setdefault(pkg, []).append((name, url))
-
-          new_dir = Path("new-wheels")
-          if new_dir.exists():
-              for whl in new_dir.glob("*.whl"):
-                  pkg = parse_wheel_name(whl.name)
-                  release_names = {w[0] for w in wheels.get(pkg, [])}
-                  if whl.name not in release_names:
-                      url = f"https://github.com/{REPO}/releases/download/{quote(RELEASE_TAG, safe='')}/{quote(whl.name, safe='')}"
-                      wheels.setdefault(pkg, []).append((whl.name, url))
-
-          print(f"Total: {sum(len(v) for v in wheels.values())} wheels in {len(wheels)} packages")
-
-          out = Path("gh-pages/wheels")
-          out.mkdir(parents=True, exist_ok=True)
-
-          for pkg_name, whl_list in wheels.items():
-              pkg_dir = out / pkg_name
-              pkg_dir.mkdir(exist_ok=True)
-              links = []
-              for whl_name, url in sorted(whl_list, key=lambda x: x[0], reverse=True):
-                  links.append(f'    <a href="{url}">{whl_name}</a><br/>')
-              (pkg_dir / "index.html").write_text(
-                  PACKAGE_INDEX_TEMPLATE.format(package_name=pkg_name, items="\n".join(links))
-              )
-
-          top_index = f"""<!DOCTYPE html>
-          <html>
-            <head><meta name="pypi:repository-version" content="1.0"><title>ROCm Wheels</title></head>
-            <body>
-              <h1>ROCm Wheels</h1>
-              <p>Pre-built wheels for AMD ROCm (gfx11 / Strix Halo / RDNA3+)</p>
-              <p><em>Generated: {datetime.now().isoformat()}</em></p>
-              <h2>Installation</h2>
-              <pre>pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
-          pip install vllm --extra-index-url {BASE_URL}</pre>
-              <h2>Available Packages</h2>
-          """
-          for p in sorted(wheels):
-              top_index += f'    <a href="{p}/">{p}</a><br/>\n'
-          top_index += "  </body>\n</html>"
-          (out / "index.html").write_text(top_index)
-          print("Index generated successfully")
-          PYEOF
-
-          python /tmp/generate_index.py
-
-      - name: Deploy to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./gh-pages/wheels
-          destination_dir: wheels
-          keep_files: false
+          pip install boto3
+          python .github/workflows/scripts/upload_wheel_s3.py \
+            --bucket "$S3_BUCKET" \
+            --package flash-attn \
+            --wheel-dir dist/
