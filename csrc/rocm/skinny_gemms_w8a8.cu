@@ -93,7 +93,8 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   //     batched GEMMs need finer K-loop granularity than ac=32 provides.
   //   - Low-bandwidth gfx11 (gfx1150/1152/1153, RDNA 3.5 mobile) defaults
   //     to (4, 2, 32); K-heavy down/MLP-back shapes prefer (2, 2, 32);
-  //     very large-M shapes prefer (4, 4, 32).
+  //     very-large-M N=1 shapes prefer (4, 4, 32), but the same shapes at
+  //     N>=2 want (4, 2, 32) — ur=4 is a clear loser there.
   int ytile, unrl, achunk;
   if (is_gfx1103_w8a8()) {
     if (K_in >= 9728) {
@@ -131,8 +132,9 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
       unrl = 2;
       achunk = 32;
     } else if (M_in >= 19000 && K_in <= 3584) {
+      // ur=4 wins on N=1 here, but loses to ur=2 on batched (N>=2).
       ytile = 4;
-      unrl = 4;
+      unrl = (N_in == 1) ? 4 : 2;
       achunk = 32;
     } else {
       ytile = 4;
