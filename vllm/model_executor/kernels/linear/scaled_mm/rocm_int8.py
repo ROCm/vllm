@@ -4,10 +4,10 @@
 """W8A8 INT8 skinny GEMM for ROCm.
 
 Uses the wvSplitK_w8a8 kernel for small batch sizes (N<=5) where
-activations fit in LDS. Falls back to cuBLAS bf16 GEMM with
-pre-dequantized weights for larger batches (prefill).
+activations fit in LDS. Falls back to Triton int8xint8 scaled_mm for
+larger batches (prefill) so the int8 weights stay resident without an
+extra dequantized copy.
 
-This mirrors the pattern used by HipW8A16LinearKernel for W8A16.
 The dispatch is wrapped in a torch.library custom op so torch.compile
 treats it as opaque, avoiding issues with data-dependent branches
 on symbolic batch sizes.
@@ -34,12 +34,11 @@ def _w8a8_apply_impl(
     x: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
-    w_dequant: torch.Tensor,
     i_s: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
 ) -> torch.Tensor:
-    """Dispatch between wvSplitK_w8a8 and cuBLAS bf16 GEMM.
+    """Dispatch between wvSplitK_w8a8 and Triton int8 scaled_mm.
 
     Registered as a custom op so torch.compile treats it as opaque,
     avoiding issues with the data-dependent m<=5 branch.
@@ -79,16 +78,22 @@ def _w8a8_apply_impl(
             bias,
         )
 
-    # Fallback: cuBLAS GEMM with pre-dequantized weights
-    out = torch.nn.functional.linear(x.to(w_dequant.dtype), w_dequant, bias)
-    return out.to(out_dtype) if out.dtype != out_dtype else out
+    # Fallback: explicit quantize + Triton int8 scaled_mm.
+    x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), i_s, None, symmetric=True)
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+        triton_scaled_mm,
+    )
+
+    return triton_scaled_mm(
+        x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=out_dtype, bias=bias
+    )
 
 
 def _w8a8_apply_fake(
     x: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
-    w_dequant: torch.Tensor,
     i_s: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
@@ -101,7 +106,7 @@ def _w8a8_apply_fake(
 def _register_w8a8_op():
     lib = torch.library.Library("_rocm_skinny_w8a8", "DEF")
     lib.define(
-        "w8a8_apply(Tensor x, Tensor w_q, Tensor w_s, Tensor w_dequant, "
+        "w8a8_apply(Tensor x, Tensor w_q, Tensor w_s, "
         "Tensor? i_s, Tensor? bias, int cu_count) -> Tensor"
     )
     lib.impl("w8a8_apply", _w8a8_apply_impl, "CUDA")
@@ -117,8 +122,7 @@ class ROCmInt8SkinnyGemmLinearKernel(TritonInt8ScaledMMLinearKernel):
 
     Uses the wvSplitK_w8a8 kernel for small batch sizes where both
     int8 activations and weights fit the LDS constraint. Falls back
-    to cuBLAS bf16 GEMM with pre-dequantized weights for larger
-    batches (prefill), matching the W8A16 fallback pattern.
+    to Triton int8 scaled_mm for larger batches (prefill).
 
     Dispatch is wrapped in a torch.library custom op so torch.compile
     sees a single opaque call, avoiding symbolic shape issues with
@@ -142,17 +146,6 @@ class ROCmInt8SkinnyGemmLinearKernel(TritonInt8ScaledMMLinearKernel):
         if not c.input_symmetric:
             return False, "supports symmetric quantization only."
         return True, None
-
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        super().process_weights_after_loading(layer)
-        w_q, w_s, _, _, _ = self._get_layer_params(layer)
-        # w_q: [K, N] int8 (transposed by parent)
-        # w_s: [N] float32 per-channel (processed by parent)
-        # Pre-compute dequantized [N, K] bf16 weights for prefill fallback.
-        # Trades ~2x weight memory for cuBLAS GEMM instead of Triton scaled_mm.
-        self._w_dequant = (
-            w_q.t().to(torch.bfloat16) * w_s.to(torch.bfloat16).reshape(-1, 1)
-        ).contiguous()
 
     def apply_weights(
         self,
@@ -181,7 +174,6 @@ class ROCmInt8SkinnyGemmLinearKernel(TritonInt8ScaledMMLinearKernel):
                 x,
                 w_q,
                 w_s,
-                self._w_dequant,
                 i_s,
                 bias,
                 num_compute_units(),
