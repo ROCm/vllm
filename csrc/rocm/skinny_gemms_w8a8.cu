@@ -90,9 +90,9 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   //     prefer (4, 1, 16). gfx9 follows the same rules.
   //   - gfx1103 (Radeon 760M, RDNA 3 mobile) prefers ur=4 across the board;
   //     yt drops as K grows.
-  //   - Low-bandwidth gfx11 (gfx1150/1152/1153) defaults to (4, 1, 32);
-  //     K-heavy down/MLP-back shapes prefer (2, 1, 32); very large-M
-  //     shapes prefer (4, 4, 32).
+  //   - Low-bandwidth gfx11 (gfx1150/1152/1153, RDNA 3.5 mobile) defaults
+  //     to (4, 2, 32); K-heavy down/MLP-back shapes prefer (2, 2, 32);
+  //     very large-M shapes prefer (4, 4, 32).
   int ytile, unrl, achunk;
   if (is_gfx1103_w8a8()) {
     if (K_in >= 9728) {
@@ -111,7 +111,7 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   } else if (is_low_bandwidth_gfx11_w8a8()) {
     if (K_in >= 11008) {
       ytile = 2;
-      unrl = 1;
+      unrl = 2;
       achunk = 32;
     } else if (M_in >= 19000 && K_in <= 3584) {
       ytile = 4;
@@ -119,7 +119,7 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
       achunk = 32;
     } else {
       ytile = 4;
-      unrl = 1;
+      unrl = 2;
       achunk = 32;
     }
   } else {
