@@ -86,8 +86,9 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   // dispatch.cuh's dispatch_w8a8 helper.
   //
   // Tuned from the w8a8 sweep on gfx1151/gfx1150/gfx1103 (Apr 2026):
-  //   - gfx1151 default is (1, 4, 32); the lm_head/large-gate_up shapes
-  //     prefer (4, 1, 16). gfx9 follows the same rules.
+  //   - gfx1151 default is (1, 4, 32); small-K shapes (K<=1024) prefer
+  //     ac=8 with yt scaling on M; lm_head/large-gate_up at K=2560-3584
+  //     prefers (4, 1, 16). gfx9 shares this branch (no sweep data).
   //   - gfx1103 (Radeon 760M, RDNA 3 mobile) prefers ur=4 across the board;
   //     yt drops as K grows. For N>=2 ac also shrinks with K — small-K
   //     batched GEMMs need finer K-loop granularity than ac=32 provides.
@@ -143,7 +144,13 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
     }
   } else {
     // gfx1151 and gfx9
-    if (N_in == 1 && M_in >= 19000 && K_in <= 3584) {
+    if (K_in <= 1024) {
+      // Small-K shapes prefer ac=8; yt scales with M.
+      unrl = 4;
+      achunk = 8;
+      ytile = (M_in >= 4096) ? 4 : 2;
+    } else if (N_in == 1 && M_in >= 19000 && K_in >= 2560 && K_in <= 3584) {
+      // lm_head / large-gate_up at K=2560-3584 (N=1 only).
       ytile = 4;
       unrl = 1;
       achunk = 16;
