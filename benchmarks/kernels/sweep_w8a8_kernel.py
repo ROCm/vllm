@@ -267,15 +267,42 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype):
                 )
                 tested += 1
 
+            # Measure the production op too — it runs the actual C++
+            # heuristic internally, so this is the timing the heuristic
+            # would deliver in real use. No need to mirror the heuristic
+            # in Python; the source of truth stays in C++.
+            heur_time_us = float("inf")
+            try:
+                heur_fn = (
+                    lambda w=W_int8,
+                    a=A_typed,
+                    ws=w_scale_typed,
+                    as_=a_scale: ops.wvSplitK_w8a8(w, a, ws, as_, cu_count)
+                )
+                heur_ms = triton.testing.do_bench(
+                    heur_fn, warmup=warmup, rep=rep, return_mode="median"
+                )
+                heur_time_us = heur_ms * 1000
+            except Exception as e:
+                print(f"  ERROR: N={N} {M}x{K} heuristic op: {e}")
+
             if shape_results:
                 best = min(shape_results, key=lambda r: r["time_us"])
+                best["heur_time_us"] = heur_time_us
                 results.append(best)
                 elapsed = time.time() - t0
+                heur_marker = ""
+                if heur_time_us > best["time_us"] * 1.05:
+                    regret = (heur_time_us - best["time_us"]) / best["time_us"] * 100
+                    heur_marker = f"  heur {heur_time_us:.1f} us ({regret:.0f}% slower)"
+                else:
+                    heur_marker = f"  heur {heur_time_us:.1f} us"
                 print(
                     f"  N={N} {M:>6}x{K:<6} {label:<22} "
                     f"best: yt={best['ytile']} ur={best['unrl']} "
                     f"ac={best['achunk']} wv={best['wvprgrp']}  "
-                    f"{best['time_us']:>8.1f} us  {best['bw_gibs']:>6.1f} GiB/s  "
+                    f"{best['time_us']:>8.1f} us  {best['bw_gibs']:>6.1f} GiB/s "
+                    f"{heur_marker}  "
                     f"[{tested} tested, {elapsed:.0f}s elapsed]"
                 )
 
@@ -377,10 +404,17 @@ def analyze_results(csv_path, best_per_shape):
                     f"avg regret {avg_r:.1f}%, max regret {max_r:.1f}%"
                 )
 
-    # --- YTILE/UNRL vs production heuristic ---
+    # --- Production heuristic vs sweep best ---
+    # Heuristic time was measured during the sweep loop by calling the
+    # production op (ops.wvSplitK_w8a8) directly — no Python mirror of
+    # the C++ heuristic. Look up by (M, K, N).
+    heur_by_shape = {
+        (r["M"], r["K"], r["N"]): r.get("heur_time_us", float("inf"))
+        for r in best_per_shape
+    }
     print()
     print("=" * 100)
-    print("YTILE/UNRL ANALYSIS (best per shape vs current heuristic)")
+    print("HEURISTIC ANALYSIS (best per shape vs measured production heuristic)")
     print("=" * 100)
 
     for sk in sorted(shape_keys):
@@ -391,33 +425,21 @@ def analyze_results(csv_path, best_per_shape):
         if not rows_for_shape:
             continue
         best = min(rows_for_shape, key=lambda r: r["time_us"])
-
-        # W8A8 production heuristic (from skinny_gemms_w8a8.cu WVSPLIT_W8A8_TILE)
-        # Two device classes: low-bandwidth gfx11 vs gfx1151/gfx9.
-        # Detection would need the GPU; assume gfx9/gfx1151 path here
-        # (the sweep runs on the actual device, so results are valid either way).
-        if K <= 1024 and M % 2 == 0:
-            heur_yt, heur_ur = 2, 1
-        else:
-            heur_yt, heur_ur = 1, 4
-
-        heur_rows = [
-            r for r in rows_for_shape if r["ytile"] == heur_yt and r["unrl"] == heur_ur
-        ]
-        heur_best = min(heur_rows, key=lambda r: r["time_us"]) if heur_rows else None
+        heur_time = heur_by_shape.get((M, K, N), float("inf"))
 
         marker = ""
-        if heur_best and heur_best["time_us"] > best["time_us"] * 1.05:
-            regret = (heur_best["time_us"] - best["time_us"]) / best["time_us"] * 100
-            marker = f"  <-- heuristic {regret:.0f}% slower"
+        heur_str = "N/A"
+        if heur_time != float("inf"):
+            heur_str = f"{heur_time:.1f} us"
+            if heur_time > best["time_us"] * 1.05:
+                regret = (heur_time - best["time_us"]) / best["time_us"] * 100
+                marker = f"  <-- heuristic {regret:.0f}% slower"
 
-        heur_str = f" ({heur_best['time_us']:.1f} us)" if heur_best else " (N/A)"
         print(
             f"  N={N} {M:>6}x{K:<6} {label:<22} "
             f"best: yt={best['ytile']} ur={best['unrl']} "
             f"ac={best['achunk']} wv={best['wvprgrp']} "
-            f"({best['time_us']:.1f} us) "
-            f"heur: yt={heur_yt} ur={heur_ur}{heur_str}{marker}"
+            f"({best['time_us']:.1f} us)  heur: {heur_str}{marker}"
         )
 
     print()
