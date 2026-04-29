@@ -89,7 +89,8 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
   //   - gfx1151 default is (1, 4, 32); the lm_head/large-gate_up shapes
   //     prefer (4, 1, 16). gfx9 follows the same rules.
   //   - gfx1103 (Radeon 760M, RDNA 3 mobile) prefers ur=4 across the board;
-  //     yt drops as K grows.
+  //     yt drops as K grows. For N>=2 ac also shrinks with K — small-K
+  //     batched GEMMs need finer K-loop granularity than ac=32 provides.
   //   - Low-bandwidth gfx11 (gfx1150/1152/1153, RDNA 3.5 mobile) defaults
   //     to (4, 2, 32); K-heavy down/MLP-back shapes prefer (2, 2, 32);
   //     very large-M shapes prefer (4, 4, 32).
@@ -99,7 +100,23 @@ torch::Tensor wvSplitK_w8a8(const at::Tensor& in_a, const at::Tensor& in_b,
       ytile = 1;
       unrl = 4;
       achunk = 32;
+    } else if (N_in >= 2) {
+      // Batched paths want smaller ac for smaller K on gfx1103.
+      if (K_in >= 3584) {
+        ytile = 2;
+        unrl = 4;
+        achunk = 32;
+      } else if (K_in >= 2048) {
+        ytile = 4;
+        unrl = 4;
+        achunk = 16;
+      } else {  // K_in <= 1024
+        ytile = 4;
+        unrl = 4;
+        achunk = 8;
+      }
     } else if (K_in >= 4096) {
+      // N == 1
       ytile = 2;
       unrl = 4;
       achunk = 32;

@@ -35,6 +35,8 @@ inline void dispatch_w8a8(dim3 grid, cudaStream_t stream, int K, int M, int Bx,
     if (ytile == 2 && unrl == 4 && achunk == 32) LAUNCH(32, 2, 4, 32);
     if (ytile == 4 && unrl == 2 && achunk == 32) LAUNCH(32, 4, 2, 32);
     if (ytile == 2 && unrl == 2 && achunk == 32) LAUNCH(32, 2, 2, 32);
+    if (ytile == 4 && unrl == 4 && achunk == 16) LAUNCH(32, 4, 4, 16);
+    if (ytile == 4 && unrl == 4 && achunk == 8) LAUNCH(32, 4, 4, 8);
   } else {  // thrds == 64, gfx9 wave64
     if (ytile == 1 && unrl == 4 && achunk == 32) LAUNCH(64, 1, 4, 32);
     if (ytile == 4 && unrl == 1 && achunk == 16) LAUNCH(64, 4, 1, 16);
