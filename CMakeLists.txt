@@ -1223,6 +1223,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/rocm/skinny_gemms_int8.cu"
     "csrc/rocm/skinny_gemms_int4.cu"
     "csrc/rocm/skinny_gemms_w8a8.cu"
+    "csrc/rocm/skinny_gemms_w8a8/instantiate_n1.cu"
+    "csrc/rocm/skinny_gemms_w8a8/instantiate_n2.cu"
+    "csrc/rocm/skinny_gemms_w8a8/instantiate_n3.cu"
+    "csrc/rocm/skinny_gemms_w8a8/instantiate_n4.cu"
+    "csrc/rocm/skinny_gemms_w8a8/instantiate_n5.cu"
     "csrc/rocm/attention.cu")
 
   set(VLLM_ROCM_FLAGS ${VLLM_GPU_FLAGS})
