@@ -52,16 +52,28 @@ inline bool is_gfx11_w8a8() {
 }
 
 // Check if this is a low-bandwidth gfx11 variant (gfx1150, gfx1152, gfx1153)
-// or gfx1103, which benefit from optimized heuristics for lower bandwidth.
-// Excludes gfx1151 which has higher bandwidth similar to gfx9.
+// — RDNA 3.5 mobile parts. gfx1151 (Strix Halo) has higher bandwidth and is
+// handled like gfx9. gfx1103 (RDNA 3 mobile, Radeon 760M) has different
+// instruction-level preferences and gets its own branch via
+// is_gfx1103_w8a8().
 inline bool is_low_bandwidth_gfx11_w8a8() {
   static const bool result = [] {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     std::string device_arch = dprops->gcnArchName;
     return device_arch.find("gfx1150") != std::string::npos ||
            device_arch.find("gfx1152") != std::string::npos ||
-           device_arch.find("gfx1153") != std::string::npos ||
-           device_arch.find("gfx1103") != std::string::npos;
+           device_arch.find("gfx1153") != std::string::npos;
+  }();
+  return result;
+}
+
+// gfx1103 (Radeon 760M, RDNA 3 mobile) — strongly prefers ur=4 across most
+// shapes, unlike its RDNA 3.5 cousins (gfx1150/1152/1153) which prefer ur=2.
+inline bool is_gfx1103_w8a8() {
+  static const bool result = [] {
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    std::string device_arch = dprops->gcnArchName;
+    return device_arch.find("gfx1103") != std::string::npos;
   }();
   return result;
 }
