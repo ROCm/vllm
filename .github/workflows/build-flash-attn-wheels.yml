@@ -26,6 +26,9 @@ on:
   push:
     branches:
       - gfx11
+  pull_request:
+    branches:
+      - gfx11
 
 env:
   PYTORCH_INDEX_URL: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
@@ -203,7 +206,7 @@ jobs:
   upload-wheel:
     needs: build-wheel
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'ROCm'
+    if: github.event_name == 'push' && github.repository_owner == 'ROCm'
     permissions:
       id-token: write
       contents: read
