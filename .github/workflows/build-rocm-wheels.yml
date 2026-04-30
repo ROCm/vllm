@@ -32,6 +32,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     permissions:
+      actions: write
       contents: read
       packages: read
 
