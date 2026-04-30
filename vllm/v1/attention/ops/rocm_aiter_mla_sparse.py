@@ -241,7 +241,7 @@ def fp8_paged_mqa_logits_torch(
             device=q.device,
             dtype=torch.float32,
         )
-        if context_lens.dim > 1:
+        if context_lens.dim() > 1:
             context_lens = context_lens.squeeze(-1)
         kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
         for i in range(batch_size):
