@@ -27,6 +27,8 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
+    sparse_attn_decode_triton,
+    sparse_attn_prefill_triton,
 )
 
 if TYPE_CHECKING:
@@ -384,10 +386,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                return torch.nn.functional.linear(
+                    hidden_states.float(),
+                    compressor.fused_wkv_wgate.weight.float(),
                 )
 
             aux_fns[0] = compressor_kv_score
@@ -401,10 +402,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
-                return torch.mm(
-                    hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
-                    out_dtype=torch.float32,
+                return torch.nn.functional.linear(
+                    hidden_states.float(),
+                    indexer.compressor.fused_wkv_wgate.weight.float(),
                 )
 
             aux_fns[1] = indexer_weights_proj
@@ -460,7 +460,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
             aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+                self.aux_stream_list[0]
+                if self.aux_stream_list is not None
+                else None
             )
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
@@ -490,7 +492,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+                self.aux_stream_list[0]
+                if self.aux_stream_list is not None
+                else None
             )
             compressor = self.compressor
 
@@ -1231,15 +1235,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
-        blocked_swa = self._dequantize_blocked_k_cache(self.swa_cache_layer.kv_cache)
-        blocked_extra = None if swa_only else self._dequantize_blocked_k_cache(kv_cache)
         attn_out = self._ref_sparse_attn_decode(
             q=q.unsqueeze(1),
-            blocked_k=blocked_swa,
+            blocked_k=self.swa_cache_layer.kv_cache,
             indices_in_kvcache=swa_indices.unsqueeze(1),
             topk_length=swa_lens,
             attn_sink=self.attn_sink[: q.shape[1]],
-            extra_blocked_k=blocked_extra,
+            extra_blocked_k=None if swa_only else kv_cache,
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
         )
@@ -1290,7 +1292,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         topk_length: torch.Tensor | None,
     ) -> torch.Tensor:
         indices = indices.clone().squeeze(1)
-        s_q, h_q, d_qk = q.shape
+        _, h_q, _ = q.shape
         topk = indices.shape[-1]
         s_kv = kv.shape[0]
         if topk_length is not None:
@@ -1299,33 +1301,28 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             ) >= topk_length.unsqueeze(1)
             indices[mask] = -1
         invalid_mask = (indices < 0) | (indices >= s_kv)
-        indices[invalid_mask] = 0
+        indices[invalid_mask] = -1
 
-        qf = q.float()
-        gathered_kv = (
-            kv.index_select(0, indices.flatten()).reshape(s_q, topk, d_qk).float()
+        assert q.is_cuda and kv.is_cuda and indices.is_cuda
+        assert kv.ndim == 3 and kv.shape[1] == 1, (
+            f"ROCm Triton sparse prefill expects kv=[skv,1,d], got {kv.shape}"
         )
-        scores = qf @ gathered_kv.transpose(1, 2)
-        scores *= self.scale
-        scores[invalid_mask.unsqueeze(1).expand_as(scores)] = float("-inf")
+        assert q.shape[-1] == self.head_dim, (
+            f"expected q head dim {self.head_dim}, got {q.shape[-1]}"
+        )
+        assert self.nope_head_dim == 448 and self.rope_head_dim == 64, (
+            "DeepSeek-V4 Triton sparse prefill expects 448 NoPE dims and 64 RoPE dims"
+        )
+        return sparse_attn_prefill_triton(
+            q=q,
+            kv=kv.squeeze(1),
+            indices=indices,
+            scale=self.scale,
+            attn_sink=None if self.attn_sink is None else self.attn_sink[:h_q],
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+        )
 
-        orig_lse = torch.logsumexp(scores, dim=-1)
-        lse_for_o = orig_lse
-        if self.attn_sink is not None:
-            lse_for_o = torch.logsumexp(
-                torch.stack(
-                    [orig_lse, self.attn_sink[:h_q].view(1, h_q).expand_as(orig_lse)],
-                    dim=0,
-                ),
-                dim=0,
-            )
-        lse_for_o = lse_for_o.clone()
-        lse_for_o[lse_for_o == float("-inf")] = float("+inf")
-        probs = torch.exp(scores - lse_for_o.unsqueeze(-1))
-        out = probs @ gathered_kv[..., : self.head_dim]
-        lonely_q_mask = orig_lse == float("-inf")
-        out[lonely_q_mask.unsqueeze(-1).expand_as(out)] = 0.0
-        return out.to(torch.bfloat16)
 
     def _ref_sparse_attn_decode(
         self,
@@ -1338,65 +1335,45 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         extra_indices_in_kvcache: torch.Tensor | None = None,
         extra_topk_length: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        b, s_q, h_q, d_qk = q.shape
-        d_v = self.head_dim
-
-        def process_scope(
-            cur_blocked_k: torch.Tensor,
-            cur_indices: torch.Tensor,
-            cur_topk_length: torch.Tensor | None,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            cur_indices = cur_indices.reshape(b, s_q, -1)
-            topk = cur_indices.size(-1)
-            fixed_indices = torch.clamp_min(cur_indices, 0)
-            gathered_kv = (
-                cur_blocked_k.view(-1, d_qk)
-                .index_select(0, fixed_indices.view(-1))
-                .view(b, s_q, topk, d_qk)
-            )
-            invalid_mask = cur_indices == -1
-            if cur_topk_length is not None:
-                cur_topk_length = cur_topk_length.reshape(b)
-                invalid_mask |= torch.arange(0, topk, device=invalid_mask.device).view(
-                    1, 1, topk
-                ) >= cur_topk_length.view(b, 1, 1)
-            return gathered_kv, invalid_mask
-
-        gathered_kv, invalid_mask = process_scope(
-            blocked_k, indices_in_kvcache, topk_length
+        b, s_q, h_q, _ = q.shape
+        assert q.is_cuda and blocked_k.is_cuda
+        assert blocked_k.dtype == torch.uint8, (
+            f"ROCm Triton sparse decode expects uint8 fp8_ds_mla cache, got {blocked_k.dtype}"
         )
-        if extra_blocked_k is not None:
-            assert extra_indices_in_kvcache is not None
-            gathered_kv1, invalid_mask1 = process_scope(
-                extra_blocked_k, extra_indices_in_kvcache, extra_topk_length
+        assert s_q == 1, f"ROCm Triton decode expects s_q=1, got {s_q}"
+        assert self.head_dim == 512 and self.nope_head_dim == 448 and self.rope_head_dim == 64, (
+            "DeepSeek-V4 Triton sparse decode expects 512 total dims (448 NoPE + 64 RoPE)"
+        )
+        main_indices = indices_in_kvcache.reshape(b, -1).clone()
+        if topk_length is not None:
+            main_mask = torch.arange(
+                main_indices.shape[-1], device=main_indices.device
+            ).view(1, -1) >= topk_length.reshape(b, 1)
+            main_indices[main_mask] = -1
+
+        extra_indices = None
+        if extra_blocked_k is not None and extra_indices_in_kvcache is not None:
+            extra_indices = extra_indices_in_kvcache.reshape(b, -1).clone()
+            if extra_topk_length is not None:
+                extra_mask = torch.arange(
+                    extra_indices.shape[-1], device=extra_indices.device
+                ).view(1, -1) >= extra_topk_length.reshape(b, 1)
+                extra_indices[extra_mask] = -1
+            assert extra_blocked_k.dtype == torch.uint8, (
+                f"ROCm Triton sparse decode expects uint8 extra cache, got {extra_blocked_k.dtype}"
             )
-            gathered_kv = torch.cat([gathered_kv, gathered_kv1], dim=2)
-            invalid_mask = torch.cat([invalid_mask, invalid_mask1], dim=2)
 
-        gathered_kv = gathered_kv.view(b * s_q, -1, d_qk).float()
-        gathered_kv[gathered_kv != gathered_kv] = 0.0
-        qf = q.float().view(b * s_q, h_q, d_qk)
-        attn_weight = qf @ gathered_kv.transpose(-1, -2)
-        attn_weight *= self.scale
-        attn_weight[
-            invalid_mask.view(b * s_q, 1, -1).expand(
-                b * s_q, h_q, invalid_mask.size(-1)
-            )
-        ] = float("-inf")
-        lse = attn_weight.logsumexp(dim=-1)
-        attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
-        output = attn_weight @ gathered_kv[..., :d_v]
-        output = output.view(b, s_q, h_q, d_v)
-        lse = lse.view(b, s_q, h_q)
-
-        if attn_sink is not None:
-            output *= (
-                1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
-            ).unsqueeze(-1)
-
-        lonely_q_mask = lse == float("-inf")
-        output[lonely_q_mask.unsqueeze(-1).expand_as(output)] = 0.0
-        return output.squeeze(1).to(torch.bfloat16)
+        return sparse_attn_decode_triton(
+            q=q.squeeze(1),
+            main_cache=blocked_k,
+            main_indices=main_indices,
+            scale=self.scale,
+            attn_sink=None if attn_sink is None else attn_sink[:h_q],
+            extra_cache=extra_blocked_k,
+            extra_indices=extra_indices,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+        )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
@@ -1466,7 +1443,7 @@ class DeepseekV4Indexer(nn.Module):
         self.compress_ratio = compress_ratio
         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
         logger.info_once(
-            "Using %s indexer cache for Lightning Indexer.",
+            "Using %s indexer cache for Lighening Indexer.",
             "MXFP4" if self.use_fp4_kv else "FP8",
         )
 
