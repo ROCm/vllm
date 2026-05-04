@@ -206,7 +206,7 @@ jobs:
   upload-wheel:
     needs: build-wheel
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.repository_owner == 'ROCm'
+    if: github.repository_owner == 'ROCm'
     permissions:
       id-token: write
       contents: read
