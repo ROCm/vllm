@@ -65,10 +65,11 @@ def select_2d_config(
 
         if max_seqlen_q >= 256:
             BLOCK_M = 128
-            shmem = BLOCK_M * head_size * element_size
-            if current_platform.is_navi() and shmem > 65536:
-                BLOCK_M = 65536 // (head_size * element_size)
-                BLOCK_M = max(16, triton.next_power_of_2(BLOCK_M) // 2)
+            q_tile_bytes = BLOCK_M * head_size * element_size
+            if current_platform.is_navi() and q_tile_bytes > 65536:
+                max_block_m = 65536 // (head_size * element_size)
+                # Largest power-of-2 BLOCK_M that leaves headroom for K/V tiles
+                BLOCK_M = max(16, triton.next_power_of_2(max_block_m) // 2)
             num_stages_2d = 1
             num_warps = 4
         BLOCK_Q = BLOCK_M // num_queries_per_kv
