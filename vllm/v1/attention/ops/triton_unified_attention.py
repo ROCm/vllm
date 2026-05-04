@@ -43,6 +43,8 @@ def select_2d_config(
         max_num_stages_2d = 4
         if head_size > 128:
             max_num_stages_2d = 2
+        if current_platform.is_navi() and head_size > 256:
+            max_num_stages_2d = 1
 
         if not all_decode:
             num_stages_2d = 1
@@ -63,6 +65,10 @@ def select_2d_config(
 
         if max_seqlen_q >= 256:
             BLOCK_M = 128
+            shmem = BLOCK_M * head_size * element_size
+            if current_platform.is_navi() and shmem > 65536:
+                BLOCK_M = 65536 // (head_size * element_size)
+                BLOCK_M = max(16, triton.next_power_of_2(BLOCK_M) // 2)
             num_stages_2d = 1
             num_warps = 4
         BLOCK_Q = BLOCK_M // num_queries_per_kv
