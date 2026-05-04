@@ -155,7 +155,7 @@ jobs:
         # `python` from the image's python3.12 to Debian's python3.11. This
         # breaks /usr/local/bin/rocm-smi (shebang #!/usr/local/bin/python)
         # and any later `python ...` invocation in this workflow.
-        run: ln -sf python3.12 /usr/local/bin/python
+        run: ls -al /usr/local/bin/python
 
       - name: Checkout code
         uses: actions/checkout@v4
