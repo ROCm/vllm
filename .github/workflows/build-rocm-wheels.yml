@@ -149,6 +149,14 @@ jobs:
       PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2-staging/gfx1151' }}
 
     steps:
+      - name: Restore /usr/local/bin/python symlink (overwritten by runner hook)
+        # The self-hosted runner's container startup command runs
+        # `ln -sf /usr/bin/python3 /usr/local/bin/python`, repointing
+        # `python` from the image's python3.12 to Debian's python3.11. This
+        # breaks /usr/local/bin/rocm-smi (shebang #!/usr/local/bin/python)
+        # and any later `python ...` invocation in this workflow.
+        run: ln -sf python3.12 /usr/local/bin/python
+
       - name: Checkout code
         uses: actions/checkout@v4
 
