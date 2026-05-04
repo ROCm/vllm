@@ -195,3 +195,75 @@ def test_triton_w4a16_skinny_fmt_gemm_asymmetric(dtype, M, K, N, G, random_seed:
 
     # bf16 accumulation at larger shapes needs slightly looser tolerance
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# Performance regression test
+# ---------------------------------------------------------------------------
+
+# Reference TFLOPS measured on gfx1151 (Strix Halo, 40 CUs) with the
+# tuned kernel (num_stages=1, UNROLL_K=4, BM=64/BN=256/BK=64/w=8 for
+# M>1024).
+# Key: (M, K, N, group_size, has_zp) -> reference TFLOPS
+_PERF_REFERENCE_TFLOPS: dict[tuple[int, int, int, int, bool], float] = {
+    # Qwen2.5-7B shapes — symmetric (compressed-tensors w4a16)
+    (1606, 3584, 37888, 128, False): 25.0,
+    (1606, 3584, 18944, 128, False): 26.0,
+    (1606, 3584, 4608, 128, False): 27.0,
+    (1606, 3584, 3584, 128, False): 26.0,
+    # Qwen2.5-7B shapes — asymmetric (AWQ, zero_point=True)
+    (1606, 3584, 37888, 128, True): 24.5,
+    (1606, 3584, 18944, 128, True): 24.5,
+    (1606, 3584, 4608, 128, True): 25.5,
+    (1606, 3584, 3584, 128, True): 24.5,
+}
+
+PERF_TOLERANCE = 0.05  # 5% relative tolerance
+
+
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
+@pytest.mark.parametrize("has_zp", [False, True], ids=["symmetric", "asymmetric"])
+@pytest.mark.parametrize(
+    "M,K,N,G",
+    [
+        (1606, 3584, 37888, 128),
+        (1606, 3584, 18944, 128),
+        (1606, 3584, 4608, 128),
+        (1606, 3584, 3584, 128),
+    ],
+)
+def test_triton_w4a16_prefill_perf_regression(M, K, N, G, has_zp):
+    """Fail if prefill TFLOPS drops more than 5% below reference."""
+    triton_testing = pytest.importorskip("triton.testing")
+
+    ref_tflops = _PERF_REFERENCE_TFLOPS[(M, K, N, G, has_zp)]
+    num_groups = K // G
+
+    a = torch.randn((M, K), device=device, dtype=torch.float16)
+    b_q_i32 = torch.randint(0, 2**31, (N, K // 8), dtype=torch.int32, device=device)
+    scales = torch.randn(N, num_groups, dtype=torch.float16, device=device) * 0.01
+    zp = None
+    if has_zp:
+        zp = torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device).to(
+            torch.float16
+        )
+
+    def run():
+        triton_w4a16_skinny_fmt_gemm(a, b_q_i32, scales, G, zp=zp)
+
+    # Warm up to trigger Triton JIT compilation before timing.
+    for _ in range(3):
+        run()
+    torch.accelerator.synchronize()
+
+    ms = triton_testing.do_bench(run, warmup=50, rep=100)
+    tflops = (2 * M * N * K) * 1e-12 / (ms * 1e-3)
+
+    mode = "asymmetric" if has_zp else "symmetric"
+    min_tflops = ref_tflops * (1 - PERF_TOLERANCE)
+    assert tflops >= min_tflops, (
+        f"Performance regression ({mode}): {tflops:.2f} TFLOPS < "
+        f"{min_tflops:.2f} TFLOPS (reference {ref_tflops:.1f}, "
+        f"tolerance {PERF_TOLERANCE * 100:.0f}%) for "
+        f"M={M} K={K} N={N} G={G} ({ms:.3f} ms)"
+    )
