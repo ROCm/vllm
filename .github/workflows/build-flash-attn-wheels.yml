@@ -12,14 +12,15 @@ name: Build Flash Attn ROCm Wheels
 #   2. The Triton kernels are compiled JIT (just-in-time) at runtime
 #   3. The resulting wheel is architecture-agnostic
 #
-# Versioning: the workflow tracks the `main` branch of
-# Dao-AILab/flash-attention. The wheel version is derived from `git describe`
-# against the latest v2.* tag, e.g.
+# Versioning: the workflow tracks a pinned commit of
+# Dao-AILab/flash-attention (before the aiter migration that introduced a
+# hard triton==3.5.1 pin and removed the bundled AMD Triton backend).
+# The wheel version is derived from `git describe` against the latest v2.*
+# tag, e.g.
 #   on a tag       → 2.8.3
 #   N commits past → 2.8.4.dev<N>+g<shortsha>
-# Once upstream tags v2.8.4, the dev-version override falls away automatically.
 #
-# The check job skips the build when a wheel matching the upstream HEAD SHA
+# The check job skips the build when a wheel matching the pinned SHA
 # is already present in the S3 index.
 
 on:
@@ -33,7 +34,7 @@ on:
 env:
   PYTORCH_INDEX_URL: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
   FLASH_ATTN_REPO: 'Dao-AILab/flash-attention'
-  FLASH_ATTN_BRANCH: 'main'
+  FLASH_ATTN_REF: 'bbe25bacff9f337568b66e69950e549df9839068'
   S3_BUCKET: aig-embd-gfx11-wheels
   S3_ROLE_ARN: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
   AWS_REGION: us-east-1
@@ -48,16 +49,14 @@ jobs:
       sha: ${{ steps.resolve.outputs.sha }}
       should_build: ${{ steps.decide.outputs.should_build }}
     steps:
-      - name: Resolve flash-attention HEAD
+      - name: Resolve flash-attention ref
         id: resolve
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ env.FLASH_ATTN_REPO }}
-          BRANCH: ${{ env.FLASH_ATTN_BRANCH }}
+          REF: ${{ env.FLASH_ATTN_REF }}
         run: |
           set -euo pipefail
-          SHA=$(gh api "repos/${REPO}/commits/${BRANCH}" -q '.sha' | cut -c1-8)
-          echo "Latest ${REPO}@${BRANCH} = ${SHA}"
+          SHA=${REF:0:8}
+          echo "Pinned ref = ${SHA}"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials via OIDC
@@ -104,13 +103,14 @@ jobs:
       - name: Clone flash-attention repository
         env:
           REPO: ${{ env.FLASH_ATTN_REPO }}
-          BRANCH: ${{ env.FLASH_ATTN_BRANCH }}
+          REF: ${{ env.FLASH_ATTN_REF }}
         run: |
           # Need full history (or at least back to the latest v2.* tag) so
           # `git describe` can compute commit count + short SHA.
-          git clone --branch "$BRANCH" "https://github.com/${REPO}" flash-attention
+          git clone "https://github.com/${REPO}" flash-attention
           cd flash-attention
-          echo "Flash Attention HEAD: $(git rev-parse HEAD)"
+          git checkout "$REF"
+          echo "Flash Attention at: $(git rev-parse HEAD)"
           git describe --tags --long --match 'v2.*'
 
       - name: Compute wheel version from git describe
