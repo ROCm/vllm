@@ -62,18 +62,19 @@ def select_2d_config(
                 TILE_SIZE = min(TILE_SIZE, 128)
 
         if max_seqlen_q >= 256:
-            BLOCK_M = 128
+            BLOCK_M = 64 if current_platform.is_gfx1151() else 128
             num_stages_2d = 1
             num_warps = 4
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         num_stages_2d = min(max_num_stages_2d, num_stages_2d)
+        waves_per_eu = 4 if current_platform.is_gfx1151() else 2
         return {
             "BLOCK_M": BLOCK_M,
             "BLOCK_Q": BLOCK_Q,
             "TILE_SIZE": TILE_SIZE,
             "num_warps": num_warps,
             "num_stages": num_stages_2d,
-            "waves_per_eu": 2,
+            "waves_per_eu": waves_per_eu,
         }
     else:
         TILE_SIZE = 32
