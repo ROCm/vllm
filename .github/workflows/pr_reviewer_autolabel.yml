@@ -1,0 +1,106 @@
+name: Request PR reviewers based on labels
+
+on:
+  pull_request_target:
+    types: [opened, reopened, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  request-reviewers:
+    if: github.repository == 'vllm-project/vllm'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request reviewers for matching labels
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd  # v8.0.0
+        with:
+          script: |
+            // Map PR labels to reviewers. Add future label routing here.
+            // Team reviewers must be GitHub team slugs, not display names.
+            const reviewerConfig = {
+              rocm: {
+                users: ['AndreasKaratzas'],
+                teams: [],
+              },
+              'ci-failure': {
+                users: ['AndreasKaratzas'],
+                teams: [],
+              },
+              'ci/build': {
+                users: ['AndreasKaratzas'],
+                teams: [],
+              },
+              // Example:
+              // performance: {
+              //   users: ['perfexpert'],
+              //   teams: ['performance-reviewers'],
+              // },
+            };
+
+            const pr = context.payload.pull_request;
+            const labels = pr.labels.map(label => label.name);
+            const matchingLabels = labels.filter(label => reviewerConfig[label]);
+
+            if (matchingLabels.length === 0) {
+              core.notice(`No reviewer routing configured for labels: ${labels.join(', ') || 'none'}`);
+              return;
+            }
+
+            const author = pr.user.login.toLowerCase();
+            const existingUsers = new Set(
+              (pr.requested_reviewers || []).map(reviewer => reviewer.login.toLowerCase())
+            );
+            const existingTeams = new Set(
+              (pr.requested_teams || []).map(team => team.slug.toLowerCase())
+            );
+
+            const usersToRequest = [
+              ...new Set(matchingLabels.flatMap(label => reviewerConfig[label].users || []))
+            ]
+              .filter(user => user.toLowerCase() !== author)
+              .filter(user => !existingUsers.has(user.toLowerCase()));
+
+            const teamsToRequest = [
+              ...new Set(matchingLabels.flatMap(label => reviewerConfig[label].teams || []))
+            ].filter(team => !existingTeams.has(team.toLowerCase()));
+
+            const requestedUsers = [];
+            for (const reviewer of usersToRequest) {
+              try {
+                await github.rest.pulls.requestReviewers({
+                  ...context.repo,
+                  pull_number: pr.number,
+                  reviewers: [reviewer],
+                });
+                requestedUsers.push(reviewer);
+              } catch (error) {
+                core.warning(`Could not request @${reviewer}: ${error.message}`);
+              }
+            }
+
+            const requestedTeams = [];
+            for (const team of teamsToRequest) {
+              try {
+                await github.rest.pulls.requestReviewers({
+                  ...context.repo,
+                  pull_number: pr.number,
+                  team_reviewers: [team],
+                });
+                requestedTeams.push(team);
+              } catch (error) {
+                core.warning(`Could not request team @${context.repo.owner}/${team}: ${error.message}`);
+              }
+            }
+
+            const requested = [
+              ...requestedUsers.map(user => `@${user}`),
+              ...requestedTeams.map(team => `@${context.repo.owner}/${team}`),
+            ];
+
+            core.notice(
+              requested.length > 0
+                ? `Requested ${requested.join(', ')} for labels: ${matchingLabels.join(', ')}`
+                : `No new reviewers requested for labels: ${matchingLabels.join(', ')}`
+            );
