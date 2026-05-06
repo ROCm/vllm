@@ -237,11 +237,24 @@ def triton_w4a16_skinny_fmt_gemm(
         elif M <= 64:
             BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 32, 4
         elif M <= 128:
-            if K >= 2 * N:  # tall K (e.g. down_proj)
+            # For K >= 4096 AND N >= 4096, a single config (BN=32, BK=128,
+            # NW=4) wins on every projection shape across Qwen3-8B and
+            # Llama-3.1-8B (down/qkv/gate_up/o_proj all gain +23%..+35% vs
+            # prior shape-specific configs). The wider K-tile escapes WMMA
+            # latency-bound regime (wmma.md: >= 2 waves/SIMD), and BN=32
+            # keeps the workgroup grid large enough to saturate 40 CUs even
+            # at N up to ~28k.
+            #
+            # Small-N or small-K shapes (Qwen3-VL-4B / Qwen3-4B) need the
+            # legacy shape-specific configs — at N=2560 the BN=32 grid drops
+            # below the saturation point.
+            if K >= 4096 and N >= 4096:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 128, 4
+            elif K >= 2 * N:  # tall K, small-N down (e.g. Qwen3-VL-4B down)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 16, 64, 1
-            elif N > K:  # wide N (e.g. qkv_proj, gate_up_proj)
+            elif N > K:  # wide N, small K (e.g. Qwen3-VL-4B qkv/gate_up)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
-            else:  # N ~= K (e.g. o_proj)
+            else:  # N ~= K, small K (e.g. Qwen3-VL-4B o_proj)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 4
         elif M <= 1024:
             if K >= 2 * N:  # tall K (e.g. down_proj)
