@@ -31,8 +31,8 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   torch::Tensor expert_ids,
                                   int64_t block_size_m, int64_t CuCount,
                                   int64_t group_size, torch::Tensor zero_points,
-                                  torch::Tensor sorted_token_ids,
-                                  int64_t top_k);
+                                  torch::Tensor sorted_token_ids, int64_t top_k,
+                                  bool fuse_silu_mul);
 
 #ifdef VLLM_SKINNY_GEMM_SWEEP
 torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,

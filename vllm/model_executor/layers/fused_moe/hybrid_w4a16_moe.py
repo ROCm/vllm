@@ -10,6 +10,8 @@ shuffle packed).  Both kernels read from the same weight tensors:
 CUDA-graph compatible.
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -274,9 +276,34 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 gemm1_in = _resize_cache(workspace13, (num_slots, K))
                 torch.index_select(hidden_states, 0, source_rows.long(), out=gemm1_in)
 
-        gemm1_out = _resize_cache(workspace2, (num_slots, N))
-        act_out = _resize_cache(workspace13, (num_slots, activation_out_dim))
-        gemm2_out = _resize_cache(workspace2, (num_slots, K))
+        # Determine whether GEMM2's silu_and_mul preamble can be fused into
+        # the moe_wvSplitK_int4_hf_sml_ kernel.  Computed early because the
+        # workspace allocation differs in the fused case: gemm1_out and
+        # gemm2_out cannot share storage when GEMM2 reads gemm1_out as its
+        # activation (the kernel iterates expert blocks in a single grid,
+        # so writing gemm2_out for one slot would corrupt gemm1_out for
+        # another slot that hasn't been processed yet).
+        MOE_LDS_ELEMS = 8192
+        _silu_fuse_disabled = os.environ.get("VLLM_DISABLE_MOE_SILU_FUSE", "0") == "1"
+        _can_fuse_silu_into_gemm2 = (
+            not use_triton
+            and not _silu_fuse_disabled
+            and activation == MoEActivation.SILU
+            and block_size_m == 1
+            and K <= MOE_LDS_ELEMS
+        )
+
+        if _can_fuse_silu_into_gemm2:
+            # Place gemm1_out on workspace13 (which would otherwise hold
+            # act_out, no longer needed when fused).  gemm2_out keeps
+            # workspace2.
+            gemm1_out = _resize_cache(workspace13, (num_slots, N))
+            act_out = None
+            gemm2_out = _resize_cache(workspace2, (num_slots, K))
+        else:
+            gemm1_out = _resize_cache(workspace2, (num_slots, N))
+            act_out = _resize_cache(workspace13, (num_slots, activation_out_dim))
+            gemm2_out = _resize_cache(workspace2, (num_slots, K))
 
         if use_triton:
             # The Triton kernel skips padding blocks (expert_ids == -1),
@@ -365,16 +392,30 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                     top_k_num,
                 )
 
-            # Activation
-            apply_moe_activation(activation, act_out, gemm1_out)
+            # Decided by _can_fuse_silu_into_gemm2 above (controls
+            # workspace layout); reuse here.
+            fuse_silu_mul_into_gemm2 = _can_fuse_silu_into_gemm2
+
+            if fuse_silu_mul_into_gemm2:
+                # Skip apply_moe_activation; pass gemm1_out (the pre-act
+                # tensor with last dim 2*K) straight to GEMM2.  The
+                # FUSED_SILU_MUL path inside moe_wvSplitK_int4_hf_sml_
+                # reads [gate(K)|up(K)] and computes silu(gate)*up while
+                # staging into LDS.
+                gemm2_input = gemm1_out
+            else:
+                # Activation
+                apply_moe_activation(activation, act_out, gemm1_out)
+                gemm2_input = act_out
 
             # GEMM 2 (HIP wvSplitK decode path)
             with record_function_or_nullcontext(
                 f"fused_moe_wvsplitk_int4 {num_tokens}x{K}x{activation_out_dim} "
                 f"E={global_num_experts} top_k={top_k_num}"
+                + (" +silu" if fuse_silu_mul_into_gemm2 else "")
             ):
                 fused_moe_wvSplitK_int4_gemm(
-                    act_out,
+                    gemm2_input,
                     w2,
                     self.w2_scale,
                     gemm2_out,
@@ -385,6 +426,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                     self.quant_config.w2_zp,
                     sorted_token_ids if scattered else None,
                     1,
+                    fuse_silu_mul_into_gemm2,
                 )
 
         # ---- Reduce via moe_unpermute ----

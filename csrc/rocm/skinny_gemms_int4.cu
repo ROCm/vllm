@@ -139,6 +139,51 @@ __device__ __forceinline__ void load_act_into_lds(
   }
   __syncthreads();
 }
+
+// Variant of load_act_into_lds that fuses the silu_and_mul preamble.
+// The source activation tensor has K*2 columns per row, packed as
+// [gate(K) | up(K)].  This routine reads both halves and writes
+// silu(gate) * up into the LDS staging buffer, eliminating a separate
+// silu_and_mul kernel launch + the round-trip through global memory for
+// the MoE GEMM2 input.
+//
+// Only N=1 is supported (decode path with block_size_m=1); the
+// multi-row layout for N>1 isn't compatible with the gate|up packing.
+template <typename scalar_t, int THRDS, int WvPrGrp, int A_CHUNK, int N>
+__device__ __forceinline__ void load_act_into_lds_silu_mul(
+    scalar_t* s, const scalar_t* __restrict__ A, const int K,
+    const int max_lds_len) {
+  static_assert(N == 1,
+                "load_act_into_lds_silu_mul only supports N=1; the gate|up "
+                "packing isn't well-defined across multiple rows.");
+  union bigTypeA {
+    scalar_t h[A_CHUNK];
+    float f[A_CHUNK / 2];
+  };
+  // Per-row layout in A: [ gate(K) | up(K) ]
+  // Per-row layout in s: [ silu(gate)*up (K) ]
+  const int limit = min__(K, max_lds_len);
+  for (uint32_t k = 0; k < (uint32_t)limit; k += THRDS * WvPrGrp * A_CHUNK) {
+    uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
+    if (k_in >= (uint32_t)limit) break;
+    bigTypeA gate = *((const bigTypeA*)(&A[k_in]));
+    bigTypeA up = *((const bigTypeA*)(&A[k_in + K]));
+    bigTypeA out;
+  #pragma unroll
+    for (int i = 0; i < A_CHUNK; ++i) {
+      // Match the unfused silu_and_mul semantics exactly: silu is done in
+      // fp32, cast back to scalar_t, then the fp16/bf16 multiply by `up`
+      // happens in the lower precision.  Doing the multiply in fp32 here
+      // gave subtly different generated text on Qwen3-Omni-30B due to
+      // accumulated rounding differences in the downstream GEMM.
+      float g = __s2float(gate.h[i]);
+      scalar_t silu_g = __float2s<scalar_t>(g / (1.0f + expf(-g)));
+      out.h[i] = silu_g * up.h[i];
+    }
+    *((bigTypeA*)(&s[k_in])) = out;
+  }
+  __syncthreads();
+}
 #endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 
 // W4A16 skinny GEMM kernel: packed int4 weights, fp16/bf16 activations
@@ -895,7 +940,8 @@ constexpr int MOE_LDS_ELEMS = 8192;
 
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
+          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
+          bool FUSED_SILU_MUL = false>
 __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
@@ -916,6 +962,17 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
   // load_act_into_lds() call whenever it is unchanged from the previous
   // iteration -- the trailing __syncthreads() of the prior compute call
   // guarantees s[] is still populated with the exact A slice we need.
+  //
+  // FUSED_SILU_MUL: the input tensor A_base has shape [num_slots, 2*K]
+  // packed as [gate(K) | up(K)] per row.  load_act_into_lds_silu_mul
+  // computes silu(gate)*up on-the-fly while staging into LDS, fusing the
+  // separate silu_and_mul preamble into this kernel.  Only N=1 is
+  // supported in this mode (the gate|up packing has no natural
+  // multi-row interpretation).
+  static_assert(!FUSED_SILU_MUL || N == 1, "FUSED_SILU_MUL requires N=1");
+  // Per-row stride of A in the source layout.  Doubled for FUSED_SILU_MUL
+  // because each row holds gate(K)+up(K) = 2*K elements.
+  constexpr int A_ROW_STRIDE_MUL = FUSED_SILU_MUL ? 2 : 1;
   __shared__ scalar_t s[MOE_LDS_ELEMS];
   long last_src_row = -1;
   for (int eb = 0; eb < num_expert_blocks; ++eb) {
@@ -937,17 +994,22 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
     if (sorted_token_ids) {
       int slot_id = sorted_token_ids[eb * N];
       src_row = (long)(slot_id / top_k);
-      A = A_base + src_row * K;
+      A = A_base + src_row * (long)(K * A_ROW_STRIDE_MUL);
       C = C_base + (long)slot_id * M;
     } else {
       src_row = (long)eb * N;
-      A = A_base + src_row * K;
+      A = A_base + src_row * (long)(K * A_ROW_STRIDE_MUL);
       C = C_base + src_row * M;
     }
 
     if (src_row != last_src_row) {
-      load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(s, A, K,
-                                                              MOE_LDS_ELEMS);
+      if constexpr (FUSED_SILU_MUL) {
+        load_act_into_lds_silu_mul<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(
+            s, A, K, MOE_LDS_ELEMS);
+      } else {
+        load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(s, A, K,
+                                                                MOE_LDS_ELEMS);
+      }
       last_src_row = src_row;
     }
 
@@ -1015,7 +1077,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 }
 #else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
+          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
+          bool FUSED_SILU_MUL = false>
 __global__ void moe_wvSplitK_int4_hf_sml_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
@@ -1053,30 +1116,57 @@ __global__ void moe_wvSplitK_int4_hf_(
 // Like MOE_WVSPLITK_INT4G_LAUNCH but parameterizes WvPrGrp and A_CHUNK.
 // Used by the gfx1151 N=1, K<1024 heuristic to instantiate (Y4 U2 AC32);
 // all other call sites go through the (W=16, AC=16) wrapper above.
-#define MOE_WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, _W, _AC, _UNRL, _N,   \
-                                       _GS, _HAS_ZP)                         \
-  {                                                                          \
-    /* One workgroup per CU; expert-block iteration happens inside the       \
-       kernel (see moe_wvSplitK_int4_hf_sml_).  This restores the            \
-       'workgroups == CuCount' M-split invariant of wvSplitK_int4_hf_sml     \
-       and keeps the Strix Halo 20-CU / 8-active-expert tuning optimal. */   \
-    int moe_cu = CuCount;                                                    \
-    if (num_expert_blocks == 0) return;                                      \
-    dim3 block(_THRDS, _W);                                                  \
-    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, _W);                  \
-    dim3 grid(moe_cu);                                                       \
-    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0)                    \
-      moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N,  \
-                                _GS, _HAS_ZP><<<grid, block, 0, stream>>>(   \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,        \
-          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,      \
-          __wvPrGrp, moe_cu, num_expert_blocks);                             \
-    else                                                                     \
-      moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS, \
-                            _HAS_ZP><<<grid, block, 0, stream>>>(            \
-          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,        \
-          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,      \
-          __wvPrGrp, moe_cu, num_expert_blocks);                             \
+//
+// fuse_silu_mul (runtime): when true and _N==1 and the sml path is
+// chosen, dispatch the FUSED_SILU_MUL=true instantiation that reads
+// the activation as [gate(K)|up(K)] and computes silu(gate)*up while
+// staging into LDS.  Otherwise fall back to the standard kernel.
+#define MOE_WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, _W, _AC, _UNRL, _N,    \
+                                       _GS, _HAS_ZP)                          \
+  {                                                                           \
+    /* One workgroup per CU; expert-block iteration happens inside the        \
+       kernel (see moe_wvSplitK_int4_hf_sml_).  This restores the             \
+       'workgroups == CuCount' M-split invariant of wvSplitK_int4_hf_sml      \
+       and keeps the Strix Halo 20-CU / 8-active-expert tuning optimal. */    \
+    int moe_cu = CuCount;                                                     \
+    if (num_expert_blocks == 0) return;                                       \
+    dim3 block(_THRDS, _W);                                                   \
+    int __wvPrGrp = mindiv_int4(M_in, moe_cu * _YTILE, _W);                   \
+    dim3 grid(moe_cu);                                                        \
+    if (K_in * _N <= MOE_LDS_ELEMS && M_in % _YTILE == 0) {                   \
+      if constexpr ((_N) == 1) {                                              \
+        if (fuse_silu_mul) {                                                  \
+          moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL,   \
+                                    _N, _GS, _HAS_ZP, true>                   \
+              <<<grid, block, 0, stream>>>(                                   \
+                  K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr, \
+                  top_k_in, expert_stride_w, expert_stride_s,                 \
+                  expert_stride_zp, __wvPrGrp, moe_cu, num_expert_blocks);    \
+        } else {                                                              \
+          moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL,   \
+                                    _N, _GS, _HAS_ZP, false>                  \
+              <<<grid, block, 0, stream>>>(                                   \
+                  K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr, \
+                  top_k_in, expert_stride_w, expert_stride_s,                 \
+                  expert_stride_zp, __wvPrGrp, moe_cu, num_expert_blocks);    \
+        }                                                                     \
+      } else {                                                                \
+        moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, \
+                                  _GS, _HAS_ZP, false>                        \
+            <<<grid, block, 0, stream>>>(                                     \
+                K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,   \
+                top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp, \
+                __wvPrGrp, moe_cu, num_expert_blocks);                        \
+      }                                                                       \
+    } else {                                                                  \
+      /* Non-sml path: fuse_silu_mul not supported here; the caller must      \
+         only request fusion when the sml condition is met. */                \
+      moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,  \
+                            _HAS_ZP><<<grid, block, 0, stream>>>(             \
+          K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,         \
+          top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp,       \
+          __wvPrGrp, moe_cu, num_expert_blocks);                              \
+    }                                                                         \
   }
 
 #define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
@@ -1278,8 +1368,8 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   torch::Tensor expert_ids,
                                   int64_t block_size_m, int64_t CuCount,
                                   int64_t group_size, torch::Tensor zero_points,
-                                  torch::Tensor sorted_token_ids,
-                                  int64_t top_k) {
+                                  torch::Tensor sorted_token_ids, int64_t top_k,
+                                  bool fuse_silu_mul) {
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -1302,6 +1392,19 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
   // unpermuted activations via sorted_token_ids[block] / top_k.
   bool scattered = sorted_token_ids.numel() > 0;
   int top_k_in = scattered ? static_cast<int>(top_k) : 1;
+
+  // FUSED_SILU_MUL preconditions: only supported for the N_in=1 sml path.
+  // The caller signs up to provide A as [num_slots, 2*K_in].
+  if (fuse_silu_mul) {
+    TORCH_CHECK(N_in == 1, "fuse_silu_mul requires block_size_m == 1, got ",
+                N_in);
+    TORCH_CHECK(K_in * 1 <= MOE_LDS_ELEMS && M_in % 1 == 0,
+                "fuse_silu_mul requires the sml LDS path (K=", K_in,
+                " * N=1 must fit MOE_LDS_ELEMS=", MOE_LDS_ELEMS, ")");
+    TORCH_CHECK(a.size(-1) == 2 * K_in,
+                "fuse_silu_mul expects A's last dim to be 2*K_in=", 2 * K_in,
+                ", got ", a.size(-1));
+  }
 
   // No c.zero_() needed: the wvSplitK kernel writes all M output rows directly
   // (no atomicAdd), and padding blocks with expert_id==-1 are never read by
