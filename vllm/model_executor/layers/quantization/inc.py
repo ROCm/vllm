@@ -301,6 +301,14 @@ class INCConfig(QuantizationConfig):
         if isinstance(layer, FusedMoE):
             if use_marlin:
                 return AWQMarlinMoEMethod(quant_args_marlin, layer.moe_config)
+            from vllm.model_executor.layers.quantization.inc_moe import (
+                INCHybridW4A16MoEMethod,
+                can_use_hybrid_w4a16_moe,
+            )
+
+            if can_use_hybrid_w4a16_moe(weight_bits, group_size, sym):
+                return INCHybridW4A16MoEMethod(layer.moe_config, group_size)
+
             from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
             config = {
@@ -388,21 +396,27 @@ class INCConfig(QuantizationConfig):
         if isinstance(layer, FusedMoE):
             if use_marlin:
                 return GPTQMarlinMoEMethod(quant_args_marlin, layer.moe_config)
-            else:
-                from vllm.model_executor.layers.quantization.moe_wna16 import (
-                    MoeWNA16Config,
-                )
 
-                config = {
-                    "quant_method": "gptq",
-                    "bits": weight_bits,
-                    "group_size": group_size,
-                    "sym": sym,
-                    "lm_head": False,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix
-                )
+            from vllm.model_executor.layers.quantization.inc_moe import (
+                INCHybridW4A16MoEMethod,
+                can_use_hybrid_w4a16_moe,
+            )
+
+            if can_use_hybrid_w4a16_moe(weight_bits, group_size, sym):
+                return INCHybridW4A16MoEMethod(layer.moe_config, group_size)
+
+            from vllm.model_executor.layers.quantization.moe_wna16 import (
+                MoeWNA16Config,
+            )
+
+            config = {
+                "quant_method": "gptq",
+                "bits": weight_bits,
+                "group_size": group_size,
+                "sym": sym,
+                "lm_head": False,
+            }
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
