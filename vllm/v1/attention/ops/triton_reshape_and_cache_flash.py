@@ -386,8 +386,15 @@ def triton_reshape_and_cache_flash(
     # heuristics instead of autotuning
     TILE_SIZE = min(2048, triton.next_power_of_2(n))
     if current_platform.is_rocm() or current_platform.is_xpu():
-        num_stages = 4
-        num_warps = 8
+        # For small decode payloads (1-4 tokens), one CTA per token suffices and
+        # the per-CTA work is tiny (e.g. 2 KB for num_kv_heads=4, head_size=128).
+        # Drop num_warps/num_stages to minimise GPU-side wave-dispatch overhead.
+        if slot_mapping.shape[0] <= 4 and TILE_SIZE <= 512:
+            num_stages = 1
+            num_warps = 1
+        else:
+            num_stages = 4
+            num_warps = 8
     else:  # cuda
         num_stages = 10
         num_warps = 16
