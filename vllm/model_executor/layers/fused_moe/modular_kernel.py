@@ -878,6 +878,14 @@ class FusedMoEExpertsModular(FusedMoEExperts):
     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
         raise NotImplementedError
 
+    def accepts_output_alias(self) -> bool:
+        """Return True if this expert kernel can safely write its output
+        to a buffer that aliases the inplace hidden_states input. Allows
+        the modular pipeline to skip the trailing fused_out -> output copy
+        in TopKWeightAndReduceNoOP.
+        """
+        return False
+
     @abstractmethod
     def apply(
         self,
@@ -1040,12 +1048,17 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
+        output_alias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Allocate temporary and output buffers for the fused experts op.
         Inputs:
         - out_dtype: output type of workspace and output tensors.
         - device: the device of the workspace and output tensors.
+        - output_alias: if provided and shape/dtype/contiguity match
+          the fused_out buffer, return this tensor as fused_out instead
+          of allocating from the workspace. Lets the expert kernel write
+          directly to the final destination, avoiding a trailing copy.
         See `workspace_shapes` for a description of the remainder of arguments.
         Returns a tuple of (workspace13, workspace2, output) tensors.
         """
@@ -1077,16 +1090,32 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        # We can reuse the memory between cache1 and cache3 because by the
-        # time we need cache3, we're done with cache1.
-        # Reuse workspace13 for the output since there is only one chunk.
-        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+        can_alias_output = (
+            output_alias is not None
+            and tuple(output_alias.shape) == tuple(fused_out_shape)
+            and output_alias.dtype == workspace_dtype
+            and output_alias.is_contiguous()
+            and output_alias.device == device
+        )
+
+        if can_alias_output:
+            # fused_out aliases the final destination, so we only need
+            # workspace13 to be large enough to hold the gemm-1 result.
+            max_shape_size = prod(workspace13_shape)
+        else:
+            # We can reuse the memory between cache1 and cache3 because
+            # by the time we need cache3, we're done with cache1.
+            # Reuse workspace13 for the output since there is only one chunk.
+            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
         common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
             ((max_shape_size,), workspace_dtype),
             (workspace2_shape, workspace_dtype),
         )
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
-        fused_out = _resize_cache(common_workspace, fused_out_shape)
+        if can_alias_output:
+            fused_out = output_alias
+        else:
+            fused_out = _resize_cache(common_workspace, fused_out_shape)
 
         return workspace13, workspace2, fused_out
 
@@ -1204,6 +1233,7 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
+        output_alias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1230,6 +1260,7 @@ class FusedMoEKernelModularImpl:
             local_num_experts,
             expert_tokens_meta,
             activation,
+            output_alias=output_alias,
         )
 
         self.fused_experts.apply(
@@ -1378,6 +1409,20 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
         )
 
+        # If the expert kernel opts in (no shared experts), let it write
+        # directly to `output` so the trailing fused_out -> output copy in
+        # TopKWeightAndReduceNoOP can be skipped. This is independent of
+        # `self.inplace`: even when `output` was freshly allocated above,
+        # passing it as the fused_out destination just saves the copy.
+        fused_out_alias = (
+            output
+            if (
+                self.shared_experts is None
+                and self.fused_experts.accepts_output_alias()
+            )
+            else None
+        )
+
         fused_out = self._fused_experts(
             in_dtype=hidden_states.dtype,
             a1q=a1q,
@@ -1392,6 +1437,7 @@ class FusedMoEKernelModularImpl:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
+            output_alias=fused_out_alias,
         )
 
         return self._finalize(
