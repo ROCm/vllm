@@ -68,43 +68,75 @@ def _median_se(times_sorted):
     return med, se / med * 100
 
 
-def bench_dynamic(fn, target_se_pct=0.1, min_iters=20, max_iters=5000, max_time_s=2.0):
-    """Benchmark fn with adaptive iteration count.
+def bench_dynamic(
+    fn,
+    target_se_pct=0.2,
+    min_replays=8,
+    max_replays=40,
+    max_time_s=1.0,
+    target_replay_ms=20.0,
+):
+    """Benchmark fn by capturing many launches into a CUDA graph.
 
-    Collects per-iteration GPU times via CUDA events. Stops when the
-    standard error of the median drops below target_se_pct of the median,
-    or when max_iters / max_time_s is reached.
+    Probes the kernel time, sizes one capture so a replay runs ~target_replay_ms
+    (so the GPU stays continuously busy and DVFS doesn't drop the clock between
+    launches), captures `iters_per_replay` calls of fn(0..iters-1), and times
+    repeated replays. fn(i) lets callers rotate weight buffers.
 
-    fn is called as fn(iteration_index) so callers can rotate buffers
-    to avoid cache hits.
-
-    Returns (median_ms, num_iters, se_pct).
+    Returns (median_ms_per_kernel, num_kernels_timed, se_pct).
     """
-    for i in range(10):
-        fn(i)
+    # 1) Probe one kernel to size the graph.
+    fn(0)
+    torch.accelerator.synchronize()
+    probe_start = torch.Event(enable_timing=True)
+    probe_end = torch.Event(enable_timing=True)
+    probe_start.record()
+    fn(0)
+    probe_end.record()
+    torch.accelerator.synchronize()
+    probe_ms = max(probe_start.elapsed_time(probe_end), 1e-3)
+    iters_per_replay = max(2, min(2000, int(target_replay_ms / probe_ms)))
+
+    # 2) Warm + capture on a side stream. Run a few more launches inside the
+    #    capture stream before recording so the caching allocator is settled.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for i in range(5):
+            fn(i)
+    torch.cuda.current_stream().wait_stream(s)
     torch.accelerator.synchronize()
 
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        for i in range(iters_per_replay):
+            fn(i)
+
+    # Warm one replay to absorb first-launch cost.
+    g.replay()
+    torch.accelerator.synchronize()
+
+    # 3) Time replays adaptively.
     times = []
     start_ev = torch.Event(enable_timing=True)
     end_ev = torch.Event(enable_timing=True)
     wall_start = time.monotonic()
-
-    for i in range(max_iters):
+    for r in range(max_replays):
         start_ev.record()
-        fn(i)
+        g.replay()
         end_ev.record()
         torch.accelerator.synchronize()
-        times.append(start_ev.elapsed_time(end_ev))
+        times.append(start_ev.elapsed_time(end_ev) / iters_per_replay)
 
-        if len(times) >= min_iters and len(times) % 10 == 0:
+        if len(times) >= min_replays and len(times) % 5 == 0:
             med, se_pct = _median_se(sorted(times))
             if se_pct < target_se_pct:
-                return med, len(times), se_pct
+                return med, len(times) * iters_per_replay, se_pct
             if time.monotonic() - wall_start > max_time_s:
-                return med, len(times), se_pct
+                return med, len(times) * iters_per_replay, se_pct
 
     med, se_pct = _median_se(sorted(times))
-    return med, len(times), se_pct
+    return med, len(times) * iters_per_replay, se_pct
 
 
 def parse_shape(s):
