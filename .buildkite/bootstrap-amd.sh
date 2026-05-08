@@ -109,14 +109,8 @@ upload_pipeline() {
     curl -sSfL https://github.com/mitsuhiko/minijinja/releases/download/2.3.1/minijinja-cli-installer.sh | sh
     source "$HOME/.cargo/env"
 
-    if [[ $BUILDKITE_BRANCH == "shadow_internal" ]]; then
-        AMD_MIRROR_HW="amdtentative"
-        curl -o .buildkite/test-template.j2 \
-            "https://raw.githubusercontent.com/rocm/vllm/shadow_internal/.buildkite/test-template-amd.j2?$(date +%s)"
-    else
-        curl -o .buildkite/test-template.j2 \
-            "https://raw.githubusercontent.com/rocm/vllm/${BUILDKITE_BRANCH}/.buildkite/test-template-amd.j2?$(date +%s)"
-    fi
+    curl -o .buildkite/test-template.j2 \
+        "https://raw.githubusercontent.com/rocm/vllm/${BUILDKITE_BRANCH}/.buildkite/test-template-amd.j2?$(date +%s)"
 
 
     # (WIP) Use pipeline generator instead of jinja template
