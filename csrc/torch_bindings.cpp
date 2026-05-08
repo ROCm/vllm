@@ -177,6 +177,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int forced_token_heads_per_warp=-1) -> ()");
   ops.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
+  // Fused QK Norm + MRotaryEmbedding (Qwen3-VL / Qwen3-Omni).  q and k are
+  // separate (post-split), positions is [3, num_tokens] (T/H/W).
+  ops.def(
+      "fused_qk_norm_mrope(Tensor! q, Tensor! k, int num_q_heads, "
+      "int num_k_heads, int head_dim, float eps, "
+      "Tensor q_weight, Tensor k_weight, Tensor cos_sin_cache, "
+      "Tensor positions, int mrope_section_t, int mrope_section_h, "
+      "int mrope_section_w, bool mrope_interleaved) -> ()");
+  ops.impl("fused_qk_norm_mrope", torch::kCUDA, &fused_qk_norm_mrope);
+
   // Apply repetition penalties to logits in-place
   ops.def(
       "apply_repetition_penalties_(Tensor! logits, Tensor prompt_mask, "

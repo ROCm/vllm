@@ -24,6 +24,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+from vllm.model_executor.layers.rotary_embedding.mrope import (
+    apply_interleaved_rope,
+)
 from vllm.platforms import current_platform
 
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
@@ -157,6 +161,111 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
             )
         )
         return result
+
+
+class MatcherMRotaryEmbedding(MatcherCustomOp):
+    """Matcher for MRotaryEmbedding.forward_native (multimodal RoPE).
+
+    Unlike MatcherRotaryEmbedding (which mirrors RotaryEmbedding.forward_static
+    for 1-D positions), this mirrors MRotaryEmbedding.forward_native with a
+    2-D positions tensor of shape [3, num_tokens] (T/H/W positions) and an
+    mrope_section split.
+
+    There is no "custom op" path here yet — MRotaryEmbedding's custom path
+    (forward_cuda) is the opaque triton_mrope kernel which is not matchable
+    by the inductor pattern matcher.  forward_custom therefore raises.
+    """
+
+    def __init__(
+        self,
+        is_neox: bool,
+        head_size: int,
+        rotary_dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mrope_section: tuple[int, int, int],
+        mrope_interleaved: bool,
+    ) -> None:
+        # We always match the native decomposition; there is no custom op
+        # path for mrope that the matcher can replace.
+        super().__init__(enabled=False)
+        self.is_neox = is_neox
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.q_size = self.num_heads * self.head_size
+        self.kv_size = self.num_kv_heads * self.head_size
+        self.mrope_section = list(mrope_section)
+        self.mrope_interleaved = mrope_interleaved
+
+    def inputs(self) -> list[torch.Tensor]:
+        # positions is [3, T] for mrope.
+        positions = self.empty_int64(3, 5)
+        query = self.empty(5, self.q_size)
+        key = self.empty(5, self.kv_size)
+        cos_sin_cache = self.empty(4096, self.rotary_dim)
+        return [positions, query, key, cos_sin_cache]
+
+    def forward_custom(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:  # pragma: no cover
+        raise NotImplementedError(
+            "MatcherMRotaryEmbedding has no custom-op path; mrope's CUDA "
+            "path is the opaque triton_mrope kernel."
+        )
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Mirror of MRotaryEmbedding.forward_native restricted to the 2-D
+        positions / mrope_section path.  Uses ApplyRotaryEmb.forward_static
+        for the actual rotation so the resulting FX subgraph matches what
+        the model produces when neither RotaryEmbedding nor ApplyRotaryEmb
+        custom ops are enabled."""
+        assert key is not None
+        num_tokens = positions.shape[-1]
+        cos_sin = cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if self.mrope_interleaved:
+            cos = apply_interleaved_rope(cos, self.mrope_section)
+            sin = apply_interleaved_rope(sin, self.mrope_section)
+        else:
+            cos = torch.cat(
+                [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                dim=-1,
+            )
+            sin = torch.cat(
+                [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                dim=-1,
+            )
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = ApplyRotaryEmb.forward_static(
+            query_rot, cos, sin, is_neox_style=self.is_neox
+        )
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = ApplyRotaryEmb.forward_static(
+            key_rot, cos, sin, is_neox_style=self.is_neox
+        )
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
 
 
 class MatcherFusedAddRMSNorm(MatcherCustomOp):

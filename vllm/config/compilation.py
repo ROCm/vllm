@@ -932,9 +932,13 @@ class CompilationConfig:
         if (
             self.pass_config.enable_qk_norm_rope_fusion
             and "+rotary_embedding" not in self.custom_ops
+            and "-rotary_embedding" not in self.custom_ops
         ):
             # TODO(zhuhaoran): support rope native forward match and remove this.
             # Linked issue: https://github.com/vllm-project/vllm/issues/28042
+            # NOTE: explicit "-rotary_embedding" lets MRotaryEmbedding stay on
+            # its native (decomposed) forward, so the QkNormMRopePattern can
+            # fire (the triton_mrope CUDA path is opaque to inductor).
             self.custom_ops.append("+rotary_embedding")
         if (
             self.pass_config.fuse_rope_kvcache

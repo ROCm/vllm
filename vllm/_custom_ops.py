@@ -456,6 +456,40 @@ def fused_qk_norm_rope(
     )
 
 
+def fused_qk_norm_mrope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    mrope_section_t: int,
+    mrope_section_h: int,
+    mrope_section_w: int,
+    mrope_interleaved: bool,
+) -> None:
+    torch.ops._C.fused_qk_norm_mrope(
+        q,
+        k,
+        num_q_heads,
+        num_k_heads,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        mrope_section_t,
+        mrope_section_h,
+        mrope_section_w,
+        mrope_interleaved,
+    )
+
+
 def apply_repetition_penalties_torch(
     logits: torch.Tensor,
     prompt_mask: torch.Tensor,

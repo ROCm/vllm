@@ -100,6 +100,14 @@ void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
                         bool is_neox, torch::Tensor& position_ids,
                         int64_t forced_token_heads_per_warp);
 
+void fused_qk_norm_mrope(torch::Tensor& q, torch::Tensor& k,
+                         int64_t num_q_heads, int64_t num_k_heads,
+                         int64_t head_dim, double eps, torch::Tensor& q_weight,
+                         torch::Tensor& k_weight, torch::Tensor& cos_sin_cache,
+                         torch::Tensor& positions, int64_t mrope_section_t,
+                         int64_t mrope_section_h, int64_t mrope_section_w,
+                         bool mrope_interleaved);
+
 void apply_repetition_penalties_(torch::Tensor& logits,
                                  const torch::Tensor& prompt_mask,
                                  const torch::Tensor& output_mask,
