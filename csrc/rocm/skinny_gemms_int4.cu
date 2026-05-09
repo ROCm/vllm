@@ -8,6 +8,8 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
 
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
@@ -1139,10 +1141,23 @@ __global__ void moe_wvSplitK_int4_hf_(
                 2 wide-load batches per k-step instead of 4 narrow    \
                 ones, fewer waitcnt boundaries amortize HBM page-mode \
                 costs.  GFX9 wave64 stays on the previous heuristic   \
-                via MOE_WVSPLIT_INT4G_GS_W_AC's fallback. */          \
+                via MOE_WVSPLIT_INT4G_GS_W_AC's fallback.             \
+              P-2 LOW-VGPR override (env-controlled, default ON):     \
+                On Qwen3.5-35B-A3B (gemm2 K=512), the (W=32, AC=32)   \
+                instantiation compiles to 157 VGPRs/wave; combined    \
+                with WG=1024 threads (32 wave32) this caps occupancy  \
+                at 32 active wave32/CU = 50% of peak.  Switching to   \
+                (W=16, AC=16, U=2) drops VGPRs to 113 and WG=512      \
+                threads (16 wave32) so 3 WGs fit per CU = 48 active   \
+                wave32/CU = 75% of peak.  Better latency hiding for   \
+                memory-bound kernels.  Set                            \
+                VLLM_MOE_WVSPLITK_INT4_TINY_K_LOW_VGPR=0 to revert    \
+                to the original (W=32, AC=32) heuristic. */           \
     {                                                                 \
       if (K_in >= 1024)                                               \
         MOE_WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                      \
+      else if (p2_low_vgpr_tiny_k && is_gfx1x_int4())                 \
+        MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                      \
       else                                                            \
         MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 2, __N, _HAS_ZP)         \
     }                                                                 \
@@ -1306,6 +1321,17 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
   // No c.zero_() needed: the wvSplitK kernel writes all M output rows directly
   // (no atomicAdd), and padding blocks with expert_id==-1 are never read by
   // the caller (moe_unpermute only accesses valid token slots).
+
+  // P-2: env-gated override for the K<1024 (gemm2 down-proj, e.g. K=512)
+  // dispatch path.  Default ON: route to the (W=16, AC=16, U=2) low-VGPR
+  // template (113 VGPR/wave) instead of (W=32, AC=32, U=2) (157 VGPR/wave),
+  // lifting per-CU active waves from 32 to 48 on gfx1151.  Set
+  // VLLM_MOE_WVSPLITK_INT4_TINY_K_LOW_VGPR=0 to revert.  See
+  // notes/qwen35-perf-campaign/ideas-research/p2-investigation.md.
+  static const bool p2_low_vgpr_tiny_k = []() {
+    const char* e = std::getenv("VLLM_MOE_WVSPLITK_INT4_TINY_K_LOW_VGPR");
+    return e == nullptr ? true : (std::string_view(e) != "0");
+  }();
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
       a.scalar_type(), "fused_moe_wvSplitK_int4_gemm", [&] {
