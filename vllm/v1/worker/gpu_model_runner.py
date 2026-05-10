@@ -3561,13 +3561,23 @@ class GPUModelRunner(
         Returns:
             Model output tensor
         """
-        return self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-            **model_kwargs,
-        )
+        # P-5: optional roctx profile-region brackets (rocprofv3
+        # --selected-regions) so single-pass PMC can sample only the
+        # post-warmup, post-graph-capture decode steps. Default-off; gated
+        # by VLLM_ROCTX_DECODE_REGION env knob.
+        from vllm.v1.worker import _roctx_decode_region as _roctx
+
+        _roctx.begin_decode_step()
+        try:
+            return self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+        finally:
+            _roctx.end_decode_step()
 
     @staticmethod
     def _is_uniform_decode(
