@@ -219,6 +219,63 @@ direct_register_custom_op(
 )
 
 
+_BLAS_DTYPE_SHORT_NAMES: dict[torch.dtype, str] = {
+    torch.float16: "fp16",
+    torch.bfloat16: "bf16",
+    torch.float32: "fp32",
+    torch.float64: "fp64",
+    torch.int8: "int8",
+    torch.int16: "int16",
+    torch.int32: "int32",
+    torch.int64: "int64",
+    torch.uint8: "uint8",
+}
+
+
+def annotate_module_linears_for_profile(module: torch.nn.Module) -> None:
+    """Wrap every raw ``torch.nn.Linear`` descendant of ``module`` so its
+    forward call is enclosed in ``record_function_or_nullcontext(
+    f"BLAS {n}x{m}x{k} {dt}")`` where ``dt`` is the short input dtype name
+    (``fp16`` / ``bf16`` / ``fp32`` / ...).
+
+    Used to label HuggingFace-stock vision/audio tower GEMMs (which call
+    ``F.linear`` directly and bypass vLLM's ``rocm_unquantized_gemm`` path,
+    leaving the resulting hipBLASLt ``Cijk_*`` kernels unattributed in
+    PyTorch profiles).
+
+    Skips vLLM's own ``LinearBase`` subclasses (``ColumnParallelLinear``,
+    ``RowParallelLinear``, ``ReplicatedLinear``, etc.) — those route through
+    a quantization method that already emits
+    ``BLAS``/``wvSplitK``/``LLMM1`` annotations.
+
+    Idempotent: safe to call twice on the same module.
+    """
+    for child in module.modules():
+        if type(child) is not torch.nn.Linear:
+            continue
+        if getattr(child, "_vllm_profile_annotated", False):
+            continue
+        original_forward = child.forward
+        out_features = child.out_features
+        in_features = child.in_features
+
+        def wrapped_forward(
+            x: torch.Tensor,
+            _orig=original_forward,
+            _m=out_features,
+            _k=in_features,
+        ) -> torch.Tensor:
+            n = x.numel() // x.size(-1)
+            dt = _BLAS_DTYPE_SHORT_NAMES.get(
+                x.dtype, str(x.dtype).removeprefix("torch.")
+            )
+            with record_function_or_nullcontext(f"BLAS {n}x{_m}x{_k} {dt}"):
+                return _orig(x)
+
+        child.forward = wrapped_forward
+        child._vllm_profile_annotated = True
+
+
 def check_cpu_sgl_kernel(n: int, k: int, dtype: torch.dtype) -> bool:
     return (
         torch.cpu._is_amx_tile_supported()

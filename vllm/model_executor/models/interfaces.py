@@ -289,6 +289,19 @@ class SupportsMultiModal(Protocol):
 
         self._tower_model_names = children_names
 
+        # Annotate raw nn.Linear modules in the freshly-constructed tower so
+        # their hipBLASLt Cijk_* kernels are grouped as "BLAS NxKxM" in
+        # profiles. Local import: layers.utils -> _custom_ops would be a
+        # heavy top-level import here.
+        from vllm.model_executor.layers.utils import (
+            annotate_module_linears_for_profile,
+        )
+
+        for child_name in children_names:
+            child = getattr(self, child_name, None)
+            if isinstance(child, nn.Module):
+                annotate_module_linears_for_profile(child)
+
     @contextmanager
     def _mark_composite_model(
         self,
