@@ -1202,6 +1202,18 @@ __global__ void moe_wvSplitK_int4_hf_(
         MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 4, __N, _HAS_ZP)          \
       else if (K_in >= 1024)                                           \
         MOE_WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                      \
+      else if (is_gfx1x_int4() && K_in == 512)                        \
+        /* gfx1151 K=512 N=1 (Qwen3.5 MoE down-proj).  4-axis sweep   \
+         * via benchmarks/kernels/sweep_int4g_moe_kernel.py finds     \
+         * (Y=4, U=1, W=32, AC=8) at 28.1 us vs the P-2 LOW_VGPR pick \
+         * (Y=4, U=2, W=16, AC=16) at 31.4 us -- ~1.12x at            \
+         * fuse_silu_mul=False; ~1.18x at fuse_silu_mul=True (the     \
+         * down+silu trace shape).  Pure-work %DRAM lifts ~62%        \
+         * -> ~78% post per-launch floor subtraction.  W=32 + AC=8    \
+         * keeps WG threads at 1024 (32 wv32) but the narrow per-     \
+         * iter loads avoid the (W=32, AC=32) VGPR-spill penalty the  \
+         * (W=32, AC=32) default below describes. */                  \
+        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 8, 1, __N, _HAS_ZP)          \
       else if (p2_low_vgpr_tiny_k && is_gfx1x_int4())                 \
         MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                      \
       else                                                            \
