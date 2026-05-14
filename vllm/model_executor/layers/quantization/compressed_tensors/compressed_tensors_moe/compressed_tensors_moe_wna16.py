@@ -181,6 +181,18 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         import vllm.envs as envs
 
+        # AIESW-32049: PR #882 deleted the Exllama dispatch when this file was
+        # split out from compressed_tensors_moe.py.  The env var is still
+        # defined in vllm/envs.py and still defaults to true, but became dead
+        # code.  ExllamaExperts and the underlying vllm::gptq::moe_gptq_4bit
+        # HIP kernel both still exist.  On gfx1151 with Qwen3-30B-A3B-AWQ-4bit
+        # decode the Exllama path measured ~71.9 tok/s vs 55.5 for the new
+        # HybridW4A16 path that replaced it; this branch restores the GOOD
+        # default behaviour.  Set VLLM_MOE_GPTQ_EXLLAMA=0 to opt into Hybrid.
+        if envs.VLLM_MOE_GPTQ_EXLLAMA and self.num_bits == 4:
+            self._process_weights_exllama(layer)
+            return
+
         if envs.VLLM_MOE_HYBRID_W4A16 and self.num_bits == 4:
             self._process_weights_hybrid_w4a16(layer)
             return
@@ -291,6 +303,91 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             inplace=not self.moe.disable_inplace,
         )
 
+    def _process_weights_exllama(self, layer: torch.nn.Module) -> None:
+        """Exllama 4-bit GPTQ MoE path (re-wired for AIESW-32049).
+
+        Keeps weights in [E, K/8, N] int32 (ExLlama-shuffle layout) and
+        applies gptq_shuffle for the SIMD-aware kernel.  Synthesises
+        symmetric qzeros (0x77777777, i.e. 8 nibbles of 7) so the
+        underlying GPTQv1 kernel - which adds +1 internally - sees a
+        zero_point of 8.
+
+        Mirrors the dispatch that lived in compressed_tensors_moe.py at
+        commit c906bc686e before PR #882's split into the MoE submodule
+        accidentally dropped this branch.
+        """
+        from vllm._custom_ops import gptq_shuffle
+        from vllm.model_executor.layers.fused_moe.all2all_utils import (
+            maybe_make_prepare_finalize,
+        )
+        from vllm.model_executor.layers.fused_moe.exllama_moe import (
+            ExllamaExperts,
+        )
+
+        device = layer.w13_weight_packed.device
+        dummy_perm = torch.empty(0, dtype=torch.int32, device=device)
+        for e in range(layer.w13_weight_packed.size(0)):
+            gptq_shuffle(layer.w13_weight_packed.data[e], dummy_perm, self.num_bits)
+            gptq_shuffle(layer.w2_weight_packed.data[e], dummy_perm, self.num_bits)
+        # Scales already [E, groups, N] -- keep as-is for exllama.
+
+        # Synthesise symmetric qzeros for the GPTQv1 kernel.  4-bit symmetric:
+        # zero_point=8, kernel adds +1, so store 7 per nibble.  8 nibbles of
+        # 7 packed into int32 == 0x77777777.
+        E = layer.w13_weight_packed.size(0)
+        groups_w13 = layer.w13_weight_scale.size(1)
+        N_w13 = layer.w13_weight_packed.size(2)
+        groups_w2 = layer.w2_weight_scale.size(1)
+        N_w2 = layer.w2_weight_packed.size(2)
+
+        layer.register_parameter(
+            "w13_qzeros",
+            torch.nn.Parameter(
+                torch.full(
+                    (E, groups_w13, N_w13 // 8),
+                    0x77777777,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                requires_grad=False,
+            ),
+        )
+        layer.register_parameter(
+            "w2_qzeros",
+            torch.nn.Parameter(
+                torch.full(
+                    (E, groups_w2, N_w2 // 8),
+                    0x77777777,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                requires_grad=False,
+            ),
+        )
+        layer.use_exllama_moe = True
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        layer.w13_weight = layer.w13_weight_packed
+        layer.w2_weight = layer.w2_weight_packed
+
+        prepare_finalize = maybe_make_prepare_finalize(
+            moe=self.moe,
+            quant_config=self.moe_quant_config,
+            routing_tables=layer._maybe_init_expert_routing_tables(),
+            allow_new_interface=True,
+            use_monolithic=False,
+        )
+        assert prepare_finalize is not None
+        self.moe_kernel = mk.FusedMoEKernel(
+            prepare_finalize,
+            ExllamaExperts(
+                moe_config=self.moe, quant_config=self.moe_quant_config
+            ),
+            shared_experts=None,
+            inplace=not self.moe.disable_inplace,
+        )
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:
@@ -301,11 +398,14 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             else int8_w8a16_moe_quant_config
         )
 
+        # When the Exllama branch is active the GPTQv1 kernel needs the
+        # synthesised qzeros tensors created by _process_weights_exllama.
+        use_exllama = getattr(layer, "use_exllama_moe", False)
         return config_builder(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_zp=None,
-            w2_zp=None,
+            w1_zp=getattr(layer, "w13_qzeros", None) if use_exllama else None,
+            w2_zp=getattr(layer, "w2_qzeros", None) if use_exllama else None,
             block_shape=[0, self.group_size],
         )
 
