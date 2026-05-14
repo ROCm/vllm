@@ -124,11 +124,11 @@ pytest -v -s {{ matched_targets | join(' ') }}
        queue: amd-cpu
 
    {% set concurrency_limits = {
-     "1gpu": 2,
-     "2gpu": 2,
-     "4gpu": 2,
-     "8gpu": 2,
-     "cpu": 2,
+     "1gpu": 30,
+     "2gpu": 30,
+     "4gpu": 20,
+     "8gpu": 10,
+     "cpu": 10,
    } %}
 
    {% for step in steps %}
