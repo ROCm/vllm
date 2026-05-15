@@ -18,6 +18,33 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _tiny_dot_kernel(x_ptr, w_ptr, out_ptr,
+                         K, BLOCK: tl.constexpr):
+        offsets = tl.arange(0, BLOCK)
+        mask = offsets < K
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        acc = tl.sum(x * w, axis=0)
+        tl.store(out_ptr, acc)
+
+    def _tiny_dot_triton(x_flat: torch.Tensor,
+                         w_flat: torch.Tensor) -> torch.Tensor:
+        K = x_flat.numel()
+        BLOCK = triton.next_power_of_2(K)
+        # Cast to fp32 inside kernel; cast back at the call site.  Matches
+        # the eager (x*w).sum(dtype=x.dtype) semantics.
+        out_f32 = torch.empty((), dtype=torch.float32, device=x_flat.device)
+        _tiny_dot_kernel[(1,)](x_flat, w_flat, out_f32, K=K, BLOCK=BLOCK)
+        return out_f32.to(x_flat.dtype)
+except ImportError:
+    _tiny_dot_triton = None  # type: ignore[assignment]
+
+
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "gate",
     "router",
@@ -192,6 +219,23 @@ def rocm_unquantized_gemm_impl(
         and n == 1
         and x.dtype in [torch.float16, torch.bfloat16]
     ):
+        # Triton fast path: a single-block fused (x*w).sum kernel collapses
+        # the eager 2-launch chain (aten::mul + aten::sum) into one Triton
+        # launch + one aten::copy_ cast.  Cudagraph replay sees fewer
+        # dispatches per layer per decode token.  Default ON; revert via
+        # VLLM_DISABLE_TINY_DOT_TRITON=1.  Restricted to K<=4096 because
+        # the kernel is a single-block reduction (BLOCK = next_pow2(K)).
+        # Correctness covered by tests/kernels/test_tiny_dot_triton.py.
+        if (
+            os.environ.get("VLLM_DISABLE_TINY_DOT_TRITON", "0") != "1"
+            and bias is None
+            and k <= 4096
+        ):
+            with record_function_or_nullcontext(f"DOT {n}x{m}x{k} [tk]"):
+                x_flat = x.reshape(-1).contiguous()
+                w_flat = weight.reshape(-1).contiguous()
+                out = _tiny_dot_triton(x_flat, w_flat)
+                return out.reshape(*x.shape[:-1], 1)
         with record_function_or_nullcontext(f"DOT {n}x{m}x{k}"):
             x_flat = x.reshape(-1)
             w_flat = weight.reshape(-1)
