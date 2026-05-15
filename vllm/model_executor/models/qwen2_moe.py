@@ -126,7 +126,8 @@ class Qwen2MoeMLP(nn.Module):
         ``self._meta3_2_fused_silu_ok`` so we only pay this once.
 
         Preconditions:
-        - ``VLLM_BF16_WVSPLITK_FUSED_SILU=1`` (default OFF for now).
+        - ``VLLM_BF16_WVSPLITK_FUSED_SILU`` not explicitly disabled
+          (default ON; set to "0" to revert).
         - ROCm platform.
         - ``gate_up`` activation is bf16/fp16.
         - ``down_proj`` is unquantized (``layer.weight`` is the raw weight).
@@ -136,7 +137,7 @@ class Qwen2MoeMLP(nn.Module):
           shared_expert d ~ 512..2048).
         - ``gate_up.size(-1) == 2 * down_proj.weight.size(-1)``.
         """
-        if os.environ.get("VLLM_BF16_WVSPLITK_FUSED_SILU", "0") != "1":
+        if os.environ.get("VLLM_BF16_WVSPLITK_FUSED_SILU", "1") != "1":
             return False
         if gate_up.dtype not in (torch.bfloat16, torch.float16):
             return False
