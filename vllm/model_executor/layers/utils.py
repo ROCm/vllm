@@ -26,17 +26,21 @@ def _tiny_dot_kernel(x_ptr, w_ptr, out_ptr, K, BLOCK: tl.constexpr):
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     acc = tl.sum(x * w, axis=0)
+    # tl.store auto-casts acc (fp32) to the dtype of out_ptr;
+    # passing a bf16/fp16 ptr eliminates the post-kernel aten::copy_
+    # that otherwise fires once per layer per decode token.
     tl.store(out_ptr, acc)
 
 
 def _tiny_dot_triton(x_flat: torch.Tensor, w_flat: torch.Tensor) -> torch.Tensor:
     K = x_flat.numel()
     BLOCK = triton.next_power_of_2(K)
-    # Cast to fp32 inside kernel; cast back at the call site.  Matches
-    # the eager (x*w).sum(dtype=x.dtype) semantics.
-    out_f32 = torch.empty((), dtype=torch.float32, device=x_flat.device)
-    _tiny_dot_kernel[(1,)](x_flat, w_flat, out_f32, K=K, BLOCK=BLOCK)
-    return out_f32.to(x_flat.dtype)
+    # Allocate the scalar output directly in the input's dtype so the
+    # in-kernel store does the fp32 -> bf16/fp16 cast (matches the eager
+    # (x*w).sum(dtype=x.dtype) semantics, no extra aten::copy_).
+    out = torch.empty((), dtype=x_flat.dtype, device=x_flat.device)
+    _tiny_dot_kernel[(1,)](x_flat, w_flat, out, K=K, BLOCK=BLOCK)
+    return out
 
 
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
