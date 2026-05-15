@@ -131,12 +131,19 @@ RUN git clone --no-checkout --filter=blob:none https://github.com/ROCm/rocm-syst
 RUN git clone --no-checkout --filter=blob:none https://github.com/Rohan138/rocm-libraries /tmp/rocm-libraries \
     && cd /tmp/rocm-libraries \
     && git sparse-checkout init --cone \
-    && git sparse-checkout set projects/hipblaslt \
+    && git sparse-checkout set projects/hipblaslt shared/origami \
     && git checkout rocm-rel-7.2-ropotdar-enum-fix \
     && cd projects/hipblaslt \
+    && if [ "$USE_SCCACHE" = "1" ]; then \
+           export HIP_CLANG_PATH=/opt/sccache-wrappers \
+           && export CMAKE_C_COMPILER_LAUNCHER=sccache \
+           && export CMAKE_CXX_COMPILER_LAUNCHER=sccache \
+           && sccache --show-stats; \
+       fi \
     && ./install.sh -id \
-        -a "$(echo $PYTORCH_ROCM_ARCH | tr ';' ',')" \
+        -a "$PYTORCH_ROCM_ARCH" \
         --skip_rocroller \
+    && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
     && rm -rf /tmp/rocm-libraries
 
 ###
