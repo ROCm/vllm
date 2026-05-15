@@ -315,7 +315,16 @@ def fused_kkt_solve_tril_recompute_w_u_fwd(
     # fp32 scratch for the in-kernel kkt → solve_tril round-trip.  Per-program
     # writes/reads land in L2 since the slice is small (B·T·H·BT·4 bytes,
     # ≈3.85 MB at the trace shape) and the access pattern is per-program-local.
-    A_scratch = torch.empty(B, T, H, BT, dtype=torch.float32, device=k.device)
+    # NB: torch.zeros (not torch.empty) — under cudagraph capture with the MoE
+    # shared-experts running on an aux stream, torch.empty's caching allocator
+    # was handing out memory blocks that aux-stream tensors had just freed,
+    # leaving stale cache lines that the kernel's intra-program write→read
+    # round-trip would occasionally re-read instead of the freshly-stored b_A.
+    # zero-init forces the allocator to clean the block and breaks the
+    # aliasing window.  Cost: a single bf16-bandwidth fill per call (~3.85 MB
+    # / 230 GiB/s ≈ 17 µs at trace shape) — small vs the prefill speedup
+    # this fusion unlocks.
+    A_scratch = torch.zeros(B, T, H, BT, dtype=torch.float32, device=k.device)
     extra = {"waves_per_eu": 2} if is_navi else {}
     kkt_solve_tril_recompute_w_u_kernel[(NT, B * H)](
         k=k, v=v, beta=beta, g=g_cumsum, w=w, u=u, A_scratch=A_scratch,

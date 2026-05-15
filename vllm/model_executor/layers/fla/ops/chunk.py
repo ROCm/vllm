@@ -28,21 +28,20 @@ from .wy_fast_doubly_fused import fused_kkt_solve_tril_recompute_w_u_fwd
 # at M=941 shows 1.33× cold vs the re-tuned unfused chain (625 µs vs
 # 830 µs).  Production prefill TTFT improvement: ~30% over singly-fused.
 #
-# Default ON.  The kkt accumulation now uses the same single [BT, BT]
+# Default ON.  The kkt accumulation uses the same single [BT, BT]
 # matmul as the unfused kernel and writes b_A to a scratch buffer that
 # the inversion code re-reads per-block, so the kkt math is bit-
 # identical to the reference chain.  Off-diagonal Ai dots stay in fp32
 # (matches singly-fused) to avoid bf16 rounding compounding across the
 # 24 GDN layers.  Sanity validated end-to-end.
 #
-# 2026-05-15: A_scratch zero-init (wy_fast_doubly_fused.py) is required
-# for cudagraph + multi-stream-shared-experts compatibility on ROCm.
-# Without zero-init, torch.empty's caching allocator hands out blocks
-# that the aux stream just freed, leaving stale cache lines that the
-# kernel's intra-program write→read round-trip occasionally re-reads
-# (instead of the freshly-stored b_A) — which manifests as garbage
-# decode tokens (sanity check returns "!!!!!" repeats).  See
-# microbench/decode_routing_fusion in rdna35-asm-expert.
+# A_scratch is zero-initialised (wy_fast_doubly_fused.py) so it stays
+# correct under cudagraph + multi-stream-shared-experts on ROCm.
+# Without the zero-init, torch.empty's caching allocator hands out
+# blocks that the aux stream just freed, leaving stale cache lines
+# that the kernel's intra-program write->read round-trip occasionally
+# re-reads instead of the freshly-stored b_A -- which manifests as
+# garbage decode tokens (sanity check returns "!!!!!" repeats).
 _USE_FUSED_KKT = os.getenv("FLA_USE_FUSED_KKT", "1") == "1"
 
 
