@@ -41,6 +41,7 @@ from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.utils import tiny_sigmoid_dot
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     fused_moe_make_expert_params_mapping,
@@ -199,8 +200,13 @@ class Qwen2MoeMLP(nn.Module):
                     torch.ops._rocm_C, "wvSplitK_fused_silu_gate_mul"
                 ):
                     # Phase 2: collapse silu_mul + down + sigmoid*out
-                    # into a single fused kernel.
-                    gate_scalar = F.sigmoid(self.expert_gate(x)[0])
+                    # into a single fused kernel.  Compute the sigmoid
+                    # of the dot product in one Triton pass (replaces
+                    # aten::mul + aten::sum + aten::sigmoid for the
+                    # shared_expert_gate's Linear(hidden, 1) call).
+                    gate_scalar = tiny_sigmoid_dot(
+                        x.reshape(-1), self.expert_gate.weight.data
+                    ).reshape(1, 1)
                     return ops.wvSplitK_fused_silu_gate_mul(
                         weight,
                         gate_up,
