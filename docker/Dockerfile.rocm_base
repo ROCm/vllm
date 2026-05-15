@@ -127,6 +127,18 @@ RUN git clone --no-checkout --filter=blob:none https://github.com/ROCm/rocm-syst
     && make install \
     && rm -rf /tmp/rocm-systems
 
+# hipblaslt fix for https://github.com/ROCm/rocm-libraries/issues/7056
+RUN git clone --no-checkout --filter=blob:none https://github.com/Rohan138/rocm-libraries /tmp/rocm-libraries \
+    && cd /tmp/rocm-libraries \
+    && git sparse-checkout init --cone \
+    && git sparse-checkout set projects/hipblaslt \
+    && git checkout rocm-rel-7.2-ropotdar-enum-fix \
+    && cd projects/hipblaslt \
+    && ./install.sh -id \
+        -a "$(echo $PYTORCH_ROCM_ARCH | tr ';' ',')" \
+        --skip_rocroller \
+    && rm -rf /tmp/rocm-libraries
+
 ###
 ### Triton Build
 ###
