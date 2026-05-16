@@ -24,11 +24,20 @@ try:
 
     @triton.jit
     def _tiny_dot_kernel(x_ptr, w_ptr, out_ptr,
-                         K, BLOCK: tl.constexpr,
+                         M, K,
+                         BLOCK: tl.constexpr,
                          APPLY_SIGMOID: tl.constexpr):
+        """One program per output scalar (one row of M).  Each program
+        loads its K-vector of x, the shared K-vector of w, computes the
+        dot, optionally applies sigmoid, stores out[pid].  Supports
+        M >= 1 — the original 1-token shared_expert_gate uses M=1, the
+        MTP-verify path uses M=2..5 (one row per speculative token)."""
+        pid = tl.program_id(0)
+        if pid >= M:
+            return
         offsets = tl.arange(0, BLOCK)
         mask = offsets < K
-        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + pid * K + offsets, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
         acc = tl.sum(x * w, axis=0)
         if APPLY_SIGMOID:
@@ -36,18 +45,22 @@ try:
         # tl.store auto-casts acc (fp32) to the dtype of out_ptr;
         # passing a bf16/fp16 ptr eliminates the post-kernel aten::copy_
         # that otherwise fires once per layer per decode token.
-        tl.store(out_ptr, acc)
+        tl.store(out_ptr + pid, acc)
 
     def _tiny_dot_triton(x_flat: torch.Tensor,
                          w_flat: torch.Tensor,
-                         apply_sigmoid: bool = False) -> torch.Tensor:
-        K = x_flat.numel()
+                         apply_sigmoid: bool = False,
+                         M: int = 1) -> torch.Tensor:
+        """Compute out[i] = dot(x[i,:], w_flat) for i in [0, M).  Returns
+        a 0-D scalar tensor when M==1 (legacy shared_expert_gate path)
+        or a 1-D [M] tensor when M>1 (MTP-verify shared_expert_gate path).
+        Both call sites in qwen2_moe.py reshape to the expected output
+        layout."""
+        K = w_flat.numel()
         BLOCK = triton.next_power_of_2(K)
-        # Allocate the scalar output directly in the input's dtype so the
-        # in-kernel store does the fp32 -> bf16/fp16 cast (matches the eager
-        # (x*w).sum(dtype=x.dtype) semantics, no extra aten::copy_).
-        out = torch.empty((), dtype=x_flat.dtype, device=x_flat.device)
-        _tiny_dot_kernel[(1,)](x_flat, w_flat, out, K=K, BLOCK=BLOCK,
+        out_shape = () if M == 1 else (M,)
+        out = torch.empty(out_shape, dtype=x_flat.dtype, device=x_flat.device)
+        _tiny_dot_kernel[(M,)](x_flat, w_flat, out, M=M, K=K, BLOCK=BLOCK,
                                APPLY_SIGMOID=apply_sigmoid)
         return out
 except ImportError:
@@ -61,12 +74,17 @@ def tiny_sigmoid_dot(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     used for Qwen MoE shared_expert_gate where the gate is
     `Linear(hidden, 1)` and the post-call is sigmoid.  Falls back to the
     eager chain when Triton or the input shape isn't supported.
+    Handles M>=1; for M>1 (the MTP-verify path), returns a 1-D [M]
+    tensor of sigmoid(dot).
     """
-    if _tiny_dot_triton is None or weight.numel() > 4096:
-        return torch.sigmoid((x.reshape(-1) * weight.reshape(-1)).sum(dtype=x.dtype))
-    return _tiny_dot_triton(x.reshape(-1).contiguous(),
-                            weight.reshape(-1).contiguous(),
-                            apply_sigmoid=True)
+    K = weight.numel()
+    if _tiny_dot_triton is None or K > 4096:
+        return torch.sigmoid((x.reshape(-1, K) * weight.reshape(-1)).sum(
+            dim=-1, dtype=x.dtype))
+    x_2d = x.reshape(-1, K).contiguous()
+    M = x_2d.size(0)
+    return _tiny_dot_triton(x_2d.reshape(-1), weight.reshape(-1).contiguous(),
+                            apply_sigmoid=True, M=M)
 
 
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
@@ -231,16 +249,22 @@ def rocm_unquantized_gemm_impl(
     )
 
     # Tiny scalar projection (e.g. Qwen MoE shared_expert_gate): hipBLASLt
-    # runs a 64x96x32 macro tile with a SplitK + post-pass even though the
-    # output is a single scalar. Replace with a fused elementwise-mul + reduce
-    # that emits one (Inductor-friendly) reduction kernel. Triggered for the
-    # 1x1xK shape only (40 MoE layers x 1 token = 40 calls/decode step on
-    # Qwen3-Next/Qwen3.5-MoE).
+    # runs a 64x96x32 (or with MTP-verify M=3: 128x32x16) macro tile with
+    # SplitK + post-pass even though the output per row is a single scalar.
+    # Replace with one Triton program per row that does the dot in a single
+    # block.  Original trigger was M=1 N=1 (the decode shared_expert_gate);
+    # extended to small M when N=1 to also cover the MTP-verify path
+    # (M = num_speculative_tokens + 1) where the same shared_expert_gate
+    # Linear runs on the verified-token batch.
+    # Naming note: in this function `n` is BATCH (input rows) and `m`
+    # is the weight's output-feature count, so `m == 1` is the
+    # 1-output-scalar-per-row gate and `n <= 8` covers small batches
+    # (decode n=1, MTP-verify n=num_speculative_tokens+1).
     if (
         os.environ.get("VLLM_DISABLE_TINY_DOT_GEMM", "0") != "1"
         and envs.VLLM_ROCM_USE_SKINNY_GEMM
         and m == 1
-        and n == 1
+        and n <= 8
         and x.dtype in [torch.float16, torch.bfloat16]
     ):
         # Triton fast path: a single-block fused (x*w).sum kernel collapses
@@ -256,14 +280,19 @@ def rocm_unquantized_gemm_impl(
             and k <= 4096
         ):
             with record_function_or_nullcontext(f"DOT {n}x{m}x{k} [tk]"):
-                x_flat = x.reshape(-1).contiguous()
+                # `n` here is batch (input rows); `m` is the weight
+                # output count and is 1 in this branch.  Pass `n` as
+                # M to the Triton kernel which launches n programs
+                # (one per input row).
+                x_2d = x.reshape(-1, k).contiguous()
                 w_flat = weight.reshape(-1).contiguous()
-                out = _tiny_dot_triton(x_flat, w_flat, apply_sigmoid=False)
+                out = _tiny_dot_triton(x_2d.reshape(-1), w_flat,
+                                       apply_sigmoid=False, M=n)
                 return out.reshape(*x.shape[:-1], 1)
         with record_function_or_nullcontext(f"DOT {n}x{m}x{k}"):
-            x_flat = x.reshape(-1)
+            x_2d = x.reshape(-1, k)
             w_flat = weight.reshape(-1)
-            out = (x_flat * w_flat).sum(dtype=x.dtype)
+            out = (x_2d * w_flat).sum(dim=-1, dtype=x.dtype)
             if bias is not None:
                 out = out + bias.reshape(-1)[0]
             return out.reshape(*x.shape[:-1], 1)
