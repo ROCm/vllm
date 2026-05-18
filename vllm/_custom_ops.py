@@ -2877,10 +2877,22 @@ def fused_moe_wvSplitK_int4_gemm_sweep(
     if sorted_token_ids is None:
         sorted_token_ids = torch.empty(0, dtype=torch.int32, device=a.device)
     torch.ops._rocm_C.fused_moe_wvSplitK_int4_gemm_sweep(
-        a, w, scales, c, expert_ids,
-        block_size_m, cu_count, group_size,
-        zero_points, sorted_token_ids, top_k, fuse_silu_mul,
-        ytile, unrl, achunk, wvprgrp,
+        a,
+        w,
+        scales,
+        c,
+        expert_ids,
+        block_size_m,
+        cu_count,
+        group_size,
+        zero_points,
+        sorted_token_ids,
+        top_k,
+        fuse_silu_mul,
+        ytile,
+        unrl,
+        achunk,
+        wvprgrp,
     )
 
 

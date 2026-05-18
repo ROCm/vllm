@@ -1,7 +1,7 @@
 // Sweep wrapper: parallel-compiled TU sharing kernel templates with the
 // production .cu via skinny_gemms_int4_kernels.cuh.
 #ifdef VLLM_SKINNY_GEMM_SWEEP
-#include "skinny_gemms_int4_kernels.cuh"
+  #include "skinny_gemms_int4_kernels.cuh"
 
 torch::Tensor wvSplitK_int4g_hf_sweep(
     const at::Tensor& in_a, const at::Tensor& in_b, const at::Tensor& in_scale,

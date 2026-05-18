@@ -16,6 +16,7 @@ When followed by a sigmoid (the actual Qwen Phase-2 path), the kernel
 folds it via APPLY_SIGMOID -- tested here via the public helper
 `tiny_sigmoid_dot` and via `apply_sigmoid=True` directly.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -29,13 +30,16 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 @pytest.mark.parametrize("K", [32, 1024, 2048, 4096])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("apply_sigmoid", [False, True])
-def test_tiny_dot_matches_eager(M: int, K: int, dtype: torch.dtype, apply_sigmoid: bool):
+def test_tiny_dot_matches_eager(
+    M: int, K: int, dtype: torch.dtype, apply_sigmoid: bool
+):
     """_tiny_dot_triton(x_flat, w_flat, apply_sigmoid=?, M=?) matches eager.
 
     For M==1 the return is 0-D; for M>1 it is 1-D [M].  Reference is the
     same per-row reduction the dispatch's eager fallback uses.
     """
     from vllm.model_executor.layers.utils import _tiny_dot_triton
+
     if _tiny_dot_triton is None:
         pytest.skip("Triton not available")
 

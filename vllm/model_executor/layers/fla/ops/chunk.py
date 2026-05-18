@@ -92,7 +92,10 @@ def chunk_gated_delta_rule_fwd(
             output_dtype=torch.float32,
         )
         A = solve_tril(
-            A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, output_dtype=k.dtype
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=k.dtype,
         )
         w, u = recompute_w_u_fwd(
             k=k,

@@ -50,7 +50,8 @@ def _wy_configs() -> list:
                     cfgs.append(
                         triton.Config(
                             {"BK": bk, "BV": bv},
-                            num_warps=nw, num_stages=ns,
+                            num_warps=nw,
+                            num_stages=ns,
                         )
                     )
     return cfgs

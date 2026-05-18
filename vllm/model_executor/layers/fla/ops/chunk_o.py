@@ -33,8 +33,7 @@ from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_navi, is_nvidia_hopper
 # tolerates wpe=3) but it's a ROCm launch-site kwarg, not a
 # triton.Config attribute in Triton 3.6 -- passed at the kernel launch
 # below instead of via autotune.
-BKV_LIST = ([32, 64, 128] if is_navi
-            else ([64, 128] if check_shared_mem() else [32, 64]))
+BKV_LIST = [32, 64, 128] if is_navi else ([64, 128] if check_shared_mem() else [32, 64])
 NUM_WARPS = [2, 4] if (is_nvidia_hopper or is_navi) else [2, 4, 8]
 NUM_STAGES = [1, 2] if is_navi else [2, 3, 4]
 
@@ -48,7 +47,8 @@ def _chunk_o_configs() -> list:
                     cfgs.append(
                         triton.Config(
                             {"BK": BK, "BV": BV},
-                            num_warps=nw, num_stages=ns,
+                            num_warps=nw,
+                            num_stages=ns,
                         )
                     )
     return cfgs

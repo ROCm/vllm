@@ -1,7 +1,7 @@
 // Sweep wrapper: parallel-compiled TU sharing kernel templates with the
 // production .cu via skinny_gemms_int4_kernels.cuh.
 #ifdef VLLM_SKINNY_GEMM_SWEEP
-#include "skinny_gemms_int4_kernels.cuh"
+  #include "skinny_gemms_int4_kernels.cuh"
 
 void fused_moe_wvSplitK_int4_gemm_sweep(
     torch::Tensor a, torch::Tensor w, torch::Tensor scales, torch::Tensor c,
@@ -39,54 +39,82 @@ void fused_moe_wvSplitK_int4_gemm_sweep(
   TORCH_CHECK(group_size == 32 || group_size == 128,
               "group_size must be 32 or 128 for the MoE sweep");
 
-// Macro-switch chains over the four runtime knobs.  Same pattern as
-// wvSplitK_int4g_sweep above; expand only what the kernel template
-// instantiations actually reach (gfx1x THRDS=32 only).  Defined at file
-// scope because the C preprocessor doesn't process #define directives
-// that appear inside another macro's argument (AT_DISPATCH_* is itself
-// a macro, so its lambda body would not see these defines).
-#define MOE_SWP_LAUNCH(_YT, _W, _AC, _UN, _N, _GS, _HASZP) \
-  MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YT, _W, _AC, _UN, _N, _GS, _HASZP)
+  // Macro-switch chains over the four runtime knobs.  Same pattern as
+  // wvSplitK_int4g_sweep above; expand only what the kernel template
+  // instantiations actually reach (gfx1x THRDS=32 only).  Defined at file
+  // scope because the C preprocessor doesn't process #define directives
+  // that appear inside another macro's argument (AT_DISPATCH_* is itself
+  // a macro, so its lambda body would not see these defines).
+  #define MOE_SWP_LAUNCH(_YT, _W, _AC, _UN, _N, _GS, _HASZP) \
+    MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YT, _W, _AC, _UN, _N, _GS, _HASZP)
 
-#define MOE_SWP_HASZP(_YT, _W, _AC, _UN, _N, _GS)                 \
-  if (has_zp) {                                                   \
-    MOE_SWP_LAUNCH(_YT, _W, _AC, _UN, _N, _GS, true)              \
-  } else {                                                        \
-    MOE_SWP_LAUNCH(_YT, _W, _AC, _UN, _N, _GS, false)             \
-  }
+  #define MOE_SWP_HASZP(_YT, _W, _AC, _UN, _N, _GS)     \
+    if (has_zp) {                                       \
+      MOE_SWP_LAUNCH(_YT, _W, _AC, _UN, _N, _GS, true)  \
+    } else {                                            \
+      MOE_SWP_LAUNCH(_YT, _W, _AC, _UN, _N, _GS, false) \
+    }
 
-#define MOE_SWP_N(_YT, _W, _AC, _UN, _GS)                              \
-  switch (N_in) {                                                      \
-    case 1: MOE_SWP_HASZP(_YT, _W, _AC, _UN, 1, _GS); break;           \
-    case 2: MOE_SWP_HASZP(_YT, _W, _AC, _UN, 2, _GS); break;           \
-    case 4: MOE_SWP_HASZP(_YT, _W, _AC, _UN, 4, _GS); break;           \
-    default: TORCH_CHECK(false, "Unsupported block_size_m=", N_in);    \
-  }
+  #define MOE_SWP_N(_YT, _W, _AC, _UN, _GS)                    \
+    switch (N_in) {                                            \
+      case 1:                                                  \
+        MOE_SWP_HASZP(_YT, _W, _AC, _UN, 1, _GS);              \
+        break;                                                 \
+      case 2:                                                  \
+        MOE_SWP_HASZP(_YT, _W, _AC, _UN, 2, _GS);              \
+        break;                                                 \
+      case 4:                                                  \
+        MOE_SWP_HASZP(_YT, _W, _AC, _UN, 4, _GS);              \
+        break;                                                 \
+      default:                                                 \
+        TORCH_CHECK(false, "Unsupported block_size_m=", N_in); \
+    }
 
-#define MOE_SWP_UN(_YT, _W, _AC, _GS)                            \
-  if      (unrl == 1) { MOE_SWP_N(_YT, _W, _AC, 1, _GS) }        \
-  else if (unrl == 2) { MOE_SWP_N(_YT, _W, _AC, 2, _GS) }        \
-  else if (unrl == 4) { MOE_SWP_N(_YT, _W, _AC, 4, _GS) }        \
-  else { TORCH_CHECK(false, "Unsupported unrl=", unrl); }
+  #define MOE_SWP_UN(_YT, _W, _AC, _GS)              \
+    if (unrl == 1) {                                 \
+      MOE_SWP_N(_YT, _W, _AC, 1, _GS)                \
+    } else if (unrl == 2) {                          \
+      MOE_SWP_N(_YT, _W, _AC, 2, _GS)                \
+    } else if (unrl == 4) {                          \
+      MOE_SWP_N(_YT, _W, _AC, 4, _GS)                \
+    } else {                                         \
+      TORCH_CHECK(false, "Unsupported unrl=", unrl); \
+    }
 
-#define MOE_SWP_YT(_W, _AC, _GS)                                 \
-  if      (ytile == 1) { MOE_SWP_UN(1, _W, _AC, _GS) }           \
-  else if (ytile == 2) { MOE_SWP_UN(2, _W, _AC, _GS) }           \
-  else if (ytile == 4) { MOE_SWP_UN(4, _W, _AC, _GS) }           \
-  else { TORCH_CHECK(false, "Unsupported ytile=", ytile); }
+  #define MOE_SWP_YT(_W, _AC, _GS)                     \
+    if (ytile == 1) {                                  \
+      MOE_SWP_UN(1, _W, _AC, _GS)                      \
+    } else if (ytile == 2) {                           \
+      MOE_SWP_UN(2, _W, _AC, _GS)                      \
+    } else if (ytile == 4) {                           \
+      MOE_SWP_UN(4, _W, _AC, _GS)                      \
+    } else {                                           \
+      TORCH_CHECK(false, "Unsupported ytile=", ytile); \
+    }
 
-#define MOE_SWP_W(_AC, _GS)                                      \
-  if      (wvprgrp ==  8) { MOE_SWP_YT( 8, _AC, _GS) }           \
-  else if (wvprgrp == 12) { MOE_SWP_YT(12, _AC, _GS) }           \
-  else if (wvprgrp == 16) { MOE_SWP_YT(16, _AC, _GS) }           \
-  else if (wvprgrp == 32) { MOE_SWP_YT(32, _AC, _GS) }           \
-  else { TORCH_CHECK(false, "Unsupported wvprgrp=", wvprgrp); }
+  #define MOE_SWP_W(_AC, _GS)                              \
+    if (wvprgrp == 8) {                                    \
+      MOE_SWP_YT(8, _AC, _GS)                              \
+    } else if (wvprgrp == 12) {                            \
+      MOE_SWP_YT(12, _AC, _GS)                             \
+    } else if (wvprgrp == 16) {                            \
+      MOE_SWP_YT(16, _AC, _GS)                             \
+    } else if (wvprgrp == 32) {                            \
+      MOE_SWP_YT(32, _AC, _GS)                             \
+    } else {                                               \
+      TORCH_CHECK(false, "Unsupported wvprgrp=", wvprgrp); \
+    }
 
-#define MOE_SWP_AC(_GS)                                          \
-  if      (achunk ==  8) { MOE_SWP_W( 8, _GS) }                  \
-  else if (achunk == 16) { MOE_SWP_W(16, _GS) }                  \
-  else if (achunk == 32) { MOE_SWP_W(32, _GS) }                  \
-  else { TORCH_CHECK(false, "Unsupported achunk=", achunk); }
+  #define MOE_SWP_AC(_GS)                                \
+    if (achunk == 8) {                                   \
+      MOE_SWP_W(8, _GS)                                  \
+    } else if (achunk == 16) {                           \
+      MOE_SWP_W(16, _GS)                                 \
+    } else if (achunk == 32) {                           \
+      MOE_SWP_W(32, _GS)                                 \
+    } else {                                             \
+      TORCH_CHECK(false, "Unsupported achunk=", achunk); \
+    }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
       a.scalar_type(), "fused_moe_wvSplitK_int4_gemm_sweep", [&] {
@@ -103,17 +131,20 @@ void fused_moe_wvSplitK_int4_gemm_sweep(
         const int* stidptr =
             scattered ? sorted_token_ids.data_ptr<int32_t>() : nullptr;
 
-        if (group_size == 128) { MOE_SWP_AC(128) }
-        else                   { MOE_SWP_AC(32) }
+        if (group_size == 128) {
+          MOE_SWP_AC(128)
+        } else {
+          MOE_SWP_AC(32)
+        }
       });
 }
 
-#undef MOE_SWP_LAUNCH
-#undef MOE_SWP_HASZP
-#undef MOE_SWP_N
-#undef MOE_SWP_UN
-#undef MOE_SWP_YT
-#undef MOE_SWP_W
-#undef MOE_SWP_AC
+  #undef MOE_SWP_LAUNCH
+  #undef MOE_SWP_HASZP
+  #undef MOE_SWP_N
+  #undef MOE_SWP_UN
+  #undef MOE_SWP_YT
+  #undef MOE_SWP_W
+  #undef MOE_SWP_AC
 
 #endif  // VLLM_SKINNY_GEMM_SWEEP

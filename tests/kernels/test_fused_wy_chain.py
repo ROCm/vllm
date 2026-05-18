@@ -11,6 +11,7 @@ The two should produce numerically close (w, u) within bf16 noise.
 Restricted to BT=64 because that's where the fused kernel is valid
 (other BT falls through to the unfused chain in chunk_gated_delta_rule_fwd).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -46,23 +47,44 @@ def test_triple_fused_wy_matches_unfused(gdn_inputs):
         fused_kkt_solve_tril_recompute_w_u_fwd,
     )
 
-    k, v, beta, g = gdn_inputs["k"], gdn_inputs["v"], gdn_inputs["beta"], gdn_inputs["g_cumsum"]
+    k, v, beta, g = (
+        gdn_inputs["k"],
+        gdn_inputs["v"],
+        gdn_inputs["beta"],
+        gdn_inputs["g_cumsum"],
+    )
 
     A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g=g, cu_seqlens=None,
-        chunk_indices=None, output_dtype=torch.float32,
+        k=k,
+        beta=beta,
+        g=g,
+        cu_seqlens=None,
+        chunk_indices=None,
+        output_dtype=torch.float32,
     )
     Ai = solve_tril(
-        A=A, cu_seqlens=None, chunk_indices=None, output_dtype=k.dtype,
+        A=A,
+        cu_seqlens=None,
+        chunk_indices=None,
+        output_dtype=k.dtype,
     )
     w_ref, u_ref = recompute_w_u_fwd(
-        k=k, v=v, beta=beta, A=Ai, g_cumsum=g,
-        cu_seqlens=None, chunk_indices=None,
+        k=k,
+        v=v,
+        beta=beta,
+        A=Ai,
+        g_cumsum=g,
+        cu_seqlens=None,
+        chunk_indices=None,
     )
 
     w_tri, u_tri = fused_kkt_solve_tril_recompute_w_u_fwd(
-        k=k, v=v, beta=beta, g_cumsum=g,
-        cu_seqlens=None, chunk_indices=None,
+        k=k,
+        v=v,
+        beta=beta,
+        g_cumsum=g,
+        cu_seqlens=None,
+        chunk_indices=None,
     )
 
     # bf16 tolerance: max abs diff at this test shape (T=256) is ~1e-4;

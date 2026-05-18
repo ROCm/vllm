@@ -44,29 +44,29 @@ from vllm.utils.platform_utils import num_compute_units as get_cu_count
 # when --dynamic-lm-head-quantization is off, the lm_head).
 SHAPES = [
     # --- Qwen3.5-A3B bf16 wvSplitK callers (the model this PR was tuned for) ---
-    (256,    2048, "Qwen3.5-A3B router gate"),
-    (1024,   2048, "Qwen3.5-A3B shared gate_up"),
-    (2048,    512, "Qwen3.5-A3B shared down"),
+    (256, 2048, "Qwen3.5-A3B router gate"),
+    (1024, 2048, "Qwen3.5-A3B shared gate_up"),
+    (2048, 512, "Qwen3.5-A3B shared down"),
     (248320, 2048, "Qwen3.5-A3B lm_head (bf16 path)"),
     # --- Broader coverage (mirrors sweep_int4g_kernel.py) ---
-    (9728,    896, "Qwen0.5B gate_up"),
-    (2048,   2048, "Gemma2B q/o"),
-    (2560,   2048, "Gemma2B qkv"),
-    (32768,  2048, "Gemma2B gate_up"),
-    (2048,  16384, "Gemma2B down"),
-    (4096,   2048, "Qwen1.7B qkv"),
-    (12288,  2048, "Qwen1.7B gate_up"),
-    (2048,   6144, "Qwen1.7B down"),
-    (2560,   2560, "Qwen3-4B q/o"),
-    (6144,   2560, "Qwen3-4B qkv"),
-    (19456,  2560, "Qwen3-4B gate_up"),
-    (2560,   9728, "Qwen3-4B down"),
+    (9728, 896, "Qwen0.5B gate_up"),
+    (2048, 2048, "Gemma2B q/o"),
+    (2560, 2048, "Gemma2B qkv"),
+    (32768, 2048, "Gemma2B gate_up"),
+    (2048, 16384, "Gemma2B down"),
+    (4096, 2048, "Qwen1.7B qkv"),
+    (12288, 2048, "Qwen1.7B gate_up"),
+    (2048, 6144, "Qwen1.7B down"),
+    (2560, 2560, "Qwen3-4B q/o"),
+    (6144, 2560, "Qwen3-4B qkv"),
+    (19456, 2560, "Qwen3-4B gate_up"),
+    (2560, 9728, "Qwen3-4B down"),
     (151936, 2560, "Qwen3-4B lm_head"),
-    (4096,   4096, "LLaMA8B q/o"),
-    (6144,   4096, "LLaMA8B qkv"),
-    (28672,  4096, "LLaMA8B gate_up"),
-    (4096,  14336, "LLaMA8B down"),
-    (1024,   4096, "K=4096 small-M sanity"),
+    (4096, 4096, "LLaMA8B q/o"),
+    (6144, 4096, "LLaMA8B qkv"),
+    (28672, 4096, "LLaMA8B gate_up"),
+    (4096, 14336, "LLaMA8B down"),
+    (1024, 4096, "K=4096 small-M sanity"),
 ]
 
 YTILES = [1, 2, 3, 4]
@@ -102,19 +102,28 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype, csv_path):
     print(f"GPU: {gpu_name}, CU count: {cu_count}")
     print(f"Dtype: {dtype}")
     print(f"Shapes: {len(shapes)}, Batch sizes: {batch_sizes}")
-    print(f"Param grid: YTILE={YTILES} x UNRL={UNRLS}  "
-          f"(WvPrGrp and A_CHUNK are macro-baked at 16/8 in wvSplitK_sweep)")
+    print(
+        f"Param grid: YTILE={YTILES} x UNRL={UNRLS}  "
+        f"(WvPrGrp and A_CHUNK are macro-baked at 16/8 in wvSplitK_sweep)"
+    )
     print(f"warmup={warmup}ms, rep={rep}ms")
     print()
 
     csv_file = open(csv_path, "w", newline="")  # noqa: SIM115
     writer = csv.writer(csv_file)
-    writer.writerow([
-        "M", "K", "N", "label",
-        "ytile", "unrl",
-        "time_us", "weight_bw_gibs",
-        "is_dispatcher_pick",
-    ])
+    writer.writerow(
+        [
+            "M",
+            "K",
+            "N",
+            "label",
+            "ytile",
+            "unrl",
+            "time_us",
+            "weight_bw_gibs",
+            "is_dispatcher_pick",
+        ]
+    )
 
     best_per_shape = []
     tested = skipped = 0
@@ -128,13 +137,17 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype, csv_path):
                 # three variants under the hood.  Just noting it for the user.
                 pass
 
-            A = (torch.randn(M, K, dtype=dtype, device="cuda") * 0.01)
-            B = (torch.randn(N, K, dtype=dtype, device="cuda") * 0.01)
+            A = torch.randn(M, K, dtype=dtype, device="cuda") * 0.01
+            B = torch.randn(N, K, dtype=dtype, device="cuda") * 0.01
             weight_bytes = M * K * A.element_size()
 
             # Production dispatcher pick (single measurement, used as anchor).
-            prod_us = time_us(lambda: ops.wvSplitK(A, B, cu_count=cu_count),
-                              warmup=warmup, rep=rep)
+            # Bind A/B as default args to avoid the B023 loop-capture warning.
+            prod_us = time_us(
+                lambda A=A, B=B: ops.wvSplitK(A, B, cu_count=cu_count),
+                warmup=warmup,
+                rep=rep,
+            )
             prod_bw = weight_bytes / (prod_us * 1e-6) / (1 << 30)
 
             shape_rows = []
@@ -144,23 +157,27 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype, csv_path):
                     continue
                 try:
                     us = time_us(
-                        lambda yt=ytile, ur=unrl, a=A, b=B:
-                            ops.wvSplitK_sweep(a, b, cu_count, yt, ur),
-                        warmup=warmup, rep=rep,
+                        lambda yt=ytile, ur=unrl, a=A, b=B: ops.wvSplitK_sweep(
+                            a, b, cu_count, yt, ur
+                        ),
+                        warmup=warmup,
+                        rep=rep,
                     )
                     bw = weight_bytes / (us * 1e-6) / (1 << 30)
                 except Exception as e:
                     print(f"  ERROR: N={N} {M}x{K} yt={ytile} ur={unrl}: {e}")
                     us = float("inf")
                     bw = 0.0
-                writer.writerow([M, K, N, label, ytile, unrl,
-                                 f"{us:.1f}", f"{bw:.1f}", ""])
+                writer.writerow(
+                    [M, K, N, label, ytile, unrl, f"{us:.1f}", f"{bw:.1f}", ""]
+                )
                 shape_rows.append((ytile, unrl, us, bw))
                 tested += 1
 
             # Production-pick anchor row.
-            writer.writerow([M, K, N, label, "", "",
-                             f"{prod_us:.1f}", f"{prod_bw:.1f}", "True"])
+            writer.writerow(
+                [M, K, N, label, "", "", f"{prod_us:.1f}", f"{prod_bw:.1f}", "True"]
+            )
 
             if shape_rows:
                 best = min(shape_rows, key=lambda r: r[2])
@@ -172,12 +189,19 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype, csv_path):
                     f"best yt={best[0]} ur={best[1]} -> {best[2]:>7.1f}us "
                     f"({speedup:.2f}x)  [{tested} tested, {elapsed:.0f}s]"
                 )
-                best_per_shape.append({
-                    "M": M, "K": K, "N": N, "label": label,
-                    "ytile": best[0], "unrl": best[1],
-                    "time_us": best[2], "bw_gibs": best[3],
-                    "prod_us": prod_us,
-                })
+                best_per_shape.append(
+                    {
+                        "M": M,
+                        "K": K,
+                        "N": N,
+                        "label": label,
+                        "ytile": best[0],
+                        "unrl": best[1],
+                        "time_us": best[2],
+                        "bw_gibs": best[3],
+                        "prod_us": prod_us,
+                    }
+                )
 
             csv_file.flush()
 
@@ -189,31 +213,50 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype, csv_path):
     print()
 
     print("=" * 110)
-    print("BEST CONFIG PER SHAPE  (wvSplitK_sweep best vs production wvSplitK dispatcher)")
+    print(
+        "BEST CONFIG PER SHAPE  (wvSplitK_sweep best vs production wvSplitK dispatcher)"
+    )
     print("=" * 110)
-    print(f"{'N':>2} {'M':>6}x{'K':<6}  {'Label':<38}  "
-          f"{'yt':>3} {'ur':>3}  {'best_us':>9}  {'prod_us':>9}  {'speedup':>8}")
+    print(
+        f"{'N':>2} {'M':>6}x{'K':<6}  {'Label':<38}  "
+        f"{'yt':>3} {'ur':>3}  {'best_us':>9}  {'prod_us':>9}  {'speedup':>8}"
+    )
     print("-" * 110)
     for r in best_per_shape:
         speedup = r["prod_us"] / r["time_us"] if r["time_us"] > 0 else 0.0
-        print(f"{r['N']:>2} {r['M']:>6}x{r['K']:<6}  {r['label']:<38}  "
-              f"{r['ytile']:>3} {r['unrl']:>3}  "
-              f"{r['time_us']:>9.1f}  {r['prod_us']:>9.1f}  {speedup:>7.2f}x")
+        print(
+            f"{r['N']:>2} {r['M']:>6}x{r['K']:<6}  {r['label']:<38}  "
+            f"{r['ytile']:>3} {r['unrl']:>3}  "
+            f"{r['time_us']:>9.1f}  {r['prod_us']:>9.1f}  {speedup:>7.2f}x"
+        )
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--batch-sizes", type=int, nargs="+", default=[1],
-                    help="N values to sweep (default: 1, the decode-token case)")
-    ap.add_argument("--shapes", type=parse_shape, nargs="+", default=None,
-                    help="Override the default shape list. e.g. --shapes 1024x4096")
-    ap.add_argument("--warmup", type=int, default=25,
-                    help="do_bench warmup time in ms (default 25)")
-    ap.add_argument("--rep", type=int, default=100,
-                    help="do_bench rep time in ms (default 100)")
+    ap.add_argument(
+        "--batch-sizes",
+        type=int,
+        nargs="+",
+        default=[1],
+        help="N values to sweep (default: 1, the decode-token case)",
+    )
+    ap.add_argument(
+        "--shapes",
+        type=parse_shape,
+        nargs="+",
+        default=None,
+        help="Override the default shape list. e.g. --shapes 1024x4096",
+    )
+    ap.add_argument(
+        "--warmup", type=int, default=25, help="do_bench warmup time in ms (default 25)"
+    )
+    ap.add_argument(
+        "--rep", type=int, default=100, help="do_bench rep time in ms (default 100)"
+    )
     ap.add_argument("--dtype", choices=["bfloat16", "float16"], default="bfloat16")
-    ap.add_argument("--csv", default="bf16_wvsplitk_sweep_results.csv",
-                    help="Output CSV path")
+    ap.add_argument(
+        "--csv", default="bf16_wvsplitk_sweep_results.csv", help="Output CSV path"
+    )
     args = ap.parse_args()
 
     shapes = args.shapes if args.shapes else SHAPES

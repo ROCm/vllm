@@ -2,7 +2,8 @@
 
 // Kernel templates, helpers, and dispatch macros for the int4 wvSplitK family.
 // Included by skinny_gemms_int4.cu (production wrappers) and
-// skinny_gemms_int4_sweep.cu (sweep wrappers) so the two TUs compile in parallel.
+// skinny_gemms_int4_sweep.cu (sweep wrappers) so the two TUs compile in
+// parallel.
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -866,21 +867,21 @@ static int mindiv_int4(int N, int div1, int div2) {
 // sharing with the default path.  Reproduce sweeps via
 // benchmarks/kernels/sweep_int4g_kernel.py (already exposes all 4 axes
 // through wvSplitK_int4g_sweep).
-#define WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,    \
-                                   _HAS_ZP)                                    \
-  {                                                                            \
-    dim3 block(_THRDS, _W);                                                    \
-    int __wvPrGrp = mindiv_int4(M_in, CuCount * _YTILE, _W);                   \
-    if (K_in * N_in <= max_lds_len && M_in % _YTILE == 0)                      \
-      wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,   \
-                            _HAS_ZP><<<grid, block, 0, stream>>>(              \
-          K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,    \
-          __wvPrGrp, CuCount);                                                 \
-    else                                                                       \
-      wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,       \
-                        _HAS_ZP><<<grid, block, 0, stream>>>(                  \
-          K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,    \
-          __wvPrGrp, CuCount);                                                 \
+#define WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,  \
+                                   _HAS_ZP)                                  \
+  {                                                                          \
+    dim3 block(_THRDS, _W);                                                  \
+    int __wvPrGrp = mindiv_int4(M_in, CuCount * _YTILE, _W);                 \
+    if (K_in * N_in <= max_lds_len && M_in % _YTILE == 0)                    \
+      wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS, \
+                            _HAS_ZP><<<grid, block, 0, stream>>>(            \
+          K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,  \
+          __wvPrGrp, CuCount);                                               \
+    else                                                                     \
+      wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,     \
+                        _HAS_ZP><<<grid, block, 0, stream>>>(                \
+          K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,  \
+          __wvPrGrp, CuCount);                                               \
   }
 
 // Backwards-compatible wrapper: existing call sites get WvPrGrp=16, AC=16.
@@ -932,16 +933,16 @@ static int mindiv_int4(int N, int div1, int div2) {
     else if (__N >= 2)                                                \
       WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                            \
     else if (is_gfx1x_int4() && __N == 1 && K_in == 4096)             \
-      /* Tuned for gfx1151 (Qwen3.5 W4A16 decode: GDN out_proj at      \
-         M=2048, K=4096, N=1).  AC=32 doubles per-thread global load   \
-         granularity; the K=4096 row has enough work to amortize the   \
-         wider load.  W stays at 16 (vs 32 in the bf16 K=2048 branch)  \
-         because int4 dequant inflates VGPR pressure -- AC=32 + W=32   \
-         spills.  Lifts kernel ~70% -> ~84% of LPDDR5X peak post-      \
-         overhead.  K<=2048 already at ~87% by default and untouched.  \
-         Verify per shape with                                         \
-         benchmarks/kernels/sweep_int4g_kernel.py. */                  \
-      WVSPLITK_INT4G_GS_W_AC(1, 4, 16, 32, __N, _HAS_ZP)               \
+      /* Tuned for gfx1151 (Qwen3.5 W4A16 decode: GDN out_proj at     \
+         M=2048, K=4096, N=1).  AC=32 doubles per-thread global load  \
+         granularity; the K=4096 row has enough work to amortize the  \
+         wider load.  W stays at 16 (vs 32 in the bf16 K=2048 branch) \
+         because int4 dequant inflates VGPR pressure -- AC=32 + W=32  \
+         spills.  Lifts kernel ~70% -> ~84% of LPDDR5X peak post-     \
+         overhead.  K<=2048 already at ~87% by default and untouched. \
+         Verify per shape with                                        \
+         benchmarks/kernels/sweep_int4g_kernel.py. */                 \
+      WVSPLITK_INT4G_GS_W_AC(1, 4, 16, 32, __N, _HAS_ZP)              \
     else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */   \
       WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                            \
   }
@@ -1285,17 +1286,17 @@ __global__ void moe_wvSplitK_int4_hf_(
                 to the original (W=32, AC=32) heuristic. */           \
     {                                                                 \
       if (is_gfx1x_int4() && K_in == 2048)                            \
-        /* gfx1151 K=2048 N=1 (Qwen3.5 MoE gate_up at M=1024,           \
-         * E=256): 4-axis sweep via                                     \
-         * benchmarks/kernels/sweep_int4g_moe_kernel.py finds           \
-         * (Y=4, U=4, W=32, AC=32) at 44.6 us vs the (Y=4, U=4,         \
-         * W=16, AC=16) default at 46.5 us -- ~1.04x.  Wider per-       \
-         * thread loads (AC=32) + max WG threads (W=32) amortize the    \
-         * per-row work the K=2048 case has plenty of.  Narrow guard:   \
-         * only swept at M~1024; other M at K=2048 may benefit too      \
-         * but were not measured. */                                    \
-        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 4, __N, _HAS_ZP)          \
-      else if (K_in >= 1024)                                           \
+        /* gfx1151 K=2048 N=1 (Qwen3.5 MoE gate_up at M=1024,         \
+         * E=256): 4-axis sweep via                                   \
+         * benchmarks/kernels/sweep_int4g_moe_kernel.py finds         \
+         * (Y=4, U=4, W=32, AC=32) at 44.6 us vs the (Y=4, U=4,       \
+         * W=16, AC=16) default at 46.5 us -- ~1.04x.  Wider per-     \
+         * thread loads (AC=32) + max WG threads (W=32) amortize the  \
+         * per-row work the K=2048 case has plenty of.  Narrow guard: \
+         * only swept at M~1024; other M at K=2048 may benefit too    \
+         * but were not measured. */                                  \
+        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 4, __N, _HAS_ZP)         \
+      else if (K_in >= 1024)                                          \
         MOE_WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                      \
       else if (is_gfx1x_int4() && K_in == 512)                        \
         /* gfx1151 K=512 N=1 (Qwen3.5 MoE down-proj).  4-axis sweep   \

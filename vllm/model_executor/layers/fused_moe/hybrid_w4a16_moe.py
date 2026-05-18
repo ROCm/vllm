@@ -10,6 +10,8 @@ shuffle packed).  Both kernels read from the same weight tensors:
 CUDA-graph compatible.
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -235,9 +237,14 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 # through uniform) at NUM_TOKENS=128.  Note BLOCK_K=64
                 # is capped to min(BLOCK_K, group_size)=64 inside the
                 # invoke wrapper (group_size=128 here, no cap fires).
-                return dict(BLOCK_SIZE_M=self.TRITON_BLOCK_SIZE_M,
-                            BLOCK_SIZE_N=64, BLOCK_SIZE_K=64,
-                            GROUP_SIZE_M=1, num_warps=2, num_stages=1)
+                return dict(
+                    BLOCK_SIZE_M=self.TRITON_BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=64,
+                    BLOCK_SIZE_K=64,
+                    GROUP_SIZE_M=1,
+                    num_warps=2,
+                    num_stages=1,
+                )
             # gemm1-style: long contraction (K >= 1024; K=2048 on
             # Qwen3.5-A3B).  (BN=16, BK=group, GM=4, nw=2, ns=1) wins
             # ~2x over the tuned-P1 baseline across all routing

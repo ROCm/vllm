@@ -23,10 +23,9 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def _tiny_dot_kernel(x_ptr, w_ptr, out_ptr,
-                         M, K,
-                         BLOCK: tl.constexpr,
-                         APPLY_SIGMOID: tl.constexpr):
+    def _tiny_dot_kernel(
+        x_ptr, w_ptr, out_ptr, M, K, BLOCK: tl.constexpr, APPLY_SIGMOID: tl.constexpr
+    ):
         """One program per output scalar (one row of M).  Each program
         loads its K-vector of x, the shared K-vector of w, computes the
         dot, optionally applies sigmoid, stores out[pid].  Supports
@@ -47,10 +46,12 @@ try:
         # that otherwise fires once per layer per decode token.
         tl.store(out_ptr + pid, acc)
 
-    def _tiny_dot_triton(x_flat: torch.Tensor,
-                         w_flat: torch.Tensor,
-                         apply_sigmoid: bool = False,
-                         M: int = 1) -> torch.Tensor:
+    def _tiny_dot_triton(
+        x_flat: torch.Tensor,
+        w_flat: torch.Tensor,
+        apply_sigmoid: bool = False,
+        M: int = 1,
+    ) -> torch.Tensor:
         """Compute out[i] = dot(x[i,:], w_flat) for i in [0, M).  Returns
         a 0-D scalar tensor when M==1 (legacy shared_expert_gate path)
         or a 1-D [M] tensor when M>1 (MTP-verify shared_expert_gate path).
@@ -60,8 +61,9 @@ try:
         BLOCK = triton.next_power_of_2(K)
         out_shape = () if M == 1 else (M,)
         out = torch.empty(out_shape, dtype=x_flat.dtype, device=x_flat.device)
-        _tiny_dot_kernel[(M,)](x_flat, w_flat, out, M=M, K=K, BLOCK=BLOCK,
-                               APPLY_SIGMOID=apply_sigmoid)
+        _tiny_dot_kernel[(M,)](
+            x_flat, w_flat, out, M=M, K=K, BLOCK=BLOCK, APPLY_SIGMOID=apply_sigmoid
+        )
         return out
 except ImportError:
     _tiny_dot_triton = None  # type: ignore[assignment]
@@ -79,12 +81,14 @@ def tiny_sigmoid_dot(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     K = weight.numel()
     if _tiny_dot_triton is None or K > 4096:
-        return torch.sigmoid((x.reshape(-1, K) * weight.reshape(-1)).sum(
-            dim=-1, dtype=x.dtype))
+        return torch.sigmoid(
+            (x.reshape(-1, K) * weight.reshape(-1)).sum(dim=-1, dtype=x.dtype)
+        )
     x_2d = x.reshape(-1, K).contiguous()
     M = x_2d.size(0)
-    return _tiny_dot_triton(x_2d.reshape(-1), weight.reshape(-1).contiguous(),
-                            apply_sigmoid=True, M=M)
+    return _tiny_dot_triton(
+        x_2d.reshape(-1), weight.reshape(-1).contiguous(), apply_sigmoid=True, M=M
+    )
 
 
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
@@ -286,8 +290,9 @@ def rocm_unquantized_gemm_impl(
                 # (one per input row).
                 x_2d = x.reshape(-1, k).contiguous()
                 w_flat = weight.reshape(-1).contiguous()
-                out = _tiny_dot_triton(x_2d.reshape(-1), w_flat,
-                                       apply_sigmoid=False, M=n)
+                out = _tiny_dot_triton(
+                    x_2d.reshape(-1), w_flat, apply_sigmoid=False, M=n
+                )
                 return out.reshape(*x.shape[:-1], 1)
         with record_function_or_nullcontext(f"DOT {n}x{m}x{k}"):
             x_2d = x.reshape(-1, k)
