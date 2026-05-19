@@ -1,7 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base
+ARG BASE_IMAGE=rocm/vllm-dev:base_rocm7.2.3_micah_torch2.11-20260513_20260514
 # AMD NIC backend
 ARG NIC_BACKEND=none
 # AMD AINIC apt repo settings
