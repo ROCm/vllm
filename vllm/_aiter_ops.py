@@ -100,6 +100,28 @@ def if_aiter_supported(func: Callable) -> Callable:
     return wrapper
 
 
+def if_aiter_supported_mi3xx_gfx11(func: Callable) -> Callable:
+    """Like @if_aiter_supported, but also enables on gfx11 (RDNA3/3.5).
+
+    Use for aiter ops that have a working gfx11 path (e.g. CK FMHA via
+    aiter.flash_attn_varlen_func, with a Triton fallback for the
+    decode/paged-attention side which is otherwise gfx9-only).
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if is_aiter_found_and_supported():
+            return func(*args, **kwargs)
+        if current_platform.is_rocm() and IS_AITER_FOUND:
+            from vllm.platforms.rocm import on_gfx11
+
+            if on_gfx11():
+                return func(*args, **kwargs)
+        return None
+
+    return wrapper
+
+
 def _rocm_aiter_fused_moe_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1456,7 +1478,7 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._MLA_ENABLED
 
     @classmethod
-    @if_aiter_supported
+    @if_aiter_supported_mi3xx_gfx11
     def is_mha_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._MHA_ENABLED
 

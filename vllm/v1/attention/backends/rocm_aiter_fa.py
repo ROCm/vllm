@@ -804,12 +804,16 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        from vllm.platforms.rocm import on_mi3xx
+        from vllm.platforms.rocm import on_gfx11, on_mi3xx
 
         # DeviceCapability is currently created using torch.cuda.get_device_capability()
-        # which is known to be buggy on rocm systems. on_mi3xx uses amd-smi which is
-        # more reliable.
-        return on_mi3xx()
+        # which is known to be buggy on rocm systems. on_mi3xx/on_gfx11 use amd-smi
+        # which is more reliable.
+        # On gfx11, prefill uses CK FMHA via aiter.flash_attn_varlen_func (CK has
+        # gfx11 instances) and decode falls back to the Triton unified_attention
+        # kernel (the ll4mi paged_attention_v1 / paged_attention_common kernels
+        # are gfx9-only).
+        return on_mi3xx() or on_gfx11()
 
     @classmethod
     def supports_non_causal(cls) -> bool:
@@ -1255,9 +1259,15 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 # HEAD_SIZE >= 16 * NWARPS (= 64 on ROCm with NWARPS=4).
                 # For smaller head sizes or sliding window attention,
                 # fall back to the unified_attention triton kernel which
-                # handles both correctly.
+                # handles both correctly. The ll4mi kernel (and the asm/HIP
+                # paged_attention_common path) are also gfx9-only, so route
+                # through Triton on any non-gfx9 arch (e.g. gfx11).
+                from vllm.platforms.rocm import on_mi3xx
+
                 _MIN_HEAD_SIZE_FOR_LL4MI = 64
-                use_unified_attention = self.head_size < _MIN_HEAD_SIZE_FOR_LL4MI
+                use_unified_attention = (
+                    self.head_size < _MIN_HEAD_SIZE_FOR_LL4MI or not on_mi3xx()
+                )
 
                 if use_unified_attention:
                     assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
