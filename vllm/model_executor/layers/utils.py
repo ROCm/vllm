@@ -59,7 +59,7 @@ def tiny_sigmoid_dot(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     `Linear(hidden, 1)` and the post-call is sigmoid.  Falls back to the
     eager chain when Triton or the input shape isn't supported.
     """
-    if _tiny_dot_triton is None or weight.numel() > 4096:
+    if weight.numel() > 4096:
         return torch.sigmoid((x.reshape(-1) * weight.reshape(-1)).sum(dtype=x.dtype))
     return _tiny_dot_triton(
         x.reshape(-1).contiguous(), weight.reshape(-1).contiguous(), apply_sigmoid=True

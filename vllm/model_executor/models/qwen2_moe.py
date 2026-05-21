@@ -110,6 +110,11 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        if expert_gate is not None:
+            # tiny_sigmoid_dot fast path in forward() assumes no bias.
+            assert expert_gate.bias is None, (
+                "Qwen2MoeMLP expert_gate must have bias=None"
+            )
         self.expert_gate = expert_gate
 
     def forward(self, x):
