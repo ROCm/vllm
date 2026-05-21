@@ -128,7 +128,8 @@ _CK_W4A16_TARGET_SHAPES: dict[tuple, tuple[int, int]] = {
     #      inter=8192 nq=32 nkv=32 hd=64, MHA) ----
     (16384, 2048, 32, torch.bfloat16): (256, 32),  # gate_up_proj
     (6144, 2048, 32, torch.bfloat16): (256, 32),  # qkv_proj (no GQA)
-    # (2048, 2048, 32, torch.bfloat16) reused under SmolLM2 o_proj — fp16 entry doesn't apply
+    # (2048, 2048, 32, torch.bfloat16) reused under SmolLM2 o_proj — fp16
+    # entry doesn't apply
     (2048, 2048, 32, torch.bfloat16): (256, 32),  # o_proj
     (2048, 8192, 32, torch.bfloat16): (256, 32),  # down_proj
     # ---- cyankiwi/gemma-4-31B-it-AWQ-4bit (bf16 g=32 asym VLM; h=5376
@@ -248,8 +249,9 @@ def _ck_pre_dequant_to_lds() -> bool:
     TTFT). See vllm4/notes/ck-w4a16-isa/README.md.
 
     Status: the template hook is wired end-to-end through aiter, but the
-    kernel body is currently a stub that TORCH_CHECKs at runtime — see
-    TODO(AIESW-32282) in aiter/csrc/ck_w4a16/include/gemm_w4a16_common.cuh.
+    kernel body is currently a stub that fails a TORCH_CHECK at runtime —
+    see TODO(AIESW-32282) in
+    aiter/csrc/ck_w4a16/include/gemm_w4a16_common.cuh.
     Until the kernel lands, setting this env var will surface the stub
     error from the CK dispatch path."""
     import os
@@ -258,39 +260,6 @@ def _ck_pre_dequant_to_lds() -> bool:
         "1",
         "true",
         "yes",
-    )
-
-
-def _ck_truncate_bf16_round() -> bool:
-    """Whether to route the CK W4A16 dispatch into the TruncateBf16Round=true
-    variant of the aiter.ops.gemm_w4a16 op.
-
-    **Default: enabled.** Set VLLM_CK_W4A16_TRUNCATE_BF16=0 (or false/no) to
-    fall back to the IEEE round-to-nearest-even bf16 dequant.
-
-    TruncateBf16Round=true replaces the trailing IEEE round-to-nearest-even
-    in the bf16 dequant with a bit-cast >>16 truncate (bf16 IS the upper 16
-    bits of fp32). Saves ~3 RDNA3.5 VALU instructions per nibble — v_add3_u32
-    +0x7fff (round bias), v_cmp_o_f32 + v_cndmask_b16 0x7fc0 (NaN quietening
-    chain) — at <0.5 ULP of bf16 error. Worst-case ~4e-3 relative, well
-    inside the existing 5e-3 op-test tolerance. CK analog of vLLM PR
-    ROCm/vllm#953's Triton-side fp32->bf16 truncate. See
-    vllm4/notes/ck-w4a16-isa/README.md.
-
-    Status: the runtime flag is plumbed end-to-end through aiter, but the
-    underlying CK threadwise transfer hardcodes DequantPack8 /
-    DequantPack8WithZp instead of forwarding the device-op's BElementwise
-    Operation parameter — so the runtime arm acts as an assertion against
-    the build-time CK_W4A16_DEQUANT_BF16_TRUNCATE preprocessor switch.
-    Setting this env var BEFORE first import triggers a JIT recompile of
-    module_gemm_w4a16.so with the matching switch (see
-    aiter/jit/core.py). Silently ignored on the fp16 path."""
-    import os
-
-    return os.environ.get("VLLM_CK_W4A16_TRUNCATE_BF16", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
     )
 
 
@@ -739,11 +708,10 @@ def _hybrid_w4a16_apply_impl(
             # STUBBED) PreDequantToLDS=true variant of the aiter op. Read
             # once here so both arms see the same value.
             ck_pdl = _ck_pre_dequant_to_lds()
-            # VLLM_CK_W4A16_TRUNCATE_BF16=1 → route into the
-            # TruncateBf16Round=true variant (bf16 dequant uses a bit-cast
-            # truncate instead of IEEE RTE). Build-time switch — see
-            # _ck_truncate_bf16_round docstring.
-            ck_tbt = _ck_truncate_bf16_round()
+            # AIESW-32282: bf16 dequant rounding is no longer a runtime
+            # axis. CK ships truncate-to-bf16 as the only bf16 behavior
+            # (verified statistically indistinguishable from Triton on
+            # lm_eval gsm8k); fp16 path is unaffected.
             if w_zp is None:
                 # Symmetric (uint4b8 / GPTQ): no zero points.
                 from aiter.ops.gemm_w4a16 import gemm_w4a16 as _aiter_gemm_w4a16
@@ -757,7 +725,6 @@ def _hybrid_w4a16_apply_impl(
                     group_size,
                     scaled_zp=None,
                     pre_dequant_to_lds=ck_pdl,
-                    truncate_bf16_round=ck_tbt,
                 )
             elif w_scaled_zp_ck is not None:
                 # Asymmetric (AWQ): scaled_zp = (zp - 8) * scale precomputed at
@@ -774,7 +741,6 @@ def _hybrid_w4a16_apply_impl(
                     group_size,
                     scaled_zp=w_scaled_zp_ck,
                     pre_dequant_to_lds=ck_pdl,
-                    truncate_bf16_round=ck_tbt,
                 )
             # else: asymmetric layer with zp present but scaled_zp not
             # precomputed — fall through to Triton (shouldn't happen if the
