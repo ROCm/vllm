@@ -12,6 +12,7 @@ batch_specs:
 
 backends:
   - TRITON_ATTN
+  - ROCM_AITER_UNIFIED_ATTN
 
 device: "cuda:0"
 repeats: 20
