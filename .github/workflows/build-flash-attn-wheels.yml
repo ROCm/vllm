@@ -54,7 +54,7 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
-  check:
+  check-flash-attn:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -103,9 +103,9 @@ jobs:
           fi
           echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
 
-  build-wheel:
-    needs: check
-    if: needs.check.outputs.should_build == 'true'
+  build-flash-attn-wheel:
+    needs: check-flash-attn
+    if: needs.check-flash-attn.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -218,7 +218,7 @@ jobs:
           retention-days: 90
 
   upload-wheel:
-    needs: build-wheel
+    needs: build-flash-attn-wheel
     runs-on: ubuntu-latest
     if: github.repository_owner == 'ROCm'
     permissions:
