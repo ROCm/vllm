@@ -15,11 +15,11 @@ name: Build Flash Attn and AITER ROCm Wheels
 #   2. The Triton kernels are compiled JIT (just-in-time) at runtime
 #   3. The resulting wheel is architecture-agnostic
 #
-# AITER is currently built with PREBUILD_KERNELS=0, which short-circuits all
-# HIP compilation in aiter/setup.py. GPU_ARCHS is still set so flipping to
-# PREBUILD_KERNELS=1 (kernels baked in for gfx1151) is a one-line change --
-# at that point the AITER build job will additionally need ROCm available
-# on the runner (e.g. via a `rocm/dev-ubuntu-22.04` container).
+# AITER is currently built with PREBUILD_ONLY=module_gemm_w4a16, which
+# restricts the prebuild path in aiter/setup.py to a single module. This
+# still triggers HIP compilation for that module, so the build job needs
+# ROCm (hipcc + headers) on the runner -- e.g. via a `rocm/dev-ubuntu-22.04`
+# container. GPU_ARCHS=gfx1151 selects the target arch.
 #
 # Versioning: each wheel version is derived from `git describe` of the
 # upstream repo, e.g.
@@ -45,10 +45,10 @@ env:
   # Branch (or tag/SHA) of AITER to build. The check-aiter job resolves
   # this to a SHA via `git ls-remote`.
   AITER_REF: 'matthias.gfx11'
-  # Unused while AITER_PREBUILD_KERNELS=0; kept so flipping to 1 needs
-  # no other changes.
   AITER_GPU_ARCHS: 'gfx1151'
-  AITER_PREBUILD_KERNELS: '0'
+  # Allowlist of modules to prebuild (comma-separated). Overrides the
+  # PREBUILD_KERNELS modes and limits HIP compilation to just these.
+  AITER_PREBUILD_ONLY: 'module_gemm_w4a16'
   S3_BUCKET: aig-embd-gfx11-wheels
   S3_ROLE_ARN: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
   AWS_REGION: us-east-1
@@ -404,11 +404,11 @@ jobs:
 
       - name: Build wheel
         env:
-          PREBUILD_KERNELS: ${{ env.AITER_PREBUILD_KERNELS }}
+          PREBUILD_ONLY: ${{ env.AITER_PREBUILD_ONLY }}
           GPU_ARCHS: ${{ env.AITER_GPU_ARCHS }}
         working-directory: aiter
         run: |
-          echo "=== Building wheel (PREBUILD_KERNELS=$PREBUILD_KERNELS, GPU_ARCHS=$GPU_ARCHS) ==="
+          echo "=== Building wheel (PREBUILD_ONLY=$PREBUILD_ONLY, GPU_ARCHS=$GPU_ARCHS) ==="
           python setup.py bdist_wheel --dist-dir=dist
           ls -la dist/
 
