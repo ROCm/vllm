@@ -2379,7 +2379,7 @@ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kernel(
   out_ptr[threadIdx.x] = from_float<scalar_t>(acc);
 }
 
-#elif defined(__GFX12__)
+#elif !defined(__GFX12__)
 
 using floatx8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
