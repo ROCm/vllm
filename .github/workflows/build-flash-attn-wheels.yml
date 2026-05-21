@@ -16,10 +16,11 @@ name: Build Flash Attn and AITER ROCm Wheels
 #   3. The resulting wheel is architecture-agnostic
 #
 # AITER is currently built with PREBUILD_ONLY=module_gemm_w4a16, which
-# restricts the prebuild path in aiter/setup.py to a single module. This
-# still triggers HIP compilation for that module, so the build job needs
-# ROCm (hipcc + headers) on the runner -- e.g. via a `rocm/dev-ubuntu-22.04`
-# container. GPU_ARCHS=gfx1151 selects the target arch.
+# restricts the prebuild path in aiter/setup.py to a single module. HIP
+# compilation for that module is enabled by pip-installing TheRock ROCm
+# wheels (libraries + devel + the gfx1151 device package) and running
+# `rocm-sdk init` -- no `rocm/dev-ubuntu-22.04` container required.
+# GPU_ARCHS=gfx1151 selects the target arch.
 #
 # Versioning: each wheel version is derived from `git describe` of the
 # upstream repo, e.g.
@@ -396,6 +397,22 @@ jobs:
           pip install torch --index-url ${{ env.PYTORCH_INDEX_URL }}
           pip list | grep -i -E "torch" || true
           python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}')"
+
+      - name: Install ROCm SDK (TheRock multi-arch wheels)
+        run: |
+          set -euo pipefail
+          pip install \
+            --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
+            "rocm[libraries,device-gfx1151,devel]"
+          rocm-sdk init
+          ROCM_PATH=$(rocm-sdk path --root)
+          echo "Resolved ROCM_PATH=$ROCM_PATH"
+          # Export for subsequent steps (setup.py / hipcc / torch.utils.cpp_extension).
+          echo "ROCM_PATH=$ROCM_PATH"   >> "$GITHUB_ENV"
+          echo "ROCM_HOME=$ROCM_PATH"   >> "$GITHUB_ENV"
+          echo "HIP_PATH=$ROCM_PATH"    >> "$GITHUB_ENV"
+          echo "$ROCM_PATH/bin"         >> "$GITHUB_PATH"
+          "$ROCM_PATH/bin/hipcc" --version || true
 
       - name: Install AITER runtime dependencies
         working-directory: aiter
