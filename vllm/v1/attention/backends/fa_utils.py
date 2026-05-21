@@ -31,7 +31,8 @@ elif current_platform.is_xpu():
     get_scheduler_metadata = xpu_ops.get_scheduler_metadata  # type: ignore[assignment]
 elif current_platform.is_rocm():
     try:
-        from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+        #from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]
+        from aiter.ops.triton.mha import flash_attn_varlen_func
 
         # Mark that upstream flash-attn is available on ROCm
         _ROCM_FLASH_ATTN_AVAILABLE = True
