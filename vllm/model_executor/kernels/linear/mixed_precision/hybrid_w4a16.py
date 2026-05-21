@@ -52,23 +52,91 @@ LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 # Each wired layer costs an extra weight copy (~0.92 GB total for the four
 # Qwen3-4B columns on a 36-layer model).
 #
-# fp16 only — bf16 deliberately omitted. The CK kernel builds bf16 instances
-# (required by aiter convention which expects both F16/B16), but bf16 dispatch
-# is not registered here because measurement shows Triton W4A16 wins on bf16
-# at this hardware:
-#   gate_up M=2048 N=19456 K=2560 G=128 on gfx1151:
-#     fp16: CK 29.1 vs Triton 21.3 TFLOPS (CK 1.36x faster) -> dispatch CK
-#     bf16: CK 19.4 vs Triton 24.4 TFLOPS (Triton 1.26x faster) -> Triton
-# Root cause of the bf16 gap: RDNA3 (gfx11) lacks a packed bf16 multiply
-# instruction (no V_PK_FMA_BF16 in the ISA), so CK's bf16 dequant falls back
-# to scalar fp32 conversion. Triton's compiler appears to schedule fp32 dual-
-# issue more aggressively. Re-tune CK for bf16 in a follow-up if needed.
+# bf16 entries are registered below for A/B measurement only — prior microbench
+# (gate_up M=2048 N=19456 K=2560 G=128 on gfx1151) showed CK 19.4 vs Triton
+# 24.4 TFLOPS (Triton 1.26x faster on bf16, vs CK 1.36x faster on fp16). Root
+# cause is the RDNA3 (gfx11) ISA lacking a packed bf16 multiply instruction
+# (no V_PK_FMA_BF16), so CK's bf16 dequant falls back to scalar fp32
+# conversion while Triton's compiler schedules fp32 dual-issue more
+# aggressively. CK is expected to lose on bf16, but we want the end-to-end
+# number on a real bf16 model (RedHatAI/Qwen3-8B-quantized.w4a16) before
+# locking the dispatch decision. Remove the bf16 entries (or guard them) once
+# the measurement is done.
 _CK_W4A16_TARGET_SHAPES: dict[tuple, tuple[int, int]] = {
+    # ---- Qwen/Qwen3-4B-AWQ (h=2560 inter=9728 nq=32 nkv=8 hd=128) ----
     (19456, 2560, 128, torch.float16): (256, 32),  # gate_up_proj
-    (6144, 2560, 128, torch.float16): (256, 32),  # qkv_proj (q=4096+k=1024+v=1024)
+    (6144, 2560, 128, torch.float16): (256, 32),  # qkv_proj
     (2560, 4096, 128, torch.float16): (256, 32),  # o_proj
     (2560, 9728, 128, torch.float16): (256, 32),  # down_proj
-    # bf16 entries intentionally absent — see comment above.
+    # ---- cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit (h=2560 inter=9728 nq=32 nkv=8
+    #      hd=128, group_size=32, sym, AIESW-32282). Vision tower is excluded
+    #      from quantization (per the model's quantization_config.ignore list),
+    #      so only the LLM-side prefill linear columns hit this dispatch. The
+    #      activation dtype here is the bench dtype (--dtype float16 forces
+    #      fp16); the model ships bf16 weights but they're cast at load time.
+    (19456, 2560, 32, torch.float16): (256, 32),  # gate_up_proj
+    (6144, 2560, 32, torch.float16): (256, 32),  # qkv_proj
+    (2560, 4096, 32, torch.float16): (256, 32),  # o_proj
+    (2560, 9728, 32, torch.float16): (256, 32),  # down_proj
+    # ---- Qwen/Qwen3-8B-AWQ (h=4096 inter=12288 nq=32 nkv=8 hd=128) ----
+    (24576, 4096, 128, torch.float16): (256, 32),  # gate_up_proj
+    (6144, 4096, 128, torch.float16): (256, 32),  # qkv_proj
+    (4096, 4096, 128, torch.float16): (256, 32),  # o_proj
+    (4096, 12288, 128, torch.float16): (256, 32),  # down_proj
+    # ---- Qwen/Qwen2.5-3B-Instruct-AWQ (h=2048 inter=11008 nq=16 nkv=2 hd=128) ----
+    (22016, 2048, 128, torch.float16): (256, 32),  # gate_up_proj
+    (2560, 2048, 128, torch.float16): (256, 32),  # qkv_proj
+    (2048, 2048, 128, torch.float16): (256, 32),  # o_proj
+    (2048, 11008, 128, torch.float16): (256, 32),  # down_proj
+    # ---- Qwen/Qwen2.5-7B-Instruct-AWQ (h=3584 inter=18944 nq=28 nkv=4 hd=128) ----
+    (37888, 3584, 128, torch.float16): (256, 32),  # gate_up_proj
+    (4608, 3584, 128, torch.float16): (256, 32),  # qkv_proj
+    (3584, 3584, 128, torch.float16): (256, 32),  # o_proj
+    (3584, 18944, 128, torch.float16): (256, 32),  # down_proj
+    # ---- TheBloke/Llama-2-7B-AWQ (h=4096 inter=11008 nq=32 nkv=32 hd=128, MHA) ----
+    (22016, 4096, 128, torch.float16): (256, 32),  # gate_up_proj
+    (12288, 4096, 128, torch.float16): (256, 32),  # qkv_proj (no GQA, q=k=v=4096)
+    # o_proj (4096, 4096) reused from Qwen3-8B
+    (4096, 11008, 128, torch.float16): (256, 32),  # down_proj
+    # ---- google/gemma-2b-AWQ (h=2048 inter=16384 nq=8 nkv=1 hd=256) ----
+    (32768, 2048, 128, torch.float16): (
+        256,
+        32,
+    ),  # gate_up_proj (Gemma uses 2*inter for gate_up)
+    # qkv (2560, 2048) reused from Qwen2.5-3B
+    # o_proj (2048, 2048) reused from Qwen2.5-3B
+    (2048, 16384, 128, torch.float16): (256, 32),  # down_proj
+    # ---- RedHatAI/Qwen3-8B-quantized.w4a16 (bf16 g=128 sym, same Qwen3-8B
+    #      arch as fp16 row above) ----
+    (24576, 4096, 128, torch.bfloat16): (256, 32),  # gate_up_proj
+    (6144, 4096, 128, torch.bfloat16): (256, 32),  # qkv_proj
+    (4096, 4096, 128, torch.bfloat16): (256, 32),  # o_proj
+    (4096, 12288, 128, torch.bfloat16): (256, 32),  # down_proj
+    # ---- Orion-zhen/Qwen3-1.7B-AWQ (bf16 g=128 asym; h=2048 inter=6144
+    #      nq=16 nkv=8 hd=128) ----
+    (12288, 2048, 128, torch.bfloat16): (256, 32),  # gate_up_proj
+    (4096, 2048, 128, torch.bfloat16): (256, 32),  # qkv_proj
+    (2048, 2048, 128, torch.bfloat16): (256, 32),  # o_proj
+    (2048, 6144, 128, torch.bfloat16): (256, 32),  # down_proj
+    # ---- RedHatAI/Qwen2.5-VL-7B-Instruct-quantized.w4a16 (bf16 g=128 sym;
+    #      shapes match the fp16 Qwen2.5-7B entries above) ----
+    (37888, 3584, 128, torch.bfloat16): (256, 32),  # gate_up_proj
+    (4608, 3584, 128, torch.bfloat16): (256, 32),  # qkv_proj
+    (3584, 3584, 128, torch.bfloat16): (256, 32),  # o_proj
+    (3584, 18944, 128, torch.bfloat16): (256, 32),  # down_proj
+    # ---- trymirai/SmolLM2-1.7B-Instruct-AWQ (bf16 g=32 asym; h=2048
+    #      inter=8192 nq=32 nkv=32 hd=64, MHA) ----
+    (16384, 2048, 32, torch.bfloat16): (256, 32),  # gate_up_proj
+    (6144, 2048, 32, torch.bfloat16): (256, 32),  # qkv_proj (no GQA)
+    # (2048, 2048, 32, torch.bfloat16) reused under SmolLM2 o_proj — fp16 entry doesn't apply
+    (2048, 2048, 32, torch.bfloat16): (256, 32),  # o_proj
+    (2048, 8192, 32, torch.bfloat16): (256, 32),  # down_proj
+    # ---- cyankiwi/gemma-4-31B-it-AWQ-4bit (bf16 g=32 asym VLM; h=5376
+    #      inter=21504 nq=32 nkv=16 hd=256) ----
+    (43008, 5376, 32, torch.bfloat16): (256, 32),  # gate_up_proj
+    (16384, 5376, 32, torch.bfloat16): (256, 32),  # qkv_proj
+    (5376, 8192, 32, torch.bfloat16): (256, 32),  # o_proj (K = nq*hd = 32*256)
+    (5376, 21504, 32, torch.bfloat16): (256, 32),  # down_proj
 }
 
 
@@ -87,10 +155,41 @@ def _lookup_ck_target(
 ) -> tuple[int, int] | None:
     """Find a registered CK target for this layer's (N, K, group, dtype).
     Returns (min_M, KPerBlock) if any, else None. Called once per layer at
-    load time (Python ints, not SymInts) — so dict lookup is safe."""
+    load time (Python ints, not SymInts) — so dict lookup is safe.
+
+    AIESW-32282: previously the dispatch was strictly opt-in via
+    _CK_W4A16_TARGET_SHAPES (each (N, K, group, dtype) had to be listed
+    explicitly). After threading the runtime element-op down and verifying
+    correctness across all the AIESW-32282 non-MoE shapes, we now also
+    accept any shape that meets the CK config's static constraints. The
+    explicit table still wins (per-shape (min_M, KPerBlock) overrides);
+    the fallback fires only for shapes not listed.
+
+    Constraints for the generic fallback (EXP1_FINAL kernel config):
+      - dtype ∈ {fp16, bf16}                 (other dtypes have no CK kernel)
+      - group_size ∈ {32, 128}               (wired ScaleBlockK instantiations)
+      - K % KPerBlock(=32) == 0              (B tile load divisibility)
+      - K % group_size == 0                  (scale layout integrality)
+      - N % NPerBlock(=128) == 0             (B tile N divisibility)
+
+    Default returned for the fallback: (min_M=256, KPerBlock=32). Below
+    M=256 the kernel's ~0.4 ms fixed launch overhead dominates and Triton
+    is comparable on these shapes, so we don't dispatch CK there."""
     if not _is_gfx1151():
         return None
-    return _CK_W4A16_TARGET_SHAPES.get((N, K, group_size, dtype))
+    entry = _CK_W4A16_TARGET_SHAPES.get((N, K, group_size, dtype))
+    if entry is not None:
+        return entry
+    # Generic fallback: any shape meeting the CK config's static constraints.
+    if dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if group_size not in (32, 128):
+        return None
+    if K % 32 != 0 or K % group_size != 0:
+        return None
+    if N % 128 != 0:
+        return None
+    return (256, 32)
 
 
 def _has_aiter_w4a16_op() -> bool:
@@ -135,6 +234,82 @@ def _ck_disabled() -> bool:
     )
 
 
+def _ck_pre_dequant_to_lds() -> bool:
+    """Set VLLM_CK_W4A16_PRE_DEQUANT=1 to route the CK W4A16 dispatch into
+    the PreDequantToLDS=true variant of the aiter.ops.gemm_w4a16 op.
+
+    PreDequantToLDS=true dequants packed int4 weights once per K-block into
+    an LDS scratch region of activation-dtype B, so the WMMA inner loop
+    reads dequantized bf16/fp16 from LDS instead of dequanting per-tile in
+    VGPRs. The goal is to amortize the IEEE-correct round-to-bf16 dequant
+    cost — measured on RDNA 3.5 as v_add3_u32 + v_cmp_o_f32 + v_cndmask_b16
+    per nibble — which is the structural bottleneck behind the 8.6% bf16 CK
+    vs Triton gap on RedHatAI/Qwen3-8B-quantized.w4a16 (3346 vs 3082 ms
+    TTFT). See vllm4/notes/ck-w4a16-isa/README.md.
+
+    Status: the template hook is wired end-to-end through aiter, but the
+    kernel body is currently a stub that TORCH_CHECKs at runtime — see
+    TODO(AIESW-32282) in aiter/csrc/ck_w4a16/include/gemm_w4a16_common.cuh.
+    Until the kernel lands, setting this env var will surface the stub
+    error from the CK dispatch path."""
+    import os
+
+    return os.environ.get("VLLM_CK_W4A16_PRE_DEQUANT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _ck_truncate_bf16_round() -> bool:
+    """Whether to route the CK W4A16 dispatch into the TruncateBf16Round=true
+    variant of the aiter.ops.gemm_w4a16 op.
+
+    **Default: enabled.** Set VLLM_CK_W4A16_TRUNCATE_BF16=0 (or false/no) to
+    fall back to the IEEE round-to-nearest-even bf16 dequant.
+
+    TruncateBf16Round=true replaces the trailing IEEE round-to-nearest-even
+    in the bf16 dequant with a bit-cast >>16 truncate (bf16 IS the upper 16
+    bits of fp32). Saves ~3 RDNA3.5 VALU instructions per nibble — v_add3_u32
+    +0x7fff (round bias), v_cmp_o_f32 + v_cndmask_b16 0x7fc0 (NaN quietening
+    chain) — at <0.5 ULP of bf16 error. Worst-case ~4e-3 relative, well
+    inside the existing 5e-3 op-test tolerance. CK analog of vLLM PR
+    ROCm/vllm#953's Triton-side fp32->bf16 truncate. See
+    vllm4/notes/ck-w4a16-isa/README.md.
+
+    Status: the runtime flag is plumbed end-to-end through aiter, but the
+    underlying CK threadwise transfer hardcodes DequantPack8 /
+    DequantPack8WithZp instead of forwarding the device-op's BElementwise
+    Operation parameter — so the runtime arm acts as an assertion against
+    the build-time CK_W4A16_DEQUANT_BF16_TRUNCATE preprocessor switch.
+    Setting this env var BEFORE first import triggers a JIT recompile of
+    module_gemm_w4a16.so with the matching switch (see
+    aiter/jit/core.py). Silently ignored on the fp16 path."""
+    import os
+
+    return os.environ.get("VLLM_CK_W4A16_TRUNCATE_BF16", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _triton_use_scaled_zp() -> bool:
+    """Set VLLM_TRITON_W4A16_SCALED_ZP=1 to make the Triton W4A16 fallback
+    use the CK-style scaled_zp dequant formula -- (nibble - 8) * scale -
+    scaled_zp -- instead of the default (nibble - zp_raw) * scale. Only
+    fires when the layer's _hybrid_w_scaled_zp_ck precompute exists
+    (i.e. when the shape is covered by the CK target table); otherwise
+    falls back to the raw-zp path with no behavior change."""
+    import os
+
+    return os.environ.get("VLLM_TRITON_W4A16_SCALED_ZP", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _repack_vllm_to_ck_b_scale(
     w_q_skinny_i32: torch.Tensor,  # [N, K//8] int32
     KPerBlock: int,
@@ -164,7 +339,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     a_ptr,  # [M, K]  fp16/bf16 activations
     b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
     scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
-    zp_ptr,  # [N, K//G]  fp16/bf16 raw zero-points (when HAS_ZP=True)
+    zp_ptr,  # [N, K//G]  fp16/bf16 raw zp (HAS_ZP) or scaled_zp (HAS_SCALED_ZP)
     c_ptr,  # [M, N]  fp16/bf16 output
     # Dimensions
     M,
@@ -176,6 +351,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     group_size,
     ZP_BIAS: tl.constexpr,
     HAS_ZP: tl.constexpr,
+    HAS_SCALED_ZP: tl.constexpr,
     # Block sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -190,9 +366,15 @@ def _triton_w4a16_skinny_fmt_kernel(
                | (val[1]<<16) | (val[3]<<20) | (val[5]<<24) | (val[7]<<28)
 
     Scales are [N, K//G] (skinny layout, NOT transposed).
-    When HAS_ZP=True, raw zero-points zp_raw are loaded from zp_ptr [N, K//G]
-    and subtracted directly: (nibble - zp_raw) * scale.
-    When HAS_ZP=False, only the constant ZP_BIAS is subtracted (symmetric).
+    Three mutually-exclusive dequant modes:
+      - HAS_ZP=True, HAS_SCALED_ZP=False (default asym):
+            (nibble - zp_raw) * scale, with zp_raw loaded from zp_ptr.
+      - HAS_SCALED_ZP=True, HAS_ZP=False (CK-style asym):
+            (nibble - 8) * scale - scaled_zp, with scaled_zp loaded from
+            zp_ptr (precomputed (zp_raw - 8) * scale per group at load time).
+            Algebraic identity vs the HAS_ZP path; differs only in fp
+            rounding (one extra act-dtype subtract per dequant pack).
+      - both False (symmetric): only ZP_BIAS=8 is subtracted, no zp load.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -241,7 +423,13 @@ def _triton_w4a16_skinny_fmt_kernel(
         scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
 
         # ---- Dequantize ----
-        if HAS_ZP:
+        if HAS_SCALED_ZP:
+            # CK-style asymmetric: (nibble - 8) * scale - scaled_zp.
+            # scaled_zp = (zp_raw - 8) * scale precomputed at load time.
+            szp_ptrs = zp_ptr + offs_n * num_groups + g_idx
+            szp = tl.load(szp_ptrs, mask=scale_mask, other=0.0)
+            b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None] - szp[:, None]
+        elif HAS_ZP:
             # Asymmetric: (nibble - zp_raw) * scale (single subtraction)
             zp_ptrs = zp_ptr + offs_n * num_groups + g_idx
             zp_raw = tl.load(zp_ptrs, mask=scale_mask, other=0.0)
@@ -270,6 +458,7 @@ def triton_w4a16_skinny_fmt_gemm(
     group_size: int,
     zp_bias: int = 8,
     zp: torch.Tensor | None = None,  # [N, K//G] per-group zero-points
+    scaled_zp: torch.Tensor | None = None,  # [N, K//G] (zp - 8) * scale
 ) -> torch.Tensor:
     """
     Fused W4A16 GEMM reading from skinny weight format [N, K//8].
@@ -282,7 +471,13 @@ def triton_w4a16_skinny_fmt_gemm(
         zp_bias:    Constant zero bias (default 8 for unsigned int4).
         zp:         Raw per-group zero-points [N, K//G] (asymmetric),
                     stored as zp_raw in activation dtype. When provided,
-                    dequant is (nibble - zp_raw) * scale.
+                    dequant is (nibble - zp_raw) * scale. Mutually exclusive
+                    with `scaled_zp`.
+        scaled_zp:  Pre-scaled per-group zero-points [N, K//G], same dtype
+                    as a, equal to (zp_raw - 8) * scale. Selects the
+                    CK-style dequant path: (nibble - 8) * scale - scaled_zp.
+                    Algebraically equivalent to the `zp` path but with
+                    different fp rounding.
 
     Returns:
         Output matrix [M, N], same dtype as a.
@@ -290,6 +485,9 @@ def triton_w4a16_skinny_fmt_gemm(
     assert a.is_contiguous(), "Activation matrix must be contiguous"
     assert b_q.is_contiguous(), "Weight matrix must be contiguous"
     assert scales.is_contiguous(), "Scales must be contiguous"
+    assert not (zp is not None and scaled_zp is not None), (
+        "Pass at most one of zp / scaled_zp"
+    )
 
     M, K = a.shape
     N = b_q.shape[0]
@@ -305,7 +503,14 @@ def triton_w4a16_skinny_fmt_gemm(
         assert zp.shape == (N, num_groups), (
             f"zp shape mismatch: {zp.shape} vs ({N}, {num_groups})"
         )
+    if scaled_zp is not None:
+        assert scaled_zp.is_contiguous(), "scaled_zp must be contiguous"
+        assert scaled_zp.shape == (N, num_groups), (
+            f"scaled_zp shape mismatch: {scaled_zp.shape} vs ({N}, {num_groups})"
+        )
     has_zp = zp is not None
+    has_scaled_zp = scaled_zp is not None
+    zp_or_szp = scaled_zp if has_scaled_zp else zp
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
@@ -417,7 +622,7 @@ def triton_w4a16_skinny_fmt_gemm(
         a,
         b_q,
         scales,
-        zp if has_zp else scales,  # dummy pointer when no zp (unused)
+        zp_or_szp if (has_zp or has_scaled_zp) else scales,  # dummy when unused
         c,
         M,
         N,
@@ -427,6 +632,7 @@ def triton_w4a16_skinny_fmt_gemm(
         group_size=group_size,
         ZP_BIAS=zp_bias,
         HAS_ZP=has_zp,
+        HAS_SCALED_ZP=has_scaled_zp,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -521,7 +727,7 @@ def _hybrid_w4a16_apply_impl(
     # output. Conditional is inside the custom op so it's opaque to dynamo and
     # the runtime M check is a plain Python int compare against the per-layer
     # min-M threshold. aiter convention is caller-allocates output.
-    if w_q_ck is not None and ck_min_m > 0 and ck_min_m <= M:
+    if w_q_ck is not None and ck_min_m > 0 and ck_min_m <= M and not _ck_disabled():
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
@@ -529,33 +735,46 @@ def _hybrid_w4a16_apply_impl(
         )
         with ctx:
             output: torch.Tensor | None = None
+            # VLLM_CK_W4A16_PRE_DEQUANT=1 → route into the (currently
+            # STUBBED) PreDequantToLDS=true variant of the aiter op. Read
+            # once here so both arms see the same value.
+            ck_pdl = _ck_pre_dequant_to_lds()
+            # VLLM_CK_W4A16_TRUNCATE_BF16=1 → route into the
+            # TruncateBf16Round=true variant (bf16 dequant uses a bit-cast
+            # truncate instead of IEEE RTE). Build-time switch — see
+            # _ck_truncate_bf16_round docstring.
+            ck_tbt = _ck_truncate_bf16_round()
             if w_zp is None:
                 # Symmetric (uint4b8 / GPTQ): no zero points.
-                import aiter  # soft-imported, gated by _HAS_AITER_W4A16_OP
+                from aiter.ops.gemm_w4a16 import gemm_w4a16 as _aiter_gemm_w4a16
 
                 output = torch.empty((M, N), dtype=x_2d.dtype, device=x_2d.device)
-                aiter.ops.gemm_w4a16(
+                _aiter_gemm_w4a16(
                     x_2d,
                     w_q_ck,
                     w_s,
                     output,
                     group_size,
                     scaled_zp=None,
+                    pre_dequant_to_lds=ck_pdl,
+                    truncate_bf16_round=ck_tbt,
                 )
             elif w_scaled_zp_ck is not None:
                 # Asymmetric (AWQ): scaled_zp = (zp - 8) * scale precomputed at
                 # load time and passed through. aiter dispatches the asymmetric
                 # CK kernel internally based on scaled_zp being non-None.
-                import aiter
+                from aiter.ops.gemm_w4a16 import gemm_w4a16 as _aiter_gemm_w4a16
 
                 output = torch.empty((M, N), dtype=x_2d.dtype, device=x_2d.device)
-                aiter.ops.gemm_w4a16(
+                _aiter_gemm_w4a16(
                     x_2d,
                     w_q_ck,
                     w_s,
                     output,
                     group_size,
                     scaled_zp=w_scaled_zp_ck,
+                    pre_dequant_to_lds=ck_pdl,
+                    truncate_bf16_round=ck_tbt,
                 )
             # else: asymmetric layer with zp present but scaled_zp not
             # precomputed — fall through to Triton (shouldn't happen if the
@@ -571,12 +790,23 @@ def _hybrid_w4a16_apply_impl(
         else torch.profiler.record_function(f"hybrid_triton_w4a16 {M}x{N}x{K}")
     )
     with ctx:
+        # A/B knob: when VLLM_TRITON_W4A16_SCALED_ZP=1 and the layer has
+        # _hybrid_w_scaled_zp_ck precomputed (i.e. the shape is in the CK
+        # target table), feed scaled_zp into the Triton kernel instead of
+        # the raw zp. Algebraically equivalent; differs only in fp rounding.
+        if w_zp is not None and w_scaled_zp_ck is not None and _triton_use_scaled_zp():
+            triton_zp_arg: torch.Tensor | None = None
+            triton_scaled_zp_arg: torch.Tensor | None = w_scaled_zp_ck
+        else:
+            triton_zp_arg = w_zp
+            triton_scaled_zp_arg = None
         output = triton_w4a16_skinny_fmt_gemm(
             a=x_2d,
             b_q=w_q_i32,
             scales=w_s,
             group_size=group_size,
-            zp=w_zp,
+            zp=triton_zp_arg,
+            scaled_zp=triton_scaled_zp_arg,
         )
         if bias is not None:
             output.add_(bias)
@@ -731,7 +961,12 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         # outside the dynamo trace. aiter.ops.gemm_w4a16 covers both symmetric
         # and asymmetric (per-group zero-point) paths via the same single op,
         # so a single availability check (cached at module import) suffices.
-        if _HAS_AITER_W4A16_OP and not _ck_disabled():
+        # Note: precompute runs even when _ck_disabled() is True so that the
+        # Triton fallback can opt into the scaled_zp formulation via
+        # VLLM_TRITON_W4A16_SCALED_ZP=1 for A/B benchmarking. Dispatch at
+        # apply time still gates on _ck_disabled() so the runtime path is
+        # unchanged for default users.
+        if _HAS_AITER_W4A16_OP:
             N = w_q_skinny_i32.shape[0]
             K = w_q_skinny_i32.shape[1] * 8
             target = _lookup_ck_target(N, K, c.group_size, c.act_type)
