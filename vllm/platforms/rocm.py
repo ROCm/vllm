@@ -977,6 +977,7 @@ class RocmPlatform(Platform):
     def get_default_ir_op_priority(
         cls, vllm_config: "VllmConfig"
     ) -> "IrOpPriorityConfig":
+        from vllm._aiter_ops import rocm_aiter_ops
         from vllm.config.compilation import CompilationMode
         from vllm.config.kernel import IrOpPriorityConfig
 
@@ -990,12 +991,11 @@ class RocmPlatform(Platform):
         # This (mostly) preserves previous CustomOp behavior
         # Necessary on ROCm because it's common that users
         # enable rms_norm to use the aiter kernel.
+        # is_rmsnorm_enabled() applies the @if_aiter_supported gfx9 arch
+        # gate; raw env vars do not, so checking them directly would route
+        # to aiter.rms_norm on gfx11 where the symbol is not exported.
         # TODO(luka/TJ) remove env vars completely
-        if (
-            cc.is_custom_op_enabled("rms_norm")
-            and envs.VLLM_ROCM_USE_AITER
-            and envs.VLLM_ROCM_USE_AITER_RMSNORM
-        ):
+        if cc.is_custom_op_enabled("rms_norm") and rocm_aiter_ops.is_rmsnorm_enabled():
             rms_norm = ["aiter"] + default
         else:
             rms_norm = default
