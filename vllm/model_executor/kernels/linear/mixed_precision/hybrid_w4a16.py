@@ -263,22 +263,6 @@ def _ck_pre_dequant_to_lds() -> bool:
     )
 
 
-def _triton_use_scaled_zp() -> bool:
-    """Set VLLM_TRITON_W4A16_SCALED_ZP=1 to make the Triton W4A16 fallback
-    use the CK-style scaled_zp dequant formula -- (nibble - 8) * scale -
-    scaled_zp -- instead of the default (nibble - zp_raw) * scale. Only
-    fires when the layer's _hybrid_w_scaled_zp_ck precompute exists
-    (i.e. when the shape is covered by the CK target table); otherwise
-    falls back to the raw-zp path with no behavior change."""
-    import os
-
-    return os.environ.get("VLLM_TRITON_W4A16_SCALED_ZP", "0").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-
-
 def _repack_vllm_to_ck_b_scale(
     w_q_skinny_i32: torch.Tensor,  # [N, K//8] int32
     KPerBlock: int,
@@ -308,7 +292,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     a_ptr,  # [M, K]  fp16/bf16 activations
     b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
     scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
-    zp_ptr,  # [N, K//G]  fp16/bf16 raw zp (HAS_ZP) or scaled_zp (HAS_SCALED_ZP)
+    zp_ptr,  # [N, K//G]  fp16/bf16 raw zero-points (used when HAS_ZP=True)
     c_ptr,  # [M, N]  fp16/bf16 output
     # Dimensions
     M,
@@ -320,7 +304,6 @@ def _triton_w4a16_skinny_fmt_kernel(
     group_size,
     ZP_BIAS: tl.constexpr,
     HAS_ZP: tl.constexpr,
-    HAS_SCALED_ZP: tl.constexpr,
     # Block sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -335,15 +318,9 @@ def _triton_w4a16_skinny_fmt_kernel(
                | (val[1]<<16) | (val[3]<<20) | (val[5]<<24) | (val[7]<<28)
 
     Scales are [N, K//G] (skinny layout, NOT transposed).
-    Three mutually-exclusive dequant modes:
-      - HAS_ZP=True, HAS_SCALED_ZP=False (default asym):
-            (nibble - zp_raw) * scale, with zp_raw loaded from zp_ptr.
-      - HAS_SCALED_ZP=True, HAS_ZP=False (CK-style asym):
-            (nibble - 8) * scale - scaled_zp, with scaled_zp loaded from
-            zp_ptr (precomputed (zp_raw - 8) * scale per group at load time).
-            Algebraic identity vs the HAS_ZP path; differs only in fp
-            rounding (one extra act-dtype subtract per dequant pack).
-      - both False (symmetric): only ZP_BIAS=8 is subtracted, no zp load.
+    Two dequant modes:
+      - HAS_ZP=True  (asymmetric): (nibble - zp_raw) * scale; zp_raw from zp_ptr.
+      - HAS_ZP=False (symmetric):  only ZP_BIAS=8 is subtracted, no zp load.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -392,13 +369,7 @@ def _triton_w4a16_skinny_fmt_kernel(
         scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
 
         # ---- Dequantize ----
-        if HAS_SCALED_ZP:
-            # CK-style asymmetric: (nibble - 8) * scale - scaled_zp.
-            # scaled_zp = (zp_raw - 8) * scale precomputed at load time.
-            szp_ptrs = zp_ptr + offs_n * num_groups + g_idx
-            szp = tl.load(szp_ptrs, mask=scale_mask, other=0.0)
-            b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None] - szp[:, None]
-        elif HAS_ZP:
+        if HAS_ZP:
             # Asymmetric: (nibble - zp_raw) * scale (single subtraction)
             zp_ptrs = zp_ptr + offs_n * num_groups + g_idx
             zp_raw = tl.load(zp_ptrs, mask=scale_mask, other=0.0)
@@ -427,7 +398,6 @@ def triton_w4a16_skinny_fmt_gemm(
     group_size: int,
     zp_bias: int = 8,
     zp: torch.Tensor | None = None,  # [N, K//G] per-group zero-points
-    scaled_zp: torch.Tensor | None = None,  # [N, K//G] (zp - 8) * scale
 ) -> torch.Tensor:
     """
     Fused W4A16 GEMM reading from skinny weight format [N, K//8].
@@ -440,13 +410,7 @@ def triton_w4a16_skinny_fmt_gemm(
         zp_bias:    Constant zero bias (default 8 for unsigned int4).
         zp:         Raw per-group zero-points [N, K//G] (asymmetric),
                     stored as zp_raw in activation dtype. When provided,
-                    dequant is (nibble - zp_raw) * scale. Mutually exclusive
-                    with `scaled_zp`.
-        scaled_zp:  Pre-scaled per-group zero-points [N, K//G], same dtype
-                    as a, equal to (zp_raw - 8) * scale. Selects the
-                    CK-style dequant path: (nibble - 8) * scale - scaled_zp.
-                    Algebraically equivalent to the `zp` path but with
-                    different fp rounding.
+                    dequant is (nibble - zp_raw) * scale.
 
     Returns:
         Output matrix [M, N], same dtype as a.
@@ -454,9 +418,6 @@ def triton_w4a16_skinny_fmt_gemm(
     assert a.is_contiguous(), "Activation matrix must be contiguous"
     assert b_q.is_contiguous(), "Weight matrix must be contiguous"
     assert scales.is_contiguous(), "Scales must be contiguous"
-    assert not (zp is not None and scaled_zp is not None), (
-        "Pass at most one of zp / scaled_zp"
-    )
 
     M, K = a.shape
     N = b_q.shape[0]
@@ -472,14 +433,7 @@ def triton_w4a16_skinny_fmt_gemm(
         assert zp.shape == (N, num_groups), (
             f"zp shape mismatch: {zp.shape} vs ({N}, {num_groups})"
         )
-    if scaled_zp is not None:
-        assert scaled_zp.is_contiguous(), "scaled_zp must be contiguous"
-        assert scaled_zp.shape == (N, num_groups), (
-            f"scaled_zp shape mismatch: {scaled_zp.shape} vs ({N}, {num_groups})"
-        )
     has_zp = zp is not None
-    has_scaled_zp = scaled_zp is not None
-    zp_or_szp = scaled_zp if has_scaled_zp else zp
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
@@ -591,7 +545,7 @@ def triton_w4a16_skinny_fmt_gemm(
         a,
         b_q,
         scales,
-        zp_or_szp if (has_zp or has_scaled_zp) else scales,  # dummy when unused
+        zp if has_zp else scales,  # dummy pointer when no zp (unused)
         c,
         M,
         N,
@@ -601,7 +555,6 @@ def triton_w4a16_skinny_fmt_gemm(
         group_size=group_size,
         ZP_BIAS=zp_bias,
         HAS_ZP=has_zp,
-        HAS_SCALED_ZP=has_scaled_zp,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -756,23 +709,12 @@ def _hybrid_w4a16_apply_impl(
         else torch.profiler.record_function(f"hybrid_triton_w4a16 {M}x{N}x{K}")
     )
     with ctx:
-        # A/B knob: when VLLM_TRITON_W4A16_SCALED_ZP=1 and the layer has
-        # _hybrid_w_scaled_zp_ck precomputed (i.e. the shape is in the CK
-        # target table), feed scaled_zp into the Triton kernel instead of
-        # the raw zp. Algebraically equivalent; differs only in fp rounding.
-        if w_zp is not None and w_scaled_zp_ck is not None and _triton_use_scaled_zp():
-            triton_zp_arg: torch.Tensor | None = None
-            triton_scaled_zp_arg: torch.Tensor | None = w_scaled_zp_ck
-        else:
-            triton_zp_arg = w_zp
-            triton_scaled_zp_arg = None
         output = triton_w4a16_skinny_fmt_gemm(
             a=x_2d,
             b_q=w_q_i32,
             scales=w_s,
             group_size=group_size,
-            zp=triton_zp_arg,
-            scaled_zp=triton_scaled_zp_arg,
+            zp=w_zp,
         )
         if bias is not None:
             output.add_(bias)
@@ -927,11 +869,10 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         # outside the dynamo trace. aiter.ops.gemm_w4a16 covers both symmetric
         # and asymmetric (per-group zero-point) paths via the same single op,
         # so a single availability check (cached at module import) suffices.
-        # Note: precompute runs even when _ck_disabled() is True so that the
-        # Triton fallback can opt into the scaled_zp formulation via
-        # VLLM_TRITON_W4A16_SCALED_ZP=1 for A/B benchmarking. Dispatch at
-        # apply time still gates on _ck_disabled() so the runtime path is
-        # unchanged for default users.
+        # Note: precompute runs even when _ck_disabled() is True so that
+        # toggling VLLM_DISABLE_CK_W4A16 mid-experiment doesn't require a
+        # weight reload. Dispatch at apply time gates on _ck_disabled() so
+        # the runtime path is unchanged for default users.
         if _HAS_AITER_W4A16_OP:
             N = w_q_skinny_i32.shape[0]
             K = w_q_skinny_i32.shape[1] * 8
