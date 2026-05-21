@@ -8,7 +8,6 @@ model:
 
 batch_specs:
   - "q4000s4128"
-  - "q1s8k"
 
 backends:
   - TRITON_ATTN
