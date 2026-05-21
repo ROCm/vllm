@@ -449,6 +449,11 @@ RUN pip install amdsmi
 # Install amd-aiter and Triton from repo/branch (for gfx1250; base image may not include them)
 ARG AITER_REPO="https://github.com/ROCm/aiter"
 ARG AITER_BRANCH="main"
+# ENABLE_CK=0 disables Composable Kernel both at wheel build time
+# Override at build time with `--build-arg AITER_ENABLE_CK=1` to re-enable CK
+# (requires a recursive aiter clone with the composable_kernel submodule).
+ARG AITER_ENABLE_CK=0
+ENV ENABLE_CK=${AITER_ENABLE_CK}
 # TODO: Triton repo requires github.amd.com authentication; re-enable once credentials are configured
 # ARG TRITON_REPO="https://github.amd.com/GFX-IP-Arch/triton"
 # ARG TRITON_BRANCH="shared/gfx1250"
