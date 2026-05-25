@@ -91,8 +91,6 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
     return quant_tensor, InFlexData(), scale
 
 
-<<<<<<< HEAD
-=======
 def _can_support_mxfp4(
     use_grouped_topk: bool = False,
     topk_group: int | None = None,
@@ -131,7 +129,6 @@ def get_padding_alignment():
     )
 
 
->>>>>>> ROCm/gfx1250_wip_dllehr
 def _dequant_mxfp4(
     x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
 ) -> torch.Tensor:
