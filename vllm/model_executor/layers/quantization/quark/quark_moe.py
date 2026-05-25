@@ -1266,11 +1266,95 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             replace_parameter(layer, "w13_bias", w13_bias)
             replace_parameter(layer, "w2_bias", w2_bias)
 
-        if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
+        # --- Begin: Incorporate shuffle/normalization logic from incoming branch, but only if required ---
+        # Optionally post-process weights and scales for special MXFP4/FP8 handling
+
+        if hasattr(self, 'fp4_dtype') and self.fp4_dtype is not None:
+            # If a special dtype for FP4 exists, re-cast weights (ROCm/Quark, experimental)
+            layer.w13_weight = torch.nn.Parameter(
+                layer.w13_weight.view(self.fp4_dtype),
+                requires_grad=getattr(layer.w13_weight, 'requires_grad', False),
+            )
+            layer.w2_weight = torch.nn.Parameter(
+                layer.w2_weight.view(self.fp4_dtype),
+                requires_grad=getattr(layer.w2_weight, 'requires_grad', False),
+            )
+
+        # If needed, normalize input scales for certain platforms
+        if hasattr(self, 'current_platform') and self.current_platform is not None:
+            if self.current_platform.is_fp8_fnuz():
+                _, _, w13_input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                    torch.empty_like(layer.w13_weight, dtype=torch.float8_e4m3fn),
+                    torch.empty_like(
+                        layer.w13_weight_scale, dtype=layer.w13_weight_scale.dtype
+                    ),
+                    layer.w13_input_scale,
+                )
+                _, _, w2_input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                    torch.empty_like(layer.w2_weight, dtype=torch.float8_e4m3fn),
+                    torch.empty_like(
+                        layer.w2_weight_scale, dtype=layer.w2_weight_scale.dtype
+                    ),
+                    layer.w2_input_scale,
+                )
+                if w13_input_scale is not None:
+                    layer.w13_input_scale = torch.nn.Parameter(
+                        w13_input_scale, requires_grad=False
+                    )
+                if w2_input_scale is not None:
+                    layer.w2_input_scale = torch.nn.Parameter(
+                        w2_input_scale, requires_grad=False
+                    )
+
+        # Shuffle weight scales for special ROCm-AITER kernel/interop (if module available and backend matches)
+        if getattr(self, "mxfp4_backend", None) == Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
+            try:
+                from aiter.utility.fp4_utils import e8m0_shuffle
+
+                # Pre-shuffle weight scales
+                s0, s1, _ = layer.w13_weight_scale.shape
+                w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
+                w13_weight_scale = e8m0_shuffle(w13_weight_scale)
+                layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
+
+                s0, s1, _ = layer.w2_weight_scale.shape
+                w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
+                w2_weight_scale = e8m0_shuffle(w2_weight_scale)
+                layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+
+                layer.w13_weight.is_shuffled = True
+                layer.w2_weight.is_shuffled = True
+            except ImportError:
+                # If e8m0_shuffle isn't available, skip shuffling
+                pass
+
+        # Similar handling for CK/cktile vs Triton MXFP4 MoE routing
+        if getattr(envs, "VLLM_ROCM_AITER_FUSED_MOE_TRITON_GEMM_A4W4", False):
+            logger.warning_once(
+                "Quark MXFP4 MoE: VLLM_ROCM_AITER_FUSED_MOE_TRITON_GEMM_A4W4 is set; "
+                "skipping shuffle_weights. Use only with an AITER MoE path that expects "
+                "unshuffled expert weights (e.g. Triton MXFP4 MoE), not CK preshuffle."
+            )
+            # Do not shuffle, rely on logical layout
+        elif getattr(self, "emulate", False):
+            torch.cuda.empty_cache()
+            return
+        elif hasattr(rocm_aiter_ops, "shuffle_weights"):
+            shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
+                layer.w13_weight.data, layer.w2_weight.data
+            )
+            layer.w13_weight = torch.nn.Parameter(shuffled_w13, requires_grad=False)
+            layer.w2_weight = torch.nn.Parameter(shuffled_w2, requires_grad=False)
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
-        torch.accelerator.empty_cache()
+        # --- End: Added shuffle/normalization logic from incoming branch ---
+
+        # Empty accelerator cache (compatible with torch>=2.2)
+        try:
+            torch.accelerator.empty_cache()
+        except Exception:
+            torch.cuda.empty_cache()
 
         # Build quant config and kernel
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)

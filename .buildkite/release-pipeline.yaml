@@ -651,6 +651,9 @@ steps:
         echo "Base wheels for vLLM build:"
         ls -lh docker/context/base-wheels/
 
+        # Get GPU architectures from meta-data
+        PYTORCH_ROCM_ARCH="$$(buildkite-agent meta-data get rocm-pytorch-rocm-arch 2>/dev/null || echo '')"
+        PYTORCH_ROCM_ARCH="$${PYTORCH_ROCM_ARCH:-gfx90a;gfx942;gfx950;gfx1250;gfx1100;gfx1101;gfx1200;gfx1201;gfx1150;gfx1151}"
         echo "========================================"
         echo "Building vLLM wheel with:"
         echo "  BUILDKITE_COMMIT: $${BUILDKITE_COMMIT}"

@@ -1119,6 +1119,31 @@ class QueryLenSupport(Enum):
     VARLEN = "varlen"
 
 
+try:
+    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+        flash_attn_varlen_func,
+    )
+
+    is_vllm_fa = True
+except ImportError:
+    is_vllm_fa = False
+    flash_attn_varlen_func = None  # type: ignore[assignment]
+    # On ROCm, vllm_flash_attn is not available, try upstream flash_attn instead.
+    # On CUDA, vllm_flash_attn should always be available (built with vLLM),
+    # so we don't attempt the fallback there.
+    if current_platform.is_rocm():
+        try:
+            from aiter.ops.triton.mha import flash_attn_varlen_func
+            #from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef] 
+
+        except ImportError:
+            logger.debug(
+                "flash_attn not available on ROCm; "
+                "MLA models using TRITON_MLA will require flash_attn. "
+                "AITER_MLA backends use aiter kernels instead."
+            )
+
+
 def dynamic_per_batched_tensor_quant(
     x: torch.Tensor, dtype: torch.dtype = torch.float8_e4m3fn
 ):
