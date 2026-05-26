@@ -10,6 +10,8 @@ shuffle packed).  Both kernels read from the same weight tensors:
 CUDA-graph compatible.
 """
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -306,6 +308,40 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
+
+        # Experimental grouped-GEMM prefill path.  Gated off by default.
+        # Skips moe_align_block_size + virtual gather in favour of a
+        # physical moe_permute + per-block routing table consumed by a
+        # dedicated grouped Triton kernel (no padding waste).
+        if (
+            os.environ.get("VLLM_HYBRID_W4A16_GROUPED", "0") == "1"
+            and num_tokens > self.MAX_SKINNY_BATCH_SIZE
+            and expert_map is None
+            and not apply_router_weight_on_input
+        ):
+            from vllm.model_executor.layers.fused_moe.hybrid_w4a16_grouped import (
+                apply_hybrid_w4a16_grouped,
+            )
+
+            activation_out_dim = self.adjust_N_for_activation(N, activation)
+            apply_hybrid_w4a16_grouped(
+                output=output,
+                hidden_states=hidden_states,
+                w1=w1,
+                w1_scale=self.w1_scale,
+                w2=w2,
+                w2_scale=self.w2_scale,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                global_num_experts=global_num_experts,
+                activation=activation,
+                group_size=self._group_size,
+                gemm1_config=self._triton_config(K, num_tokens * top_k_num),
+                gemm2_config=self._triton_config(
+                    activation_out_dim, num_tokens * top_k_num
+                ),
+            )
+            return
 
         if global_num_experts == -1:
             global_num_experts = E
