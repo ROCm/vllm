@@ -279,17 +279,29 @@ def fused_moe_kernel_gptq_awq(
             b_nk = (b_exp >> exl_shifts) & 0xF  # [BLOCK_N, BLOCK_K]
             b = tl.trans(b_nk)  # [BLOCK_K, BLOCK_N]
 
-            # Scales: [E, N, K//G] — load per-group scale for this K tile
-            g_idx = (k * BLOCK_SIZE_K) // group_size
-            b_scale_ptrs = (
-                b_scale_ptr
-                + off_experts * stride_bse
-                + offs_bn * stride_bsn
-                + g_idx * stride_bsk
-            )
-            b_scale = tl.load(b_scale_ptrs).to(tl.float32)
-            # Dequant: (nibble - 8) * scale
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale[None, :]).to(compute_type)
+            # Scales: [E, N, K//G].  Two constexpr paths — Triton does not
+            # broadcast a degenerate [BLOCK_K, BLOCK_N] load back to a
+            # scalar reliably, so BLOCK_K <= group_size keeps its own
+            # [BLOCK_N] load (one scale per tile) for full speed.
+            if group_size >= BLOCK_SIZE_K:
+                g_idx = (k * BLOCK_SIZE_K) // group_size
+                b_scale_ptrs = (
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn * stride_bsn
+                    + g_idx * stride_bsk
+                )
+                b_scale = tl.load(b_scale_ptrs).to(tl.float32)
+                b = ((b.to(tl.float32) - b_zp_num) * b_scale[None, :]).to(compute_type)
+            else:
+                b_scale_ptrs = (
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn[None, :] * stride_bsn
+                    + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+                )
+                b_scale = tl.load(b_scale_ptrs).to(tl.float32)  # [BLOCK_K, BLOCK_N]
+                b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
         else:
             b = tl.load(b_ptrs)
             if use_int4_w4a16:
@@ -817,12 +829,15 @@ def invoke_fused_moe_kernel_hybrid_triton(
     config = config.copy()
     config["SPLIT_K"] = 1
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
-    # BLOCK_K must be multiple of 8 for ExLlama shuffle interleave
+    # BLOCK_K must be multiple of 8 for ExLlama shuffle interleave.
     assert BLOCK_SIZE_K % 8 == 0
-    # BLOCK_K must not exceed group_size (one scale per K-tile)
-    BLOCK_SIZE_K = min(BLOCK_SIZE_K, group_size)
-    assert BLOCK_SIZE_K % 8 == 0, (
-        f"group_size {group_size} must be a multiple of 8 for shuffle kernel"
+    # BLOCK_K must tile cleanly across the per-group scale layout:
+    # either BK <= group_size (multiple tiles share one scale) or
+    # BK >= group_size with BK % group_size == 0 (each tile spans an
+    # integer number of groups; scales loaded per K-row inside the kernel).
+    assert group_size >= BLOCK_SIZE_K or BLOCK_SIZE_K % group_size == 0, (
+        f"BLOCK_SIZE_K ({BLOCK_SIZE_K}) must be <= group_size ({group_size}) "
+        f"or a multiple of group_size"
     )
 
     with record_function_or_nullcontext(
