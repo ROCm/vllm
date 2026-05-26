@@ -63,6 +63,12 @@ def _parse() -> argparse.Namespace:
     )
     p.add_argument("--ns", type=int, default=1, help="num_stages")
     p.add_argument("--we", type=int, default=None, help="waves_per_eu (default: none)")
+    p.add_argument(
+        "--block-dmodel",
+        type=int,
+        default=None,
+        help="BLOCK_DMODEL override (default: next_power_of_2(head_dim))",
+    )
     p.add_argument("--warmup-ms", type=int, default=200)
     p.add_argument("--rep-ms", type=int, default=600)
     return p.parse_args()
@@ -115,7 +121,11 @@ def main() -> int:
             o.stride(1),
             kv_group_num=kv_group_num,
             BLOCK_M=BLOCK_M,
-            BLOCK_DMODEL=triton.next_power_of_2(D),
+            BLOCK_DMODEL=(
+                args.block_dmodel
+                if args.block_dmodel is not None
+                else triton.next_power_of_2(D)
+            ),
             BLOCK_N=BLOCK_N,
             IS_CAUSAL=False,
             SLIDING_WINDOW_Q=0,
@@ -158,6 +168,11 @@ def main() -> int:
             "dtype": args.dtype,
             "BLOCK_M": BLOCK_M,
             "BLOCK_N": BLOCK_N,
+            "BLOCK_DMODEL": (
+                args.block_dmodel
+                if args.block_dmodel is not None
+                else triton.next_power_of_2(D)
+            ),
             "num_warps": num_warps,
             "num_stages": args.ns,
             "waves_per_eu": args.we,

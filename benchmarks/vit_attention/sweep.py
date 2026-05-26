@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sweep tuning configs for the ViT TRITON_ATTN kernel on gfx1151 for the
-Gemma3-4B SigLIP shape (B=1, S=4096, H=16, D=72, bf16, non-causal).
+"""Sweep tuning configs for the ViT TRITON_ATTN kernel on gfx1151.
+
+Default shape is Gemma3-4B SigLIP (B=1, S=4096, H=16, D=72, bf16, non-causal);
+pass --seq / --heads / --head-dim / --dtype to target a different ViT (e.g.
+Qwen3-Omni's S=3200, fp16). Shape args are forwarded to bench.py and stamped
+into the output directory so sweeps for different shapes don't collide.
 
 Calls bench.py for each config. The bench uses triton.testing.do_bench,
 which clears the L2 cache before every measurement iteration -- so results
@@ -27,14 +31,27 @@ from pathlib import Path
 
 REPO = Path(__file__).parent
 BENCH = REPO / "bench.py"
-TMP = Path(
-    os.environ.get("VLLM_VIT_SWEEP_OUT", Path(tempfile.gettempdir()) / "vit_attn_sweep")
-)
-TMP.mkdir(parents=True, exist_ok=True)
 
 # Baseline from triton_prefill_attention.py:get_block_size/get_num_warps on RDNA bf16:
 # BLOCK_M=BLOCK_N=32, num_warps=8, num_stages=1, no waves_per_eu override.
 BASELINE = dict(bm=32, bn=32, nw=8, ns=1, we=None)
+
+
+def _shape_tag(shape: dict) -> str:
+    return (
+        f"b{shape['batch']}_s{shape['seq']}_h{shape['heads']}"
+        f"_d{shape['head_dim']}_{shape['dtype']}"
+    )
+
+
+def _out_dir(shape: dict) -> Path:
+    base = os.environ.get(
+        "VLLM_VIT_SWEEP_OUT",
+        str(Path(tempfile.gettempdir()) / "vit_attn_sweep"),
+    )
+    p = Path(base) / _shape_tag(shape)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def _gpu_lock_cmd(cmd: list[str]) -> list[str]:
@@ -44,10 +61,22 @@ def _gpu_lock_cmd(cmd: list[str]) -> list[str]:
     return cmd
 
 
-def _bench_cmd(cfg: dict) -> list[str]:
+def _bench_cmd(cfg: dict, shape: dict) -> list[str]:
     cmd = [
         sys.executable,
         str(BENCH),
+        "--batch",
+        str(shape["batch"]),
+        "--seq",
+        str(shape["seq"]),
+        "--heads",
+        str(shape["heads"]),
+        "--head-dim",
+        str(shape["head_dim"]),
+        "--dtype",
+        shape["dtype"],
+        "--num-layers",
+        str(shape["num_layers"]),
         "--bm",
         str(cfg["bm"]),
         "--bn",
@@ -62,11 +91,11 @@ def _bench_cmd(cfg: dict) -> list[str]:
     return cmd
 
 
-def run_one(cfg: dict) -> dict:
+def run_one(cfg: dict, shape: dict, out_dir: Path) -> dict:
     tag = f"bm{cfg['bm']}_bn{cfg['bn']}_nw{cfg['nw']}_ns{cfg['ns']}_we{cfg.get('we')}"
-    log_out = TMP / f"{tag}.log"
-    json_out = TMP / f"{tag}.json"
-    cmd = _gpu_lock_cmd(_bench_cmd(cfg))
+    log_out = out_dir / f"{tag}.log"
+    json_out = out_dir / f"{tag}.json"
+    cmd = _gpu_lock_cmd(_bench_cmd(cfg, shape))
     t0 = time.time()
     with open(log_out, "w") as f:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=f, timeout=600)
@@ -144,8 +173,47 @@ def main() -> int:
         default=None,
         help="for refine: JSON list of axis-best configs",
     )
-    p.add_argument("--out", default=str(TMP / "sweep_results.json"))
+    p.add_argument(
+        "--batch", type=int, default=1, help="ViT batch (forwarded to bench)"
+    )
+    p.add_argument(
+        "--seq", type=int, default=4096, help="ViT seq length (forwarded to bench)"
+    )
+    p.add_argument(
+        "--heads", type=int, default=16, help="ViT num heads (forwarded to bench)"
+    )
+    p.add_argument(
+        "--head-dim", type=int, default=72, help="ViT head dim (forwarded to bench)"
+    )
+    p.add_argument(
+        "--dtype",
+        default="bf16",
+        choices=("bf16", "fp16", "fp32"),
+        help="ViT dtype (forwarded to bench)",
+    )
+    p.add_argument(
+        "--num-layers",
+        type=int,
+        default=27,
+        help="ViT depth, used only to scale per-image totals in the report",
+    )
+    p.add_argument(
+        "--out",
+        default=None,
+        help="results JSON path (default: <out_dir>/sweep_results.json)",
+    )
     args = p.parse_args()
+
+    shape = dict(
+        batch=args.batch,
+        seq=args.seq,
+        heads=args.heads,
+        head_dim=args.head_dim,
+        dtype=args.dtype,
+        num_layers=args.num_layers,
+    )
+    out_dir = _out_dir(shape)
+    out_path = Path(args.out) if args.out else out_dir / "sweep_results.json"
 
     if args.phase == "axis":
         grid = axis_sweep()
@@ -157,6 +225,8 @@ def main() -> int:
         with open(args.configs) as f:
             grid = json.load(f)
 
+    print(f"Shape: {_shape_tag(shape)}  ({shape})", file=sys.stderr)
+    print(f"Out dir: {out_dir}", file=sys.stderr)
     print(f"Configs to sweep: {len(grid)}", file=sys.stderr)
 
     results: list[dict] = []
@@ -167,9 +237,9 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
-        r = run_one(c)
+        r = run_one(c, shape, out_dir)
         results.append({"input_cfg": c, **r})
-        with open(args.out, "w") as f:
+        with open(out_path, "w") as f:
             json.dump(results, f, indent=2)
         if "error" in r:
             print(f"  ERROR: {r['error']}", file=sys.stderr)
