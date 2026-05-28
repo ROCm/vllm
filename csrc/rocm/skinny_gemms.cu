@@ -1672,12 +1672,22 @@ torch::Tensor wvSplitK_fused_silu_gate_mul(
 }
 
 // Sweep function disabled by default to reduce compile time.
-// Build with -DVLLM_SKINNY_GEMM_SWEEP to enable.
-#ifdef VLLM_SKINNY_GEMM_SWEEP
+// Build with -DVLLM_SKINNY_GEMM_SWEEP_BF16 (or the umbrella
+// -DVLLM_SKINNY_GEMM_SWEEP) to enable.  Compared to the dispatcher's
+// (YTILE, UNRL) heuristic this lets the caller also pick A_CHUNK and
+// WvPrGrp at runtime, which is necessary to verify whether the (W=32,
+// AC=16) trick used by the K=2048 N=1 fast path also recovers other
+// K%2048 == 0 shapes that currently route through (W=16, AC=8).
+// The YTILE grid is restricted to {1, 2} -- the production dispatcher
+// never picks YTILE > 2 for the slow K%2048 shapes (YT=1 for N=1,
+// YT=2 for N>=2 + !fit_lds) -- which keeps the template-instantiation
+// count to 24 combos x 4 N x 3 kernel variants = 288.
+#ifdef VLLM_SKINNY_GEMM_SWEEP_BF16
 torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
                              const std::optional<at::Tensor>& in_bias,
                              const int64_t CuCount, const int64_t ytile,
-                             const int64_t unrl) {
+                             const int64_t unrl, const int64_t achunk,
+                             const int64_t wvprgrp) {
   auto M_in = in_a.size(0);
   auto K_in = in_a.size(1);
   auto N_in = in_b.size(0);
@@ -1708,63 +1718,78 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int max_lds_len = get_lds_size() / 2;
 
-  #define WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, _N)                  \
+  #define WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _AC, _WVPRGRP)   \
     {                                                                       \
-      dim3 block(_THRDS, 16);                                               \
-      int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, 16);                   \
+      dim3 block(_THRDS, _WVPRGRP);                                         \
+      int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, _WVPRGRP);             \
       if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))           \
-        wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
+        wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N>  \
             <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
                                          By_in, af4, bf4, biasf4, c,        \
                                          __wvPrGrp, CuCount);               \
       else if (Kbp_in * N_in <= max_lds_len * 1.2)                          \
-        wvSplitK_hf_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>              \
+        wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N>      \
             <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
                                          By_in, af4, bf4, biasf4, c,        \
                                          __wvPrGrp, CuCount);               \
       else                                                                  \
-        wvSplitK_hf_big_<fptype, _THRDS, _YTILE, 16, 8, _UNRL, _N>          \
+        wvSplitK_hf_big_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N>  \
             <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in, \
                                          By_in, af4, bf4, biasf4, c,        \
                                          __wvPrGrp, CuCount);               \
     }
 
-  #define WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL)              \
-    switch (N_in) {                                            \
-      case 1:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 1) break; \
-      case 2:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 2) break; \
-      case 3:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 3) break; \
-      case 4:                                                  \
-        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 4) break; \
-      default:                                                 \
-        TORCH_CHECK(false, "Unsupported N=", N_in);            \
+  #define WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL, _AC, _WVPRGRP)              \
+    switch (N_in) {                                                           \
+      case 1:                                                                 \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 1, _AC, _WVPRGRP) break; \
+      case 2:                                                                 \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 2, _AC, _WVPRGRP) break; \
+      case 3:                                                                 \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 3, _AC, _WVPRGRP) break; \
+      case 4:                                                                 \
+        WVSPLITK_SWEEP_LAUNCH(_THRDS, _YTILE, _UNRL, 4, _AC, _WVPRGRP) break; \
+      default:                                                                \
+        TORCH_CHECK(false, "Unsupported N=", N_in);                           \
+    }
+
+  #define WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, _AC) \
+    if (wvprgrp == 16) {                                     \
+      WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL, _AC, 16)       \
+    } else if (wvprgrp == 32) {                              \
+      WVSPLITK_SWEEP_N(_THRDS, _YTILE, _UNRL, _AC, 32)       \
+    } else {                                                 \
+      TORCH_CHECK(false, "Unsupported wvprgrp=", wvprgrp,    \
+                  "; allowed: 16, 32");                      \
+    }
+
+  #define WVSPLITK_SWEEP_AC(_THRDS, _YTILE, _UNRL)                           \
+    if (achunk == 8) {                                                       \
+      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 8)                       \
+    } else if (achunk == 16) {                                               \
+      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 16)                      \
+    } else {                                                                 \
+      TORCH_CHECK(false, "Unsupported achunk=", achunk, "; allowed: 8, 16"); \
     }
 
   #define WVSPLITK_SWEEP_UNRL(_THRDS, _YTILE)        \
     if (unrl == 1) {                                 \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 1)            \
+      WVSPLITK_SWEEP_AC(_THRDS, _YTILE, 1)           \
     } else if (unrl == 2) {                          \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 2)            \
+      WVSPLITK_SWEEP_AC(_THRDS, _YTILE, 2)           \
     } else if (unrl == 4) {                          \
-      WVSPLITK_SWEEP_N(_THRDS, _YTILE, 4)            \
+      WVSPLITK_SWEEP_AC(_THRDS, _YTILE, 4)           \
     } else {                                         \
       TORCH_CHECK(false, "Unsupported unrl=", unrl); \
     }
 
-  #define WVSPLITK_SWEEP_YTILE(_THRDS)                 \
-    if (ytile == 1) {                                  \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 1)                   \
-    } else if (ytile == 2) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 2)                   \
-    } else if (ytile == 3) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 3)                   \
-    } else if (ytile == 4) {                           \
-      WVSPLITK_SWEEP_UNRL(_THRDS, 4)                   \
-    } else {                                           \
-      TORCH_CHECK(false, "Unsupported ytile=", ytile); \
+  #define WVSPLITK_SWEEP_YTILE(_THRDS)                                    \
+    if (ytile == 1) {                                                     \
+      WVSPLITK_SWEEP_UNRL(_THRDS, 1)                                      \
+    } else if (ytile == 2) {                                              \
+      WVSPLITK_SWEEP_UNRL(_THRDS, 2)                                      \
+    } else {                                                              \
+      TORCH_CHECK(false, "Unsupported ytile=", ytile, "; allowed: 1, 2"); \
     }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK_sweep", [&] {
@@ -1786,12 +1811,14 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
 
   #undef WVSPLITK_SWEEP_LAUNCH
   #undef WVSPLITK_SWEEP_N
+  #undef WVSPLITK_SWEEP_WVPRGRP
+  #undef WVSPLITK_SWEEP_AC
   #undef WVSPLITK_SWEEP_UNRL
   #undef WVSPLITK_SWEEP_YTILE
 
   return out_c;
 }
-#endif  // VLLM_SKINNY_GEMM_SWEEP
+#endif  // VLLM_SKINNY_GEMM_SWEEP_BF16
 
 // This version targets cases skinny where CUs are not filled
 // Wave-SplitK is used with reduction done via atomics.
