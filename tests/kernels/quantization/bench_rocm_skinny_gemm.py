@@ -8,10 +8,10 @@ at batch sizes 1-4. Validates accuracy against torch.mm. Dynamically
 determines iteration count per shape based on IQR convergence.
 
 Usage:
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py --dtype bf16
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py --batch-sizes 1 4
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py --shapes 4096x4096
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py --dtype bf16
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py --batch-sizes 1 4
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py --shapes 4096x4096
 """
 
 import argparse
