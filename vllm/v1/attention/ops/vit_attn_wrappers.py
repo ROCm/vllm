@@ -187,6 +187,102 @@ def vit_triton_attn_wrapper(
     )
 
 
+def aiter_triton_fa_maxseqlen_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run aiter's Triton flash_attn_2.varlen_fwd for ViT attention.
+
+    This routes to aiter.ops.triton._triton_kernels.flash_attn_triton_amd.
+    flash_attn_2.varlen_fwd, which is the "dao_ai" implementation in aiter
+    parlance. It is not selectable via aiter.flash_attn_varlen_func (which
+    only exposes the CK FMHA and the aiter-native triton kernels), so it
+    needs its own dispatch path.
+    """
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import (
+        flash_attn_2 as flash_attn_gpu,
+    )
+
+    q_len = q.size(1)
+    if cu_seqlens is None:
+        cu_seqlens = torch.arange(
+            0, (batch_size + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device
+        )
+    max_seqlen_int = q_len if max_seqlen is None else int(max_seqlen.item())
+
+    q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+    softmax_scale = scale if scale is not None else q.shape[-1] ** -0.5
+    out = torch.empty_like(q)
+    flash_attn_gpu.varlen_fwd(
+        q,
+        k,
+        v,
+        out,
+        cu_seqlens,
+        cu_seqlens,
+        None,  # seqused_k
+        None,  # leftpad_k
+        None,  # block_table_
+        None,  # alibi_slopes
+        max_seqlen_int,
+        max_seqlen_int,
+        0.0,  # dropout_p
+        softmax_scale,
+        False,  # zero_tensors
+        False,  # causal
+        -1,  # window_size_left
+        -1,  # window_size_right
+        0.0,  # softcap
+        False,  # return_softmax
+    )
+    context_layer = einops.rearrange(out, "(b s) h d -> b s h d", b=batch_size)
+    return context_layer
+
+
+def aiter_triton_fa_maxseqlen_wrapper_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+direct_register_custom_op(
+    op_name="aiter_triton_fa_maxseqlen_wrapper",
+    op_func=aiter_triton_fa_maxseqlen_wrapper,
+    fake_impl=aiter_triton_fa_maxseqlen_wrapper_fake,
+)
+
+
+def vit_aiter_triton_fa_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.aiter_triton_fa_maxseqlen_wrapper(
+        q,
+        k,
+        v,
+        batch_size,
+        scale,
+        cu_seqlens,
+        max_seqlen,
+    )
+
+
 def apply_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,

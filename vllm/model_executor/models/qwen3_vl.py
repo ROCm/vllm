@@ -603,6 +603,7 @@ class Qwen3_VisionTransformer(nn.Module):
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.ROCM_AITER_TRITON_FA,
             AttentionBackendEnum.TRITON_ATTN,
             AttentionBackendEnum.FLASHINFER,
         }:

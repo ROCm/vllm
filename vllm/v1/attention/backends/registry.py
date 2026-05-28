@@ -54,6 +54,14 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     ROCM_AITER_FA = (
         "vllm.v1.attention.backends.rocm_aiter_fa.AiterFlashAttentionBackend"
     )
+    # ViT-only tag: routes the encoder forward to aiter's Triton flash_attn_2
+    # (aiter.ops.triton._triton_kernels.flash_attn_triton_amd.flash_attn_2,
+    # a.k.a. the "dao_ai" impl in aiter.ops.triton.attention.mha). The path
+    # is not exposed by aiter.flash_attn_varlen_func, so it needs its own
+    # backend tag. No decode backend is registered under this name; the value
+    # must be unique because Enum aliases members with identical values (e.g.
+    # TORCH_SDPA = "").
+    ROCM_AITER_TRITON_FA = "vit_only.rocm_aiter_triton_fa"
     ROCM_AITER_MLA_SPARSE = (
         "vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse.ROCMAiterMLASparseBackend"
     )

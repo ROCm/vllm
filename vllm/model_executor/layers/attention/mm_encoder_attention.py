@@ -12,6 +12,7 @@ from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops.vit_attn_wrappers import (
+    vit_aiter_triton_fa_wrapper,
     vit_flash_attn_wrapper,
     vit_flashinfer_wrapper,
     vit_torch_sdpa_wrapper,
@@ -108,6 +109,7 @@ class MMEncoderAttention(CustomOp):
             in (
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.ROCM_AITER_FA,
+                AttentionBackendEnum.ROCM_AITER_TRITON_FA,
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLASHINFER,
             )
@@ -353,6 +355,38 @@ class MMEncoderAttention(CustomOp):
             output = output.reshape(bsz, q_len, -1)
         return output
 
+    def _forward_aiter_triton_fa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Forward using aiter's Triton flash_attn_2.varlen_fwd."""
+        assert (cu_seqlens is not None and max_seqlen is not None) or (
+            cu_seqlens is None and max_seqlen is None
+        ), "cu_seqlens and max_seqlen should be both set or both None."
+
+        bsz, q_len = query.size()[:2]
+        kv_len = key.size(1)
+        is_reshaped = query.dim() != 4
+
+        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
+
+        output = vit_aiter_triton_fa_wrapper(
+            q=query,
+            k=key,
+            v=value,
+            batch_size=bsz,
+            scale=self.scale,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        if is_reshaped:
+            output = output.reshape(bsz, q_len, -1)
+        return output
+
     def _forward_flashinfer(
         self,
         query: torch.Tensor,
@@ -398,6 +432,10 @@ class MMEncoderAttention(CustomOp):
     ) -> torch.Tensor:
         if self.is_flash_attn_backend:
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
+        elif self.attn_backend == AttentionBackendEnum.ROCM_AITER_TRITON_FA:
+            return self._forward_aiter_triton_fa(
+                query, key, value, cu_seqlens, max_seqlen
+            )
         elif self.attn_backend == AttentionBackendEnum.TRITON_ATTN:
             return self._forward_triton(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.FLASHINFER:
