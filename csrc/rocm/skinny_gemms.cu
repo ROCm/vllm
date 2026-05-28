@@ -1341,6 +1341,45 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
            launch dispatch floor.  Verify per shape with                     \
            benchmarks/kernels/sweep_bf16_kernel.py. */                       \
         WVSPLITK_CFG_AC(32, 32, 1, 8, __N, 16)                               \
+      /* gfx1151 AC=32 fast paths.  Each cell beats AC=16 by >=2% with       \
+         z>1.96 in a 10-rep do_bench A/B (stderr 0.1-1.0us per cell, mean    \
+         delta 1.5-3 us per cell).  Other K%2048==0 cells stay on the AC=16  \
+         fallbacks below where AC=32 was a tie or lost (notably 4096x4096    \
+         N=4 was -2.7%, do not extrapolate to untested cells).  Re-verify    \
+         per shape with benchmarks/kernels/sweep_bf16_kernel.py (extend the  \
+         ACHUNKS list to include 32 and rebuild with                         \
+         VLLM_SKINNY_GEMM_SWEEP_BF16=1). */                                  \
+      else if ((K_in == 2048) && (__N == 2 || __N == 3))                     \
+        /* M=2560 K=2048 N=2: 1.057x (z=21.5); N=3: 1.049x (z=12.8) */       \
+        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
+      else if ((K_in == 4096) && (__N == 1))                                 \
+        /* M=2560 K=4096 N=1: 1.041x (z=3.7); UR=4 not 2 for N=1 */          \
+        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 4, __N, 32)                     \
+      else if ((K_in == 4096) && (__N == 2) && (M_in < 4096))                \
+        /* M<4096 K=4096 N=2: 1.057x (z=13.1), W=16 wins at this M */        \
+        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
+      else if ((K_in == 4096) && (__N == 2) && (M_in >= 4096))               \
+        /* M>=4096 K=4096 N=2: 1.028x (z=6.2), W=32 wins at larger M */      \
+        WVSPLITK_CFG_AC(_THRDS, 32, 1, 2, __N, 32)                           \
+      else if ((K_in == 4096) && (__N == 3))                                 \
+        /* M=2560 K=4096 N=3: 1.031x (z=4.9) */                              \
+        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
+      else if ((K_in == 8192) && (__N == 2))                                 \
+        /* M=2560 K=8192 N=2: 1.040x (z=9.3), W=32 wins at this K */         \
+        WVSPLITK_CFG_AC(_THRDS, 32, 1, 2, __N, 32)                           \
+      else if ((K_in % 2048 == 0) && (__N == 2))                             \
+        /* gfx1151 K%2048==0, N=2 only: YT=2 + W=32 + AC=16 + UR=4.          \
+           sweep_bf16_kernel.py 4-axis sweep showed this is the best         \
+           N=2 config across K in {2048, 4096, 8192} and 4096x4096,          \
+           1.06x (K=8192) to 1.60x (K=2048) over the prior AC=8 default. */  \
+        WVSPLITK_CFG_AC(_THRDS, 32, 2, 4, __N, 16)                           \
+      else if ((K_in % 2048 == 0) && (__N != 2))                             \
+        /* gfx1151 K%2048==0, N in {1, 3, 4} (K=2048 N=1 handled above):     \
+           YT=1 + W=16 + AC=16 + UR=4.  N=3/4 want YT=1 not YT=2 (LDS/VGPR   \
+           pressure from W=32 hurts them); same config also wins for N=1.    \
+           sweep showed 1.11x-1.19x (N=1), 1.23x-1.98x (N=3),                \
+           1.59x-2.73x (N=4) over the prior AC=8 defaults. */                \
+        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 4, __N, 16)                     \
       else if (K_in <= 2048)                                                 \
         WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                            \
       else if (__N >= 2 && !fit_lds) {                                       \
