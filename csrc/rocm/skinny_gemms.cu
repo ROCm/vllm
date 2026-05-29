@@ -160,6 +160,18 @@ __device__ __forceinline__ T loadnt(T* addr) {
   return __builtin_nontemporal_load(addr);
 }
 
+#if defined(__HIP__GFX1X__)
+// gfx10+/RDNA wave32 cross-half (lane i <-> lane i^16) shuffle.
+// Lowers to a single v_permlanex16_b32 instead of the ds_bpermute_b32 the
+// compiler picks for __shfl_xor(x, 16) — saves the LDS round-trip and lgkmcnt.
+__device__ __forceinline__ float shfl_xor16_f32(float v) {
+  uint32_t bits = __builtin_bit_cast(uint32_t, v);
+  bits = __builtin_amdgcn_permlanex16(bits, bits, 0x76543210u, 0xfedcba98u,
+                                      /*fi=*/false, /*bc=*/false);
+  return __builtin_bit_cast(float, bits);
+}
+#endif
+
 __device__ __forceinline__ float4 load_ntmprl(const float4* addr) {
   auto addr_alias = reinterpret_cast<const float*>(addr);
   auto dat0 = loadnt(addr_alias);
@@ -558,7 +570,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x143, 0xf, 0xf,
                                                 1);  // ROW_BCAST31
   #else
-          sum[n][y] += __shfl_xor(sum[n][y], 16);
+          // AC=32 paths are VALU-dense (high pk_dot intensity); the LDS
+          // bpermute overlaps with VALU and is faster than v_permlanex16_b32,
+          // which adds to the critical VALU schedule. Other AC values have
+          // spare VALU slots and benefit from removing the lgkmcnt round-trip.
+          if constexpr (A_CHUNK == 32)
+            sum[n][y] += __shfl_xor(sum[n][y], 16);  // ds_bpermute
+          else
+            sum[n][y] += shfl_xor16_f32(sum[n][y]);  // v_permlanex16_b32
   #endif
         }
       }
@@ -791,7 +810,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x143, 0xf, 0xf,
                                                 1);  // ROW_BCAST31
   #else
-          sum[n][y] += __shfl_xor(sum[n][y], 16);
+          // AC=32 paths are VALU-dense (high pk_dot intensity); the LDS
+          // bpermute overlaps with VALU and is faster than v_permlanex16_b32,
+          // which adds to the critical VALU schedule. Other AC values have
+          // spare VALU slots and benefit from removing the lgkmcnt round-trip.
+          if constexpr (A_CHUNK == 32)
+            sum[n][y] += __shfl_xor(sum[n][y], 16);  // ds_bpermute
+          else
+            sum[n][y] += shfl_xor16_f32(sum[n][y]);  // v_permlanex16_b32
   #endif
         }
       }
@@ -1143,7 +1169,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x143, 0xf, 0xf,
                                                 1);  // ROW_BCAST31
   #else
-          sum[n][y] += __shfl_xor(sum[n][y], 16);
+          // AC=32 paths are VALU-dense (high pk_dot intensity); the LDS
+          // bpermute overlaps with VALU and is faster than v_permlanex16_b32,
+          // which adds to the critical VALU schedule. Other AC values have
+          // spare VALU slots and benefit from removing the lgkmcnt round-trip.
+          if constexpr (A_CHUNK == 32)
+            sum[n][y] += __shfl_xor(sum[n][y], 16);  // ds_bpermute
+          else
+            sum[n][y] += shfl_xor16_f32(sum[n][y]);  // v_permlanex16_b32
   #endif
         }
       }
@@ -1802,13 +1835,16 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
                   "; allowed: 16, 32");                      \
     }
 
-  #define WVSPLITK_SWEEP_AC(_THRDS, _YTILE, _UNRL)                           \
-    if (achunk == 8) {                                                       \
-      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 8)                       \
-    } else if (achunk == 16) {                                               \
-      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 16)                      \
-    } else {                                                                 \
-      TORCH_CHECK(false, "Unsupported achunk=", achunk, "; allowed: 8, 16"); \
+  #define WVSPLITK_SWEEP_AC(_THRDS, _YTILE, _UNRL)      \
+    if (achunk == 8) {                                  \
+      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 8)  \
+    } else if (achunk == 16) {                          \
+      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 16) \
+    } else if (achunk == 32) {                          \
+      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 32) \
+    } else {                                            \
+      TORCH_CHECK(false, "Unsupported achunk=", achunk, \
+                  "; allowed: 8, 16, 32");              \
     }
 
   #define WVSPLITK_SWEEP_UNRL(_THRDS, _YTILE)        \

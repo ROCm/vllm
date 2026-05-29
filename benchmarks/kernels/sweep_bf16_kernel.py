@@ -71,7 +71,7 @@ SHAPES = [
 
 YTILES = [1, 2]
 UNRLS = [1, 2, 4]
-ACHUNKS = [8, 16]
+ACHUNKS = [8, 16, 32]
 WVPRGRPS = [16, 32]
 
 # Working-set guards used by the dispatcher's variant selection
