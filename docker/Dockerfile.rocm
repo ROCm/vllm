@@ -101,8 +101,14 @@ FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 # vLLM build stages
 FROM fetch_vllm AS build_vllm
 # Build vLLM (setup.py auto-detects sccache in PATH)
+# --ignore-requires-python needed for amd-quark which declares <3.13 but works fine on 3.13+
 RUN cd vllm \
-    && python3 -m pip install -r requirements/rocm.txt \
+    && PIP_IGNORE_FLAG="" \
+    && PYTHON_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)") \
+    && if [ "$PYTHON_MINOR" -ge 13 ]; then \
+         PIP_IGNORE_FLAG="--ignore-requires-python"; \
+       fi \
+    && python3 -m pip install $PIP_IGNORE_FLAG -r requirements/rocm.txt \
     && python3 setup.py clean --all  \
     && python3 setup.py bdist_wheel --dist-dir=dist
 FROM scratch AS export_vllm
@@ -292,9 +298,15 @@ RUN echo "Pinning vLLM dependencies to custom wheel versions..." \
     && python3 /tmp/pin_rocm_dependencies.py /install ${COMMON_WORKDIR}/vllm/requirements/rocm.txt
 
 # Install dependencies using custom wheels from /install
+# --ignore-requires-python needed for amd-quark which declares <3.13 but works fine on 3.13+
 RUN cd vllm \
     && echo "Building vLLM with custom wheels from /install" \
-    && python3 -m pip install --find-links /install -r requirements/rocm.txt \
+    && PIP_IGNORE_FLAG="" \
+    && PYTHON_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)") \
+    && if [ "$PYTHON_MINOR" -ge 13 ]; then \
+         PIP_IGNORE_FLAG="--ignore-requires-python"; \
+       fi \
+    && python3 -m pip install $PIP_IGNORE_FLAG --find-links /install -r requirements/rocm.txt \
     && python3 setup.py clean --all
 
 # Build wheel using pre-extracted version to avoid dirty state from modified requirements/rocm.txt
