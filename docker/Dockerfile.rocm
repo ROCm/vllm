@@ -132,18 +132,10 @@ ENV UCX_HOME=/usr/local/ucx
 ENV RIXL_HOME=/usr/local/rixl
 ENV RIXL_BENCH_HOME=/usr/local/rixl_bench
 
-# Detect ROCm path: pip-installed SDK or traditional /opt/rocm
-# Writes to /tmp/rocm_path for use by subsequent RUN steps
-RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_core; import os; print(os.path.dirname(_rocm_sdk_core.__file__))" 2>/dev/null || echo "") && \
-    if [ -n "$ROCM_SDK_PATH" ] && [ -d "$ROCM_SDK_PATH/include" ]; then \
-      echo "$ROCM_SDK_PATH" > /tmp/rocm_path; \
-      echo "Using pip-installed ROCm at: $ROCM_SDK_PATH"; \
-    elif [ -d "/opt/rocm/include" ]; then \
-      echo "/opt/rocm" > /tmp/rocm_path; \
-      echo "Using system ROCm at: /opt/rocm"; \
-    else \
-      echo "ERROR: Could not find ROCm installation"; exit 1; \
-    fi
+# Detect pip-installed ROCm SDK path
+RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_core; import os; print(os.path.dirname(_rocm_sdk_core.__file__))" ) && \
+    echo "$ROCM_SDK_PATH" > /tmp/rocm_path && \
+    echo "ROCm SDK path: $ROCM_SDK_PATH"
 
 # RIXL build system dependences and RDMA support
 RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
@@ -217,15 +209,9 @@ ARG DEEPEP_REPO="https://github.com/ROCm/DeepEP.git"
 ARG DEEPEP_NIC="cx7"
 ENV ROCSHMEM_DIR=/opt/rocshmem
 
-# Detect ROCm path: pip-installed SDK or traditional /opt/rocm
-RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_core; import os; print(os.path.dirname(_rocm_sdk_core.__file__))" 2>/dev/null || echo "") && \
-    if [ -n "$ROCM_SDK_PATH" ] && [ -d "$ROCM_SDK_PATH/include" ]; then \
-      echo "$ROCM_SDK_PATH" > /tmp/rocm_path; \
-    elif [ -d "/opt/rocm/include" ]; then \
-      echo "/opt/rocm" > /tmp/rocm_path; \
-    else \
-      echo "ERROR: Could not find ROCm installation"; exit 1; \
-    fi
+# Detect pip-installed ROCm SDK path
+RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_core; import os; print(os.path.dirname(_rocm_sdk_core.__file__))") && \
+    echo "$ROCM_SDK_PATH" > /tmp/rocm_path
 
 RUN DETECTED_ROCM_PATH=$(cat /tmp/rocm_path) && \
     git clone ${ROCSHMEM_REPO} \
