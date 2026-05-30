@@ -124,7 +124,7 @@ COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/vllm/v1 /vllm_v1
 
 # RIXL/UCX build stages
 FROM base AS build_rixl
-ARG RIXL_BRANCH="bf4a7214e6935805de3f20edc52d521cac799aef"
+ARG RIXL_BRANCH="f33a5599"
 ARG RIXL_REPO="https://github.com/ROCm/RIXL.git"
 ARG UCX_BRANCH="da3fac2a"
 ARG UCX_REPO="https://github.com/ROCm/ucx.git"
@@ -132,12 +132,10 @@ ENV UCX_HOME=/usr/local/ucx
 ENV RIXL_HOME=/usr/local/rixl
 ENV RIXL_BENCH_HOME=/usr/local/rixl_bench
 
-# Detect pip-installed ROCm SDK path and create a stable symlink
+# Symlink pip-installed ROCm SDK to /opt/rocm so all build tools find it
 RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_devel; import os; print(os.path.dirname(_rocm_sdk_devel.__file__))") && \
-    ln -sf "$ROCM_SDK_PATH" /usr/local/rocm && \
-    echo "ROCm SDK path: $ROCM_SDK_PATH -> /usr/local/rocm"
-ENV ROCM_PATH=/usr/local/rocm
-ENV PATH=${ROCM_PATH}/bin:${PATH}
+    ln -sf "$ROCM_SDK_PATH" /opt/rocm
+ENV ROCM_PATH=/opt/rocm
 
 # RIXL build system dependences and RDMA support
 RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
@@ -171,7 +169,7 @@ RUN cd /usr/local/src && \
         --disable-doxygen-doc \
         --enable-optimizations \
         --enable-devel-headers \
-        --with-rocm=${ROCM_PATH} \
+        --with-rocm=/opt/rocm \
         --with-verbs \
         --with-dm \
         --enable-mt && \
@@ -208,11 +206,10 @@ ARG DEEPEP_REPO="https://github.com/ROCm/DeepEP.git"
 ARG DEEPEP_NIC="cx7"
 ENV ROCSHMEM_DIR=/opt/rocshmem
 
-# Detect pip-installed ROCm SDK path and create a stable symlink
+# Symlink pip-installed ROCm SDK to /opt/rocm so all build tools find it
 RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_devel; import os; print(os.path.dirname(_rocm_sdk_devel.__file__))") && \
-    ln -sf "$ROCM_SDK_PATH" /usr/local/rocm
-ENV ROCM_PATH=/usr/local/rocm
-ENV PATH=${ROCM_PATH}/bin:${PATH}
+    ln -sf "$ROCM_SDK_PATH" /opt/rocm
+ENV ROCM_PATH=/opt/rocm
 
 RUN git clone ${ROCSHMEM_REPO} \
  && cd rocm-systems \
@@ -221,7 +218,7 @@ RUN git clone ${ROCSHMEM_REPO} \
  && cd projects/rocshmem/build \
  && cmake .. \
     -DCMAKE_INSTALL_PREFIX="${ROCSHMEM_DIR}" \
-    -DROCM_PATH=${ROCM_PATH} \
+    -DROCM_PATH=/opt/rocm \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DUSE_EXTERNAL_MPI=OFF \
  && make -j \
