@@ -132,10 +132,12 @@ ENV UCX_HOME=/usr/local/ucx
 ENV RIXL_HOME=/usr/local/rixl
 ENV RIXL_BENCH_HOME=/usr/local/rixl_bench
 
-# Detect pip-installed ROCm SDK path
+# Detect pip-installed ROCm SDK path and create a stable symlink
 RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_devel; import os; print(os.path.dirname(_rocm_sdk_devel.__file__))") && \
-    echo "$ROCM_SDK_PATH" > /tmp/rocm_path && \
-    echo "ROCm SDK path: $ROCM_SDK_PATH"
+    ln -sf "$ROCM_SDK_PATH" /usr/local/rocm && \
+    echo "ROCm SDK path: $ROCM_SDK_PATH -> /usr/local/rocm"
+ENV ROCM_PATH=/usr/local/rocm
+ENV PATH=${ROCM_PATH}/bin:${PATH}
 
 # RIXL build system dependences and RDMA support
 RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
@@ -156,8 +158,7 @@ RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
 
 RUN uv pip install --system meson auditwheel patchelf tomlkit
 
-RUN DETECTED_ROCM_PATH=$(cat /tmp/rocm_path) && \
-    cd /usr/local/src && \
+RUN cd /usr/local/src && \
     git clone ${UCX_REPO} &&  \
     cd ucx  && \
     git checkout ${UCX_BRANCH} && \
@@ -170,7 +171,7 @@ RUN DETECTED_ROCM_PATH=$(cat /tmp/rocm_path) && \
         --disable-doxygen-doc \
         --enable-optimizations \
         --enable-devel-headers \
-        --with-rocm=${DETECTED_ROCM_PATH} \
+        --with-rocm=${ROCM_PATH} \
         --with-verbs \
         --with-dm \
         --enable-mt && \
@@ -180,23 +181,21 @@ RUN DETECTED_ROCM_PATH=$(cat /tmp/rocm_path) && \
 ENV PATH=/usr/local/ucx/bin:$PATH
 ENV LD_LIBRARY_PATH=${UCX_HOME}/lib:${LD_LIBRARY_PATH}
 
-RUN DETECTED_ROCM_PATH=$(cat /tmp/rocm_path) && \
-    git clone ${RIXL_REPO} /opt/rixl && \
+RUN git clone ${RIXL_REPO} /opt/rixl && \
     cd /opt/rixl && \
     git checkout ${RIXL_BRANCH} && \
     meson setup build --prefix=${RIXL_HOME} \
                      -Ducx_path=${UCX_HOME} \
-                     -Drocm_path=${DETECTED_ROCM_PATH} && \
+                     -Drocm_path=${ROCM_PATH} && \
     cd build && \
     ninja && \
     ninja install
 
 # Generate RIXL wheel
-RUN DETECTED_ROCM_PATH=$(cat /tmp/rocm_path) && \
-    cd /opt/rixl && mkdir -p /app/install && \
+RUN cd /opt/rixl && mkdir -p /app/install && \
     ./contrib/build-wheel.sh \
         --output-dir /app/install \
-        --rocm-dir ${DETECTED_ROCM_PATH} \
+        --rocm-dir ${ROCM_PATH} \
         --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
         --nixl-plugins-dir ${RIXL_HOME}/lib/x86_64-linux-gnu/plugins
 
@@ -209,19 +208,20 @@ ARG DEEPEP_REPO="https://github.com/ROCm/DeepEP.git"
 ARG DEEPEP_NIC="cx7"
 ENV ROCSHMEM_DIR=/opt/rocshmem
 
-# Detect pip-installed ROCm SDK path
+# Detect pip-installed ROCm SDK path and create a stable symlink
 RUN ROCM_SDK_PATH=$(python3 -c "import _rocm_sdk_devel; import os; print(os.path.dirname(_rocm_sdk_devel.__file__))") && \
-    echo "$ROCM_SDK_PATH" > /tmp/rocm_path
+    ln -sf "$ROCM_SDK_PATH" /usr/local/rocm
+ENV ROCM_PATH=/usr/local/rocm
+ENV PATH=${ROCM_PATH}/bin:${PATH}
 
-RUN DETECTED_ROCM_PATH=$(cat /tmp/rocm_path) && \
-    git clone ${ROCSHMEM_REPO} \
+RUN git clone ${ROCSHMEM_REPO} \
  && cd rocm-systems \
  && git checkout ${ROCSHMEM_BRANCH} \
  && mkdir -p projects/rocshmem/build \
  && cd projects/rocshmem/build \
  && cmake .. \
     -DCMAKE_INSTALL_PREFIX="${ROCSHMEM_DIR}" \
-    -DROCM_PATH=${DETECTED_ROCM_PATH} \
+    -DROCM_PATH=${ROCM_PATH} \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DUSE_EXTERNAL_MPI=OFF \
  && make -j \
