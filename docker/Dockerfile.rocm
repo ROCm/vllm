@@ -191,7 +191,9 @@ RUN git clone ${RIXL_REPO} /opt/rixl && \
 
 # Generate RIXL wheel
 RUN cd /opt/rixl && mkdir -p /app/install && \
+    PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')") && \
     ./contrib/build-wheel.sh \
+        --python-version ${PY_VER} \
         --output-dir /app/install \
         --rocm-dir ${ROCM_PATH} \
         --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
