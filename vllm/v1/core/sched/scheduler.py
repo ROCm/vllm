@@ -103,6 +103,12 @@ class Scheduler(SchedulerInterface):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        self.enable_hybrid_pipeline = (
+            envs.VLLM_NPU_ASYNC_PIPELINE
+            and envs.VLLM_VISION_NPU_CACHE
+        )
+        # Set during schedule() when a request is deferred for NPU vision.
+        self.waiting_on_vision_encoding = False
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens
@@ -357,6 +363,8 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        self.waiting_on_vision_encoding = False
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -573,6 +581,25 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                # HYBRID PIPELINING: defer prefill until NPU vision is ready.
+                if self.enable_hybrid_pipeline and self.max_num_running_reqs == 1:
+                    needs_vision = (
+                        request.num_computed_tokens == 0 and request.mm_features
+                    )
+                    if needs_vision:
+                        from vllm.v1.engine.core import (
+                            _VISION_PREENCODING_CACHE,
+                            is_vision_preencoding_ready,
+                        )
+
+                        if not is_vision_preencoding_ready(
+                            request_id, _VISION_PREENCODING_CACHE
+                        ):
+                            self.waiting_on_vision_encoding = True
+                            request_queue.pop_request()
+                            step_skipped_waiting.prepend_request(request)
+                            continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -814,6 +841,19 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 self.running.append(request)
+
+                if self.enable_hybrid_pipeline and self.max_num_running_reqs == 1:
+                    is_vision_phase = (
+                        request.num_computed_tokens == 0 and request.mm_features
+                    )
+                    phase_name = "VISION" if is_vision_phase else "LLM"
+                    logger.debug(
+                        "[Hybrid Scheduler] Scheduled %s in %s phase (running: %d)",
+                        request.request_id,
+                        phase_name,
+                        len(self.running),
+                    )
+
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp

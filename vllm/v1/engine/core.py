@@ -85,6 +85,34 @@ HANDSHAKE_TIMEOUT_MINS = 5
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
+# Global vision pre-encoding cache (shared between EngineCore and workers)
+_VISION_PREENCODING_CACHE: dict[str, Any] = {}
+
+# Busy-loop backoff while deferred requests wait on NPU vision (seconds).
+_VISION_POLL_SLEEP_S = 0.02
+_DEFAULT_BUSY_LOOP_SLEEP_S = 0.001
+
+
+def is_vision_preencoding_ready(
+    request_id: str, cache: dict[str, Any] | None = None
+) -> bool:
+    """Return True when background vision encoding finished for a request."""
+    if cache is None:
+        cache = _VISION_PREENCODING_CACHE
+    cached = cache.get(request_id)
+    if cached == "COMPLETED":
+        return True
+    if cached is None:
+        return False
+    done = getattr(cached, "done", None)
+    return callable(done) and done()
+
+
+def _request_has_vision_mm(request: Any) -> bool:
+    if not request.mm_features:
+        return False
+    return any(f.modality in ("image", "video") for f in request.mm_features)
+
 
 class EngineCore:
     """Inner loop of vLLM's Engine."""
@@ -398,6 +426,59 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _schedule_waiting_vision(self) -> None:
+        """Vision Scheduler: Proactively trigger pre-encoding for waiting requests.
+
+        This is the key to enabling pipelining with max-num-seqs=1:
+        - Core scheduler only schedules 1 LLM at a time (max-num-seqs=1)
+        - Vision scheduler processes ALL waiting requests' vision independently
+        - Request 2's vision can process while Request 1's LLM runs
+        """
+        if not (
+            envs.VLLM_NPU_ASYNC_PIPELINE
+            and envs.VLLM_VISION_NPU_CACHE
+        ):
+            return
+
+        try:
+            waiting_requests = list(self.scheduler.waiting)  # type: ignore[attr-defined]
+        except Exception as e:
+            logger.exception("[Vision Scheduler] Error accessing waiting queue: %s", e)
+            return
+
+        if not waiting_requests:
+            return
+
+        # Skip the scan when every waiting vision request is already submitted.
+        pending_submit = False
+        for request in waiting_requests:
+            if not _request_has_vision_mm(request):
+                continue
+            req_id = request.request_id
+            if req_id not in _VISION_PREENCODING_CACHE:
+                pending_submit = True
+                break
+
+        if not pending_submit:
+            return
+
+        for request in waiting_requests:
+            if not _request_has_vision_mm(request):
+                continue
+
+            req_id = request.request_id
+            if req_id in _VISION_PREENCODING_CACHE:
+                continue
+
+            has_mm_hash = any(mm_feature.mm_hash for mm_feature in request.mm_features)
+            if not has_mm_hash:
+                continue
+
+            logger.debug(
+                "[Vision Scheduler] Submitting pre-encoding for request %s", req_id
+            )
+            self.model_executor.submit_vision_encoding(req_id, request.mm_features)
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -409,6 +490,10 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+
+        # Vision pre-encoding for waiting requests (overlaps with running LLM).
+        self._schedule_waiting_vision()
+
         scheduler_output = self.scheduler.schedule()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -467,7 +552,12 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            # VISION SCHEDULER: Proactively trigger pre-encoding
+            # Request 2's vision can start while Request 1's LLM runs
+            self._schedule_waiting_vision()
+
             scheduler_output = self.scheduler.schedule()
+
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -1211,7 +1301,10 @@ class EngineCoreProc(EngineCore):
         # background threads (like NIXL handshake) to make progress.
         # Without this, the tight polling loop can starve background threads.
         if not model_executed and self.scheduler.has_unfinished_requests():
-            time.sleep(0.001)
+            if getattr(self.scheduler, "waiting_on_vision_encoding", False):
+                time.sleep(_VISION_POLL_SLEEP_S)
+            else:
+                time.sleep(_DEFAULT_BUSY_LOOP_SLEEP_S)
 
         return model_executed
 

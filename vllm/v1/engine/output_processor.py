@@ -10,6 +10,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -37,6 +38,8 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+logger = init_logger(__name__)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -678,6 +681,33 @@ class OutputProcessor:
                     self._update_stats_from_finished(
                         req_state, finish_reason, iteration_stats
                     )
+
+                    # Debug logging for request timing
+                    if req_state.stats and iteration_stats:
+                        metrics = req_state.stats
+                        e2e_time = (
+                            iteration_stats.iteration_timestamp - metrics.arrival_time
+                        )
+                        queued_time = metrics.scheduled_ts - metrics.queued_ts
+                        prefill_time = metrics.first_token_ts - metrics.scheduled_ts
+                        decode_time = metrics.last_token_ts - metrics.first_token_ts
+                        num_tokens = metrics.num_generation_tokens
+                        tokens_per_sec = (
+                            num_tokens / decode_time if decode_time > 0 else 0
+                        )
+                        logger.debug(
+                            "Request %s: E2E=%.3fs, Queue=%.3fs, "
+                            "Prefill=%.3fs, Decode=%.3fs, "
+                            "Tokens=%d (%.1f tok/s)",
+                            req_state.request_id,
+                            e2e_time,
+                            queued_time,
+                            prefill_time,
+                            decode_time,
+                            num_tokens,
+                            tokens_per_sec,
+                        )
+
                     if self.tracing_enabled:
                         self.do_tracing(engine_core_output, req_state, iteration_stats)
 
