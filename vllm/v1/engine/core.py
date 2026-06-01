@@ -436,7 +436,7 @@ class EngineCore:
         """
         if not (
             envs.VLLM_NPU_ASYNC_PIPELINE
-            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+            and envs.VLLM_VISION_NPU_CACHE
         ):
             return
 

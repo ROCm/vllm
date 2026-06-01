@@ -144,7 +144,6 @@ class FlexMLRTVisionBackend(NPUVisionBackend):
         """Get output embedding dimension from FlexMLRT model."""
         return self.model.output_dim()
 
-
 class AsyncFlexMLRTVisionBackend:
     """Async wrapper for FlexMLRT backend enabling NPU+GPU pipelining.
 
@@ -340,3 +339,4 @@ class AsyncFlexMLRTVisionBackend:
         """Cleanup thread pool on deletion."""
         if hasattr(self, "npu_executor"):
             self.npu_executor.shutdown(wait=True)
+

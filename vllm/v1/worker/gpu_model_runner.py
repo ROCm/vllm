@@ -2752,7 +2752,7 @@ class GPUModelRunner(
         """
         enable_preencoding = (
             envs.VLLM_NPU_ASYNC_PIPELINE
-            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+            and envs.VLLM_VISION_NPU_CACHE
         )
 
         if not enable_preencoding:
@@ -2802,7 +2802,7 @@ class GPUModelRunner(
         """
         enable_preencoding = (
             envs.VLLM_NPU_ASYNC_PIPELINE
-            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+            and envs.VLLM_VISION_NPU_CACHE
         )
 
         if not enable_preencoding:
@@ -3081,7 +3081,7 @@ class GPUModelRunner(
         # Check for pre-encoded vision embeddings from background thread
         enable_preencoding = (
             envs.VLLM_NPU_ASYNC_PIPELINE
-            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+            and envs.VLLM_VISION_NPU_CACHE
         )
 
         if enable_preencoding:
@@ -3176,7 +3176,7 @@ class GPUModelRunner(
             if not_ready_req_ids:
                 enable_hybrid_pipeline = (
                     envs.VLLM_NPU_ASYNC_PIPELINE
-                    and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+                    and envs.VLLM_VISION_NPU_CACHE
                 )
                 if enable_hybrid_pipeline:
                     logger.debug(
@@ -3327,7 +3327,7 @@ class GPUModelRunner(
                 )
 
         # Check if NPU backend and parallel processing enabled
-        using_npu = envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+        using_npu = bool(envs.VLLM_VISION_NPU_CACHE)
         enable_parallel = using_npu and envs.VLLM_NPU_ASYNC_PIPELINE
 
         # Collect all batches from the generator first
@@ -3629,7 +3629,7 @@ class GPUModelRunner(
                 if encoder_output == "NOT_READY":
                     enable_hybrid_pipeline = (
                         envs.VLLM_NPU_ASYNC_PIPELINE
-                        and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+                        and envs.VLLM_VISION_NPU_CACHE
                     )
                     if enable_hybrid_pipeline:
                         # Raise exception to signal execute_model should skip request

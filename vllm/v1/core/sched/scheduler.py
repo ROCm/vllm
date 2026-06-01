@@ -105,7 +105,7 @@ class Scheduler(SchedulerInterface):
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.enable_hybrid_pipeline = (
             envs.VLLM_NPU_ASYNC_PIPELINE
-            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+            and envs.VLLM_VISION_NPU_CACHE
         )
         # Set during schedule() when a request is deferred for NPU vision.
         self.waiting_on_vision_encoding = False
