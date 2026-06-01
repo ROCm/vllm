@@ -628,6 +628,7 @@ def get_npu_vision_backend():
 
     Returns:
         NPUVisionBackend instance if NPU backend is enabled, None otherwise.
+        Returns AsyncFlexMLRTVisionBackend if VLLM_NPU_ASYNC_PIPELINE=1.
 
     Raises:
         ValueError: If backend name is recognized but initialization fails.
@@ -647,8 +648,14 @@ def get_npu_vision_backend():
             )
         device_name = envs.VLLM_VISION_NPU_DEVICE or "stx"
 
-        from vllm.vision_npu.flexmlrt_backend import FlexMLRTVisionBackend
+        # Use async backend if pipelining is enabled
+        if envs.VLLM_NPU_ASYNC_PIPELINE:
+            from vllm.vision_npu.flexmlrt_backend import AsyncFlexMLRTVisionBackend
 
-        return FlexMLRTVisionBackend(model_cache, device_name)
+            return AsyncFlexMLRTVisionBackend(model_cache, device_name)
+        else:
+            from vllm.vision_npu.flexmlrt_backend import FlexMLRTVisionBackend
+
+            return FlexMLRTVisionBackend(model_cache, device_name)
 
     return None

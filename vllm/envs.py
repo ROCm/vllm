@@ -215,6 +215,7 @@ if TYPE_CHECKING:
     VLLM_VISION_NPU_BACKEND: str = ""
     VLLM_VISION_NPU_CACHE: str | None = None
     VLLM_VISION_NPU_DEVICE: str | None = None
+    VLLM_NPU_ASYNC_PIPELINE: bool = False
     VLLM_NPU_TIMING: bool = False
     VLLM_MORIIO_QP_PER_TRANSFER: int = 1
     VLLM_MORIIO_POST_BATCH_SIZE: int = -1
@@ -1754,6 +1755,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_VISION_NPU_CACHE": lambda: os.getenv("VLLM_VISION_NPU_CACHE"),
     # NPU device name (e.g., "stx" for Strix, "phx" for Phoenix)
     "VLLM_VISION_NPU_DEVICE": lambda: os.getenv("VLLM_VISION_NPU_DEVICE"),
+    # Enable async pipelining of NPU vision encoding with GPU LLM inference
+    "VLLM_NPU_ASYNC_PIPELINE": lambda: os.getenv("VLLM_NPU_ASYNC_PIPELINE", "0") == "1",
     # Enable NPU timing debug logs
     "VLLM_NPU_TIMING": lambda: os.getenv("VLLM_NPU_TIMING", "0") == "1",
     # Enable CUDA compatibility mode for datacenter GPUs with older
