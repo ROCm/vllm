@@ -218,6 +218,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+# Custom exception for hybrid NPU+GPU pipelining
+class VisionNotReadyError(Exception):
+    """Raised when vision encoding is not ready in hybrid pipelining mode."""
+
+    pass
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -624,6 +632,7 @@ class GPUModelRunner(
         )
         self._init_block_sizes = [placeholder_block_size]
         self._init_kernel_block_sizes = [placeholder_block_size]
+
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
@@ -2735,6 +2744,316 @@ class GPUModelRunner(
 
         return mm_hashes, mm_kwargs, mm_lora_refs
 
+    def submit_vision_encoding(self, req_id, mm_features) -> None:
+        """Submit vision encoding for a waiting request (called by Vision Scheduler).
+
+        This enables pipelining by starting vision processing for requests that are
+        waiting in the queue (not yet scheduled for LLM execution).
+        """
+        enable_preencoding = (
+            envs.VLLM_NPU_ASYNC_PIPELINE
+            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+        )
+
+        if not enable_preencoding:
+            return
+
+        # Initialize thread pool if not already done
+        if not hasattr(self, "_vision_preencoding_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._vision_preencoding_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vision_preenc"
+            )
+            logger.info_once(
+                "[Model Runner] Vision pre-encoding thread pool initialized"
+            )
+
+        from vllm.v1.engine.core import _VISION_PREENCODING_CACHE
+
+        # Check if already in cache
+        if req_id in _VISION_PREENCODING_CACHE:
+            return
+
+        # Check if request has vision features
+        if not mm_features:
+            return
+
+        logger.debug(
+            "[Model Runner] Submitting vision pre-encoding for request %s", req_id
+        )
+
+        # Create encoder_input_ids (use placeholder [0] for waiting requests)
+        encoder_input_ids = [0]
+
+        # Submit to background thread
+        future = self._vision_preencoding_pool.submit(
+            self._encode_single_request_vision, req_id, encoder_input_ids, mm_features
+        )
+
+        _VISION_PREENCODING_CACHE[req_id] = future
+
+    def _start_vision_preencoding(self, scheduler_output: "SchedulerOutput"):
+        """
+        Start vision encoding in background thread for new encoder inputs.
+
+        This is called at the beginning of execute_model() to start NPU vision
+        encoding ASAP, allowing it to overlap with previous request's LLM processing.
+        """
+        enable_preencoding = (
+            envs.VLLM_NPU_ASYNC_PIPELINE
+            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+        )
+
+        if not enable_preencoding:
+            return
+
+        # Initialize thread pool if not already done
+        if not hasattr(self, "_vision_preencoding_pool"):
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._vision_preencoding_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vision_preenc"
+            )
+            logger.info_once(
+                "[NPU Pre-encoding] Vision pre-encoding thread pool initialized"
+            )
+
+        from datetime import datetime
+
+        from vllm.v1.engine.core import _VISION_PREENCODING_CACHE
+
+        # Build a mapping of req_id -> mm_features from scheduled_new_reqs
+        req_id_to_mm_features = {}
+        for new_req in scheduler_output.scheduled_new_reqs:
+            if new_req.mm_features:
+                req_id_to_mm_features[new_req.req_id] = new_req.mm_features
+
+        # Start encoding for scheduled requests
+        if scheduler_output.scheduled_encoder_inputs:
+            scheduled_req_ids = list(scheduler_output.scheduled_encoder_inputs.keys())
+            logger.debug(
+                "[NPU Pre-encoding] Scheduled encoder inputs for: %s",
+                scheduled_req_ids,
+            )
+            # scheduled_encoder_inputs is a dict: {req_id: [encoder_input_ids]}
+            for (
+                req_id,
+                encoder_input_ids,
+            ) in scheduler_output.scheduled_encoder_inputs.items():
+                # Skip if already encoding OR already encoded
+                if req_id in _VISION_PREENCODING_CACHE:
+                    cached_value = _VISION_PREENCODING_CACHE[req_id]
+                    if cached_value == "COMPLETED":
+                        # Already encoded, skip
+                        logger.debug(
+                            "[NPU Pre-encoding] SCHEDULED Request %s: SKIP - completed",
+                            req_id,
+                        )
+                        continue
+                    else:
+                        # Future object - already in progress, skip
+                        logger.debug(
+                            "[NPU Pre-encoding] SCHEDULED Request %s: SKIP - in prog",
+                            req_id,
+                        )
+                        continue
+
+                # Get mm_features for this request from scheduled_new_reqs
+                if req_id not in req_id_to_mm_features:
+                    # This shouldn't happen, but skip if no mm_features found
+                    logger.warning(
+                        "[NPU Pre-encoding] Request %s: No mm_features found",
+                        req_id,
+                    )
+                    continue
+
+                mm_features = req_id_to_mm_features[req_id]
+
+                logger.debug(
+                    "[NPU Pre-encoding] SCHEDULED Request %s: Submitting at %s",
+                    req_id,
+                    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                )
+
+                # Submit to background thread
+                # Pass encoder_input_ids and mm_features directly
+                future = self._vision_preencoding_pool.submit(
+                    self._encode_single_request_vision,
+                    req_id,
+                    encoder_input_ids,
+                    mm_features,
+                )
+
+                _VISION_PREENCODING_CACHE[req_id] = future
+
+        # Start encoding for IMMEDIATE requests (highest priority)
+        immediate_keys = [
+            k for k in _VISION_PREENCODING_CACHE if k.startswith("immediate_")
+        ]
+        for immediate_key in immediate_keys:
+            request = _VISION_PREENCODING_CACHE[immediate_key]
+            req_id = immediate_key.replace("immediate_", "")
+
+            # Check if not already processing or completed
+            if req_id in _VISION_PREENCODING_CACHE:
+                cached_value = _VISION_PREENCODING_CACHE[req_id]
+                if cached_value == "COMPLETED":
+                    logger.debug(
+                        "[NPU Pre-encoding] IMMEDIATE Request %s: SKIPPING - completed",
+                        req_id,
+                    )
+                    del _VISION_PREENCODING_CACHE[immediate_key]
+                    continue
+                # Already started (Future object), remove the immediate marker
+                logger.debug(
+                    "[NPU Pre-encoding] IMMEDIATE Request %s: SKIPPING - in progress",
+                    req_id,
+                )
+                del _VISION_PREENCODING_CACHE[immediate_key]
+                continue
+
+            # Extract encoder_input_ids
+            encoder_input_ids = list(range(len(request.mm_features)))
+
+            logger.debug(
+                "[NPU Pre-encoding] IMMEDIATE Request %s: Submitting at %s",
+                req_id,
+                datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            )
+
+            # Submit to background thread
+            future = self._vision_preencoding_pool.submit(
+                self._encode_single_request_vision,
+                req_id,
+                encoder_input_ids,
+                request.mm_features,
+            )
+
+            _VISION_PREENCODING_CACHE[req_id] = future
+            # Clean up the immediate marker
+            del _VISION_PREENCODING_CACHE[immediate_key]
+
+        # Start encoding for WAITING requests (for pipelining)
+        # Check if EngineCore marked any waiting requests
+        waiting_keys = [
+            k for k in _VISION_PREENCODING_CACHE if k.startswith("waiting_")
+        ]
+        for waiting_key in waiting_keys:
+            request = _VISION_PREENCODING_CACHE[waiting_key]
+            req_id = waiting_key.replace("waiting_", "")
+
+            # Check if not already processing or completed
+            if req_id in _VISION_PREENCODING_CACHE:
+                cached_value = _VISION_PREENCODING_CACHE[req_id]
+                if cached_value == "COMPLETED":
+                    logger.debug(
+                        "[NPU Pre-encoding] WAITING Request %s: SKIPPING - completed",
+                        req_id,
+                    )
+                    del _VISION_PREENCODING_CACHE[waiting_key]
+                    continue
+                # Already in progress (Future object)
+                logger.debug(
+                    "[NPU Pre-encoding] WAITING Request %s: SKIPPING - in progress",
+                    req_id,
+                )
+                del _VISION_PREENCODING_CACHE[waiting_key]
+                continue
+
+            # Extract encoder_input_ids (typically [0] for first vision input)
+            encoder_input_ids = list(range(len(request.mm_features)))
+
+            logger.debug(
+                "[NPU Pre-encoding] WAITING Request %s: Submitting at %s",
+                req_id,
+                datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            )
+
+            # Submit to background thread
+            future = self._vision_preencoding_pool.submit(
+                self._encode_single_request_vision,
+                req_id,
+                encoder_input_ids,
+                request.mm_features,
+            )
+
+            _VISION_PREENCODING_CACHE[req_id] = future
+            # Clean up the waiting marker
+            del _VISION_PREENCODING_CACHE[waiting_key]
+
+    def _encode_single_request_vision(
+        self, req_id: str, encoder_input_ids: list[int], mm_features: list
+    ):
+        """Encode vision for a single request in background thread.
+
+        Args:
+            req_id: Request ID
+            encoder_input_ids: List of multimodal input indices for this request
+            mm_features: List of MultiModalFeatureSpec from scheduler_output
+
+        Returns:
+            List of encoded vision embeddings (one per encoder_input_id)
+        """
+        from datetime import datetime
+
+        logger.debug(
+            "[NPU Pre-encoding] Request %s: Vision encoding STARTED at %s",
+            req_id,
+            datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        )
+
+        try:
+            # Extract mm_kwargs for the encoder_input_ids
+            # This mirrors what _batch_mm_inputs_from_scheduler() does
+            mm_kwargs_list = []
+            for mm_input_id in encoder_input_ids:
+                mm_feature = mm_features[mm_input_id]
+                if mm_feature.data is not None:
+                    mm_kwargs_list.append((mm_feature.modality, mm_feature.data))
+
+            if not mm_kwargs_list:
+                logger.warning(
+                    "[NPU Pre-encoding] Request %s: No valid multimodal data found",
+                    req_id,
+                )
+                return []
+
+            # Batch the multimodal kwargs using the same logic as _execute_mm_encoder
+            from vllm.multimodal.utils import group_and_batch_mm_kwargs
+
+            batches = list(
+                group_and_batch_mm_kwargs(
+                    mm_kwargs_list,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                )
+            )
+
+            # Use the model's vision encoder
+            model = cast(SupportsMultiModal, self.model)
+
+            # Process each batch (typically just one batch for single request)
+            encoder_outputs: list[torch.Tensor] = []
+            for modality, num_items, mm_kwargs_batch in batches:
+                # Call embed_multimodal with properly batched inputs
+                batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+                encoder_outputs.extend(batch_outputs)
+
+            logger.debug(
+                "[NPU Pre-encoding] Request %s: Vision COMPLETED at %s (%d embeddings)",
+                req_id,
+                datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                len(encoder_outputs),
+            )
+
+            return encoder_outputs
+        except Exception as e:
+            logger.exception(
+                "[NPU Pre-encoding] Request %s: Vision encoding FAILED: %s", req_id, e
+            )
+            raise
+
     def _execute_mm_encoder(
         self, scheduler_output: "SchedulerOutput"
     ) -> list[torch.Tensor]:
@@ -2744,6 +3063,184 @@ class GPUModelRunner(
 
         if not mm_kwargs:
             return []
+
+        # Log which requests are being encoded
+        from datetime import datetime
+
+        req_ids = (
+            list(scheduler_output.scheduled_encoder_inputs.keys())
+            if scheduler_output.scheduled_encoder_inputs
+            else []
+        )
+        logger.debug(
+            "[NPU Pre-encoding] _execute_mm_encoder called at %s for requests: %s",
+            datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            req_ids,
+        )
+
+        # Check for pre-encoded vision embeddings from background thread
+        enable_preencoding = (
+            envs.VLLM_NPU_ASYNC_PIPELINE
+            and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+        )
+
+        if enable_preencoding:
+            # Import global cache
+            from vllm.v1.engine.core import _VISION_PREENCODING_CACHE
+
+            # Try to get pre-encoded embeddings for this batch
+            # scheduled_encoder_inputs is a dict: {req_id: [encoder_input_ids]}
+            req_ids = list(scheduler_output.scheduled_encoder_inputs.keys())
+
+            # Split requests into pre-encoded and non-pre-encoded
+            preencoded_req_ids = []
+            non_preencoded_req_ids = []
+
+            for req_id in req_ids:
+                if req_id in _VISION_PREENCODING_CACHE:
+                    cached_value = _VISION_PREENCODING_CACHE[req_id]
+                    if cached_value == "COMPLETED":
+                        # Already completed - this shouldn't happen but log it
+                        logger.warning(
+                            "[NPU Pre-encoding] Request %s: COMPLETED but re-encoding",
+                            req_id,
+                        )
+                        non_preencoded_req_ids.append(req_id)
+                    else:
+                        # Future object - pre-encoding in progress or completed
+                        preencoded_req_ids.append(req_id)
+                else:
+                    non_preencoded_req_ids.append(req_id)
+
+            # Process pre-encoded requests first
+            preencoded_outputs = []
+            preencoded_hashes = []
+
+            # Check which requests have vision ready
+            ready_req_ids = []
+            not_ready_req_ids = []
+
+            for req_id in preencoded_req_ids:
+                future = _VISION_PREENCODING_CACHE[req_id]
+
+                from datetime import datetime
+
+                # Check if vision encoding is complete (non-blocking)
+                if not future.done():
+                    # Vision still in progress
+                    logger.debug(
+                        "[NPU Pre-encoding] Request %s: Vision NOT ready yet at %s",
+                        req_id,
+                        datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    )
+                    not_ready_req_ids.append(req_id)
+                else:
+                    ready_req_ids.append(req_id)
+
+            # Process ready requests
+            for req_id in ready_req_ids:
+                future = _VISION_PREENCODING_CACHE[req_id]
+
+                from datetime import datetime
+
+                logger.debug(
+                    "[NPU Pre-encoding] Request %s: Vision ready, getting result at %s",
+                    req_id,
+                    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                )
+
+                # Vision is complete, get result (won't block)
+                embeddings_list = future.result()
+
+                logger.debug(
+                    "[NPU Pre-encoding] Request %s: Got vision at %s (%d embeddings)",
+                    req_id,
+                    datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                    len(embeddings_list),
+                )
+
+                # Find corresponding mm_hash for this request
+                req_idx = req_ids.index(req_id)
+                preencoded_hashes.append(mm_hashes[req_idx])
+                preencoded_outputs.extend(embeddings_list)
+
+                # Replace the Future with completion marker (prevents re-encoding)
+                _VISION_PREENCODING_CACHE[req_id] = "COMPLETED"
+                logger.debug(
+                    "[NPU Pre-encoding] Request %s: Marked as COMPLETED in cache",
+                    req_id,
+                )
+
+            # For not-ready requests in hybrid pipelining mode: mark in cache
+            # Allows the scheduler to move on while NPU processes this request
+            if not_ready_req_ids:
+                enable_hybrid_pipeline = (
+                    envs.VLLM_NPU_ASYNC_PIPELINE
+                    and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+                )
+                if enable_hybrid_pipeline:
+                    logger.debug(
+                        "[NPU Pre-encoding] %d requests NOT ready, marking: %s",
+                        len(not_ready_req_ids),
+                        not_ready_req_ids,
+                    )
+                    # Mark these requests' mm_hashes as NOT_READY in encoder cache
+                    # This prevents _gather_mm_embeddings from asserting
+                    for req_id in not_ready_req_ids:
+                        req_idx = req_ids.index(req_id)
+                        self.encoder_cache[mm_hashes[req_idx]] = "NOT_READY"
+                    # Don't add to non_preencoded - skip synchronous encoding
+                else:
+                    # Legacy behavior: block until vision completes
+                    logger.warning(
+                        "[NPU Pre-encoding] %d requests not ready, will BLOCK: %s",
+                        len(not_ready_req_ids),
+                        not_ready_req_ids,
+                    )
+                    non_preencoded_req_ids.extend(not_ready_req_ids)
+
+            # Cache pre-encoded embeddings
+            if preencoded_outputs:
+                logger.debug(
+                    "[NPU Pre-encoding] Using pre-encoded: %d embeddings, %d reqs",
+                    len(preencoded_outputs),
+                    len(preencoded_req_ids),
+                )
+                for mm_hash, output in zip(preencoded_hashes, preencoded_outputs):
+                    self.encoder_cache[mm_hash] = output
+                    logger.debug("Using pre-encoded vision for mm hash %s", mm_hash)
+                    self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+            # If ALL requests were pre-encoded, return early
+            if not non_preencoded_req_ids:
+                return preencoded_outputs
+
+            # Otherwise, we need to process non-pre-encoded requests below
+            # Filter mm_kwargs and mm_hashes to only include non-pre-encoded requests
+            logger.debug(
+                "[NPU Pre-encoding] %d requests need synchronous encoding",
+                len(non_preencoded_req_ids),
+            )
+
+            # Rebuild mm_kwargs and mm_hashes for only non-pre-encoded requests
+            non_preencoded_mm_kwargs = []
+            non_preencoded_mm_hashes = []
+            non_preencoded_mm_lora_refs = []
+
+            for req_id in non_preencoded_req_ids:
+                req_idx = req_ids.index(req_id)
+                non_preencoded_mm_kwargs.append(mm_kwargs[req_idx])
+                non_preencoded_mm_hashes.append(mm_hashes[req_idx])
+                # mm_lora_refs needs to be filtered carefully
+                # It's a list of tuples (req_id, pos_info), filter by req_id
+                for lora_ref in mm_lora_refs:
+                    if lora_ref[0] == req_id:
+                        non_preencoded_mm_lora_refs.append(lora_ref)
+
+            # Update variables for the rest of the function
+            mm_kwargs = non_preencoded_mm_kwargs
+            mm_hashes = non_preencoded_mm_hashes
+            mm_lora_refs = non_preencoded_mm_lora_refs
 
         should_time = bool(
             self.observability_config
@@ -2829,14 +3326,135 @@ class GPUModelRunner(
                     connector_mapping,
                 )
 
+        # Check if NPU backend and parallel processing enabled
+        using_npu = envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+        enable_parallel = using_npu and envs.VLLM_NPU_ASYNC_PIPELINE
+
+        # Collect all batches from the generator first
+        batches = list(
+            group_and_batch_mm_kwargs(
+                mm_kwargs,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
+        )
+
+        # DEBUG: Log batch count
+        if envs.VLLM_NPU_TIMING:
+            import threading
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            logger.info(
+                "[GPU Model Runner] %s T-%d: npu=%s, par=%s, batches=%d, kwargs=%d",
+                timestamp,
+                threading.get_ident(),
+                using_npu,
+                enable_parallel,
+                len(batches),
+                len(mm_kwargs),
+            )
+
         encoder_outputs: list[torch.Tensor] = []
+
+        # NPU parallel processing path
+        if enable_parallel and len(batches) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            if envs.VLLM_NPU_TIMING:
+                import threading
+                from datetime import datetime
+
+                timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                logger.info(
+                    "[GPU Model Runner] %s Thread-%d: %d batches PARALLEL",
+                    timestamp,
+                    threading.get_ident(),
+                    len(batches),
+                )
+
+            def process_batch_item(batch_info):
+                modality, num_items, mm_kwargs_batch = batch_info
+                if envs.VLLM_NPU_TIMING:
+                    import threading
+                    from datetime import datetime
+
+                    start = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    logger.info(
+                        "[GPU Model Runner] %s Thread-%d: Starting %s (items=%d)",
+                        start,
+                        threading.get_ident(),
+                        modality,
+                        num_items,
+                    )
+
+                # Call embed_multimodal for this batch
+                batch_outputs = model.embed_multimodal(**mm_kwargs_batch)
+                sanity_check_mm_encoder_outputs(
+                    batch_outputs, expected_num_items=num_items
+                )
+
+                if envs.VLLM_NPU_TIMING:
+                    import threading
+                    from datetime import datetime
+
+                    end = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    logger.info(
+                        "[GPU Model Runner] %s Thread-%d: Finished batch for %s",
+                        end,
+                        threading.get_ident(),
+                        modality,
+                    )
+
+                return batch_outputs
+
+            # Process all batches in parallel
+            with ThreadPoolExecutor(
+                max_workers=len(batches), thread_name_prefix="vision_parallel"
+            ) as executor:
+                futures = [
+                    executor.submit(process_batch_item, batch) for batch in batches
+                ]
+                batch_results = [f.result() for f in futures]
+
+            # Flatten results
+            for outputs in batch_results:
+                encoder_outputs.extend(outputs)
+
+            # Cache the encoder outputs by mm_hash
+            for mm_hash, output in zip(mm_hashes, encoder_outputs):
+                self.encoder_cache[mm_hash] = output
+                logger.debug("Finish execute for mm hash %s", mm_hash)
+                self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
+
+            if envs.VLLM_NPU_TIMING:
+                from datetime import datetime
+
+                timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                logger.info(
+                    "[GPU Model Runner] %s: All %d batches completed in parallel",
+                    timestamp,
+                    len(batches),
+                )
+
+            return encoder_outputs
+
+        # Standard sequential path (GPU or single batch or parallel disabled)
+        if envs.VLLM_NPU_TIMING and batches:
+            import threading
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            logger.info(
+                "[GPU Model Runner] %s Thread-%d: Processing %d batches SEQUENTIALLY",
+                timestamp,
+                threading.get_ident(),
+                len(batches),
+            )
+
         # Track the current index in mm_kwargs/mm_lora_refs to map groups to request IDs
         current_item_idx = 0
-        for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
-            mm_kwargs,
-            device=self.device,
-            pin_memory=self.pin_memory,
-        ):
+        for modality, num_items, mm_kwargs_batch in batches:
             batch_outputs: MultiModalEmbeddings
 
             # EVS and dynamic res video related change.
@@ -2917,6 +3535,37 @@ class GPUModelRunner(
             logger.debug("Finish execute for mm hash %s", mm_hash)
             self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
+        # Combine pre-encoded outputs (if any) with synchronously encoded outputs
+        if (
+            enable_preencoding
+            and "preencoded_outputs" in locals()
+            and preencoded_outputs
+        ):
+            # Merge the two lists in correct order based on original req_ids
+            all_req_ids = list(scheduler_output.scheduled_encoder_inputs.keys())
+            combined_outputs = []
+
+            preencoded_idx = 0
+            sync_idx = 0
+
+            for req_id in all_req_ids:
+                if req_id in preencoded_req_ids:
+                    # This request was pre-encoded
+                    combined_outputs.append(preencoded_outputs[preencoded_idx])
+                    preencoded_idx += 1
+                else:
+                    # This request was synchronously encoded
+                    combined_outputs.append(encoder_outputs[sync_idx])
+                    sync_idx += 1
+
+            logger.debug(
+                "[NPU Pre-encoding] Combined %d pre-encoded + %d sync = %d total",
+                len(preencoded_outputs),
+                len(encoder_outputs),
+                len(combined_outputs),
+            )
+            return combined_outputs
+
         return encoder_outputs
 
     def _gather_mm_embeddings(
@@ -2975,6 +3624,19 @@ class GPUModelRunner(
 
                 mm_hash = mm_feature.identifier
                 encoder_output = self.encoder_cache.get(mm_hash, None)
+
+                # Check if vision encoding is still in progress (hybrid pipelining mode)
+                if encoder_output == "NOT_READY":
+                    enable_hybrid_pipeline = (
+                        envs.VLLM_NPU_ASYNC_PIPELINE
+                        and envs.VLLM_VISION_NPU_BACKEND.lower() == "flexmlrt"
+                    )
+                    if enable_hybrid_pipeline:
+                        # Raise exception to signal execute_model should skip request
+                        raise VisionNotReadyError(
+                            f"Vision not ready for req {req_id}, mm_hash {mm_hash}"
+                        )
+
                 assert encoder_output is not None, f"Encoder cache miss for {mm_hash}."
 
                 if (is_embed := pos_info.is_embed) is not None:
@@ -3236,12 +3898,21 @@ class GPUModelRunner(
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
             # Run the multimodal encoder if any.
-            with self.maybe_get_ec_connector_output(
-                scheduler_output,
-                encoder_cache=self.encoder_cache,
-            ) as ec_connector_output:
-                self._execute_mm_encoder(scheduler_output)
-                mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+            try:
+                with self.maybe_get_ec_connector_output(
+                    scheduler_output,
+                    encoder_cache=self.encoder_cache,
+                ) as ec_connector_output:
+                    self._execute_mm_encoder(scheduler_output)
+                    mm_embeds, is_mm_embed = self._gather_mm_embeddings(
+                        scheduler_output
+                    )
+            except VisionNotReadyError as e:
+                # Vision not ready - return None to signal scheduler to skip step
+                logger.debug(
+                    "[Hybrid Pipelining] Vision not ready: %s - returning None", e
+                )
+                return None, None, None, None, {}, None
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
@@ -3830,6 +4501,9 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        # Start vision pre-encoding in background for any new encoder inputs
+        self._start_vision_preencoding(scheduler_output)
+
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4040,6 +4714,17 @@ class GPUModelRunner(
                 )
             )
 
+            preprocess_result = self._preprocess(
+                scheduler_output, num_tokens_padded, intermediate_tensors
+            )
+
+            # Check if vision encoding was not ready (hybrid pipelining mode)
+            if preprocess_result == (None, None, None, None, {}, None):
+                logger.info(
+                    "[Hybrid Pipelining] Vision not ready, returning EMPTY_OUTPUT"
+                )
+                return EMPTY_MODEL_RUNNER_OUTPUT
+
             (
                 input_ids,
                 inputs_embeds,
@@ -4047,9 +4732,7 @@ class GPUModelRunner(
                 intermediate_tensors,
                 model_kwargs,
                 ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
-            )
+            ) = preprocess_result
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible

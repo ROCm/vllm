@@ -132,6 +132,17 @@ class UniProcExecutor(Executor):
         # it's running.
         return
 
+    def submit_vision_encoding(self, req_id, mm_features):
+        """Submit vision encoding for a waiting request to enable pipelining.
+
+        This is called by the Vision Scheduler to proactively start vision processing
+        for requests that are waiting in the queue (not yet scheduled for LLM).
+        """
+        # Direct call to model_runner for UniProcExecutor (no RPC needed)
+        if hasattr(self.driver_worker, "model_runner"):
+            self.driver_worker.model_runner.submit_vision_encoding(req_id, mm_features)
+        return None
+
     def shutdown(self) -> None:
         if worker := self.driver_worker:
             worker.shutdown()
