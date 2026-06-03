@@ -1,15 +1,15 @@
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=registry-sc-harbor.amd.com/framework/therock-npi:pytorch-2.11.0-rocm7.14.0a20260603-7.14.0a20260603-nightly-ubuntu24.04-gfx1250
 ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
-ARG AITER_BRANCH="v0.1.13.post1"
+ARG AITER_BRANCH="main"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG MORI_BRANCH="v1.1.0"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 
 # vLLM build settings (merged from Dockerfile.rocm)
 ARG COMMON_WORKDIR=/app
-ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_BRANCH="main"
+ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
+ARG VLLM_BRANCH="455_wip"
 # NIC backend for MoRI RDMA support: all | ainic | bnxt | none
 ARG NIC_BACKEND=all
 ARG AINIC_VERSION=1.117.3-hydra
@@ -24,6 +24,11 @@ FROM ${BASE_IMAGE} AS base
 ENV PYTORCH_ROCM_ARCH=gfx1250
 ENV AITER_ROCM_ARCH=gfx1250
 ENV MORI_GPU_ARCHS=gfx1250
+
+# Make HIP's CMake package discoverable for raw find_package(hip) builds (e.g. MoRI).
+# hip-config.cmake lives at ${ROCM_PATH}/lib/cmake/hip in the TheRock SDK base image.
+ENV CMAKE_PREFIX_PATH=${ROCM_PATH}:${ROCM_PATH}/lib/cmake:${CMAKE_PREFIX_PATH}
+ENV HIP_PATH=${ROCM_PATH}
 
 # Required for RCCL in ROCm7.1
 ENV HSA_NO_SCRATCH_RECLAIM=1
@@ -52,7 +57,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     && python3 --version && python3 -m pip --version
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
-        sudo vim less libgfortran5 libopenmpi-dev libpci-dev \
+        sudo vim less libgfortran5 libopenmpi-dev libpci-dev libnuma-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
@@ -122,38 +127,43 @@ RUN mkdir -p /app/install && cp ${ROCM_PATH}/share/amd_smi/dist/*.whl /app/insta
 #     && cp /app/audio/dist/*.whl /app/install
 
 
+### MORI Build (SKIPPED)
+### MoRI's gfx1250 support is still under development upstream, so the C++
+### wheel build is disabled for now. Re-enable this stage (and its use in the
+### `debs` stage below) once gfx1250 is supported.
 ###
-### MORI Build
-###
-FROM base AS build_mori
-ARG MORI_BRANCH
-ARG MORI_REPO
-# torch is already provided by the base image (build_pytorch stage is disabled)
-# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-#     pip install /install/*.whl
-RUN git clone ${MORI_REPO}
-RUN cd mori \
-    && git checkout ${MORI_BRANCH} \
-    && git submodule update --init --recursive \
-    && python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl
-RUN mkdir -p /app/install && cp /app/mori/dist/*.whl /app/install
+# FROM base AS build_mori
+# ARG MORI_BRANCH
+# ARG MORI_REPO
+# RUN git clone ${MORI_REPO}
+# # The TheRock SDK's hsakmt-config.cmake links numa::numa but leaves its
+# # find_dependency commented out, so the imported target is never created.
+# # Pull in the SDK's own bundled NUMA package config so numa::numa exists
+# # before find_package(hip) (which transitively includes hsakmt) runs.
+# RUN cd mori \
+#     && git checkout ${MORI_BRANCH} \
+#     && git submodule update --init --recursive \
+#     && sed -i "1i include(\"$ROCM_PATH/lib/rocm_sysdeps/lib/cmake/NUMA/numa-config.cmake\")" CMakeLists.txt \
+#     && python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl
+# RUN mkdir -p /app/install && cp /app/mori/dist/*.whl /app/install
 
 
 ###
 ### FlashAttention Build
 ###
-FROM base AS build_fa
-ARG FA_BRANCH
-ARG FA_REPO
-# torch is already provided by the base image (build_pytorch stage is disabled)
-# RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-#     pip install /install/*.whl
-RUN git clone ${FA_REPO}
-RUN cd flash-attention \
-    && git checkout ${FA_BRANCH} \
-    && git submodule update --init \
-    && GPU_ARCHS=gfx1250 python3 setup.py bdist_wheel --dist-dir=dist
-RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
+# AssertionError: One of GPU archs of ['gfx1250'] is invalid or not supported by Flash-Attention
+# FROM base AS build_fa
+# ARG FA_BRANCH
+# ARG FA_REPO
+# # torch is already provided by the base image (build_pytorch stage is disabled)
+# # RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
+# #     pip install /install/*.whl
+# RUN git clone ${FA_REPO}
+# RUN cd flash-attention \
+#     && git checkout ${FA_BRANCH} \
+#     && git submodule update --init \
+#     && GPU_ARCHS=gfx1250 python3 setup.py bdist_wheel --dist-dir=dist
+# RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 
 
 ###
@@ -187,8 +197,8 @@ FROM base AS debs_wheel_release
 RUN mkdir /app/debs
 # RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+# RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
+#     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 # RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
@@ -201,16 +211,17 @@ FROM base AS debs
 RUN mkdir /app/debs
 # RUN --mount=type=bind,from=build_triton,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+# RUN --mount=type=bind,from=build_fa,src=/app/install/,target=/install \
+#     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_amdsmi,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
 # RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
 #     cp /install/*.whl /app/debs
 RUN --mount=type=bind,from=build_aiter,src=/app/install/,target=/install \
     cp /install/*.whl /app/debs
-RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
-    cp /install/*.whl /app/debs
+# MoRI build skipped (gfx1250 support under development)
+# RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
+#     cp /install/*.whl /app/debs
 
 FROM base AS final
 RUN --mount=type=bind,from=debs,src=/app/debs,target=/install \
