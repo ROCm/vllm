@@ -3,15 +3,19 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # --- ROCm + PyTorch versioning (override any of these at build time) -------
 ARG GFX_ARCH=gfx1250
-ARG ROCM_VERSION=7.14.0a20260603
-ARG TORCH_VERSION=2.11.0
-ARG PYTHON_TAG=cp312
+ARG ROCM_VERSION=7.14.0a20260604
+ARG ROCM_BUILD=a0
+ARG TORCH_VERSION=2.10.0
 ARG ROCM_WHEEL_INDEX=https://rocm.genesis.amd.com/whl/gfx1250/
-
 ARG VLLM_REPO="https://github.com/ROCm/vllm.git"
 ARG VLLM_BRANCH="455_wip"
-
 ARG AITER_BRANCH="jpvillam/gfx1250_0604"
+
+ENV VLLM_TARGET_DEVICE=rocm
+ENV PYTORCH_ROCM_ARCH=${GFX_ARCH}
+ENV CMAKE_BUILD_TYPE=Release
+ENV GPU_TARGET=${GFX_ARCH}
+ENV VIRTUAL_ENV=/opt/venv
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -23,7 +27,6 @@ RUN apt-get update && \
 
 SHELL ["/bin/bash", "-e", "-u", "-o", "pipefail", "-c"]
 
-ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv "${VIRTUAL_ENV}" && \
     "${VIRTUAL_ENV}/bin/python" -m pip install --upgrade pip setuptools PyYAML
 ENV PATH=${VIRTUAL_ENV}/bin:$PATH
@@ -42,8 +45,8 @@ ENV HSA_ENABLE_INTERRUPT=0
 
 # Install the TheRock PyTorch wheel and the matching rocm-sdk wheels into the venv
 RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
-        "torch==${TORCH_VERSION}+rocm${ROCM_VERSION}" \
-        "rocm[libraries,devel]==${ROCM_VERSION}" && \
+        "torch==${TORCH_VERSION}+rocm${ROCM_VERSION}${ROCM_BUILD:+.${ROCM_BUILD}}" \
+        "rocm[libraries,devel]==${ROCM_VERSION}${ROCM_BUILD:++${ROCM_BUILD}}" && \
     rocm-sdk init
 
 RUN pip install \
@@ -97,12 +100,6 @@ RUN git clone "${VLLM_REPO}" /app/vllm \
     && cd /app/vllm \
     && git fetch -v --prune -- origin "${VLLM_BRANCH}" \
     && git checkout FETCH_HEAD
-
-ENV VLLM_TARGET_DEVICE=rocm \
-    PYTORCH_ROCM_ARCH=gfx1250 \
-    ROCM_HOME=${ROCM_PATH} \
-    CMAKE_BUILD_TYPE=Release \
-    GPU_TARGET=gfx1250
 
 # Compile the C++/HIP extensions (_C, _rocm_C) for gfx1250 and editable-install.
 # MAX_JOBS is a build-arg so it can be tuned per machine (docker build --build-arg).
