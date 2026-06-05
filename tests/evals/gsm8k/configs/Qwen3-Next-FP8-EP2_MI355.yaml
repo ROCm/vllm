@@ -7,3 +7,4 @@ server_args: >-
   --tensor-parallel-size 2
   --enable-expert-parallel
   --async-scheduling
+  --compilation-config '{"pass_config":{"fuse_norm_quant":false}}'
