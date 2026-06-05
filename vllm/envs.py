@@ -111,7 +111,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
-    VLLM_ROCM_USE_AITER: bool = False
+    VLLM_ROCM_USE_AITER: bool = True
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -1095,7 +1095,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
     "VLLM_ROCM_USE_AITER": lambda: (
-        os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
+        os.getenv("VLLM_ROCM_USE_AITER", "True").lower() in ("true", "1")
     ),
     # Whether to use aiter paged attention.
     # By default is disabled.
