@@ -1,8 +1,8 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base
-ARG CI_BASE_IMAGE=rocm/vllm-dev:ci_base
+ARG BASE_IMAGE=rocm/vllm-dev:vllm-base-ubuntu24.04-py3.14-nightlies-device-all-rocm7.14.0a20260531-ad7125a43
+ARG CI_BASE_IMAGE=ci_base
 # NIC backend for MoRI RDMA support.
 # By default (all), drivers and userspace libraries for all supported NIC types
 # (ainic and bnxt) are installed; MoRI selects the appropriate one at runtime.
@@ -10,12 +10,12 @@ ARG CI_BASE_IMAGE=rocm/vllm-dev:ci_base
 #   --build-arg NIC_BACKEND=ainic   # AMD AINIC (Pensando) only
 #   --build-arg NIC_BACKEND=bnxt    # Broadcom Thor-2 only
 #   --build-arg NIC_BACKEND=none    # Install nothing.
-ARG NIC_BACKEND=all
+ARG NIC_BACKEND=none
 # AMD AINIC apt repo settings
 # Users can specify a custom version compatible with their host drivers.
 # The default version has been tested with ioinic-dkms=25.11.1.001
 ARG AINIC_VERSION=1.117.3-hydra
-ARG UBUNTU_CODENAME=jammy
+ARG UBUNTU_CODENAME=noble
 
 # Sccache configuration. Release builds use this today; CI can opt in when a
 # shared S3-compatible cache backend is available.
@@ -30,6 +30,9 @@ FROM ${BASE_IMAGE} AS base
 
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
+# AITER_META reads GPU_ARCHS at runtime. CI clears PYTORCH_ROCM_ARCH before
+# running tests, so keep AITER's supported arch list available separately.
+ENV GPU_ARCHS=${GPU_ARCHS:-gfx942;gfx950}
 
 # Install build dependencies and utilities
 RUN apt-get update -q -y && apt-get install -q -y \
@@ -230,6 +233,7 @@ COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/requirements /requirements
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/benchmarks /benchmarks
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/tests /tests
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/examples /examples
+COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/tools/install_torchcodec_rocm.sh /tools/install_torchcodec_rocm.sh
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/docker/Dockerfile.rocm /docker/
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/.buildkite /.buildkite
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/pyproject.toml /pyproject.toml
@@ -241,17 +245,13 @@ ARG RIXL_BRANCH="39be1de8"
 ARG RIXL_REPO="https://github.com/ROCm/RIXL.git"
 ARG UCX_BRANCH="bfb51733"
 ARG UCX_REPO="https://github.com/openucx/ucx.git"
-ENV ROCM_PATH=/opt/rocm
 ENV UCX_HOME=/usr/local/ucx
 ENV RIXL_HOME=/usr/local/rixl
 ENV RIXL_BENCH_HOME=/usr/local/rixl_bench
 
 # RIXL build system dependences and RDMA support
 RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
-    libgrpc-dev \
-    libgrpc++-dev \
     libprotobuf-dev \
-    protobuf-compiler-grpc \
     libcpprest-dev \
     libaio-dev \
     librdmacm1 \
@@ -310,8 +310,10 @@ RUN cd /opt/rixl && \
     sed -i "s/--exclude 'libamdhip64\*'/--exclude 'libamdhip64*' --exclude 'libcore*' --exclude 'libpull*'/" \
         contrib/build-wheel.sh && \
     mkdir -p /app/install && \
+    RIXL_PYTHON_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" && \
     _ucx_install_dir=${UCX_HOME} \
     ./contrib/build-wheel.sh \
+        --python-version ${RIXL_PYTHON_VERSION} \
         --output-dir /app/install \
         --rocm-dir ${ROCM_PATH} \
         --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
@@ -325,7 +327,6 @@ ARG ROCSHMEM_REPO="https://github.com/ROCm/rocm-systems.git"
 # DeepEP only supports gfx942 and gfx950; build ROCShmem for the same set so
 # it can be linked against DeepEP without arch mismatches.
 ARG DEEPEP_ROCM_ARCH="gfx942;gfx950"
-ENV ROCM_PATH=/opt/rocm
 ENV ROCSHMEM_DIR=/opt/rocshmem
 
 RUN --mount=type=cache,target=/root/.cache/ccache \
@@ -513,6 +514,7 @@ COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/requirements /requir
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/benchmarks /benchmarks
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/tests /tests
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/examples /examples
+COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/tools/install_torchcodec_rocm.sh /tools/install_torchcodec_rocm.sh
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/docker/Dockerfile.rocm /docker/
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/.buildkite /.buildkite
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/pyproject.toml /pyproject.toml
