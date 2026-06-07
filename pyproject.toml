@@ -101,9 +101,6 @@ check_untyped_defs = true
 follow_imports = "silent"
 
 [tool.pytest.ini_options]
-filterwarnings = [
-    "ignore:Due to '_pack_'.*:DeprecationWarning:amdsmi\\.amdsmi_wrapper",
-]
 markers = [
     "slow_test",
     "skip_global_cleanup",
