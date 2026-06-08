@@ -13,6 +13,7 @@ weight copy. The triton kernel transposes tiles in-register.
 """
 
 from contextlib import nullcontext
+import os
 
 import torch
 
@@ -270,6 +271,27 @@ def _select_skinny_gfx11_config(M: int, N: int, K: int) -> tuple[int, int, int]:
         very wide (Gemma2B q/o, LLaMA8B q/o, Qwen3.5 GDN would lose 17-31% at
         BLOCK_M=128); shallow K=2560 at small N also prefers 64.
     """
+    forced_prefill_tile = os.getenv("VLLM_W4A16_PREFILL_TILE") or os.getenv(
+        "VLLM_W4A16_671_TILE"
+    )
+    if forced_prefill_tile:
+        parts = [p.strip() for p in forced_prefill_tile.split(",")]
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            return int(parts[0]), int(parts[1]), int(parts[2])
+
+    # Profile-guided default for Qwen3-VL-like single-request multimodal prefill
+    # in the common token-length band around the current workload.
+    # Keep this limited to recurring Qwen3 projection shapes to reduce risk for
+    # unrelated models while preserving the measured TTFT win.
+    qwen3_prefill_shapes = {
+        (19456, 2560),  # gate_up_proj-like
+        (2560, 9728),   # down_proj-like
+        (6144, 2560),   # qkv_proj-like
+        (2560, 4096),   # o_proj-like
+    }
+    if 576 <= M <= 832 and (N, K) in qwen3_prefill_shapes:
+        return 64, 256, 8
+
     block_n, num_warps = 256, 8
     block_m = 128 if ((K >= 3072 and K % 2048 != 0) or N >= 16384) else 64
     return block_m, block_n, num_warps
