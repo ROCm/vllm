@@ -893,6 +893,32 @@ def _apply_inv_rope_ref(
     return _apply_gptj_inv_rope_ref(x, positions, rotary_emb.cos_sin_cache, rope_dim)
 
 
+def dequant_wo_a_bf16(
+    wo_a: torch.nn.Module,
+    n_local_groups: int,
+    o_lora_rank: int,
+) -> torch.Tensor:
+    """Dequantize the grouped WO_A LoRA weight to BF16 [groups, rank, hidden].
+
+    The weight + (e8m0 block) scale are load-time constants, so this can be
+    computed ONCE at load and reused — avoiding the per-step e8m0 decode +
+    repeat_interleave + multiply inside rocm_inv_rope_einsum (mirrors ATOM,
+    which dequantizes wo_a to BF16 in process_weights_after_loading).
+    """
+    hidden_dim = wo_a.weight.shape[-1]
+    if getattr(wo_a, "weight_scale_inv", None) is not None:
+        w = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(torch.float32)
+        s = _expand_2d_block_scales(
+            wo_a.weight_scale_inv.view(
+                n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
+            ),
+            o_lora_rank,
+            hidden_dim,
+        )
+        return (w * s).to(torch.bfloat16)
+    return wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(torch.bfloat16)
+
+
 def rocm_inv_rope_einsum(
     rotary_emb: torch.nn.Module,
     o: torch.Tensor,
@@ -901,32 +927,22 @@ def rocm_inv_rope_einsum(
     n_local_groups: int,
     o_lora_rank: int,
     wo_a: torch.nn.Module,
+    wo_a_bf16: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Reference inverse-RoPE + WO_A einsum path used on ROCm."""
+    """Reference inverse-RoPE + WO_A einsum path used on ROCm.
+
+    wo_a_bf16: optional precomputed BF16 [groups, rank, hidden] weight (decoded
+    once at load). When provided, the per-step wo_a dequant is skipped.
+    """
     o_ref = _apply_inv_rope_ref(rotary_emb, o, positions, rope_head_dim).to(
         torch.bfloat16
     )
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
-    hidden_dim = o_ref.shape[-1]
-    if hasattr(wo_a, "weight_scale_inv"):
-        wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.float32
-        )
-        wo_a_scale = _expand_2d_block_scales(
-            wo_a.weight_scale_inv.view(
-                n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
-            ),
-            o_lora_rank,
-            hidden_dim,
-        )
-        wo_a_weight = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
-    else:
-        wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.bfloat16
-        )
+    if wo_a_bf16 is None:
+        wo_a_bf16 = dequant_wo_a_bf16(wo_a, n_local_groups, o_lora_rank)
 
-    return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+    return torch.einsum("tgd,grd->tgr", o_ref, wo_a_bf16)
 
 
 _DSV4_SPARSE_NOPE_DIM = 448
@@ -988,26 +1004,43 @@ def build_ragged_indices_from_dense(
     indices: torch.Tensor,
     lengths: torch.Tensor,
     num_rows: int = -1,
+    out_flat: torch.Tensor | None = None,
+    out_indptr: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # out_flat / out_indptr: optional persistent buffers to write into (decode
+    # path) instead of allocating fresh temporaries every step + a separate copy
+    # into graph buffers. out_indptr[0] must already be 0 (zeroed once at buffer
+    # creation); cumsum only writes [1:]. Returned views are sliced to the live
+    # size and bounded by indptr, matching _copy_ragged_to_graph_buffers' output.
     indices = indices.reshape(indices.shape[0], -1)
     lengths = lengths.to(device=indices.device, dtype=torch.int32).reshape(-1)
     assert lengths.numel() == indices.shape[0], (
         f"Expected one length per row, got {lengths.shape} for indices {indices.shape}"
     )
 
+    rows = indices.shape[0]
     max_width = indices.shape[1] if indices.ndim == 2 else 0
     lengths = lengths.clamp(min=0, max=max_width).contiguous()
 
-    indptr = torch.zeros(indices.shape[0] + 1, dtype=torch.int32, device=indices.device)
-    torch.cumsum(lengths, dim=0, out=indptr[1:])
+    if out_indptr is not None:
+        indptr = out_indptr[: rows + 1]
+        torch.cumsum(lengths, dim=0, out=indptr[1:])
+    else:
+        indptr = torch.zeros(rows + 1, dtype=torch.int32, device=indices.device)
+        torch.cumsum(lengths, dim=0, out=indptr[1:])
 
     if indices.numel() == 0:
-        flat = torch.empty(0, dtype=torch.int32, device=indices.device)
+        flat = (
+            out_flat[:0]
+            if out_flat is not None
+            else torch.empty(0, dtype=torch.int32, device=indices.device)
+        )
     else:
-        flat = torch.empty(
-            indices.shape[0] * max_width,
-            dtype=torch.int32,
-            device=indices.device,
+        n_flat = rows * max_width
+        flat = (
+            out_flat[:n_flat]
+            if out_flat is not None
+            else torch.empty(n_flat, dtype=torch.int32, device=indices.device)
         )
         if flat.numel() > 0:
             block_size = 128

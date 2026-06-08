@@ -24,7 +24,10 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_q_kv_rmsnorm,
 )
 from vllm.utils.deep_gemm import fp8_einsum
-from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    dequant_wo_a_bf16,
+    rocm_inv_rope_einsum,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -208,6 +211,10 @@ class DeepseekV4MLA(nn.Module):
 
         self.kv_norm = kv_norm
         self.wo_a = wo_a
+        # Precomputed BF16 wo_a weight for the ROCm inv-rope einsum path; decoded
+        # once at load by prepare_wo_a_dequant() so the per-step e8m0 dequant in
+        # rocm_inv_rope_einsum is skipped. None until prepared / on non-ROCm.
+        self._wo_a_bf16: torch.Tensor | None = None
 
         self._wo_a_act_quant = QuantFP8(
             static=False,
@@ -303,6 +310,16 @@ class DeepseekV4MLA(nn.Module):
                 k_cache_prefix=self.mla_attn.prefix,
             )
 
+    def prepare_wo_a_dequant(self) -> None:
+        """One-shot load-time dequant of wo_a -> BF16 for the ROCm inv-rope
+        einsum (skips the per-step e8m0 dequant). Called from the model's
+        load_weights pass; wo_a weight/scale are load-time constants."""
+        if not current_platform.is_rocm():
+            return
+        self._wo_a_bf16 = dequant_wo_a_bf16(
+            self.wo_a, self.n_local_groups, self.o_lora_rank
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -334,6 +351,7 @@ class DeepseekV4MLA(nn.Module):
                 self.n_local_groups,
                 self.o_lora_rank,
                 self.wo_a,
+                wo_a_bf16=self._wo_a_bf16,
             )
             return self.wo_b(z.flatten(1))
 

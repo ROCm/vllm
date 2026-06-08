@@ -347,6 +347,42 @@ def _rocm_aiter_biased_grouped_topk_fake(
     pass
 
 
+def _rocm_aiter_topk_gating_impl(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor | None = None,
+    need_renorm: bool = True,
+    routed_scaling_factor: float = 1.0,  # mul to topk_weights
+    score_func: str = "sqrtsoftplus",
+) -> None:
+    from aiter import topk_gating
+
+    # Fused score (sqrtsoftplus/sigmoid/softmax) + bias select + top-k + renorm
+    # + scale. Writes topk_weights/topk_ids in place.
+    topk_gating(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        correction_bias=correction_bias,
+        need_renorm=need_renorm,
+        routed_scaling_factor=routed_scaling_factor,
+        score_func=score_func,
+    )
+
+
+def _rocm_aiter_topk_gating_fake(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor | None = None,
+    need_renorm: bool = True,
+    routed_scaling_factor: float = 1.0,  # mul to topk_weights
+    score_func: str = "sqrtsoftplus",
+) -> None:
+    pass
+
+
 def _rocm_aiter_grouped_topk_impl(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -672,6 +708,32 @@ def _rocm_aiter_gemm_a8w8_blockscale_fake(
     m = A.shape[0]
     n = B.shape[0]
     Y = torch.empty(m, n, dtype=output_dtype, device=A.device)
+    return Y
+
+
+def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    from aiter import gemm_a8w8_blockscale_bpreshuffle
+
+    # B must already be weight-preshuffled (shuffle_weight, layout (16,16)) and
+    # As must be column-major (fused_clamp_act_mul transpose_scale=True).
+    return gemm_a8w8_blockscale_bpreshuffle(A, B, As, Bs, dtype=output_dtype)
+
+
+def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    # shuffle_weight preserves shape, so B is still [N, K].
+    Y = torch.empty(A.shape[0], B.shape[0], dtype=output_dtype, device=A.device)
     return Y
 
 
@@ -1037,6 +1099,48 @@ def _rocm_aiter_act_mul_and_fp8_group_quant_fake(
         dtype=torch.float32,
         device=x.device,
     )
+    return x_fp8, out_bs
+
+
+def _rocm_aiter_fused_clamp_act_mul_impl(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+
+    # Fused clamped SwiGLU (gate=min(g,L), up=clamp(u,+-L), silu(gate)*up) +
+    # per-token group fp8 quant; returns (x_fp8, x_scale) ready for the a8w8
+    # block-scale GEMM (skips the separate down-proj input quant).
+    # transpose_scale=True emits a column-major (num_blocks, M) x_scale, which
+    # the B-preshuffle GEMM (gemm_a8w8_blockscale_bpreshuffle) expects.
+    return fused_clamp_act_mul(
+        x,
+        swiglu_limit=swiglu_limit,
+        activation="silu",
+        dtype_quant=FP8_DTYPE,
+        transpose_scale=transpose_scale,
+        quant_block_size=group_size,
+        scale_dtype_fmt="fp32",
+    )
+
+
+def _rocm_aiter_fused_clamp_act_mul_fake(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    assert N % 2 == 0
+    N_half = N // 2
+    num_blocks = (N_half + group_size - 1) // group_size
+    x_fp8 = torch.empty((M, N_half), dtype=FP8_DTYPE, device=x.device)
+    # transpose_scale only reorders the block-scale *values* into a column-major
+    # layout; the logical shape stays (M, num_blocks) (verified against installed
+    # aiter), so the fake shape is the same either way.
+    out_bs = torch.empty((M, num_blocks), dtype=torch.float32, device=x.device)
     return x_fp8, out_bs
 
 
@@ -1634,6 +1738,14 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_topk_gating",
+                op_func=_rocm_aiter_topk_gating_impl,
+                mutates_args=["topk_weights", "topk_ids"],
+                fake_impl=_rocm_aiter_topk_gating_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_grouped_topk",
                 op_func=_rocm_aiter_grouped_topk_impl,
                 mutates_args=["topk_weights", "topk_ids"],
@@ -1681,6 +1793,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_gemm_a8w8_blockscale_bpreshuffle",
+                op_func=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl,
+                fake_impl=_rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_rmsnorm_fused_dynamic_quant",
                 op_func=_rocm_aiter_rmsnorm_fused_dynamic_quant_impl,
                 fake_impl=_rocm_aiter_rmsnorm_fused_dynamic_quant_fake,
@@ -1716,6 +1834,14 @@ class rocm_aiter_ops:
                 op_name="rocm_aiter_act_mul_and_fp8_group_quant",
                 op_func=_rocm_aiter_act_mul_and_fp8_group_quant_impl,
                 fake_impl=_rocm_aiter_act_mul_and_fp8_group_quant_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_fused_clamp_act_mul",
+                op_func=_rocm_aiter_fused_clamp_act_mul_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_fused_clamp_act_mul_fake,
+                dispatch_key=current_platform.dispatch_key,
             )
 
             direct_register_custom_op(
@@ -1872,6 +1998,17 @@ class rocm_aiter_ops:
         )
 
     @staticmethod
+    def fused_clamp_act_mul(
+        x: torch.Tensor,
+        swiglu_limit: float,
+        group_size: int = 128,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_fused_clamp_act_mul(
+            x, swiglu_limit, group_size, transpose_scale
+        )
+
+    @staticmethod
     def gemm_a8w8_blockscale(
         A: torch.Tensor,
         B: torch.Tensor,
@@ -1881,6 +2018,18 @@ class rocm_aiter_ops:
         output_dtype: torch.dtype = torch.float16,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale(
+            A, B, As, Bs, output_dtype
+        )
+
+    @staticmethod
+    def gemm_a8w8_blockscale_bpreshuffle(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        output_dtype: torch.dtype = torch.float16,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale_bpreshuffle(
             A, B, As, Bs, output_dtype
         )
 
@@ -2018,6 +2167,28 @@ class rocm_aiter_ops:
             topk_group,
             need_renorm,
             routed_scaling_factor,
+        )
+
+    @staticmethod
+    def topk_gating(
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        gating_output: torch.Tensor,
+        correction_bias: torch.Tensor | None = None,
+        need_renorm: bool = True,
+        routed_scaling_factor: float = 1.0,
+        score_func: str = "sqrtsoftplus",
+    ) -> None:
+        if correction_bias is not None and correction_bias.dtype != gating_output.dtype:
+            correction_bias = correction_bias.to(gating_output.dtype)
+        torch.ops.vllm.rocm_aiter_topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias,
+            need_renorm,
+            routed_scaling_factor,
+            score_func,
         )
 
     @staticmethod

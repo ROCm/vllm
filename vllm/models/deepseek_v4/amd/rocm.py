@@ -474,7 +474,9 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
                 dtype=torch.int32,
                 device=self.device,
             )
-            self.c128a_decode_topk_ragged_indptr_buffer = torch.empty(
+            # zeros (not empty): build_ragged_indices_from_dense writes cumsum into
+            # [1:] every step and relies on a persistent leading 0 at index 0.
+            self.c128a_decode_topk_ragged_indptr_buffer = torch.zeros(
                 max_tokens + 1,
                 dtype=torch.int32,
                 device=self.device,
@@ -497,19 +499,15 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(FlashMLASparseMetadataBuilder)
         dense_decode = base.c128a_global_decode_topk_indices
         decode_lens = base.c128a_decode_topk_lens
         if dense_decode is not None and decode_lens is not None:
+            assert self.c128a_decode_topk_ragged_indices_buffer is not None
+            assert self.c128a_decode_topk_ragged_indptr_buffer is not None
+            # Write ragged indices/indptr straight into the persistent graph
+            # buffers (no per-step temp alloc + separate copy).
             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
                 dense_decode.reshape(dense_decode.shape[0], -1),
                 decode_lens,
-            )
-            assert self.c128a_decode_topk_ragged_indices_buffer is not None
-            assert self.c128a_decode_topk_ragged_indptr_buffer is not None
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
-                self.c128a_decode_topk_ragged_indices_buffer,
-                self.c128a_decode_topk_ragged_indptr_buffer,
-                dense_decode.shape[0],
-                self.c128a_max_compressed,
+                out_flat=self.c128a_decode_topk_ragged_indices_buffer,
+                out_indptr=self.c128a_decode_topk_ragged_indptr_buffer,
             )
 
         return DeepseekV4ROCMAiterMLASparseMetadata(
@@ -528,7 +526,9 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             dtype=torch.int32,
             device=self.device,
         )
-        self.decode_swa_ragged_indptr_buffer = torch.empty(
+        # zeros (not empty): build_ragged_indices_from_dense relies on a
+        # persistent leading 0 at index 0 (cumsum writes only [1:]).
+        self.decode_swa_ragged_indptr_buffer = torch.zeros(
             max_tokens + 1,
             dtype=torch.int32,
             device=self.device,
@@ -553,17 +553,13 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
+            # Write straight into the persistent graph buffers (no per-step
+            # temp alloc + separate copy).
             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
                 base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
                 base.decode_swa_lens,
-            )
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
-                self.decode_swa_ragged_indices_buffer,
-                self.decode_swa_ragged_indptr_buffer,
-                base.num_decode_tokens,
-                self.window_size,
+                out_flat=self.decode_swa_ragged_indices_buffer,
+                out_indptr=self.decode_swa_ragged_indptr_buffer,
             )
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -8,11 +9,13 @@ import regex as re
 import torch
 import torch.nn as nn
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
@@ -53,6 +56,25 @@ from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import has_tilelang
+
+# Dev-only flag (to be consolidated into vllm.envs later): on ROCm the clamped
+# SwiGLU (SiluAndMulWithClamp) runs eager and the down-proj does a separate fp8
+# input-quant. Setting this fuses both into aiter's fused_clamp_act_mul kernel,
+# which emits the already-quantized (fp8, scale) fed straight into the a8w8
+# block-scale GEMM (mirrors ATOM's fused expert MLP).
+_USE_AITER_FUSED_MLP = (
+    os.environ.get("VLLM_DSV4_AITER_FUSED_MLP_ACT_QUANT", "0") == "1"
+)
+
+# Dev-only flag (sub-mode of the MLP fuse above): route the fused down-proj GEMM
+# through aiter's B-preshuffle kernel (gemm_a8w8_blockscale_bpreshuffle) instead
+# of the default gemm_a8w8_blockscale. The down-proj weight is preshuffled once
+# at load and the activation scale is emitted column-major (transpose_scale=True)
+# to match — mirrors ATOM's ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE path. No effect
+# unless VLLM_DSV4_AITER_FUSED_MLP_ACT_QUANT=1 is also set.
+_USE_AITER_FUSED_MLP_PRESHUFFLE = (
+    os.environ.get("VLLM_DSV4_AITER_FUSED_MLP_PRESHUFFLE", "0") == "1"
+)
 
 
 class DeepseekV4MLP(nn.Module):
@@ -99,8 +121,100 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
+        # Static gate for the fused clamped-SwiGLU + fp8 down-proj input-quant
+        # path; the down-proj weight-scale (post-load) is checked in forward().
+        self.swiglu_limit = swiglu_limit
+        self._fused_act_quant = (
+            _USE_AITER_FUSED_MLP
+            and swiglu_limit is not None
+            and current_platform.is_rocm()
+            and rocm_aiter_ops.is_fused_moe_enabled()
+        )
+        # Optional B-preshuffle GEMM sub-mode (only meaningful when fusing).
+        self._fused_preshuffle = (
+            self._fused_act_quant and _USE_AITER_FUSED_MLP_PRESHUFFLE
+        )
+        # fp32 down-proj block weight scale for the fused path, decoded once at
+        # load time by prepare_fused_act_quant() (None until then / when not
+        # fusing). Kept out of forward so nothing runs per step or in-graph.
+        self._fused_down_weight_scale: torch.Tensor | None = None
+        # Preshuffled down-proj weight for the B-preshuffle GEMM, built once at
+        # load (None unless _fused_preshuffle). Held separately so the eager
+        # fallback (act_fn + down_proj) keeps using the unshuffled weight.
+        self._fused_down_weight: torch.Tensor | None = None
+
+    def prepare_fused_act_quant(self) -> None:
+        """One-shot post-load setup for the fused clamped-SwiGLU + a8w8 path.
+
+        fused_clamp_act_mul emits an fp32 x_scale, but DSv4 (scale_fmt=ue8m0)
+        stores the down-proj block weight scale as float8_e8m0fnu, and the a8w8
+        GEMM requires both scales share a dtype. Decode the E8M0 weight scale to
+        fp32 (exact, power-of-two preserving) — the same conversion the stock
+        block-scaled-mm path does per call (kernels/.../scaled_mm/aiter.py), but
+        done once here since the weight scale is a load-time constant. The scale
+        is not reshaped by process_weights_after_loading, so this load-time value
+        matches the runtime one. Called from DeepseekV4Model.load_weights.
+
+        When _fused_preshuffle is set, also preshuffle a copy of the down-proj
+        weight (shuffle_weight, layout (16,16)) for the B-preshuffle GEMM. The
+        weight scale is NOT shuffled for per-128 block scale (matches ATOM).
+        """
+        if not self._fused_act_quant:
+            return
+        ws = getattr(self.down_proj, "weight_scale", None)
+        if ws is None:
+            ws = getattr(self.down_proj, "weight_scale_inv", None)
+        if ws is None:
+            return
+        if ws.dtype == torch.float8_e8m0fnu:
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                _upcast_e8m0_to_fp32,
+            )
+
+            ws = _upcast_e8m0_to_fp32(ws).contiguous()
+        self._fused_down_weight_scale = ws
+
+        if self._fused_preshuffle:
+            from aiter.ops.shuffle import shuffle_weight
+
+            self._fused_down_weight = shuffle_weight(
+                self.down_proj.weight.data, layout=(16, 16)
+            )
+
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
+        if self._fused_down_weight_scale is not None and gate_up.dim() == 2:
+            if self._fused_preshuffle:
+                # clamp+silu*mul + fp8 quant, column-major scale -> B-preshuffle
+                # GEMM against the preshuffled down-proj weight.
+                x_fp8, x_scale = rocm_aiter_ops.fused_clamp_act_mul(
+                    gate_up, self.swiglu_limit, group_size=128, transpose_scale=True
+                )
+                out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                    x_fp8,
+                    self._fused_down_weight,
+                    x_scale,
+                    self._fused_down_weight_scale,
+                    output_dtype=x.dtype,
+                )
+            else:
+                # clamp+silu*mul + per-token group-128 fp8 quant -> (fp8, scale)
+                x_fp8, x_scale = rocm_aiter_ops.fused_clamp_act_mul(
+                    gate_up, self.swiglu_limit, group_size=128
+                )
+                out = rocm_aiter_ops.gemm_a8w8_blockscale(
+                    x_fp8,
+                    self.down_proj.weight,
+                    x_scale,
+                    self._fused_down_weight_scale,
+                    [1, 128],
+                    output_dtype=x.dtype,
+                )
+            # down_proj is RowParallel: replicate its result reduction since
+            # we bypass its forward().
+            if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -850,6 +964,16 @@ class DeepseekV4Model(nn.Module):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(name)
                     continue
+
+        # One-shot setup for the optional aiter fused MLP act+quant path: decode
+        # each fused MLP's down-proj e8m0 block weight scale to fp32 now, so the
+        # forward stays a constant read (no per-step / in-graph conversion).
+        for module in self.modules():
+            if isinstance(module, DeepseekV4MLP):
+                module.prepare_fused_act_quant()
+            elif isinstance(module, DeepseekV4MLA):
+                # decode wo_a -> BF16 once for the ROCm inv-rope einsum path
+                module.prepare_wo_a_dequant()
 
         return loaded_params
 

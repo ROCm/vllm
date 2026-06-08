@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 from collections.abc import Callable
 
 import torch
@@ -15,6 +16,12 @@ from vllm.model_executor.layers.fused_moe.config import (
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+
+# Dev-only flag (to be consolidated into vllm.envs later): when aiter fused MoE
+# is enabled, DSv4's "sqrtsoftplus" scoring matches no fused router branch and
+# falls through to an eager softplus/sqrt/topk/gather/renorm path. Setting this
+# routes it through aiter's fused topk_gating kernel instead.
+_USE_AITER_TOPK_GATING = os.environ.get("VLLM_DSV4_AITER_TOPK_GATING", "0") == "1"
 
 
 def vllm_topk_softmax(
@@ -254,6 +261,36 @@ def fused_topk_bias(
             if routed_scaling_factor != 1.0:
                 topk_weights *= routed_scaling_factor
             return topk_weights, topk_ids
+
+    elif (
+        _USE_AITER_TOPK_GATING
+        and rocm_aiter_ops.is_fused_moe_enabled()
+        and scoring_func == "sqrtsoftplus"
+        and hash_indices_table is None
+    ):
+        # Fused aiter sqrtsoftplus router (score + bias select + top-k + renorm
+        # + scale in one launch); replaces the eager fallthrough below. The hash
+        # path is excluded since topk_gating does not consume hash_indices_table.
+        M = hidden_states.size(0)
+        topk_weights = torch.empty(
+            M, topk, dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids = torch.empty(
+            M,
+            topk,
+            dtype=torch.int32 if indices_type is None else indices_type,
+            device=hidden_states.device,
+        )
+        rocm_aiter_ops.topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias=e_score_correction_bias,
+            need_renorm=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            score_func="sqrtsoftplus",
+        )
+        return topk_weights, topk_ids
 
     n_routed_experts = gating_output.shape[-1]
     if scoring_func == "softmax":

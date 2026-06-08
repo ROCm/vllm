@@ -305,6 +305,29 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             )
         return True, None
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        # The block GEMM activation scale (As) is fp32 (QuantFP8 use_ue8m0=False),
+        # so apply_block_scaled_mm would E8M0->fp32 upcast the *constant* weight
+        # scale (Bs) on EVERY call -- a per-step cast(uint8->int32) + (<<23) shift
+        # + contiguous for every fp8 block linear. Decode it once here so As/Bs
+        # share fp32 and the per-call upcast guard short-circuits entirely.
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
+
+        params = self._get_layer_params(layer)
+        scale_attr_name = (
+            params.WEIGHT_SCALE
+            if params.weight_scale_inv is None
+            else params.WEIGHT_SCALE_INV
+        )
+        ws = getattr(layer, scale_attr_name, None)
+        if ws is not None and ws.dtype == torch.float8_e8m0fnu:
+            replace_parameter(
+                layer, scale_attr_name, _upcast_e8m0_to_fp32(ws).contiguous().data
+            )
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
