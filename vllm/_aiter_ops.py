@@ -145,6 +145,7 @@ def _rocm_aiter_fused_moe_impl(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
+    gate_mode: str = "separated",
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -173,6 +174,7 @@ def _rocm_aiter_fused_moe_impl(
         bias1=bias1,
         bias2=bias2,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        gate_mode=gate_mode,
     )
 
 
@@ -197,6 +199,7 @@ def _rocm_aiter_fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
+    gate_mode: str = "separated",
 ) -> torch.Tensor:
     if output_dtype is not None:
         return torch.empty_like(hidden_states, dtype=output_dtype)
@@ -2055,6 +2058,7 @@ class rocm_aiter_ops:
         bias1: torch.Tensor | None = None,
         bias2: torch.Tensor | None = None,
         moe_sorting_dispatch_policy: int = 0,
+        gate_mode: str = "separated",
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -2077,6 +2081,7 @@ class rocm_aiter_ops:
             bias1,
             bias2,
             moe_sorting_dispatch_policy,
+            gate_mode,
         )
 
     @staticmethod

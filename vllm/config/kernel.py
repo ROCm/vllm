@@ -133,6 +133,7 @@ MoEBackend = Literal[
     "humming",
     "triton_unfused",
     "aiter",
+    "aiter_flydsl",
     "emulation",
 ]
 
@@ -185,6 +186,8 @@ class KernelConfig:
     - "humming": Use Humming Mixed Precision kernels
     - "triton_unfused": Use Triton unfused MoE kernels
     - "aiter": Use AMD AITer kernels (ROCm only)
+    - "aiter_flydsl": Use AMD AITER FlyDSL MXFP4 W4A8 MoE kernels with FP8
+      activations (ROCm gfx950 only; requires the flydsl package)
     - "emulation": use BF16/FP16 GEMM, dequantizing weights and
                    running QDQ on activations.
     """

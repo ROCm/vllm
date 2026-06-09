@@ -350,7 +350,10 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_precision_config = w2_scale
 
         # AITER backend requires weights to be marked as shuffled.
-        if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+        if self.mxfp4_backend in (
+            Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            Mxfp4MoeBackend.AITER_FLYDSL_W4A8,
+        ):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
@@ -684,7 +687,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_precision_config = w2_scale
 
         # AITER backend requires weights to be marked as shuffled.
-        if self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+        if self.mxfp4_backend in (
+            Mxfp4MoeBackend.AITER_MXFP4_BF16,
+            Mxfp4MoeBackend.AITER_FLYDSL_W4A8,
+        ):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 

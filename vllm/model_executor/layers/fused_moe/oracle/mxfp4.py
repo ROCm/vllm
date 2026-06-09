@@ -76,6 +76,7 @@ class Mxfp4MoeBackend(Enum):
     AITER = "AITER_MXFP4_BF16"
     AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8: triton kernel
     AITER_MXFP4_MXFP4 = "AITER_MXFP4_MXFP4"  # W4A4: CK kernel
+    AITER_FLYDSL_W4A8 = "AITER_FLYDSL_W4A8"  # W4A8: FlyDSL kernel (dynamic FP8)
     # Triton
     TRITON = "TRITON"
     TRITON_UNFUSED = "TRITON_UNFUSED"
@@ -94,6 +95,7 @@ AITER_BACKENDS = (
     Mxfp4MoeBackend.AITER_MXFP4_BF16,
     Mxfp4MoeBackend.AITER_MXFP4_FP8,
     Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+    Mxfp4MoeBackend.AITER_FLYDSL_W4A8,
 )
 
 
@@ -205,6 +207,13 @@ def backend_to_kernel_cls(
 
         return [AiterExperts]
 
+    elif backend == Mxfp4MoeBackend.AITER_FLYDSL_W4A8:
+        from vllm.model_executor.layers.fused_moe.experts.aiter_flydsl_w4a8_moe import (
+            AiterFlyDslW4A8Experts,
+        )
+
+        return [AiterFlyDslW4A8Experts]
+
     elif backend == Mxfp4MoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import XPUExpertsMXFp4
 
@@ -255,6 +264,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
         ],
         "aiter_mxfp4_fp8": [Mxfp4MoeBackend.AITER_MXFP4_FP8],
         "aiter_mxfp4_mxfp4": [Mxfp4MoeBackend.AITER_MXFP4_MXFP4],
+        "aiter_flydsl": [Mxfp4MoeBackend.AITER_FLYDSL_W4A8],
         "xpu": [Mxfp4MoeBackend.XPU],
         "cpu": [Mxfp4MoeBackend.CPU],
         "emulation": [Mxfp4MoeBackend.EMULATION],
@@ -1021,7 +1031,12 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
-    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.AITER_MXFP4_BF16,
+        Mxfp4MoeBackend.AITER_FLYDSL_W4A8,
+    ):
+        # FlyDSL W4A8 shares the AITER a16w4 weight/scale layout with the
+        # BF16 path; the kernel applies FP8 activation quant internally.
         from vllm._aiter_ops import rocm_aiter_ops
 
         if w13_bias is not None:
@@ -1463,6 +1478,52 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
+    elif mxfp4_backend == Mxfp4MoeBackend.AITER_FLYDSL_W4A8:
+        # FlyDSL a8w4 (FP8 act + MXFP4 wt): gate-up-interleaved (gui) layout.
+        # w13 is loaded as [gate_all, up_all]; shuffle_weight_a16w4(gate_up=True)
+        # interleaves the two halves as the gui kernels expect. Activation FP8
+        # quant + inter-stage requant happen inside aiter at runtime.
+        # Recipe validated vs a bf16 ref on gfx950 (scripts/validate_flydsl_a8w4.py).
+        from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+        if w13_bias is not None:
+            w13_bias = w13_bias.data.to(torch.float32)
+        if w2_bias is not None:
+            w2_bias = w2_bias.data.to(torch.float32)
+
+        # Diagnostic: dump the checkpoint tensor metadata the kernel will see
+        # (scales must be e8m0 uint8 [E, N, K/32]). DEBUG-level to stay quiet.
+        logger.debug_once(
+            "aiter_flydsl conv: w13_weight %s %s | w2_weight %s %s | "
+            "w13_scale %s %s | w2_scale %s %s | num_experts=%d",
+            tuple(w13_weight.shape), w13_weight.dtype,
+            tuple(w2_weight.shape), w2_weight.dtype,
+            tuple(w13_weight_scale.shape), w13_weight_scale.dtype,
+            tuple(w2_weight_scale.shape), w2_weight_scale.dtype,
+            num_experts,
+        )
+
+        w13_weight.data = w13_weight.data.view(torch.float4_e2m1fn_x2)
+        w2_weight.data = w2_weight.data.view(torch.float4_e2m1fn_x2)
+
+        w13_weight.data = shuffle_weight_a16w4(w13_weight, 16, True)
+        w2_weight.data = shuffle_weight_a16w4(w2_weight, 16, False)
+        shuffled_w13_scale = shuffle_scale_a16w4(
+            w13_weight_scale.view(-1, w13_weight_scale.shape[-1]), num_experts, True
+        )
+        shuffled_w2_scale = shuffle_scale_a16w4(
+            w2_weight_scale.view(-1, w2_weight_scale.shape[-1]), num_experts, False
+        )
+
+        return (
+            w13_weight,
+            w2_weight,
+            shuffled_w13_scale,
+            shuffled_w2_scale,
+            w13_bias,
+            w2_bias,
+        )
+
     elif mxfp4_backend in TRITON_BACKENDS:
         from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
@@ -1620,6 +1681,7 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
+        Mxfp4MoeBackend.AITER_FLYDSL_W4A8,
         Mxfp4MoeBackend.CPU,
     ):
         return mxfp4_w4a16_moe_quant_config(
