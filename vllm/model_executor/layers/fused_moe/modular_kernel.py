@@ -888,6 +888,14 @@ class FusedMoEExpertsModular(FusedMoEExperts):
     def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
         raise NotImplementedError
 
+    def accepts_output_alias(self) -> bool:
+        """Return True if this expert kernel can safely write its output
+        to a buffer that aliases the inplace hidden_states input. Allows
+        the modular pipeline to skip the trailing fused_out -> output copy
+        in TopKWeightAndReduceNoOP.
+        """
+        return False
+
     @abstractmethod
     def apply(
         self,
@@ -1041,12 +1049,17 @@ class FusedMoEKernelModularImpl:
         local_num_experts: int,
         expert_tokens_meta: ExpertTokensMetadata | None,
         activation: MoEActivation,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        allocate_output: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """
         Allocate temporary and output buffers for the fused experts op.
         Inputs:
         - out_dtype: output type of workspace and output tensors.
         - device: the device of the workspace and output tensors.
+        - allocate_output: when False, the caller will supply its own
+          output buffer; this function returns `None` for `fused_out`
+          and reserves only enough workspace to hold the gemm-1 result
+          (no output reservation).
         See `workspace_shapes` for a description of the remainder of arguments.
         Returns a tuple of (workspace13, workspace2, output) tensors.
         """
@@ -1078,16 +1091,25 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
-        # We can reuse the memory between cache1 and cache3 because by the
-        # time we need cache3, we're done with cache1.
-        # Reuse workspace13 for the output since there is only one chunk.
-        max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+        if allocate_output:
+            # We can reuse the memory between cache1 and cache3 because
+            # by the time we need cache3, we're done with cache1.
+            # Reuse workspace13 for the output since there is only one chunk.
+            max_shape_size = max(prod(workspace13_shape), prod(fused_out_shape))
+        else:
+            # The caller will provide the output buffer, so we only need
+            # workspace13 to be large enough to hold the gemm-1 result.
+            max_shape_size = prod(workspace13_shape)
         common_workspace, workspace2 = current_workspace_manager().get_simultaneous(
             ((max_shape_size,), workspace_dtype),
             (workspace2_shape, workspace_dtype),
         )
         workspace13 = _resize_cache(common_workspace, workspace13_shape)
-        fused_out = _resize_cache(common_workspace, fused_out_shape)
+        fused_out: torch.Tensor | None = (
+            _resize_cache(common_workspace, fused_out_shape)
+            if allocate_output
+            else None
+        )
 
         return workspace13, workspace2, fused_out
 
@@ -1206,7 +1228,7 @@ class FusedMoEKernelModularImpl:
         expert_map: torch.Tensor | None,
         apply_router_weight_on_input: bool,
         expert_tokens_meta: ExpertTokensMetadata | None,
-        output_alias: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         _, M_full, N, K, top_k = self.fused_experts.moe_problem_size(
             a1q, w1, w2, topk_ids
@@ -1221,6 +1243,33 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
 
+        # When the caller supplies `out`, it must satisfy the same shape /
+        # dtype / contiguity / device contract that `_allocate_buffers`
+        # would have produced — the expert kernel writes into it directly.
+        if out is not None:
+            workspace_dtype = self.fused_experts.workspace_dtype(in_dtype)
+            _, _, fused_out_shape = self.fused_experts.workspace_shapes(
+                M_full,
+                N,
+                K,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                expert_tokens_meta,
+                activation,
+            )
+            assert tuple(out.shape) == tuple(fused_out_shape), (
+                f"out.shape {tuple(out.shape)} != fused_out_shape "
+                f"{tuple(fused_out_shape)}"
+            )
+            assert out.dtype == workspace_dtype, (
+                f"out.dtype {out.dtype} != workspace_dtype {workspace_dtype}"
+            )
+            assert out.is_contiguous(), "out must be contiguous"
+            assert out.device == a1q.device, (
+                f"out.device {out.device} != a1q.device {a1q.device}"
+            )
+
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
             a1q.device,
@@ -1233,24 +1282,28 @@ class FusedMoEKernelModularImpl:
             local_num_experts,
             expert_tokens_meta,
             activation,
+            allocate_output=out is None,
         )
+        if out is not None:
+            fused_out = out
 
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
         # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
         # double-copy MoE write-back path).
+        assert fused_out is not None
         if current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
             if (
                 rocm_aiter_ops.is_fused_moe_enabled()
-                and output_alias is not None
-                and output_alias.shape == fused_out.shape
-                and output_alias.dtype == fused_out.dtype
-                and output_alias.device == fused_out.device
-                and output_alias.is_contiguous()
+                and out is not None
+                and out.shape == fused_out.shape
+                and out.dtype == fused_out.dtype
+                and out.device == fused_out.device
+                and out.is_contiguous()
             ):
-                fused_out = output_alias
+                fused_out = out
 
         self.fused_experts.apply(
             output=fused_out,
@@ -1397,6 +1450,14 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
         )
 
+        # If the expert kernel opts in, let it write directly to `output`
+        # so the trailing fused_out -> output copy in TopKWeightAndReduceNoOP
+        # can be skipped. Safe even when shared_experts is present: in the
+        # non-async path _maybe_apply_shared_experts is never called while
+        # the expert kernel is writing to output, and shared expert inputs
+        # are separate from output.
+        fused_out_alias = output if self.fused_experts.accepts_output_alias() else None
+
         fused_out = self._fused_experts(
             in_dtype=hidden_states.dtype,
             a1q=a1q,
@@ -1411,7 +1472,7 @@ class FusedMoEKernelModularImpl:
             expert_map=expert_map,
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
-            output_alias=output,
+            out=fused_out_alias,
         )
 
         return self._finalize(

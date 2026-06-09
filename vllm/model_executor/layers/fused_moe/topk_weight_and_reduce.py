@@ -73,6 +73,12 @@ class TopKWeightAndReduceNoOP(mk.TopKWeightAndReduce):
             f"But got output={output.size()}, "
             f"used_expert_output={fused_expert_output.size()}"
         )
+        # Fast path: when the expert kernel has opted in via
+        # `accepts_output_alias()` and the modular pipeline plumbed
+        # `output` straight through as the fused_out buffer, the data
+        # has already been written to `output` and the copy is a no-op.
+        if output.data_ptr() == fused_expert_output.data_ptr():
+            return output
         output.copy_(fused_expert_output, non_blocking=True)
         return output
 

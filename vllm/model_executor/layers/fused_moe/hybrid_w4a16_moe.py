@@ -108,6 +108,24 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def accepts_output_alias(self) -> bool:
+        """Safe to alias `output` with the fused_out workspace because
+        by the time `moe_unpermute` writes to `output`, `hidden_states`
+        is no longer read by this kernel. The data flow is:
+
+            gemm1_in  = hidden_states          (READ in GEMM1)
+            gemm1_out = workspace2             (WRITE)
+            act_out   = workspace13            (WRITE)
+            gemm2_out = workspace2             (WRITE; aliases gemm1_out)
+            output    <- moe_unpermute(gemm2_out, ...)  (last step)
+
+        `gemm2_out` is a separate workspace tensor (NOT hidden_states),
+        so reading from it is unaffected even if `output` aliases the
+        original hidden_states. This invariant must be re-checked for
+        any other kernel before opting in.
+        """
+        return True
+
     # Maximum batch size for the HIP wvSplitK kernel path.  Above this
     # threshold the Triton prefill kernel is used instead.
     MAX_SKINNY_BATCH_SIZE = 5
