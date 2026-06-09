@@ -1,8 +1,8 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-dev:base
-ARG CI_BASE_IMAGE=rocm/vllm-dev:ci_base
+ARG BASE_IMAGE=rocm/vllm-dev:vllm-base-ubuntu24.04-py3.12-nightlies-device-all-cdna-rocm7.14.0a20260608-0decac0d9
+ARG CI_BASE_IMAGE=ci_base
 # NIC backend for MoRI RDMA support.
 # By default (all), drivers and userspace libraries for all supported NIC types
 # (ainic and bnxt) are installed; MoRI selects the appropriate one at runtime.
@@ -10,12 +10,12 @@ ARG CI_BASE_IMAGE=rocm/vllm-dev:ci_base
 #   --build-arg NIC_BACKEND=ainic   # AMD AINIC (Pensando) only
 #   --build-arg NIC_BACKEND=bnxt    # Broadcom Thor-2 only
 #   --build-arg NIC_BACKEND=none    # Install nothing.
-ARG NIC_BACKEND=all
+ARG NIC_BACKEND=none
 # AMD AINIC apt repo settings
 # Users can specify a custom version compatible with their host drivers.
 # The default version has been tested with ioinic-dkms=25.11.1.001
 ARG AINIC_VERSION=1.117.3-hydra
-ARG UBUNTU_CODENAME=jammy
+ARG UBUNTU_CODENAME=noble
 
 # Sccache configuration. Release builds use this today; CI can opt in when a
 # shared S3-compatible cache backend is available.
@@ -30,6 +30,7 @@ FROM ${BASE_IMAGE} AS base
 
 ARG ARG_PYTORCH_ROCM_ARCH
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
+ENV GPU_ARCHS=${GPU_ARCHS:-gfx942;gfx950}
 
 # Install build dependencies and utilities
 RUN apt-get update -q -y && apt-get install -q -y \
@@ -311,8 +312,10 @@ RUN cd /opt/rixl && \
     sed -i "s/--exclude 'libamdhip64\*'/--exclude 'libamdhip64*' --exclude 'libcore*' --exclude 'libpull*'/" \
         contrib/build-wheel.sh && \
     mkdir -p /app/install && \
+    RIXL_PYTHON_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" && \
     _ucx_install_dir=${UCX_HOME} \
     ./contrib/build-wheel.sh \
+        --python-version ${RIXL_PYTHON_VERSION} \
         --output-dir /app/install \
         --rocm-dir ${ROCM_PATH} \
         --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
