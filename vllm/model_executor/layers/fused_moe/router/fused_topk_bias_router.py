@@ -131,8 +131,12 @@ def vllm_topk_softplus_sqrt(
     # is registered. On the DeepSeek-V4 ROCm flydsl path the MoE is all-aiter and
     # nothing else loads _moe_C before routing, so the op would otherwise raise
     # AttributeError in the worker on first call. (Verified the HIP kernel runs on
-    # gfx950.)
-    import vllm._moe_C  # noqa: F401
+    # gfx950.) Newer builds migrated the op into the stable-libtorch extension and
+    # dropped the regular _moe_C module, so fall back to that name.
+    try:
+        import vllm._moe_C  # noqa: F401
+    except ImportError:
+        import vllm._moe_C_stable_libtorch  # noqa: F401
 
     ops.topk_hash_softplus_sqrt(
         topk_weights,
