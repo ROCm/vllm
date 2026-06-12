@@ -268,6 +268,38 @@ def fused_topk_bias(
                 topk_weights *= routed_scaling_factor
             return topk_weights, topk_ids
 
+    elif (
+        rocm_aiter_ops.is_fused_moe_enabled()
+        and scoring_func == "sqrtsoftplus"
+        and hash_indices_table is None
+    ):
+        # aiter's fused sqrtsoftplus router (topk_softplus_kernel_opt) is ~1.8x
+        # faster than upstream's topkGatingSoftplusSqrt on gfx950 (26 vs 48 ms per
+        # c=32 decode window), so prefer it automatically on the ROCm aiter path.
+        # No env flag -- this is a platform-appropriate fast path, not a toggle.
+        # Upstream's vllm_topk_softplus_sqrt (below) covers the hash path + other
+        # platforms.
+        M = hidden_states.size(0)
+        topk_weights = torch.empty(
+            M, topk, dtype=torch.float32, device=hidden_states.device
+        )
+        topk_ids = torch.empty(
+            M,
+            topk,
+            dtype=torch.int32 if indices_type is None else indices_type,
+            device=hidden_states.device,
+        )
+        rocm_aiter_ops.topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias=e_score_correction_bias,
+            need_renorm=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            score_func="sqrtsoftplus",
+        )
+        return topk_weights, topk_ids
+
     elif scoring_func == "sqrtsoftplus":
         M = hidden_states.size(0)
         topk_weights = torch.empty(
