@@ -596,7 +596,13 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.wo_a,
             wo_a_bf16=self._wo_a_bf16,
         )
-        return self.wo_b(z.flatten(1))
+        zf = z.flatten(1)
+        # opt#3: B-preshuffle GEMM when prepared (RowParallel -> TP all-reduce).
+        if self._wo_b_pre_w is not None and zf.dim() == 2:
+            return self._bpre_attn_gemm(
+                self._wo_b_pre_w, self._wo_b_pre_s, zf, True
+            )
+        return self.wo_b(zf)
 
     def forward_mqa(
         self,

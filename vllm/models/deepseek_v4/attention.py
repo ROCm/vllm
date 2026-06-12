@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -29,6 +30,15 @@ from vllm.models.deepseek_v4.common.ops import (
 from vllm.platforms import current_platform
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import dequant_wo_a_bf16
 
+# Dev-only flag: route the DSv4 attention fp8 blockscale projections
+# (fused_wqa_wkv, wo_b) through aiter's B-preshuffle GEMM instead of the default
+# ck cshuffle_v3<ABScale>, mirroring the MLP gate_up/down preshuffle. Weights are
+# preshuffled once at load; the (bf16) input is quantized to fp8 group-128 with a
+# column-major scale. ROCm-only; no effect off-platform / when off.
+_USE_AITER_ATTN_PRESHUFFLE = (
+    os.environ.get("VLLM_DSV4_AITER_ATTN_PRESHUFFLE", "0") == "1"
+)
+
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
@@ -39,7 +49,10 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -234,6 +247,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return_bias=False,
             prefix=f"{prefix}.wo_b",
         )
+        # Optional B-preshuffle for the attention fp8 projections (opt#3). Set at
+        # load by prepare_attn_preshuffle() when VLLM_DSV4_AITER_ATTN_PRESHUFFLE=1
+        # on ROCm; None otherwise (keeps the normal linear forward).
+        self._wqa_wkv_pre_w: torch.Tensor | None = None
+        self._wqa_wkv_pre_s: torch.Tensor | None = None
+        self._wo_b_pre_w: torch.Tensor | None = None
+        self._wo_b_pre_s: torch.Tensor | None = None
 
         # Initialize rotary embedding before the indexer/compressor consume it.
         self.rotary_emb = build_deepseek_v4_rope(
@@ -331,6 +351,57 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.wo_a, self.n_local_groups, self.o_lora_rank
         )
 
+    def prepare_attn_preshuffle(self) -> None:
+        """One-shot load-time B-preshuffle of the attention fp8 projections
+        (fused_wqa_wkv, wo_b): preshuffle the weight (shuffle_weight 16x16) and
+        decode the e8m0 block weight-scale to fp32 so forward() can run them
+        through gemm_a8w8_blockscale_bpreshuffle. ROCm + flag-gated; skips any
+        projection whose K-dim isn't 128-aligned or lacks a block scale."""
+        if not (_USE_AITER_ATTN_PRESHUFFLE and current_platform.is_rocm()):
+            return
+        from aiter.ops.shuffle import shuffle_weight
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
+
+        def _prep(linear):
+            w = getattr(linear, "weight", None)
+            if w is None or w.dim() != 2 or w.shape[-1] % 128 != 0:
+                return None, None
+            ws = getattr(linear, "weight_scale", None)
+            if ws is None:
+                ws = getattr(linear, "weight_scale_inv", None)
+            if ws is None:
+                return None, None
+            if ws.dtype == torch.float8_e8m0fnu:
+                ws = _upcast_e8m0_to_fp32(ws).contiguous()
+            return shuffle_weight(w.data, layout=(16, 16)), ws
+
+        self._wqa_wkv_pre_w, self._wqa_wkv_pre_s = _prep(self.fused_wqa_wkv)
+        self._wo_b_pre_w, self._wo_b_pre_s = _prep(self.wo_b)
+
+    def _bpre_attn_gemm(self, w_pre, w_scale, x, reduce_tp):
+        """fp8 group-128 (column-major scale) quant + B-preshuffle GEMM, with an
+        optional TP all-reduce for RowParallel (wo_b). Same recipe as the MLP
+        down/gate_up preshuffle. NOTE: eager-validated; wrap the raw aiter quant
+        as a registered op before relying on cudagraph/torch.compile."""
+        from aiter.ops.quant import per_group_quant_hip
+
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        x_fp8, x_scale = per_group_quant_hip(
+            x.contiguous(),
+            quant_dtype=current_platform.fp8_dtype(),
+            group_size=128,
+            transpose_scale=True,
+        )
+        out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            x_fp8, w_pre, x_scale, w_scale, output_dtype=x.dtype
+        )
+        if reduce_tp and get_tensor_model_parallel_world_size() > 1:
+            out = tensor_model_parallel_all_reduce(out)
+        return out
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -423,6 +494,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             aux_fns[2] = indexer_compressor_kv_score
 
         def fused_wqa_wkv() -> torch.Tensor:
+            # opt#3: B-preshuffle GEMM when prepared (ColumnParallel -> no reduce).
+            if self._wqa_wkv_pre_w is not None and hidden_states.dim() == 2:
+                return self._bpre_attn_gemm(
+                    self._wqa_wkv_pre_w, self._wqa_wkv_pre_s, hidden_states, False
+                )
             # MergedColumnParallelLinear returns (output, bias); bias is None.
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv

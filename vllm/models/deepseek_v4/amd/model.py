@@ -915,6 +915,8 @@ class DeepseekV4Model(nn.Module):
             elif isinstance(module, DeepseekV4ROCMAiterMLAAttention):
                 # decode wo_a -> BF16 once for the ROCm inv-rope einsum path
                 module.prepare_wo_a_dequant()
+                # opt#3: preshuffle the fp8 attention projections (flag-gated)
+                module.prepare_attn_preshuffle()
 
         return loaded_params
 
