@@ -84,13 +84,9 @@ class MHCPreOp(CustomOp):
         # AITER mHC kernels are ~2.2x lighter than tilelang (see ATOM). They were
         # disabled here over an aiter accuracy bug at large token counts; that bug
         # is fixed upstream (b639cb63 sqrsum race, #3417, #3396), so re-enable
-        # behind VLLM_DSV4_AITER_MHC. The aiter pre op has no fused-rmsnorm-into-pre
-        # path wired, so only take it when norm_weight is None (DSv4 norms separately).
-        if (
-            _USE_AITER_MHC
-            and norm_weight is None
-            and residual.shape[-1] % 256 == 0
-        ):
+        # behind VLLM_DSV4_AITER_MHC. norm_weight is plumbed through so the RMSNorm
+        # can be fused into mhc_pre (aiter mhc_pre_big_fuse_rmsnorm) when provided.
+        if _USE_AITER_MHC and residual.shape[-1] % 256 == 0:
             return torch.ops.vllm.mhc_pre_aiter(
                 residual,
                 fn,
@@ -102,6 +98,8 @@ class MHCPreOp(CustomOp):
                 hc_post_mult_value,
                 sinkhorn_repeat,
                 n_splits,
+                norm_weight,
+                norm_eps,
             )
         if HAS_TILELANG:
             return torch.ops.vllm.mhc_pre_tilelang(
@@ -456,13 +454,9 @@ class MHCFusedPostPreOp(CustomOp):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # AITER has no single fused post+pre kernel; mhc_fused_post_pre_aiter
         # composes the two lighter aiter kernels (post then pre) and is
-        # numerically equivalent. Gated on VLLM_DSV4_AITER_MHC; only when
-        # norm_weight is None (no fused-rmsnorm-into-pre path wired).
-        if (
-            _USE_AITER_MHC
-            and norm_weight is None
-            and residual.shape[-1] % 256 == 0
-        ):
+        # numerically equivalent. Gated on VLLM_DSV4_AITER_MHC. norm_weight is
+        # plumbed to the pre step to fuse the RMSNorm (mhc_pre_big_fuse_rmsnorm).
+        if _USE_AITER_MHC and residual.shape[-1] % 256 == 0:
             return torch.ops.vllm.mhc_fused_post_pre_aiter(
                 x,
                 residual,
@@ -478,6 +472,8 @@ class MHCFusedPostPreOp(CustomOp):
                 sinkhorn_repeat,
                 n_splits,
                 tile_n,
+                norm_weight,
+                norm_eps,
             )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,

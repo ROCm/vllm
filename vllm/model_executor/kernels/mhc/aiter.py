@@ -16,6 +16,8 @@ def mhc_pre_aiter(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Forward pass for mHC pre block.
@@ -52,6 +54,8 @@ def mhc_pre_aiter(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
     )
 
 
@@ -66,6 +70,8 @@ def _mhc_pre_aiter_fake(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
@@ -139,6 +145,8 @@ def mhc_fused_post_pre_aiter(
     sinkhorn_repeat: int,
     n_splits: int = 1,
     tile_n: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mHC post(prev sublayer) followed by mHC pre(next sublayer).
 
@@ -167,6 +175,8 @@ def mhc_fused_post_pre_aiter(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        norm_weight,
+        norm_eps,
     )
     return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
@@ -186,6 +196,8 @@ def _mhc_fused_post_pre_aiter_fake(
     sinkhorn_repeat: int,
     n_splits: int = 1,
     tile_n: int = 1,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]

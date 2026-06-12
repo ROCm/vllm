@@ -86,6 +86,13 @@ _USE_AITER_GATEUP_PRESHUFFLE = (
     os.environ.get("VLLM_DSV4_AITER_GATEUP_PRESHUFFLE", "0") == "1"
 )
 
+# Dev-only flag: fuse the attn/ffn pre-RMSNorm into the preceding mHC pre block
+# (mhc_pre / mhc_fused_post_pre take a norm_weight and emit the already-normed
+# layer_input via mhc_pre_big_fuse_rmsnorm), dropping the standalone RMSNorm
+# kernel before attention/FFN. Mirrors ATOM (norm_act ~22 vs ~82 ms). Works for
+# both the tilelang and aiter mHC backends (both accept norm_weight).
+_FUSE_MHC_NORM = os.environ.get("VLLM_DSV4_FUSE_MHC_NORM", "0") == "1"
+
 
 class DeepseekV4MLP(nn.Module):
     def __init__(
@@ -489,6 +496,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
     ):
         post_mix, res_mix, layer_input = self.mhc_pre(
             residual=x,
@@ -500,6 +508,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=self.rms_norm_eps,
         )
         return layer_input, post_mix, res_mix
 
@@ -521,11 +531,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # opt: fuse attn/ffn RMSNorm into the mHC pre block (skip the standalone
+        # norm below). norm_weight=None keeps the original separate-norm behavior.
+        nw_attn = self.attn_norm.weight if _FUSE_MHC_NORM else None
+        nw_ffn = self.ffn_norm.weight if _FUSE_MHC_NORM else None
         if residual is None:
             # Run standalone hc_pre on first layer
             residual = x
             x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                norm_weight=nw_attn,
             )
         else:
             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
@@ -541,9 +559,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                norm_weight=nw_attn,
+                norm_eps=self.rms_norm_eps,
             )
 
-        x = self.attn_norm(x)
+        if not _FUSE_MHC_NORM:
+            x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
@@ -559,8 +580,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_eps,
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
+            norm_weight=nw_ffn,
+            norm_eps=self.rms_norm_eps,
         )
-        x = self.ffn_norm(x)
+        if not _FUSE_MHC_NORM:
+            x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
@@ -575,19 +599,25 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
+        nw_attn = self.attn_norm.weight if _FUSE_MHC_NORM else None
+        nw_ffn = self.ffn_norm.weight if _FUSE_MHC_NORM else None
         residual = x
         x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+            norm_weight=nw_attn,
         )
-        x = self.attn_norm(x)
+        if not _FUSE_MHC_NORM:
+            x = self.attn_norm(x)
         x = self.attn(positions, x, None)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
         x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+            norm_weight=nw_ffn,
         )
-        x = self.ffn_norm(x)
+        if not _FUSE_MHC_NORM:
+            x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         x = self.hc_post(x, residual, post, comb)
         return x, None, None, None
