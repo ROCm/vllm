@@ -124,6 +124,85 @@ def _mhc_post_aiter_fake(
     return torch.empty_like(residual)
 
 
+def mhc_fused_post_pre_aiter(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    tile_n: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused mHC post(prev sublayer) followed by mHC pre(next sublayer).
+
+    AITER has no single post+pre kernel, so this is the composition of
+    ``mhc_post_aiter`` then ``mhc_pre_aiter`` on the updated residual streams
+    -- numerically identical to ``mhc_fused_post_pre_tilelang`` but using the
+    two lighter AITER mHC kernels. ``n_splits``/``tile_n`` are accepted for
+    signature parity with the tilelang op and ignored (AITER picks split-k).
+
+    Returns (residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur).
+    """
+    hidden_size = residual.shape[-1]
+    assert hidden_size % 256 == 0
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    residual_cur = rocm_aiter_ops.mhc_post(
+        x, residual, post_layer_mix, comb_res_mix
+    )
+    post_mix_cur, comb_mix_cur, layer_input_cur = rocm_aiter_ops.mhc_pre(
+        residual_cur,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
+
+
+def _mhc_fused_post_pre_aiter_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    tile_n: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    outer_shape = residual.shape[:-2]
+    residual_cur = torch.empty_like(residual)
+    post_mix = torch.empty(
+        *outer_shape, hc_mult, 1, dtype=torch.float32, device=residual.device
+    )
+    comb_mix = torch.empty(
+        *outer_shape, hc_mult, hc_mult, dtype=torch.float32, device=residual.device
+    )
+    layer_input = torch.empty(
+        *outer_shape, hidden_size, dtype=torch.bfloat16, device=residual.device
+    )
+    return residual_cur, post_mix, comb_mix, layer_input
+
+
 direct_register_custom_op(
     op_name="mhc_pre_aiter",
     op_func=mhc_pre_aiter,
@@ -135,4 +214,10 @@ direct_register_custom_op(
     op_func=mhc_post_aiter,
     mutates_args=[],
     fake_impl=_mhc_post_aiter_fake,
+)
+direct_register_custom_op(
+    op_name="mhc_fused_post_pre_aiter",
+    op_func=mhc_fused_post_pre_aiter,
+    mutates_args=[],
+    fake_impl=_mhc_fused_post_pre_aiter_fake,
 )

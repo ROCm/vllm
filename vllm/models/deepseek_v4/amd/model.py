@@ -76,6 +76,17 @@ _USE_AITER_FUSED_MLP_PRESHUFFLE = (
     os.environ.get("VLLM_DSV4_AITER_FUSED_MLP_PRESHUFFLE", "0") == "1"
 )
 
+# Dev-only flag: also route the MLP/shared-expert gate_up_proj through aiter's
+# B-preshuffle GEMM. The gate_up weight is preshuffled once at load and the
+# (already RMS-normed) input is quantized to fp8 group-128 with a column-major
+# scale (per_group_quant_hip transpose_scale=True) -- the same recipe the
+# down-proj already uses, but for the gate_up GEMM, which is the dominant
+# non-preshuffled blockscale GEMM (ck cshuffle_v3<ABScale>) left in decode.
+# Mirrors ATOM, which preshuffles every dense fp8 GEMM. Requires the MLP fuse on.
+_USE_AITER_GATEUP_PRESHUFFLE = (
+    os.environ.get("VLLM_DSV4_AITER_GATEUP_PRESHUFFLE", "0") == "1"
+)
+
 
 class DeepseekV4MLP(nn.Module):
     def __init__(
@@ -142,6 +153,14 @@ class DeepseekV4MLP(nn.Module):
         # load (None unless _fused_preshuffle). Held separately so the eager
         # fallback (act_fn + down_proj) keeps using the unshuffled weight.
         self._fused_down_weight: torch.Tensor | None = None
+        # Optional gate_up_proj B-preshuffle (opt#2). Mirrors the down-proj
+        # preshuffle but for the gate_up GEMM. Built once at load; held
+        # separately so the eager fallback keeps using the original weight.
+        self._gateup_preshuffle = (
+            self._fused_act_quant and _USE_AITER_GATEUP_PRESHUFFLE
+        )
+        self._gateup_weight: torch.Tensor | None = None
+        self._gateup_weight_scale: torch.Tensor | None = None
 
     def prepare_fused_act_quant(self) -> None:
         """One-shot post-load setup for the fused clamped-SwiGLU + a8w8 path.
@@ -181,8 +200,53 @@ class DeepseekV4MLP(nn.Module):
                 self.down_proj.weight.data, layout=(16, 16)
             )
 
+        # opt#2: preshuffle the gate_up weight + decode its block weight scale,
+        # so forward() can run the gate_up GEMM through the B-preshuffle kernel.
+        if self._gateup_preshuffle:
+            from aiter.ops.shuffle import shuffle_weight
+
+            gws = getattr(self.gate_up_proj, "weight_scale", None)
+            if gws is None:
+                gws = getattr(self.gate_up_proj, "weight_scale_inv", None)
+            if gws is not None:
+                if gws.dtype == torch.float8_e8m0fnu:
+                    from vllm.model_executor.layers.quantization.utils.fp8_utils import (  # noqa: E501
+                        _upcast_e8m0_to_fp32,
+                    )
+
+                    gws = _upcast_e8m0_to_fp32(gws).contiguous()
+                self._gateup_weight_scale = gws
+                self._gateup_weight = shuffle_weight(
+                    self.gate_up_proj.weight.data, layout=(16, 16)
+                )
+
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        if self._gateup_weight is not None and x.dim() == 2:
+            # opt#2: fp8 group-128 quant (column-major scale) of the already
+            # RMS-normed input -> B-preshuffle gate_up GEMM. Same recipe as the
+            # down-proj path but for gate_up (the dominant cshuffle_v3<ABScale>
+            # GEMM in decode). gate_up_proj is ColumnParallel (output-sharded, no
+            # all-reduce), so bypassing its forward() is safe; the weight is the
+            # local shard. NOTE: eager-validated -- for cudagraph/torch.compile
+            # this raw aiter quant should be wrapped as a registered custom op
+            # (like fused_clamp_act_mul); kept inline here behind the dev flag.
+            from aiter.ops.quant import per_group_quant_hip
+
+            x_fp8, x_scale = per_group_quant_hip(
+                x.contiguous(),
+                quant_dtype=current_platform.fp8_dtype(),
+                group_size=128,
+                transpose_scale=True,
+            )
+            gate_up = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                x_fp8,
+                self._gateup_weight,
+                x_scale,
+                self._gateup_weight_scale,
+                output_dtype=x.dtype,
+            )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         if self._fused_down_weight_scale is not None and gate_up.dim() == 2:
             if self._fused_preshuffle:
                 # clamp+silu*mul + fp8 quant, column-major scale -> B-preshuffle

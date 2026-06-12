@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 # this import will also register the custom ops
@@ -9,6 +11,14 @@ from vllm.model_executor.custom_op import CustomOp
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
+
+# Route the mHC pre/post/fused-post-pre blocks through the AITER HIP kernels
+# (mhc_pre / mhc_post) instead of the tilelang kernels. These are ~2.2x lighter
+# (see ATOM) and were previously disabled in vLLM over an aiter accuracy bug at
+# large token counts; that bug is fixed upstream (ROCm/aiter b639cb63 "Fix
+# sqrsum store race", plus #3417 mhc_pre_big_fuse accuracy and #3396 fused
+# rmsnorm). Off by default; enable for DeepSeek-V4 on gfx950 with a recent aiter.
+_USE_AITER_MHC = os.environ.get("VLLM_DSV4_AITER_MHC", "0") == "1"
 
 
 # --8<-- [start:mhc_pre]
@@ -71,24 +81,28 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # TODO: Reenable aiter after we are at the aiter
-        # version that has this bugfix
-        # https://github.com/ROCm/aiter/commit/b639cb63bcac4672dce33a731fad042a65cb3649
-        # It has accuracy problem at large number of tokens.
-        # hidden_size = residual.shape[-1]
-        # if hidden_size % 256 == 0:
-        #     return torch.ops.vllm.mhc_pre_aiter(
-        #         residual,
-        #         fn,
-        #         hc_scale,
-        #         hc_base,
-        #         rms_eps,
-        #         hc_pre_eps,
-        #         hc_sinkhorn_eps,
-        #         hc_post_mult_value,
-        #         sinkhorn_repeat,
-        #     )
-        # else:
+        # AITER mHC kernels are ~2.2x lighter than tilelang (see ATOM). They were
+        # disabled here over an aiter accuracy bug at large token counts; that bug
+        # is fixed upstream (b639cb63 sqrsum race, #3417, #3396), so re-enable
+        # behind VLLM_DSV4_AITER_MHC. The aiter pre op has no fused-rmsnorm-into-pre
+        # path wired, so only take it when norm_weight is None (DSv4 norms separately).
+        if (
+            _USE_AITER_MHC
+            and norm_weight is None
+            and residual.shape[-1] % 256 == 0
+        ):
+            return torch.ops.vllm.mhc_pre_aiter(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
         if HAS_TILELANG:
             return torch.ops.vllm.mhc_pre_tilelang(
                 residual,
@@ -181,19 +195,12 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        # TODO: Reenable aiter after we are at the aiter
-        # version that has this bugfix
-        # https://github.com/ROCm/aiter/commit/b639cb63bcac4672dce33a731fad042a65cb3649
-        # It has accuracy problem at large number of tokens.
-        # hidden_size = residual.shape[-1]
-        # if hidden_size % 256 == 0:
-        #     return torch.ops.vllm.mhc_post_aiter(
-        #         x,
-        #         residual,
-        #         post_layer_mix,
-        #         comb_res_mix,
-        #     )
-        # else:
+        # See MHCPreOp.forward_hip: AITER mHC re-enabled behind VLLM_DSV4_AITER_MHC
+        # now that the upstream accuracy fixes are present.
+        if _USE_AITER_MHC and residual.shape[-1] % 256 == 0:
+            return torch.ops.vllm.mhc_post_aiter(
+                x, residual, post_layer_mix, comb_res_mix
+            )
         if HAS_TILELANG:
             return torch.ops.vllm.mhc_post_tilelang(
                 x, residual, post_layer_mix, comb_res_mix
@@ -373,6 +380,31 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # AITER has no single fused post+pre kernel; mhc_fused_post_pre_aiter
+        # composes the two lighter aiter kernels (post then pre) and is
+        # numerically equivalent. Gated on VLLM_DSV4_AITER_MHC; only when
+        # norm_weight is None (no fused-rmsnorm-into-pre path wired).
+        if (
+            _USE_AITER_MHC
+            and norm_weight is None
+            and residual.shape[-1] % 256 == 0
+        ):
+            return torch.ops.vllm.mhc_fused_post_pre_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+            )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,
