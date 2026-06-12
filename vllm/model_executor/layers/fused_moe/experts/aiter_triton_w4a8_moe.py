@@ -15,6 +15,8 @@ dedicated AITER_TRITON_W4A8 branch in oracle/mxfp4.py. Recipe validated
 numerically on gfx950 (scripts/validate_triton_a8w4.py).
 """
 
+import os
+
 import torch
 import triton
 
@@ -38,6 +40,10 @@ _FP8_MAX = 448.0
 # Single-CTA fused_routing_from_topk caps at NK=4096; above it (prefill chunks)
 # use a scalable torch argsort + the fast triton ExptData kernel.
 _FUSED_ROUTING_NK_MAX = 4096
+# Step 1 (leaner pipeline): fold the inter-stage requant into stage1's epilogue
+# via out_mx_quant. Toggle off to recover the original explicit 2-kernel requant
+# (for A/B accuracy isolation).
+_FOLD_REQUANT = os.environ.get("VLLM_DSV4_TRITON_FOLD_REQUANT", "1") == "1"
 
 
 def _routing_from_topk(topk_weights, topk_ids, n_experts, block_m):
@@ -153,6 +159,21 @@ class AiterTritonW4A8Experts(mk.FusedMoEExpertsModular):
         from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
         from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 
+        from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+            should_use_cdna4_mx_scale_swizzle,
+        )
+
+        # The weight scale's CDNA4 swizzle is applied at load time only when
+        # should_use_cdna4_mx_scale_swizzle() is true (gfx950 AND TP<=2; at
+        # TP>=4 the A8W4 dispatch uses BLOCK_K<256 tiles, incompatible with the
+        # 256-aligned CDNA4 scale swizzle). The kernel's swizzle_mx_scale arg
+        # MUST agree with what _swizzle_mxfp4 actually did — hardcoding
+        # "CDNA4_SCALE" at TP>=4 makes the kernel read an un-swizzled (Strided)
+        # scale as if CDNA4-swizzled, silently corrupting the per-block weight
+        # scales (coherent but ~18pt GSM8K loss at TP=8). Gate it like the
+        # non-modular aiter_mxfp4_w4a8_moe reference does.
+        swz = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
+
         qc = self.quant_config
         E = global_num_experts if global_num_experts > 0 else w1.shape[0]
         M = hidden_states.shape[0]
@@ -170,27 +191,39 @@ class AiterTritonW4A8Experts(mk.FusedMoEExpertsModular):
         unpadded_i = self.moe_config.intermediate_size_per_partition_unpadded
         unpadded_h = self.moe_config.hidden_dim_unpadded
 
-        # Stage 1 (gate+up, SILU) — dynamic mxfp8 (per-1x32) activation -> bf16.
+        # Stage 1 (gate+up, SILU) — dynamic mxfp8 (per-1x32) activation.
         # mxfp8 is far finer than per-tensor fp8: per-tensor crushes precision on
         # real activations with outlier channels, degrading generation quality.
         x_q, x_sc = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
-        inter = moe_gemm_a8w4(
+        # Leaner pipeline (decode): fold the inter-stage requant into stage1's
+        # epilogue. out_mx_quant=True makes stage1 emit (fp8 e4m3, ue8m0 per-1x32
+        # scale) straight from the GEMM write-back — exactly stage2's input — so
+        # the standalone _downcast_to_mxfp kernel between the stages is removed
+        # (−1 launch + −1 HBM round-trip / layer). The mx-out epilogue requires
+        # split_k==1, which holds for the whole fused-routing range (NK<=4096,
+        # i.e. decode); prefill (NK>4096, where split_k may be >1) keeps the
+        # explicit 2-kernel requant. Same tuned stage1 config either way.
+        fold_requant = _FOLD_REQUANT and topk_ids.numel() <= _FUSED_ROUTING_NK_MAX
+        stage1 = moe_gemm_a8w4(
             x_q, w1.storage.data, x_sc, qc.w1_precision.weight_scale.storage.data,
             None, None, qc.w1_bias, routing_data, gather_indx=gather_idx,
-            swizzle_mx_scale="CDNA4_SCALE", out_dtype=torch.bfloat16,
+            swizzle_mx_scale=swz, out_dtype=torch.bfloat16,
             apply_swiglu=True, alpha=1.0, limit=swiglu_limit,
-            swiglu_add_residual=False,
+            swiglu_add_residual=False, out_mx_quant=fold_requant,
             unpadded_N=unpadded_i * 2 if unpadded_i else None,
             unpadded_K=unpadded_h,
         )
+        if fold_requant:
+            i_q, i_sc = stage1  # (fp8 values, ue8m0 per-1x32 scales) from epilogue
+        else:
+            i_q, i_sc = downcast_to_mxfp(stage1, torch.float8_e4m3fn, axis=-1)
 
-        # Inter-stage mxfp8 requant, then Stage 2 (down) with gammas.
-        i_q, i_sc = downcast_to_mxfp(inter, torch.float8_e4m3fn, axis=-1)
+        # Stage 2 (down) with gammas.
         out = moe_gemm_a8w4(
             i_q, w2.storage.data, i_sc, qc.w2_precision.weight_scale.storage.data,
             None, None, qc.w2_bias, routing_data, scatter_indx=scatter_idx,
             gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
-            swizzle_mx_scale="CDNA4_SCALE", out_dtype=torch.bfloat16,
+            swizzle_mx_scale=swz, out_dtype=torch.bfloat16,
             unpadded_N=unpadded_h, unpadded_K=unpadded_i,
         )
         output.copy_(out.view(output.shape))
