@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from importlib.util import find_spec
 
 import torch
@@ -919,6 +920,130 @@ def dequant_wo_a_bf16(
     return wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(torch.bfloat16)
 
 
+# Opt-out for the fused inverse-RoPE kernel (falls back to the eager add/mul/neg
+# reference). On by default; falls back automatically if the kernel or the GPT-J
+# cos_sin_cache layout is unavailable.
+_USE_FUSED_INV_ROPE = os.environ.get("VLLM_DSV4_FUSED_INV_ROPE", "1") == "1"
+
+
+@triton.jit
+def _inv_rope_gptj_kernel(
+    x_ptr,
+    cos_ptr,
+    sin_ptr,
+    pos_ptr,
+    stride_x_s,
+    stride_x_h,
+    stride_x_d,
+    stride_cos_s,
+    stride_cos_d,
+    S,
+    BLOCK_S: tl.constexpr,
+    BLOCK_RD: tl.constexpr,
+    BLOCK_RD_HALF: tl.constexpr,
+):
+    """In-place GPT-J inverse RoPE on the rope slice of the attention output.
+
+    Ported from ROCm/ATOM (atom/model_ops/v4_kernels/inverse_rope.py, MIT) — one
+    kernel that indexes the cos/sin cache by position and applies the inverse
+    rotation, replacing the eager freqs-index + add/mul/neg path.
+    """
+    pid_h = tl.program_id(0)
+    pid_s = tl.program_id(1)
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    d_offs = tl.arange(0, BLOCK_RD)
+    s_mask = s_offs < S
+    pos = tl.load(pos_ptr + s_offs, mask=s_mask)
+    # GPT-J + reuse_freqs_front_part: cos/sin hold rd//2 entries, each shared by
+    # a pair of adjacent elements -> freq index = d_offs // 2.
+    d_cos_offs = d_offs // 2
+    cos_offs = pos[:, None] * stride_cos_s + d_cos_offs[None, :] * stride_cos_d
+    cos_mask = s_mask[:, None] & (d_cos_offs < BLOCK_RD_HALF)[None, :]
+    cos = tl.load(cos_ptr + cos_offs, mask=cos_mask)
+    sin = tl.load(sin_ptr + cos_offs, mask=cos_mask)
+    x_offs = (
+        s_offs[:, None] * stride_x_s
+        + pid_h * stride_x_h
+        + d_offs[None, :] * stride_x_d
+    )
+    x_mask = s_mask[:, None] & (d_offs < BLOCK_RD)[None, :]
+    x = tl.load(x_ptr + x_offs, mask=x_mask)
+    # Inverse GPT-J rotation (conjugate of forward):
+    #   out[2i]   =  x[2i]*cos + x[2i+1]*sin
+    #   out[2i+1] = -x[2i]*sin + x[2i+1]*cos
+    x_sin = x * sin
+    even_mask = (d_offs % 2 == 0)[None, :]
+    x_neg = tl.where(even_mask, -x_sin, x_sin)
+    x_neg = tl.reshape(x_neg, (BLOCK_S, BLOCK_RD_HALF, 2))
+    x_neg = tl.flip(x_neg, 2)
+    x_rot = tl.reshape(x_neg, (BLOCK_S, BLOCK_RD))
+    out = (x * cos + x_rot).to(x_ptr.dtype.element_ty)
+    tl.store(x_ptr + x_offs, out, mask=x_mask)
+
+
+def _apply_inv_rope_atom(
+    rotary_emb: torch.nn.Module,
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+) -> torch.Tensor | None:
+    """Fused GPT-J inverse-RoPE on o's last ``rope_dim`` dims (ATOM-style), via
+    ``_inv_rope_gptj_kernel``, replacing the eager add/mul/neg reference. Returns
+    a contiguous ``[T, H, head_dim]`` tensor with the rope slice un-rotated, or
+    ``None`` to fall back to eager (non-GPT-J layout / missing cache / kernel
+    error). Numerically validated vs the eager GPT-J ref on gfx950
+    (scripts/validate_inv_rope_aiter.py: maxΔ≈4e-3, 100% close).
+    """
+    if not _USE_FUSED_INV_ROPE:
+        return None
+    if getattr(rotary_emb, "is_neox_style", False):
+        return None  # only the GPT-J cos_sin_cache layout is handled here
+    cache = getattr(rotary_emb, "cos_sin_cache", None)
+    half = rope_dim // 2
+    if rope_dim == 0 or cache is None or cache.shape[-1] < 2 * half:
+        return None
+    # cos / sin views are a load-time constant table; materialise once in o.dtype.
+    cos = getattr(rotary_emb, "_mla_inv_cos", None)
+    sin = getattr(rotary_emb, "_mla_inv_sin", None)
+    if (
+        cos is None
+        or sin is None
+        or cos.dtype != o.dtype
+        or cos.device != o.device
+    ):
+        cos = cache[:, :half].contiguous().to(o.dtype)
+        sin = cache[:, half : 2 * half].contiguous().to(o.dtype)
+        rotary_emb._mla_inv_cos = cos
+        rotary_emb._mla_inv_sin = sin
+    try:
+        nope = o.shape[-1] - rope_dim
+        # o is a (padded-head) slice -> make contiguous for the kernel + .view().
+        o_c = o.contiguous()
+        rope = o_c[..., nope:]  # strided view [T, H, rope_dim]; kernel reads strides
+        S, H, rd = rope.shape
+        BLOCK_RD = triton.next_power_of_2(rd)
+        grid = (H, triton.cdiv(S, 32))
+        _inv_rope_gptj_kernel[grid](
+            rope,
+            cos,
+            sin,
+            positions.to(torch.int32),
+            rope.stride(0),
+            rope.stride(1),
+            rope.stride(2),
+            cos.stride(0),
+            cos.stride(1),
+            S,
+            BLOCK_S=32,
+            BLOCK_RD=BLOCK_RD,
+            BLOCK_RD_HALF=BLOCK_RD // 2,
+            num_warps=4,
+        )
+        return o_c
+    except Exception:
+        return None
+
+
 def rocm_inv_rope_einsum(
     rotary_emb: torch.nn.Module,
     o: torch.Tensor,
@@ -934,9 +1059,10 @@ def rocm_inv_rope_einsum(
     wo_a_bf16: optional precomputed BF16 [groups, rank, hidden] weight (decoded
     once at load). When provided, the per-step wo_a dequant is skipped.
     """
-    o_ref = _apply_inv_rope_ref(rotary_emb, o, positions, rope_head_dim).to(
-        torch.bfloat16
-    )
+    o_ref = _apply_inv_rope_atom(rotary_emb, o, positions, rope_head_dim)
+    if o_ref is None:
+        o_ref = _apply_inv_rope_ref(rotary_emb, o, positions, rope_head_dim)
+    o_ref = o_ref.to(torch.bfloat16)
     o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
 
     if wo_a_bf16 is None:
