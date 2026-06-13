@@ -134,7 +134,6 @@ MoEBackend = Literal[
     "triton_unfused",
     "aiter",
     "aiter_flydsl",
-    "aiter_triton_a8w4",
     "emulation",
 ]
 
@@ -190,8 +189,6 @@ class KernelConfig:
     - "aiter": Use AMD AITer kernels (ROCm only)
     - "aiter_flydsl": Use AMD AITER FlyDSL MXFP4 W4A8 MoE kernels with FP8
       activations (ROCm gfx950 only; requires the flydsl package)
-    - "aiter_triton_a8w4": Use AMD AITER Triton moe_gemm_a8w4 MXFP4 W4A8 MoE
-      kernels with dynamic FP8 activations (ROCm gfx950 only)
     - "emulation": use BF16/FP16 GEMM, dequantizing weights and
                    running QDQ on activations.
     """

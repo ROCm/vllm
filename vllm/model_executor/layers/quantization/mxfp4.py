@@ -341,12 +341,12 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
 
-        # For TRITON backends (incl. AITER_TRITON_W4A8), weights are wrapped
+        # For TRITON backends (incl. AITER_MXFP4_MXFP8), weights are wrapped
         # triton_kernels tensors + PrecisionConfig scales that don't support
         # .detach(). Manually assign; store the precision configs on self.
         _precision_cfg_backends = (
             *TRITON_BACKENDS,
-            Mxfp4MoeBackend.AITER_TRITON_W4A8,
+            Mxfp4MoeBackend.AITER_MXFP4_MXFP8,
         )
         if self.mxfp4_backend not in _precision_cfg_backends:
             replace_parameter(layer, "w13_weight", w13)
@@ -407,7 +407,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias = getattr(layer, "w2_bias", None)
 
         if self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_TRITON_W4A8
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP8
         ):
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
@@ -695,12 +695,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
 
-        # For TRITON backends (incl. AITER_TRITON_W4A8), weights are wrapped
+        # For TRITON backends (incl. AITER_MXFP4_MXFP8), weights are wrapped
         # triton_kernels tensors + PrecisionConfig scales that don't support
         # .detach(). Manually assign; store the precision configs on self.
         _precision_cfg_backends = (
             *TRITON_BACKENDS,
-            Mxfp4MoeBackend.AITER_TRITON_W4A8,
+            Mxfp4MoeBackend.AITER_MXFP4_MXFP8,
         )
         if self.mxfp4_backend not in _precision_cfg_backends:
             replace_parameter(layer, "w13_weight", w13)
@@ -763,7 +763,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         swiglu_limit = getattr(layer, "swiglu_limit", None)
 
         if self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_TRITON_W4A8
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP8
         ):
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
