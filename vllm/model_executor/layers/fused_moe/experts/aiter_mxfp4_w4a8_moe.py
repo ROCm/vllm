@@ -27,20 +27,6 @@ __all__ = [
 ]
 
 
-@functools.cache
-def _aiter_mxfp4_mxfp8_supported() -> bool:
-    """Whether the installed aiter exposes the grouped routing API this backend
-    needs.
-    """
-    import inspect
-
-    try:
-        from aiter.ops.triton.moe.moe_routing.routing import routing
-    except ImportError:
-        return False
-    return "use_grouped_topk" in inspect.signature(routing).parameters
-
-
 def aiter_triton_kernel_w4a8_moe_forward(
     hidden_states: torch.Tensor,
     w1,  # Tensor or triton_kernels.Tensor
@@ -63,7 +49,7 @@ def aiter_triton_kernel_w4a8_moe_forward(
         and quant_config.use_mxfp4_w4a8
         and rocm_aiter_ops.is_enabled()
     )
-    from aiter.ops.triton.moe.moe_routing.routing import routing as aiter_routing
+    from aiter.ops.triton.moe_routing.routing import routing as aiter_routing
 
     routing_data, gather_idx, scatter_idx = aiter_routing(
         gating_output, topk, sm_first=not renormalize
@@ -108,10 +94,10 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
     unpadded_K_w1=None,
     unpadded_N_w2=None,
     unpadded_K_w2=None,
-    dynamic_mxfp8_act: bool = False,
-    fold_inter_stage_requant: bool = False,
 ) -> torch.Tensor:
     assert quant_config is not None
+    # type check, uint8 means mxfp4
+    assert hidden_states.dtype == torch.bfloat16
     assert quant_config.w1_bias is None or quant_config.w1_bias.dtype == torch.float32
     assert quant_config.w2_bias is None or quant_config.w2_bias.dtype == torch.float32
 
@@ -127,14 +113,13 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
 
     gammas = routing_data.gate_scal if routing_data else None
 
-    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
+    from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4
+    from aiter.ops.triton.quant_moe import downcast_to_static_fp8
 
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         should_use_cdna4_mx_scale_swizzle,
     )
 
-    # Load-time scale swizzle (_swizzle_mxfp4) and this kernel arg must agree;
-    # both gate on the same predicate (gfx950 AND TP<=2).
     _swizzle_mx_scale = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
 
     assert quant_config.w1_precision is not None, (
@@ -143,71 +128,6 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
     assert quant_config.w2_precision is not None, (
         "w2_precision in quant config can't be None"
     )
-
-    if dynamic_mxfp8_act:
-        # Dynamic per-1x32 mxfp8 activations (dual-mode): if the caller already
-        # quantized (fp8 values + a1q_scale, e.g. via the prepare step), use it
-        # as-is; otherwise quantize the bf16 input here. The inter-stage requant
-        # is folded into stage1's out_mx_quant epilogue at decode (split_k==1);
-        # prefill uses the explicit 2-kernel requant.
-        if hidden_states.dtype == torch.float8_e4m3fn:
-            assert a1q_scale is not None, (
-                "pre-quantized fp8 activations require a1q_scale"
-            )
-            x_q, x_sc = hidden_states, a1q_scale
-        else:
-            from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-
-            x_q, x_sc = downcast_to_mxfp(
-                hidden_states, torch.float8_e4m3fn, axis=-1
-            )
-        stage1 = moe_gemm_a8w4(
-            x_q,
-            w1.storage.data,
-            x_sc,
-            quant_config.w1_precision.weight_scale.storage.data,
-            None,
-            None,
-            quant_config.w1_bias,
-            routing_data,
-            gather_indx=gather_indx,
-            gammas=gammas if apply_router_weight_on_input else None,
-            swizzle_mx_scale=_swizzle_mx_scale,
-            out_dtype=torch.bfloat16,
-            apply_swiglu=True,
-            alpha=swiglu_alpha,
-            limit=swiglu_limit,
-            swiglu_add_residual=False,
-            out_mx_quant=fold_inter_stage_requant,
-            unpadded_N=unpadded_N_w1,
-            unpadded_K=unpadded_K_w1,
-        )
-        if fold_inter_stage_requant:
-            inter_q, inter_sc = stage1
-        else:
-            inter_q, inter_sc = downcast_to_mxfp(
-                stage1, torch.float8_e4m3fn, axis=-1
-            )
-        return moe_gemm_a8w4(
-            inter_q,
-            w2.storage.data,
-            inter_sc,
-            quant_config.w2_precision.weight_scale.storage.data,
-            None,
-            None,
-            quant_config.w2_bias,
-            routing_data,
-            scatter_indx=scatter_indx,
-            gammas=None if apply_router_weight_on_input else gammas,
-            swizzle_mx_scale=_swizzle_mx_scale,
-            out_dtype=torch.bfloat16,
-            unpadded_N=unpadded_N_w2,
-            unpadded_K=unpadded_K_w2,
-        )
-
-    # Static per-tensor FP8 activation path: quantizes a bf16 input.
-    assert hidden_states.dtype == torch.bfloat16
-    from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
     hidden_states = downcast_to_static_fp8(
         hidden_states, quant_config.w1_precision.flex_ctx.lhs_data.scale
@@ -257,8 +177,8 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
     Monolithic MXFP4 W4A8 expert using AITER triton kernels.
 
     This backend uses:
-    - aiter.ops.triton.moe.moe_routing.routing for routing
-    - aiter.ops.triton.moe.moe_op_gemm_a8w4.moe_gemm_a8w4 for computation
+    - aiter.ops.triton.moe_routing.routing for routing
+    - aiter.ops.triton.moe_op_gemm_a8w4.moe_gemm_a8w4 for computation
 
     Weight format: MXFP4 weights with GFX950 swizzle
     Activation: Static FP8 quantization
@@ -378,6 +298,134 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         )
 
 
+# ---------------------------------------------------------------------------
+# DeepSeek-V4 MXFP4 weights + dynamic per-1x32 MXFP8 activations.
+#
+# Self-contained: this section does not modify the gpt-oss W4A8 path above. It
+# routes from logits via aiter's grouped routing() (noaux_tc) and runs its own
+# two-stage moe_gemm_a8w4 with dynamic mxfp8 activation quantization.
+#
+# This backend requires a newer aiter (grouped routing API), so it imports the
+# canonical aiter.ops.triton.moe.* layout directly, rather than the flat
+# backward-compat aliases the gpt-oss path above uses for older-aiter support.
+# ---------------------------------------------------------------------------
+
+
+@functools.cache
+def _aiter_mxfp4_mxfp8_supported() -> bool:
+    """Whether the installed aiter exposes the grouped routing API this backend
+    needs.
+    """
+    import inspect
+
+    try:
+        from aiter.ops.triton.moe.moe_routing.routing import routing
+    except ImportError:
+        return False
+    return "use_grouped_topk" in inspect.signature(routing).parameters
+
+
+def _aiter_mxfp4_mxfp8_fused_experts(
+    hidden_states: torch.Tensor,
+    w1,  # Tensor or triton_kernels.Tensor
+    w2,  # Tensor or triton_kernels.Tensor
+    routing_data,  # RoutingData
+    gather_indx,  # GatherIndx
+    scatter_indx,  # ScatterIndx
+    quant_config: FusedMoEQuantConfig,
+    swiglu_alpha: float = 1.0,
+    swiglu_limit: float = 1e30,
+    apply_router_weight_on_input: bool = False,
+    a1q_scale: torch.Tensor | None = None,
+    unpadded_N_w1=None,
+    unpadded_K_w1=None,
+    unpadded_N_w2=None,
+    unpadded_K_w2=None,
+    fold_inter_stage_requant: bool = False,
+) -> torch.Tensor:
+    """MXFP4 weights + dynamic per-1x32 MXFP8 activations, two-stage moe_gemm_a8w4.
+
+    The inter-stage mxfp8 requant is folded into stage1's ``out_mx_quant``
+    epilogue when ``fold_inter_stage_requant`` is set (decode; requires
+    split_k == 1); otherwise an explicit requant runs between the two GEMMs.
+    """
+    assert quant_config is not None
+    assert quant_config.w1_bias is None or quant_config.w1_bias.dtype == torch.float32
+    assert quant_config.w2_bias is None or quant_config.w2_bias.dtype == torch.float32
+    assert hidden_states.shape[-1] == w1.shape[-2]
+    assert w2.shape[-1] == w1.shape[1]
+    assert quant_config.w1_precision is not None, (
+        "w1_precision in quant config can't be None"
+    )
+    assert quant_config.w2_precision is not None, (
+        "w2_precision in quant config can't be None"
+    )
+
+    gammas = routing_data.gate_scal if routing_data else None
+
+    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+
+    from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
+        should_use_cdna4_mx_scale_swizzle,
+    )
+
+    # Load-time scale swizzle (_swizzle_mxfp4) and this kernel arg must agree;
+    # both gate on the same predicate (gfx950 AND TP<=2).
+    swizzle = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
+
+    # Dual-mode input: a pre-quantized fp8 activation (+a1q_scale, e.g. from the
+    # prepare step) is used as-is; otherwise quantize the bf16 input here.
+    if hidden_states.dtype == torch.float8_e4m3fn:
+        assert a1q_scale is not None, "pre-quantized fp8 activations require a1q_scale"
+        x_q, x_sc = hidden_states, a1q_scale
+    else:
+        x_q, x_sc = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+
+    stage1 = moe_gemm_a8w4(
+        x_q,
+        w1.storage.data,
+        x_sc,
+        quant_config.w1_precision.weight_scale.storage.data,
+        None,
+        None,
+        quant_config.w1_bias,
+        routing_data,
+        gather_indx=gather_indx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=swizzle,
+        out_dtype=torch.bfloat16,
+        apply_swiglu=True,
+        alpha=swiglu_alpha,
+        limit=swiglu_limit,
+        swiglu_add_residual=False,
+        out_mx_quant=fold_inter_stage_requant,
+        unpadded_N=unpadded_N_w1,
+        unpadded_K=unpadded_K_w1,
+    )
+    if fold_inter_stage_requant:
+        inter_q, inter_sc = stage1
+    else:
+        inter_q, inter_sc = downcast_to_mxfp(stage1, torch.float8_e4m3fn, axis=-1)
+
+    return moe_gemm_a8w4(
+        inter_q,
+        w2.storage.data,
+        inter_sc,
+        quant_config.w2_precision.weight_scale.storage.data,
+        None,
+        None,
+        quant_config.w2_bias,
+        routing_data,
+        scatter_indx=scatter_indx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=swizzle,
+        out_dtype=torch.bfloat16,
+        unpadded_N=unpadded_N_w2,
+        unpadded_K=unpadded_K_w2,
+    )
+
+
 class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
     """
     Monolithic MXFP4 W4A8 expert using AITER triton kernels, for DeepSeek-V4.
@@ -459,9 +507,7 @@ class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        # Take bf16 and self-quantize to per-1x32 mxfp8 in-class. The shared
-        # helper also accepts pre-quantized mxfp8 (fp8 + a1q_scale); a caller
-        # that pre-quantizes to that layout would set this False.
+        # Take bf16 and self-quantize to per-1x32 mxfp8
         return True
 
     def apply(
@@ -510,25 +556,21 @@ class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         swiglu_limit = (
             qc.gemm1_clamp_limit if qc.gemm1_clamp_limit is not None else 1e30
         )
-        return triton_kernel_fused_mxfp4_w4a8_experts(
-            None,
+        return _aiter_mxfp4_mxfp8_fused_experts(
             hidden_states,
             w1,
             w2,
             routing_data,
             gather_idx,
             scatter_idx,
-            activation="silu",
             quant_config=qc,
             swiglu_alpha=1.0,
             swiglu_limit=swiglu_limit,
             apply_router_weight_on_input=apply_router_weight_on_input,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
+            a1q_scale=a1q_scale,
             unpadded_N_w1=unpadded_i * 2,
             unpadded_K_w1=unpadded_h,
             unpadded_N_w2=unpadded_h,
             unpadded_K_w2=unpadded_i,
-            dynamic_mxfp8_act=True,
             fold_inter_stage_requant=fold,
         )
