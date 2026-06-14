@@ -526,7 +526,12 @@ class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
+        # DeepSeek-V4 hash-layer routing (experts looked up by token id)
+        input_ids: torch.Tensor | None = None,
+        hash_indices_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        import triton
+
         from aiter.ops.triton.moe.moe_routing.routing import routing
 
         qc = self.quant_config
@@ -534,20 +539,45 @@ class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         assert self.moe_config.intermediate_size_per_partition_unpadded is not None
         assert self.moe_config.hidden_dim_unpadded is not None
 
-        # DSv4 noaux_tc: sqrtsoftplus score + correction bias + (grouped) top-k +
-        # renorm + scale, done by aiter's scalable all-Triton routing (any NK).
-        use_grouped = num_expert_group is not None and num_expert_group > 1
-        routing_data, gather_idx, scatter_idx = routing(
-            router_logits,
-            self.topk,
-            score_mode="sqrtsoftplus",
-            bias=e_score_correction_bias,
-            renorm=True,
-            routed_scaling_factor=routed_scaling_factor or 1.0,
-            use_grouped_topk=use_grouped,
-            num_expert_group=num_expert_group,
-            topk_group=topk_group,
-        )
+        rsf = routed_scaling_factor or 1.0
+        if hash_indices_table is not None:
+            # DSv4 hash MoE layer: a token's experts come from the tid2eid table
+            # (looked up by token id), not logits top-k. aiter's routing_from_hash
+            # does the lookup + sqrtsoftplus score + renorm + scale in one kernel.
+            # Hash layers do not use e_score_correction_bias.
+            assert input_ids is not None, "DSv4 hash MoE routing requires input_ids"
+            from aiter.ops.triton.moe.moe_routing.routing import routing_from_hash
+
+            E = global_num_experts if global_num_experts > 0 else w1.shape[0]
+            M = router_logits.shape[0]
+            block_m = max(
+                16, min(triton.next_power_of_2(max(M * self.topk // E, 1)), 128)
+            )
+            routing_data, gather_idx, scatter_idx = routing_from_hash(
+                router_logits,
+                hash_indices_table,
+                input_ids,
+                self.topk,
+                block_m,
+                score_mode="sqrtsoftplus",
+                renorm=True,
+                routed_scaling_factor=rsf,
+            )
+        else:
+            # DSv4 noaux_tc: sqrtsoftplus score + correction bias + (grouped)
+            # top-k + renorm + scale, done by aiter's scalable all-Triton routing.
+            use_grouped = num_expert_group is not None and num_expert_group > 1
+            routing_data, gather_idx, scatter_idx = routing(
+                router_logits,
+                self.topk,
+                score_mode="sqrtsoftplus",
+                bias=e_score_correction_bias,
+                renorm=True,
+                routed_scaling_factor=rsf,
+                use_grouped_topk=use_grouped,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
 
         unpadded_i = self.moe_config.intermediate_size_per_partition_unpadded
         unpadded_h = self.moe_config.hidden_dim_unpadded

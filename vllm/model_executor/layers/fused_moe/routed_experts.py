@@ -1106,6 +1106,7 @@ class RoutedExperts(PluggableLayer):
         x: torch.Tensor,
         router_logits: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
+        hash_indices_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -1119,6 +1120,8 @@ class RoutedExperts(PluggableLayer):
             x: Input tensor after any transforms
             router_logits: Router logits (for monolithic kernels)
             input_ids: input ids for DeepSeek V4
+            hash_indices_table: DeepSeek-V4 hash-layer tid2eid table (from the
+                router); when set, monolithic kernels route via token-id lookup.
 
         Returns:
             Output tensor from routed experts
@@ -1131,6 +1134,7 @@ class RoutedExperts(PluggableLayer):
             x=x,
             router_logits=router_logits,
             input_ids=input_ids,
+            hash_indices_table=hash_indices_table,
         )
 
     def forward(
