@@ -36,6 +36,8 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
 
+_PRECISION_CONFIG_BACKENDS = (*TRITON_BACKENDS, Mxfp4MoeBackend.AITER_MXFP4_MXFP8)
+
 
 class Mxfp4Config(QuantizationConfig):
     """Canonical base config for MXFP4 quantization.
@@ -341,14 +343,9 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
 
-        # For TRITON backends (incl. AITER_MXFP4_MXFP8), weights are wrapped
-        # triton_kernels tensors + PrecisionConfig scales that don't support
-        # .detach(). Manually assign; store the precision configs on self.
-        _precision_cfg_backends = (
-            *TRITON_BACKENDS,
-            Mxfp4MoeBackend.AITER_MXFP4_MXFP8,
-        )
-        if self.mxfp4_backend not in _precision_cfg_backends:
+        # For TRITON backends, weights are wrapped tensors from triton_kernels
+        # that don't support .detach(). Manually assign parameters.
+        if self.mxfp4_backend not in _PRECISION_CONFIG_BACKENDS:
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             replace_parameter(layer, "w13_weight_scale", w13_scale)
@@ -406,9 +403,7 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
         w1_bias = getattr(layer, "w13_bias", None)
         w2_bias = getattr(layer, "w2_bias", None)
 
-        if self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP8
-        ):
+        if self.mxfp4_backend in _PRECISION_CONFIG_BACKENDS:
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
             w1_scale = self.w13_precision_config
@@ -480,11 +475,6 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            # DSv4 routing params (monolithic kernels route internally).
-            num_expert_group=layer.num_expert_group,
-            e_score_correction_bias=layer.e_score_correction_bias,
-            routed_scaling_factor=layer.routed_scaling_factor,
-            topk_group=layer.topk_group,
             input_ids=input_ids,
             hash_indices_table=hash_indices_table,
         )
@@ -703,14 +693,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
         )
 
-        # For TRITON backends (incl. AITER_MXFP4_MXFP8), weights are wrapped
-        # triton_kernels tensors + PrecisionConfig scales that don't support
-        # .detach(). Manually assign; store the precision configs on self.
-        _precision_cfg_backends = (
-            *TRITON_BACKENDS,
-            Mxfp4MoeBackend.AITER_MXFP4_MXFP8,
-        )
-        if self.mxfp4_backend not in _precision_cfg_backends:
+        # For TRITON backends, weights are wrapped tensors from triton_kernels
+        # that don't support .detach(). Manually assign parameters.
+        if self.mxfp4_backend not in _PRECISION_CONFIG_BACKENDS:
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             replace_parameter(layer, "w13_weight_scale", w13_scale)
@@ -770,9 +755,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias = getattr(layer, "w2_bias", None)
         swiglu_limit = getattr(layer, "swiglu_limit", None)
 
-        if self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP8
-        ):
+        if self.mxfp4_backend in _PRECISION_CONFIG_BACKENDS:
             assert self.w13_precision_config is not None
             assert self.w2_precision_config is not None
             w1_scale = self.w13_precision_config
@@ -842,7 +825,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            # DSv4 routing params (monolithic kernels route internally).
+            # Monolithic routes internally, so pass the routing config the router
+            # would use (routed_scaling_factor is already output-scale-adjusted).
             num_expert_group=layer.num_expert_group,
             e_score_correction_bias=layer.e_score_correction_bias,
             routed_scaling_factor=layer.routed_scaling_factor,

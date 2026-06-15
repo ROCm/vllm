@@ -1490,7 +1490,10 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         e, n, k = w13_weight.shape
         w13_weight = (
-            w13_weight.view(e, 2, n // 2, k).permute(0, 2, 1, 3).reshape(e, n, k).contiguous()
+            w13_weight.view(e, 2, n // 2, k)
+            .permute(0, 2, 1, 3)
+            .reshape(e, n, k)
+            .contiguous()
         )
         w13_weight_scale = (
             w13_weight_scale.view(e, 2, n // 2, -1)
@@ -1648,8 +1651,8 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.AITER_MXFP4_FP8,
         Mxfp4MoeBackend.AITER_MXFP4_MXFP8,
     ):
-        # W4A8: MXFP4 weights + FP8 activations (static for the gpt-oss
-        # AITER_MXFP4_FP8 path; dynamic per-1x32 mxfp8 for AITER_MXFP4_MXFP8).
+        # W4A8: MXFP4 weights + FP8 activations (static for AITER_MXFP4_FP8;
+        # dynamic per-1x32 mxfp8, quantized in-kernel, for AITER_MXFP4_MXFP8).
         return mxfp4_w4a8_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,

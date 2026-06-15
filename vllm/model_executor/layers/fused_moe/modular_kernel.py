@@ -1470,8 +1470,7 @@ class FusedMoEKernelMonolithicImpl:
             defer_input_quant=self.fused_experts.expects_unquantized_inputs,
         )
 
-        # Forward DeepSeek-V4 hash-layer routing inputs only to backends that
-        # declare them, so other monolithic backends are unaffected.
+        # Only pass hash-routing inputs to backends that declare them.
         extra_kwargs: dict = {}
         _apply_params = inspect.signature(self.fused_experts.apply).parameters
         if "input_ids" in _apply_params:

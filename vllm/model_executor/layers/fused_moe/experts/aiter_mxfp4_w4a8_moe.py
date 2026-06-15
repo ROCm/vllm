@@ -298,31 +298,20 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         )
 
 
-# ---------------------------------------------------------------------------
-# DeepSeek-V4 MXFP4 weights + dynamic per-1x32 MXFP8 activations.
-#
-# Self-contained: this section does not modify the gpt-oss W4A8 path above. It
-# routes from logits via aiter's grouped routing() (noaux_tc) and runs its own
-# two-stage moe_gemm_a8w4 with dynamic mxfp8 activation quantization.
-#
-# This backend requires a newer aiter (grouped routing API), so it imports the
-# canonical aiter.ops.triton.moe.* layout directly, rather than the flat
-# backward-compat aliases the gpt-oss path above uses for older-aiter support.
-# ---------------------------------------------------------------------------
-
-
 @functools.cache
 def _aiter_mxfp4_mxfp8_supported() -> bool:
-    """Whether the installed aiter exposes the grouped routing API this backend
-    needs.
-    """
+    """Whether the installed aiter exposes the routing APIs this backend needs."""
     import inspect
 
     try:
-        from aiter.ops.triton.moe.moe_routing.routing import routing
-    except ImportError:
+        from aiter.ops.triton.moe.moe_routing.routing import (  # noqa: F401
+            routing,
+            routing_from_hash,
+        )
+
+        return "use_grouped_topk" in inspect.signature(routing).parameters
+    except Exception:
         return False
-    return "use_grouped_topk" in inspect.signature(routing).parameters
 
 
 def _aiter_mxfp4_mxfp8_fused_experts(
@@ -343,12 +332,7 @@ def _aiter_mxfp4_mxfp8_fused_experts(
     unpadded_K_w2=None,
     fold_inter_stage_requant: bool = False,
 ) -> torch.Tensor:
-    """MXFP4 weights + dynamic per-1x32 MXFP8 activations, two-stage moe_gemm_a8w4.
-
-    The inter-stage mxfp8 requant is folded into stage1's ``out_mx_quant``
-    epilogue when ``fold_inter_stage_requant`` is set (decode; requires
-    split_k == 1); otherwise an explicit requant runs between the two GEMMs.
-    """
+    """MXFP4 weights + dynamic per-1x32 MXFP8 activations, two-stage moe_gemm_a8w4."""
     assert quant_config is not None
     assert quant_config.w1_bias is None or quant_config.w1_bias.dtype == torch.float32
     assert quant_config.w2_bias is None or quant_config.w2_bias.dtype == torch.float32
@@ -526,12 +510,11 @@ class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         e_score_correction_bias: torch.Tensor | None = None,
         routed_scaling_factor: float | None = None,
         topk_group: int | None = None,
-        # DeepSeek-V4 hash-layer routing (experts looked up by token id)
+        # DeepSeek-V4 hash-layer routing
         input_ids: torch.Tensor | None = None,
         hash_indices_table: torch.Tensor | None = None,
     ) -> torch.Tensor:
         import triton
-
         from aiter.ops.triton.moe.moe_routing.routing import routing
 
         qc = self.quant_config
@@ -541,10 +524,8 @@ class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
 
         rsf = routed_scaling_factor or 1.0
         if hash_indices_table is not None:
-            # DSv4 hash MoE layer: a token's experts come from the tid2eid table
-            # (looked up by token id), not logits top-k. aiter's routing_from_hash
-            # does the lookup + sqrtsoftplus score + renorm + scale in one kernel.
-            # Hash layers do not use e_score_correction_bias.
+            # DSv4 hash layer: experts come from the tid2eid table (by token id),
+            # not logits top-k
             assert input_ids is not None, "DSv4 hash MoE routing requires input_ids"
             from aiter.ops.triton.moe.moe_routing.routing import routing_from_hash
 
@@ -564,8 +545,6 @@ class AiterMxfp4Mxfp8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
                 routed_scaling_factor=rsf,
             )
         else:
-            # DSv4 noaux_tc: sqrtsoftplus score + correction bias + (grouped)
-            # top-k + renorm + scale, done by aiter's scalable all-Triton routing.
             use_grouped = num_expert_group is not None and num_expert_group > 1
             routing_data, gather_idx, scatter_idx = routing(
                 router_logits,
