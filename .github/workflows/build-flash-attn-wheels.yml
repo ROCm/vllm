@@ -1,6 +1,10 @@
-name: Build Flash Attn ROCm Wheels
+name: Build Flash Attn and AITER ROCm Wheels
 
-# This workflow builds flash_attn wheels with the Triton backend for ROCm.
+# This workflow builds two wheels and (optionally) uploads them to
+# s3://aig-embd-gfx11-wheels/ (PEP 503 index):
+#
+#   * flash_attn       (Triton backend) -> simple/flash-attn/
+#   * amd-aiter        (kernels off)    -> simple/amd-aiter/
 #
 # IMPORTANT: Architecture Independence
 # ------------------------------------
@@ -11,46 +15,100 @@ name: Build Flash Attn ROCm Wheels
 #   2. The Triton kernels are compiled JIT (just-in-time) at runtime
 #   3. The resulting wheel is architecture-agnostic
 #
-# The PyTorch index is only used during build because setup.py imports torch
-# to detect IS_HIP_EXTENSION. The actual GPU target (gfx1150, gfx1151, etc.)
-# is determined at runtime when Triton compiles the attention kernels.
+# AITER is currently built with PREBUILD_ONLY=module_gemm_w4a16, which
+# restricts the prebuild path in aiter/setup.py to a single module. HIP
+# compilation for that module is enabled by pip-installing TheRock ROCm
+# wheels (libraries + devel + the gfx1151 device package) and running
+# `rocm-sdk init` -- no `rocm/dev-ubuntu-22.04` container required.
+# GPU_ARCHS=gfx1151 selects the target arch.
 #
-# This means users can install this wheel and use it on any gfx11 target
-# that Triton supports, regardless of which PyTorch index was used during build.
+# Versioning: each wheel version is derived from `git describe` of the
+# upstream repo, e.g.
+#   on a tag       -> 2.8.3
+#   N commits past -> 2.8.4.dev<N>+g<shortsha>
+#
+# Each check job skips the build when a wheel matching the pinned SHA
+# is already present in the S3 index.
 
 on:
-  workflow_dispatch:
-    inputs:
-      pytorch_index:
-        description: 'PyTorch index URL (only needed for build-time torch import)'
-        default: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
-        required: false
-      flash_attn_repo:
-        description: 'Flash Attention repository URL'
-        default: 'https://github.com/ROCm/flash-attention'
-        required: false
-      flash_attn_ref:
-        description: 'Flash Attention git ref (branch/tag/commit)'
-        default: 'main'
-        required: false
-      local_version:
-        description: 'Local version suffix for wheel (e.g., rocm.triton.gfx11)'
-        default: 'rocm.triton.gfx11'
-        required: false
+  push:
+    branches:
+      - gfx11
+  pull_request:
+    branches:
+      - gfx11
 
 env:
-  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2-staging/gfx1151' }}
-  FLASH_ATTN_REPO: ${{ github.event.inputs.flash_attn_repo || 'https://github.com/ROCm/flash-attention' }}
-  FLASH_ATTN_REF: ${{ github.event.inputs.flash_attn_ref || 'main' }}
-  # Enable Triton backend - this skips CK compilation and makes the wheel arch-agnostic
-  FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
-  # Custom version suffix to indicate this is a ROCm Triton build
-  FLASH_ATTN_LOCAL_VERSION: ${{ github.event.inputs.local_version || 'rocm.triton.gfx11' }}
+  PYTORCH_INDEX_URL: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
+  FLASH_ATTN_REPO: 'Dao-AILab/flash-attention'
+  FLASH_ATTN_REF: 'bbe25bacff9f337568b66e69950e549df9839068'
+  AITER_REPO: 'ROCm/aiter'
+  # Branch (or tag/SHA) of AITER to build. The check-aiter job resolves
+  # this to a SHA via `git ls-remote`.
+  AITER_REF: 'matthias.gfx11'
+  AITER_GPU_ARCHS: 'gfx1151'
+  # Allowlist of modules to prebuild (comma-separated). Overrides the
+  # PREBUILD_KERNELS modes and limits HIP compilation to just these.
+  AITER_PREBUILD_ONLY: 'module_gemm_w4a16'
+  S3_BUCKET: aig-embd-gfx11-wheels
+  S3_ROLE_ARN: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
+  AWS_REGION: us-east-1
 
 jobs:
-  build-wheel:
+  check-flash-attn:
     runs-on: ubuntu-latest
-    
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Resolve flash-attention ref
+        id: resolve
+        env:
+          REF: ${{ env.FLASH_ATTN_REF }}
+        run: |
+          set -euo pipefail
+          SHA=${REF:0:8}
+          echo "Pinned ref = ${SHA}"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ env.S3_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # `git describe` puts the SHA after `g` in the version string, so
+          # the wheel filename contains `+g${SHA}-` (or, on a tag, no SHA at
+          # all -- but then upstream has cut a release and we just want the
+          # next release-tracking workflow to fire).
+          MATCH=$(aws s3api list-objects-v2 \
+                    --bucket "$S3_BUCKET" \
+                    --prefix "simple/flash-attn/flash_attn-" \
+                    --query "Contents[?contains(Key, '+g${SHA}-')].Key" \
+                    --output text)
+          if [ -n "$MATCH" ] && [ "$MATCH" != "None" ]; then
+            echo "Already in S3: $MATCH"
+            SHOULD=false
+          else
+            echo "No wheel matching +g${SHA}- in S3; building"
+            SHOULD=true
+          fi
+          echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
+
+  build-flash-attn-wheel:
+    needs: check-flash-attn
+    if: needs.check-flash-attn.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -58,11 +116,39 @@ jobs:
           fetch-depth: 1
 
       - name: Clone flash-attention repository
+        env:
+          REPO: ${{ env.FLASH_ATTN_REPO }}
+          REF: ${{ env.FLASH_ATTN_REF }}
         run: |
-          git clone --depth 1 --branch ${{ env.FLASH_ATTN_REF }} ${{ env.FLASH_ATTN_REPO }} flash-attention
+          # Need full history (or at least back to the latest v2.* tag) so
+          # `git describe` can compute commit count + short SHA.
+          git clone "https://github.com/${REPO}" flash-attention
           cd flash-attention
-          echo "Flash Attention commit: $(git rev-parse HEAD)"
-          echo "Flash Attention ref: ${{ env.FLASH_ATTN_REF }}"
+          git checkout "$REF"
+          echo "Flash Attention at: $(git rev-parse HEAD)"
+          git describe --tags --long --match 'v2.*'
+
+      - name: Compute wheel version from git describe
+        working-directory: flash-attention
+        run: |
+          set -euo pipefail
+          RAW=$(git describe --tags --long --match 'v2.*' --abbrev=8)
+          echo "git describe: $RAW"
+          # RAW looks like:  v2.8.3-42-gabc12345
+          TAG=${RAW#v}; TAG=${TAG%-*-*}                        # 2.8.3
+          COUNT=$(echo "$RAW" | awk -F- '{print $(NF-1)}')     # 42
+          SHA=$(echo "$RAW" | awk -F- '{print $NF}')           # gabc12345
+          if [ "$COUNT" -eq 0 ]; then
+            VERSION="$TAG"
+          else
+            NEXT=$(echo "$TAG" | awk -F. -v OFS=. '{ $NF=$NF+1; print }')
+            VERSION="${NEXT}.dev${COUNT}+${SHA}"
+          fi
+          echo "Computed VERSION=$VERSION"
+          # Upstream's setup.py reads __version__ from flash_attn/__init__.py;
+          # rewrite it so bdist_wheel produces the right filename.
+          sed -i "s/^__version__ = .*/__version__ = \"${VERSION}\"/" flash_attn/__init__.py
+          grep '^__version__' flash_attn/__init__.py
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -95,10 +181,7 @@ jobs:
 
       - name: Install PyTorch from ROCm nightly
         run: |
-          # Install PyTorch with ROCm support (needed for setup.py to detect HIP)
           pip install torch --index-url ${{ env.PYTORCH_INDEX_URL }}
-          
-          # Show what's installed
           pip list | grep -i -E "torch" || true
           python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}')"
 
@@ -109,13 +192,8 @@ jobs:
       - name: Build wheel
         env:
           FLASH_ATTENTION_TRITON_AMD_ENABLE: "TRUE"
-          FLASH_ATTN_LOCAL_VERSION: ${{ env.FLASH_ATTN_LOCAL_VERSION }}
         working-directory: flash-attention
         run: |
-          echo "=== Environment ==="
-          echo "FLASH_ATTENTION_TRITON_AMD_ENABLE=$FLASH_ATTENTION_TRITON_AMD_ENABLE"
-          echo "FLASH_ATTN_LOCAL_VERSION=$FLASH_ATTN_LOCAL_VERSION"
-          echo ""
           echo "=== Building wheel ==="
           python setup.py bdist_wheel --dist-dir=dist
           ls -la dist/
@@ -140,172 +218,272 @@ jobs:
           path: flash-attention/dist/*.whl
           retention-days: 90
 
-  create-release:
-    needs: build-wheel
+  upload-wheel:
+    needs: build-flash-attn-wheel
     runs-on: ubuntu-latest
+    if: github.repository_owner == 'ROCm'
     permissions:
-      contents: write
-    outputs:
-      release_tag: ${{ steps.create-tag.outputs.tag }}
+      id-token: write
+      contents: read
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/workflows/scripts
+          fetch-depth: 1
+
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
           name: flash-attn-rocm-wheel
           path: dist/
 
-      - name: Determine release tag
-        id: create-tag
-        run: |
-          WHEEL=$(find dist -name '*.whl' -print -quit)
-          BASENAME=$(basename "$WHEEL" .whl)
-          VERSION=$(echo "$BASENAME" | sed 's/^flash_attn-//; s/-cp[0-9].*//')
-          TAG="wheels/flash-attn-${VERSION}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
         with:
-          tag_name: ${{ steps.create-tag.outputs.tag }}
-          target_commitish: ${{ github.sha }}
-          files: dist/*.whl
-          prerelease: true
-          body: |
-            ## Flash Attention ROCm Wheel (Triton backend)
+          role-to-assume: ${{ env.S3_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-            Built with `FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE` (architecture-agnostic).
+      - name: Upload wheel to S3
+        run: |
+          pip install boto3
+          python .github/workflows/scripts/upload_wheel_s3.py \
+            --bucket "$S3_BUCKET" \
+            --package flash-attn \
+            --wheel-dir dist/
 
-            ### Installation
-            ```bash
-            pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
-            pip install flash-attn --extra-index-url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels
-            ```
-
-  publish-to-gh-pages:
-    needs: create-release
+  check-aiter:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pages: write
+      id-token: write
+      contents: read
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      full_sha: ${{ steps.resolve.outputs.full_sha }}
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Resolve AITER ref to commit SHA
+        id: resolve
+        env:
+          REPO: ${{ env.AITER_REPO }}
+          REF: ${{ env.AITER_REF }}
+        run: |
+          set -euo pipefail
+          # AITER_REF may be a branch, tag, or SHA. `git ls-remote` works
+          # for branches/tags; for a raw SHA we just truncate.
+          if FULL=$(git ls-remote "https://github.com/${REPO}" "${REF}" \
+                      | awk 'NR==1 {print $1}') && [ -n "$FULL" ]; then
+            echo "Resolved ${REF} -> ${FULL}"
+          else
+            FULL=$REF
+            echo "Treating ${REF} as raw SHA"
+          fi
+          SHA=${FULL:0:8}
+          echo "full_sha=$FULL" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
+        with:
+          role-to-assume: ${{ env.S3_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Wheel filename contains `+g${SHA}-` (see version derivation in
+          # build-aiter-wheel). Package name `amd-aiter` becomes
+          # `amd_aiter-` in the filename.
+          MATCH=$(aws s3api list-objects-v2 \
+                    --bucket "$S3_BUCKET" \
+                    --prefix "simple/amd-aiter/amd_aiter-" \
+                    --query "Contents[?contains(Key, '+g${SHA}-')].Key" \
+                    --output text)
+          if [ -n "$MATCH" ] && [ "$MATCH" != "None" ]; then
+            echo "Already in S3: $MATCH"
+            SHOULD=false
+          else
+            echo "No wheel matching +g${SHA}- in S3; building"
+            SHOULD=true
+          fi
+          echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
+
+  build-aiter-wheel:
+    needs: check-aiter
+    if: needs.check-aiter.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Clone AITER repository
+        env:
+          REPO: ${{ env.AITER_REPO }}
+          FULL_SHA: ${{ needs.check-aiter.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+          # Recursive submodules pull in composable_kernel; only required
+          # once we enable PREBUILD_KERNELS=1, but cheap enough to do now
+          # so the build environment matches the future kernels-on path.
+          git clone --recursive "https://github.com/${REPO}" aiter
+          cd aiter
+          git checkout "$FULL_SHA"
+          git submodule update --init --recursive
+          echo "AITER at: $(git rev-parse HEAD)"
+          git describe --tags --long --match 'v*' || true
+
+      - name: Compute wheel version from git describe
+        working-directory: aiter
+        run: |
+          set -euo pipefail
+          RAW=$(git describe --tags --long --match 'v*' --abbrev=8)
+          echo "git describe: $RAW"
+          # RAW looks like:  v0.1.14-rc0-8-gc387fb45  (or v2.8.3-42-gabc12345)
+          TAG=${RAW#v}; TAG=${TAG%-*-*}                        # 0.1.14-rc0
+          COUNT=$(echo "$RAW" | awk -F- '{print $(NF-1)}')     # 8
+          SHA=$(echo "$RAW" | awk -F- '{print $NF}')           # gc387fb45
+          if [ "$COUNT" -eq 0 ]; then
+            VERSION="$TAG"
+          else
+            # awk numeric-coerces the last dotted field, so e.g. `14-rc0`
+            # becomes 15 (rc suffix dropped). Good enough for a dev build.
+            NEXT=$(echo "$TAG" | awk -F. -v OFS=. '{ $NF=$NF+1; print }')
+            VERSION="${NEXT}.dev${COUNT}+${SHA}"
+          fi
+          echo "Computed VERSION=$VERSION"
+          # AITER's setup.py uses `use_scm_version=True`; the pretend-version
+          # env var overrides setuptools_scm so the wheel filename is
+          # predictable and matches the check-aiter S3 lookup.
+          echo "SETUPTOOLS_SCM_PRETEND_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-aiter-${{ runner.os }}-py312
+          restore-keys: |
+            pip-aiter-${{ runner.os }}-
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel setuptools setuptools_scm ninja packaging psutil pyyaml
+
+      - name: Install PyTorch from ROCm nightly
+        run: |
+          pip install torch --index-url ${{ env.PYTORCH_INDEX_URL }}
+          pip list | grep -i -E "torch" || true
+          python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}')"
+
+      - name: Install ROCm SDK (TheRock multi-arch wheels)
+        run: |
+          set -euo pipefail
+          pip install \
+            --index-url https://rocm.nightlies.amd.com/whl-multi-arch/ \
+            "rocm[libraries,device-gfx1151,devel]"
+          rocm-sdk init
+          ROCM_PATH=$(rocm-sdk path --root)
+          echo "Resolved ROCM_PATH=$ROCM_PATH"
+          # Export for subsequent steps (setup.py / hipcc / torch.utils.cpp_extension).
+          echo "ROCM_PATH=$ROCM_PATH"   >> "$GITHUB_ENV"
+          echo "ROCM_HOME=$ROCM_PATH"   >> "$GITHUB_ENV"
+          echo "HIP_PATH=$ROCM_PATH"    >> "$GITHUB_ENV"
+          echo "$ROCM_PATH/bin"         >> "$GITHUB_PATH"
+          "$ROCM_PATH/bin/hipcc" --version || true
+
+      - name: Install AITER runtime dependencies
+        working-directory: aiter
+        run: |
+          pip install -r requirements.txt
+
+      - name: Build wheel
+        env:
+          PREBUILD_ONLY: ${{ env.AITER_PREBUILD_ONLY }}
+          GPU_ARCHS: ${{ env.AITER_GPU_ARCHS }}
+        working-directory: aiter
+        run: |
+          echo "=== Building wheel (PREBUILD_ONLY=$PREBUILD_ONLY, GPU_ARCHS=$GPU_ARCHS) ==="
+          python setup.py bdist_wheel --dist-dir=dist
+          ls -la dist/
+
+      - name: Rename wheel for manylinux compliance
+        working-directory: aiter
+        run: |
+          cd dist
+          for wheel in *.whl; do
+            if [[ "$wheel" == *"linux"* ]] && [[ "$wheel" != *"manylinux"* ]]; then
+              new_name="${wheel/linux/manylinux_2_31}"
+              mv "$wheel" "$new_name"
+              echo "Renamed $wheel to $new_name"
+            fi
+          done
+          ls -la
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-rocm-wheel
+          path: aiter/dist/*.whl
+          retention-days: 90
+
+  upload-aiter-wheel:
+    needs: build-aiter-wheel
+    runs-on: ubuntu-latest
+    # Upload is intentionally disabled while the AITER build job is being
+    # validated. To enable, replace `if: false` with the same guard the
+    # flash-attn upload uses:
+    #   if: github.repository_owner == 'ROCm'
+    if: false
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/workflows/scripts
+          fetch-depth: 1
+
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
         with:
-          name: flash-attn-rocm-wheel
-          path: new-wheels/
+          name: aiter-rocm-wheel
+          path: dist/
 
-      - name: Generate index pointing to GitHub Releases
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          BASE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels"
-          RELEASE_TAG: ${{ needs.create-release.outputs.release_tag }}
-        run: |
-          pip install packaging
-
-          cat > /tmp/generate_index.py << 'PYEOF'
-          import os, json, subprocess
-          from pathlib import Path
-          from datetime import datetime
-          from urllib.parse import quote
-
-          REPO = os.environ["REPO"]
-          BASE_URL = os.environ["BASE_URL"]
-          RELEASE_TAG = os.environ.get("RELEASE_TAG", "latest")
-
-          PACKAGE_INDEX_TEMPLATE = """<!DOCTYPE html>
-          <html>
-            <head><meta name="pypi:repository-version" content="1.0"><title>{package_name}</title></head>
-            <body>
-          {items}
-            </body>
-          </html>
-          """
-
-          def parse_wheel_name(filename):
-              base = filename.removesuffix(".whl")
-              parts = base.split("-")
-              for i, part in enumerate(parts):
-                  if part[0].isdigit():
-                      return "-".join(parts[:i]).replace("_", "-")
-              return parts[0].replace("_", "-")
-
-          result = subprocess.run(
-              ["gh", "release", "list", "--repo", REPO, "--limit", "100", "--json", "tagName"],
-              capture_output=True, text=True
-          )
-          releases = json.loads(result.stdout) if result.returncode == 0 else []
-          print(f"Found {len(releases)} releases")
-
-          wheels = {}
-          for rel in releases:
-              tag = rel["tagName"]
-              result = subprocess.run(
-                  ["gh", "release", "view", tag, "--repo", REPO, "--json", "assets"],
-                  capture_output=True, text=True
-              )
-              if result.returncode != 0:
-                  continue
-              assets = json.loads(result.stdout).get("assets", [])
-              for asset in assets:
-                  name = asset["name"]
-                  url = asset["url"]
-                  if name.endswith(".whl"):
-                      pkg = parse_wheel_name(name)
-                      wheels.setdefault(pkg, []).append((name, url))
-
-          new_dir = Path("new-wheels")
-          if new_dir.exists():
-              for whl in new_dir.glob("*.whl"):
-                  pkg = parse_wheel_name(whl.name)
-                  release_names = {w[0] for w in wheels.get(pkg, [])}
-                  if whl.name not in release_names:
-                      url = f"https://github.com/{REPO}/releases/download/{quote(RELEASE_TAG, safe='')}/{quote(whl.name, safe='')}"
-                      wheels.setdefault(pkg, []).append((whl.name, url))
-
-          print(f"Total: {sum(len(v) for v in wheels.values())} wheels in {len(wheels)} packages")
-
-          out = Path("gh-pages/wheels")
-          out.mkdir(parents=True, exist_ok=True)
-
-          for pkg_name, whl_list in wheels.items():
-              pkg_dir = out / pkg_name
-              pkg_dir.mkdir(exist_ok=True)
-              links = []
-              for whl_name, url in sorted(whl_list, key=lambda x: x[0], reverse=True):
-                  links.append(f'    <a href="{url}">{whl_name}</a><br/>')
-              (pkg_dir / "index.html").write_text(
-                  PACKAGE_INDEX_TEMPLATE.format(package_name=pkg_name, items="\n".join(links))
-              )
-
-          top_index = f"""<!DOCTYPE html>
-          <html>
-            <head><meta name="pypi:repository-version" content="1.0"><title>ROCm Wheels</title></head>
-            <body>
-              <h1>ROCm Wheels</h1>
-              <p>Pre-built wheels for AMD ROCm (gfx11 / Strix Halo / RDNA3+)</p>
-              <p><em>Generated: {datetime.now().isoformat()}</em></p>
-              <h2>Installation</h2>
-              <pre>pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
-          pip install vllm --extra-index-url {BASE_URL}</pre>
-              <h2>Available Packages</h2>
-          """
-          for p in sorted(wheels):
-              top_index += f'    <a href="{p}/">{p}</a><br/>\n'
-          top_index += "  </body>\n</html>"
-          (out / "index.html").write_text(top_index)
-          print("Index generated successfully")
-          PYEOF
-
-          python /tmp/generate_index.py
-
-      - name: Deploy to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./gh-pages/wheels
-          destination_dir: wheels
-          keep_files: false
+          role-to-assume: ${{ env.S3_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload wheel to S3
+        run: |
+          pip install boto3
+          python .github/workflows/scripts/upload_wheel_s3.py \
+            --bucket "$S3_BUCKET" \
+            --package amd-aiter \
+            --wheel-dir dist/
