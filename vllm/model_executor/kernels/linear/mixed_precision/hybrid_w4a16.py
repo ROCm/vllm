@@ -327,10 +327,7 @@ def _select_skinny_gfx11_config(
     else:
         # Scalar-dequant path (bf16): pre-packed-kernel scalar-tuned table.
         if on_gfx1103() and M > 256:
-            # gfx1103 (Hawk Point 780M): deep-prefill W4A16 GEMMs are weight-load
-            # bound; the wide BLOCK_N=256 / halved BLOCK_M=64 tile reuses each
-            # dequantized weight tile across more output columns. ~37% W4A16 GEMM
-            # time (~29% TTFT) vs the narrow default on Qwen3-VL-4B-AWQ. (AIESW-36468)
+            # Tested on Qwen3-VL-4B-AWQ
             block_m, block_n, block_k, num_warps = 64, 256, 64, 8
         elif M <= 32:
             block_m, block_n, block_k, num_warps = 32, 32, 128, 4
