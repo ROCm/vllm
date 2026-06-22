@@ -238,6 +238,38 @@ class VocabParallelEmbedding(PluggableLayer):
         hf_config = get_current_vllm_config().model_config.hf_config
         return getattr(hf_config, "tie_word_embeddings", False)
 
+    def _is_main_embedding(self) -> bool:
+        """Return True if this is the primary token embedding.
+
+        Used to distinguish the primary token embedding (which doubles as
+        lm_head when tie_word_embeddings is True) from auxiliary embeddings
+        that should NOT receive dynamic int8 quantization.
+
+        The primary embedding is identified by having embedding_dim equal
+        to the model's hidden_size. This is a structural invariant of
+        transformer language models: the token embedding projects vocab
+        tokens into the hidden dimension that flows through all layers.
+
+        Auxiliary embeddings (e.g. Gemma 4's Per-Layer Embeddings) may
+        share the same vocab size but use a different embedding dimension
+        (e.g. num_layers * per_layer_dim), so vocab size alone is not
+        sufficient to distinguish them.
+
+        If a future architecture introduces a second embedding with
+        embedding_dim == hidden_size that is NOT the lm_head, this
+        heuristic would incorrectly apply int8 to it. This would be
+        architecturally unusual — it would mean two separate projections
+        from vocab to hidden_size, which is redundant.
+        """
+        from vllm.config import get_current_vllm_config
+
+        hf_config = get_current_vllm_config().model_config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        hidden_size = getattr(text_config, "hidden_size", None)
+        if hidden_size is None:
+            return False
+        return self.embedding_dim == hidden_size
+
     def __init__(
         self,
         num_embeddings: int,
@@ -284,7 +316,9 @@ class VocabParallelEmbedding(PluggableLayer):
                 should_use_dynamic_int8_lm_head,
             )
 
-            is_lm_head = isinstance(self, ParallelLMHead) or self._has_tied_embeddings()
+            is_lm_head = isinstance(self, ParallelLMHead) or (
+                self._has_tied_embeddings() and self._is_main_embedding()
+            )
             if is_lm_head and should_use_dynamic_int8_lm_head(embedding_dim):
                 quant_method = DynamicInt8LMHeadMethod()
             else:

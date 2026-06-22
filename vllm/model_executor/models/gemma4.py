@@ -963,6 +963,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
+        self.dtype = vllm_config.model_config.dtype
 
         # PLE config values (default to 0 if not present — disables PLE)
         self.hidden_size_per_layer_input = getattr(
@@ -1108,7 +1109,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
             )
             self.hidden_states = torch.zeros(
                 (max_num_tokens, config.hidden_size),
-                dtype=self.embed_tokens.weight.dtype,
+                dtype=self.dtype,
                 device=device,
             )
             if (
@@ -1121,7 +1122,7 @@ class Gemma4Model(nn.Module, EagleModelMixin):
                         config.num_hidden_layers,
                         self.hidden_size_per_layer_input,
                     ),
-                    dtype=self.embed_tokens.weight.dtype,
+                    dtype=self.dtype,
                     device=device,
                 )
             else:
