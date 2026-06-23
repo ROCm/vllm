@@ -1045,7 +1045,7 @@ class Gemma4ForConditionalGeneration(
                     config.text_config.num_hidden_layers,
                     ple_dim,
                     device=(self.language_model.model.embed_tokens.weight.device),
-                    dtype=(self.language_model.model.embed_tokens.weight.dtype),
+                    dtype=(self.language_model.model.dtype),
                 )
             else:
                 self.per_layer_embeddings = None
@@ -1202,7 +1202,7 @@ class Gemma4ForConditionalGeneration(
         vt = self.vision_tower
         vision_cfg = self.config.vision_config
         pooling_k2 = vision_cfg.pooling_kernel_size**2
-        target_dtype = self.language_model.model.embed_tokens.weight.dtype
+        target_dtype = self.language_model.model.dtype
 
         # Concurrent requests with different image resolutions may
         # arrive as a list of per-image tensors, while same-resolution
@@ -1286,7 +1286,7 @@ class Gemma4ForConditionalGeneration(
 
         # Use embed_tokens dtype as compute dtype; embedding_projection.weight
         # may be uint8 under BnB 4-bit, which would corrupt the cast.
-        target_dtype = self.language_model.model.embed_tokens.weight.dtype
+        target_dtype = self.language_model.model.dtype
 
         # Project all images in a single batched call.
         flat_valid_states = torch.cat(all_valid_states, dim=0).to(target_dtype)
@@ -1329,7 +1329,7 @@ class Gemma4ForConditionalGeneration(
         vt = self.vision_tower
         vision_cfg = self.config.vision_config
         pooling_k2 = vision_cfg.pooling_kernel_size**2
-        target_dtype = self.language_model.model.embed_tokens.weight.dtype
+        target_dtype = self.language_model.model.dtype
 
         if isinstance(frame_counts, torch.Tensor):
             fc_list = frame_counts.tolist()
