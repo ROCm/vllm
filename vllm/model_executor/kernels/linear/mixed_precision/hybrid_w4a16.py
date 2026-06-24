@@ -45,8 +45,11 @@ LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
 
 def _handasm_w4a16_enabled() -> bool:
-    """Opt-in hand-tuned AMDGCN override for the skinny W4A16 GEMM (gfx1151)."""
-    return os.environ.get("VLLM_W4A16_HANDASM", "0") == "1" and on_gfx1151()
+    """Hand-tuned AMDGCN override for the skinny W4A16 GEMM (gfx1151).
+
+    On by default; set VLLM_W4A16_HANDASM=0 to fall back to the Triton kernel.
+    """
+    return os.environ.get("VLLM_W4A16_HANDASM", "1") == "1" and on_gfx1151()
 
 
 # ---------------------------------------------------------------------------
