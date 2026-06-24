@@ -283,22 +283,17 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	ds_load_b128 v[71:74], v46
 	ds_load_b128 v[79:82], v46 offset:4096
 	.loc	1 234 50                        ; hybrid_w4a16.py:234:50
-	v_dot2_bf16_bf16 v92, v86, v83, 0
-	v_dot2_bf16_bf16 v88, v88, v83, 0
-	v_dot2_bf16_bf16 v86, v90, v83, 0
-	v_dot2_bf16_bf16 v90, v91, v83, 0
-	v_dot2_bf16_bf16 v89, v89, v83, 0
-	v_dot2_bf16_bf16 v87, v87, v83, 0
-	v_dot2_bf16_bf16 v91, v84, v83, 0
-	v_dot2_bf16_bf16 v83, v85, v83, 0
-	.loc	1 240 33                        ; hybrid_w4a16.py:240:33
-	v_perm_b32 v86, v90, v86, 0x5040100
-	v_perm_b32 v85, v89, v88, 0x5040100
-	v_perm_b32 v84, v87, v92, 0x5040100
+	v_dot2_bf16_bf16 v94, v84, v83, 0
+	v_dot2_bf16_bf16 v94, v85, v83, 0 op_sel:[0,0,0,1]
+	v_dot2_bf16_bf16 v95, v86, v83, 0
+	v_dot2_bf16_bf16 v95, v87, v83, 0 op_sel:[0,0,0,1]
+	v_dot2_bf16_bf16 v96, v88, v83, 0
+	v_dot2_bf16_bf16 v96, v89, v83, 0 op_sel:[0,0,0,1]
+	v_dot2_bf16_bf16 v97, v90, v83, 0
+	v_dot2_bf16_bf16 v97, v91, v83, 0 op_sel:[0,0,0,1]
 	s_waitcnt lgkmcnt(0)
-	v_perm_b32 v83, v83, v91, 0x5040100
 	s_barrier
-	ds_store_b128 v42, v[83:86]
+	ds_store_b128 v42, v[94:97]
 	s_waitcnt lgkmcnt(0)
 	s_barrier
 	ds_load_b128 v[83:86], v47
