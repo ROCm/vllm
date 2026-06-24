@@ -9,8 +9,8 @@
 	v_and_or_b32 \dst, \src, s36, 0x4300c308
 .endm
 .macro DQ_PACK dst, klo, khi  ; two dot2: klo->low half, khi->high half of dst
-	v_dot2_bf16_bf16 \dst, \klo, v83, 0
-	v_dot2_bf16_bf16 \dst, \khi, v83, 0 op_sel:[0,0,0,1]
+	v_dot2_bf16_bf16 \dst, \klo, v124, 0
+	v_dot2_bf16_bf16 \dst, \khi, v124, 0 op_sel:[0,0,0,1]
 .endm
 
 	.text
@@ -196,9 +196,9 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	s_mov_b32 s11, s15
 	s_mov_b32 s35, 15           ; mask_lo (SGPR; survives the loop, ds_load only writes VGPRs)
 	s_mov_b32 s36, 0xf0000      ; mask_hi
-.LBB0_2:                                ; =>This Inner Loop Header: Depth=1
+	; --- prologue: prefetch iter 0 ---
 	.loc	1 143 26                        ; hybrid_w4a16.py:143:26
-	v_add_nc_u32_e32 v51, s5, v37
+	v_add_nc_u32_e32 v125, s5, v37
 	.loc	1 153 61                        ; hybrid_w4a16.py:153:61
 	v_cmp_gt_i32_e64 s2, s4, v36
 	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
@@ -206,7 +206,7 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	s_abs_i32 s29, s5
 	s_xor_b32 s31, s3, s6
 	.loc	1 143 26                        ; hybrid_w4a16.py:143:26
-	v_cmp_gt_i32_e64 s3, s26, v51
+	v_cmp_gt_i32_e64 s3, s26, v125
 	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
 	s_mul_hi_u32 s30, s29, s7
 	.loc	1 153 42                        ; hybrid_w4a16.py:153:42
@@ -214,7 +214,7 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
 	s_mul_i32 s33, s30, s27
 	.loc	1 154 27                        ; hybrid_w4a16.py:154:27
-	v_cndmask_b32_e64 v51, 0x80000000, v39, s2
+	v_cndmask_b32_e64 v125, 0x80000000, v39, s2
 	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
 	s_sub_i32 s29, s29, s33
 	.loc	1 147 41                        ; hybrid_w4a16.py:147:41
@@ -223,22 +223,22 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	s_add_i32 s34, s30, 1
 	s_sub_i32 s33, s29, s27
 	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
-	v_cndmask_b32_e64 v52, 0x80000000, v40, s2
+	v_cndmask_b32_e64 v126, 0x80000000, v40, s2
 	.loc	1 147 41                        ; hybrid_w4a16.py:147:41
 	s_and_b32 s2, s1, s3
 	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
 	s_cmp_ge_u32 s29, s27
 	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
-	v_cndmask_b32_e64 v55, 0x80000000, v41, s2
+	v_cndmask_b32_e64 v127, 0x80000000, v41, s2
 	.loc	1 154 27                        ; hybrid_w4a16.py:154:27
-	buffer_load_b32 v59, v51, s[16:19], 0 offen
+	buffer_load_b32 v123, v125, s[16:19], 0 offen
 	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
 	s_cselect_b32 s2, s34, s30
 	s_cselect_b32 s3, s33, s29
 	s_add_i32 s29, s2, 1
 	s_cmp_ge_u32 s3, s27
 	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
-	buffer_load_b128 v[51:54], v52, s[12:15], 0 offen
+	buffer_load_b128 v[115:118], v126, s[12:15], 0 offen
 	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
 	s_cselect_b32 s2, s29, s2
 	.loc	1 141 28                        ; hybrid_w4a16.py:141:28
@@ -252,34 +252,33 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	.loc	1 141 28                        ; hybrid_w4a16.py:141:28
 	v_add_nc_u32_e32 v40, 64, v40
 	.loc	1 224 16                        ; hybrid_w4a16.py:224:16
-	v_add_lshl_u32 v56, s2, v38, 1
+	v_add_lshl_u32 v125, s2, v38, 1
 	.loc	1 141 28                        ; hybrid_w4a16.py:141:28
 	v_add_nc_u32_e32 v41, 64, v41
-	s_add_i32 s28, s28, -1
 	s_add_i32 s5, s5, 32
-	s_cmp_lg_u32 s28, 0
 	.loc	1 224 16                        ; hybrid_w4a16.py:224:16
-	v_cndmask_b32_e64 v56, 0x80000000, v56, s0
-	buffer_load_u16 v83, v56, s[8:11], 0 offen
+	v_cndmask_b32_e64 v125, 0x80000000, v125, s0
+	buffer_load_u16 v124, v125, s[8:11], 0 offen
 	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
-	buffer_load_b128 v[55:58], v55, s[12:15], 0 offen
+	buffer_load_b128 v[119:122], v127, s[12:15], 0 offen
+.LBB0_2:                                ; =>This Inner Loop Header: Depth=1
 	s_waitcnt vmcnt(0)
 	s_barrier
-	ds_store_b128 v42, v[51:54]
-	ds_store_b128 v42, v[55:58] offset:4096
+	ds_store_b128 v42, v[115:118]
+	ds_store_b128 v42, v[119:122] offset:4096
 	.loc	1 190 22                        ; hybrid_w4a16.py:190:22
-	v_lshrrev_b32_e32 v95, 4, v59       ; view>>4
-	v_lshrrev_b32_e32 v96, 8, v59       ; view>>8
-	v_lshrrev_b32_e32 v97, 12, v59      ; view>>12
-	DQ_EXT_LO v84, v59                  ; K0
-	DQ_EXT_HI v85, v59                  ; K1
+	v_lshrrev_b32_e32 v95, 4, v123       ; view>>4
+	v_lshrrev_b32_e32 v96, 8, v123       ; view>>8
+	v_lshrrev_b32_e32 v97, 12, v123      ; view>>12
+	DQ_EXT_LO v84, v123                 ; K0
+	DQ_EXT_HI v85, v123                 ; K1
 	DQ_EXT_LO v86, v95                  ; K2
 	DQ_EXT_HI v87, v95                  ; K3
 	DQ_EXT_LO v88, v96                  ; K4
 	DQ_EXT_HI v89, v96                  ; K5
 	DQ_EXT_LO v90, v97                  ; K6
 	DQ_EXT_HI v91, v97                  ; K7
-	v_lshl_or_b32 v83, v83, 16, v83     ; (scale, scale)
+	v_lshl_or_b32 v124, v124, 16, v124     ; (scale, scale)
 	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
 	s_waitcnt lgkmcnt(0)
 	s_barrier
@@ -296,6 +295,73 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	DQ_PACK v95, v86, v87
 	DQ_PACK v96, v88, v89
 	DQ_PACK v97, v90, v91
+	; --- prefetch iter k+1 (overlaps ds_store B + ds_load B + WMMA) ---
+	.loc	1 143 26                        ; hybrid_w4a16.py:143:26
+	v_add_nc_u32_e32 v125, s5, v37
+	.loc	1 153 61                        ; hybrid_w4a16.py:153:61
+	v_cmp_gt_i32_e64 s2, s4, v36
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_ashr_i32 s3, s5, 31
+	s_abs_i32 s29, s5
+	s_xor_b32 s31, s3, s6
+	.loc	1 143 26                        ; hybrid_w4a16.py:143:26
+	v_cmp_gt_i32_e64 s3, s26, v125
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_mul_hi_u32 s30, s29, s7
+	.loc	1 153 42                        ; hybrid_w4a16.py:153:42
+	s_and_b32 s2, s0, s2
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_mul_i32 s33, s30, s27
+	.loc	1 154 27                        ; hybrid_w4a16.py:154:27
+	v_cndmask_b32_e64 v125, 0x80000000, v39, s2
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_sub_i32 s29, s29, s33
+	.loc	1 147 41                        ; hybrid_w4a16.py:147:41
+	s_and_b32 s2, vcc_lo, s3
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_add_i32 s34, s30, 1
+	s_sub_i32 s33, s29, s27
+	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
+	v_cndmask_b32_e64 v126, 0x80000000, v40, s2
+	.loc	1 147 41                        ; hybrid_w4a16.py:147:41
+	s_and_b32 s2, s1, s3
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_cmp_ge_u32 s29, s27
+	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
+	v_cndmask_b32_e64 v127, 0x80000000, v41, s2
+	.loc	1 154 27                        ; hybrid_w4a16.py:154:27
+	buffer_load_b32 v123, v125, s[16:19], 0 offen
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_cselect_b32 s2, s34, s30
+	s_cselect_b32 s3, s33, s29
+	s_add_i32 s29, s2, 1
+	s_cmp_ge_u32 s3, s27
+	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
+	buffer_load_b128 v[115:118], v126, s[12:15], 0 offen
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_cselect_b32 s2, s29, s2
+	.loc	1 141 28                        ; hybrid_w4a16.py:141:28
+	v_add_nc_u32_e32 v36, 4, v36
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_xor_b32 s2, s2, s31
+	.loc	1 141 28                        ; hybrid_w4a16.py:141:28
+	v_add_nc_u32_e32 v39, 16, v39
+	.loc	1 193 39                        ; hybrid_w4a16.py:193:39
+	s_sub_i32 s2, s2, s31
+	.loc	1 141 28                        ; hybrid_w4a16.py:141:28
+	v_add_nc_u32_e32 v40, 64, v40
+	.loc	1 224 16                        ; hybrid_w4a16.py:224:16
+	v_add_lshl_u32 v125, s2, v38, 1
+	.loc	1 141 28                        ; hybrid_w4a16.py:141:28
+	v_add_nc_u32_e32 v41, 64, v41
+	s_add_i32 s28, s28, -1
+	s_add_i32 s5, s5, 32
+	s_cmp_lg_u32 s28, 0
+	.loc	1 224 16                        ; hybrid_w4a16.py:224:16
+	v_cndmask_b32_e64 v125, 0x80000000, v125, s0
+	buffer_load_u16 v124, v125, s[8:11], 0 offen
+	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
+	buffer_load_b128 v[119:122], v127, s[12:15], 0 offen
 	s_waitcnt lgkmcnt(0)
 	s_barrier
 	ds_store_b128 v42, v[94:97]
@@ -939,7 +1005,7 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 		.amdhsa_system_sgpr_workgroup_id_z 0
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
-		.amdhsa_next_free_vgpr 115
+		.amdhsa_next_free_vgpr 128
 		.amdhsa_next_free_sgpr 37
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_round_mode_32 0
@@ -1181,7 +1247,7 @@ amdhsa.kernels:
     .symbol:         _triton_w4a16_skinny_fmt_kernel.kd
     .uniform_work_group_size: 1
     .uses_dynamic_stack: false
-    .vgpr_count:     115
+    .vgpr_count:     128
     .vgpr_spill_count: 0
     .wavefront_size: 32
     .workgroup_processor_mode: 0
