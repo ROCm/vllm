@@ -1376,6 +1376,25 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 endif()
 
+# Hand-editable AMDGCN kernels (gfx1151): assemble .amdgcn -> .hsaco at build
+# time so editable installs (and wheels) ship a ready binary next to the source
+# .amdgcn. The runtime loader (asm_w4a16.py) re-assembles on demand if the
+# .amdgcn is edited without a rebuild, so this is a convenience, not a hard dep.
+if (VLLM_GPU_LANG STREQUAL "HIP" AND VLLM_GPU_ARCHES MATCHES "gfx1151")
+  set(_HANDASM_DIR
+      ${CMAKE_CURRENT_SOURCE_DIR}/vllm/model_executor/kernels/linear/mixed_precision/asm)
+  set(_HANDASM_SRC ${_HANDASM_DIR}/hybrid_w4a16_skinny_gfx1151.amdgcn)
+  set(_HANDASM_OUT ${_HANDASM_DIR}/hybrid_w4a16_skinny_gfx1151.hsaco)
+  add_custom_command(
+    OUTPUT ${_HANDASM_OUT}
+    COMMAND ${CMAKE_HIP_COMPILER} -target amdgcn-amd-amdhsa -mcpu=gfx1151
+            -x assembler ${_HANDASM_SRC} -o ${_HANDASM_OUT}
+    DEPENDS ${_HANDASM_SRC}
+    COMMENT "Assembling hand-tuned W4A16 AMDGCN -> hsaco (gfx1151)"
+    VERBATIM)
+  add_custom_target(vllm_handasm_w4a16 ALL DEPENDS ${_HANDASM_OUT})
+endif()
+
 # Must run after the last HIP `define_extension_target` so every extension
 # has registered its sources.
 if (VLLM_GPU_LANG STREQUAL "HIP")
