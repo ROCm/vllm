@@ -10,8 +10,11 @@ shuffle packed).  Both kernels read from the same weight tensors:
 CUDA-graph compatible.
 """
 
+import contextlib
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -38,6 +41,48 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.utils import record_function_or_nullcontext
+
+
+def _moe_gemm_triton_scope(
+    M: int,
+    N: int,
+    K: int,
+    E: int,
+    top_k: int,
+    group_size: int,
+    block_m: int,
+    num_tokens_post_padded: torch.Tensor | None,
+):
+    """apply()-level record_function around the Triton MoE GEMM (the gptq
+    fused_moe_kernel_gptq_awq path).
+
+    Emitted *here* -- at the apply() call site -- rather than deep inside
+    invoke_fused_moe_kernel_hybrid_triton, because an apply()-level scope
+    survives torch.compile replay and so attaches to the kernel, whereas the
+    deep `hybrid_triton_moe` scope inside the launch helper does not (it ends up
+    orphaned from the compiled kernel, leaving the MoE GEMM with no roofline).
+    Carries the dims the roofline gptq calc needs: M, N, K, E, top_k, the quant
+    group size g (= group_size; the per-group scale bytes and dequant FLOPs scale
+    with K/g, so it must be the real value, not a 128 default) plus valid_blocks
+    (non-padding blocks the kernel runs = num_tokens_post_padded // block_m), so
+    valid_blocks*block_m is the padded row count the kernel actually computes.
+
+    valid_blocks is only known at runtime, so reading it forces a device->host
+    sync. We take it solely when profiling scopes are enabled -- production (where
+    the context is a nullcontext) pays nothing."""
+    if not (
+        envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
+    ):
+        return contextlib.nullcontext()
+    valid_blocks = (
+        int(num_tokens_post_padded.item()) // block_m
+        if num_tokens_post_padded is not None
+        else 0
+    )
+    return record_function_or_nullcontext(
+        f"moe_gemm_triton {M}x{N}x{K} E={E} top_k={top_k} g={group_size} "
+        f"block_m={block_m} valid_blocks={valid_blocks}"
+    )
 
 
 class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
@@ -403,22 +448,32 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             # GEMM 1 (Triton prefill path)
             # The kernel gathers from hidden_states via
             # sorted_token_ids // top_k, so pass the original top_k.
-            invoke_fused_moe_kernel_hybrid_triton(
-                A=gemm1_in,
-                B=w1,
-                C=gemm1_out,
-                B_scale=self.w1_scale,
-                topk_weights=topk_weights if apply_router_weight_on_input else None,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=_expert_ids_for(config_gemm1),
-                num_tokens_post_padded=num_tokens_post_padded,
-                mul_routed_weight=apply_router_weight_on_input,
-                top_k=top_k_num,
-                config=config_gemm1,
-                compute_type=compute_type,
-                group_size=self._group_size,
-                align_block_size_m=block_size_m,
-            )
+            with _moe_gemm_triton_scope(
+                gemm1_in.size(0),
+                N,
+                K,
+                global_num_experts,
+                top_k_num,
+                self._group_size,
+                block_size_m,
+                num_tokens_post_padded,
+            ):
+                invoke_fused_moe_kernel_hybrid_triton(
+                    A=gemm1_in,
+                    B=w1,
+                    C=gemm1_out,
+                    B_scale=self.w1_scale,
+                    topk_weights=topk_weights if apply_router_weight_on_input else None,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=_expert_ids_for(config_gemm1),
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    mul_routed_weight=apply_router_weight_on_input,
+                    top_k=top_k_num,
+                    config=config_gemm1,
+                    compute_type=compute_type,
+                    group_size=self._group_size,
+                    align_block_size_m=block_size_m,
+                )
 
             # Activation (only the [0:P] real rows; padding rows unread)
             apply_moe_activation(activation, act_out[:P], gemm1_out[:P])
@@ -427,22 +482,32 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             # act_out is in slot-space (GEMM1 wrote at sorted_token_ids
             # positions). Pass top_k=1 so the kernel reads act_out[slot]
             # directly.
-            invoke_fused_moe_kernel_hybrid_triton(
-                A=act_out,
-                B=w2,
-                C=gemm2_out,
-                B_scale=self.w2_scale,
-                topk_weights=None,
-                sorted_token_ids=sorted_token_ids,
-                expert_ids=_expert_ids_for(config_gemm2),
-                num_tokens_post_padded=num_tokens_post_padded,
-                mul_routed_weight=False,
-                top_k=1,
-                config=config_gemm2,
-                compute_type=compute_type,
-                group_size=self._group_size,
-                align_block_size_m=block_size_m,
-            )
+            with _moe_gemm_triton_scope(
+                act_out.size(0),
+                K,
+                activation_out_dim,
+                global_num_experts,
+                1,
+                self._group_size,
+                block_size_m,
+                num_tokens_post_padded,
+            ):
+                invoke_fused_moe_kernel_hybrid_triton(
+                    A=act_out,
+                    B=w2,
+                    C=gemm2_out,
+                    B_scale=self.w2_scale,
+                    topk_weights=None,
+                    sorted_token_ids=sorted_token_ids,
+                    expert_ids=_expert_ids_for(config_gemm2),
+                    num_tokens_post_padded=num_tokens_post_padded,
+                    mul_routed_weight=False,
+                    top_k=1,
+                    config=config_gemm2,
+                    compute_type=compute_type,
+                    group_size=self._group_size,
+                    align_block_size_m=block_size_m,
+                )
         else:
             from vllm._custom_ops import fused_moe_wvSplitK_int4_gemm
 
