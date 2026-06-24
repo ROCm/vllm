@@ -113,6 +113,15 @@ torch::Tensor gptq_gemm_rdna3_wmma(torch::Tensor a, torch::Tensor b_q_weight,
                                    torch::Tensor b_scales,
                                    torch::Tensor b_g_idx, bool use_v2_format);
 
+// W4A16 MoE prefill WMMA GEMM for gfx11 (defined in moe_gemm_w4a16_wmma.cu;
+// real body is gfx11-only, stub elsewhere). Mutates C in place; callers gate
+// the shape (Python prefill_uses_rdna_moe_gemm), so an unsupported shape raises
+// via TORCH_CHECK.
+void moe_gemm_w4a16(at::Tensor A, at::Tensor w_packed, at::Tensor w_scale,
+                    at::Tensor sorted_token_ids, at::Tensor expert_ids,
+                    at::Tensor C, int64_t n_valid_tokens, int64_t top_k,
+                    int64_t block_m, int64_t num_blocks);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,

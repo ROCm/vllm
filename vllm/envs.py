@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_MOE_AWQ_GEMV_HIP: bool = False
     VLLM_MOE_GPTQ_EXLLAMA: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
+    VLLM_MOE_HIP: str | None = None
     VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
@@ -1117,6 +1118,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOE_GPTQ_EXLLAMA": lambda: (
         os.getenv("VLLM_MOE_GPTQ_EXLLAMA", "true").lower() in ("true", "1")
     ),
+    # rdna_moe_gemm gfx11 W4A16 MoE prefill WMMA GEMM. Tri-state: unset =
+    # default-on wherever the kernel is built (gfx11), "1" forces on, "0" forces
+    # the Triton path. Read via moe_hip_w4a16.is_enabled().
+    "VLLM_MOE_HIP": lambda: os.environ.get("VLLM_MOE_HIP", None),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (

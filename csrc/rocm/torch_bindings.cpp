@@ -155,6 +155,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gptq_gemm_rdna3_wmma", torch::kCUDA, &gptq_gemm_rdna3_wmma);
 #endif
 
+  // W4A16 MoE prefill WMMA GEMM for AMD RDNA3 (gfx11). Always registered; the
+  // kernel body is gfx11-only (stub elsewhere) and Python gates calls on
+  // on_gfx1x(). Mutates c in place; an unsupported shape raises via TORCH_CHECK
+  // (callers gate via the Python prefill_uses_rdna_moe_gemm predicate).
+  rocm_ops.def(
+      "moe_gemm_w4a16(Tensor a, Tensor w_packed, Tensor w_scale, "
+      "Tensor sorted_token_ids, Tensor expert_ids, Tensor! c, "
+      "int n_valid_tokens, int top_k, int block_m, int num_blocks) -> ()");
+  rocm_ops.impl("moe_gemm_w4a16", torch::kCUDA, &moe_gemm_w4a16);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.
