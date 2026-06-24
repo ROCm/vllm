@@ -268,18 +268,18 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	ds_store_b128 v42, v[51:54]
 	ds_store_b128 v42, v[55:58] offset:4096
 	.loc	1 190 22                        ; hybrid_w4a16.py:190:22
-	DQ_EXT_LO v84, v59
-	DQ_EXT_HI v85, v59
-	v_lshrrev_b32_e32 v87, 4, v59
-	DQ_EXT_LO v86, v87
-	DQ_EXT_HI v87, v87
-	v_lshrrev_b32_e32 v89, 8, v59
-	DQ_EXT_LO v88, v89
-	DQ_EXT_HI v89, v89
-	v_lshrrev_b32_e32 v91, 12, v59
-	DQ_EXT_LO v90, v91
-	DQ_EXT_HI v91, v91
-	v_lshl_or_b32 v83, v83, 16, v83
+	v_lshrrev_b32_e32 v95, 4, v59       ; view>>4
+	v_lshrrev_b32_e32 v96, 8, v59       ; view>>8
+	v_lshrrev_b32_e32 v97, 12, v59      ; view>>12
+	DQ_EXT_LO v84, v59                  ; K0
+	DQ_EXT_HI v85, v59                  ; K1
+	DQ_EXT_LO v86, v95                  ; K2
+	DQ_EXT_HI v87, v95                  ; K3
+	DQ_EXT_LO v88, v96                  ; K4
+	DQ_EXT_HI v89, v96                  ; K5
+	DQ_EXT_LO v90, v97                  ; K6
+	DQ_EXT_HI v91, v97                  ; K7
+	v_lshl_or_b32 v83, v83, 16, v83     ; (scale, scale)
 	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
 	s_waitcnt lgkmcnt(0)
 	s_barrier
