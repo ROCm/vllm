@@ -1,5 +1,19 @@
 	.amdgcn_target "amdgcn-amd-amdhsa--gfx1151"
 	.amdhsa_code_object_version 5
+
+; --- W4A16 dequant macros (assembler text-expansion; zero runtime cost) ---
+.macro DQ_EXT0 dst        ; nibble@bit0 -> (bf16(128+n) low, bf16(-136) high)
+	v_and_or_b32 \dst, v59, v92, 0xc3084300
+.endm
+.macro DQ_EXT dst, sh     ; nibble@bit<sh> -> (bf16(128+n) low, bf16(-136) high)
+	v_lshrrev_b32_e32 \dst, \sh, v59
+	v_and_or_b32 \dst, \dst, v92, 0xc3084300
+.endm
+.macro DQ_PACK dst, klo, khi  ; two dot2: klo->low half, khi->high half of dst
+	v_dot2_bf16_bf16 \dst, \klo, v83, 0
+	v_dot2_bf16_bf16 \dst, \khi, v83, 0 op_sel:[0,0,0,1]
+.endm
+
 	.text
 	.globl	_triton_w4a16_skinny_fmt_kernel ; -- Begin function _triton_w4a16_skinny_fmt_kernel
 	.p2align	8
@@ -254,21 +268,14 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	ds_store_b128 v42, v[55:58] offset:4096
 	.loc	1 190 22                        ; hybrid_w4a16.py:190:22
 	v_mov_b32 v92, 15
-	v_and_or_b32 v84, v59, v92, 0xc3084300
-	v_lshrrev_b32_e32 v85, 16, v59
-	v_and_or_b32 v85, v85, v92, 0xc3084300
-	v_lshrrev_b32_e32 v86, 4, v59
-	v_and_or_b32 v86, v86, v92, 0xc3084300
-	v_lshrrev_b32_e32 v87, 20, v59
-	v_and_or_b32 v87, v87, v92, 0xc3084300
-	v_lshrrev_b32_e32 v88, 8, v59
-	v_and_or_b32 v88, v88, v92, 0xc3084300
-	v_lshrrev_b32_e32 v89, 24, v59
-	v_and_or_b32 v89, v89, v92, 0xc3084300
-	v_lshrrev_b32_e32 v90, 12, v59
-	v_and_or_b32 v90, v90, v92, 0xc3084300
-	v_lshrrev_b32_e32 v91, 28, v59
-	v_and_or_b32 v91, v91, v92, 0xc3084300
+	DQ_EXT0 v84
+	DQ_EXT v85, 16
+	DQ_EXT v86, 4
+	DQ_EXT v87, 20
+	DQ_EXT v88, 8
+	DQ_EXT v89, 24
+	DQ_EXT v90, 12
+	DQ_EXT v91, 28
 	v_cndmask_b32_e64 v83, 0x3f80, v83, s0
 	v_lshl_or_b32 v83, v83, 16, v83
 	.loc	1 148 20                        ; hybrid_w4a16.py:148:20
@@ -283,14 +290,10 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	ds_load_b128 v[71:74], v46
 	ds_load_b128 v[79:82], v46 offset:4096
 	.loc	1 234 50                        ; hybrid_w4a16.py:234:50
-	v_dot2_bf16_bf16 v94, v84, v83, 0
-	v_dot2_bf16_bf16 v94, v85, v83, 0 op_sel:[0,0,0,1]
-	v_dot2_bf16_bf16 v95, v86, v83, 0
-	v_dot2_bf16_bf16 v95, v87, v83, 0 op_sel:[0,0,0,1]
-	v_dot2_bf16_bf16 v96, v88, v83, 0
-	v_dot2_bf16_bf16 v96, v89, v83, 0 op_sel:[0,0,0,1]
-	v_dot2_bf16_bf16 v97, v90, v83, 0
-	v_dot2_bf16_bf16 v97, v91, v83, 0 op_sel:[0,0,0,1]
+	DQ_PACK v94, v84, v85
+	DQ_PACK v95, v86, v87
+	DQ_PACK v96, v88, v89
+	DQ_PACK v97, v90, v91
 	s_waitcnt lgkmcnt(0)
 	s_barrier
 	ds_store_b128 v42, v[94:97]
