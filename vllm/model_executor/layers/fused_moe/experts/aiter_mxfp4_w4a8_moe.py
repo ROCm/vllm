@@ -140,6 +140,7 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
         should_use_cdna4_mx_scale_swizzle,
     )
 
+    from vllm.platforms.rocm import on_gfx1250
     _swizzle_mx_scale = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
     #TODO (JPVILLAM): merge conflic resolve later if _swizzle_mx_scale is enough
     mx_scale_swizzle = None if on_gfx1250() else "CDNA4_SCALE"
@@ -160,7 +161,6 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
     # CDNA4-swizzled scale as garbage (validated on the FFM sim: CDNA4_SCALE ->
     # maxrel ~7e4, plain/None -> ~6e-3); pass swizzle_mx_scale=None there.
     # gfx950 uses the CDNA4 swizzle layout.
-    from vllm.platforms.rocm import on_gfx1250
 
 
     intermediate_cache1 = moe_gemm_a8w4(
