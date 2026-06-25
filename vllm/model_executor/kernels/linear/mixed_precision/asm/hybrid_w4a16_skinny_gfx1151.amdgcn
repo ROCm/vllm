@@ -158,7 +158,14 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	v_mov_b32_e32 v7, v25
 	v_mov_b32_e32 v8, v25
 	s_mov_b32 s15, 0x31027000
-	s_mov_b32 s14, 0x7ffffffe
+	; --- per-buffer num_records (bytes): hardware clamps OOB loads to 0 (no fault).
+	; --- dims still live here: M=s22 N=s23 K=s26 stride_bn=s5 num_groups=s6.
+	s_mul_i32 s14, s22, s26     ; activation: M*K
+	s_lshl_b32 s14, s14, 1      ;   *2 (bf16)   -> s[12:15] dword2
+	s_mul_i32 s37, s23, s5      ; weight: N*stride_bn
+	s_lshl_b32 s37, s37, 2      ;   *4 (int32)  -> s[16:19] dword2 (temp)
+	s_mul_i32 s38, s23, s6      ; scale: N*num_groups
+	s_lshl_b32 s38, s38, 1      ;   *2 (bf16)   -> s[8:11] dword2 (temp)
 	s_and_b32 s17, s17, 0xffff
 	s_and_b32 s19, s19, 0xffff
 	s_mul_hi_u32 s3, s2, s3
@@ -170,9 +177,9 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	s_mov_b32 s13, s17
 	s_mov_b32 s16, s18
 	s_mov_b32 s17, s19
-	s_mov_b32 s18, s14
+	s_mov_b32 s18, s37          ; weight num_records = N*stride_bn*4
 	s_mov_b32 s19, s15
-	s_mov_b32 s10, s14
+	s_mov_b32 s10, s38          ; scale num_records = N*num_groups*2
 	s_mov_b32 s11, s15
 	s_mov_b32 s35, 15           ; mask_lo (SGPR; survives the loop, ds_load only writes VGPRs)
 	s_mov_b32 s36, 0xf0000      ; mask_hi
@@ -253,44 +260,35 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	DQ_PACK v96, v88, v89
 	DQ_PACK v97, v90, v91
 	; --- prefetch iter k+1 (overlaps ds_store B + ds_load B + WMMA) ---
-	v_add_nc_u32_e32 v125, s5, v37
-	v_cmp_gt_i32_e64 s2, s4, v36
+	; OOB guards removed: group_size(32)==BLOCK_K divides K => no K-tail ever;
+	; M-tail + speculative last prefetch are clamped by the buffer descriptor.
 	s_ashr_i32 s3, s5, 31
 	s_abs_i32 s29, s5
 	s_xor_b32 s31, s3, s6
-	v_cmp_gt_i32_e64 s3, s26, v125
 	s_mul_hi_u32 s30, s29, s7
-	s_and_b32 s2, s0, s2
 	s_mul_i32 s33, s30, s27
-	v_cndmask_b32_e64 v125, 0x80000000, v39, s2
 	s_sub_i32 s29, s29, s33
-	s_and_b32 s2, vcc_lo, s3
 	s_add_i32 s34, s30, 1
 	s_sub_i32 s33, s29, s27
-	v_cndmask_b32_e64 v126, 0x80000000, v40, s2
-	s_and_b32 s2, s1, s3
 	s_cmp_ge_u32 s29, s27
-	v_cndmask_b32_e64 v127, 0x80000000, v41, s2
-	buffer_load_b32 v123, v125, s[16:19], 0 offen
+	buffer_load_b32 v123, v39, s[16:19], 0 offen        ; weight (pre-inc base)
 	s_cselect_b32 s2, s34, s30
 	s_cselect_b32 s3, s33, s29
 	s_add_i32 s29, s2, 1
 	s_cmp_ge_u32 s3, s27
-	buffer_load_b128 v[115:118], v126, s[12:15], 0 offen
+	buffer_load_b128 v[115:118], v40, s[12:15], 0 offen ; act A0 (pre-inc base)
 	s_cselect_b32 s2, s29, s2
-	v_add_nc_u32_e32 v36, 4, v36
 	s_xor_b32 s2, s2, s31
 	v_add_nc_u32_e32 v39, 16, v39
 	s_sub_i32 s2, s2, s31
 	v_add_nc_u32_e32 v40, 64, v40
-	v_add_lshl_u32 v125, s2, v38, 1
-	v_add_nc_u32_e32 v41, 64, v41
+	v_add_lshl_u32 v125, s2, v38, 1                     ; scale group addr
 	s_add_i32 s28, s28, -1
 	s_add_i32 s5, s5, 32
 	s_cmp_lg_u32 s28, 0
-	v_cndmask_b32_e64 v125, 0x80000000, v125, s0
-	buffer_load_u16 v124, v125, s[8:11], 0 offen
-	buffer_load_b128 v[119:122], v127, s[12:15], 0 offen
+	buffer_load_u16 v124, v125, s[8:11], 0 offen        ; scale
+	buffer_load_b128 v[119:122], v41, s[12:15], 0 offen ; act A1 (pre-inc base)
+	v_add_nc_u32_e32 v41, 64, v41
 	s_waitcnt lgkmcnt(0)
 	s_barrier
 	ds_store_b128 v42, v[94:97]
@@ -707,7 +705,7 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
 		.amdhsa_next_free_vgpr 128
-		.amdhsa_next_free_sgpr 37
+		.amdhsa_next_free_sgpr 39
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_round_mode_32 0
 		.amdhsa_float_round_mode_16_64 0
@@ -943,7 +941,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 256
     .name:           _triton_w4a16_skinny_fmt_kernel
     .private_segment_fixed_size: 0
-    .sgpr_count:     39
+    .sgpr_count:     41
     .sgpr_spill_count: 0
     .symbol:         _triton_w4a16_skinny_fmt_kernel.kd
     .uniform_work_group_size: 1
