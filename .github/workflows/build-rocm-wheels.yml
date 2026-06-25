@@ -85,7 +85,7 @@ jobs:
           # Device extras (torch[device-gfx*]) pull GPU runtime libraries
           # that are only needed to run on a GPU, not to compile vllm.
           # Skip them to save ~2 GB of disk on the GitHub-hosted runner.
-          uv pip install --system --link-mode=copy \
+          uv pip install --system --break-system-packages --link-mode=copy \
             -c constraints.txt \
             "rocm[devel,libraries]" \
             torch \
