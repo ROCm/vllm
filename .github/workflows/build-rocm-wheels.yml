@@ -59,8 +59,7 @@ jobs:
           # must share the same +rocm build-date suffix or they
           # ABI-mismatch at import ("operator torchvision::nms does not
           # exist").
-          # Pin to 0624 until rocm==7.14.0a20260625 is published on the index
-          echo 'torch==2.11.0+rocm7.14.0a20260624' > constraints.in
+          echo 'torch==2.11.*' > constraints.in
           # --no-deps: torch pins exact rocm[libraries]/triton versions
           # in its metadata (e.g. rocm[libraries]==7.14.0a..., triton==
           # 3.7.0+rocm...); we don't want those locked in constraints.
@@ -198,12 +197,18 @@ jobs:
 
   upload-wheel:
     runs-on: ubuntu-latest
-    # TODO: Until we understand the reason for inconsistent
-    # performance on different runners, we don't let
-    # tests-kernels-performance block the upload.  Runner VRAM
-    # configuration is one idea.
+    # Performance tests are excluded from `needs` because results vary
+    # across runners (VRAM configuration, thermal state, etc.).
+    # `always()` is required so that a performance-test failure doesn't
+    # implicitly skip this job via GitHub Actions' default `success()`
+    # gate, which checks ALL prior jobs — not just the `needs` list.
     needs: [build-wheel, test-kernels-correctness]
-    if: github.event_name == 'push' && github.repository_owner == 'ROCm'
+    if: >-
+      always()
+      && needs.build-wheel.result == 'success'
+      && needs.test-kernels-correctness.result == 'success'
+      && github.event_name == 'push'
+      && github.repository_owner == 'ROCm'
     permissions:
       id-token: write
       contents: read
