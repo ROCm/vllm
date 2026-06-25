@@ -216,11 +216,8 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	s_cmp_ge_u32 s3, s27
 	buffer_load_b128 v[115:118], v126, s[12:15], 0 offen
 	s_cselect_b32 s2, s29, s2
-	v_add_nc_u32_e32 v36, 4, v36
 	s_xor_b32 s2, s2, s31
-	v_add_nc_u32_e32 v39, 16, v39
 	s_sub_i32 s2, s2, s31
-	v_add_nc_u32_e32 v40, 64, v40
 	v_add_lshl_u32 v125, s2, v38, 1
 	s_add_i32 s5, s5, 32
 	v_cndmask_b32_e64 v125, 0x80000000, v125, s0
@@ -260,6 +257,9 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	; --- prefetch iter k+1 (overlaps ds_store B + ds_load B + WMMA) ---
 	; OOB guards removed: group_size(32)==BLOCK_K divides K => no K-tail ever;
 	; M-tail + speculative last prefetch are clamped by the buffer descriptor.
+	s_lshr_b32 s37, s5, 1       ; weight K byte offset = s5/2 (4-bit packed)
+	s_lshl_b32 s38, s5, 1       ; act A0 K byte offset = s5*2 (bf16)
+	s_add_i32  s40, s38, s39    ; act A1 K byte offset = A0 + 128*K
 	s_ashr_i32 s3, s5, 31
 	s_abs_i32 s29, s5
 	s_xor_b32 s31, s3, s6
@@ -269,23 +269,21 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	s_add_i32 s34, s30, 1
 	s_sub_i32 s33, s29, s27
 	s_cmp_ge_u32 s29, s27
-	buffer_load_b32 v123, v39, s[16:19], 0 offen        ; weight (pre-inc base)
+	buffer_load_b32 v123, v39, s[16:19], s37 offen     ; weight (base + s5/2)
 	s_cselect_b32 s2, s34, s30
 	s_cselect_b32 s3, s33, s29
 	s_add_i32 s29, s2, 1
 	s_cmp_ge_u32 s3, s27
-	buffer_load_b128 v[115:118], v40, s[12:15], 0 offen ; act A0 (pre-inc base)
+	buffer_load_b128 v[115:118], v40, s[12:15], s38 offen ; act A0 (base + s5*2)
 	s_cselect_b32 s2, s29, s2
 	s_xor_b32 s2, s2, s31
-	v_add_nc_u32_e32 v39, 16, v39
 	s_sub_i32 s2, s2, s31
 	v_add_lshl_u32 v125, s2, v38, 1                     ; scale group addr
 	s_add_i32 s28, s28, -1
 	s_add_i32 s5, s5, 32
 	s_cmp_lg_u32 s28, 0
 	buffer_load_u16 v124, v125, s[8:11], 0 offen        ; scale
-	buffer_load_b128 v[119:122], v40, s[12:15], s39 offen ; act A1 = v40+128*K
-	v_add_nc_u32_e32 v40, 64, v40        ; advance shared act base (after A0+A1)
+	buffer_load_b128 v[119:122], v40, s[12:15], s40 offen ; act A1 (base + s5*2 + 128*K)
 	s_waitcnt lgkmcnt(0)
 	s_barrier
 	ds_store_b128 v42, v[94:97]
@@ -702,7 +700,7 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 		.amdhsa_system_sgpr_workgroup_info 0
 		.amdhsa_system_vgpr_workitem_id 0
 		.amdhsa_next_free_vgpr 128
-		.amdhsa_next_free_sgpr 40
+		.amdhsa_next_free_sgpr 41
 		.amdhsa_reserve_vcc 1
 		.amdhsa_float_round_mode_32 0
 		.amdhsa_float_round_mode_16_64 0
@@ -938,7 +936,7 @@ amdhsa.kernels:
     .max_flat_workgroup_size: 256
     .name:           _triton_w4a16_skinny_fmt_kernel
     .private_segment_fixed_size: 0
-    .sgpr_count:     42
+    .sgpr_count:     43
     .sgpr_spill_count: 0
     .symbol:         _triton_w4a16_skinny_fmt_kernel.kd
     .uniform_work_group_size: 1
