@@ -141,7 +141,7 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	v_add_nc_u32_e32 v47, 0, v4
 	v_dual_mov_b32 v9, v25 :: v_dual_add_nc_u32 v48, 0, v10
 	v_dual_mov_b32 v14, v25 :: v_dual_add_nc_u32 v49, 0, v11
-	v_dual_mov_b32 v11, v25 :: v_dual_add_nc_u32 v50, 0, v12
+	v_dual_mov_b32 v11, v25 :: v_dual_add_nc_u32 v82, 0, v12
 	v_mov_b32_e32 v10, v25
 	v_mov_b32_e32 v12, v25
 	v_mov_b32_e32 v13, v25
@@ -245,14 +245,14 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	v_lshl_or_b32 v124, v124, 16, v124     ; (scale, scale)
 	s_waitcnt lgkmcnt(0)
 	s_barrier
-	ds_load_b128 v[51:54], v43
-	ds_load_b128 v[59:62], v43 offset:4096
-	ds_load_b128 v[55:58], v44
-	ds_load_b128 v[63:66], v44 offset:4096
-	ds_load_b128 v[67:70], v45
-	ds_load_b128 v[75:78], v45 offset:4096
-	ds_load_b128 v[71:74], v46
-	ds_load_b128 v[79:82], v46 offset:4096
+	ds_load_b128 v[50:53], v43
+	ds_load_b128 v[58:61], v43 offset:4096
+	ds_load_b128 v[54:57], v44
+	ds_load_b128 v[62:65], v44 offset:4096
+	ds_load_b128 v[66:69], v45
+	ds_load_b128 v[74:77], v45 offset:4096
+	ds_load_b128 v[70:73], v46
+	ds_load_b128 v[78:81], v46 offset:4096
 	DQ_PACK v94, v84, v85
 	DQ_PACK v95, v86, v87
 	DQ_PACK v96, v88, v89
@@ -297,20 +297,20 @@ _triton_w4a16_skinny_fmt_kernel:        ; @_triton_w4a16_skinny_fmt_kernel
 	ds_load_b128 v[95:98], v48 offset:2048
 	ds_load_b128 v[99:102], v49
 	ds_load_b128 v[107:110], v49 offset:2048
-	ds_load_b128 v[103:106], v50
-	ds_load_b128 v[111:114], v50 offset:2048
+	ds_load_b128 v[103:106], v82
+	ds_load_b128 v[111:114], v82 offset:2048
 	s_waitcnt lgkmcnt(5)
-	v_wmma_f32_16x16x16_bf16 v[25:32], v[83:90], v[51:58], v[25:32]
+	v_wmma_f32_16x16x16_bf16 v[25:32], v[83:90], v[50:57], v[25:32]
 	s_waitcnt lgkmcnt(4)
-	v_wmma_f32_16x16x16_bf16 v[17:24], v[91:98], v[51:58], v[17:24]
-	v_wmma_f32_16x16x16_bf16 v[9:16], v[83:90], v[59:66], v[9:16]
-	v_wmma_f32_16x16x16_bf16 v[1:8], v[91:98], v[59:66], v[1:8]
+	v_wmma_f32_16x16x16_bf16 v[17:24], v[91:98], v[50:57], v[17:24]
+	v_wmma_f32_16x16x16_bf16 v[9:16], v[83:90], v[58:65], v[9:16]
+	v_wmma_f32_16x16x16_bf16 v[1:8], v[91:98], v[58:65], v[1:8]
 	s_waitcnt lgkmcnt(1)
-	v_wmma_f32_16x16x16_bf16 v[25:32], v[99:106], v[67:74], v[25:32]
+	v_wmma_f32_16x16x16_bf16 v[25:32], v[99:106], v[66:73], v[25:32]
 	s_waitcnt lgkmcnt(0)
-	v_wmma_f32_16x16x16_bf16 v[17:24], v[107:114], v[67:74], v[17:24]
-	v_wmma_f32_16x16x16_bf16 v[9:16], v[99:106], v[75:82], v[9:16]
-	v_wmma_f32_16x16x16_bf16 v[1:8], v[107:114], v[75:82], v[1:8]
+	v_wmma_f32_16x16x16_bf16 v[17:24], v[107:114], v[66:73], v[17:24]
+	v_wmma_f32_16x16x16_bf16 v[9:16], v[99:106], v[74:81], v[9:16]
+	v_wmma_f32_16x16x16_bf16 v[1:8], v[107:114], v[74:81], v[1:8]
 	s_cbranch_scc1 .LBB0_2                   ; backedge: branch to next K-tile
 	; --- end of main loop (fall through to epilogue) ---
 
