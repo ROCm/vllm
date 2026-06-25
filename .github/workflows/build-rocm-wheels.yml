@@ -59,7 +59,8 @@ jobs:
           # must share the same +rocm build-date suffix or they
           # ABI-mismatch at import ("operator torchvision::nms does not
           # exist").
-          echo 'torch==2.11.*' > constraints.in
+          # Pin to 0624 until rocm==7.14.0a20260625 is published on the index
+          echo 'torch==2.11.0+rocm7.14.0a20260624' > constraints.in
           # --no-deps: torch pins exact rocm[libraries]/triton versions
           # in its metadata (e.g. rocm[libraries]==7.14.0a..., triton==
           # 3.7.0+rocm...); we don't want those locked in constraints.
@@ -81,13 +82,14 @@ jobs:
           # indexes and let the +rocm constraint pick the nightly wheel.
           # --prerelease=allow: rocm-sdk transitive deps are alpha-tagged
           # nightlies (e.g. rocm==7.14.0a20260518).
-          # shellcheck disable=SC2046
-          DEVICE_EXTRAS=$(printf "device-%s," $(echo "$PYTORCH_ROCM_ARCH" | tr ';' ' '))
-          uv pip install --system \
+          # Device extras (torch[device-gfx*]) pull GPU runtime libraries
+          # that are only needed to run on a GPU, not to compile vllm.
+          # Skip them to save ~2 GB of disk on the GitHub-hosted runner.
+          uv pip install --system --link-mode=copy \
             -c constraints.txt \
             "rocm[devel,libraries]" \
-            "torch[${DEVICE_EXTRAS%,}]" \
-            "torchvision[${DEVICE_EXTRAS%,}]" \
+            torch \
+            torchvision \
             -r requirements/build/rocm.txt \
             --index-url ${{ env.PYTORCH_INDEX_URL }} \
             --extra-index-url https://pypi.org/simple/ \
