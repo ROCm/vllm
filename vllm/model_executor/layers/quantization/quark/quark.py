@@ -7,7 +7,8 @@ from typing import Any, Optional, cast
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.layer import (
+    FusedMoE, UnquantizedFusedMoEMethod)
 from vllm.model_executor.layers.linear import (LinearBase, LinearMethodBase,
                                                UnquantizedLinearMethod)
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -61,9 +62,20 @@ class QuarkConfig(QuantizationConfig):
 
         # Check if the layer is skipped for quantization.
         exclude_layers = cast(list[str], self.quant_config.get("exclude"))
-        if should_ignore_layer(prefix,
-                               ignore=exclude_layers,
-                               fused_mapping=self.packed_modules_mapping):
+        is_ignored = should_ignore_layer(
+            prefix,
+            ignore=exclude_layers,
+            fused_mapping=self.packed_modules_mapping)
+        if isinstance(layer, FusedMoE) and exclude_layers:
+            # Quark stores MoE excludes at child expert projection names,
+            # e.g. model.layers.78.mlp.experts.0.down_proj. FusedMoE is the
+            # aggregate module, so honor child excludes at the parent prefix.
+            is_ignored = is_ignored or any(
+                excluded == prefix or excluded.startswith(prefix + ".")
+                for excluded in exclude_layers)
+        if is_ignored:
+            if isinstance(layer, FusedMoE):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
