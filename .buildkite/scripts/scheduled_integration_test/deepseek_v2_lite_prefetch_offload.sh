@@ -33,10 +33,26 @@ if [[ -n "${ATTENTION_BACKEND:-}" ]]; then
   EXTRA_ARGS+=(--attention-backend "${ATTENTION_BACKEND}")
 fi
 
+# ROCm: detect platform once and apply ROCm-specific workarounds.
+IS_ROCM=0
+if command -v rocm-smi &> /dev/null || command -v amd-smi &> /dev/null || [[ -d /opt/rocm ]] || [[ -n "${ROCM_PATH:-}" ]]; then
+  IS_ROCM=1
+fi
+
+# ROCm: use the AITER (precompiled, JIT-free) MoE/MLA path instead of Triton.
+# The default Triton kernels intermittently miscompute under load on ROCm and
+# corrupt DeepSeek-V2-Lite output (accuracy collapses to ~0.01); the AITER path
+# is largely immune. Mirrors the AITER-as-reference approach in
+# https://github.com/vllm-project/vllm/pull/46409
+if [[ "${IS_ROCM}" == "1" ]]; then
+  echo "ROCm platform detected: enabling AITER (VLLM_ROCM_USE_AITER=1) to avoid Triton miscompute under load"
+  export VLLM_ROCM_USE_AITER=1
+fi
+
 # ROCm: run eager to avoid intermittent HIP-graph decode corruption.
 # See https://github.com/ROCm/clr/issues/279
 # TODO(aarushjain29): Revert after TheRock 7.14
-if command -v rocm-smi &> /dev/null || command -v amd-smi &> /dev/null || [[ -d /opt/rocm ]] || [[ -n "${ROCM_PATH:-}" ]]; then
+if [[ "${IS_ROCM}" == "1" ]]; then
   echo "ROCm platform detected: adding --enforce-eager to avoid HIP-graph decode corruption"
   EXTRA_ARGS+=(--enforce-eager)
 fi
