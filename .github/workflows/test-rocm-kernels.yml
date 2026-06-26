@@ -71,18 +71,13 @@ jobs:
           # Use the build step's constraints.txt (shipped in the wheel
           # artifact) so the test env pins the exact same torch+triton
           # that the wheel was compiled against.
-          if [ -f dist/constraints.txt ]; then
-            cp dist/constraints.txt constraints.txt
-            echo "Using build-time constraints:"
-          else
-            echo 'torch==2.11.*' > constraints.in
-            uv pip compile constraints.in \
-              --index-url ${{ env.PYTORCH_INDEX_URL }} \
-              --prerelease allow \
-              --no-header --no-annotate --no-deps \
-              -o constraints.txt
-            echo "Resolved fresh constraints (no build-time constraints found):"
+          if [ ! -f dist/constraints.txt ]; then
+            echo "ERROR: dist/constraints.txt not found in wheel artifact."
+            echo "The build-wheel step should produce this file."
+            exit 1
           fi
+          cp dist/constraints.txt constraints.txt
+          echo "Using build-time constraints:"
           TORCH_LOCAL=$(grep '^torch==' constraints.txt | sed 's/.*+//')
           TORCH_PATCH_SUFFIX=$(grep '^torch==' constraints.txt | sed 's/^torch==[0-9]\+\.[0-9]\+\.\([0-9]\+[^+]*\)+.*/\1/')
           echo "torchvision==0.26.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
