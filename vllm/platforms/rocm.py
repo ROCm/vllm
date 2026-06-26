@@ -289,8 +289,10 @@ def on_gfx1100() -> bool:
 def on_gfx1103() -> bool:
     return _ON_GFX1103
 
+
 def on_gfx1150() -> bool:
     return _ON_GFX1150
+
 
 def on_gfx1151() -> bool:
     return _ON_GFX1151
