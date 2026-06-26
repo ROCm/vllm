@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+import sys
 from enum import IntEnum
 
 import torch
@@ -78,6 +80,21 @@ class SharedExperts:
             if self._stream is not None:
                 logger.debug_once("Enabled separate cuda stream for MoE shared_experts")
 
+        # On gfx11 (RDNA3) overlapping the shared expert on a separate stream is
+        # net-positive across every measured prefill size, so default the token
+        # threshold to unlimited there. Other platforms keep the configured cap,
+        # where the separate-stream win disappears for large batches. An explicit
+        # VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD always takes precedence.
+        self._stream_token_threshold = envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        if (
+            current_platform.is_rocm()
+            and "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD" not in os.environ
+        ):
+            from vllm.platforms.rocm import on_gfx11
+
+            if on_gfx11():
+                self._stream_token_threshold = sys.maxsize
+
     @property
     def _disable_shared_experts_overlap(self) -> bool:
         # Disable shared expert overlap if:
@@ -102,8 +119,7 @@ class SharedExperts:
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda_alike()
             and self._stream is not None
-            and hidden_states.shape[0]
-            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and hidden_states.shape[0] <= self._stream_token_threshold
         )
 
         if should_run_shared_in_aux_stream:
