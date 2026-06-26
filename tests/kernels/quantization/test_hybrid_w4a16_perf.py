@@ -146,6 +146,33 @@ SHAPES: list[dict[str, Any]] = [
         "group_size": 128,
         "comment": "Qwen3-4B down_proj",
     },
+    # Qwen3-VL-4B-Instruct-AWQ-4bit (group_size=32). Same text-decoder dims as
+    # Qwen3-4B but quantized at g=32; these are the dominant decode GEMMs seen
+    # profiling the model with eagle3 speculative decoding (N=3..4).
+    {
+        "in_features": 2560,
+        "out_features": 6144,
+        "group_size": 32,
+        "comment": "Qwen3-VL-4B qkv_proj (g=32)",
+    },
+    {
+        "in_features": 4096,
+        "out_features": 2560,
+        "group_size": 32,
+        "comment": "Qwen3-VL-4B o_proj (g=32)",
+    },
+    {
+        "in_features": 2560,
+        "out_features": 19456,
+        "group_size": 32,
+        "comment": "Qwen3-VL-4B gate_up_proj (g=32)",
+    },
+    {
+        "in_features": 9728,
+        "out_features": 2560,
+        "group_size": 32,
+        "comment": "Qwen3-VL-4B down_proj (g=32)",
+    },
     # RedHatAI/Qwen3-8B-quantized.w4a16 (asymmetric bf16; see PR #953)
     {
         "in_features": 4096,
