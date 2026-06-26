@@ -18,6 +18,10 @@ on:
         default: 'gfx1103;gfx1150;gfx1151'
         required: false
 
+concurrency:
+  group: build-wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
   PYTORCH_ROCM_ARCH: ${{ github.event.inputs.rocm_arch || 'gfx1103;gfx1150;gfx1151' }}
