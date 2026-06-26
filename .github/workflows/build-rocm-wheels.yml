@@ -81,13 +81,14 @@ jobs:
           # indexes and let the +rocm constraint pick the nightly wheel.
           # --prerelease=allow: rocm-sdk transitive deps are alpha-tagged
           # nightlies (e.g. rocm==7.14.0a20260518).
-          # shellcheck disable=SC2046
-          DEVICE_EXTRAS=$(printf "device-%s," $(echo "$PYTORCH_ROCM_ARCH" | tr ';' ' '))
-          uv pip install --system \
+          # Device extras (torch[device-gfx*]) pull GPU runtime libraries
+          # that are only needed to run on a GPU, not to compile vllm.
+          # Skip them to save ~2 GB of disk on the GitHub-hosted runner.
+          uv pip install --system --break-system-packages --link-mode=copy \
             -c constraints.txt \
             "rocm[devel,libraries]" \
-            "torch[${DEVICE_EXTRAS%,}]" \
-            "torchvision[${DEVICE_EXTRAS%,}]" \
+            torch \
+            torchvision \
             -r requirements/build/rocm.txt \
             --index-url ${{ env.PYTORCH_INDEX_URL }} \
             --extra-index-url https://pypi.org/simple/ \
@@ -196,12 +197,18 @@ jobs:
 
   upload-wheel:
     runs-on: ubuntu-latest
-    # TODO: Until we understand the reason for inconsistent
-    # performance on different runners, we don't let
-    # tests-kernels-performance block the upload.  Runner VRAM
-    # configuration is one idea.
+    # Performance tests are excluded from `needs` because results vary
+    # across runners (VRAM configuration, thermal state, etc.).
+    # `always()` is required so that a performance-test failure doesn't
+    # implicitly skip this job via GitHub Actions' default `success()`
+    # gate, which checks ALL prior jobs — not just the `needs` list.
     needs: [build-wheel, test-kernels-correctness]
-    if: github.event_name == 'push' && github.repository_owner == 'ROCm'
+    if: >-
+      always()
+      && needs.build-wheel.result == 'success'
+      && needs.test-kernels-correctness.result == 'success'
+      && github.event_name == 'push'
+      && github.repository_owner == 'ROCm'
     permissions:
       id-token: write
       contents: read

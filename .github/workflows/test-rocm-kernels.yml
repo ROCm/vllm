@@ -68,18 +68,31 @@ jobs:
           # satisfied by the vanilla PyPI wheel (PyTorch 2.11.0+cu130,
           # HIP: None), and tests fail to find any GPU. See the build
           # workflow for the same trick.
-          echo 'torch==2.11.*' > constraints.in
-          uv pip compile constraints.in \
-            --index-url ${{ env.PYTORCH_INDEX_URL }} \
-            --prerelease allow \
-            --no-header --no-annotate --no-deps \
-            -o constraints.txt
+          # Use the build step's constraints.txt (shipped in the wheel
+          # artifact) so the test env pins the exact same torch+triton
+          # that the wheel was compiled against.
+          if [ -f dist/constraints.txt ]; then
+            cp dist/constraints.txt constraints.txt
+            echo "Using build-time constraints:"
+          else
+            echo 'torch==2.11.*' > constraints.in
+            uv pip compile constraints.in \
+              --index-url ${{ env.PYTORCH_INDEX_URL }} \
+              --prerelease allow \
+              --no-header --no-annotate --no-deps \
+              -o constraints.txt
+            echo "Resolved fresh constraints (no build-time constraints found):"
+          fi
           TORCH_LOCAL=$(grep '^torch==' constraints.txt | sed 's/.*+//')
           TORCH_PATCH_SUFFIX=$(grep '^torch==' constraints.txt | sed 's/^torch==[0-9]\+\.[0-9]\+\.\([0-9]\+[^+]*\)+.*/\1/')
           echo "torchvision==0.26.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
           echo "torchaudio==2.11.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
           cat constraints.txt
-          uv pip install --system \
+          # --break-system-packages: the CI container is ephemeral (destroyed
+          # after each job), so installing into the system Python is safe.
+          # The container's Debian base ships the PEP 668 EXTERNALLY-MANAGED
+          # marker which uv enforces by default.
+          uv pip install --system --break-system-packages --link-mode=copy \
             -c constraints.txt \
             "$(echo dist/vllm-*.whl)[device-gfx1151]" \
             "huggingface_hub" \
@@ -96,7 +109,7 @@ jobs:
             --prerelease allow
           # Kernel tests don't need torchvision; remove to keep the env
           # minimal and avoid any future ABI surprises.
-          uv pip uninstall --system torchvision 2>/dev/null || true
+          uv pip uninstall --system --break-system-packages torchvision 2>/dev/null || true
 
       - name: GPU sanity check
         run: |
