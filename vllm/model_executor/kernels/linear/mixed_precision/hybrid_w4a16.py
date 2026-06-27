@@ -274,6 +274,50 @@ def _triton_w4a16_skinny_fmt_kernel(
 #
 # BLOCK_K is capped to group_size so a K-block never straddles a quant group
 # (scale aliasing); gs128 -- the bulk -- passes the table BLOCK_K through.
+# gfx1103 (Hawk Point, RDNA3) bf16 scalar-dequant tile table -- AIESW-36468.
+# The bf16 kernel body takes the scalar int4 unshuffle path (the packed
+# v_and_or/v_pk_fma dequant is fp16-only), so it does NOT share the fp16 tile
+# table; before this it took the coarse gfx1103 pick (M>256 -> 64,256,64,8) on
+# top of the generic gfx11 scalar table, which is not CU-count-aware across the
+# rest of the M range. Re-tuned on the 12-CU gfx1103 (Radeon 780M) at
+# group_size=32 over the Qwen3-VL-4B-Instruct AWQ-4bit prefill GEMMs
+# (qkv/o/gate_up/down), bf16 sym + asym, M tiers 129..2048: median x1.27 with
+# no regression vs the generic scalar table. gate_up (wide N) and down (tall K)
+# dominate the W4A16 prefill cost and both want the wide BN=256 tile that fills
+# the 12 CUs at deep M (+1.3-1.6x at M=660); the narrower qkv/o (mid) shapes
+# keep the base tile until M is large enough that BN=256 wins without the
+# M~462 regression (BN=256 regresses qkv ~5% at M=462). BLOCK_K is returned as
+# 64 and clamped to group_size by the caller, so the deployed g=32 checkpoint
+# runs exactly the swept BLOCK_K=32.
+def _select_skinny_gfx1103_bf16_config(
+    M: int, N: int, K: int
+) -> tuple[int, int, int, int]:
+    """Return (BLOCK_M, BLOCK_N, BLOCK_K, num_warps) for the gfx1103 bf16 GEMM.
+
+    Only invoked for M > 128 (small-M decode-adjacent shapes stay on the shared
+    scalar table). See the table comment above for the tuning provenance.
+    """
+    tall = K >= 2 * N  # down_proj-like (tall K)
+    wide = N >= 4 * K  # gate_up-like (very wide N)
+    if M <= 256:  # 129..256
+        if wide:
+            return 128, 64, 64, 4
+        if tall:
+            return 64, 128, 64, 8
+        return 64, 128, 64, 4  # mid (qkv/o): == base tile (safe)
+    # M >= 257 (deep prefill: 462, 660, ...). gate_up (wide) + down (tall) are
+    # the dominant GEMMs and both take the wide BN=256 tile.
+    if wide or tall:
+        return 64, 256, 64, 8
+    # mid (qkv: N>K ; o_proj: K>N). Keep the base tile through ~512 (BN=256
+    # regresses qkv at M~462); above that the wide/nw8 pick wins cleanly.
+    if M <= 512:
+        return 64, 128, 64, 4  # base-optimal at M~462/512 (no regression)
+    if N > K:
+        return 64, 256, 64, 8  # qkv at M~660: x1.21
+    return 64, 128, 64, 8  # o_proj at M~660: x1.08
+
+
 def _select_skinny_gfx11_config(
     M: int, N: int, K: int, group_size: int, dtype: torch.dtype
 ) -> tuple[int, int, int, int]:
@@ -330,10 +374,14 @@ def _select_skinny_gfx11_config(
             block_n = min(block_n, 32)
     else:
         # Scalar-dequant path (bf16): pre-packed-kernel scalar-tuned table.
-        if on_gfx1103() and M > 256:
-            # Tested on Qwen3-VL-4B-AWQ
-            block_m, block_n, block_k, num_warps = 64, 256, 64, 8
-        elif M <= 32:
+        # On the 12-CU gfx1103 (780M), deep prefill (M>128) uses the CU-count-
+        # aware bf16 table above; small-M stays on the shared table below.
+        if on_gfx1103() and M > 128:
+            block_m, block_n, block_k, num_warps = _select_skinny_gfx1103_bf16_config(
+                M, N, K
+            )
+            return block_m, block_n, min(block_k, group_size), num_warps
+        if M <= 32:
             block_m, block_n, block_k, num_warps = 32, 32, 128, 4
         elif M <= 64:
             block_m, block_n, block_k, num_warps = 64, 64, 32, 4
