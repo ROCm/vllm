@@ -1300,6 +1300,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     "csrc/rocm/skinny_gemms.cu"
+    "csrc/rocm/skinny_gemms/instantiate_n1.cu"
+    "csrc/rocm/skinny_gemms/instantiate_n2.cu"
+    "csrc/rocm/skinny_gemms/instantiate_n3.cu"
+    "csrc/rocm/skinny_gemms/instantiate_n4.cu"
+    "csrc/rocm/skinny_gemms/instantiate_n5.cu"
     "csrc/rocm/skinny_gemms_int8.cu"
     "csrc/rocm/skinny_gemms_int8/instantiate_n1.cu"
     "csrc/rocm/skinny_gemms_int8/instantiate_n2.cu"
