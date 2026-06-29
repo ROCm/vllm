@@ -1,8 +1,14 @@
-// Production wrappers for int4 wvSplitK GEMMs. Templates and macros live in
-// skinny_gemms_int4_kernels.cuh; the sweep variants live in
-// skinny_gemms_int4_sweep.cu. Splitting kept the file small so production +
-// sweep TUs compile in parallel.
+// Production wrappers for int4 wvSplitK GEMMs. Kernel templates live in
+// skinny_gemms_int4_kernels.cuh; per-N instantiation shards live in
+// skinny_gemms_int4/instantiate_n{1..5}.cu.
+#include <torch/all.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include "../cuda_compat.h"
+#include "dispatch_utils.h"
 #include "skinny_gemms_int4_kernels.cuh"
+#include "skinny_gemms_int4/launch.h"
 
 torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
                               const at::Tensor& in_scale,
@@ -71,6 +77,8 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(in_w));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  bool has_zp = in_zero_points.has_value();
+
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
       in_x.scalar_type(), "wvSplitK_int4_g", [&] {
         using fptype = typename scalar<scalar_t>::type;
@@ -88,30 +96,46 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
                 : nullptr;
         fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-        if (in_zero_points.has_value())
-          WVSPLIT_INT4G_DISPATCH(true)
-        else
-          WVSPLIT_INT4G_DISPATCH(false)
+        switch (N_in) {
+          case 1:
+            launch_int4_n1(grid, stream, K_in, M_in, Bx_in, By_in, wptr, aptr,
+                           sptr, zpptr, biasptr, cptr, CuCount,
+                           b_row_stride_bytes_i32, group_size, max_lds_len,
+                           has_zp);
+            break;
+          case 2:
+            launch_int4_n2(grid, stream, K_in, M_in, Bx_in, By_in, wptr, aptr,
+                           sptr, zpptr, biasptr, cptr, CuCount,
+                           b_row_stride_bytes_i32, group_size, max_lds_len,
+                           has_zp);
+            break;
+          case 3:
+            launch_int4_n3(grid, stream, K_in, M_in, Bx_in, By_in, wptr, aptr,
+                           sptr, zpptr, biasptr, cptr, CuCount,
+                           b_row_stride_bytes_i32, group_size, max_lds_len,
+                           has_zp);
+            break;
+          case 4:
+            launch_int4_n4(grid, stream, K_in, M_in, Bx_in, By_in, wptr, aptr,
+                           sptr, zpptr, biasptr, cptr, CuCount,
+                           b_row_stride_bytes_i32, group_size, max_lds_len,
+                           has_zp);
+            break;
+          case 5:
+            launch_int4_n5(grid, stream, K_in, M_in, Bx_in, By_in, wptr, aptr,
+                           sptr, zpptr, biasptr, cptr, CuCount,
+                           b_row_stride_bytes_i32, group_size, max_lds_len,
+                           has_zp);
+            break;
+          default:
+            throw std::runtime_error("Unsupported N value: " +
+                                     std::to_string(N_in));
+        }
       });
 
   return out_c;
 }
 
-// Fused MoE wrapper around wvSplitK_int4_g.
-//
-// Single GPU kernel launch — expert routing happens on-device via blockIdx.y.
-// No host-side loop, no GPU→CPU memcpy of expert_ids.
-// Activations must be pre-permuted into contiguous expert blocks.
-//
-// a:           [num_slots, K] pre-permuted activations (fp16/bf16)
-// w:           [E, N_weight, K//8] int32 packed weights (skinny layout)
-// scales:      [E, N_weight, K//group_size] fp16/bf16
-// c:           [num_slots, N_weight] output (pre-allocated)
-// expert_ids:  [num_expert_blocks] int32 — expert id per block
-// block_size_m: 1, 2, or 4 — rows per expert block
-// CuCount:     number of compute units
-// group_size:  32 or 128
-// zero_points: [E, N_weight, K//group_size] or empty tensor
 void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   torch::Tensor scales, torch::Tensor c,
                                   torch::Tensor expert_ids,
@@ -122,36 +146,25 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  // Weight layout: [E, N_weight, K//8]
-  int M_in = static_cast<int>(w.size(1));      // N_weight (wvSplitK M dim)
-  int K_in = static_cast<int>(w.size(2)) * 8;  // unpacked K
-  int N_in = static_cast<int>(block_size_m);   // batch rows per expert block
+  int M_in = static_cast<int>(w.size(1));
+  int K_in = static_cast<int>(w.size(2)) * 8;
+  int N_in = static_cast<int>(block_size_m);
   int num_expert_blocks = static_cast<int>(expert_ids.size(0));
 
   bool has_zp = zero_points.numel() > 0;
 
-  // Expert strides: w stride is in int32 elements, convert to bytes for uint8*
   long expert_stride_w = w.stride(0) * static_cast<long>(sizeof(int32_t));
   long expert_stride_s = scales.stride(0);
   long expert_stride_zp = has_zp ? zero_points.stride(0) : 0;
 
   const int max_lds_len = get_lds_size_int4() / 2;
 
-  // Scattered mode: sorted_token_ids is non-empty, kernel indexes into
-  // unpermuted activations via sorted_token_ids[block] / top_k.
   bool scattered = sorted_token_ids.numel() > 0;
   int top_k_in = scattered ? static_cast<int>(top_k) : 1;
 
-  // The MOE_WVSPLIT_INT4G_GS_W_AC dispatch macro (in _kernels.cuh) takes a
-  // runtime fuse_silu_mul branch reachable from the sweep wrapper.  The
-  // production op never requests fusion (its public signature has no such
-  // arg); declare a const-false here so the dispatch falls through to the
-  // unfused codepath and the optimiser eliminates the fused branch.
   const bool fuse_silu_mul = false;
 
-  // No c.zero_() needed: the wvSplitK kernel writes all M output rows directly
-  // (no atomicAdd), and padding blocks with expert_id==-1 are never read by
-  // the caller (moe_unpermute only accesses valid token slots).
+  dim3 grid(CuCount);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
       a.scalar_type(), "fused_moe_wvSplitK_int4_gemm", [&] {
@@ -168,12 +181,45 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
         const int* stidptr =
             scattered ? sorted_token_ids.data_ptr<int32_t>() : nullptr;
 
-        // Single kernel launch: grid = dim3(CuCount); the expert-block
-        // dimension is walked by an in-kernel for-loop inside the MoE
-        // kernel so the "workgroups == CuCount" M-split invariant holds.
-        if (has_zp)
-          MOE_WVSPLIT_INT4G_DISPATCH(true)
-        else
-          MOE_WVSPLIT_INT4G_DISPATCH(false)
+        switch (N_in) {
+          case 1:
+            launch_moe_int4_n1(grid, stream, K_in, M_in, N_in, wptr, aptr, sptr,
+                               zpptr, cptr, eidptr, stidptr, top_k_in,
+                               expert_stride_w, expert_stride_s,
+                               expert_stride_zp, CuCount, num_expert_blocks,
+                               group_size, max_lds_len, has_zp, fuse_silu_mul);
+            break;
+          case 2:
+            launch_moe_int4_n2(grid, stream, K_in, M_in, N_in, wptr, aptr, sptr,
+                               zpptr, cptr, eidptr, stidptr, top_k_in,
+                               expert_stride_w, expert_stride_s,
+                               expert_stride_zp, CuCount, num_expert_blocks,
+                               group_size, max_lds_len, has_zp, fuse_silu_mul);
+            break;
+          case 3:
+            launch_moe_int4_n3(grid, stream, K_in, M_in, N_in, wptr, aptr, sptr,
+                               zpptr, cptr, eidptr, stidptr, top_k_in,
+                               expert_stride_w, expert_stride_s,
+                               expert_stride_zp, CuCount, num_expert_blocks,
+                               group_size, max_lds_len, has_zp, fuse_silu_mul);
+            break;
+          case 4:
+            launch_moe_int4_n4(grid, stream, K_in, M_in, N_in, wptr, aptr, sptr,
+                               zpptr, cptr, eidptr, stidptr, top_k_in,
+                               expert_stride_w, expert_stride_s,
+                               expert_stride_zp, CuCount, num_expert_blocks,
+                               group_size, max_lds_len, has_zp, fuse_silu_mul);
+            break;
+          case 5:
+            launch_moe_int4_n5(grid, stream, K_in, M_in, N_in, wptr, aptr, sptr,
+                               zpptr, cptr, eidptr, stidptr, top_k_in,
+                               expert_stride_w, expert_stride_s,
+                               expert_stride_zp, CuCount, num_expert_blocks,
+                               group_size, max_lds_len, has_zp, fuse_silu_mul);
+            break;
+          default:
+            throw std::runtime_error("Unsupported N value: " +
+                                     std::to_string(N_in));
+        }
       });
 }
