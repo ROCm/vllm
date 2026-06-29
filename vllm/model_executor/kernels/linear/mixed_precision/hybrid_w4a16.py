@@ -16,6 +16,8 @@ from contextlib import nullcontext
 
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
@@ -29,6 +31,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
+
+logger = init_logger(__name__)
 
 SUPPORTED_GROUP_SIZES = [32, 64, 128]
 
@@ -606,6 +610,7 @@ def _hybrid_w4a16_apply_impl(
     cu_count: int,
     group_size: int,
     packed_scale_zp: torch.Tensor | None = None,
+    w_dequant: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
@@ -618,6 +623,11 @@ def _hybrid_w4a16_apply_impl(
                single format: dequant = (nibble - zp_raw) * scale.
       packed_scale_zp: [N, K//G] fp32 carrier packing scale + zero-point per
                group (Triton prefill, asymmetric only), or None for symmetric.
+      w_dequant:  [N, K] dense dequantized weight (VLLM_W4A16_PREFILL_DEQUANT), or None.
+               When present, prefill (M > MAX_SKINNY_BATCH_SIZE) runs a dense GEMM
+               on it. Passed as an op arg (not branched on in apply_weights) so the
+               M-branch stays out of the compiled graph -- decode (small M) replays
+               the same int4 cudagraph whether or not the dequantized copy exists.
 
     Registered as a custom op so torch.compile treats it as opaque.
     """
@@ -637,6 +647,16 @@ def _hybrid_w4a16_apply_impl(
         )
         with ctx:
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
+
+    # Prefill with the pre-dequantized dense copy (load-time cached), if present.
+    if w_dequant is not None:
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"hybrid_dequant_w4a16 {M}x{N}x{K}")
+        )
+        with ctx:
+            return torch.nn.functional.linear(x_2d, w_dequant, bias)
 
     ctx = (
         nullcontext()
@@ -669,6 +689,7 @@ def _hybrid_w4a16_apply_fake(
     cu_count: int,
     group_size: int,
     packed_scale_zp: torch.Tensor | None = None,
+    w_dequant: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M = x_2d.size(0)
     N = w_q.size(0)
@@ -769,6 +790,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         w_s_skinny = w_s_raw.data.contiguous()
 
         # ---- Process zero-points for asymmetric quantization ----
+        w_zp = None
         if c.zero_points:
             assert self.w_zp_name is not None
             w_zp_raw = getattr(layer, self.w_zp_name)
@@ -807,6 +829,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         #         plain integer. Consumed by the int-domain subtract (RDNA3 has no
         #         v_pk_fma_bf16). Bit-identical to the separate scale+zp loads.
         if c.zero_points and c.act_type in (torch.float16, torch.bfloat16):
+            assert w_zp is not None  # set above whenever c.zero_points is True
             scale_u16 = w_s_skinny.view(torch.uint16).to(torch.int32) & 0xFFFF
             if c.act_type == torch.float16:
                 w_s_f32 = w_s_skinny.to(torch.float32)
@@ -823,6 +846,83 @@ class HybridW4A16LinearKernel(MPLinearKernel):
                 "_hybrid_w_packed_scale_zp",
                 torch.nn.Parameter(packed_scale_zp, requires_grad=False),
             )
+
+        # ---- Optional: cache a dequantized copy of the weight (in the model's
+        # activation dtype, fp16 or bf16) so the
+        # prefill path (M > MAX_SKINNY_BATCH_SIZE) can run a dense hipBLASLt GEMM
+        # and skip the in-kernel int4 unpack. Decode still uses the int4 weights
+        # (bandwidth-bound at small M). The copy costs ~4x the int4 weight, so it
+        # is gated per-weight on the gpu_memory_utilization budget: weights are
+        # cached greedily until the budget is exhausted, after which the rest keep
+        # the int4 prefill path. Allocating here (before the memory profiler runs)
+        # lets the KV-cache sizing account for the copies.
+        if envs.VLLM_W4A16_PREFILL_DEQUANT and unpacked.device.type == "cuda":
+            self._maybe_cache_dequant_prefill_weight(layer, unpacked, w_s_skinny, w_zp)
+
+    def _maybe_cache_dequant_prefill_weight(
+        self,
+        layer: torch.nn.Module,
+        unpacked: torch.Tensor,
+        w_s_skinny: torch.Tensor,
+        w_zp: torch.Tensor | None,
+    ) -> None:
+        """Cache a dense dequantized copy of the weight (in the activation dtype,
+        fp16 or bf16) for the prefill GEMM, when it still fits in vLLM's budget.
+
+        The copy is registered as ``_hybrid_w_dequant`` and consumed by the prefill
+        branch of ``apply_weights``. The gate is anchored to the configured
+        ``gpu_memory_utilization`` budget rather than a raw free-VRAM number:
+
+          budget    = total * gpu_memory_utilization   (weights + acts + KV)
+          spendable = free_now - total * (1 - util)     (room left in budget)
+
+        We cache the copy only while ``spendable`` clears it. The check uses live
+        free memory, so it is self-limiting: as copies are allocated,
+        ``spendable`` shrinks and later layers stop being cached once the budget
+        is exhausted. Skipped weights keep the int4 prefill path (warns once).
+        """
+        from vllm.config import get_current_vllm_config
+        from vllm.utils.mem_utils import MemorySnapshot
+
+        c = self.config
+        N, K = unpacked.shape
+        dequant_bytes = N * K * torch.empty((), dtype=c.act_type).element_size()
+
+        util = get_current_vllm_config().cache_config.gpu_memory_utilization
+        # MemorySnapshot mirrors vLLM's own KV-cache profiler: on integrated/UMA
+        # GPUs (e.g. gfx1151 Strix Halo) cudaMemGetInfo underreports free memory,
+        # so it falls back to psutil there -- keeping this gate consistent with
+        # how the KV-cache budget is actually sized.
+        snapshot = MemorySnapshot(device=unpacked.device)
+        free_bytes, total_bytes = snapshot.free_memory, snapshot.total_memory
+        # Memory vLLM deliberately leaves untouched outside its budget.
+        out_of_budget = total_bytes * (1.0 - util)
+        # Room still free within the budget right now.
+        spendable = free_bytes - out_of_budget
+        if spendable < dequant_bytes:
+            logger.warning_once(
+                "VLLM_W4A16_PREFILL_DEQUANT: no room left in the "
+                "gpu_memory_utilization=%.2f budget to cache a dequantized "
+                "prefill copy; affected W4A16 weights use the int4 prefill path. Raise "
+                "gpu_memory_utilization to cache more.",
+                util,
+            )
+            return
+
+        G = c.group_size
+        u = unpacked.to(torch.float32)  # [N, K] natural order, nibble 0..15
+        scale_exp = w_s_skinny.to(torch.float32).repeat_interleave(G, dim=1)
+        if w_zp is not None:
+            zp_exp = w_zp.to(torch.float32).repeat_interleave(G, dim=1)
+            w_dequant = ((u - zp_exp) * scale_exp).to(c.act_type)
+        else:
+            w_dequant = ((u - 8.0) * scale_exp).to(c.act_type)
+        # Buffer (not a Parameter): this is a derived, recomputable cache, so it
+        # should move with the module but stay out of .parameters() and, with
+        # persistent=False, out of state_dict().
+        layer.register_buffer(
+            "_hybrid_w_dequant", w_dequant.contiguous(), persistent=False
+        )
 
     def apply_weights(
         self,
@@ -842,6 +942,14 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         N = w_q.shape[0]
         out_shape = x.shape[:-1] + (N,)
 
+        # Dequantized copy cached at load time (opt-in via
+        # VLLM_W4A16_PREFILL_DEQUANT, subject to the free-VRAM gate), or None when
+        # absent/skipped. Passed straight to the op; the M-branch (prefill ->
+        # dense dequant, decode -> int4) lives INSIDE the opaque op so it never
+        # enters the compiled graph -- decode replays the same int4 cudagraph
+        # whether or not the dequantized copy exists.
+        w_dequant = getattr(layer, "_hybrid_w_dequant", None)
+
         cu_count = num_compute_units()
         output = torch.ops.vllm.hybrid_w4a16_apply(
             x_2d,
@@ -853,5 +961,6 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             cu_count,
             c.group_size,
             packed_scale_zp,
+            w_dequant,
         )
         return output.reshape(out_shape)

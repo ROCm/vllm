@@ -118,6 +118,7 @@ if TYPE_CHECKING:
     VLLM_MOE_AWQ_GEMV_HIP: bool = False
     VLLM_MOE_GPTQ_EXLLAMA: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
+    VLLM_W4A16_PREFILL_DEQUANT: bool = False
     VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
@@ -1111,6 +1112,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Converts weights to skinny layout [E, N, K//8] int32 (ExLlama shuffle).
     "VLLM_MOE_HYBRID_W4A16": lambda: (
         os.getenv("VLLM_MOE_HYBRID_W4A16", "true").lower() in ("true", "1")
+    ),
+    # ROCm W4A16 linear: cache a dequantized copy of each weight (in the model's
+    # activation dtype, fp16 or bf16) at load time so the prefill GEMM (batch
+    # M > skinny threshold) runs a dense hipBLASLt GEMM instead of the fused
+    # in-kernel int4 unpack. Decode still uses the int4 weights. Trades VRAM
+    # (~4x the int4 weight) for prefill compute. The copy is only kept while
+    # there is room left in the gpu_memory_utilization budget (budget = total *
+    # util): a weight is cached if (free_mem - total * (1 - util)) >=
+    # dequant_bytes at load time, otherwise it keeps the int4 prefill path. The
+    # check is self-limiting -- each copy shrinks the spendable budget, so later
+    # layers stop being cached once the budget is exhausted (a message is
+    # emitted). Raise gpu_memory_utilization to cache more weights at the cost of
+    # KV-cache memory.
+    "VLLM_W4A16_PREFILL_DEQUANT": lambda: (
+        os.getenv("VLLM_W4A16_PREFILL_DEQUANT", "false").lower() in ("true", "1")
     ),
     # Use exllama 4-bit kernel for MoE GPTQ instead of Triton.
     # Requires exllama-native weight format [E, K/8, N] int32.
