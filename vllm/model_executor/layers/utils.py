@@ -99,6 +99,7 @@ def default_unquantized_gemm(
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):
+    from vllm.platforms.rocm import on_gfx1250
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()
         # MI300's - fp8nuz=True
@@ -107,9 +108,17 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     ):
         return False
 
-    # use hipblaslt for the larger GEMMs
-    if n > 2048 and m > 512:
+    # PATCH: gfx1250 branch-aiter gemm_a16w16 is 8-16x FASTER than rocBLAS even
+    # for large prefill batches (validated: 16384x5120x2880 -> 685us vs 5917us).
+    # The original "use hipblaslt for larger GEMMs" guard sent big prefill qkv/o_proj
+    # to rocBLAS (Cijk). Disable it on gfx1250 so large prefill GEMMs use aiter too.
+    if n > 2048 and m > 512 and not on_gfx1250():
         return False
+    # PATCH: gfx1250 aiter gluon gemm_a16w16 handles arbitrary shapes (incl.
+    # lm_head m=201088,k=2880 and K%256!=0). Route ALL bf16 dense GEMMs through
+    # it so lm_head (and any other shape) stops falling back to rocBLAS (Cijk).
+    if on_gfx1250():
+        return True
     return (
         (m == 5120 and k == 2880)
         or (m == 2880 and k == 4096)
@@ -168,9 +177,10 @@ def rocm_unquantized_gemm_impl(
     # K % 256 == 0 (it walks K with fixed-size descriptors and won't pad a
     # partial last tile). Some whitelisted shapes have K=2880 (e.g. gpt-oss-120b
     # hidden), so skip aiter there and fall back to the torch GEMM path below.
-    if use_aiter_triton_gemm(n, m, k, x.dtype) and not (
-        on_gfx1250() and k % 256 != 0
-    ):
+    # PATCH: branch aiter gemm_a16w16 handles K%256!=0 (e.g. gpt-oss-120b K=2880),
+    # validated numerically. Drop the stale gfx1250 guard so these bf16 projections
+    # use aiter gluon GEMM instead of falling back to slow rocBLAS (Cijk) torch.linear.
+    if use_aiter_triton_gemm(n, m, k, x.dtype):
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
         return gemm_a16w16(x, weight, bias)

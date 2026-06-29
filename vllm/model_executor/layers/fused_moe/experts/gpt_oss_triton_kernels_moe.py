@@ -894,16 +894,12 @@ def _aiter_moe_two_gemm(
     arch = get_arch()
     quant_dtype = torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
 
-    # gfx1250's in-kernel gather miscomputes (validated on the FFM sim), so gather
-    # rows into expert-sorted order in torch and pass gather_indx=None instead. Per
-    # aiter's moe_gemm_torch, sorted row i reads source token gather_idx[i] // topk.
-    if arch == "gfx1250":
-        gather_src = gather_idx.to(torch.long) // topk
-        gemm1_input = hidden_states[gather_src]
-        gemm1_gather_indx = None
-    else:
-        gemm1_input = hidden_states
-        gemm1_gather_indx = gather_idx
+    # PATCH_GATHER: in-kernel gather on gfx1250 (ATOM behavior). ATOM (same aiter
+    # commit) passes gather_indx straight to moe_gemm_a8w4 on gfx1250; do the same
+    # to drop the eager vectorized_gather + floordiv. (If this miscomputes, the
+    # gfx1250 in-kernel gather needs GFX1250_SCALE-swizzled scales -> add swizzle.)
+    gemm1_input = hidden_states
+    gemm1_gather_indx = gather_idx
 
     gammas = routing_data.gate_scal if routing_data else None
     g1_gammas = gammas if apply_router_weight_on_input else None

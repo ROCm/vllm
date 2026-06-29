@@ -113,6 +113,12 @@ def _log_jit_compile(fn_name: str, kwargs) -> None:
 
 def _setup_triton_jit_hook() -> None:
     """Register a ``jit_post_compile_hook`` that warns on compilation."""
+    # PATCH: upstream triton efbae9a's serialize_specialization_data cannot
+    # JSON-encode Gluon PaddedSharedLayout constexprs (passed by e.g. aiter
+    # gemm_a16w16), and triton builds spec-data for ANY registered hook.
+    # This monitor is purely diagnostic, so skip registering to avoid
+    # crashing live kernel compilation.
+    return
     if not HAS_TRITON:
         return
     from triton import knobs  # type: ignore[import-untyped]
