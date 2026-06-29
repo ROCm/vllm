@@ -187,9 +187,6 @@ jobs:
         tests/models/multimodal/processing/test_openvla.py
 
   test-kernels-performance:
-    # TEMPORARILY DISABLED: noneng runners are offline (since 2026-06-23).
-    # Remove `if: false` once the runner pool is restored.
-    if: false
     name: test-kernels (performance)
     needs: build-wheel
     uses: ./.github/workflows/test-rocm-kernels.yml
