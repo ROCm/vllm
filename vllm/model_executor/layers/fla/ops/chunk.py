@@ -12,6 +12,8 @@ import os
 
 import torch
 
+from vllm.v1.utils import record_function_or_nullcontext
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
@@ -268,19 +270,25 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale,
-        initial_state,
-        output_final_state,
-        cu_seqlens,
-        chunk_indices,
-        chunk_offsets,
-        use_qk_l2norm_in_kernel,
-        core_attn_out,
-    )
+    # Annotate the forward with the FLA chunk size (and fused-KKT flag) so a
+    # profiler trace carries the un-derivable chunk size to roofline tooling.
+    # record_function under profiling, nullcontext otherwise (zero overhead).
+    with record_function_or_nullcontext(
+        f"gdn_chunk_fwd chunk_size={FLA_CHUNK_SIZE} fused={int(_USE_FUSED_KKT)}"
+    ):
+        o, final_state = ChunkGatedDeltaRuleFunction.apply(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            cu_seqlens,
+            chunk_indices,
+            chunk_offsets,
+            use_qk_l2norm_in_kernel,
+            core_attn_out,
+        )
     return o, final_state
