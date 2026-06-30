@@ -120,9 +120,9 @@ ENV PYTHONPATH=${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi
 # (e.g. TORCH_VERSION=2.11.0) and the full tag is assembled here.
 RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
     --extra-index-url https://pypi.org/simple \
-    "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
-    "torchvision==${TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
-    "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" \
+    "torch[device-all]==${TORCH_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION:-0.26.0}+rocm${ROCM_SDK_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" \
     "rocm[libraries,devel,device-all]==${ROCM_SDK_VERSION}" && \
     rocm-sdk init
  
@@ -282,11 +282,11 @@ ARG MORI_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "ROCM_WHEEL_INDEX: ${ROCM_WHEEL_INDEX}" >> /app/versions.txt \
     && echo "ROCM_SDK_VERSION: ${ROCM_SDK_VERSION}" >> /app/versions.txt \
-    && echo "TORCH_VERSION: ${TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
-    && echo "TORCHVISION_VERSION: ${TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
-    && echo "TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
-    && echo "TRITON_VERSION: ${TRITON_VERSION}.rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
-    && echo "APEX_VERSION: ${APEX_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "TORCH_VERSION: ${TORCH_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "TORCHVISION_VERSION: ${TORCHVISION_VERSION:-0.26.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "TRITON_VERSION: ${TRITON_VERSION:-3.7.1+git110cd8e2}.rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "APEX_VERSION: ${APEX_VERSION:-1.12.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
     && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
