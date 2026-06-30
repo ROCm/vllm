@@ -1,11 +1,12 @@
 ARG BASE_IMAGE=ubuntu:24.04
 ARG ROCM_WHEEL_INDEX=https://rocm.nightlies.amd.com/whl-multi-arch/
 ARG ROCM_SDK_VERSION=7.15.0a20260630
-ARG TORCH_VERSION=2.11.0+rocm7.15.0a20260630
-ARG TORCHVISION_VERSION=0.26.0+rocm7.15.0a20260630
-ARG TORCHAUDIO_VERSION=2.11.0+rocm7.15.0a20260630
-ARG TRITON_VERSION=3.7.1+git110cd8e2.rocm7.15.0a20260630
-ARG APEX_VERSION=1.12.0+rocm7.15.0a20260630
+# Base versions only — +rocm<ROCM_SDK_VERSION> suffix is appended at install time
+ARG TORCH_VERSION=2.11.0
+ARG TORCHVISION_VERSION=0.26.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG TRITON_VERSION=3.7.1+git110cd8e2
+ARG APEX_VERSION=1.12.0
 
 
 ARG FA_BRANCH="0e60e394"
@@ -95,10 +96,11 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
 ## Install PyTorch w/ Triton + ROCM_SDK from ROCM wheel index
 ##
 ARG ROCM_WHEEL_INDEX
+ARG ROCM_SDK_VERSION
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
-ARG ROCM_SDK_VERSION
+ARG TRITON_VERSION
 ARG APEX_VERSION
 ENV SITE_PACKAGES=${VIRTUAL_ENV}/lib/python${PYTHON_VERSION}/site-packages
 ENV ROCM_PATH=${SITE_PACKAGES}/_rocm_sdk_devel
@@ -113,14 +115,14 @@ ENV CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake:${SITE_PACKAGES}/torch/share/cmake
 ENV PYTHONPATH=${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi
 
 # torch/torchvision/torchaudio must be pinned to mutually-consistent builds
-# (same +rocm... suffix) or the C++ ops break at import (ABI skew). The rocm
-# sdk version is derived from torch's own dependency pin unless overridden,
-# which keeps the set consistent and avoids pip backtracking.
+# (same +rocm... suffix) or the C++ ops break at import (ABI skew).
+# ROCM_SDK_VERSION drives the suffix for all packages — pass only base versions
+# (e.g. TORCH_VERSION=2.11.0) and the full tag is assembled here.
 RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
     --extra-index-url https://pypi.org/simple \
-    "torch[device-all]==${TORCH_VERSION}" \
-    "torchvision==${TORCHVISION_VERSION}" \
-    "torchaudio==${TORCHAUDIO_VERSION}" \
+    "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" \
     "rocm[libraries,devel,device-all]==${ROCM_SDK_VERSION}" && \
     rocm-sdk init
  
@@ -269,6 +271,8 @@ ARG ROCM_SDK_VERSION
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
+ARG TRITON_VERSION
+ARG APEX_VERSION
 ARG FA_BRANCH
 ARG FA_REPO
 ARG AITER_BRANCH
@@ -278,9 +282,11 @@ ARG MORI_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "ROCM_WHEEL_INDEX: ${ROCM_WHEEL_INDEX}" >> /app/versions.txt \
     && echo "ROCM_SDK_VERSION: ${ROCM_SDK_VERSION}" >> /app/versions.txt \
-    && echo "TORCH_VERSION: ${TORCH_VERSION}" >> /app/versions.txt \
-    && echo "TORCHVISION_VERSION: ${TORCHVISION_VERSION}" >> /app/versions.txt \
-    && echo "TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION}" >> /app/versions.txt \
+    && echo "TORCH_VERSION: ${TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "TORCHVISION_VERSION: ${TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "TRITON_VERSION: ${TRITON_VERSION}.rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+    && echo "APEX_VERSION: ${APEX_VERSION}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
     && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
