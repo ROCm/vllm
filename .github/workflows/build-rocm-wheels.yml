@@ -204,17 +204,12 @@ jobs:
 
   upload-wheel:
     runs-on: ubuntu-latest
-    # Performance tests are excluded from `needs` because results vary
-    # across runners (VRAM configuration, thermal state, etc.).
-    # `always()` is required so that a performance-test failure doesn't
-    # implicitly skip this job via GitHub Actions' default `success()`
-    # gate, which checks ALL prior jobs — not just the `needs` list.
     needs: [build-wheel, test-kernels-correctness]
+    # always() so a failed performance test doesn't block this job via
+    # GitHub Actions' implicit success() gate on non-needs jobs.
     if: >-
       always()
       && needs.build-wheel.result == 'success'
-      && needs.test-kernels-correctness.result == 'success'
-      && github.event_name == 'push'
       && github.repository_owner == 'ROCm'
     permissions:
       id-token: write
@@ -239,9 +234,30 @@ jobs:
           role-to-assume: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
           aws-region: us-east-1
 
-      - name: Upload wheel to S3
+      # Staging: every successful build (push, PR, dispatch).
+      # Wheels at s3://BUCKET/staging/<run-id>/ let downstream CI test
+      # PR builds before they're published to the PEP 503 index.
+      - name: Upload staging wheel
         run: |
           pip install boto3
+          python .github/workflows/scripts/upload_wheel_s3.py \
+            --bucket aig-embd-gfx11-wheels \
+            --staging-run-id "${{ github.run_id }}" \
+            --package vllm \
+            --wheel-dir dist/
+
+      - name: Clean up old staging wheels
+        run: |
+          python .github/workflows/scripts/upload_wheel_s3.py \
+            --bucket aig-embd-gfx11-wheels \
+            --cleanup-staging-days 31
+
+      # Production: only on push to gfx11, after correctness tests pass.
+      - name: Upload wheel to PEP 503 index
+        if: >-
+          needs.test-kernels-correctness.result == 'success'
+          && github.event_name == 'push'
+        run: |
           python .github/workflows/scripts/upload_wheel_s3.py \
             --bucket aig-embd-gfx11-wheels \
             --package vllm \
