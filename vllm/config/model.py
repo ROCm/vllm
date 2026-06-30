@@ -226,6 +226,10 @@ class ModelConfig:
     graph and always execute the model in eager mode. If False, we will use
     CUDA graph and eager execution in hybrid for maximal performance and
     flexibility."""
+    w4a16_prefill_dequant: str = "off"
+    """Cache dequantized W4A16 weights for the prefill GEMM.
+    'off': no caching (default). 'soft': cache until budget exhausted, warn on
+    skip. 'hard': cache, error if budget exhausted."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
     max_logprobs: int = 20
@@ -389,6 +393,7 @@ class ModelConfig:
             "tokenizer_revision",
             "spec_target_max_model_len",
             "enforce_eager",
+            "w4a16_prefill_dequant",
             "logprobs_mode",
             "use_fp64_gumbel",
             "disable_cascade_attn",
