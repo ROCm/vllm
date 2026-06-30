@@ -1,24 +1,7 @@
 # default base image
 ARG REMOTE_VLLM="0"
 ARG COMMON_WORKDIR=/app
-ARG BASE_IMAGE=rocm/vllm-private:juan_455_npi_base
-ARG CI_BASE_IMAGE=rocm/vllm-dev:ci_base
-# NIC backend for MoRI RDMA support.
-# By default (all), drivers and userspace libraries for all supported NIC types
-# (ainic and bnxt) are installed; MoRI selects the appropriate one at runtime.
-# To install drivers for a single NIC type only, set NIC_BACKEND explicitly:
-#   --build-arg NIC_BACKEND=ainic   # AMD AINIC (Pensando) only
-#   --build-arg NIC_BACKEND=bnxt    # Broadcom Thor-2 only
-#   --build-arg NIC_BACKEND=none    # Install nothing.
-ARG NIC_BACKEND=all
-# AMD AINIC apt repo settings
-# Users can specify a custom version compatible with their host drivers.
-# The default version has been tested with ioinic-dkms=25.11.1.001
-ARG AINIC_VERSION=1.117.3-hydra
-ARG UBUNTU_CODENAME=jammy
-
-# Sccache configuration. Release builds use this today; CI can opt in when a
-# shared S3-compatible cache backend is available.
+ARG BASE_IMAGE=rocm/vllm-dev:base
 ARG CI_BASE_IMAGE=rocm/vllm-dev:ci_base
 # NIC backend for MoRI RDMA support.
 # By default (all), drivers and userspace libraries for all supported NIC types
@@ -48,7 +31,6 @@ FROM ${BASE_IMAGE} AS base
 ARG ARG_PYTORCH_ROCM_ARCH=gfx1250
 ENV PYTORCH_ROCM_ARCH=${ARG_PYTORCH_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 
-# Install build dependencies and utilities
 # Install build dependencies and utilities
 RUN apt-get update -q -y && apt-get install -q -y \
     sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev libsuitesparse-dev \
@@ -160,27 +142,25 @@ RUN apt-get update -q -y && apt-get install -q -y --no-install-recommends \
 COPY tools/install_protoc.sh /tmp/install_protoc.sh
 RUN /tmp/install_protoc.sh && rm /tmp/install_protoc.sh
 
-# Install rustup; the toolchain itself is pinned by rust-toolchain.toml.
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --profile minimal --default-toolchain none
-ENV PATH="/root/.cargo/bin:${PATH}"
-
 # Cap cargo parallelism to avoid exhausting the AMD CI host's open-file limit
 # (rustc spawns enough concurrent processes to hit RLIMIT_NOFILE otherwise).
 ENV CARGO_BUILD_JOBS=4
 ENV CARGO_NET_RETRY=10
 ENV RUSTUP_MAX_RETRIES=10
 
+RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
+    cd ${COMMON_WORKDIR}/vllm \
+    && uv pip install --system -r requirements/build/rust.txt
+
 # Build the release binary. Cargo's registry/git caches can be written by
 # concurrent BuildKit jobs on shared workers, so lock those cache mounts while
-# keeping the cache benefit. Copy the binary out so it persists into the image
-# layer for later COPY --from=rust-build.
+# keeping the cache benefit. Do not cache target/, because stale target metadata
+# can outlive source updates across BuildKit cache reuse.
 RUN --mount=type=cache,id=vllm-rocm-cargo-registry,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,id=vllm-rocm-cargo-git,target=/root/.cargo/git,sharing=locked \
-    --mount=type=cache,id=vllm-rocm-cargo-target,target=${COMMON_WORKDIR}/vllm/rust/target,sharing=locked \
     cd ${COMMON_WORKDIR}/vllm \
-    && VLLM_RS_TARGET_PATH=/tmp/vllm-rs bash build_rust.sh \
-    && test -x /tmp/vllm-rs
+    && bash build_rust.sh \
+    && test -x vllm/vllm-rs
 
 # -----------------------
 # vLLM native build stages
@@ -200,6 +180,7 @@ RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
 # pyproject.toml is bind-mounted in the RUN step so metadata-only changes do
 # not invalidate the expensive native build layer.
 COPY setup.py CMakeLists.txt ./
+COPY tools/build_rust.py tools/build_rust.py
 COPY cmake cmake/
 COPY csrc csrc/
 COPY vllm/envs.py vllm/envs.py
@@ -231,9 +212,10 @@ ENV VLLM_TARGET_DEVICE=rocm
 
 COPY --from=csrc-build ${COMMON_WORKDIR}/vllm/dist /precompiled-wheels
 
-# Drop the pre-built rust frontend binary into the source tree. setup.py
-# detects it and ships it as-is, skipping the local cargo build.
-COPY --from=rust-build /tmp/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+# Drop the pre-built Rust artifacts into the source tree. setup.py detects
+# them and ships them as-is, skipping the local Rust build.
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/_rust_*.so ${COMMON_WORKDIR}/vllm/vllm/
 
 RUN --mount=type=cache,id=vllm-rocm-uv,target=/root/.cache/uv \
     cd vllm \
@@ -255,7 +237,6 @@ COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/examples /examples
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/tools/install_torchcodec_rocm.sh /tools/install_torchcodec_rocm.sh
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/docker/Dockerfile.rocm /docker/
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/.buildkite /.buildkite
-COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/pyproject.toml /pyproject.toml
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/pyproject.toml /pyproject.toml
 COPY --from=build_vllm ${COMMON_WORKDIR}/vllm/vllm/v1 /vllm_v1
 
@@ -289,19 +270,14 @@ RUN apt-get -y update && apt-get -y install autoconf libtool pkg-config \
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system meson auditwheel patchelf tomlkit
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system meson auditwheel patchelf tomlkit
 
 RUN --mount=type=cache,target=/root/.cache/ccache \
-    cd /usr/local/src && \
-    RUN --mount=type=cache,target=/root/.cache/ccache \
     cd /usr/local/src && \
     git clone ${UCX_REPO} &&  \
     cd ucx  && \
     git checkout ${UCX_BRANCH} && \
     ./autogen.sh && \
     mkdir build && cd build && \
-    CC="ccache gcc" CXX="ccache g++" \
     CC="ccache gcc" CXX="ccache g++" \
     ../configure \
     --prefix=/usr/local/ucx \
@@ -322,18 +298,14 @@ ENV LD_LIBRARY_PATH=${UCX_HOME}/lib:${LD_LIBRARY_PATH}
 
 RUN --mount=type=cache,target=/root/.cache/ccache \
     git clone ${RIXL_REPO} /opt/rixl && \
-    RUN --mount=type=cache,target=/root/.cache/ccache \
-    git clone ${RIXL_REPO} /opt/rixl && \
     cd /opt/rixl && \
     git checkout ${RIXL_BRANCH} && \
-    CC="ccache gcc" CXX="ccache g++" \
     CC="ccache gcc" CXX="ccache g++" \
     meson setup build --prefix=${RIXL_HOME} \
     --force-fallback-for=abseil-cpp \
     -Ducx_path=${UCX_HOME} \
     -Drocm_path=${ROCM_PATH} && \
     cd build && \
-    ninja -j$(nproc) && \
     ninja -j$(nproc) && \
     ninja install
 
@@ -455,9 +427,10 @@ FROM fetch_vllm AS build_vllm_wheel_release
 
 ARG COMMON_WORKDIR
 
-# Drop the pre-built rust frontend binary into the source tree. setup.py
-# detects it and ships it as-is, skipping the local cargo build.
-COPY --from=rust-build /tmp/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+# Drop the pre-built Rust artifacts into the source tree. setup.py detects
+# them and ships them as-is, skipping the local Rust build.
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/vllm-rs ${COMMON_WORKDIR}/vllm/vllm/vllm-rs
+COPY --from=rust-build ${COMMON_WORKDIR}/vllm/vllm/_rust_*.so ${COMMON_WORKDIR}/vllm/vllm/
 
 # Create /install directory for custom wheels
 RUN mkdir -p /install
@@ -492,9 +465,7 @@ RUN if [ "$GIT_REPO_CHECK" != "0" ]; then \
 # This ensures setuptools_scm sees clean repo state for version detection
 RUN --mount=type=bind,source=.git,target=vllm/.git \
     --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=cache,target=/root/.cache/uv \
     cd vllm \
-    && uv pip install --system setuptools_scm regex \
     && uv pip install --system setuptools_scm regex \
     && VLLM_VERSION=$(python3 -c "import setuptools_scm; print(setuptools_scm.get_version())") \
     && echo "Detected vLLM version: ${VLLM_VERSION}" \
@@ -533,25 +504,18 @@ RUN echo "Pinning vLLM dependencies to custom wheel versions..." \
 # Install dependencies using custom wheels from /install
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd vllm \
-    RUN --mount=type=cache,target=/root/.cache/uv \
-    cd vllm \
     && echo "Building vLLM with custom wheels from /install" \
     && uv pip install --system --find-links /install -r requirements/rocm.txt
-&& uv pip install --system --find-links /install -r requirements/rocm.txt
 
 # Build wheel using pre-extracted version to avoid dirty state from modified requirements/rocm.txt
 # (setup.py auto-detects ccache/sccache in PATH)
-# (setup.py auto-detects ccache/sccache in PATH)
 RUN --mount=type=bind,source=.git,target=vllm/.git \
     --mount=type=cache,id=vllm-rocm-ccache,target=/root/.cache/ccache \
-    --mount=type=cache,id=vllm-rocm-ccache,target=/root/.cache/ccache \
     cd vllm \
-    && export CCACHE_BASEDIR="$PWD" \
     && export CCACHE_BASEDIR="$PWD" \
     && export SETUPTOOLS_SCM_PRETEND_VERSION=$(cat /tmp/vllm_version.txt) \
     && echo "Building wheel with version: ${SETUPTOOLS_SCM_PRETEND_VERSION}" \
     && MAX_JOBS="${MAX_JOBS:-$(nproc)}" python3 setup.py bdist_wheel --dist-dir=dist
-&& MAX_JOBS="${MAX_JOBS:-$(nproc)}" python3 setup.py bdist_wheel --dist-dir=dist
 
 FROM scratch AS export_vllm_wheel_release
 ARG COMMON_WORKDIR
@@ -563,7 +527,6 @@ COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/examples /examples
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/tools/install_torchcodec_rocm.sh /tools/install_torchcodec_rocm.sh
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/docker/Dockerfile.rocm /docker/
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/.buildkite /.buildkite
-COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/pyproject.toml /pyproject.toml
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/pyproject.toml /pyproject.toml
 COPY --from=build_vllm_wheel_release ${COMMON_WORKDIR}/vllm/vllm/v1 /vllm_v1
 
@@ -588,16 +551,9 @@ RUN if [ "${DEEPEP_NIC}" = "cx7" ] || [ "${DEEPEP_NIC}" = "io" ]; then \
 RUN --mount=type=bind,from=build_rixl,src=/app/install,target=/rixl_install \
     --mount=type=bind,from=build_deepep,src=/app/deep_install,target=/deep_install \
     uv pip install --system /rixl_install/*.whl /deep_install/*.whl
---mount=type=bind,from=build_deepep,src=/app/deep_install,target=/deep_install \
-    uv pip install --system /rixl_install/*.whl /deep_install/*.whl
 
 # Copy ROCShmem runtime libraries.
 COPY --from=build_rocshmem /opt/rocshmem /opt/rocshmem
-
-# RDMA userspace libraries plus FFmpeg dev libs needed by torchcodec.
-RUN apt-get update -q -y && apt-get install -q -y --no-install-recommends \
-    # Copy ROCShmem runtime libraries.
-    COPY --from=build_rocshmem /opt/rocshmem /opt/rocshmem
 
 # RDMA userspace libraries plus FFmpeg dev libs needed by torchcodec.
 RUN apt-get update -q -y && apt-get install -q -y --no-install-recommends \
@@ -607,24 +563,16 @@ RUN apt-get update -q -y && apt-get install -q -y --no-install-recommends \
     ibverbs-utils \
     pkg-config ffmpeg libavcodec-dev libavformat-dev libavutil-dev \
     libswscale-dev libavdevice-dev libavfilter-dev libswresample-dev \
-    pkg-config ffmpeg libavcodec-dev libavformat-dev libavutil-dev \
-    libswscale-dev libavdevice-dev libavfilter-dev libswresample-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install torchcodec from source for ROCm/torch ABI compatibility.
 # Install torchcodec from source for ROCm/torch ABI compatibility.
 COPY tools/install_torchcodec_rocm.sh /tmp/install_torchcodec.sh
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/pip \
     --mount=type=cache,target=/root/.cache/torchcodec-wheels \
     bash /tmp/install_torchcodec.sh \
-    RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=cache,target=/root/.cache/pip \
-    --mount=type=cache,target=/root/.cache/torchcodec-wheels \
-    bash /tmp/install_torchcodec.sh \
     && rm /tmp/install_torchcodec.sh \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
-&& apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Pre-install shared ROCm runtime dependencies.
 COPY requirements/common.txt requirements/rocm.txt /tmp/ci-base-requirements/
@@ -651,46 +599,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm /tmp/rocm-test-reqs.txt
 
 # Set MIOPEN ENVS to resolve performance regressions in MIOpen 3D convolution kernel.
-# Set MIOPEN ENVS to resolve performance regressions in MIOpen 3D convolution kernel.
 # See: https://github.com/pytorch/pytorch/issues/169857
 ENV MIOPEN_DEBUG_CONV_DIRECT=0
 ENV MIOPEN_DEBUG_CONV_GEMM=0
 
-# Use legacy IPC mode for HSA to avoid GPU memory pinning issues with UCX rocm_ipc.
-# See: https://github.com/ROCm/rocm-libraries/issues/6266
-ENV HSA_ENABLE_IPC_MODE_LEGACY=1
-
-# ROCm profiler limits workaround.
-RUN echo "ROCTRACER_MAX_EVENTS=10000000" > ${COMMON_WORKDIR}/libkineto.conf
-ENV KINETO_CONFIG="${COMMON_WORKDIR}/libkineto.conf"
-
-# Install vllm_test_utils in ci_base for ci_base + wheel parity.
-COPY tests/vllm_test_utils /tmp/vllm_test_utils
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system /tmp/vllm_test_utils \
-    && rm -rf /tmp/vllm_test_utils
-
-# -----------------------
-# Test vLLM image (Tier 2) - vLLM-only layer on top of ci_base.
-FROM ${CI_BASE_IMAGE} AS test
-ARG COMMON_WORKDIR
-
-# Install the vLLM wheel (--no-deps: all deps already in ci_base).
-RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
-    --mount=type=cache,target=/root/.cache/uv \
-    cd /install \
-    && uv pip install --system --no-deps *.whl
-
-# Store the vLLM wheel in the image for python-only install tests.
-COPY --from=export_vllm /*.whl /opt/vllm-wheels/
-
-WORKDIR /vllm-workspace
-COPY --from=build_vllm ${COMMON_WORKDIR}/vllm /vllm-workspace
-
-# Copy in the v1 package (for python-only install test group).
-COPY --from=export_vllm /vllm_v1 /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1
-
-# Hide source under src/ so it won't shadow the installed package in tests.
 # Use legacy IPC mode for HSA to avoid GPU memory pinning issues with UCX rocm_ipc.
 # See: https://github.com/ROCm/rocm-libraries/issues/6266
 ENV HSA_ENABLE_IPC_MODE_LEGACY=1
@@ -744,7 +656,6 @@ RUN rm -f /usr/bin/sccache || true \
 ENV SCCACHE_BUCKET=
 ENV SCCACHE_REGION=
 ENV SCCACHE_ENDPOINT=
-ENV SCCACHE_ENDPOINT=
 ENV SCCACHE_S3_NO_CREDENTIALS=
 ENV SCCACHE_IDLE_TIMEOUT=
 
@@ -792,9 +703,6 @@ ENV SAFETENSORS_FAST_GPU=1
 
 # Performance environment variable.
 ENV HIP_FORCE_DEV_KERNARG=1
-
-# Keep torch.cuda.is_available() fork-safe (see vllm/env_override.py).
-ENV PYTORCH_NVML_BASED_CUDA_CHECK=1
 
 # Workaround for ROCm profiler limits
 RUN echo "ROCTRACER_MAX_EVENTS=10000000" > ${COMMON_WORKDIR}/libkineto.conf
