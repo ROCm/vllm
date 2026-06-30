@@ -666,7 +666,12 @@ def _hybrid_w4a16_apply_impl(
             else torch.profiler.record_function(f"hybrid_dequant_w4a16 {M}x{N}x{K}")
         )
         with ctx:
-            return torch.nn.functional.linear(x_2d, w_dequant, bias)
+            # Route through the unquantized GEMM dispatch so the dense dequant copy
+            # reuses the same skinny/aiter/tgemm/BLAS selection (and stride-aware
+            # cliff handling) as UnquantizedLinearMethod.
+            from vllm.model_executor.layers.utils import rocm_unquantized_gemm_impl
+
+            return rocm_unquantized_gemm_impl(x_2d, w_dequant, bias)
 
     ctx = (
         nullcontext()
@@ -896,7 +901,18 @@ class HybridW4A16LinearKernel(MPLinearKernel):
 
         c = self.config
         N, K = unpacked.shape
-        dequant_bytes = N * K * torch.empty((), dtype=c.act_type).element_size()
+        elem_size = torch.empty((), dtype=c.act_type).element_size()
+        # Account for the gfx11x cache-line pad applied to the cached copy below
+        # (pad_weights_avoid_cache_cliff_on_gfx11) so the gpu_memory_utilization
+        # gate stays honest.
+        from vllm.model_executor.layers.utils import cache_cliff_pad_elems
+
+        pad_elems = (
+            cache_cliff_pad_elems(K, elem_size)
+            if on_gfx1x() and unpacked.device.type == "cuda"
+            else 0
+        )
+        dequant_bytes = N * (K + pad_elems) * elem_size
 
         util = get_current_vllm_config().cache_config.gpu_memory_utilization
         # MemorySnapshot mirrors vLLM's own KV-cache profiler: on integrated/UMA
@@ -929,9 +945,16 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             w_dequant = ((u - 8.0) * scale_exp).to(c.act_type)
         # Buffer (not a Parameter): this is a derived, recomputable cache, so it
         # should move with the module but stay out of .parameters() and, with
-        # persistent=False, out of state_dict().
+        # persistent=False, out of state_dict(). Pad the row stride off the
+        # gfx11x 2048-byte cliff (shared with the unquantized linear path).
+        from vllm.model_executor.layers.utils import (
+            pad_weights_avoid_cache_cliff_on_gfx11,
+        )
+
         layer.register_buffer(
-            "_hybrid_w_dequant", w_dequant.contiguous(), persistent=False
+            "_hybrid_w_dequant",
+            pad_weights_avoid_cache_cliff_on_gfx11(w_dequant.contiguous()),
+            persistent=False,
         )
 
     def apply_weights(
