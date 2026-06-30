@@ -16,7 +16,7 @@ from contextlib import nullcontext
 
 import torch
 
-import vllm.envs as envs
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
@@ -633,7 +633,7 @@ def _hybrid_w4a16_apply_impl(
                single format: dequant = (nibble - zp_raw) * scale.
       packed_scale_zp: [N, K//G] fp32 carrier packing scale + zero-point per
                group (Triton prefill, asymmetric only), or None for symmetric.
-      w_dequant:  [N, K] dense dequantized weight (VLLM_W4A16_PREFILL_DEQUANT), or None.
+      w_dequant:  [N, K] dense dequantized weight (--w4a16-prefill-dequant), or None.
                When present, prefill (M > MAX_SKINNY_BATCH_SIZE) runs a dense GEMM
                on it. Passed as an op arg (not branched on in apply_weights) so the
                M-branch stays out of the compiled graph -- decode (small M) replays
@@ -866,8 +866,11 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         # cached greedily until the budget is exhausted, after which the rest keep
         # the int4 prefill path. Allocating here (before the memory profiler runs)
         # lets the KV-cache sizing account for the copies.
-        if envs.VLLM_W4A16_PREFILL_DEQUANT and unpacked.device.type == "cuda":
-            self._maybe_cache_dequant_prefill_weight(layer, unpacked, w_s_skinny, w_zp)
+        dequant_mode = get_current_vllm_config().model_config.w4a16_prefill_dequant
+        if dequant_mode != "off" and unpacked.device.type == "cuda":
+            self._maybe_cache_dequant_prefill_weight(
+                layer, unpacked, w_s_skinny, w_zp, dequant_mode
+            )
 
     def _maybe_cache_dequant_prefill_weight(
         self,
@@ -875,23 +878,16 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         unpacked: torch.Tensor,
         w_s_skinny: torch.Tensor,
         w_zp: torch.Tensor | None,
+        mode: str = "soft",
     ) -> None:
-        """Cache a dense dequantized copy of the weight (in the activation dtype,
-        fp16 or bf16) for the prefill GEMM, when it still fits in vLLM's budget.
+        """Cache a dense dequantized copy of the weight for the prefill GEMM.
 
-        The copy is registered as ``_hybrid_w_dequant`` and consumed by the prefill
-        branch of ``apply_weights``. The gate is anchored to the configured
-        ``gpu_memory_utilization`` budget rather than a raw free-VRAM number:
-
-          budget    = total * gpu_memory_utilization   (weights + acts + KV)
-          spendable = free_now - total * (1 - util)     (room left in budget)
-
-        We cache the copy only while ``spendable`` clears it. The check uses live
-        free memory, so it is self-limiting: as copies are allocated,
-        ``spendable`` shrinks and later layers stop being cached once the budget
-        is exhausted. Skipped weights keep the int4 prefill path (warns once).
+        ``mode`` controls behavior when the gpu_memory_utilization budget is
+        exhausted:
+          - ``"soft"``: warn once and fall back to the int4 prefill path.
+          - ``"hard"``: raise ``RuntimeError`` so the user knows the dequant
+            cache could not be fully applied.
         """
-        from vllm.config import get_current_vllm_config
         from vllm.utils.mem_utils import MemorySnapshot
 
         c = self.config
@@ -910,12 +906,22 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         # Room still free within the budget right now.
         spendable = free_bytes - out_of_budget
         if spendable < dequant_bytes:
+            need_mib = dequant_bytes / 2**20
+            have_mib = max(0, spendable) / 2**20
+            msg = (
+                f"--w4a16-prefill-dequant: no room left in the "
+                f"gpu_memory_utilization={util:.2f} budget to cache a "
+                f"dequantized prefill copy (need {need_mib:.1f} MiB, "
+                f"have {have_mib:.1f} MiB). "
+            )
+            if mode == "hard":
+                raise RuntimeError(
+                    msg + "Reduce model size, raise gpu_memory_utilization, "
+                    "or use --w4a16-prefill-dequant soft."
+                )
             logger.warning_once(
-                "VLLM_W4A16_PREFILL_DEQUANT: no room left in the "
-                "gpu_memory_utilization=%.2f budget to cache a dequantized "
-                "prefill copy; affected W4A16 weights use the int4 prefill path. Raise "
-                "gpu_memory_utilization to cache more.",
-                util,
+                msg + "Affected W4A16 weights use the int4 prefill path. "
+                "Raise gpu_memory_utilization to cache more.",
             )
             return
 
@@ -953,7 +959,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         out_shape = x.shape[:-1] + (N,)
 
         # Dequantized copy cached at load time (opt-in via
-        # VLLM_W4A16_PREFILL_DEQUANT, subject to the free-VRAM gate), or None when
+        # --w4a16-prefill-dequant, subject to the free-VRAM gate), or None when
         # absent/skipped. Passed straight to the op; the M-branch (prefill ->
         # dense dequant, decode -> int4) lives INSIDE the opaque op so it never
         # enters the compiled graph -- decode replays the same int4 cudagraph
