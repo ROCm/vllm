@@ -169,6 +169,54 @@ def use_aiter_triton_gemm(n, m, k, dtype):
     )
 
 
+# gfx11x L2/MALL channel-hash bandwidth cliff: a dense weight whose row stride
+# is a multiple of this many bytes makes the multi-row global loads collide on
+# the channel hash. Offsetting the stride by one cache line dodges it.
+CACHE_CLIFF_STRIDE_BYTES = 2048
+CACHE_LINE_BYTES = 128
+
+
+def cache_cliff_pad_elems(k: int, element_size: int) -> int:
+    """Row-stride pad (in elements) that moves an ``[N, k]`` weight off the
+    gfx11x cache cliff, or 0 when the stride is already clear. Single source of
+    truth for the cliff geometry; see ``pad_weights_avoid_cache_cliff_on_gfx11``.
+    """
+    if (k * element_size) % CACHE_CLIFF_STRIDE_BYTES != 0:
+        return 0
+    return CACHE_LINE_BYTES // element_size
+
+
+def pad_weights_avoid_cache_cliff_on_gfx11(weight: torch.Tensor) -> torch.Tensor:
+    """Dodge the gfx11x L2/MALL channel-hash bandwidth cliff for a dense weight.
+
+    When a 2D weight's row stride lands on a cliff multiple, the multi-row global
+    loads collide on the channel/MALL hash and hipBLASLt (plus the stride-aware
+    wvSplitK kernel) stall. Offsetting the row stride by one cache line sidesteps
+    it while keeping each row cache-line aligned.
+
+    Returns an ``[N, K]`` view whose ``stride(0) = K + pad`` (the padded backing
+    is kept alive by the view), or ``weight`` unchanged when the pad does not
+    apply (non-rocm, non-gfx11x, non-2D, non-contiguous, or stride already off
+    the cliff grid). Meant to run once at load, so it is free at runtime;
+    overhead is one cache line per row only on affected layers. The stride-blind
+    paths (LLMM1/aiter/tgemm) detect the non-contiguous weight and route to BLAS
+    (see ``rocm_unquantized_gemm_impl``).
+    """
+    from vllm.platforms.rocm import on_gfx1x
+
+    if not (current_platform.is_rocm() and on_gfx1x()):
+        return weight
+    if weight.dim() != 2 or not weight.is_contiguous():
+        return weight
+    n, k = weight.shape
+    pad = cache_cliff_pad_elems(k, weight.element_size())
+    if pad == 0:
+        return weight
+    buf = torch.empty((n, k + pad), dtype=weight.dtype, device=weight.device)
+    buf[:, :k].copy_(weight)
+    return buf[:, :k]
+
+
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
