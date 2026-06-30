@@ -44,9 +44,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Remove sccache only if not using sccache (it exists in base image from Dockerfile.rocm_base)
 ARG USE_SCCACHE
 RUN if [ "$USE_SCCACHE" != "1" ]; then \
-    apt-get purge -y sccache || true; \
-    python3 -m pip uninstall -y sccache || true; \
-    rm -f "$(which sccache)" || true; \
+        apt-get purge -y sccache || true; \
+        python3 -m pip uninstall -y sccache || true; \
+        rm -f "$(which sccache)" || true; \
     fi
 
 # Install UV — download first, then run, so a curl failure is not masked by the pipe
@@ -80,21 +80,21 @@ ARG SCCACHE_BUCKET_NAME
 ARG SCCACHE_REGION_NAME
 ARG SCCACHE_S3_NO_CREDENTIALS
 RUN if [ "$USE_SCCACHE" = "1" ]; then \
-    if command -v sccache >/dev/null 2>&1; then \
-    echo "sccache already installed, skipping installation"; \
-    sccache --version; \
-    else \
-    echo "Installing sccache..." \
-    && SCCACHE_ARCH="x86_64" \
-    && SCCACHE_VERSION="v0.8.1" \
-    && SCCACHE_DL_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
-    && curl -L -o /tmp/sccache.tar.gz ${SCCACHE_DL_URL} \
-    && tar -xzf /tmp/sccache.tar.gz -C /tmp \
-    && mv /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
-    && chmod +x /usr/bin/sccache \
-    && rm -rf /tmp/sccache.tar.gz /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl \
-    && sccache --version; \
-    fi; \
+        if command -v sccache >/dev/null 2>&1; then \
+            echo "sccache already installed, skipping installation"; \
+            sccache --version; \
+        else \
+            echo "Installing sccache..." \
+            && SCCACHE_ARCH="x86_64" \
+            && SCCACHE_VERSION="v0.8.1" \
+            && SCCACHE_DL_URL="${SCCACHE_DOWNLOAD_URL:-https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl.tar.gz}" \
+            && curl -L -o /tmp/sccache.tar.gz ${SCCACHE_DL_URL} \
+            && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+            && mv /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl/sccache /usr/bin/sccache \
+            && chmod +x /usr/bin/sccache \
+            && rm -rf /tmp/sccache.tar.gz /tmp/sccache-${SCCACHE_VERSION}-${SCCACHE_ARCH}-unknown-linux-musl \
+            && sccache --version; \
+        fi; \
     fi
 
 # Set sccache environment variables only when USE_SCCACHE=1
@@ -119,12 +119,12 @@ ARG VLLM_BRANCH="455_wip"
 ENV VLLM_REPO=${VLLM_REPO}
 ENV VLLM_BRANCH=${VLLM_BRANCH}
 ONBUILD RUN git clone ${VLLM_REPO} \
-    && cd vllm \
-    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
-    && git checkout FETCH_HEAD \
-    && if [ ${VLLM_REPO} != "https://github.com/vllm-project/vllm.git" ] ; then \
-    git remote add upstream "https://github.com/vllm-project/vllm.git" \
-    && git fetch upstream ; fi
+	    && cd vllm \
+	    && git fetch -v --prune -- origin ${VLLM_BRANCH} \
+	    && git checkout FETCH_HEAD \
+        && if [ ${VLLM_REPO} != "https://github.com/vllm-project/vllm.git" ] ; then \
+               git remote add upstream "https://github.com/vllm-project/vllm.git" \
+               && git fetch upstream ; fi
 FROM fetch_vllm_${REMOTE_VLLM} AS fetch_vllm
 
 # -----------------------
@@ -136,7 +136,7 @@ ARG COMMON_WORKDIR
 
 # protoc is used by tonic-build/prost-build.
 RUN apt-get update -q -y && apt-get install -q -y --no-install-recommends \
-    ca-certificates curl unzip \
+        ca-certificates curl unzip \
     && rm -rf /var/lib/apt/lists/*
 
 COPY tools/install_protoc.sh /tmp/install_protoc.sh
@@ -280,16 +280,16 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
     mkdir build && cd build && \
     CC="ccache gcc" CXX="ccache g++" \
     ../configure \
-    --prefix=/usr/local/ucx \
-    --enable-shared \
-    --disable-static \
-    --disable-doxygen-doc \
-    --enable-optimizations \
-    --enable-devel-headers \
-    --with-rocm=${ROCM_PATH} \
-    --with-verbs \
-    --with-dm \
-    --enable-mt && \
+        --prefix=/usr/local/ucx \
+        --enable-shared \
+        --disable-static \
+        --disable-doxygen-doc \
+        --enable-optimizations \
+        --enable-devel-headers \
+        --with-rocm=${ROCM_PATH} \
+        --with-verbs \
+        --with-dm \
+        --enable-mt && \
     make -j$(nproc) && \
     make install
 
@@ -302,9 +302,9 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
     git checkout ${RIXL_BRANCH} && \
     CC="ccache gcc" CXX="ccache g++" \
     meson setup build --prefix=${RIXL_HOME} \
-    --force-fallback-for=abseil-cpp \
-    -Ducx_path=${UCX_HOME} \
-    -Drocm_path=${ROCM_PATH} && \
+                     --force-fallback-for=abseil-cpp \
+                     -Ducx_path=${UCX_HOME} \
+                     -Drocm_path=${ROCM_PATH} && \
     cd build && \
     ninja -j$(nproc) && \
     ninja install
@@ -314,18 +314,18 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # that are not shipped in the wheel and vary across base images.
 RUN cd /opt/rixl && \
     sed -i "s/--exclude 'libamdhip64\*'/--exclude 'libamdhip64*' --exclude 'libcore*' --exclude 'libpull*'/" \
-    contrib/build-wheel.sh && \
+        contrib/build-wheel.sh && \
     # The wheel build re-runs meson via meson-python; force the bundled abseil
     sed -i 's|setup = \["-Dinstall_headers=false"\]|setup = ["-Dinstall_headers=false", "--force-fallback-for=abseil-cpp"]|' \
-    pyproject.toml && \
+        pyproject.toml && \
     grep -q 'force-fallback-for' pyproject.toml && \
     mkdir -p /app/install && \
     _ucx_install_dir=${UCX_HOME} \
     ./contrib/build-wheel.sh \
-    --output-dir /app/install \
-    --rocm-dir ${ROCM_PATH} \
-    --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
-    --nixl-plugins-dir ${RIXL_HOME}/lib/x86_64-linux-gnu/plugins
+        --output-dir /app/install \
+        --rocm-dir ${ROCM_PATH} \
+        --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
+        --nixl-plugins-dir ${RIXL_HOME}/lib/x86_64-linux-gnu/plugins
 
 # ROCShmem build stage - split from DeepEP so changing DEEPEP_BRANCH does not
 # invalidate the slow ROCShmem build.
@@ -340,16 +340,16 @@ ENV ROCSHMEM_DIR=/opt/rocshmem
 
 RUN --mount=type=cache,target=/root/.cache/ccache \
     git clone --no-checkout --filter=blob:none ${ROCSHMEM_REPO} \
-    && cd rocm-systems \
-    && git sparse-checkout set --cone projects/rocshmem \
-    && git checkout ${ROCSHMEM_BRANCH} \
-    && mkdir -p projects/rocshmem/build \
-    && cd projects/rocshmem/build \
-    && CC="ccache gcc" CXX="ccache g++" INSTALL_PREFIX=${ROCSHMEM_DIR} \
+ && cd rocm-systems \
+ && git sparse-checkout set --cone projects/rocshmem \
+ && git checkout ${ROCSHMEM_BRANCH} \
+ && mkdir -p projects/rocshmem/build \
+ && cd projects/rocshmem/build \
+ && CC="ccache gcc" CXX="ccache g++" INSTALL_PREFIX=${ROCSHMEM_DIR} \
     bash ../scripts/build_configs/all_backends \
-    -DROCM_PATH=${ROCM_PATH} \
-    -DGPU_TARGETS="${DEEPEP_ROCM_ARCH}" \
-    -DUSE_EXTERNAL_MPI=OFF
+      -DROCM_PATH=${ROCM_PATH} \
+      -DGPU_TARGETS="${DEEPEP_ROCM_ARCH}" \
+      -DUSE_EXTERNAL_MPI=OFF
 
 # DeepEP build stage - depends on ROCShmem, builds the HIP kernel wheel.
 FROM build_rocshmem AS build_deepep
@@ -361,10 +361,10 @@ ARG DEEPEP_NIC="cx7"
 # DeepEP only supports gfx942 and gfx950, so avoid gfx90a in the default list.
 RUN --mount=type=cache,target=/root/.cache/ccache \
     export PYTORCH_ROCM_ARCH="gfx942;gfx950" \
-    && git clone ${DEEPEP_REPO} \
-    && cd DeepEP \
-    && git checkout ${DEEPEP_BRANCH} \
-    && LDFLAGS="-fuse-ld=mold" MAX_JOBS="${MAX_JOBS:-$(nproc)}" python3 setup.py --variant rocm --rocm-explicit-ctx --nic ${DEEPEP_NIC} bdist_wheel --dist-dir=/app/deep_install
+ && git clone ${DEEPEP_REPO} \
+ && cd DeepEP \
+ && git checkout ${DEEPEP_BRANCH} \
+ && LDFLAGS="-fuse-ld=mold" MAX_JOBS="${MAX_JOBS:-$(nproc)}" python3 setup.py --variant rocm --rocm-explicit-ctx --nic ${DEEPEP_NIC} bdist_wheel --dist-dir=/app/deep_install
 
 # MoRI runtime dependencies live in Dockerfile.rocm so NIC backend changes do
 # not force users to rebuild the long-lived Dockerfile.rocm_base image.
@@ -373,52 +373,52 @@ ARG NIC_BACKEND
 ARG AINIC_VERSION
 ARG UBUNTU_CODENAME
 RUN /bin/bash -lc 'set -euo pipefail; \
-    \
-    install_ainic() { \
-    apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https; \
-    rm -rf /var/lib/apt/lists/*; \
-    mkdir -p /etc/apt/keyrings; \
-    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
-    > /etc/apt/sources.list.d/amdainic.list; \
-    apt-get update && apt-get install -y --no-install-recommends \
-    libionic-dev \
-    ionic-common \
-    ; \
-    rm -rf /var/lib/apt/lists/*; \
-    }; \
-    \
-    # NOTE: requires FW 235.2.86.0 and kernel drivers on the host: \
-    #   bnxt-en-dkms=1.10.3.235.2.86.0 bnxt-re-dkms=235.2.86.0 (from packages.broadcom.com PPA) \
-    install_bnxt() { \
-    install -m 0755 -d /etc/apt/keyrings; \
-    curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
-    -o /etc/apt/keyrings/broadcom-nic.asc; \
-    chmod a+r /etc/apt/keyrings/broadcom-nic.asc; \
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" \
-    > /etc/apt/sources.list.d/broadcom-nic.list; \
-    apt-get update && apt-get install -y --no-install-recommends \
-    bnxt-rocelib=235.2.86.0 \
-    ; \
-    cp -a /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/; \
-    ldconfig; \
-    rm -rf /var/lib/apt/lists/*; \
-    }; \
-    \
-    echo "[MORI] Install MoRI proxy deps"; \
-    pip install --quiet --ignore-installed blinker && \
-    pip install --quiet quart msgpack aiohttp pyzmq; \
-    echo "[MORI] NIC_BACKEND=${NIC_BACKEND}"; \
-    \
-    # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override). \
-    # Only vendor packages are installed here for dlopen; no compile-time flags needed. \
-    case "${NIC_BACKEND}" in \
-    none)  ;; \
-    all)   install_ainic; install_bnxt ;; \
-    ainic) install_ainic ;; \
-    bnxt)  install_bnxt ;; \
-    *)     echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic, bnxt, all"; exit 2 ;; \
-    esac'
+ \
+ install_ainic() { \
+   apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https; \
+   rm -rf /var/lib/apt/lists/*; \
+   mkdir -p /etc/apt/keyrings; \
+   curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
+     > /etc/apt/sources.list.d/amdainic.list; \
+   apt-get update && apt-get install -y --no-install-recommends \
+     libionic-dev \
+     ionic-common \
+   ; \
+   rm -rf /var/lib/apt/lists/*; \
+ }; \
+ \
+ # NOTE: requires FW 235.2.86.0 and kernel drivers on the host: \
+ #   bnxt-en-dkms=1.10.3.235.2.86.0 bnxt-re-dkms=235.2.86.0 (from packages.broadcom.com PPA) \
+ install_bnxt() { \
+   install -m 0755 -d /etc/apt/keyrings; \
+   curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
+     -o /etc/apt/keyrings/broadcom-nic.asc; \
+   chmod a+r /etc/apt/keyrings/broadcom-nic.asc; \
+   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" \
+     > /etc/apt/sources.list.d/broadcom-nic.list; \
+   apt-get update && apt-get install -y --no-install-recommends \
+     bnxt-rocelib=235.2.86.0 \
+   ; \
+   cp -a /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/; \
+   ldconfig; \
+   rm -rf /var/lib/apt/lists/*; \
+ }; \
+ \
+ echo "[MORI] Install MoRI proxy deps"; \
+ pip install --quiet --ignore-installed blinker && \
+ pip install --quiet quart msgpack aiohttp pyzmq; \
+ echo "[MORI] NIC_BACKEND=${NIC_BACKEND}"; \
+ \
+ # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override). \
+ # Only vendor packages are installed here for dlopen; no compile-time flags needed. \
+ case "${NIC_BACKEND}" in \
+   none)  ;; \
+   all)   install_ainic; install_bnxt ;; \
+   ainic) install_ainic ;; \
+   bnxt)  install_bnxt ;; \
+   *)     echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic, bnxt, all"; exit 2 ;; \
+ esac'
 
 # -----------------------
 # vLLM wheel release build stage (for building distributable wheels)
@@ -443,22 +443,22 @@ COPY docker/context/base-wheels/ /tmp/base-wheels/
 # If there are not wheels found there, we are not building for a wheel release. 
 # So we exit with an error. To skip this stage.
 RUN if [ -n "$(ls /tmp/base-wheels/*.whl 2>/dev/null)" ]; then \
-    echo "Found custom wheels - copying to /install"; \
-    cp /tmp/base-wheels/*.whl /install/ && \
-    echo "Copied custom wheels:"; \
-    ls -lh /install/; \
+        echo "Found custom wheels - copying to /install"; \
+        cp /tmp/base-wheels/*.whl /install/ && \
+        echo "Copied custom wheels:"; \
+        ls -lh /install/; \
     else \
-    echo "ERROR: No custom wheels found in docker/context/base-wheels/"; \
-    echo "Wheel releases require pre-built ROCm wheels."; \
-    exit 1; \
+        echo "ERROR: No custom wheels found in docker/context/base-wheels/"; \
+        echo "Wheel releases require pre-built ROCm wheels."; \
+        exit 1; \
     fi
 
 # GIT_REPO_CHECK: Verify repo is clean and tags are available (for release builds)
 # This matches CUDA's Dockerfile behavior for proper version detection via setuptools_scm
 ARG GIT_REPO_CHECK=0
 RUN if [ "$GIT_REPO_CHECK" != "0" ]; then \
-    echo "Running repository checks..."; \
-    cd vllm && bash tools/check_repo.sh; \
+        echo "Running repository checks..."; \
+        cd vllm && bash tools/check_repo.sh; \
     fi
 
 # Extract version from git BEFORE any modifications (pin_rocm_dependencies.py modifies requirements/rocm.txt)
@@ -477,22 +477,22 @@ RUN --mount=type=bind,source=.git,target=vllm/.git \
 RUN echo "Checking for git-based packages in requirements files..." \
     && echo "Checking common.txt for git-based packages:" \
     && if grep -q 'git+' ${COMMON_WORKDIR}/vllm/requirements/common.txt; then \
-    echo "ERROR: Git-based packages found in common.txt:"; \
-    grep 'git+' ${COMMON_WORKDIR}/vllm/requirements/common.txt; \
-    echo "Please publish these packages to PyPI instead of using git dependencies."; \
-    exit 1; \
-    else \
-    echo "  ✓ No git-based packages found in common.txt"; \
-    fi \
+         echo "ERROR: Git-based packages found in common.txt:"; \
+         grep 'git+' ${COMMON_WORKDIR}/vllm/requirements/common.txt; \
+         echo "Please publish these packages to PyPI instead of using git dependencies."; \
+         exit 1; \
+       else \
+         echo "  ✓ No git-based packages found in common.txt"; \
+       fi \
     && echo "Checking rocm.txt for git-based packages:" \
     && if grep -q 'git+' ${COMMON_WORKDIR}/vllm/requirements/rocm.txt; then \
-    echo "ERROR: Git-based packages found in rocm.txt:"; \
-    grep 'git+' ${COMMON_WORKDIR}/vllm/requirements/rocm.txt; \
-    echo "Please publish these packages to PyPI instead of using git dependencies."; \
-    exit 1; \
-    else \
-    echo "  ✓ No git-based packages found in rocm.txt"; \
-    fi \
+         echo "ERROR: Git-based packages found in rocm.txt:"; \
+         grep 'git+' ${COMMON_WORKDIR}/vllm/requirements/rocm.txt; \
+         echo "Please publish these packages to PyPI instead of using git dependencies."; \
+         exit 1; \
+       else \
+         echo "  ✓ No git-based packages found in rocm.txt"; \
+       fi \
     && echo "All requirements files are clean - no git-based packages found"
 
 # Pin vLLM dependencies to exact versions of custom ROCm wheels
@@ -545,7 +545,7 @@ RUN if [ "${DEEPEP_NIC}" = "cx7" ] || [ "${DEEPEP_NIC}" = "io" ]; then \
     mkdir -p build && cd build && \
     cmake -GNinja -DCMAKE_INSTALL_PREFIX=/usr -DNO_MAN_PAGES=1 .. && \
     ninja && ninja install && ldconfig && rm -rf /tmp/rdma-core; \
-    fi
+fi
 
 # Install RIXL + DeepEP wheels.
 RUN --mount=type=bind,from=build_rixl,src=/app/install,target=/rixl_install \
@@ -595,7 +595,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     FASTSAFETENSORS_REQ="$(grep -E '^fastsafetensors(==| @ )' /tmp/rocm-test-reqs.txt | head -1)" \
     && test -n "${FASTSAFETENSORS_REQ}" \
     && python3 -m pip install --force-reinstall --no-deps \
-    --no-binary fastsafetensors "${FASTSAFETENSORS_REQ}" \
+        --no-binary fastsafetensors "${FASTSAFETENSORS_REQ}" \
     && rm /tmp/rocm-test-reqs.txt
 
 # Set MIOPEN ENVS to resolve performance regressions in MIOpen 3D convolution kernel.
@@ -662,9 +662,9 @@ ENV SCCACHE_IDLE_TIMEOUT=
 # Error related to odd state for numpy 1.20.3 where there is no METADATA etc, but an extra LICENSES_bundled.txt.
 # Manually remove it so that later steps of numpy upgrade can continue
 RUN case "$(which python3)" in \
-    *"/opt/conda/envs/py_3.9"*) \
-    rm -rf /opt/conda/envs/py_3.9/lib/python3.9/site-packages/numpy-1.20.3.dist-info/;; \
-    *) ;; esac
+        *"/opt/conda/envs/py_3.9"*) \
+            rm -rf /opt/conda/envs/py_3.9/lib/python3.9/site-packages/numpy-1.20.3.dist-info/;; \
+        *) ;; esac
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --upgrade huggingface-hub[cli]
