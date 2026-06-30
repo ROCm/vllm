@@ -185,6 +185,8 @@ wht = "wht"
 WHT = "WHT"
 # Huawei Compute Architecture for Neural Networks
 CANN = "CANN"
+# CloudFront hostname substring (d183u042sr8tht.cloudfront.net)
+tht = "tht"
 
 [tool.uv]
 no-build-isolation-package = ["torch"]
