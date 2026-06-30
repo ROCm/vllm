@@ -215,13 +215,13 @@ class UnquantizedLinearMethod(LinearMethodBase):
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
             return
 
-        # gfx11x K%4096 B bandwidth cliff: when the weight row stride (K) lands
-        # on a 4096 B multiple, hipBLASLt (and the stride-aware wvSplitK kernel)
-        # hit an L2 cache collision. Offsetting the row stride by one cache line
-        # (+128 B) sidesteps it. Done once at load, so it is free at runtime;
-        # ~3% weight-memory overhead only on affected layers. The stride-blind
-        # paths (LLMM1/aiter/tgemm) detect the non-contiguous weight and route
-        # to BLAS (see rocm_unquantized_gemm_impl).
+        # gfx11x K%2048 B bandwidth cliff: when the weight row stride (K) lands
+        # on a 2048 B multiple, hipBLASLt (and the stride-aware wvSplitK kernel)
+        # hit an L2/MALL channel-hash collision. Offsetting the row stride by one
+        # cache line (+128 B) sidesteps it. Done once at load, so it is free at
+        # runtime; one cache line per row overhead only on affected layers. The
+        # stride-blind paths (LLMM1/aiter/tgemm) detect the non-contiguous weight
+        # and route to BLAS (see rocm_unquantized_gemm_impl).
         from vllm.platforms.rocm import on_gfx1x
 
         if current_platform.is_rocm() and on_gfx1x():
@@ -229,7 +229,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if w.dim() == 2 and w.is_contiguous():
                 n, k = w.shape
                 es = w.element_size()
-                if (k * es) % 4096 == 0:
+                if (k * es) % 2048 == 0:
                     pad = 128 // es
                     buf = torch.empty((n, k + pad), dtype=w.dtype, device=w.device)
                     buf[:, :k].copy_(w)
