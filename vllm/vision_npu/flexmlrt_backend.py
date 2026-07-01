@@ -21,7 +21,7 @@ import torch
 import vllm.envs as envs
 
 from .backend import NPUVisionBackend
-from .cpu_preprocess import get_preprocessor
+from .cpu_preprocess import get_preprocessor, read_cache_io_spec
 
 logger = logging.getLogger(__name__)
 
@@ -58,93 +58,62 @@ class FlexMLRTVisionBackend(NPUVisionBackend):
     Implements CPU preprocessing operations that VitisAI EP normally handles.
     """
 
-    def __init__(self, model_cache_path: str, device_name: str = "stx"):
-        """Initialize FlexMLRT vision model with CPU preprocessing.
+    def __init__(self, model_cache_path: str, device_name: str = "stx",
+                 model_type: str | None = None):
+        """Initialize the generic FlexMLRT vision backend.
 
         Args:
             model_cache_path: Path to VAIP model cache (vaiml_par_0 directory)
             device_name: XRT device name ("stx" for Strix, "phx" for Phoenix)
+            model_type: model's config.model_type; selects the preprocessor.
         """
         from vllm.vision_npu._vision_flexmlrt_cpu import VisionFlexMLRTModel
 
         self.model = VisionFlexMLRTModel(model_cache_path, device_name)
+        # Per-model preprocessor (registry) + IO names/shape/batch read from the
+        # cache's own spec — the backend itself is model-agnostic.
+        self.preprocessor = get_preprocessor(model_cache_path, model_type)
+        self.io = read_cache_io_spec(model_cache_path)
+        logger.info(
+            "[FlexMLRT Backend] model_type=%s  in=%s%s  out=%s%s",
+            model_type, self.io["input_name"], self.io["in_shape"],
+            self.io["output_name"], self.io["out_shape"],
+        )
 
-        # Initialize the preprocessor (Qwen2.5-VL: CPU-preprocess pipeline).
-        # NOTE: step 3 threads real model_type through; hardcoded here for now so
-        # the existing Qwen path keeps working after the factory consolidation.
-        self.preprocessor = get_preprocessor(model_cache_path, model_type="qwen2_5_vl")
-        logger.info("[FlexMLRT Backend] Initialized with CPU preprocessing")
-
-    def forward(self, pixel_values: np.ndarray, grid_thw: np.ndarray) -> np.ndarray:
-        """Run vision encoding with CPU preprocessing + NPU execution.
-
-        Pipeline:
-        1. CPU preprocessing: [4292, 1176] → [1073, 4, 1280]
-        2. NPU execution: [1073, 4, 1280] → [1073, 3584]
-        3. CPU postprocessing: Apply reverse_index reordering
+    def forward(self, pixel_values, geometry=None) -> np.ndarray:
+        """Generic vision encode: preprocess -> NPU (per group) -> postprocess.
 
         Args:
-            pixel_values: [seq_len, feature_dim] float32 array from HF processor
-            grid_thw: [num_images, 3] int64 array (unused for now)
-
+            pixel_values: model's raw vision input (the preprocessor adapts it).
+            geometry: model's per-item geometry (grid_thw / tgt_sizes); the
+                preprocessor uses or ignores it.
         Returns:
-            embeddings: [merged_seq_len, hidden_dim] float32 array
+            [tokens, hidden] (or [n, tokens, hidden]) float32 embeddings.
         """
         total_start = time.monotonic() if VLLM_NPU_TIMING else None
 
-        # Convert numpy to torch for preprocessing
-        with npu_timing("NumPy→Torch conversion", logger):
-            if isinstance(pixel_values, np.ndarray):
-                pixel_values_torch = torch.from_numpy(pixel_values).float()
-            else:
-                pixel_values_torch = pixel_values.float()
+        groups = self.preprocessor.preprocess(pixel_values, geometry)
+        outputs = []
+        for g in groups:
+            with npu_timing("NPU inference", logger):
+                outputs.append(self.model.forward(
+                    g, self.io["input_name"], self.io["output_name"],
+                    self.io["out_shape"],
+                ))
+        final_output = self.preprocessor.postprocess(outputs, geometry)
 
-        # Step 1: CPU preprocessing
-        logger.debug(
-            "[FlexMLRT Backend] Preprocessing input shape: %s", pixel_values.shape
-        )
-        with npu_timing("CPU preprocessing (total)", logger):
-            preprocessed = self.preprocessor.preprocess(pixel_values_torch)
-
-        # Step 2: NPU execution
-        logger.debug(
-            "[FlexMLRT Backend] Running NPU inference on shape: %s",
-            preprocessed.shape,
-        )
-        with npu_timing("NPU inference", logger):
-            npu_output = self.model.forward(preprocessed)
-
-        # Step 3: CPU postprocessing
-        logger.debug(
-            "[FlexMLRT Backend] Postprocessing NPU output shape: %s", npu_output.shape
-        )
-        with npu_timing("CPU postprocessing", logger):
-            final_output = self.preprocessor.postprocess(npu_output)
-
-        logger.debug("[FlexMLRT Backend] Final output shape: %s", final_output.shape)
-
-        # Log total time and memory stats
         if VLLM_NPU_TIMING and total_start is not None:
             total_ms = (time.monotonic() - total_start) * 1000
-            logger.info("[NPU Timing] Total vision pipeline: %.2fms", total_ms)
-            logger.info("[NPU Memory] Input: %.2f MB", pixel_values.nbytes / 1024**2)
             logger.info(
-                "[NPU Memory] Preprocessed: %.2f MB", preprocessed.nbytes / 1024**2
+                "[NPU Timing] Total vision pipeline: %.2fms (%d NPU call(s))",
+                total_ms, len(groups),
             )
-            logger.info("[NPU Memory] Output: %.2f MB", final_output.nbytes / 1024**2)
-            logger.info(
-                "[ViT Output] Shape: %s \u2192 %d patches \u00d7 %d embedding_dim",
-                final_output.shape,
-                final_output.shape[0],
-                final_output.shape[1],
-            )
-
         return final_output
 
     @property
     def output_dim(self) -> int:
-        """Get output embedding dimension from FlexMLRT model."""
-        return self.model.output_dim()
+        """Output embedding dim (from the cache's own IO spec)."""
+        return int(self.io["out_shape"][-1])
 
 
 class AsyncFlexMLRTVisionBackend:
@@ -161,15 +130,19 @@ class AsyncFlexMLRTVisionBackend:
     - Speedup: 1.43x for 2 requests, approaches 1.5x+ for longer sequences
     """
 
-    def __init__(self, model_cache_path: str, device_name: str = "stx"):
+    def __init__(self, model_cache_path: str, device_name: str = "stx",
+                 model_type: str | None = None):
         """Initialize async wrapper with underlying synchronous backend.
 
         Args:
             model_cache_path: Path to VAIP model cache (vaiml_par_0 directory)
             device_name: XRT device name ("stx" for Strix, "phx" for Phoenix)
+            model_type: model's config.model_type (forwarded to the sync backend).
         """
-        # Underlying synchronous backend
-        self.sync_backend = FlexMLRTVisionBackend(model_cache_path, device_name)
+        # Underlying synchronous backend (generic; selects preprocessor by model_type)
+        self.sync_backend = FlexMLRTVisionBackend(
+            model_cache_path, device_name, model_type
+        )
 
         # Thread pool for NPU inference (separate from GPU thread)
         # Single worker ensures NPU executes one request at a time

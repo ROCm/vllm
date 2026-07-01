@@ -29,15 +29,16 @@ class NPUVisionBackend(ABC):
         pass
 
     @abstractmethod
-    def forward(self, pixel_values: np.ndarray, grid_thw: np.ndarray) -> np.ndarray:
-        """Run vision encoding on NPU.
+    def forward(self, pixel_values, geometry=None) -> np.ndarray:
+        """Run vision encoding on the NPU.
 
         Args:
-            pixel_values: Input pixel data [seq_len, feature_dim] float32
-            grid_thw: Grid dimensions [num_images, 3] int64 (temporal, height, width)
+            pixel_values: model's raw vision input (adapted by the preprocessor).
+            geometry: model's per-item geometry (e.g. grid_thw for Qwen,
+                tgt_sizes for MiniCPM); used or ignored by the preprocessor.
 
         Returns:
-            embeddings: Vision embeddings [merged_seq_len, hidden_dim] float32
+            embeddings: vision embeddings [tokens, hidden] (or [n, tokens, hidden]).
         """
         pass
 

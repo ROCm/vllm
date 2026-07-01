@@ -369,17 +369,42 @@ class MiniCPMV_Preprocessor:
         return cat[:n]
 
 
+class _SingleGroupAdapter:
+    """Adapt a single-input/single-output preprocessor (e.g. Qwen's) to the
+    uniform list contract used by the backend:
+
+        preprocess(pixel_values, geometry) -> [one NPU input]
+        postprocess([one NPU output], geometry) -> array
+
+    Also converts numpy -> torch for the wrapped preprocessor. Lets legacy
+    single-shot preprocessors work unchanged behind the generic backend loop.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def preprocess(self, pixel_values, geometry=None) -> list:
+        if isinstance(pixel_values, np.ndarray):
+            pixel_values = torch.from_numpy(pixel_values).float()
+        return [self._inner.preprocess(pixel_values)]
+
+    def postprocess(self, outputs: list, geometry=None) -> np.ndarray:
+        return self._inner.postprocess(outputs[0])
+
+
 @register_preprocessor("qwen2_5_vl", "qwen2_vl")
 def _build_qwen_preprocessor(model_cache_dir: str):
-    """Qwen2.5-VL: partial-NPU graph -> CPU-preprocess pipeline (optimized->numpy)."""
+    """Qwen2.5-VL: partial-NPU graph -> CPU-preprocess pipeline (optimized->numpy),
+    wrapped in the uniform list contract (Qwen's preprocessor code is untouched)."""
     try:
-        return Qwen2_5_VL_CPUPreprocessor_Optimized(model_cache_dir)
+        inner = Qwen2_5_VL_CPUPreprocessor_Optimized(model_cache_dir)
     except Exception as e:
         logger.warning(
             "Failed to load optimized Qwen preprocessor: %s, falling back to numpy",
             e,
         )
-        return Qwen2_5_VL_CPUPreprocessor(model_cache_dir)
+        inner = Qwen2_5_VL_CPUPreprocessor(model_cache_dir)
+    return _SingleGroupAdapter(inner)
 
 
 def get_preprocessor(model_cache_dir: str, model_type: str | None = None):
