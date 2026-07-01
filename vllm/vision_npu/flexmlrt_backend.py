@@ -21,7 +21,7 @@ import torch
 import vllm.envs as envs
 
 from .backend import NPUVisionBackend
-from .cpu_preprocess import get_cpu_preprocessor
+from .cpu_preprocess import get_preprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +69,10 @@ class FlexMLRTVisionBackend(NPUVisionBackend):
 
         self.model = VisionFlexMLRTModel(model_cache_path, device_name)
 
-        # Initialize CPU preprocessor
-        self.preprocessor = get_cpu_preprocessor(model_cache_path, optimized=True)
+        # Initialize the preprocessor (Qwen2.5-VL: CPU-preprocess pipeline).
+        # NOTE: step 3 threads real model_type through; hardcoded here for now so
+        # the existing Qwen path keeps working after the factory consolidation.
+        self.preprocessor = get_preprocessor(model_cache_path, model_type="qwen2_5_vl")
         logger.info("[FlexMLRT Backend] Initialized with CPU preprocessing")
 
     def forward(self, pixel_values: np.ndarray, grid_thw: np.ndarray) -> np.ndarray:
