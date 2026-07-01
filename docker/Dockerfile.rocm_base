@@ -176,18 +176,13 @@ RUN mkdir -p /app/install && cp ${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi/di
 
 
 ###
-### MORI Build
+### MORI — install pre-built wheel from PyPI (no GPU needed at build time)
 ###
 FROM base AS build_mori
-ARG MORI_BRANCH
-ARG MORI_REPO
-RUN mkdir -p /app/install; \
-    git clone ${MORI_REPO} \
-    && cd mori \
-    && git checkout ${MORI_BRANCH} \
-    && git submodule update --init --recursive \
-    && python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl \
-    && cp /app/mori/dist/*.whl /app/install;
+ARG MORI_VERSION=1.2.1
+RUN mkdir -p /app/install && \
+    pip download "amd-mori==${MORI_VERSION}" --no-deps -d /app/install && \
+    ls /app/install/*.whl
 
 
 ###
