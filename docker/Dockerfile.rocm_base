@@ -13,7 +13,7 @@ ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
 ARG AITER_BRANCH="main"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
-ARG MORI_BRANCH="v1.1.0"
+ARG MORI_BRANCH="v1.2.1"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 
 # Sccache configuration (only used in release pipeline)
@@ -187,7 +187,10 @@ RUN mkdir -p /app/install; \
     && cd mori \
     && git checkout ${MORI_BRANCH} \
     && git submodule update --init --recursive \
-    && MORI_GPU_ARCHS=${MORI_GPU_ARCHS} python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl \
+    && HIP_PATH=${ROCM_PATH} \
+       CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake \
+       MORI_GPU_ARCHS=${MORI_GPU_ARCHS} \
+       python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl \
     && cp /app/mori/dist/*.whl /app/install;
 
 
