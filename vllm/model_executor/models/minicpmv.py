@@ -40,6 +40,7 @@ from transformers import BatchFeature, PretrainedConfig
 from typing_extensions import TypeVar
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import ModalityData, MultiModalDataDict
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -143,6 +144,8 @@ class MiniCPMVImageEmbeddingInputs(TensorSchema):
 
 
 MiniCPMVImageInputs: TypeAlias = MiniCPMVImagePixelInputs | MiniCPMVImageEmbeddingInputs
+
+logger = init_logger(__name__)
 
 DEFAULT_LN = partial(nn.LayerNorm, eps=1e-6)
 
@@ -1121,7 +1124,20 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
         if image_input["type"] == "image_embeds":
             return image_input["image_embeds"]
 
-        image_features_flat = self.get_vision_hidden_states(image_input)
+        if getattr(self, "npu_backend", None) is not None:
+            # NPU path: the backend runs vpm+resampler on the NPU and returns
+            # [n_slices, query_num, hidden]. Move it to the LLM's device/dtype.
+            import numpy as np
+
+            ie = self.llm.model.embed_tokens.weight
+            emb = self.npu_backend.forward(
+                image_input["pixel_values"], image_input["tgt_sizes"]
+            )
+            image_features_flat = torch.from_numpy(np.ascontiguousarray(emb)).to(
+                device=ie.device, dtype=ie.dtype
+            )
+        else:
+            image_features_flat = self.get_vision_hidden_states(image_input)
 
         num_slices = image_input["num_slices"]
         return [e.flatten(0, 1) for e in image_features_flat.split(num_slices.tolist())]
@@ -1418,6 +1434,30 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         assert self.version == (2, 6)
 
+        # NPU vision offload: run vpm+resampler on the AMD NPU, LLM on the GPU.
+        # The GPU vpm/resampler built by the base __init__ go unused (their
+        # weights are skipped in load_weights).
+        from vllm.model_executor.models.vision import (
+            get_npu_vision_backend,
+            use_npu_vision_backend,
+        )
+
+        self.npu_backend = (
+            get_npu_vision_backend(
+                model_type=getattr(self.config, "model_type", "minicpmv")
+            )
+            if use_npu_vision_backend()
+            else None
+        )
+        if self.npu_backend is not None:
+            logger.info("[MiniCPMV2.6] NPU vision backend active (vpm+resampler)")
+            # The GPU vpm/resampler built by the base __init__ are unused (vision
+            # runs on the NPU). Replace them with param-free stubs so their
+            # checkpoint weights can be skipped without tripping vLLM's
+            # "all params initialized from checkpoint" check. Frees ~1 GB.
+            self.vpm = nn.Identity()
+            self.resampler = nn.Identity()
+
     def init_llm(
         self,
         vllm_config: VllmConfig,
@@ -1493,7 +1533,11 @@ class MiniCPMV2_6(MiniCPMVBaseModel, SupportsLoRA):
         return self.resampler(vision_embedding, tgt_sizes)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["apm.", "audio", "tts"])
+        skip_prefixes = ["apm.", "audio", "tts"]
+        # When vision runs on the NPU, skip the unused GPU vpm/resampler weights.
+        if getattr(self, "npu_backend", None) is not None:
+            skip_prefixes = skip_prefixes + ["vpm.", "resampler."]
+        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         loaded = loader.load_weights(weights)
         self._ensure_resampler_device()
         return loaded
@@ -1590,7 +1634,11 @@ class MiniCPMV4_0(MiniCPMVBaseModel, SupportsLoRA):
         return self.resampler(vision_embedding, tgt_sizes)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["apm.", "audio", "tts"])
+        skip_prefixes = ["apm.", "audio", "tts"]
+        # When vision runs on the NPU, skip the unused GPU vpm/resampler weights.
+        if getattr(self, "npu_backend", None) is not None:
+            skip_prefixes = skip_prefixes + ["vpm.", "resampler."]
+        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         loaded = loader.load_weights(weights)
         self._ensure_resampler_device()
         return loaded
@@ -1692,7 +1740,11 @@ class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
         return self.resampler(vision_embedding, tgt_sizes, all_temporal_ids)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self, skip_prefixes=["apm.", "audio", "tts"])
+        skip_prefixes = ["apm.", "audio", "tts"]
+        # When vision runs on the NPU, skip the unused GPU vpm/resampler weights.
+        if getattr(self, "npu_backend", None) is not None:
+            skip_prefixes = skip_prefixes + ["vpm.", "resampler."]
+        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
         loaded = loader.load_weights(weights)
         self._ensure_resampler_device()
         return loaded
