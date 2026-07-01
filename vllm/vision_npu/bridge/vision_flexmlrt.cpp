@@ -96,66 +96,47 @@ class VisionFlexMLRTModel {
     DEBUG_LOG(" VisionFlexMLRTModel constructor END (opts memory released)");
   }
 
-  // Forward pass with CPU-preprocessed input [1073, 4, 1280]
-  py::array_t<float> forward(py::array_t<float> preprocessed_input) {
-    DEBUG_LOG(" forward() START (CPU-preprocessed input)");
+  // Generic forward pass: the caller supplies the NPU partition's input/output
+  // tensor names and the output shape (read from the cache's own IO spec), so
+  // this shim works for ANY model — Qwen2.5-VL, MiniCPM-V, Gemma-3, ...
+  // The input array's own shape is used verbatim (any ndim is accepted).
+  py::array_t<float> forward(py::array_t<float> input,
+                             const std::string& input_name,
+                             const std::string& output_name,
+                             const std::vector<int64_t>& output_shape) {
+    DEBUG_LOG(" forward() START");
 
-    auto buf = preprocessed_input.request();
-    DEBUG_LOG(" Input ndim: " << buf.ndim);
+    auto buf = input.request();
+    std::vector<int64_t> in_shape(buf.shape.begin(), buf.shape.end());
+    const size_t in_bytes = static_cast<size_t>(buf.size) * sizeof(float);
+    DEBUG_LOG(" Input '" << input_name << "' ndim=" << buf.ndim
+                         << " numel=" << buf.size);
 
-    if (buf.ndim != 3) {
-      throw std::runtime_error(
-          "preprocessed_input must be 3D array [1073, 4, 1280]");
-    }
-
-    int64_t dim0 = buf.shape[0];  // 1073
-    int64_t dim1 = buf.shape[1];  // 4
-    int64_t dim2 = buf.shape[2];  // 1280
-
-    DEBUG_LOG(" Input shape: [" << dim0 << ", " << dim1 << ", " << dim2 << "]");
-
-    if (dim0 != 1073 || dim1 != 4 || dim2 != 1280) {
-      throw std::runtime_error(
-          "Expected input shape [1073, 4, 1280], got [" + std::to_string(dim0) +
-          ", " + std::to_string(dim1) + ", " + std::to_string(dim2) + "]");
-    }
-
-    // Build input tensors
+    // Build input tensor from the array's actual shape.
     std::vector<flexmlrt::client::ErtIoTypeNew> ifms;
+    ifms.push_back(
+        makeIO(input_name, 0, buf.ptr, in_bytes, "float32", in_shape));
 
-    // Input name from NPU partition ONNX: "/blocks/Gather_output_0"
-    ifms.push_back(makeIO("/blocks/Gather_output_0", 0, buf.ptr,
-                          dim0 * dim1 * dim2 * sizeof(float), "float32",
-                          {dim0, dim1, dim2}));
-    DEBUG_LOG(" Input tensor built: /blocks/Gather_output_0 [1073, 4, 1280]");
-
-    // Output tensor
-    // From NPU partition ONNX: "/merger/merger/mlp/mlp.2/Gemm_output_0" [1073,
-    // 3584]
-    int64_t out_dim0 = 1073;
-    int64_t out_dim1 = 3584;
-
-    std::vector<float> output_buf(out_dim0 * out_dim1);
+    // Build output tensor sized by the caller-provided output shape.
+    int64_t out_numel = 1;
+    for (int64_t d : output_shape) out_numel *= d;
+    if (out_numel <= 0) {
+      throw std::runtime_error("output_shape must have positive dimensions");
+    }
+    std::vector<float> output_buf(static_cast<size_t>(out_numel));
     std::vector<flexmlrt::client::ErtIoTypeNew> ofms;
-    ofms.push_back(makeIO("/merger/merger/mlp/mlp.2/Gemm_output_0", 0,
-                          output_buf.data(), output_buf.size() * sizeof(float),
-                          "float32", {out_dim0, out_dim1}));
-    DEBUG_LOG(
-        " Output tensor built: /merger/merger/mlp/mlp.2/Gemm_output_0 [1073, "
-        "3584]");
+    ofms.push_back(makeIO(output_name, 0, output_buf.data(),
+                          output_buf.size() * sizeof(float), "float32",
+                          output_shape));
+    DEBUG_LOG(" Output '" << output_name << "' numel=" << out_numel);
 
     std::vector<flexmlrt::client::ErtIoTypeNew> wts;
 
-    // Run NPU inference
+    // Run NPU inference (release the GIL so the GPU LLM can run in parallel).
     DEBUG_LOG(" Calling model->forward()...");
-    DEBUG_LOG(" Releasing GIL to allow GPU parallelization...");
     try {
-      // CRITICAL: Release GIL during NPU execution to allow GPU to run in
-      // parallel NPU inference takes ~11 seconds - other Python threads must be
-      // able to proceed
       py::gil_scoped_release release;
       model_->forward(ifms, ofms, wts);
-      // GIL automatically reacquired when 'release' goes out of scope
       DEBUG_LOG(" model->forward() returned successfully (GIL reacquired)");
     } catch (const std::exception& e) {
       std::cerr << "[FlexMLRT ERROR] model->forward() threw exception: "
@@ -164,26 +145,18 @@ class VisionFlexMLRTModel {
                                e.what());
     }
 
-    // Copy output to numpy array
-    DEBUG_LOG(" Copying output to numpy array...");
-    py::array_t<float> result({out_dim0, out_dim1});
+    // Copy output into a numpy array of the requested shape.
+    py::array_t<float> result(output_shape);
     auto result_buf = result.request();
     std::memcpy(result_buf.ptr, output_buf.data(),
                 output_buf.size() * sizeof(float));
 
-    // Explicitly clear temporary buffers (helps with memory fragmentation)
     output_buf.clear();
     output_buf.shrink_to_fit();
     ifms.clear();
     ofms.clear();
-
-    DEBUG_LOG(" forward() END (temporary buffers released)");
-
+    DEBUG_LOG(" forward() END");
     return result;
-  }
-
-  int output_dim() const {
-    return 3584;  // Fixed for Qwen2.5-VL
   }
 
  private:
@@ -205,14 +178,18 @@ PYBIND11_MODULE(_vision_flexmlrt_cpu, m) {
            "Args:\n"
            "    model_cache: Path to VAIP model cache (vaiml_par_0 directory)\n"
            "    device_name: XRT device name (default: 'stx')")
-      .def("forward", &VisionFlexMLRTModel::forward,
-           py::arg("preprocessed_input"),
-           "Run vision encoding on NPU with CPU-preprocessed input\n\n"
+      .def("forward", &VisionFlexMLRTModel::forward, py::arg("input"),
+           py::arg("input_name") = "/blocks/Gather_output_0",
+           py::arg("output_name") = "/merger/merger/mlp/mlp.2/Gemm_output_0",
+           py::arg("output_shape") = std::vector<int64_t>{1073, 3584},
+           "Run vision encoding on the NPU (generic; IO names/shape supplied by "
+           "the caller from the cache's own spec).\n\n"
            "Args:\n"
-           "    preprocessed_input: [1073, 4, 1280] float32 array "
-           "(CPU-preprocessed)\n\n"
+           "    input: float32 array matching the cache's input tensor\n"
+           "    input_name: NPU-partition input tensor name\n"
+           "    output_name: NPU-partition output tensor name\n"
+           "    output_shape: output tensor shape\n\n"
            "Returns:\n"
-           "    embeddings: [1073, 3584] float32 array")
-      .def("output_dim", &VisionFlexMLRTModel::output_dim,
-           "Get output embedding dimension");
+           "    float32 array of output_shape\n\n"
+           "Defaults reproduce the Qwen2.5-VL contract for backward compat.");
 }
