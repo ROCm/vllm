@@ -623,8 +623,12 @@ def use_npu_vision_backend() -> bool:
     return backend == "flexmlrt"
 
 
-def get_npu_vision_backend():
-    """Get NPU vision backend instance if enabled.
+def get_npu_vision_backend(model_type: str | None = None):
+    """Get the NPU vision backend instance if enabled.
+
+    One generic backend serves every model; ``model_type`` selects the per-model
+    preprocessor (via the registry) inside the backend. Callers should pass their
+    model's ``config.model_type``.
 
     Returns:
         NPUVisionBackend instance if NPU backend is enabled, None otherwise.
@@ -652,10 +656,10 @@ def get_npu_vision_backend():
         if envs.VLLM_NPU_ASYNC_PIPELINE:
             from vllm.vision_npu.flexmlrt_backend import AsyncFlexMLRTVisionBackend
 
-            return AsyncFlexMLRTVisionBackend(model_cache, device_name)
+            return AsyncFlexMLRTVisionBackend(model_cache, device_name, model_type)
         else:
             from vllm.vision_npu.flexmlrt_backend import FlexMLRTVisionBackend
 
-            return FlexMLRTVisionBackend(model_cache, device_name)
+            return FlexMLRTVisionBackend(model_cache, device_name, model_type)
 
     return None

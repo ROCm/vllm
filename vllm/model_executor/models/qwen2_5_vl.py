@@ -594,7 +594,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
 
         if use_npu_vision_backend():
             try:
-                self.npu_backend = get_npu_vision_backend()
+                self.npu_backend = get_npu_vision_backend(model_type="qwen2_5_vl")
                 logger.info("[Qwen2.5VL] Using NPU vision backend")
                 return
             except Exception as e:
