@@ -181,13 +181,13 @@ RUN mkdir -p /app/install && cp ${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi/di
 FROM base AS build_mori
 ARG MORI_BRANCH
 ARG MORI_REPO
-ARG MORI_GPU_ARCHS
+ARG MORI_GPU_ARCHS=gfx942;gfx950;gfx1250
 RUN mkdir -p /app/install; \
     git clone ${MORI_REPO} \
     && cd mori \
     && git checkout ${MORI_BRANCH} \
     && git submodule update --init --recursive \
-    && python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl \
+    && MORI_GPU_ARCHS=${MORI_GPU_ARCHS} python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl \
     && cp /app/mori/dist/*.whl /app/install;
 
 
