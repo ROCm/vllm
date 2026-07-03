@@ -51,13 +51,22 @@ def _shape_supported(K: int, N: int, G: int, top_k: int) -> bool:
 
 
 def prefill_uses_rdna_moe_gemm(
-    K_hidden: int, N_gemm1: int, act_dim: int, top_k: int, group_size: int
+    K_hidden: int,
+    N_gemm1: int,
+    act_dim: int,
+    top_k: int,
+    group_size: int,
+    in_dtype: torch.dtype,
 ) -> bool:
     """True iff BOTH MoE prefill GEMMs will run on the rdna_moe_gemm kernel for this
-    shape. Shape-only (no tensors), so workspace_shapes and apply() can agree on
-    block_m up front. gemm1 = (K_hidden, N_gemm1, top_k); gemm2 = down proj
-    (act_dim, K_hidden, top_k=1)."""
+    shape+dtype. Tensor-free (takes the dtype, not the tensor), so workspace_shapes
+    and apply() can agree on block_m up front. gemm1 = (K_hidden, N_gemm1, top_k);
+    gemm2 = down proj (act_dim, K_hidden, top_k=1). The WMMA kernel is bf16-only
+    (wmma_f32_16x16x16_bf16); any other dtype falls through to the Triton path,
+    which handles fp16."""
     if not is_enabled() or not on_gfx11():
+        return False
+    if in_dtype != torch.bfloat16:
         return False
     return _shape_supported(K_hidden, N_gemm1, group_size, top_k) and _shape_supported(
         act_dim, K_hidden, group_size, 1
@@ -78,9 +87,9 @@ def _moe_gemm_w4a16_impl(
 ) -> None:
     """Run the rdna_moe_gemm WMMA W4A16 MoE GEMM, writing into C in place.
 
-    Callers MUST gate on ``prefill_uses_rdna_moe_gemm`` first (shape-only, so the
-    block_m choice and this dispatch agree). The kernel validates the shape with
-    TORCH_CHECK, so a mismatch raises rather than silently falling back.
+    Callers MUST gate on ``prefill_uses_rdna_moe_gemm`` first (shape+dtype, so the
+    block_m choice and this dispatch agree). The kernel validates shape and dtype
+    with TORCH_CHECK, so a mismatch raises rather than silently falling back.
 
     num_blocks: sync-free launch upper bound (Triton's EM cdiv block_m); padding
         blocks carry expert_id == -1 and early-return in the kernel.

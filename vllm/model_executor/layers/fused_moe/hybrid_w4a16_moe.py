@@ -267,16 +267,21 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         return 1
 
     def _prefill_uses_rdna_moe_gemm(
-        self, N: int, K: int, topk: int, activation: MoEActivation
+        self,
+        N: int,
+        K: int,
+        topk: int,
+        activation: MoEActivation,
+        in_dtype: torch.dtype,
     ) -> bool:
-        """Whether the rdna_moe_gemm WMMA kernel can run gemm1 for this shape (gemm1
-        K-by-N top_k; gemm2 down proj also checked since both must be supported).
-        Gates the gemm1 rdna_moe_gemm-vs-Triton dispatch in apply()."""
+        """Whether the rdna_moe_gemm WMMA kernel can run gemm1 for this shape+dtype
+        (gemm1 K-by-N top_k; gemm2 down proj also checked since both must be
+        supported). Gates the gemm1 rdna_moe_gemm-vs-Triton dispatch in apply()."""
         from vllm.model_executor.layers.fused_moe import moe_hip_w4a16
 
         act_dim = self.adjust_N_for_activation(N, activation)
         return moe_hip_w4a16.prefill_uses_rdna_moe_gemm(
-            K, N, act_dim, topk, self._group_size
+            K, N, act_dim, topk, self._group_size, in_dtype
         )
 
     def moe_problem_size(
@@ -450,9 +455,10 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         # rdna_moe_gemm prefill path: gemm1 runs the rdna_moe_gemm WMMA kernel
         # and gemm2 runs Triton, both at the single block_size_m alignment (32).
         # gemm1 at 32 is faster than at 16 (the better tile beats the extra
-        # padding), so there is no separate gemm2 alignment.
+        # padding), so there is no separate gemm2 alignment. The predicate also
+        # gates on bf16 (the WMMA kernel is bf16-only); other dtypes stay on Triton.
         use_rdna_moe_gemm = use_triton and self._prefill_uses_rdna_moe_gemm(
-            N, K, top_k_num, activation
+            N, K, top_k_num, activation, hidden_states.dtype
         )
         # The rdna_moe_gemm kernel cannot fold routing weights on input; that flag is
         # only set for top_k==1 layers, which the gemm1 family (top_k>1) never
