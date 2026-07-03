@@ -1478,7 +1478,10 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
           WVSPLIT_TILE_CFG(64, 16, sYT, 4)
         break;
       case 5:
-        WVSPLIT_TILE(sYT, 5)
+        if (use_wave32)
+          WVSPLIT_TILE_CFG(32, 16, sYT, 5)
+        else
+          WVSPLIT_TILE_CFG(64, 16, sYT, 5)
         break;
       default:
         throw std::runtime_error(
@@ -1719,11 +1722,8 @@ torch::Tensor wvSplitK_fused_silu_gate_mul(
 // K%2048 == 0 shapes that currently route through (W=16, AC=8).
 // The YTILE grid is restricted to {1, 2} -- the production dispatcher
 // never picks YTILE > 2 for the slow K%2048 shapes (YT=1 for N=1,
-// YT=2 for N>=2 + !fit_lds).  A_CHUNK is currently pinned at 32 to
-// keep build time manageable; flip back to {8, 16} in WVSPLITK_SWEEP_AC
-// (and ACHUNKS in the Python script) if you need to revisit AC<32.
-// Current grid: 2 YT x 3 UNRL x 1 AC x 2 W = 12 combos x 4 N x 3
-// kernel variants = 144 template instantiations.
+// YT=2 for N>=2 + !fit_lds) -- which keeps the template-instantiation
+// count to 24 combos x 4 N x 3 kernel variants = 288.
 #ifdef VLLM_SKINNY_GEMM_SWEEP_BF16
 torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
                              const std::optional<at::Tensor>& in_bias,
@@ -1805,11 +1805,13 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
                   "; allowed: 16, 32");                      \
     }
 
-  #define WVSPLITK_SWEEP_AC(_THRDS, _YTILE, _UNRL)                        \
-    if (achunk == 32) {                                                   \
-      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 32)                   \
-    } else {                                                              \
-      TORCH_CHECK(false, "Unsupported achunk=", achunk, "; allowed: 32"); \
+  #define WVSPLITK_SWEEP_AC(_THRDS, _YTILE, _UNRL)                           \
+    if (achunk == 8) {                                                       \
+      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 8)                       \
+    } else if (achunk == 16) {                                               \
+      WVSPLITK_SWEEP_WVPRGRP(_THRDS, _YTILE, _UNRL, 16)                      \
+    } else {                                                                 \
+      TORCH_CHECK(false, "Unsupported achunk=", achunk, "; allowed: 8, 16"); \
     }
 
   #define WVSPLITK_SWEEP_UNRL(_THRDS, _YTILE)        \

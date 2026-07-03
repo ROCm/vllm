@@ -7,9 +7,8 @@ Measures throughput and weight bandwidth for representative model shapes
 at batch sizes 1-4. Validates accuracy against torch.mm. Dynamically
 determines iteration count per shape based on IQR convergence.
 
-Per-kernel timestamps are recorded inside a captured CUDA graph via a small
-ctypes shim that calls hipEventRecordWithFlags(hipEventRecordExternal) —
-PyTorch's high-level torch.cuda.Event blocks this path on ROCm (AIESW-34641).
+Per-kernel timestamps are recorded inside a captured CUDA graph via
+torch.cuda.Event(enable_timing=True, external=True).
 
 Usage:
     python tests/kernels/quantization/bench_rocm_skinny_gemm.py
@@ -19,12 +18,16 @@ Usage:
 """
 
 import argparse
-import ctypes
 import math
-import os
 import time
 
 import torch
+
+if tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 12):
+    raise RuntimeError(
+        f"PyTorch >= 2.12 required for torch.cuda.Event(external=True) on ROCm "
+        f"(got {torch.__version__})"
+    )
 
 import vllm._custom_ops as ops
 from vllm.utils.platform_utils import num_compute_units as get_cu_count
@@ -34,63 +37,9 @@ from vllm.utils.platform_utils import num_compute_units as get_cu_count
 CACHE_SIZE_BYTES = 64 * 1024 * 1024
 
 
-# ---------------------------------------------------------------------------
-# HIP ctypes shim — workaround for PyTorch's blanket disable of
-# cudaEventRecordExternal on ROCm (see AIESW-34641). Lets us record per-kernel
-# events inside a captured CUDA graph and read back queryable timestamps.
-# Remove once PyTorch upstream lifts the TORCH_CHECK in c10/cuda/CUDAEvent.h.
-# ---------------------------------------------------------------------------
-HIP_EVENT_RECORD_EXTERNAL = 0x01
-
-
-def _load_hip():
-    site = os.path.dirname(os.path.dirname(torch.__file__))
-    for sub in ("_rocm_sdk_core/lib", "_rocm_sdk_devel/lib"):
-        for name in ("libamdhip64.so.7", "libamdhip64.so"):
-            p = os.path.join(site, sub, name)
-            if os.path.exists(p):
-                lib = ctypes.CDLL(p)
-                lib.hipEventRecordWithFlags.argtypes = [
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                    ctypes.c_uint,
-                ]
-                lib.hipEventRecordWithFlags.restype = ctypes.c_int
-                lib.hipEventElapsedTime.argtypes = [
-                    ctypes.POINTER(ctypes.c_float),
-                    ctypes.c_void_p,
-                    ctypes.c_void_p,
-                ]
-                lib.hipEventElapsedTime.restype = ctypes.c_int
-                return lib
-    raise RuntimeError("libamdhip64 not found under torch site-packages")
-
-
-_HIP = _load_hip()
-
-
-def _record_external(ev: torch.cuda.Event, stream) -> None:
-    """Record `ev` on `stream` with hipEventRecordExternal (graph-safe)."""
-    err = _HIP.hipEventRecordWithFlags(
-        int(ev.cuda_event), int(stream.cuda_stream), HIP_EVENT_RECORD_EXTERNAL
-    )
-    if err != 0:
-        raise RuntimeError(f"hipEventRecordWithFlags returned {err}")
-
-
-def _elapsed_ms(start_ev: torch.cuda.Event, end_ev: torch.cuda.Event) -> float:
-    ms = ctypes.c_float(-1.0)
-    err = _HIP.hipEventElapsedTime(
-        ctypes.byref(ms), int(start_ev.cuda_event), int(end_ev.cuda_event)
-    )
-    if err != 0:
-        raise RuntimeError(f"hipEventElapsedTime returned {err}")
-    return ms.value
-
-
 def _make_event():
-    """Create a timing event and force lazy hipEventCreate by recording once."""
-    e = torch.cuda.Event(enable_timing=True)
+    """Create an external timing event and force lazy hipEventCreate."""
+    e = torch.cuda.Event(enable_timing=True, external=True)
     e.record()
     return e
 
@@ -149,8 +98,8 @@ def bench_dynamic(
     Probes the kernel time, sizes one capture so a replay runs ~target_replay_ms
     (so the GPU stays continuously busy and DVFS doesn't drop the clock between
     launches), captures `iters_per_replay` calls of fn(0..iters-1), each
-    bracketed by hipEventRecord(EXTERNAL) so per-kernel timestamps are queryable
-    on replay. fn(i) lets callers rotate weight buffers.
+    bracketed by torch.cuda.Event(external=True) so per-kernel timestamps are
+    queryable on replay. fn(i) lets callers rotate weight buffers.
 
     Returns (median_ms_per_kernel, num_samples, se_pct).
     """
@@ -166,21 +115,20 @@ def bench_dynamic(
     probe_ms = max(probe_start.elapsed_time(probe_end), 1e-3)
     iters_per_replay = max(2, min(2000, int(target_replay_ms / probe_ms)))
 
-    # 2) Allocate a chain of iters_per_replay+1 events. The i-th per-kernel
-    #    time is events[i].elapsed_time(events[i+1]). Force handle creation
+    # 2) Allocate a chain of iters_per_replay+1 events. Force handle creation
     #    on the default stream so the underlying hipEvent_t exists before
     #    the stream-capture region.
     events = [_make_event() for _ in range(iters_per_replay + 1)]
     torch.accelerator.synchronize()
 
-    # 3) Capture on a side stream, recording the event chain with EXTERNAL.
+    # 3) Capture on a side stream, recording the event chain with external=True.
     s = torch.cuda.Stream()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g, stream=s):
-        _record_external(events[0], s)
+        events[0].record(s)
         for i in range(iters_per_replay):
             fn(i)
-            _record_external(events[i + 1], s)
+            events[i + 1].record(s)
 
     # Warm one replay to absorb first-launch cost.
     g.replay()
@@ -193,7 +141,7 @@ def bench_dynamic(
         g.replay()
         torch.accelerator.synchronize()
         for i in range(iters_per_replay):
-            samples.append(_elapsed_ms(events[i], events[i + 1]))
+            samples.append(events[i].elapsed_time(events[i + 1]))
 
         if r + 1 >= min_replays:
             med, se_pct = _median_se(sorted(samples))
@@ -236,7 +184,7 @@ def run_bench(shapes, batch_sizes, dtype, target_se_pct):
             ref_out = torch.mm(activation, weight.t())
             out = ops.wvSplitK(weight, activation, cu_count)
             atol = max(1e-3, torch.finfo(dtype).eps * math.sqrt(K))
-            torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+            torch.testing.assert_close(out.cpu(), ref_out.cpu(), atol=atol, rtol=1e-2)
 
             weight_bytes = M * K * dtype.itemsize
             n_bufs = max(1, CACHE_SIZE_BYTES // weight_bytes + 1)
