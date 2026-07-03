@@ -23,17 +23,21 @@ import time
 
 import torch
 
-if tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2]) < (2, 12):
+import vllm._custom_ops as ops
+from vllm.utils.platform_utils import num_compute_units as get_cu_count
+
+
+def _torch_version_tuple():
+    return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+
+
+if _torch_version_tuple() < (2, 12):
     raise RuntimeError(
         f"PyTorch >= 2.12 required for torch.cuda.Event(external=True) on ROCm "
         f"(got {torch.__version__})"
     )
 
-import vllm._custom_ops as ops
-from vllm.utils.platform_utils import num_compute_units as get_cu_count
-
-# Infinity Cache on Strix Halo is 32-64MB depending on SKU.
-# Use a conservative estimate to ensure we bust L3.
+# Infinity Cache on Strix Halo is 32 MB.
 CACHE_SIZE_BYTES = 64 * 1024 * 1024
 
 
