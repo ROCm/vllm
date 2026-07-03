@@ -85,6 +85,69 @@ def _moe_gemm_triton_scope(
     )
 
 
+def _moe_gemm_w4a16_scope(
+    M: int,
+    N: int,
+    K: int,
+    E: int,
+    top_k: int,
+    group_size: int,
+    block_m: int,
+    num_tokens_post_padded: torch.Tensor | None,
+    n_routed: int,
+    topk_ids: torch.Tensor | None = None,
+):
+    """record_function scope around an rdna_moe_gemm (moe_gemm_w4a16) launch,
+    surfacing the dims the roofline tool needs -- including the quantities no
+    tensor shape exposes: the quant group size g (= group_size; the per-group
+    scale bytes and dequant FLOPs scale with K/g, so it must be the real value,
+    not a 128 default), valid_blocks (non-padding blocks the kernel actually
+    runs = num_tokens_post_padded // block_m), n_routed (M*top_k useful rows),
+    and a tokens-per-expert histogram (tok_hist): the full distribution of how
+    many block_m blocks each expert fills, as counts indexed by blocks (index
+    0 = inactive experts, index i = experts filling i blocks) -- the routing
+    skew that drives the block_m padding.
+
+    These are only known at runtime (they depend on the routing), so reading them
+    forces a device->host sync. That sync only perturbs the CPU timeline, not the
+    GPU kernel duration the roofline measures, and we take it solely when
+    profiling scopes are enabled -- production (where the context is a
+    nullcontext) pays nothing.
+    """
+    if not (
+        envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
+    ):
+        return contextlib.nullcontext()
+    valid_blocks = (
+        int(num_tokens_post_padded.item()) // block_m
+        if num_tokens_post_padded is not None
+        else 0
+    )
+    hist_str = ""
+    if topk_ids is not None:
+        ids = topk_ids.flatten()
+        ids = ids[(ids >= 0) & (ids < E)]
+        counts = torch.bincount(ids, minlength=E)  # tokens per expert
+        blocks = (counts + (block_m - 1)) // block_m  # blocks filled (0=inactive)
+        # tok_hist: full distribution, index i = #experts filling i blocks.
+        hist = torch.bincount(blocks).tolist()  # one sync
+        hist_str = " tok_hist=" + ",".join(str(int(h)) for h in hist)
+        # vtok_hist: valid tokens per block (block occupancy), index v =
+        # #blocks holding exactly v real tokens (1..block_m). Each active expert
+        # contributes (nblk-1) full blocks + one last block with last_valid; the
+        # gap to block_m is the padding the kernel computes but discards.
+        active = counts[counts > 0]
+        nblk = (active + (block_m - 1)) // block_m
+        last_valid = active - (nblk - 1) * block_m  # 1..block_m
+        vhist = torch.bincount(last_valid, minlength=block_m + 1)
+        vhist[block_m] = vhist[block_m] + (nblk - 1).sum()  # add the full blocks
+        hist_str += " vtok_hist=" + ",".join(str(int(h)) for h in vhist.tolist())
+    return record_function_or_nullcontext(
+        f"moe_gemm_w4a16 {M}x{N}x{K} E={E} top_k={top_k} g={group_size} "
+        f"block_m={block_m} valid_blocks={valid_blocks} n_routed={n_routed}{hist_str}"
+    )
+
+
 class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     """MoE experts using fused wvSplitK_int4_g kernel.
 
@@ -186,12 +249,13 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     SMALL_GROUP_SIZE_THRESHOLD = 64
 
     def _select_block_size_m(self, num_tokens: int, topk: int, E: int) -> int:
-        """Select block size in the M dimension.
+        """Select block size in the M dimension (the moe_align alignment).
 
         Decode (num_tokens <= MAX_SKINNY_BATCH_SIZE): small block sizes
         compatible with the wvSplitK_int4 HIP kernel.
-        Prefill: TRITON_BLOCK_SIZE_M, or TRITON_BLOCK_SIZE_M_SMALL_GS
-        for small group_size.
+        Prefill: TRITON_BLOCK_SIZE_M (or TRITON_BLOCK_SIZE_M_SMALL_GS for small
+        group_size). The rdna_moe_gemm WMMA gemm1 and the Triton gemm2 share this one
+        alignment.
         """
         if num_tokens > HybridW4A16MoEExperts.MAX_SKINNY_BATCH_SIZE:
             if self._group_size <= HybridW4A16MoEExperts.SMALL_GROUP_SIZE_THRESHOLD:
@@ -201,6 +265,24 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             avg = num_tokens * topk / E
             return 4 if avg >= 4 else 2 if avg >= 2 else 1
         return 1
+
+    def _prefill_uses_rdna_moe_gemm(
+        self,
+        N: int,
+        K: int,
+        topk: int,
+        activation: MoEActivation,
+        in_dtype: torch.dtype,
+    ) -> bool:
+        """Whether the rdna_moe_gemm WMMA kernel can run gemm1 for this shape+dtype
+        (gemm1 K-by-N top_k; gemm2 down proj also checked since both must be
+        supported). Gates the gemm1 rdna_moe_gemm-vs-Triton dispatch in apply()."""
+        from vllm.model_executor.layers.fused_moe import moe_hip_w4a16
+
+        act_dim = self.adjust_N_for_activation(N, activation)
+        return moe_hip_w4a16.prefill_uses_rdna_moe_gemm(
+            K, N, act_dim, topk, self._group_size, in_dtype
+        )
 
     def moe_problem_size(
         self,
@@ -370,6 +452,21 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
 
         P = num_tokens * top_k_num
         use_triton = num_tokens > self.MAX_SKINNY_BATCH_SIZE
+        # rdna_moe_gemm prefill path: gemm1 runs the rdna_moe_gemm WMMA kernel
+        # and gemm2 runs Triton, both at the single block_size_m alignment (32).
+        # gemm1 at 32 is faster than at 16 (the better tile beats the extra
+        # padding), so there is no separate gemm2 alignment. The predicate also
+        # gates on bf16 (the WMMA kernel is bf16-only); other dtypes stay on Triton.
+        use_rdna_moe_gemm = use_triton and self._prefill_uses_rdna_moe_gemm(
+            N, K, top_k_num, activation, hidden_states.dtype
+        )
+        # The rdna_moe_gemm kernel cannot fold routing weights on input; that flag is
+        # only set for top_k==1 layers, which the gemm1 family (top_k>1) never
+        # matches, so the two are mutually exclusive in practice.
+        assert not (use_rdna_moe_gemm and apply_router_weight_on_input), (
+            "VLLM_MOE_HIP rdna_moe_gemm kernel does not support "
+            "apply_router_weight_on_input"
+        )
 
         # ---- Route tokens to experts ----
         scattered = block_size_m == 1
@@ -419,22 +516,17 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 if w1.dtype == torch.int32 and hidden_states.dtype == torch.float16
                 else tl.bfloat16
             )
-            # Compute one config per GEMM: gemm1's contraction is K
-            # (hidden_dim), gemm2's is activation_out_dim.  Pass the
-            # alignment block_size_m so _triton_config only emits
-            # BLOCK_SIZE_M values that divide it.
+            # Per-GEMM Triton config for the fallback (gemm1 contraction is K,
+            # gemm2's is activation_out_dim).
             M_routed = num_tokens * top_k_num
             config_gemm1 = self._triton_config(K, M_routed, block_size_m)
             config_gemm2 = self._triton_config(
                 activation_out_dim, M_routed, block_size_m
             )
 
-            # When a config picks a smaller BLOCK_SIZE_M than the
-            # alignment used, repeat-interleave expert_ids so the kernel
-            # reads a valid expert id for every (smaller) block.  This
-            # is exact: kernel block 4i..4i+3 with BLOCK_M=32 covers
-            # the same 128-row range that one BLOCK_M=128 block did, so
-            # they all process the same expert.
+            # When a Triton config picks a smaller BLOCK_SIZE_M than the
+            # alignment, repeat-interleave expert_ids so the kernel reads a valid
+            # expert id for every (smaller) block.
             def _expert_ids_for(cfg: dict) -> torch.Tensor:
                 kbm = cfg["BLOCK_SIZE_M"]
                 if kbm == block_size_m:
@@ -445,35 +537,68 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                 )
                 return expert_ids.repeat_interleave(block_size_m // kbm)
 
-            # GEMM 1 (Triton prefill path)
-            # The kernel gathers from hidden_states via
-            # sorted_token_ids // top_k, so pass the original top_k.
-            with _moe_gemm_triton_scope(
-                gemm1_in.size(0),
-                N,
-                K,
-                global_num_experts,
-                top_k_num,
-                self._group_size,
-                block_size_m,
-                num_tokens_post_padded,
-            ):
-                invoke_fused_moe_kernel_hybrid_triton(
-                    A=gemm1_in,
-                    B=w1,
-                    C=gemm1_out,
-                    B_scale=self.w1_scale,
-                    topk_weights=topk_weights if apply_router_weight_on_input else None,
-                    sorted_token_ids=sorted_token_ids,
-                    expert_ids=_expert_ids_for(config_gemm1),
-                    num_tokens_post_padded=num_tokens_post_padded,
-                    mul_routed_weight=apply_router_weight_on_input,
-                    top_k=top_k_num,
-                    config=config_gemm1,
-                    compute_type=compute_type,
-                    group_size=self._group_size,
-                    align_block_size_m=block_size_m,
-                )
+            # The rdna_moe_gemm WMMA kernel (VLLM_MOE_HIP, gfx11) replaces only the
+            # Triton GEMM1 (identical output layout); GEMM2 always runs on Triton.
+            # num_blocks == expert_ids.numel() (one id per align block);
+            # n_valid_tokens == A.rows * top_k, matching Triton.
+
+            # GEMM 1 (gathers from hidden_states via sorted_token_ids // top_k).
+            if use_rdna_moe_gemm:
+                with _moe_gemm_w4a16_scope(
+                    num_tokens,
+                    N,
+                    K,
+                    global_num_experts,
+                    top_k_num,
+                    self._group_size,
+                    block_size_m,
+                    num_tokens_post_padded,
+                    num_tokens * top_k_num,
+                    topk_ids,
+                ):
+                    torch.ops.vllm.moe_gemm_w4a16(
+                        gemm1_in,
+                        w1,
+                        self.w1_scale,
+                        sorted_token_ids,
+                        expert_ids,
+                        gemm1_out,
+                        num_tokens * top_k_num,
+                        top_k_num,
+                        block_size_m,
+                        expert_ids.numel(),
+                    )
+            else:
+                # The kernel gathers from hidden_states via
+                # sorted_token_ids // top_k, so pass the original top_k.
+                with _moe_gemm_triton_scope(
+                    gemm1_in.size(0),
+                    N,
+                    K,
+                    global_num_experts,
+                    top_k_num,
+                    self._group_size,
+                    block_size_m,
+                    num_tokens_post_padded,
+                ):
+                    invoke_fused_moe_kernel_hybrid_triton(
+                        A=gemm1_in,
+                        B=w1,
+                        C=gemm1_out,
+                        B_scale=self.w1_scale,
+                        topk_weights=topk_weights
+                        if apply_router_weight_on_input
+                        else None,
+                        sorted_token_ids=sorted_token_ids,
+                        expert_ids=_expert_ids_for(config_gemm1),
+                        num_tokens_post_padded=num_tokens_post_padded,
+                        mul_routed_weight=apply_router_weight_on_input,
+                        top_k=top_k_num,
+                        config=config_gemm1,
+                        compute_type=compute_type,
+                        group_size=self._group_size,
+                        align_block_size_m=block_size_m,
+                    )
 
             # Activation (only the [0:P] real rows; padding rows unread)
             apply_moe_activation(activation, act_out[:P], gemm1_out[:P])
