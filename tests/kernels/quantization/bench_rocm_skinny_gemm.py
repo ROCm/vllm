@@ -7,11 +7,14 @@ Measures throughput and weight bandwidth for representative model shapes
 at batch sizes 1-4. Validates accuracy against torch.mm. Dynamically
 determines iteration count per shape based on IQR convergence.
 
+Per-kernel timestamps are recorded inside a captured CUDA graph via
+torch.cuda.Event(enable_timing=True, external=True).
+
 Usage:
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py --dtype bf16
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py --batch-sizes 1 4
-    python tests/kernels/quantization/bench_rocm_skinny_gemm_bf16.py --shapes 4096x4096
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py --dtype bf16
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py --batch-sizes 1 4
+    python tests/kernels/quantization/bench_rocm_skinny_gemm.py --shapes 4096x4096
 """
 
 import argparse
@@ -23,9 +26,27 @@ import torch
 import vllm._custom_ops as ops
 from vllm.utils.platform_utils import num_compute_units as get_cu_count
 
-# Infinity Cache on Strix Halo is 32-64MB depending on SKU.
-# Use a conservative estimate to ensure we bust L3.
+
+def _torch_version_tuple():
+    return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+
+
+if _torch_version_tuple() < (2, 12):
+    raise RuntimeError(
+        f"PyTorch >= 2.12 required for torch.cuda.Event(external=True) on ROCm "
+        f"(got {torch.__version__})"
+    )
+
+# Infinity Cache on Strix Halo is 32 MB.
 CACHE_SIZE_BYTES = 64 * 1024 * 1024
+
+
+def _make_event():
+    """Create an external timing event and force lazy hipEventCreate."""
+    e = torch.cuda.Event(enable_timing=True, external=True)
+    e.record()
+    return e
+
 
 SHAPES = [
     # Qwen3-4B / Qwen3-VL-4B (identical backbone)
@@ -68,43 +89,73 @@ def _median_se(times_sorted):
     return med, se / med * 100
 
 
-def bench_dynamic(fn, target_se_pct=0.1, min_iters=20, max_iters=5000, max_time_s=2.0):
-    """Benchmark fn with adaptive iteration count.
+def bench_dynamic(
+    fn,
+    target_se_pct=0.2,
+    min_replays=4,
+    max_replays=40,
+    max_time_s=1.0,
+    target_replay_ms=20.0,
+):
+    """Benchmark fn with per-kernel timing inside a captured CUDA graph.
 
-    Collects per-iteration GPU times via CUDA events. Stops when the
-    standard error of the median drops below target_se_pct of the median,
-    or when max_iters / max_time_s is reached.
+    Probes the kernel time, sizes one capture so a replay runs ~target_replay_ms
+    (so the GPU stays continuously busy and DVFS doesn't drop the clock between
+    launches), captures `iters_per_replay` calls of fn(0..iters-1), each
+    bracketed by torch.cuda.Event(external=True) so per-kernel timestamps are
+    queryable on replay. fn(i) lets callers rotate weight buffers.
 
-    fn is called as fn(iteration_index) so callers can rotate buffers
-    to avoid cache hits.
-
-    Returns (median_ms, num_iters, se_pct).
+    Returns (median_ms_per_kernel, num_samples, se_pct).
     """
-    for i in range(10):
-        fn(i)
+    # 1) Probe one kernel to size the graph.
+    fn(0)
+    torch.accelerator.synchronize()
+    probe_start = torch.Event(enable_timing=True)
+    probe_end = torch.Event(enable_timing=True)
+    probe_start.record()
+    fn(0)
+    probe_end.record()
+    torch.accelerator.synchronize()
+    probe_ms = max(probe_start.elapsed_time(probe_end), 1e-3)
+    iters_per_replay = max(2, min(2000, int(target_replay_ms / probe_ms)))
+
+    # 2) Allocate a chain of iters_per_replay+1 events. Force handle creation
+    #    on the default stream so the underlying hipEvent_t exists before
+    #    the stream-capture region.
+    events = [_make_event() for _ in range(iters_per_replay + 1)]
     torch.accelerator.synchronize()
 
-    times = []
-    start_ev = torch.Event(enable_timing=True)
-    end_ev = torch.Event(enable_timing=True)
+    # 3) Capture on a side stream, recording the event chain with external=True.
+    s = torch.cuda.Stream()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        events[0].record(s)
+        for i in range(iters_per_replay):
+            fn(i)
+            events[i + 1].record(s)
+
+    # Warm one replay to absorb first-launch cost.
+    g.replay()
+    torch.accelerator.synchronize()
+
+    # 4) Time replays adaptively. Each replay yields iters_per_replay samples.
+    samples = []
     wall_start = time.monotonic()
-
-    for i in range(max_iters):
-        start_ev.record()
-        fn(i)
-        end_ev.record()
+    for r in range(max_replays):
+        g.replay()
         torch.accelerator.synchronize()
-        times.append(start_ev.elapsed_time(end_ev))
+        for i in range(iters_per_replay):
+            samples.append(events[i].elapsed_time(events[i + 1]))
 
-        if len(times) >= min_iters and len(times) % 10 == 0:
-            med, se_pct = _median_se(sorted(times))
+        if r + 1 >= min_replays:
+            med, se_pct = _median_se(sorted(samples))
             if se_pct < target_se_pct:
-                return med, len(times), se_pct
+                return med, len(samples), se_pct
             if time.monotonic() - wall_start > max_time_s:
-                return med, len(times), se_pct
+                return med, len(samples), se_pct
 
-    med, se_pct = _median_se(sorted(times))
-    return med, len(times), se_pct
+    med, se_pct = _median_se(sorted(samples))
+    return med, len(samples), se_pct
 
 
 def parse_shape(s):
@@ -124,11 +175,8 @@ def run_bench(shapes, batch_sizes, dtype, target_se_pct):
     print(f"Shapes: {len(shapes)}, Batch sizes: {batch_sizes}")
     print()
 
-    print(
-        f"{'N':>2} {'M':>6}x{'K':<6} {'Label':<22} "
-        f"{'time_us':>9} {'BW GiB/s':>9} {'bufs':>5} {'iters':>6} {'SE%':>5}"
-    )
-    print("-" * 80)
+    print(f"{'N':>2} {'M':>6}x{'K':<6} {'Label':<22} {'med_us':>9} {'med_GiB/s':>10}")
+    print("-" * 60)
 
     t0 = time.time()
     for M, K, label in shapes:
@@ -140,7 +188,7 @@ def run_bench(shapes, batch_sizes, dtype, target_se_pct):
             ref_out = torch.mm(activation, weight.t())
             out = ops.wvSplitK(weight, activation, cu_count)
             atol = max(1e-3, torch.finfo(dtype).eps * math.sqrt(K))
-            torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
+            torch.testing.assert_close(out.cpu(), ref_out.cpu(), atol=atol, rtol=1e-2)
 
             weight_bytes = M * K * dtype.itemsize
             n_bufs = max(1, CACHE_SIZE_BYTES // weight_bytes + 1)
@@ -152,17 +200,14 @@ def run_bench(shapes, batch_sizes, dtype, target_se_pct):
             fn = lambda i, ws=weights, a=activation: ops.wvSplitK(
                 ws[i % len(ws)], a, cu_count
             )
-            med_ms, iters, se_pct = bench_dynamic(
+            med_ms, _, _ = bench_dynamic(
                 fn,
                 target_se_pct=target_se_pct,
             )
-            time_us = med_ms * 1000
-            bw_gibs = weight_bytes / (med_ms * 1e-3) / (1 << 30)
+            med_us = med_ms * 1000
+            med_bw = weight_bytes / (med_ms * 1e-3) / (1 << 30)
 
-            print(
-                f"{N:>2} {M:>6}x{K:<6} {label:<22} "
-                f"{time_us:>8.1f} {bw_gibs:>8.1f} {n_bufs:>5} {iters:>6} {se_pct:>5.2f}"
-            )
+            print(f"{N:>2} {M:>6}x{K:<6} {label:<22} {med_us:>8.1f} {med_bw:>9.1f}")
 
     elapsed = time.time() - t0
     print()

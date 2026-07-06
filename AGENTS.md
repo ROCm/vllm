@@ -129,3 +129,6 @@ change and explain why**.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+
+- **Skinny GEMM kernels** (`csrc/rocm/skinny_gemms.cu`, `wvSplitK_hf_*` family):
+  Benchmark with `tests/kernels/quantization/bench_rocm_skinny_gemm.py`
