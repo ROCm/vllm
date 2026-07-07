@@ -1,11 +1,11 @@
 ARG BASE_IMAGE=ubuntu:24.04
-ARG ROCM_WHEEL_INDEX=https://rocm.devreleases.amd.com/whl-multi-arch/
-ARG ROCM_SDK_VERSION=7.14.0a20260623
-ARG TORCH_VERSION=2.11.0+rocm7.14.0a20260623
-ARG TORCHVISION_VERSION=0.26.0+rocm7.14.0a20260623
-ARG TORCHAUDIO_VERSION=2.11.0+rocm7.14.0a20260623
-ARG TRITON_VERSION=3.7.1+git110cd8e2.rocm7.14.0a20260623
-ARG APEX_VERSION=1.11.0+rocm7.14.0a20260623
+ARG ROCM_WHEEL_INDEX=https://rocm.nightlies.amd.com/whl-multi-arch/
+ARG ROCM_SDK_VERSION=7.15.0a20260630
+ARG TORCH_VERSION=2.11.0
+ARG TORCHVISION_VERSION=0.26.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG TRITON_VERSION=3.7.1+git110cd8e2
+ARG APEX_VERSION=1.12.0
 
 
 ARG FA_BRANCH="0e60e394"
@@ -109,17 +109,23 @@ ENV LD_LIBRARY_PATH=${ROCM_PATH}/lib:${SITE_PACKAGES}/_rocm_sdk_core/lib
 ENV CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake:${SITE_PACKAGES}/torch/share/cmake
 ENV PYTHONPATH=${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi
 
-# torch/torchvision/torchaudio must be pinned to mutually-consistent builds
-# (same +rocm... suffix) or the C++ ops break at import (ABI skew). The rocm
-# sdk version is derived from torch's own dependency pin unless overridden,
-# which keeps the set consistent and avoids pip backtracking.
-RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
-    --extra-index-url https://pypi.org/simple \
-    "torch[device-all]==${TORCH_VERSION}" \
-    "torchvision==${TORCHVISION_VERSION}" \
-    "torchaudio==${TORCHAUDIO_VERSION}" \
+# gfx1250 (MI450 A0) runtime env vars
+ENV HSA_OVERRIDE_GFX_VERSION=12.5.0
+ENV HSA_ENABLE_SDMA=0
+ENV HSA_NO_SCRATCH_RECLAIM=1
+
+# ROCm SDK must be installed and initialized before torch so device libs are present.
+RUN pip install --index-url "${ROCM_WHEEL_INDEX}" \
     "rocm[libraries,devel,device-all]==${ROCM_SDK_VERSION}" && \
     rocm-sdk init
+
+# torch/torchvision/torchaudio pinned to same +rocm suffix as ROCM_SDK_VERSION.
+# Base versions (TORCH_VERSION etc.) contain no suffix — it is appended here so
+# callers only need to pass ROCM_SDK_VERSION to keep the full set consistent.
+RUN pip install --index-url "${ROCM_WHEEL_INDEX}" \
+    "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
+    "torchvision[device-all]==${TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}"
  
 # Torch runtime deps that may not be published on the ROCm wheel index;
 # install them from PyPI afterwards.

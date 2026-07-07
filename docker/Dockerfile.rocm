@@ -15,7 +15,7 @@ ARG NIC_BACKEND=all
 # Users can specify a custom version compatible with their host drivers.
 # The default version has been tested with ioinic-dkms=25.11.1.001
 ARG AINIC_VERSION=1.117.3-hydra
-ARG UBUNTU_CODENAME=jammy
+ARG UBUNTU_CODENAME=noble
 
 # Sccache configuration. Release builds use this today; CI can opt in when a
 # shared S3-compatible cache backend is available.
@@ -395,7 +395,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
    curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public \
      -o /etc/apt/keyrings/broadcom-nic.asc; \
    chmod a+r /etc/apt/keyrings/broadcom-nic.asc; \
-   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" \
+   echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public ${UBUNTU_CODENAME} main" \
      > /etc/apt/sources.list.d/broadcom-nic.list; \
    apt-get update && apt-get install -y --no-install-recommends \
      bnxt-rocelib=235.2.86.0 \
@@ -639,6 +639,10 @@ COPY --from=export_vllm /vllm_v1 /usr/local/lib/python${PYTHON_VERSION}/dist-pac
 
 # Hide source under src/ so it won't shadow the installed package in tests.
 RUN mkdir src && mv vllm src/vllm
+
+# tblib is required by conftest.py at collection time; --no-deps prevents
+# uv from pulling CUDA torch as a transitive dependency.
+RUN uv pip install --system --no-deps tblib
 
 # -----------------------
 # Final vLLM image
