@@ -1,4 +1,5 @@
 ARG BASE_IMAGE=ubuntu:24.04
+<<<<<<< kithumma/mi450-dockerfile-nightlies
 ARG ROCM_WHEEL_INDEX=https://rocm.nightlies.amd.com/whl-multi-arch/
 ARG ROCM_SDK_VERSION=7.15.0a20260630
 # Base versions only — +rocm<ROCM_SDK_VERSION> suffix is appended at install time
@@ -7,6 +8,15 @@ ARG TORCHVISION_VERSION=0.26.0
 ARG TORCHAUDIO_VERSION=2.11.0
 ARG TRITON_VERSION=3.7.1+git110cd8e2
 ARG APEX_VERSION=1.12.0
+=======
+ARG ROCM_WHEEL_INDEX=https://rocm.devreleases.amd.com/whl-multi-arch/
+ARG ROCM_SDK_VERSION=7.14.0a20260623
+ARG TORCH_VERSION=2.11.0+rocm7.14.0a20260623
+ARG TORCHVISION_VERSION=0.26.0+rocm7.14.0a20260623
+ARG TORCHAUDIO_VERSION=2.11.0+rocm7.14.0a20260623
+ARG TRITON_VERSION=3.7.1+git110cd8e2.rocm7.14.0a20260623
+ARG APEX_VERSION=1.11.0+rocm7.14.0a20260623
+>>>>>>> 455_wip
 
 
 ARG FA_BRANCH="0e60e394"
@@ -32,6 +42,10 @@ ENV AITER_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ENV MORI_GPU_ARCHS=gfx942;gfx950
 ENV FA_GPU_ARCHS=gfx942;gfx950
 
+<<<<<<< kithumma/mi450-dockerfile-nightlies
+=======
+# TODO: Unset these when support is available for gfx1250
+>>>>>>> 455_wip
 ENV ENABLE_CK=0
 ARG PREBUILD_KERNELS=0
 
@@ -51,7 +65,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python and other dependencies
 RUN apt-get update -y \
+<<<<<<< kithumma/mi450-dockerfile-nightlies
     && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 libopenmpi-dev libpci-dev liblzma-dev pkg-config g++\
+=======
+    && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 libopenmpi-dev libpci-dev liblzma-dev pkg-config g++ \
+>>>>>>> 455_wip
     && for i in 1 2 3; do \
     add-apt-repository -y ppa:deadsnakes/ppa && break || \
     { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
@@ -96,11 +114,18 @@ RUN if [ "$USE_SCCACHE" = "1" ]; then \
 ## Install PyTorch w/ Triton + ROCM_SDK from ROCM wheel index
 ##
 ARG ROCM_WHEEL_INDEX
+<<<<<<< kithumma/mi450-dockerfile-nightlies
 ARG ROCM_SDK_VERSION
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
 ARG TRITON_VERSION
+=======
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
+ARG ROCM_SDK_VERSION
+>>>>>>> 455_wip
 ARG APEX_VERSION
 ENV SITE_PACKAGES=${VIRTUAL_ENV}/lib/python${PYTHON_VERSION}/site-packages
 ENV ROCM_PATH=${SITE_PACKAGES}/_rocm_sdk_devel
@@ -115,6 +140,7 @@ ENV CMAKE_PREFIX_PATH=${ROCM_PATH}/lib/cmake:${SITE_PACKAGES}/torch/share/cmake
 ENV PYTHONPATH=${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi
 
 # torch/torchvision/torchaudio must be pinned to mutually-consistent builds
+<<<<<<< kithumma/mi450-dockerfile-nightlies
 # (same +rocm... suffix) or the C++ ops break at import (ABI skew).
 # ROCM_SDK_VERSION drives the suffix for all packages — pass only base versions
 # (e.g. TORCH_VERSION=2.11.0) and the full tag is assembled here.
@@ -123,6 +149,16 @@ RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
     "torch[device-all]==${TORCH_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" \
     "torchvision==${TORCHVISION_VERSION:-0.26.0}+rocm${ROCM_SDK_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" \
+=======
+# (same +rocm... suffix) or the C++ ops break at import (ABI skew). The rocm
+# sdk version is derived from torch's own dependency pin unless overridden,
+# which keeps the set consistent and avoids pip backtracking.
+RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
+    --extra-index-url https://pypi.org/simple \
+    "torch[device-all]==${TORCH_VERSION}" \
+    "torchvision==${TORCHVISION_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}" \
+>>>>>>> 455_wip
     "rocm[libraries,devel,device-all]==${ROCM_SDK_VERSION}" && \
     rocm-sdk init
  
@@ -176,6 +212,7 @@ RUN mkdir -p /app/install && cp ${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi/di
 
 
 ###
+<<<<<<< kithumma/mi450-dockerfile-nightlies
 ### MORI — install pre-built wheel from PyPI (no GPU needed at build time)
 ###
 FROM base AS build_mori
@@ -183,6 +220,25 @@ ARG MORI_VERSION=1.2.1
 RUN mkdir -p /app/install && \
     pip download "amd-mori==${MORI_VERSION}" --no-deps -d /app/install && \
     ls /app/install/*.whl
+=======
+### MORI Build TODO(Build needs fixing)
+###
+FROM base AS build_mori
+ARG MORI_BRANCH
+ARG MORI_REPO
+ARG MORI_GPU_ARCHS
+RUN mkdir -p /app/install; \
+    if echo "${PYTORCH_ROCM_ARCH}" | grep -q "gfx1250"; then \
+    echo "gfx1250 in PYTORCH_ROCM_ARCH; skipping MORI build"; \
+    else \
+    git clone ${MORI_REPO} \
+    && cd mori \
+    && git checkout ${MORI_BRANCH} \
+    && git submodule update --init --recursive \
+    && python3 setup.py bdist_wheel --dist-dir=dist && ls /app/mori/dist/*.whl \
+    && cp /app/mori/dist/*.whl /app/install; \
+    fi
+>>>>>>> 455_wip
 
 
 ###
@@ -265,8 +321,11 @@ ARG ROCM_SDK_VERSION
 ARG TORCH_VERSION
 ARG TORCHVISION_VERSION
 ARG TORCHAUDIO_VERSION
+<<<<<<< kithumma/mi450-dockerfile-nightlies
 ARG TRITON_VERSION
 ARG APEX_VERSION
+=======
+>>>>>>> 455_wip
 ARG FA_BRANCH
 ARG FA_REPO
 ARG AITER_BRANCH
@@ -276,11 +335,17 @@ ARG MORI_REPO
 RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "ROCM_WHEEL_INDEX: ${ROCM_WHEEL_INDEX}" >> /app/versions.txt \
     && echo "ROCM_SDK_VERSION: ${ROCM_SDK_VERSION}" >> /app/versions.txt \
+<<<<<<< kithumma/mi450-dockerfile-nightlies
     && echo "TORCH_VERSION: ${TORCH_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
     && echo "TORCHVISION_VERSION: ${TORCHVISION_VERSION:-0.26.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
     && echo "TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION:-2.11.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
     && echo "TRITON_VERSION: ${TRITON_VERSION:-3.7.1+git110cd8e2}.rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
     && echo "APEX_VERSION: ${APEX_VERSION:-1.12.0}+rocm${ROCM_SDK_VERSION}" >> /app/versions.txt \
+=======
+    && echo "TORCH_VERSION: ${TORCH_VERSION}" >> /app/versions.txt \
+    && echo "TORCHVISION_VERSION: ${TORCHVISION_VERSION}" >> /app/versions.txt \
+    && echo "TORCHAUDIO_VERSION: ${TORCHAUDIO_VERSION}" >> /app/versions.txt \
+>>>>>>> 455_wip
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
     && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
