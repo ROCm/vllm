@@ -85,13 +85,6 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
-        if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
-            # ATOM-style K/V-outermost layout: K=cache[0], V=cache[1] each
-            # standalone-contiguous (block stride == block content). Required by
-            # the gfx1250 gluon unified-attn-3d kernel (TDM descriptors assume
-            # contiguous per-block K/V). The default (num_blocks, 2, ...)
-            # interleaves K/V per block (2x gap) -> gluon reads garbage.
-            return (2, num_blocks, block_size, num_kv_heads, head_size)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -155,12 +148,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if (
-            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-            and self.attn_type != AttentionType.ENCODER_DECODER
-        ):
-            # ATOM layout (2, num_blocks, block_size, num_kv_heads, head_size).
-            return kv_cache.unbind(0)
         if self.attn_type != AttentionType.ENCODER_DECODER:
             return kv_cache.unbind(1)
 
@@ -181,18 +168,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             ),
         )
         return kv_cache.unbind(0)
-
-    def _shuffle_kv_views(
-        self, key_cache: torch.Tensor, value_cache: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # No-copy reinterpret of standalone-contiguous K/V (num_blocks,
-        # block_size, num_kv_heads, head_size) as the 5D shuffle layout the
-        # gluon kernel reads (the shuffle WRITER laid bytes in this order).
-        nb, bs, nkv, hd = key_cache.shape
-        x = 16 // key_cache.element_size()
-        kc = key_cache.reshape(nb, nkv, hd // x, bs, x)
-        vc = value_cache.reshape(nb, nkv, bs // x, hd, x)
-        return kc, vc
 
     def forward(
         self,
@@ -260,16 +235,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         if is_quantized_kv_cache(self.kv_cache_dtype):
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
-        _shuffled = (
-            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-            and self.attn_type != AttentionType.ENCODER_DECODER
-        )
-        if _shuffled:
-            key_cache, value_cache = self._shuffle_kv_views(key_cache, value_cache)
-        # Shuffle path pre-divides K/V by k/v_scale before the (scale=1.0)
-        # writer, so the stored fp8 == reshape_and_cache_flash's; descale with
-        # the same layer scales as the vanilla path.
-        _kd, _vd = layer._k_scale, layer._v_scale
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
@@ -293,11 +258,10 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             block_table=block_table,
             softcap=self.logits_soft_cap,
             q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
-            k_descale=_kd,
-            v_descale=_vd,
+            k_descale=layer._k_scale,
+            v_descale=layer._v_scale,
             sinks=self.sinks,
             output_scale=output_scale,
-            shuffled_kv_cache=_shuffled,
         )
 
         return output
@@ -315,39 +279,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         key_cache, value_cache = self._split_kv_cache(kv_cache)
-
-        if (
-            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-            and self.attn_type != AttentionType.ENCODER_DECODER
-        ):
-            # Write new tokens directly into the 5D shuffle byte layout the
-            # gluon kernel reads (ATOM-equivalent). Quantizes with scale=1.0.
-            from vllm.v1.attention.backends.rocm_aiter_fa import (
-                reshape_and_cache_shuffle_triton,
-            )
-
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-                # PATCH3: the shuffle writer stores at scale=1.0 and the reader
-                # descales by layer._k/v_scale. For gpt-oss these scales are 1.0,
-                # so NO pre-division is needed (key/1.0 == key) and the earlier
-                # `(key/scale).to(dtype)` was a wasted full-K/V fp32 elementwise
-                # pass every layer (+2.7ms/prefill step). Drop it.
-                # (If a model ships k/v scales != 1.0, the shuffle writer kernel
-                #  must be taught to apply them; gpt-oss does not.)
-            _dummy = torch.empty(1, dtype=torch.float32, device=key.device)
-            reshape_and_cache_shuffle_triton(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                slot_mapping,
-                self.kv_cache_dtype,
-                _dummy,
-                _dummy,
-            )
-            return
 
         # Reshape the input keys and values and store them in the cache.
         ops.reshape_and_cache_flash(
@@ -381,25 +312,12 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         key_cache, value_cache = self._split_kv_cache(kv_cache)
+        flash_layout = True
 
         is_fp8_kv_cache = is_quantized_kv_cache(self.kv_cache_dtype)
         if is_fp8_kv_cache:
             key_cache = key_cache.view(self.fp8_dtype)
             value_cache = value_cache.view(self.fp8_dtype)
-
-        # PATCH4_FUSED_ROPE_SHUFFLE: when the shuffle KV-cache layout is active,
-        # the fused RoPE+cache kernel must write the SAME 5D shuffle byte layout
-        # the gluon unified-attn-3d reader expects (ATOM parity). Reinterpret the
-        # standalone-contiguous K/V as the 5D shuffle views (no copy) and use the
-        # non-flash (shuffle) layout. Stores at layer k/v scales (=1.0 for
-        # gpt-oss) -> byte-identical to the non-fused shuffle writer (PATCH3).
-        _shuffled = (
-            rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-            and self.attn_type != AttentionType.ENCODER_DECODER
-        )
-        if _shuffled:
-            key_cache, value_cache = self._shuffle_kv_views(key_cache, value_cache)
-        flash_layout = not _shuffled
 
         rocm_aiter_ops.triton_rope_and_cache(
             query,
