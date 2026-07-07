@@ -118,7 +118,6 @@ ENV HSA_NO_SCRATCH_RECLAIM=1
 # TORCH_VERSION etc. carry the base version only (no +rocm suffix); the suffix
 # is assembled here from ROCM_SDK_VERSION so callers only need one version pin.
 RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
-    --extra-index-url https://pypi.org/simple \
     "rocm[libraries,devel,device-all]==${ROCM_SDK_VERSION}" \
     "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
     "torchvision[device-all]==${TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
