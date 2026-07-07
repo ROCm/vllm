@@ -111,7 +111,6 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in ("processed_logits", "processed_logprobs")
             and rocm_aiter_ops.is_enabled()
-            and not on_gfx1250()  # TODO (JPVILLAM): Enable this path
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
