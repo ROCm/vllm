@@ -114,18 +114,16 @@ ENV HSA_OVERRIDE_GFX_VERSION=12.5.0
 ENV HSA_ENABLE_SDMA=0
 ENV HSA_NO_SCRATCH_RECLAIM=1
 
-# ROCm SDK must be installed and initialized before torch so device libs are present.
-RUN pip install --index-url "${ROCM_WHEEL_INDEX}" \
-    "rocm[libraries,devel,device-all]==${ROCM_SDK_VERSION}" && \
-    rocm-sdk init
-
-# torch/torchvision/torchaudio pinned to same +rocm suffix as ROCM_SDK_VERSION.
-# Base versions (TORCH_VERSION etc.) contain no suffix — it is appended here so
-# callers only need to pass ROCM_SDK_VERSION to keep the full set consistent.
-RUN pip install --index-url "${ROCM_WHEEL_INDEX}" \
+# torch/torchvision/torchaudio must be pinned to mutually-consistent builds.
+# TORCH_VERSION etc. carry the base version only (no +rocm suffix); the suffix
+# is assembled here from ROCM_SDK_VERSION so callers only need one version pin.
+RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
+    --extra-index-url https://pypi.org/simple \
+    "rocm[libraries,devel,device-all]==${ROCM_SDK_VERSION}" \
     "torch[device-all]==${TORCH_VERSION}+rocm${ROCM_SDK_VERSION}" \
     "torchvision[device-all]==${TORCHVISION_VERSION}+rocm${ROCM_SDK_VERSION}" \
-    "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}"
+    "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_SDK_VERSION}" && \
+    rocm-sdk init
  
 # Torch runtime deps that may not be published on the ROCm wheel index;
 # install them from PyPI afterwards.
