@@ -11,13 +11,14 @@ if (DEFINED ENV{TRITON_KERNELS_SRC_DIR})
           SOURCE_DIR $ENV{TRITON_KERNELS_SRC_DIR}
   )
 
+#TODO (JPVILLAM): Test new release of triton kernels and put back to normal
 else()
-  set(TRITON_GIT "https://github.com/triton-lang/triton.git")
+  set(TRITON_GIT "https://github.com/jpvillam-amd/triton.git")
   message (STATUS "[triton_kernels] Fetch from ${TRITON_GIT}:${DEFAULT_TRITON_KERNELS_TAG}")
   FetchContent_Declare(
           triton_kernels
           # TODO (varun) : Fetch just the triton_kernels directory from Triton
-          GIT_REPOSITORY https://github.com/triton-lang/triton.git
+          GIT_REPOSITORY https://github.com/jpvillam-amd/triton.git
           GIT_TAG ${DEFAULT_TRITON_KERNELS_TAG}
           GIT_PROGRESS TRUE
           SOURCE_SUBDIR python/triton_kernels/triton_kernels
