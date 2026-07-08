@@ -178,18 +178,19 @@ PYBIND11_MODULE(_vision_flexmlrt_cpu, m) {
            "Args:\n"
            "    model_cache: Path to VAIP model cache (vaiml_par_0 directory)\n"
            "    device_name: XRT device name (default: 'stx')")
-      .def("forward", &VisionFlexMLRTModel::forward, py::arg("input"),
-           py::arg("input_name") = "/blocks/Gather_output_0",
-           py::arg("output_name") = "/merger/merger/mlp/mlp.2/Gemm_output_0",
-           py::arg("output_shape") = std::vector<int64_t>{1073, 3584},
-           "Run vision encoding on the NPU (generic; IO names/shape supplied by "
-           "the caller from the cache's own spec).\n\n"
-           "Args:\n"
-           "    input: float32 array matching the cache's input tensor\n"
-           "    input_name: NPU-partition input tensor name\n"
-           "    output_name: NPU-partition output tensor name\n"
-           "    output_shape: output tensor shape\n\n"
-           "Returns:\n"
-           "    float32 array of output_shape\n\n"
-           "Defaults reproduce the Qwen2.5-VL contract for backward compat.");
+      .def(
+          "forward", &VisionFlexMLRTModel::forward, py::arg("input"),
+          py::arg("input_name") = "/blocks/Gather_output_0",
+          py::arg("output_name") = "/merger/merger/mlp/mlp.2/Gemm_output_0",
+          py::arg("output_shape") = std::vector<int64_t>{1073, 3584},
+          "Run vision encoding on the NPU (generic; IO names/shape supplied by "
+          "the caller from the cache's own spec).\n\n"
+          "Args:\n"
+          "    input: float32 array matching the cache's input tensor\n"
+          "    input_name: NPU-partition input tensor name\n"
+          "    output_name: NPU-partition output tensor name\n"
+          "    output_shape: output tensor shape\n\n"
+          "Returns:\n"
+          "    float32 array of output_shape\n\n"
+          "Defaults reproduce the Qwen2.5-VL contract for backward compat.");
 }

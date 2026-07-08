@@ -40,9 +40,9 @@ from transformers import BatchFeature, PretrainedConfig
 from typing_extensions import TypeVar
 
 from vllm.config import VllmConfig
-from vllm.logger import init_logger
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs import ModalityData, MultiModalDataDict
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.resampler import (
     BaseResampler,

@@ -33,10 +33,12 @@ _PREPROCESSOR_REGISTRY: dict = {}
 
 def register_preprocessor(*model_types: str):
     """Register a preprocessor builder (a class or a factory fn) for model_type(s)."""
+
     def deco(builder):
         for mt in model_types:
             _PREPROCESSOR_REGISTRY[mt.lower()] = builder
         return builder
+
     return deco
 
 
@@ -315,22 +317,17 @@ class MiniCPMV_Preprocessor:
 
     def __init__(self, model_cache_dir: str):
         spec = read_cache_io_spec(model_cache_dir)
-        self.batch = int(spec["in_shape"][0])          # B the cache expects
-        self.tile = int(spec["in_shape"][2])           # 448
-        self.tokens = int(spec["out_shape"][-2])       # 64
-        self.hidden = int(spec["out_shape"][-1])       # 3584
+        self.batch = int(spec["in_shape"][0])  # B the cache expects
+        self.tile = int(spec["in_shape"][2])  # 448
+        self.tokens = int(spec["out_shape"][-2])  # 64
+        self.hidden = int(spec["out_shape"][-1])  # 3584
 
     def _to_square_tile(self, t: torch.Tensor, h: int, w: int) -> torch.Tensor:
         # invert reshape_by_patch: [C,14,14*N] -> [C,14h,14w]  (N = h*w)
         P = self.PATCH
         C = t.shape[0]
         N = int(h) * int(w)
-        x = (
-            t.float()
-            .reshape(C, P, N, P)
-            .permute(0, 1, 3, 2)
-            .reshape(C * P * P, N)
-        )
+        x = t.float().reshape(C, P, N, P).permute(0, 1, 3, 2).reshape(C * P * P, N)
         img = torch.nn.functional.fold(
             x.unsqueeze(0),
             output_size=(int(h) * P, int(w) * P),
@@ -339,8 +336,10 @@ class MiniCPMV_Preprocessor:
         )[0]  # [C, 14h, 14w]
         if img.shape[-2:] != (self.tile, self.tile):
             img = torch.nn.functional.interpolate(
-                img.unsqueeze(0), size=(self.tile, self.tile),
-                mode="bicubic", align_corners=False,
+                img.unsqueeze(0),
+                size=(self.tile, self.tile),
+                mode="bicubic",
+                align_corners=False,
             )[0]
         return img
 
@@ -355,7 +354,7 @@ class MiniCPMV_Preprocessor:
         n, B = arr.shape[0], self.batch
         groups = []
         for i in range(0, n, B):
-            g = arr[i:i + B]
+            g = arr[i : i + B]
             if g.shape[0] < B:  # pad last group up to B
                 pad = np.zeros((B - g.shape[0], *g.shape[1:]), dtype=g.dtype)
                 g = np.concatenate([g, pad], axis=0)
@@ -418,6 +417,6 @@ def get_preprocessor(model_cache_dir: str, model_type: str | None = None):
         raise ValueError(
             f"No NPU vision preprocessor registered for model_type={model_type!r}. "
             f"Registered: {sorted(_PREPROCESSOR_REGISTRY)}. "
-            f"Add one with @register_preprocessor(\"{model_type}\")."
+            f'Add one with @register_preprocessor("{model_type}").'
         )
     return builder(model_cache_dir)

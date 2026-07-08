@@ -16,7 +16,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import torch
 
 import vllm.envs as envs
 
@@ -58,8 +57,12 @@ class FlexMLRTVisionBackend(NPUVisionBackend):
     Implements CPU preprocessing operations that VitisAI EP normally handles.
     """
 
-    def __init__(self, model_cache_path: str, device_name: str = "stx",
-                 model_type: str | None = None):
+    def __init__(
+        self,
+        model_cache_path: str,
+        device_name: str = "stx",
+        model_type: str | None = None,
+    ):
         """Initialize the generic FlexMLRT vision backend.
 
         Args:
@@ -76,8 +79,11 @@ class FlexMLRTVisionBackend(NPUVisionBackend):
         self.io = read_cache_io_spec(model_cache_path)
         logger.info(
             "[FlexMLRT Backend] model_type=%s  in=%s%s  out=%s%s",
-            model_type, self.io["input_name"], self.io["in_shape"],
-            self.io["output_name"], self.io["out_shape"],
+            model_type,
+            self.io["input_name"],
+            self.io["in_shape"],
+            self.io["output_name"],
+            self.io["out_shape"],
         )
 
     def forward(self, pixel_values, geometry=None) -> np.ndarray:
@@ -96,17 +102,22 @@ class FlexMLRTVisionBackend(NPUVisionBackend):
         outputs = []
         for g in groups:
             with npu_timing("NPU inference", logger):
-                outputs.append(self.model.forward(
-                    g, self.io["input_name"], self.io["output_name"],
-                    self.io["out_shape"],
-                ))
+                outputs.append(
+                    self.model.forward(
+                        g,
+                        self.io["input_name"],
+                        self.io["output_name"],
+                        self.io["out_shape"],
+                    )
+                )
         final_output = self.preprocessor.postprocess(outputs, geometry)
 
         if VLLM_NPU_TIMING and total_start is not None:
             total_ms = (time.monotonic() - total_start) * 1000
             logger.info(
                 "[NPU Timing] Total vision pipeline: %.2fms (%d NPU call(s))",
-                total_ms, len(groups),
+                total_ms,
+                len(groups),
             )
         return final_output
 
@@ -130,8 +141,12 @@ class AsyncFlexMLRTVisionBackend:
     - Speedup: 1.43x for 2 requests, approaches 1.5x+ for longer sequences
     """
 
-    def __init__(self, model_cache_path: str, device_name: str = "stx",
-                 model_type: str | None = None):
+    def __init__(
+        self,
+        model_cache_path: str,
+        device_name: str = "stx",
+        model_type: str | None = None,
+    ):
         """Initialize async wrapper with underlying synchronous backend.
 
         Args:
