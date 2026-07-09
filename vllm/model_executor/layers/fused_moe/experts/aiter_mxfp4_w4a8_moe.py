@@ -20,7 +20,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 
 __all__ = [
     "AiterW4A8ExpertsMonolithic",
+    "AiterW4A16ExpertsMonolithic",
     "aiter_triton_kernel_w4a8_moe_forward",
+    "aiter_triton_kernel_w4a16_moe_forward",
 ]
 
 
@@ -309,6 +311,220 @@ class AiterW4A8ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         assert self.moe_config.intermediate_size_per_partition_unpadded is not None
         assert self.moe_config.hidden_dim_unpadded is not None
         return aiter_triton_kernel_w4a8_moe_forward(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            gating_output=router_logits,
+            topk=self.topk,
+            renormalize=self.renormalize,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            quant_config=self.quant_config,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            unpadded_N_w1=self.moe_config.intermediate_size_per_partition_unpadded * 2,
+            unpadded_K_w1=self.moe_config.hidden_dim_unpadded,
+            unpadded_N_w2=self.moe_config.hidden_dim_unpadded,
+            unpadded_K_w2=self.moe_config.intermediate_size_per_partition_unpadded,
+        )
+
+
+def _aiter_raw(t):
+    return t.storage.data if hasattr(t, "storage") else t
+
+
+def aiter_triton_kernel_w4a16_moe_forward(
+    hidden_states: torch.Tensor,
+    w1,
+    w2,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    activation: MoEActivation = MoEActivation.SWIGLUOAI,
+    quant_config: FusedMoEQuantConfig | None = None,
+    apply_router_weight_on_input: bool = False,
+    global_num_experts: int = -1,
+    expert_map: torch.Tensor | None = None,
+    unpadded_N_w1=None,
+    unpadded_K_w1=None,
+    unpadded_N_w2=None,
+    unpadded_K_w2=None,
+):
+    assert quant_config is not None and rocm_aiter_ops.is_enabled()
+    from vllm.platforms.rocm import on_gfx1250
+
+    try:
+        from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
+        from aiter.ops.triton.moe.moe_routing.routing import routing as _routing_mod
+    except ImportError:
+        from aiter.ops.triton.moe_routing import routing as _routing_mod
+
+        from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
+
+    if on_gfx1250():
+        _routing_mod.is_tdm_avail = lambda: False
+    aiter_routing = _routing_mod.routing
+
+    routing_data, gather_idx, scatter_idx = aiter_routing(
+        gating_output, topk, sm_first=not renormalize
+    )
+
+    if on_gfx1250():
+        gather_src = gather_idx.to(torch.long) // topk
+        hidden_states = hidden_states[gather_src]
+        gather_idx = None
+
+    assert quant_config.w1_precision is not None
+    assert quant_config.w2_precision is not None
+
+    w1_data = _aiter_raw(w1)
+    w2_data = _aiter_raw(w2)
+    w1_wscale = _aiter_raw(quant_config.w1_precision.weight_scale)
+    w2_wscale = _aiter_raw(quant_config.w2_precision.weight_scale)
+
+    gammas = routing_data.gate_scal if routing_data else None
+
+    swiglu_alpha = (
+        quant_config.gemm1_alpha
+        if quant_config.gemm1_alpha is not None
+        else 1.0
+    )
+    swiglu_limit = (
+        quant_config.gemm1_clamp_limit
+        if quant_config.gemm1_clamp_limit is not None
+        else 7.0
+    )
+
+    intermediate = moe_gemm_a16w4(
+        hidden_states,
+        w1_data,
+        None,
+        w1_wscale,
+        None,
+        None,
+        quant_config.w1_bias,
+        routing_data,
+        gather_indx=gather_idx,
+        gammas=gammas if apply_router_weight_on_input else None,
+        swizzle_mx_scale=None,
+        apply_swiglu=True,
+        alpha=swiglu_alpha,
+        limit=swiglu_limit,
+        swiglu_add_residual=True,
+        unpadded_N=unpadded_N_w1,
+        unpadded_K=unpadded_K_w1,
+    )
+
+    out = moe_gemm_a16w4(
+        intermediate,
+        w2_data,
+        None,
+        w2_wscale,
+        None,
+        None,
+        quant_config.w2_bias,
+        routing_data,
+        scatter_indx=scatter_idx,
+        gammas=None if apply_router_weight_on_input else gammas,
+        swizzle_mx_scale=None,
+        unpadded_N=unpadded_N_w2,
+        unpadded_K=unpadded_K_w2,
+    )
+
+    return out
+
+
+class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(moe_config, quant_config)
+        self.topk = moe_config.experts_per_token
+        self.renormalize = moe_config.routing_method in (
+            RoutingMethodType.Renormalize,
+            RoutingMethodType.RenormalizeNaive,
+        )
+
+    @staticmethod
+    def activation_format() -> mk.FusedMoEActivationFormat:
+        return mk.FusedMoEActivationFormat.Standard
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        if not rocm_aiter_ops.is_enabled():
+            return False
+        from vllm.platforms.rocm import on_gfx950, on_gfx1250
+
+        return on_gfx950() or on_gfx1250()
+
+    @staticmethod
+    def _supports_no_act_and_mul() -> bool:
+        return False
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return (weight_key, activation_key) == (kMxfp4Static, None)
+
+    @staticmethod
+    def _supports_activation(activation: MoEActivation) -> bool:
+        return activation == MoEActivation.SWIGLUOAI
+
+    @staticmethod
+    def _supports_parallel_config(
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> bool:
+        return (
+            not moe_parallel_config.use_all2all_kernels
+            and not moe_parallel_config.enable_eplb
+            and moe_parallel_config.dp_size <= 1
+        )
+
+    @staticmethod
+    def _supports_routing_method(
+        routing_method: RoutingMethodType,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return routing_method in [
+            RoutingMethodType.Renormalize,
+            RoutingMethodType.RenormalizeNaive,
+        ]
+
+    @staticmethod
+    def _supports_router_logits_dtype(
+        router_logits_dtype: torch.dtype | None,
+        routing_method: RoutingMethodType,
+    ) -> bool:
+        return True
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return True
+
+    def apply(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+    ) -> torch.Tensor:
+        assert self.moe_config.intermediate_size_per_partition_unpadded is not None
+        assert self.moe_config.hidden_dim_unpadded is not None
+        return aiter_triton_kernel_w4a16_moe_forward(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,

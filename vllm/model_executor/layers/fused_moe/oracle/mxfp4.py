@@ -219,11 +219,14 @@ def backend_to_kernel_cls(
         return [BatchedMarlinExperts]
 
     elif backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
+        from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a8_moe import (
+            AiterW4A16ExpertsMonolithic,
+        )
         from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
             AiterExperts,
         )
 
-        return [AiterExperts]
+        return [AiterExperts, AiterW4A16ExpertsMonolithic]
 
     elif backend == Mxfp4MoeBackend.AITER_MXFP4_FP8:
         from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a8_moe import (
