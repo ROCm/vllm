@@ -179,6 +179,11 @@ __device__ bool processHistogramStep(
   }
 
   auto distributeToBins = [&](float logit, int /* idx */ = 0) {
+    // Map non-finite logits (+inf/-inf/NaN, e.g. fp8 overflow / cudagraph
+    // stale workspace) to -FLT_MAX so they sort to the bottom and are never
+    // selected. Their raw float bit patterns otherwise land in the top
+    // histogram bins and get picked, returning garbage KV positions.
+    logit = isfinite(logit) ? logit : -FLT_MAX;
     if (isPartialMatch<patternShift>(logit, logitPattern)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
       atomicAdd(&smemFinal.histo.data[binIdx], 1);
@@ -254,6 +259,9 @@ __device__ bool processHistogramStep(
   thresholdBinIdx = smemThresholdBinIdx[0];
 
   auto processBins = [&](float logit, int idx) {
+    // Map non-finite logits to -FLT_MAX (see distributeToBins) so they are
+    // never selected into the top-k output.
+    logit = isfinite(logit) ? logit : -FLT_MAX;
     if (isPartialMatch<patternShift>(logit, logitPattern)) {
       uint32_t binIdx = extractBinIdx<step>(logit);
       // Only write elements with binIdx < thresholdBinIdx when:
