@@ -241,27 +241,14 @@ def apply_sdpa(
     """
     q, k, v = (einops.rearrange(x, "b s h d -> b h s d") for x in [q, k, v])
 
-    # Prepare profiling scope for attention metadata
-    batch_size = q.shape[0]
-    num_heads = q.shape[1]
-    seq_len = q.shape[2]
-    head_size = q.shape[3]
-    num_kv_heads = k.shape[1]
-
-    with create_attention_profiler_scope(
-        backend_name="TORCH_SDPA",
-        batch_size=batch_size,
-        max_query_len=seq_len,
-        max_seq_len=seq_len,
-        num_heads=num_heads,
-        head_size=head_size,
-        num_kv_heads=num_kv_heads,
-        dtype=q.dtype,
-        is_causal=False,  # ViT attention is non-causal
-    ):
-        output = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
-        )
+    # NOTE: No profiler scope here. The SDPA op is already wrapped by the
+    # encoder-layer scope in MMEncoderAttention._forward_sdpa (matching how
+    # FLASH_ATTN / TRITON_ATTN are counted). Adding a second scope with the
+    # same name here caused torch profiler key_averages() to count every
+    # SDPA op twice (inflating "Calls" and "CUDA total" ~2x).
+    output = F.scaled_dot_product_attention(
+        q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa
+    )
     output = einops.rearrange(output, "b h s d -> b s h d ")
     return output
 
