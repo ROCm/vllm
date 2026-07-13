@@ -501,26 +501,11 @@ def aiter_triton_kernel_w4a16_moe_forward(
         else 7.0
     )
 
-    if activation == MoEActivation.SILU:
-        return _aiter_w4a16_silu_via_a8w4(
-            hidden_states,
-            w1_data,
-            w2_data,
-            w1_wscale,
-            w2_wscale,
-            quant_config.w1_bias,
-            quant_config.w2_bias,
-            routing_data,
-            gather_idx,
-            scatter_idx,
-            gammas,
-            apply_router_weight_on_input,
-            swiglu_limit,
-            unpadded_N_w1,
-            unpadded_K_w1,
-            unpadded_N_w2,
-            unpadded_K_w2,
-        )
+    # SILU: silu(gate) * up — same kernel, just no "+1" residual in swiglu.
+    # _aiter_w4a16_silu_via_a8w4 routes through moe_gemm_a8w4 which on gfx1250
+    # transposes the weight tensor for the gluon kernel layout, but our weights
+    # are prepared for moe_gemm_a16w4 — the double-transpose produces garbage.
+    swiglu_add_residual = activation != MoEActivation.SILU
 
     intermediate = moe_gemm_a16w4(
         hidden_states,
@@ -537,7 +522,7 @@ def aiter_triton_kernel_w4a16_moe_forward(
         apply_swiglu=True,
         alpha=swiglu_alpha,
         limit=swiglu_limit,
-        swiglu_add_residual=True,
+        swiglu_add_residual=swiglu_add_residual,
         unpadded_N=unpadded_N_w1,
         unpadded_K=unpadded_K_w1,
     )
