@@ -59,11 +59,16 @@ jobs:
           # Resolve torch on the ROCm nightly index, then derive matching
           # torchvision/torchaudio pins. The nightly publishes multiple
           # base versions side-by-side (2.9, 2.10, 2.11, 2.12); pin to
-          # 2.11 to match requirements/build/rocm.txt. The three packages
-          # must share the same +rocm build-date suffix or they
+          # 2.12 to match requirements/build/rocm.txt. torch and
+          # torchvision must share the same +rocm build-date suffix or they
           # ABI-mismatch at import ("operator torchvision::nms does not
-          # exist").
-          echo 'torch==2.11.*' > constraints.in
+          # exist"). torchaudio is a special case: it was retired from the
+          # PyTorch release process at 2.11 (I/O moved to TorchCodec, see
+          # pytorch/audio#3902), so there is no 2.12 build and never will
+          # be. It is pinned at its terminal 2.11.0 release (same +rocm
+          # suffix), which declares no torch version dependency and floats
+          # across torch minors.
+          echo 'torch==2.12.*' > constraints.in
           # --no-deps: torch pins exact rocm[libraries]/triton versions
           # in its metadata (e.g. rocm[libraries]==7.14.0a..., triton==
           # 3.7.0+rocm...); we don't want those locked in constraints.
@@ -76,8 +81,10 @@ jobs:
           # +rocm local version uv just picked for torch.
           TORCH_LOCAL=$(grep '^torch==' constraints.txt | sed 's/.*+//')
           TORCH_PATCH_SUFFIX=$(grep '^torch==' constraints.txt | sed 's/^torch==[0-9]\+\.[0-9]\+\.\([0-9]\+[^+]*\)+.*/\1/')
-          echo "torchvision==0.26.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
-          echo "torchaudio==2.11.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
+          echo "torchvision==0.27.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
+          # torchaudio is frozen at 2.11.0 (no 2.12+ exists); hardcode the
+          # base version and only inherit the +rocm build-date suffix.
+          echo "torchaudio==2.11.0+${TORCH_LOCAL}" >> constraints.txt
           cat constraints.txt
           # unsafe-best-match: uv defaults to stopping at the first
           # index that has a given package name, so PyPI (extra-index)
