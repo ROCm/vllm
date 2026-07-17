@@ -124,12 +124,6 @@ def aiter_triton_kernel_w4a8_moe_forward(
         gating_output, topk, sm_first=not renormalize
     )
 
-    # gfx1250: aiter's in-kernel gather is numerically broken
-    if on_gfx1250():
-        gather_src = gather_idx.to(torch.long) // topk
-        hidden_states = hidden_states[gather_src]
-        gather_idx = None
-
     return triton_kernel_fused_mxfp4_w4a8_experts(
         None,
         hidden_states,
@@ -194,9 +188,15 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
 
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         should_use_cdna4_mx_scale_swizzle,
+        should_use_gfx1250_mx_scale_swizzle,
     )
 
-    _swizzle_mx_scale = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
+    if should_use_gfx1250_mx_scale_swizzle():
+        _swizzle_mx_scale = "GFX1250_SCALE"
+    elif should_use_cdna4_mx_scale_swizzle():
+        _swizzle_mx_scale = "CDNA4_SCALE"
+    else:
+        _swizzle_mx_scale = None
 
     assert quant_config.w1_precision is not None, (
         "w1_precision in quant config can't be None"
@@ -407,9 +407,18 @@ def _aiter_w4a16_silu_via_a8w4(
 
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         should_use_cdna4_mx_scale_swizzle,
+        should_use_gfx1250_mx_scale_swizzle,
     )
 
-    swz = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
+    # gfx1250: _swizzle_mxfp4 GFX1250-swizzles the weight scales at load time
+    # (shuffle_scale_moe, preshuffle_factor=32), so the kernel must be told
+    # SWIZZLE_MX_SCALE="GFX1250_SCALE" to unswizzle them.
+    if should_use_gfx1250_mx_scale_swizzle():
+        swz = "GFX1250_SCALE"
+    elif should_use_cdna4_mx_scale_swizzle():
+        swz = "CDNA4_SCALE"
+    else:
+        swz = None
     quant_dtype = torch.float8_e4m3fn
 
     g1_gammas = gammas if apply_router_weight_on_input else None
@@ -523,11 +532,6 @@ def aiter_triton_kernel_w4a16_moe_forward(
         routing_data, gather_idx, scatter_idx = aiter_routing(
             gating_output, topk, sm_first=not renormalize
         )
-
-    if on_gfx1250():
-        gather_src = gather_idx.to(torch.long) // topk
-        hidden_states = hidden_states[gather_src]
-        gather_idx = None
 
     assert quant_config.w1_precision is not None
     assert quant_config.w2_precision is not None
