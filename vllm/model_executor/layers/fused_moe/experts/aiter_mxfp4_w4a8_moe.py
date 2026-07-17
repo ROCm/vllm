@@ -63,17 +63,6 @@ def aiter_triton_kernel_w4a8_moe_forward(
         gating_output, topk, sm_first=not renormalize
     )
 
-    # gfx1250: aiter's in-kernel gather is numerically broken (validated on the
-    # FFM sim: do_gather=True -> maxrel ~2.4), so gather rows into expert-sorted
-    # order in torch and pass gather_indx=None. Per aiter's moe_gemm_torch,
-    # sorted row i reads source token gather_idx[i] // n_expts_act, so this
-    # reproduces the in-kernel gather exactly (manual gather -> maxrel ~5e-3).
-    # gfx950 keeps the (working) in-kernel gather.
-    if on_gfx1250():
-        gather_src = gather_idx.to(torch.long) // topk
-        hidden_states = hidden_states[gather_src]
-        gather_idx = None
-
     return triton_kernel_fused_mxfp4_w4a8_experts(
         None,
         hidden_states,
@@ -135,12 +124,14 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
 
     from aiter.ops.triton.moe_op_gemm_a8w4 import moe_gemm_a8w4
     from aiter.ops.triton.quant_moe import downcast_to_static_fp8
+    from vllm.platforms.rocm import on_gfx1250
 
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         should_use_cdna4_mx_scale_swizzle,
     )
 
     _swizzle_mx_scale = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
+    _swizzle_mx_scale = "GFX1250_SCALE" if on_gfx1250() else _swizzle_mx_scale
 
     assert quant_config.w1_precision is not None, (
         "w1_precision in quant config can't be None"
@@ -152,12 +143,6 @@ def triton_kernel_fused_mxfp4_w4a8_experts(
     hidden_states = downcast_to_static_fp8(
         hidden_states, quant_config.w1_precision.flex_ctx.lhs_data.scale
     )
-
-    # gfx1250 stores the MXFP4 weight scale unswizzled (StridedLayout, see
-    # mxfp4_utils._swizzle_mxfp4) because the gfx1250 moe_gemm_a8w4 reads a
-    # CDNA4-swizzled scale as garbage (validated on the FFM sim: CDNA4_SCALE ->
-    # maxrel ~7e4, plain/None -> ~6e-3); pass swizzle_mx_scale=None there.
-    # gfx950 uses the CDNA4 swizzle layout.
 
     intermediate_cache1 = moe_gemm_a8w4(
         hidden_states,
@@ -363,8 +348,13 @@ def _aiter_w4a16_silu_via_a8w4(
     from vllm.model_executor.layers.quantization.utils.mxfp4_utils import (
         should_use_cdna4_mx_scale_swizzle,
     )
+    from vllm.platforms.rocm import on_gfx1250
 
+    # gfx1250: _swizzle_mxfp4 GFX1250-swizzles the weight scales at load time
+    # (shuffle_scale_moe, preshuffle_factor=32), so the kernel must be told
+    # SWIZZLE_MX_SCALE="GFX1250_SCALE" to unswizzle them.
     swz = "CDNA4_SCALE" if should_use_cdna4_mx_scale_swizzle() else None
+    swz = "GFX1250_SCALE" if on_gfx1250() else swz
     quant_dtype = torch.float8_e4m3fn
 
     g1_gammas = gammas if apply_router_weight_on_input else None
@@ -474,12 +464,7 @@ def aiter_triton_kernel_w4a16_moe_forward(
         routing_data, gather_idx, scatter_idx = aiter_routing(
             gating_output, topk, sm_first=not renormalize
         )
-
-    if on_gfx1250():
-        gather_src = gather_idx.to(torch.long) // topk
-        hidden_states = hidden_states[gather_src]
-        gather_idx = None
-
+ 
     assert quant_config.w1_precision is not None
     assert quant_config.w2_precision is not None
 

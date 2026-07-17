@@ -13,9 +13,52 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+from vllm.platforms.rocm import on_gfx1250 
+from vllm._aiter_ops import rocm_aiter_ops
 
 _SAMPLING_EPS = 1e-5
 
+
+def mixed_sample_eligible(sm, predict_bonus_token):
+    if not rocm_aiter_ops.is_enabled():
+        return False
+    if not on_gfx1250():
+        return False
+    if predict_bonus_token:
+        return False
+    if not sm.all_random or sm.temperature is None:
+        return False
+    if sm.top_k is not None or sm.top_p is not None:
+        return False
+    if sm.max_num_logprobs is not None or sm.logprob_token_ids:
+        return False
+    if not sm.no_penalties or sm.allowed_token_ids_mask is not None or sm.bad_words_token_ids:
+        return False
+    lp = sm.logitsprocs
+    if lp.argmax_invariant or lp.non_argmax_invariant:
+        return False
+    h = sm.thinking_budget_state_holder
+    if h is not None and h.has_tracked_requests():
+        return False
+    return True
+
+def _aiter_raw_fused_sample(logits, sm):
+    """Sample token ids directly from RAW (bf16) logits via fused aiter kernel. int32 [n,1]."""
+    from aiter import mixed_sample_outer_exponential
+    import torch as _t
+    n, vocab = logits.shape
+    out = _t.empty(n, dtype=_t.int32, device=logits.device)
+    gens = sm.generators
+    if not gens:
+        exp = _t.empty((1, vocab), dtype=_t.float32,
+                       device=logits.device).exponential_().expand(n, vocab)
+    else:
+        exp = _t.empty((n, vocab), dtype=_t.float32, device=logits.device)
+        exp.exponential_()
+        for i, g in gens.items():
+            exp[i].exponential_(generator=g)
+    mixed_sample_outer_exponential(out, logits, exp, sm.temperature, eps=1e-10)
+    return out.unsqueeze(-1)
 
 class Sampler(nn.Module):
     """
@@ -76,6 +119,11 @@ class Sampler(nn.Module):
         predict_bonus_token: bool = False,
         logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
+        if mixed_sample_eligible(sampling_metadata, predict_bonus_token):
+            return SamplerOutput(
+                sampled_token_ids=_aiter_raw_fused_sample(logits, sampling_metadata),
+                logprobs_tensors=None,
+            )
         logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.

@@ -18,6 +18,27 @@ if HAS_TRITON:
 
 logger = init_logger(__name__)
 
+def _aiter_temp_gumbel_sample(logits, generators, use_fp64_gumbel):
+    """Fused temperature Gumbel-max sampling via aiter (ATOM parity).
+    logits are ALREADY temperature-scaled by the parent Sampler, so temps=1.
+    Returns int64 token ids (num_tokens,)."""
+    from aiter import mixed_sample_outer_exponential
+    n, vocab = logits.shape
+    out = torch.empty(n, dtype=torch.int32, device=logits.device)
+    nseed = len(generators)
+    if nseed == 0:
+        # common case: ATOM-style shared (1,vocab) exponential noise (cheap RNG)
+        exp = torch.empty((1, vocab), dtype=torch.float32,
+                           device=logits.device).exponential_().expand(n, vocab)
+    else:
+        exp = torch.empty((n, vocab), dtype=torch.float32, device=logits.device)
+        if nseed != n:
+            exp.exponential_()
+        for i, g in generators.items():
+            exp[i].exponential_(generator=g)
+    temps = torch.ones(n, dtype=torch.float32, device=logits.device)
+    mixed_sample_outer_exponential(out, logits, exp, temps, eps=1e-10)
+    return out.to(torch.int64)
 
 def flashinfer_sampler_supported() -> bool:
     """Decide whether FlashInfer's top-p/top-k sampler can be used.
@@ -111,7 +132,6 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in ("processed_logits", "processed_logprobs")
             and rocm_aiter_ops.is_enabled()
-            and not on_gfx1250()  # TODO (JPVILLAM): Enable this path
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False
@@ -229,6 +249,12 @@ class TopKTopPSampler(nn.Module):
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Optimized ROCm/aiter path (same structure as forward_cuda)."""
+
+        if (on_gfx1250() and k is None and p is None and not self.use_fp64_gumbel
+            and self.logprobs_mode not in ("processed_logits", "processed_logprobs")):
+            return _aiter_temp_gumbel_sample(logits, generators, self.use_fp64_gumbel), None
+        if on_gfx1250():
+            return self.forward_native(logits, generators, k, p)
         if (k is None and p is None) or generators:
             if generators:
                 logger.warning_once(

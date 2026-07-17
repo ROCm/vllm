@@ -68,6 +68,49 @@ from .utils import (
     maybe_prefix,
 )
 
+from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.platforms.rocm import on_gfx1250
+
+
+
+def _gpt_oss_rmsnorm_pad_add(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    pad_to: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.normalization.fused_add_rmsnorm_pad import (
+        fused_add_rmsnorm_pad,
+    )
+
+    out, res_out = fused_add_rmsnorm_pad(x, weight, eps, residual, pad_to)
+
+    return out, res_out
+
+
+def _gpt_oss_rmsnorm_pad_add_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    pad_to: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    n_out = ((N + pad_to - 1) // pad_to) * pad_to if pad_to > 0 else N
+    return (
+        torch.empty((M, n_out), dtype=x.dtype, device=x.device),
+        torch.empty_like(residual),
+    )
+
+
+direct_register_custom_op(
+    op_name="gpt_oss_rmsnorm_pad_add",
+    op_func=_gpt_oss_rmsnorm_pad_add,
+    mutates_args=[],
+    fake_impl=_gpt_oss_rmsnorm_pad_add_fake,
+)
+
 
 class OAIAttention(nn.Module):
     # Override to switch RoPE convention. gpt-oss uses NeoX (chunk halves);
@@ -283,7 +326,19 @@ class TransformerBlock(torch.nn.Module):
         hidden_states = self.attn(hidden_states, positions)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        _pad_to = self.mlp.experts.moe_config.hidden_dim
+        if residual is not None and _pad_to > hidden_states.shape[-1] and on_gfx1250():
+            hidden_states, residual = torch.ops.vllm.gpt_oss_rmsnorm_pad_add(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.variance_epsilon,
+                _pad_to,
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         output = self.mlp(hidden_states)
         return output, residual
 

@@ -41,6 +41,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
     from triton_kernels.tensor_details.layout import StridedLayout
+    from vllm.platforms.rocm import on_gfx1250
 
     value_layout_opts: dict[str, Any] = {}
     scale_layout_opts: dict[str, Any] = {}
@@ -102,6 +103,14 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8):
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
+
+    if current_platform.is_rocm() and on_gfx1250():
+        from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+        assert scale.dim() == 3 and scale.shape[-1] % 32 == 0 and scale.shape[-2] % 8 == 0, (
+            f"GFX1250 scale swizzle needs (E,K_SCALE%8,N%32); got {tuple(scale.shape)}"
+        )
+        scale = shuffle_scale_moe(scale, arch="gfx1250", preshuffle_factor=32, scale_kwidth=8)
+
     quant_tensor = convert_layout(
         wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
     )

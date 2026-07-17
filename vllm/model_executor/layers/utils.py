@@ -99,6 +99,7 @@ def default_unquantized_gemm(
 
 
 def use_aiter_triton_gemm(n, m, k, dtype):
+    from vllm.platforms.rocm import on_gfx1250
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()
         # MI300's - fp8nuz=True
@@ -106,6 +107,9 @@ def use_aiter_triton_gemm(n, m, k, dtype):
         or dtype not in [torch.float16, torch.bfloat16]
     ):
         return False
+
+    if on_gfx1250():
+        return True
 
     # use hipblaslt for the larger GEMMs
     if n > 2048 and m > 512:
@@ -164,13 +168,7 @@ def rocm_unquantized_gemm_impl(
     if use_skinny_reduce_counting:
         return ops.wvSplitKrc(x, weight, cu_count, bias)
 
-    # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
-    # K % 256 == 0 (it walks K with fixed-size descriptors and won't pad a
-    # partial last tile). Some whitelisted shapes have K=2880 (e.g. gpt-oss-120b
-    # hidden), so skip aiter there and fall back to the torch GEMM path below.
-    if use_aiter_triton_gemm(n, m, k, x.dtype) and not (
-        on_gfx1250() and k % 256 != 0
-    ):
+    if use_aiter_triton_gemm(n, m, k, x.dtype):
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
         return gemm_a16w16(x, weight, bias)
