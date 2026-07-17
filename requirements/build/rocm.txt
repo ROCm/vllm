@@ -3,8 +3,10 @@
 
 
 --extra-index-url https://download.pytorch.org/whl/rocm7.1
-torch==2.11.0
-torchvision==0.26.0
+torch==2.12.0
+torchvision==0.27.0
+# torchaudio was retired at 2.11 (no 2.12+; see pytorch/audio#3902). Its
+# terminal release declares no torch pin and floats across torch minors.
 torchaudio==2.11.0
 triton
 cmake>=3.26.1,<4
