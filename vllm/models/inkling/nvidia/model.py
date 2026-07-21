@@ -354,6 +354,40 @@ class InklingModel(nn.Module):
         return self.norm(hidden_states)
 
 
+def _remap_quark_exclude_to_vllm(quant_config: QuantizationConfig | None) -> None:
+    """Translate a Quark ``exclude`` list from checkpoint-native to served names.
+
+    The MXFP4 (Quark) release checkpoint lists its unquantized ``exclude`` layers
+    under the checkpoint's native module names (``model.llm.…attn.wq_du``,
+    ``…mlp.w13_dn``), but vLLM matches ``exclude`` against the *served* module
+    prefixes (``model.…attn.qkvr``, ``…mlp.gate_up_proj``). Without translation
+    every bf16 layer -- attention, the dense MLPs, the layer-2 bf16 experts --
+    fails ``should_ignore_layer`` and is wrongly handed a quant method, so load
+    blows up on the missing scales. Rewrite the list in place with the same
+    renames as ``hf_to_vllm_mapper``; the fused ``attn.qkvr`` name is expanded
+    back to its ``wq_du``/``wk_dv``/``wv_dv``/``wr_du`` shards via the model's
+    ``packed_modules_mapping`` (passed by reference into the quant config), so
+    the attention projections only need the ``model.llm.`` -> ``model.`` strip.
+    A no-op on checkpoints whose ``exclude`` is already in served names.
+    """
+    raw = getattr(quant_config, "quant_config", None)
+    if not isinstance(raw, dict):
+        return
+    exclude = raw.get("exclude")
+    if not exclude:
+        return
+
+    def _translate(name: str) -> str:
+        name = name.replace("model.llm.", "model.")
+        name = name.replace(".mlp.w13_dn", ".mlp.gate_up_proj")
+        name = name.replace(".mlp.w2_md", ".mlp.down_proj")
+        return name
+
+    remapped = [_translate(n) for n in exclude]
+    if remapped != exclude:
+        raw["exclude"] = remapped
+
+
 class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
     """Shared text-backbone causal-LM scaffolding for both entry classes."""
 
@@ -400,6 +434,7 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
         prefix: str,
     ) -> None:
         quant_config = vllm_config.quant_config
+        _remap_quark_exclude_to_vllm(quant_config)
         self.config = text_config
         # Read by the MRV2 runner to publish per-request short-conv metadata.
         # Short convolution is intrinsic to Inkling, so this is always set.
@@ -635,8 +670,23 @@ def _load_inkling_weights(
     tp_rank = get_tensor_model_parallel_rank()
     local_ids = set(config.local_layer_ids)
 
+    def _base_weights() -> Iterable[tuple[str, torch.Tensor]]:
+        # The MXFP4 release bundles a separate rank-16 MXFP4 quant-recovery
+        # LoRA (the ``language_model.*`` tree in ``adapter_model.safetensors``,
+        # every tensor carrying ``.lora_A``/``.lora_B``). It is referenced from
+        # the safetensors index, so the default loader streams it in alongside
+        # the base shards. We serve the base MXFP4 checkpoint only for now, so
+        # drop the adapter tensors before mapping -- otherwise they rename onto
+        # the fused ``model.layers.*`` params and crash the expert loader.
+        # TODO(milestone-2b): fold the LoRA into the bf16/expert weights for the
+        # last few points of accuracy the recovery adapter buys back.
+        for name, weight in weights:
+            if name.startswith("language_model.") or ".lora_A." in name or ".lora_B." in name:
+                continue
+            yield name, weight
+
     def _iter_loadable_weights() -> Iterable[tuple[str, torch.Tensor]]:
-        for name, weight in module.hf_to_vllm_mapper.apply(weights):
+        for name, weight in module.hf_to_vllm_mapper.apply(_base_weights()):
             shard_id = getattr(weight, "shard_id", None)
             # Replicate K/V conv-free GQA heads when tp_size > num_kv_heads.
             if (

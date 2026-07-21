@@ -570,6 +570,15 @@ class InklingMoE(nn.Module):
             return [f"experts.routed_experts.{projection}_input_scale"]
 
         param = getattr(experts, key)
+
+        # MXFP4 (Quark) stores the per-block weight scales flattened over the
+        # (expert, output-channel) axes -- e.g. w13 as [n_experts * 2F, K/32] --
+        # whereas the FusedMoE scale param is 3D [n_experts, 2F, K/32]. Restore
+        # the expert axis so the per-expert copy below (shared with the packed
+        # weight tensors) lands each expert's scales in the right slot.
+        if key.endswith("weight_scale") and weight.ndim == 2:
+            weight = weight.reshape(self.n_routed_experts, -1, weight.shape[-1])
+
         slots = self._local_expert_slots()
         gids = sorted(slots)
         lids = [slots[g] for g in gids]
@@ -587,17 +596,29 @@ class InklingMoE(nn.Module):
             # that slab (a single bounded synchronous H2D; pre-uploading whole
             # untrimmed tensors pins the mmap pages of the entire checkpoint
             # and OOMs the host) and de-interleave on device.
-            half = param.shape[1] // 2
+            #
+            # The MXFP4/AITER MoE method rounds intermediate_size_per_partition
+            # up to the CK 256-alignment, so each gate/up half of the param may
+            # carry trailing zero padding (e.g. 384 real -> 512). Slice the
+            # slab from the *checkpoint* extent and write into the leading rows
+            # of each (possibly padded) half; create_weights zero-inits the rest.
+            real_2h = weight.shape[1] // experts.moe_config.moe_parallel_config.tp_size
+            half_real = real_2h // 2
+            half_pad = param.shape[1] // 2
             for gid, lid in slots.items():
-                slab = weight[gid].narrow(0, tp_rank * 2 * half, 2 * half)
+                slab = weight[gid].narrow(0, tp_rank * real_2h, real_2h)
                 slab = slab.to(param.device)
-                param.data[lid, :half].copy_(slab[0::2])
-                param.data[lid, half:].copy_(slab[1::2])
+                param.data[lid, :half_real].copy_(slab[0::2])
+                param.data[lid, half_pad : half_pad + half_real].copy_(slab[1::2])
         else:
-            # w2: shard the packed intermediate (last) dim.
-            shard = param.shape[2]
+            # w2: shard the packed intermediate (last) dim. As with w13 the
+            # param's intermediate extent may be rounded up for CK alignment, so
+            # take this rank's real slice from the checkpoint and write it into
+            # the leading columns of the (possibly padded) param.
+            real = weight.shape[-1] // experts.moe_config.moe_parallel_config.tp_size
             for gid, lid in slots.items():
-                param.data[lid].copy_(weight[gid].narrow(1, tp_rank * shard, shard))
+                src = weight[gid].narrow(1, tp_rank * real, real)
+                param.data[lid, :, :real].copy_(src.to(param.device))
         return [f"experts.routed_experts.{key}"]
 
     def finalize_load(self) -> list[str]:
