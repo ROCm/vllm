@@ -150,5 +150,10 @@ _PROVIDER = _WarmupProvider()
 
 
 def register_fa4_warmup(config: InklingFA4WarmupConfig) -> None:
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        return  # no CuTe-DSL kernels to warm up on ROCm
+
     _PROVIDER.configs.add(config)
     register_cutedsl_warmup_provider(_PROVIDER)

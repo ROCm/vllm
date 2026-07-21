@@ -67,6 +67,8 @@ def inkling_fa4_num_splits(
     max_kv_len: int,
 ) -> int:
     """Return the split-KV cap for Inkling relative attention."""
+    if current_platform.is_rocm():
+        return 1  # ROCm reference kernel does not split KV
     capability = current_platform.get_device_capability()
     if capability is not None and capability.major == 9:
         return 1
@@ -126,6 +128,26 @@ def inkling_fa4_rel_attention(
     Hopper uses standard FA4's score-mod gather. Blackwell uses tml-fa4's
     sheared relative-bias layout.
     """
+    if current_platform.is_rocm():
+        from ...rocm.rel_attention import inkling_rocm_rel_attention
+
+        return inkling_rocm_rel_attention(
+            q,
+            key_cache,
+            value_cache,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            rel_extent=rel_extent,
+            rel_logits=rel_logits,
+            num_splits=num_splits,
+            out=out,
+        )
+
     # cute uses (None, None) to mean "no window".
     cute_window = (None, None) if window_size == (-1, -1) else window_size
 
