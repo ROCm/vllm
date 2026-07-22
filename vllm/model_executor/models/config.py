@@ -826,7 +826,29 @@ class LongcatFlashNgramForCausalLMConfig(VerifyAndUpdateConfig):
             compilation_config.cudagraph_mode = CUDAGraphMode.FULL
 
 
+class InklingForConditionalGenerationConfig(VerifyAndUpdateConfig):
+    @staticmethod
+    def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+        # Inkling's short convolution keeps a paged sliding-window "conv state"
+        # cache, written per request by the fused sconv kernel. It is not
+        # prefix-cache-safe: on a prefix-cache hit vLLM's SlidingWindowManager
+        # leaves the reused conv blocks unpopulated (null blocks) for the new
+        # request, and the sconv kernel's block-table read of those pre-forward
+        # tap positions dereferences a null block -> hard GPU memory access
+        # fault under load. (Chunked prefill is fine -- each chunk writes its
+        # own conv state.) Disable prefix caching here, at config time, before
+        # the KV-cache manager is built.
+        cache_config = vllm_config.cache_config
+        if cache_config.enable_prefix_caching:
+            cache_config.enable_prefix_caching = False
+            logger.info(
+                "Inkling: disabling prefix caching (the short-conv state cache "
+                "is not prefix-cache-safe)."
+            )
+
+
 MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
+    "InklingForConditionalGeneration": InklingForConditionalGenerationConfig,
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": ColQwen3_5Config,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
