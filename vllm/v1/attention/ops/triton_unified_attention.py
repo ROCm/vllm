@@ -794,6 +794,39 @@ def _get_tile_size(
     return tile_size
 
 
+def _cap_num_stages_for_navi_lds(
+    num_stages: int | None,
+    block_m: int,
+    tile_size: int,
+    head_size: int,
+    element_size: int,
+    lds_budget: int = 65536,
+) -> int | None:
+    """Cap the K/V software-pipeline depth so the kernel's LDS usage stays
+    within ``lds_budget`` (gfx11 has a 64KB shared-memory limit).
+
+    Each pipeline stage holds independent K and V tiles, so LDS grows with
+    ``num_stages``.  Wide heads (e.g. gemma-4 full-attention layers,
+    head_size=512) overflow the budget at num_stages=3 and Triton aborts
+    engine startup with ``OutOfResources: shared memory``.
+    Conservative per-launch layout used for the estimate:
+        Q tile : block_m * head_size * element_size
+        S accum: block_m * tile_size * 4        (fp32)
+        K + V  : num_stages * 2 * tile_size * head_size * element_size
+
+    Returns ``num_stages`` unchanged when it already fits (or is ``None``).
+    """
+    if num_stages is None:
+        return None
+    q_bytes = block_m * head_size * element_size
+    s_bytes = block_m * tile_size * 4
+    kv_bytes_per_stage = 2 * tile_size * head_size * element_size
+    remaining = lds_budget - q_bytes - s_bytes
+    if kv_bytes_per_stage > 0 and remaining > 0:
+        return min(num_stages, max(1, remaining // kv_bytes_per_stage))
+    return 1
+
+
 def unified_attention(
     q,
     k,
@@ -1037,22 +1070,11 @@ def unified_attention(
             # alongside Q+S in 64KB LDS.  Without this, gfx1151 prefill at
             # head_size>=80 + num_stages=3 overflows for head_size=128
             # (Qwen3.5-style) since each pipeline stage holds independent
-            # K and V tiles.  Layout per stage:
-            #   Q tile (1×): BLOCK_M × head_size × element_size
-            #   S accum:     BLOCK_M × tile_size × 4  (fp32)
-            #   K + V (N×):  2 × tile_size × head_size × element_size
-            if current_platform.is_navi() and num_stages is not None:
-                lds_budget = 65536
-                tile_size_prefill = TILE_SIZE_PREFILL
-                q_bytes = BLOCK_M * head_size * element_size
-                s_bytes = BLOCK_M * tile_size_prefill * 4
-                kv_bytes_per_stage = 2 * tile_size_prefill * head_size * element_size
-                remaining = lds_budget - q_bytes - s_bytes
-                if kv_bytes_per_stage > 0 and remaining > 0:
-                    max_stages = max(1, remaining // kv_bytes_per_stage)
-                    num_stages = min(num_stages, max_stages)
-                else:
-                    num_stages = 1
+            # K and V tiles.
+            if current_platform.is_navi():
+                num_stages = _cap_num_stages_for_navi_lds(
+                    num_stages, BLOCK_M, TILE_SIZE_PREFILL, head_size, element_size
+                )
 
             # Long context uses more warps
             num_warps = 4
@@ -1122,6 +1144,12 @@ def unified_attention(
             num_warps = 4
             num_stages = 4 if is_large_mha else (1 if num_kv_heads == 1 else 3)
             waves_per_eu = 6 if is_large_mha else (2 if is_small_head_or_mqa else 4)
+
+        # Navi memory: Apply the same cap the 2D path uses
+        if current_platform.is_navi():
+            num_stages = _cap_num_stages_for_navi_lds(
+                num_stages, BLOCK_M, TILE_SIZE_DECODE, head_size, q.element_size()
+            )
 
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
 
