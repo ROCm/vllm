@@ -353,22 +353,38 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         if self._group_size <= HybridW4A16MoEExperts.SMALL_GROUP_SIZE_THRESHOLD:
             # gemm2 BM=64 < alignment=128; apply()'s _expert_ids_for
             # repeat_interleaves expert_ids to compensate.
+            #
+            # Swept on Strix Halo (gfx1151), Qwen3-30B-A3B AWQ shapes
+            # (group_size=32, E=128, alignment=128): 108 tile configs x 10
+            # token counts (M_routed 48..24448) x 2 routing distributions.
+            # Picks below are the best geomean of (us / per-M best), so they
+            # hold across the batch range and not just at one M.  num_stages=4
+            # is the common win; the "pipeliner regresses" note in the
+            # large-group branch below was measured at its much narrower
+            # BLOCK_SIZE_N=16/64, num_warps=2 tiles.
             if K < 1024:
+                # gemm2 (K=768).  Chose BLOCK_SIZE_N=128, num_warps=8,
+                # num_stages=4: geomean 1.043 vs 1.109 for the previous
+                # BLOCK_SIZE_N=64, num_warps=4, num_stages=1.  BLOCK_SIZE_M=128
+                # ties on geomean but has a worse tail, so it stays at 64.
                 return dict(
                     BLOCK_SIZE_M=64,
-                    BLOCK_SIZE_N=64,
+                    BLOCK_SIZE_N=128,
                     BLOCK_SIZE_K=BLOCK_SIZE_K,
                     GROUP_SIZE_M=1,
-                    num_warps=4,
-                    num_stages=1,
+                    num_warps=8,
+                    num_stages=4,
                 )
+            # gemm1 (K=2048).  Only num_stages moves: 4 scores 1.040 vs 1.284
+            # for 1.  BLOCK_SIZE_N=128 is up to 1.77x off the best at small
+            # batches and num_warps=4 ties 8, so both stay put.
             return dict(
                 BLOCK_SIZE_M=128,
                 BLOCK_SIZE_N=64,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 GROUP_SIZE_M=1,
                 num_warps=8,
-                num_stages=1,
+                num_stages=4,
             )
 
         # Per-shape sweep on Strix Halo (gfx1151) at BLOCK_M=32 (the
