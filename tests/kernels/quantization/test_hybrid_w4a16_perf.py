@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pathlib
 import time
 from typing import Any
@@ -281,6 +282,25 @@ SHAPES: list[dict[str, Any]] = [
         "group_size": 128,
         "comment": "Gemma3-4B down_proj",
     },
+    # cyankiwi/gemma-4-31B-it-AWQ-4bit (g=32, asymmetric)
+    {
+        "in_features": 5376,
+        "out_features": 43008,
+        "group_size": 32,
+        "comment": "Gemma4-31B gate_up_proj",
+    },
+    {
+        "in_features": 21504,
+        "out_features": 5376,
+        "group_size": 32,
+        "comment": "Gemma4-31B down_proj",
+    },
+    {
+        "in_features": 5376,
+        "out_features": 16384,
+        "group_size": 32,
+        "comment": "Gemma4-31B qkv_proj",
+    },
 ]
 
 # Provider naming convention: "<base>[-zp][-bf16]". Suffix -zp selects the
@@ -477,12 +497,23 @@ def _cool_down(config: Any, test_id: str) -> None:
     _log_temp(config, f"{test_id}:post-sleep")
 
 
-# Rotate the weight operand through this many MiB so a revisited buffer has been
-# evicted from the gfx1151 32 MiB MALL -- yields cold-weight measurements (as in
-# a real forward pass, where each weight is read once and evicted before its next
-# use) instead of the hot-MALL numbers a single-buffer cudagraph would report.
-_ROTATE_TARGET_BYTES = 48 << 20
-_ROTATE_MAX = 32
+# Rotate the weight operand through this many MiB so a revisited buffer reads
+# cold -- as in a real forward pass, where each weight is read once and evicted
+# before its next use -- instead of the hot numbers a single-buffer cudagraph
+# would report.
+#
+# Merely exceeding the 32 MiB MALL is NOT enough. Measured against in-model
+# per-call times from a torch-profiler trace (gemma-4-31B AWQ, bs=1, gfx1151),
+# a 48 MiB target left the bench 19% optimistic on 44-58 MB weights, because it
+# clamps n_buf to 2 and an ~88 MB working set still gets help the model never
+# sees (the model streams weights scattered over ~19.5 GB). Raising the target
+# so the rotation spans several hundred MB closes it to <=1.1% on every shape
+# checked; 512 MiB and 2048 MiB measure identically, so this is past the knee.
+# Small weights converge at ~84 MB, which _ROTATE_MAX=32 already delivers.
+#
+# Override via VLLM_BENCH_ROTATE_MIB / VLLM_BENCH_ROTATE_MAX to re-validate.
+_ROTATE_TARGET_BYTES = int(os.environ.get("VLLM_BENCH_ROTATE_MIB", "512")) << 20
+_ROTATE_MAX = int(os.environ.get("VLLM_BENCH_ROTATE_MAX", "32"))
 
 
 def _clone_strided(t: torch.Tensor | None) -> torch.Tensor | None:
