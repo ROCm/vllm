@@ -1516,6 +1516,13 @@ def pytest_addoption(parser):
         default=False,
         help="record performance measurements instead of asserting",
     )
+    parser.addoption(
+        "--eager",
+        action="store_true",
+        default=False,
+        help="benchmark kernels with triton do_bench (eager launches) instead "
+        "of do_bench_cudagraph; enables per-dispatch profiling (e.g. ATT)",
+    )
 
 
 def pytest_report_header(config):

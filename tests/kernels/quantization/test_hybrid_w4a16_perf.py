@@ -534,6 +534,7 @@ def measure_tflops(
     N: int,
     group_size: int,
     provider: str,
+    eager: bool = False,
 ) -> tuple[str, float]:
     """Run the kernel and return (kernel label, median TFLOP/s).
 
@@ -597,7 +598,15 @@ def measure_tflops(
             w["packed_scale_zp"],
         )
 
-    ms = triton.testing.do_bench_cudagraph(run, quantiles=[0.5])
+    # --eager uses do_bench (individual kernel launches) instead of
+    # do_bench_cudagraph (graph replay).  Eager launches are visible to
+    # per-dispatch profilers such as rocprofv3 ATT, which cannot intercept
+    # graph-captured kernels; the cudagraph path stays the default for the
+    # lowest-overhead steady-state timing used by the golden baselines.
+    if eager:
+        ms = triton.testing.do_bench(run, quantiles=[0.5])
+    else:
+        ms = triton.testing.do_bench_cudagraph(run, quantiles=[0.5])
     tflops = (2 * M * N * K) * 1e-12 / (ms * 1e-3)
 
     # Detect which kernel path was taken by observing record_function labels.
@@ -806,6 +815,7 @@ def test_hybrid_w4a16_perf(
     preload_golden(request.config, gcn_arch)
 
     measure_mode = request.config.getoption("--write-golden", default=False)
+    eager_mode = request.config.getoption("--eager", default=False)
     intermittent_mode = (
         request.config.getoption("--intermittent", default=False) or measure_mode
     )
@@ -882,7 +892,9 @@ def test_hybrid_w4a16_perf(
 
         # ---- measure ----
         _log_temp(request.config, f"{test_id}:bs{bs}:pre")
-        kernel, tflops = measure_tflops(bs, weights, K, N, group_size, provider)
+        kernel, tflops = measure_tflops(
+            bs, weights, K, N, group_size, provider, eager=eager_mode
+        )
         post_temp = _log_temp(request.config, f"{test_id}:bs{bs}:post")
         temp_tag = f" [{post_temp:.0f}\u00b0C]"
 
