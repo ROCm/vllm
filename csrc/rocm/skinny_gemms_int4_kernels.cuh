@@ -193,6 +193,19 @@ __device__ __forceinline__ void load_act_into_lds_silu_mul(
 }
 #endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 
+// Zero-points are consumed in the packed 4-bit form the checkpoint ships:
+// [N/8, num_groups] uint32, row n's nibble at word[n/8] bits 4*(n%8).  This is
+// the layout unpack_quantized_values_into_int32(packed_dim=0) inverts.
+// Expanding them to the activation dtype at load time cost 4x the DRAM traffic
+// (14.5 MB vs 3.6 MB per call on gemma-4-31B gate_up) for values that only ever
+// span 0..15, and this kernel is memory-bound, so those bytes are time.
+__device__ __forceinline__ uint32_t zp_nibble(const uint32_t* zp_packed,
+                                              const int row, const int group,
+                                              const int num_groups) {
+  const uint32_t w = zp_packed[(row >> 3) * num_groups + group];
+  return (w >> (4 * (row & 7))) & 0xFu;
+}
+
 // W4A16 skinny GEMM kernel: packed int4 weights, fp16/bf16 activations
 // Targets the "sml" case where activations fit in LDS.
 // A_CHUNK: number of K-elements processed per thread per step.
@@ -211,7 +224,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
-    const scalar_t* scale, const scalar_t* zero_points,
+    const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, scalar_t* s, const int B_row_stride_bytes) {
   // B_row_stride_bytes is the per-row byte stride of the packed weights;
@@ -350,7 +363,8 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
               if constexpr (!std::is_same_v<scalar_t, __hip_bfloat16>) {
                 if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
                   uint32_t group_idx = k_ / GROUP_SIZE;
-                  scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
+                  scalar_t zp = __float2s<scalar_t>((float)zp_nibble(
+                      zero_points, m + y, group_idx, num_groups));
   #pragma unroll
                   for (uint32_t b = 0; b < A_CHUNK; b++) {
                     cvtB.h[b] = cvtB.h[b] - zp;
@@ -373,8 +387,8 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                   }
                   if constexpr (HAS_ZERO_POINTS) {
                     uint32_t group_idx_zp = k_ / GROUP_SIZE;
-                    float zp_f = __s2float(
-                        zero_points[(m + y) * num_groups + group_idx_zp]);
+                    float zp_f = (float)zp_nibble(zero_points, m + y,
+                                                  group_idx_zp, num_groups);
                     partial -= (128.0f + zp_f) * act_sum;
                   } else {
                     partial -= 136.0f * act_sum;
@@ -484,7 +498,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_int4_hf_sml_(const int K, const int M, const int Bx, const int By,
                           const uint8_t* B_packed,
                           const scalar_t* __restrict__ A, const scalar_t* scale,
-                          const scalar_t* zero_points,
+                          const uint32_t* zero_points,
                           const scalar_t* __restrict__ BIAS, scalar_t* C,
                           const int _WvPrGrp, const int CuCount,
                           const int B_row_stride_bytes) {
@@ -502,7 +516,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __global__ void wvSplitK_int4_hf_sml_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
-    const scalar_t* scale, const scalar_t* zero_points,
+    const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, const int B_row_stride_bytes) {
   UNREACHABLE_CODE
@@ -520,7 +534,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __device__ __forceinline__ void wvSplitK_int4_compute_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
-    const scalar_t* scale, const scalar_t* zero_points,
+    const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, scalar_t* s, const int B_row_stride_bytes) {
   constexpr int max_lds_len = LDS_SIZE / 2;
@@ -667,7 +681,8 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
               if constexpr (!std::is_same_v<scalar_t, __hip_bfloat16>) {
                 if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
                   uint32_t group_idx = k_ / GROUP_SIZE;
-                  scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
+                  scalar_t zp = __float2s<scalar_t>((float)zp_nibble(
+                      zero_points, m + y, group_idx, num_groups));
   #pragma unroll
                   for (uint32_t b = 0; b < A_CHUNK; b++) {
                     cvtB.h[b] = cvtB.h[b] - zp;
@@ -690,8 +705,8 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
                   }
                   if constexpr (HAS_ZERO_POINTS) {
                     uint32_t group_idx_zp = k_ / GROUP_SIZE;
-                    float zp_f = __s2float(
-                        zero_points[(m + y) * num_groups + group_idx_zp]);
+                    float zp_f = (float)zp_nibble(zero_points, m + y,
+                                                  group_idx_zp, num_groups);
                     partial -= (128.0f + zp_f) * act_sum;
                   } else {
                     partial -= 136.0f * act_sum;
@@ -814,7 +829,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_int4_hf_(const int K, const int M, const int Bx, const int By,
                       const uint8_t* B_packed, const scalar_t* __restrict__ A,
-                      const scalar_t* scale, const scalar_t* zero_points,
+                      const scalar_t* scale, const uint32_t* zero_points,
                       const scalar_t* __restrict__ BIAS, scalar_t* C,
                       const int _WvPrGrp, const int CuCount,
                       const int B_row_stride_bytes) {
@@ -832,7 +847,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __global__ void wvSplitK_int4_hf_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
-    const scalar_t* scale, const scalar_t* zero_points,
+    const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, const int B_row_stride_bytes) {
   UNREACHABLE_CODE
@@ -996,7 +1011,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
-    const scalar_t* zero_points_base, scalar_t* C_base,
+    const uint32_t* zero_points_base, scalar_t* C_base,
     const int* __restrict__ expert_ids,
     const int* __restrict__ sorted_token_ids, const int top_k,
     const long expert_stride_w, const long expert_stride_s,
@@ -1036,7 +1051,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
 
     const uint8_t* B = B_packed_base + expert_id * expert_stride_w;
     const scalar_t* S = scale_base + expert_id * expert_stride_s;
-    const scalar_t* ZP = HAS_ZERO_POINTS
+    // expert_stride_zp is zero_points.stride(0), already in int32 elements of
+    // the packed [E, N/8, K/g] tensor, so it is the right unit here.
+    const uint32_t* ZP = HAS_ZERO_POINTS
                              ? (zero_points_base + expert_id * expert_stride_zp)
                              : nullptr;
 
@@ -1082,7 +1099,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                           const uint8_t* B_packed_base,
                           const scalar_t* __restrict__ A_base,
                           const scalar_t* scale_base,
-                          const scalar_t* zero_points_base, scalar_t* C_base,
+                          const uint32_t* zero_points_base, scalar_t* C_base,
                           const int* __restrict__ expert_ids,
                           const int* __restrict__ sorted_token_ids,
                           const int top_k, const long expert_stride_w,
@@ -1105,7 +1122,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
     const uint8_t* B = B_packed_base + expert_id * expert_stride_w;
     const scalar_t* S = scale_base + expert_id * expert_stride_s;
-    const scalar_t* ZP = HAS_ZERO_POINTS
+    // expert_stride_zp is zero_points.stride(0), already in int32 elements of
+    // the packed [E, N/8, K/g] tensor, so it is the right unit here.
+    const uint32_t* ZP = HAS_ZERO_POINTS
                              ? (zero_points_base + expert_id * expert_stride_zp)
                              : nullptr;
 
@@ -1142,7 +1161,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __global__ void moe_wvSplitK_int4_hf_sml_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
-    const scalar_t* zero_points_base, scalar_t* C_base,
+    const uint32_t* zero_points_base, scalar_t* C_base,
     const int* __restrict__ expert_ids,
     const int* __restrict__ sorted_token_ids, const int top_k,
     const long expert_stride_w, const long expert_stride_s,
@@ -1155,7 +1174,7 @@ template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
 __global__ void moe_wvSplitK_int4_hf_(
     const int K, const int M, const uint8_t* B_packed_base,
     const scalar_t* __restrict__ A_base, const scalar_t* scale_base,
-    const scalar_t* zero_points_base, scalar_t* C_base,
+    const uint32_t* zero_points_base, scalar_t* C_base,
     const int* __restrict__ expert_ids,
     const int* __restrict__ sorted_token_ids, const int top_k,
     const long expert_stride_w, const long expert_stride_s,
