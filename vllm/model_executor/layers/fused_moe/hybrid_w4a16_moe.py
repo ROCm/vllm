@@ -96,6 +96,7 @@ def _moe_gemm_w4a16_scope(
     num_tokens_post_padded: torch.Tensor | None,
     n_routed: int,
     topk_ids: torch.Tensor | None = None,
+    asym: bool | None = None,
 ):
     """record_function scope around an rdna_moe_gemm (moe_gemm_w4a16) launch,
     surfacing the dims the roofline tool needs -- including the quantities no
@@ -144,6 +145,7 @@ def _moe_gemm_w4a16_scope(
         hist_str += " vtok_hist=" + ",".join(str(int(h)) for h in vhist.tolist())
     return record_function_or_nullcontext(
         f"moe_gemm_w4a16 {M}x{N}x{K} E={E} top_k={top_k} g={group_size} "
+        f"{'' if asym is None else ('asym ' if asym else 'sym ')}"
         f"block_m={block_m} valid_blocks={valid_blocks} n_routed={n_routed}{hist_str}"
     )
 
@@ -555,6 +557,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                     num_tokens_post_padded,
                     num_tokens * top_k_num,
                     topk_ids,
+                    asym=self.quant_config.w1_zp is not None,
                 ):
                     torch.ops.vllm.moe_gemm_w4a16(
                         gemm1_in,
@@ -639,7 +642,9 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             # GEMM 1 (HIP wvSplitK decode path)
             with record_function_or_nullcontext(
                 f"fused_moe_wvsplitk_int4 {num_tokens}x{N}x{K} "
-                f"E={global_num_experts} top_k={top_k_num}"
+                f"E={global_num_experts} top_k={top_k_num} "
+                f"g={self._group_size} "
+                f"{'asym' if self.quant_config.w1_zp is not None else 'sym'}"
             ):
                 fused_moe_wvSplitK_int4_gemm(
                     gemm1_in,
@@ -661,7 +666,9 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             # GEMM 2 (HIP wvSplitK decode path)
             with record_function_or_nullcontext(
                 f"fused_moe_wvsplitk_int4 {num_tokens}x{K}x{activation_out_dim} "
-                f"E={global_num_experts} top_k={top_k_num}"
+                f"E={global_num_experts} top_k={top_k_num} "
+                f"g={self._group_size} "
+                f"{'asym' if self.quant_config.w2_zp is not None else 'sym'}"
             ):
                 fused_moe_wvSplitK_int4_gemm(
                     act_out,
