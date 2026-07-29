@@ -458,6 +458,7 @@ def analyze_results(csv_path, best_per_shape, medium_only=False):
 
 
 def main():
+    global GROUP_SIZE
     parser = argparse.ArgumentParser(description="Sweep int4g kernel tuning parameters")
     parser.add_argument(
         "--batch-sizes",
@@ -478,6 +479,13 @@ def main():
         action="store_true",
         help="Sweep medium (hf) kernel variant for shapes where K*N exceeds sml LDS",
     )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=GROUP_SIZE,
+        help=f"Quantization group size (default: {GROUP_SIZE}). Checkpoints such "
+        "as gemma-4-31B-it-AWQ-4bit use 32.",
+    )
     parser.add_argument("--warmup", type=int, default=25, help="Warmup iterations")
     parser.add_argument("--rep", type=int, default=100, help="Benchmark repetitions")
     parser.add_argument(
@@ -487,6 +495,8 @@ def main():
         help="Output CSV path (default: int4g128_sweep[_medium]_results.csv in CWD)",
     )
     args = parser.parse_args()
+
+    GROUP_SIZE = args.group_size
 
     shapes = args.shapes if args.shapes else SHAPES
     suffix = "_medium" if args.medium else ""
