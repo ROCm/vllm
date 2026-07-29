@@ -535,6 +535,7 @@ def measure_tflops(
     group_size: int,
     provider: str,
     eager: bool = False,
+    profile: bool = False,
 ) -> tuple[str, float]:
     """Run the kernel and return (kernel label, median TFLOP/s).
 
@@ -603,7 +604,13 @@ def measure_tflops(
     # per-dispatch profilers such as rocprofv3 ATT, which cannot intercept
     # graph-captured kernels; the cudagraph path stays the default for the
     # lowest-overhead steady-state timing used by the golden baselines.
-    if eager:
+    if profile:
+        # --profile: one warmup + one measured launch.  do_bench derives its
+        # iteration counts as max(1, int(<budget_ms> / estimate_ms)), so a zero
+        # budget clamps both to 1.  Keeps an ATT capture down to a couple of
+        # dispatches instead of the hundreds a normal timing run issues.
+        ms = triton.testing.do_bench(run, warmup=0, rep=0, quantiles=[0.5])
+    elif eager:
         ms = triton.testing.do_bench(run, quantiles=[0.5])
     else:
         ms = triton.testing.do_bench_cudagraph(run, quantiles=[0.5])
@@ -777,8 +784,15 @@ def _record_skip(
 
 
 @pytest.fixture(scope="session")
-def _warm_up_gpu():
+def _warm_up_gpu(request):
     """Run a throwaway measurement pass to bring the GPU to steady-state temp."""
+    if request.config.getoption("--profile", default=False):
+        # The warm-up sweeps a different shape across every batch size, whose
+        # dispatches would otherwise dominate (and be indistinguishable in) an
+        # external profiler capture.
+        print("Skipping GPU warm-up (--profile)")
+        yield
+        return
     if current_platform.is_rocm():
         temp = _read_gpu_temp()
         print(f"GPU temperature: {temp:.0f}\u00b0C")
@@ -815,7 +829,10 @@ def test_hybrid_w4a16_perf(
     preload_golden(request.config, gcn_arch)
 
     measure_mode = request.config.getoption("--write-golden", default=False)
-    eager_mode = request.config.getoption("--eager", default=False)
+    profile_mode = request.config.getoption("--profile", default=False)
+    # --profile implies --eager: a graph-captured kernel is invisible to
+    # per-dispatch profilers, so there would be nothing to capture.
+    eager_mode = request.config.getoption("--eager", default=False) or profile_mode
     intermittent_mode = (
         request.config.getoption("--intermittent", default=False) or measure_mode
     )
@@ -893,7 +910,14 @@ def test_hybrid_w4a16_perf(
         # ---- measure ----
         _log_temp(request.config, f"{test_id}:bs{bs}:pre")
         kernel, tflops = measure_tflops(
-            bs, weights, K, N, group_size, provider, eager=eager_mode
+            bs,
+            weights,
+            K,
+            N,
+            group_size,
+            provider,
+            eager=eager_mode,
+            profile=profile_mode,
         )
         post_temp = _log_temp(request.config, f"{test_id}:bs{bs}:post")
         temp_tag = f" [{post_temp:.0f}\u00b0C]"
@@ -1026,7 +1050,16 @@ def test_hybrid_w4a16_perf(
         )
 
     # ---- report failures ----
-    if failures:
+    if failures and profile_mode:
+        # A --profile run measures a single un-warmed launch, so it is expected
+        # to sit well below the golden band.  Report, but do not fail: the point
+        # of the run is the external profiler's capture, and a non-zero exit
+        # here reads as a real regression.
+        print(
+            f"  ({len(failures)} batch size(s) outside the golden band; "
+            "expected under --profile, not asserted)"
+        )
+    elif failures:
         raise AssertionError(
             f"{len(failures)} batch size(s) out of tolerance band. "
             "Run --write-golden to update.\n" + "\n".join(failures)

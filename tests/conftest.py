@@ -1523,6 +1523,16 @@ def pytest_addoption(parser):
         help="benchmark kernels with triton do_bench (eager launches) instead "
         "of do_bench_cudagraph; enables per-dispatch profiling (e.g. ATT)",
     )
+    parser.addoption(
+        "--profile",
+        action="store_true",
+        default=False,
+        help="minimise dispatches for an external profiler (e.g. rocprofv3 "
+        "ATT): skip the GPU warm-up pass and cut the benchmark to a single "
+        "warmup + single measured iteration. Implies --eager, since graph-"
+        "captured kernels are invisible to per-dispatch profilers. Timings "
+        "from such a run are NOT comparable to the golden baselines.",
+    )
 
 
 def pytest_report_header(config):
