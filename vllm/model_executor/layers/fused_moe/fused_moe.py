@@ -822,7 +822,12 @@ def invoke_fused_moe_kernel_hybrid_triton(
     )
 
     with record_function_or_nullcontext(
-        f"hybrid_triton_moe {M}x{N}x{K} E={E} top_k={top_k}"
+        # Always "sym": this wrapper is symmetric-only by construction (it
+        # passes b_zp_ptr=None / has_zp=False and folds the zero-point bias
+        # into the constant 8), so there is no asymmetric variant to
+        # distinguish.  The marker is emitted anyway so the roofline tool can
+        # account the per-group scale bytes, which it cannot infer from MxNxK.
+        f"hybrid_triton_moe {M}x{N}x{K} E={E} top_k={top_k} g={group_size} sym"
     ):
         fused_moe_kernel_gptq_awq[grid](
             A,

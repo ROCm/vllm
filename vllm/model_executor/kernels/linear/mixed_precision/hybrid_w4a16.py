@@ -647,13 +647,21 @@ def _hybrid_w4a16_apply_impl(
     K = x_2d.shape[1]
     N = w_q.shape[0]
 
+    # Profiler label suffix.  The GEMM's memory traffic is not determined by
+    # the shape alone: the per-group scale (and, when asymmetric, zero-point)
+    # tensors add N * (K/group_size) * 2 bytes each on top of the N*K/2 weight
+    # bytes.  At g=32 asymmetric that surcharge is ~25% of the weight bytes, so
+    # a trace that reports only MxNxK cannot be turned into a bandwidth number.
+    # Emitting g<group_size> and sym/asym makes the label self-describing.
+    _gz = f"g{group_size} {'asym' if w_zp is not None else 'sym'}"
+
     # Use the HIP skinny kernel for small batch sizes (fast decode path),
     # but only when K*M fits in LDS.  Otherwise fall through to Triton.
     if M <= MAX_SKINNY_BATCH_SIZE and K * M <= LDS_CAPACITY_ELEMENTS:
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
-            else torch.profiler.record_function(f"wvsplitk_int4 {M}x{N}x{K}")
+            else torch.profiler.record_function(f"wvsplitk_int4 {M}x{N}x{K} {_gz}")
         )
         with ctx:
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
@@ -663,7 +671,9 @@ def _hybrid_w4a16_apply_impl(
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
-            else torch.profiler.record_function(f"hybrid_dequant_w4a16 {M}x{N}x{K}")
+            else torch.profiler.record_function(
+                f"hybrid_dequant_w4a16 {M}x{N}x{K} {_gz}"
+            )
         )
         with ctx:
             # Route through the unquantized GEMM dispatch so the dense dequant copy
@@ -676,7 +686,7 @@ def _hybrid_w4a16_apply_impl(
     ctx = (
         nullcontext()
         if torch.compiler.is_compiling()
-        else torch.profiler.record_function(f"hybrid_triton_w4a16 {M}x{N}x{K}")
+        else torch.profiler.record_function(f"hybrid_triton_w4a16 {M}x{N}x{K} {_gz}")
     )
     with ctx:
         # Asymmetric layers carry the packed scale/zp carrier (scale + zero-point folded
