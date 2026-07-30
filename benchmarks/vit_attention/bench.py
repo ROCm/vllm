@@ -25,8 +25,18 @@ view into a packed tensor (token stride = mult*H*D, mult=3 for a standard fused
 QKV) while Q/K are made contiguous by the serving wrappers. --v-stride-mult
 controls this (default 3 = model-matching fused QKV; 1 = fully contiguous).
 
---no-flush measures with a warm cache (no L2 clear between iterations) instead
-of do_bench's default cold-cache behavior.
+Cache working-set state is controllable, because it dominates the gap vs real
+serving (where surrounding qkv-proj / MLP / norm work only *partially* evicts
+q/k/v between attention calls):
+  * default            -> stock do_bench (fully cold; clears the L2 each rep)
+  * --no-flush         -> fully warm (q/k/v stay resident between reps)
+  * --flush-mib N      -> zero an N-MiB device buffer before each rep, streaming
+                          it through the last-level cache to displace q/k/v.
+                          N=0 is warm; N ~ LLC size models serving-like partial
+                          eviction; N >= 2x LLC is fully cold. (A write equal to
+                          the cache size does not fully evict due to set/way
+                          associativity + the flush stream evicting itself, so
+                          full-cold needs ~2x the cache size.)
 
 Output: one JSON line per backend to stdout.
 """
@@ -110,7 +120,19 @@ def _parse() -> argparse.Namespace:
         action="store_true",
         help=(
             "Measure with a warm cache (no L2 flush between iterations) instead "
-            "of do_bench's default cold-cache flush."
+            "of do_bench's default cold-cache flush. Equivalent to --flush-mib 0."
+        ),
+    )
+    p.add_argument(
+        "--flush-mib",
+        type=int,
+        default=None,
+        help=(
+            "Zero an N-MiB device buffer before each timed rep to model a "
+            "controllable amount of cache eviction. N=0 = warm (no flush); "
+            "N ~ last-level-cache size = serving-like partial eviction; "
+            "N >= 2x LLC = fully cold. Overrides --no-flush. When unset, the "
+            "default stock do_bench full-cold L2 flush is used."
         ),
     )
     p.add_argument("--warmup-ms", type=int, default=200)
@@ -118,14 +140,23 @@ def _parse() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _do_bench_no_flush(fn, warmup_ms: int, rep_ms: int) -> list[float]:
-    """do_bench variant that does NOT clear the cache between iterations.
+def _do_bench_flush(fn, warmup_ms: int, rep_ms: int, flush_mib: int) -> list[float]:
+    """do_bench variant with a controllable N-MiB cache flush between reps.
 
     Mirrors triton.testing.do_bench's event-timed loop (5-call cost estimate ->
-    warmup -> timed reps) but omits the L2 flush, so q/k/v stay resident (warm).
-    Returns per-call times in milliseconds.
+    warmup -> timed reps). Before each timed rep it zeroes a ``flush_mib``-MiB
+    device buffer; those writes stream through the last-level cache and displace
+    the resident q/k/v. ``flush_mib=0`` performs no flush (fully warm), so q/k/v
+    stay resident; ``flush_mib ~ LLC`` models serving-like partial eviction and
+    ``flush_mib >= 2x LLC`` is fully cold. Returns per-call times in ms.
     """
     di = triton.runtime.driver.active.get_device_interface()
+
+    flush_buf = None
+    if flush_mib > 0:
+        flush_buf = torch.empty(
+            int(flush_mib) * 1024 * 1024, dtype=torch.int8, device="cuda"
+        )
 
     fn()
     di.synchronize()
@@ -147,6 +178,8 @@ def _do_bench_no_flush(fn, warmup_ms: int, rep_ms: int) -> list[float]:
     ends = [di.Event(enable_timing=True) for _ in range(n_repeat)]
     di.synchronize()
     for i in range(n_repeat):
+        if flush_buf is not None:
+            flush_buf.zero_()
         starts[i].record()
         fn()
         ends[i].record()
@@ -272,9 +305,16 @@ def _bench_one(
     else:
         raise ValueError(f"Unsupported backend: {backend_name}")
 
-    if args.no_flush:
-        # Warm cache: no L2 flush between iterations.
-        all_times = _do_bench_no_flush(_fn, args.warmup_ms, args.rep_ms)
+    if args.flush_mib is not None:
+        # Controllable partial eviction: zero an N-MiB buffer before each rep.
+        all_times = _do_bench_flush(_fn, args.warmup_ms, args.rep_ms, args.flush_mib)
+        flush_mode = "warm" if args.flush_mib == 0 else "flush_mib"
+        flush_mib = args.flush_mib
+    elif args.no_flush:
+        # Warm cache: no L2 flush between iterations (== --flush-mib 0).
+        all_times = _do_bench_flush(_fn, args.warmup_ms, args.rep_ms, 0)
+        flush_mode = "warm"
+        flush_mib = 0
     else:
         # do_bench clears the L2 cache before each measurement iteration.
         all_times = triton.testing.do_bench(
@@ -283,6 +323,8 @@ def _bench_one(
             rep=args.rep_ms,
             return_mode="all",
         )
+        flush_mode = "cold"
+        flush_mib = None
     all_times = sorted(all_times)
     n = len(all_times)
     mean = sum(all_times) / n
@@ -300,7 +342,10 @@ def _bench_one(
         "backend": backend_name,
         "v_stride_mult": args.v_stride_mult,
         "v_token_stride": int(v4.stride(-3)),
-        "flush": not args.no_flush,
+        "v_contiguous": bool(v4.is_contiguous()),
+        "flush": flush_mode != "warm",
+        "flush_mode": flush_mode,
+        "flush_mib": flush_mib,
     }
     if backend == AttentionBackendEnum.TRITON_ATTN:
         config.update(
