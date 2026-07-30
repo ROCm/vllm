@@ -497,7 +497,155 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     float sum[N][YTILE] = {};
     scalar8 sum4[N][YTILE] = {};
 
-    for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
+    //----------------------------------------------------
+    // Software-pipelined K loop: keep the B loads in flight across the
+    // backedge instead of letting vmcnt drain to 0 once per iteration.
+    // Three things make it work, all load-bearing (MLSE/1816414752):
+    //
+    //  1. Modulo variable expansion. bigB is two register sets that
+    //     rotate BY NAME, steady body unrolled over both. One
+    //     loop-carried buffer gives zero loads in flight instead: the
+    //     old value stays live while the new load overwrites the slot,
+    //     so the backend emits a copy, and copying a load result forces
+    //     s_waitcnt vmcnt(0).
+    //  2. sched_barrier(0) at every slot boundary. MVE alone still
+    //     drains mid-body, because the scheduler hoists all the consumes
+    //     above all the issues to start the DOT2C chains early.
+    //     Reordering the source does not help; only the barrier does.
+    //  3. A branch-free steady region. The `k_ >= K` guard and any
+    //     partial trailing tile stay in the epilogue loop below.
+    //
+    // Depth: the rotation unit is a CHUNK of D = UNRL/2 slots rather than
+    // a whole UNRL-slot tile, so the two sets together hold S*D = UNRL
+    // slots -- exactly what the unpipelined bigB[YTILE][UNRL] held.
+    // Register cost tracks the size of the whole rotation (S*D), not the
+    // number of loads outstanding (N = (S-1)*D = UNRL/2), because MVE
+    // names every set element separately and the slot barriers stop the
+    // allocator coalescing them. Rotating at half-tile granularity
+    // therefore keeps the pipeline while staying VGPR-neutral.
+    //
+    // The steady region never prefetches past the last whole chunk, so it
+    // issues exactly as many B loads as the unpipelined form did.
+    //----------------------------------------------------
+    constexpr uint32_t SLOTK = THRDS * A_CHUNK;            // K per slot
+    constexpr uint32_t PD = (UNRL >= 2) ? (UNRL / 2) : 1;  // D: slots/stage
+    constexpr uint32_t CHUNK = PD * SLOTK;                 // K per set
+    const uint32_t n_chunks = K / CHUNK;                   // whole chunks
+    uint32_t k_done = 0;  // K already accumulated by the steady region
+
+    // The steady loop runs floor((n_chunks - 1) / 2) times; everything
+    // else is prologue and drain. Below 5 chunks the tail dominates and
+    // the pipeline is a net loss -- measured on gfx1151, 4096x4096 needs
+    // only 2-4 chunks and regressed 6-23% until this guard was added,
+    // while K=2560 (5 chunks) and K=9728 (19 chunks) were unaffected.
+    // Short K therefore keeps the original load-all-then-consume loop.
+    constexpr uint32_t MIN_CHUNKS = 5;
+
+    if (n_chunks >= MIN_CHUNKS) {
+      bigType bigB[2][YTILE][PD];
+      using S0 = std::integral_constant<int, 0>;
+      using S1 = std::integral_constant<int, 1>;
+
+      // Issue slot k2 of the chunk at kbase into register set SET.
+      auto issue = [&](auto SET, uint32_t kbase, uint32_t k2) {
+        uint32_t k_ = kbase + k2 * SLOTK + threadIdx.x * A_CHUNK;
+        const scalar_t* B_ = &B[min__(k_, K - A_CHUNK)];
+  #pragma unroll
+        for (int y = 0; y < YTILE; y++)
+          bigB[decltype(SET)::value][y][k2].h8 =
+              (loadnt((scalar8*)(&B_[min__(y + m, M - 1) * Kbp])));
+      };
+
+      // Retire slot k2 of the chunk at kbase out of register set SET. In
+      // the steady region k_ < K always holds, so no guard is needed.
+      //
+      // sum / sum4 / bigB are captured explicitly on purpose: their only
+      // odr-uses sit inside the dependent `if constexpr` below, and clang
+      // fixes a generic lambda's implicit capture set before instantiating
+      // that branch, so `[&]` leaves them uncaptured and the build fails.
+      // `s` is __shared__ (static storage) and must not be listed.
+      auto retire = [&sum, &sum4, &bigB, Kap](auto SET, uint32_t kbase,
+                                              uint32_t k2) {
+        constexpr int SET_ = decltype(SET)::value;
+        uint32_t k_ = kbase + k2 * SLOTK + threadIdx.x * A_CHUNK;
+        bigType bigA[N];
+  #pragma unroll
+        for (int n = 0; n < N; n++)
+          bigA[n] = *((const bigType*)(&(s[k_ + Kap * n])));
+  #pragma unroll
+        for (uint32_t n = 0; n < N; n++) {
+  #pragma unroll
+          for (int y = 0; y < YTILE; y++) {
+            if constexpr (!use_mfma)
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                DOT2C(sum[n][y], bigA[n].f[b], bigB[SET_][y][k2].f[b])
+              }
+            else
+              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
+                    bigA[n].h4[b], bigB[SET_][y][k2].h4[b], sum4[n][y], 0, 0,
+                    0);
+          }
+        }
+      };
+
+      auto retire_chunk = [&](auto SET, uint32_t kbase) {
+  #pragma unroll
+        for (uint32_t k2 = 0; k2 < PD; k2++) retire(SET, kbase, k2);
+      };
+
+      // One stage: retire the chunk at k_cur out of CUR while filling NXT
+      // with the chunk at k_nxt, one slot at a time. Issue before retire,
+      // barrier on both sides; that is what pins the in-flight count.
+      //
+      // A DS|DS_READ-permeable fence (mask 0x180) was measured here to let
+      // the A-side ds_loads batch across slots: it does change the ISA
+      // (lgkmcnt drains per body 4 -> 2 at A_CHUNK=32) but moved no shape
+      // measurably, and it lowered the backedge vmcnt floor from 8 to 4.
+      // Kept fully closed.
+      auto stage = [&](auto CUR, auto NXT, uint32_t k_cur, uint32_t k_nxt) {
+  #pragma unroll
+        for (uint32_t k2 = 0; k2 < PD; k2++) {
+          issue(NXT, k_nxt, k2);
+          __builtin_amdgcn_sched_barrier(0);
+          retire(CUR, k_cur, k2);
+          __builtin_amdgcn_sched_barrier(0);
+        }
+      };
+
+      // Prologue: chunk 0 into set 0.
+  #pragma unroll
+      for (uint32_t k2 = 0; k2 < PD; k2++) issue(S0{}, 0, k2);
+
+      // Steady state, two chunks per body. Invariant at the top: the
+      // chunk at k_done is already resident in set 0. Stops one chunk
+      // short so the final stage never prefetches past the whole-chunk
+      // region.
+      const uint32_t k_last = (n_chunks - 1) * CHUNK;
+      for (; k_done + 2 * CHUNK <= k_last; k_done += 2 * CHUNK) {
+        stage(S0{}, S1{}, k_done, k_done + CHUNK);
+        stage(S1{}, S0{}, k_done + CHUNK, k_done + 2 * CHUNK);
+      }
+
+      // Drain: one optional stage to land on the final whole chunk, then
+      // retire that chunk without prefetching anything behind it.
+      bool last_in_set1 = false;
+      if (k_done + CHUNK <= k_last) {
+        stage(S0{}, S1{}, k_done, k_done + CHUNK);
+        k_done += CHUNK;
+        last_in_set1 = true;
+      }
+      if (last_in_set1)
+        retire_chunk(S1{}, k_done);
+      else
+        retire_chunk(S0{}, k_done);
+      k_done += CHUNK;
+    }
+
+    // Epilogue: the partial trailing tile, plus the whole K range when
+    // there are fewer than two tiles to pipeline over. Runs at most once
+    // per K sweep, so it keeps the original load-all-then-consume form.
+    for (uint32_t k1 = k_done; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
       bigType bigA[N][UNRL] = {};
       bigType bigB[YTILE][UNRL];
       // Fetch the weight matrix from memory!
