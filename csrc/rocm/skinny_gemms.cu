@@ -1391,16 +1391,35 @@ __global__ void wvSplitK_hf_big_(const int K, const int Kbp, const int Kap,
 #endif
 
 // Find the min val of div2 that doesn't increase N/(div1*div2)
+//
+// Note this optimises round count, not idle wave-slots, and the two differ:
+// the persistent loop advances div1*w columns per round, so a final partly
+// idle round still costs a full K sweep. At N=19456, div1=80 this returns
+// w=16 for 1024 idle slots where w=13 would give 304.
+//
+// Replacing the rule with "minimise rounds*div1*w, w floored at 3/4 div2"
+// was measured on gfx1151 and rejected. It was worth -0.57% on the shapes
+// it changed, 0.9 sigma against the drift of the shapes it did not, i.e.
+// nothing resolvable: an under-occupied tail round costs far less than its
+// slot count implies, because the kernel is bandwidth-bound. It also
+// regressed the one shape with real headroom -- at M=256, div1=20, div2=32
+// this rule picks w=20 (36% idle) where the floored search is stuck at w=24
+// (47% idle), and 256x2048 runs at 40% of peak limited by that occupancy.
+// A retry must let small N drop below 3/4 while still protecting large N.
 int mindiv(int N, int div1, int div2) {
   int nPrRnd = div1 * div2;
   int rnds[13];
-  for (int i = 0; i < 13; i++) {
+  // Stop before nPrRnd reaches 0: the 13-step walk divides by zero for
+  // div2 < 13, and yields negative wave counts below that.
+  int cnt = 0;
+  for (int i = 0; i < 13 && nPrRnd > 0; i++) {
     rnds[i] = (N + nPrRnd - 1) / nPrRnd;
     nPrRnd -= div1;
+    cnt++;
   }
-  for (int i = 12; i >= 0; i--)
+  for (int i = cnt - 1; i >= 0; i--)
     if (rnds[0] == rnds[i]) return (div2 - i);
-  return 0;
+  return div2;
 }
 
 torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
@@ -1469,6 +1488,19 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 #define WVSPLITK_CFG(_THRDS, _WVPRGRP, _YTILE, _UNRL, _N) \
   WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, _YTILE, _UNRL, _N, 8)
 
+// Why the K%1024==512 branch below keeps YTILE=4.
+//
+// YTILE sets the output granularity of the persistent loop, which advances
+// CuCount*_WvPrGrp*YTILE columns per round, so YT=4 can leave the last round
+// mostly idle -- at M=19456, K=2560 the last of 16 rounds runs at 20%
+// occupancy, 5.0% of all wave-slots. YT=2/UNRL=4 halves the round to 640
+// columns at identical loads-in-flight (PD*YTILE = 4) and identical bigB
+// footprint (2*YTILE*PD = 8 groups), and was measured on gfx1151 as a loss:
+// 0.1% at N=1 rising to 3-5% at N=4. YTILE also amortises the LDS reads,
+// since bigA is reused across all YTILE rows of B, so halving it doubles
+// ds_load traffic per dot scaled by N (2N vs 4N ds_loads per body for the
+// same 32 dots). That costs more than the idle tail saves, and the tail is
+// itself bandwidth-limited so it never cost the full 5%.
 #define WVSPLIT_TILE_CFG(_THRDS, _WVPRGRP, _sYT, __N)                        \
   {                                                                          \
     bool fit_lds = (Kbp_in * N_in <= max_lds_len);                           \
