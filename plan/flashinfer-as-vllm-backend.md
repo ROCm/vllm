@@ -12,7 +12,7 @@
 
 Working branch: `rocm-flashinfer`, based on upstream `bebf918044` (v0.26.1rc0).
 Built as `0.26.1rc1.dev180+gbebf91804...rocm723`.
-Gate scripts: `~/devel/rocm-flashinfer-probes/gate_phase{1,2,3}.py`.
+Gate scripts: `plan/scripts/gate_phase{1,2,3}.py`.
 
 ### Correctness: settled
 
@@ -45,7 +45,7 @@ TRITON agreeing meant ours was wrong — did not survive the measurement.
   `csrc/libtorch_stable/hip_view.hip`; `_C_stable_libtorch` is not optional).
 - Resolution: base on **`rocm/vllm-dev:base`** (ROCm 7.2.3, Ubuntu 22.04,
   py3.12, torch 2.11.0+gitd0c8b1f — matches `Dockerfile.rocm_base`) and apply
-  `~/devel/rocm-flashinfer-probes/patch_use_rocm.py`, which appends
+  `plan/scripts/patch_use_rocm.py`, which appends
   `-DUSE_ROCM` to `COMMON_HIPCC_FLAGS` in flashinfer's
   `compilation_context_hip.py`. **Report this to AMD.**
 - Images: `vllm-fi:base` (patched flashinfer, JIT cache warm) and
@@ -101,7 +101,7 @@ TRITON agreeing meant ours was wrong — did not survive the measurement.
 ### The prefill route is not optional
 
 Measured 2026-07-31 on MI300X (gfx942), flashinfer 0.5.3+amd.1, reproduced on
-three independent images. Probes: `~/devel/rocm-flashinfer-probes/`.
+three independent images. Probes: `plan/scripts/`.
 Full write-up: [`handoff-amd-flashinfer-fa2-prefill.md`](./handoff-amd-flashinfer-fa2-prefill.md).
 
 - **HIP `fa2` prefill is numerically wrong.** max_abs ≈ 3.5 vs a torch SDPA
@@ -156,7 +156,7 @@ No MLA, no fp8 KV, no fused RMSNorm/RoPE/sampling.
 
 1. ~~Rebase onto upstream main.~~ **Done** — branch `rocm-flashinfer`.
 2. ~~Validate flashinfer standalone before involving vLLM.~~ **Done** — see the
-   constraints section. Re-run `~/devel/rocm-flashinfer-probes/probe.py` against
+   constraints section. Re-run `plan/scripts/probe.py` against
    any new amd-flashinfer build before trusting prefill.
 3. ~~Unblock the vLLM build.~~ **Done** — builds in `vllm-fi:dev`.
 4. **Capture the AITER baseline** on the same image so later comparisons are
