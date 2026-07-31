@@ -451,6 +451,12 @@ def _get_backend_priorities(
             ]
 
     backends = []
+    # Opt-in only: amd-flashinfer is not installed in the default ROCm image,
+    # and its prefill path requires the AITER route (see the rocm_flashinfer
+    # backend docstring). Placed first so that enabling the flag actually
+    # selects it; it validates itself out if the wheel is missing.
+    if envs.VLLM_ROCM_USE_FLASHINFER:
+        backends.append(AttentionBackendEnum.ROCM_FLASHINFER)
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:

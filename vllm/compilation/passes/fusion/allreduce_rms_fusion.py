@@ -85,7 +85,12 @@ PDL_ADVANCE_LAUNCH_TOKENS = 16
 logger = init_logger(__name__)
 
 flashinfer_comm: ModuleType | None = None
-if find_spec("flashinfer"):
+# `flashinfer.comm` is CUDA-only: it builds a CudaRTLibrary at import time and
+# raises AssertionError("libcudart is not loaded") on non-CUDA hosts. A ROCm
+# host can legitimately have a `flashinfer` module installed (AMD ships the
+# `amd-flashinfer` wheel under the same name), so gate on the platform and
+# catch more than ImportError.
+if current_platform.is_cuda() and find_spec("flashinfer"):
     try:
         import flashinfer.comm as _flashinfer_comm
 
@@ -93,7 +98,7 @@ if find_spec("flashinfer"):
             _flashinfer_comm, "create_allreduce_fusion_workspace"
         ):
             flashinfer_comm = _flashinfer_comm
-    except ImportError:
+    except Exception:
         pass
 
 if hasattr(torch.ops._C, "scaled_fp4_quant"):
