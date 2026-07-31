@@ -8,7 +8,8 @@
 | 1 — register backend | **GATE PASS** — 30/30 checks (`gate_phase1.py`) |
 | 2 — builder + forward | **GATE PASS** — end-to-end coherent text on TinyLlama, eager |
 | 3 — correctness | **layers 1–2 PASS**; layer 3 (GSM8K) not run |
-| 4–7 | Not started |
+| 4 — benchmarks | **DONE (latency)** — on par with AITER, 8–16% faster than Triton. See [`benchmark-results.md`](./benchmark-results.md). Throughput/serve not run. |
+| 5–7 | Not started |
 
 Working branch: `rocm-flashinfer`, based on upstream `bebf918044` (v0.26.1rc0).
 Built as `0.26.1rc1.dev180+gbebf91804...rocm723`.
