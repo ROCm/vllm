@@ -85,6 +85,46 @@ def _moe_gemm_triton_scope(
     )
 
 
+def _fused_moe_wvsplitk_scope(
+    M: int,
+    N: int,
+    K: int,
+    E: int,
+    top_k: int,
+    group_size: int,
+    expert_ids: torch.Tensor,
+    asym: bool,
+):
+    """record_function scope around a fused_moe_wvSplitK_int4_gemm launch.
+
+    Adds ``experts=``: the number of *distinct* experts this launch reads.  The
+    kernel walks expert_ids and loads one expert's weight slab per block, and
+    those slabs dominate the traffic, so the roofline needs the count to turn
+    the trace into a bandwidth number.  It cannot be recovered downstream: a
+    trace records expert_ids' shape (the block count) but not its contents, and
+    several blocks can share an expert, so the block count is only an upper
+    bound.  E and top_k give a looser bound still (min(M*top_k, E)).
+
+    Reading it forces a device->host sync, so -- exactly as in
+    _moe_gemm_w4a16_scope -- it is taken only when profiling scopes are
+    enabled; production returns before touching the tensor and pays nothing.
+    The sync perturbs the CPU timeline, not the GPU kernel duration the
+    roofline measures.
+    """
+    if not (
+        envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
+    ):
+        return contextlib.nullcontext()
+    # Padding blocks carry expert_id == -1; bincount over the valid ids and
+    # count the non-empty bins. Fixed-size output, so one sync on the sum.
+    ids = expert_ids[(expert_ids >= 0) & (expert_ids < E)]
+    n_experts = int((torch.bincount(ids, minlength=E) > 0).sum().item())
+    return record_function_or_nullcontext(
+        f"fused_moe_wvsplitk_int4 {M}x{N}x{K} E={E} top_k={top_k} "
+        f"g={group_size} {'asym' if asym else 'sym'} experts={n_experts}"
+    )
+
+
 def _moe_gemm_w4a16_scope(
     M: int,
     N: int,
@@ -640,11 +680,15 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             from vllm._custom_ops import fused_moe_wvSplitK_int4_gemm
 
             # GEMM 1 (HIP wvSplitK decode path)
-            with record_function_or_nullcontext(
-                f"fused_moe_wvsplitk_int4 {num_tokens}x{N}x{K} "
-                f"E={global_num_experts} top_k={top_k_num} "
-                f"g={self._group_size} "
-                f"{'asym' if self.quant_config.w1_zp is not None else 'sym'}"
+            with _fused_moe_wvsplitk_scope(
+                num_tokens,
+                N,
+                K,
+                global_num_experts,
+                top_k_num,
+                self._group_size,
+                expert_ids,
+                self.quant_config.w1_zp is not None,
             ):
                 fused_moe_wvSplitK_int4_gemm(
                     gemm1_in,
@@ -664,11 +708,15 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             apply_moe_activation(activation, act_out, gemm1_out)
 
             # GEMM 2 (HIP wvSplitK decode path)
-            with record_function_or_nullcontext(
-                f"fused_moe_wvsplitk_int4 {num_tokens}x{K}x{activation_out_dim} "
-                f"E={global_num_experts} top_k={top_k_num} "
-                f"g={self._group_size} "
-                f"{'asym' if self.quant_config.w2_zp is not None else 'sym'}"
+            with _fused_moe_wvsplitk_scope(
+                num_tokens,
+                K,
+                activation_out_dim,
+                global_num_experts,
+                top_k_num,
+                self._group_size,
+                expert_ids,
+                self.quant_config.w2_zp is not None,
             ):
                 fused_moe_wvSplitK_int4_gemm(
                     act_out,
