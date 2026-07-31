@@ -4,23 +4,35 @@
 
 | Phase | State |
 |---|---|
-| 0 — env + baseline | Env **done**; flashinfer validated **done** (major finding below); AITER baseline **not started** |
-| 1 — register backend | **GATE PASS** — 30/30 checks (`~/devel/rocm-flashinfer-probes/gate_phase1.py`) |
-| 2 — builder + forward | **Runs end-to-end**, coherent text on TinyLlama — but see the open discrepancy below |
-| 3–7 | Not started |
+| 0 — env + baseline | Env **done**; flashinfer validated **done** (major finding below); vendor test suite **not run**; AITER baseline **not started** |
+| 1 — register backend | **GATE PASS** — 30/30 checks (`gate_phase1.py`) |
+| 2 — builder + forward | **GATE PASS** — end-to-end coherent text on TinyLlama, eager |
+| 3 — correctness | **layers 1–2 PASS**; layer 3 (GSM8K) not run |
+| 4–7 | Not started |
 
 Working branch: `rocm-flashinfer`, based on upstream `bebf918044` (v0.26.1rc0).
 Built as `0.26.1rc1.dev180+gbebf91804...rocm723`.
+Gate scripts: `~/devel/rocm-flashinfer-probes/gate_phase{1,2,3}.py`.
 
-### Open issue — greedy output diverges from both incumbents
+### Correctness: settled
 
-On TinyLlama-1.1B, greedy, `--enforce-eager`, 3 prompts: `ROCM_FLASHINFER`
-matches on 2/3 and diverges at token 8 on the shortest prompt.
-**`ROCM_AITER_FA` and `TRITON_ATTN` produce byte-identical output to each
-other**, so ours is the odd one out — that pattern argues against a benign
-near-tie and for a real defect in the builder or forward path. Unresolved.
-Next step is Phase 3 layer 1 (SDPA-reference harness) to localize prefill vs
-decode and get error magnitudes; do not benchmark until this is settled.
+**Layer 1 — vs SDPA reference: 18/18 PASS.** vLLM's own
+`_test_backend_correctness` harness, `atol=rtol=1e-2`, across
+single/small/medium/large decode, prefill, and mixed batch specs, with
+`TRITON_ATTN` run alongside as a control. Driven via `gate_phase3.py` because
+the packaged test parametrizes over gated `meta-llama/Meta-Llama-3-8B` and
+this host is offline; `large_prefill` is skipped since it needs
+`max_model_len=4096` and TinyLlama caps at 2048.
+
+**Layer 2 — vs AITER end-to-end:** 2/3 prompts byte-identical greedy. The
+third was **investigated and cleared**: at the diverging step the top-2
+candidates are an *exact bf16 tie* under `ROCM_FLASHINFER`
+(`' C'` and `' The'`, both -2.095223, gap 0.00e+00) and 6.25e-02 apart under
+`ROCM_AITER_FA`. That is argmax sensitivity between kernels with different
+accumulation orders, not incorrectness. Earlier read — that AITER and
+TRITON agreeing meant ours was wrong — did not survive the measurement.
+
+**Layer 3 — GSM8K:** not run. Needs the dataset, and this host is offline.
 
 ### Environment: a three-way version squeeze (resolved)
 
