@@ -217,6 +217,11 @@ class RocmFlashInferBackend(AttentionBackend):
 class RocmFlashInferMetadata(AttentionMetadata):
     num_actual_tokens: int
 
+    # Not read by forward() -- the runner hands slot_mapping to
+    # do_kv_cache_update() directly -- but carried like the other backends do,
+    # since test harnesses and profiling tools read it off the metadata.
+    slot_mapping: torch.Tensor
+
     # Batch split. Decodes are reordered to the front of the batch.
     num_decodes: int
     num_decode_tokens: int
@@ -400,6 +405,7 @@ class RocmFlashInferMetadataBuilder(AttentionMetadataBuilder[RocmFlashInferMetad
 
         attn_metadata = RocmFlashInferMetadata(
             num_actual_tokens=num_actual_tokens,
+            slot_mapping=common_attn_metadata.slot_mapping,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,

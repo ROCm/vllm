@@ -54,11 +54,20 @@ FP8_KV_CACHE_DTYPES = {
     "fp8_e4m3": current_platform.fp8_dtype(),
 }
 
-# Remove flashinfer from the list if it's not available
-try:
-    import flashinfer  # noqa: F401
-except ImportError:
+if current_platform.is_rocm():
+    # `import flashinfer` can succeed on ROCm because AMD ships its ROCm port
+    # (the `amd-flashinfer` wheel) under the same module name. That module has
+    # none of the TRT-LLM entry points the CUDA FlashInfer backend imports, so
+    # that backend is never usable here; ROCM_FLASHINFER is the ROCm analogue.
+    # It self-skips via ImportError if amd-flashinfer is absent.
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
+    BACKENDS_TO_TEST.append(AttentionBackendEnum.ROCM_FLASHINFER)
+else:
+    # Remove flashinfer from the list if it's not available
+    try:
+        import flashinfer  # noqa: F401
+    except ImportError:
+        BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
 
 
 def _convert_dtype_to_torch(dtype):
@@ -263,8 +272,17 @@ def run_attention_backend(
 
     builder_cls, impl_cls = try_get_attention_backend(actual_backend)
 
-    # Mock flashinfer's get_per_layer_parameters if needed
-    if actual_backend == AttentionBackendEnum.FLASHINFER:
+    # Both FlashInfer backends resolve per-layer hyperparameters at plan() time
+    # by scanning the model's Attention layers, which this synthetic harness
+    # does not construct. Mock that lookup for whichever one is under test.
+    per_layer_param_module = {
+        AttentionBackendEnum.FLASHINFER: "vllm.v1.attention.backends.flashinfer",
+        AttentionBackendEnum.ROCM_FLASHINFER: (
+            "vllm.v1.attention.backends.rocm_flashinfer"
+        ),
+    }.get(actual_backend)
+
+    if per_layer_param_module is not None:
         import unittest.mock
 
         from vllm.v1.attention.backends.utils import PerLayerParameters
@@ -282,7 +300,7 @@ def run_attention_backend(
             }
 
         with unittest.mock.patch(
-            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+            f"{per_layer_param_module}.get_per_layer_parameters",
             mock_get_per_layer_parameters,
         ):
             builder = builder_cls(kv_cache_spec, layer_names, vllm_config, device)
