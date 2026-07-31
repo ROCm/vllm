@@ -1520,7 +1520,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
            saturated past 92% of LPDDR5X peak after subtracting the per-     \
            launch dispatch floor.  Verify per shape with                     \
            benchmarks/kernels/sweep_bf16_kernel.py. */                       \
-        WVSPLITK_CFG_AC(32, 32, 1, 8, __N, 16)                               \
+        WVSPLITK_CFG_AC(32, 4, 1, 8, __N, 16)                                \
       /* gfx1151 AC=32 fast paths.  Each cell beats AC=16 by >=2% with       \
          z>1.96 in a 10-rep do_bench A/B (stderr 0.1-1.0us per cell, mean    \
          delta 1.5-3 us per cell).  Other K%2048==0 cells stay on the AC=16  \
@@ -1540,19 +1540,19 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
         WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
       else if ((K_in == 4096) && (__N == 2) && (M_in >= 4096))               \
         /* M>=4096 K=4096 N=2: 1.028x (z=6.2), W=32 wins at larger M */      \
-        WVSPLITK_CFG_AC(_THRDS, 32, 1, 2, __N, 32)                           \
+        WVSPLITK_CFG_AC(_THRDS, 4, 1, 2, __N, 32)                            \
       else if ((K_in == 4096) && (__N == 3))                                 \
         /* M=2560 K=4096 N=3: 1.031x (z=4.9) */                              \
         WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
       else if ((K_in == 8192) && (__N == 2))                                 \
         /* M=2560 K=8192 N=2: 1.040x (z=9.3), W=32 wins at this K */         \
-        WVSPLITK_CFG_AC(_THRDS, 32, 1, 2, __N, 32)                           \
+        WVSPLITK_CFG_AC(_THRDS, 4, 1, 2, __N, 32)                            \
       else if ((K_in % 2048 == 0) && (__N == 2))                             \
         /* gfx1151 K%2048==0, N=2 only: YT=2 + W=32 + AC=16 + UR=4.          \
            sweep_bf16_kernel.py 4-axis sweep showed this is the best         \
            N=2 config across K in {2048, 4096, 8192} and 4096x4096,          \
            1.06x (K=8192) to 1.60x (K=2048) over the prior AC=8 default. */  \
-        WVSPLITK_CFG_AC(_THRDS, 32, 2, 4, __N, 16)                           \
+        WVSPLITK_CFG_AC(_THRDS, 4, 2, 4, __N, 16)                            \
       else if ((K_in % 2048 == 0) && (__N != 2))                             \
         /* gfx1151 K%2048==0, N in {1, 3, 4} (K=2048 N=1 handled above):     \
            YT=1 + W=16 + AC=16 + UR=4.  N=3/4 want YT=1 not YT=2 (LDS/VGPR   \
@@ -1600,7 +1600,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 #define WVSPLIT_TILE(_sYT, __N)                                 \
   {                                                             \
     if (on_gfx1x()) { /* gfx11xx/GFX12, wave32 */               \
-      WVSPLIT_TILE_CFG(/*THRDS=*/32, /*WVPRGRP=*/16, _sYT, __N) \
+      WVSPLIT_TILE_CFG(/*THRDS=*/32, /*WVPRGRP=*/4, _sYT, __N) \
     } else { /* GFX9, wave64 */                                 \
       WVSPLIT_TILE_CFG(/*THRDS=*/64, /*WVPRGRP=*/16, _sYT, __N) \
     }                                                           \
