@@ -223,8 +223,8 @@ The `ROCM_FLASHINFER` backend in this branch
 
 ## Related
 
-- Working scripts used to produce these numbers live outside the repo in
-  `plan/scripts/` (`probe.py` full matrix, `probe2.py`
-  localization, `probe3.py` the causal-hypothesis test, `patch_use_rocm.py` the
-  JIT fix). The reproduction above is self-contained and does not depend on them.
+- The scripts used to produce these numbers are in [`scripts/`](./scripts/):
+  `probe.py` (full matrix), `probe2.py` (localization), `probe3.py` (the
+  causal-hypothesis test), `patch_use_rocm.py` (the JIT fix). The reproduction
+  above is self-contained and does not depend on them.
 - Integration plan and current status: [`flashinfer-as-vllm-backend.md`](./flashinfer-as-vllm-backend.md)
