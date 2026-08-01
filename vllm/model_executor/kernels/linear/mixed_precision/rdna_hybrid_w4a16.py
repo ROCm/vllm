@@ -468,13 +468,15 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             return False, "RDNAHybridW4A16LinearKernel only targets gfx11/gfx12"
 
         if envs.VLLM_BATCH_INVARIANT:
-            # This kernel switches between two independent implementations on
-            # the batch size -- a HIP skinny GEMM at M <= MAX_SKINNY_BATCH_SIZE
-            # and a Triton fused-dequant GEMM above it -- which will not agree
-            # bitwise. Unlike the MX GEMMs, where one kernel merely changes tile
-            # constants and keeps a single sequential K accumulation, there is
-            # no reason for two separate implementations to reduce in the same
-            # order. Not measured: no gfx11 hardware was available.
+            # Precautionary, not measured -- no gfx11/gfx12 hardware was
+            # available. This kernel switches between two independent
+            # implementations on the batch size: a HIP skinny GEMM at
+            # M <= MAX_SKINNY_BATCH_SIZE and a Triton fused-dequant GEMM above
+            # it. Note that is only weak evidence on its own: the ROCm fp8
+            # kernel makes the same wvSplitKQ-versus-library switch at M <= 4
+            # and was measured bitwise invariant across it. Excluding this
+            # kernel falls through to TritonW4A16LinearKernel, which was
+            # measured invariant on gfx950, so the cost of being wrong is low.
             return False, "batch invariance not supported"
 
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
