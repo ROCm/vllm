@@ -44,7 +44,14 @@ __global__ void __launch_bounds__(512, 1)
 #pragma unroll
   for (int i = 0; i < ngpus; i++) {
     int target = (rank + i) % ngpus;
-    ptrs[i] = (const P*)_dp->ptrs[target];
+    // Reduce in plain rank order rather than starting at our own rank. The
+    // rotation staggers which peer each rank reads first, but it also makes an
+    // element's accumulation order depend on which slice owns it -- and slice
+    // width is size/ngpus, so that order moves with the message size. Fixing
+    // the order here makes the two-shot kernel batch invariant and bitwise
+    // equal to the one-shot one. tmps keeps the rotation; the gather stage
+    // below indexes it by the same (rank + i) % ngpus.
+    ptrs[i] = (const P*)_dp->ptrs[i];
     tmps[i] = get_tmp_buf<P>(sg.signals[target]);
   }
   auto tmp_out = tmps[0];
@@ -354,3 +361,4 @@ class CustomAllreduce {
  *                                                       half *, int, int, int);
  */
 }  // namespace vllm
+
