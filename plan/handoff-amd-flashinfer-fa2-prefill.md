@@ -6,6 +6,17 @@
 **Severity:** High — wrong numerical output, no error raised, on the **default** code path
 **Status:** Open, not reported upstream yet
 
+## Three findings in this document
+
+1. **HIP `fa2` prefill returns wrong results** — the main subject below.
+   Correctness bug, silent, on the default route. *High.*
+2. **JIT cannot compile against torch 2.11** — one missing `-DUSE_ROCM`.
+   Blocks amd-flashinfer and current vLLM from coexisting at all. *Trivial fix.*
+3. **No `fast_decode_plan` on the ROCm path** — missing optimization, costs
+   ~37–42% on small-batch decode under CUDA graphs. *Enhancement.*
+
+They are independent; each can be filed separately.
+
 ---
 
 ## TL;DR
@@ -186,6 +197,39 @@ amd-flashinfer and current vLLM cannot coexist at all.
 
 ---
 
+## Third finding: no `fast_decode_plan` on the ROCm path
+
+Not a bug — a missing optimization, but one that costs real throughput, so it
+belongs in the same conversation.
+
+`BatchDecodeWithPagedKVCacheWrapper.plan()` runs on the host, outside any
+captured CUDA graph, once per decode step. Upstream FlashInfer ships
+`flashinfer.decode.fast_decode_plan`, a cudagraph-aware variant that avoids
+device-to-device index copies, and the CUDA vLLM backend uses it for exactly
+this reason. The ROCm build routes decode through `decode_rocm.py`, which does
+not define it:
+
+```
+ImportError: cannot import name 'fast_decode_plan' from 'flashinfer.decode_rocm'
+```
+
+Measured cost on MI300X (TinyLlama-1.1B, bf16, decode, CUDA graphs enabled,
+`ROCM_FLASHINFER` vs vLLM's `ROCM_AITER_FA`, which has no planning stage):
+
+| batch size | AITER | FlashInfer | gap |
+|---|---|---|---|
+| 1 | 0.724 s | 0.990 s | +36.7% |
+| 8 | 0.975 s | 1.388 s | +42.4% |
+| 32 | 1.627 s | 1.617 s | −0.6% |
+
+The gap vanishing by batch 32 is the tell: it is a fixed per-step host cost,
+hidden once GPU work per step is large enough. Without graphs the two backends
+are within noise of each other at every batch size — the overhead only becomes
+decisive once graphs remove everything else.
+
+A ROCm `fast_decode_plan` would close this. Full numbers and method:
+[`benchmark-results.md`](./benchmark-results.md).
+
 ## Impact on the vLLM integration
 
 The `ROCM_FLASHINFER` backend in this branch
@@ -209,9 +253,10 @@ The `ROCM_FLASHINFER` backend in this branch
 
 ## Suggested next steps
 
-1. File both issues against [AMD-Ecosystem/flashinfer](https://github.com/AMD-Ecosystem/flashinfer)
-   — the prefill correctness bug and the `-DUSE_ROCM` JIT flag. They are
-   independent and the second is a trivial fix.
+1. File all three issues against [AMD-Ecosystem/flashinfer](https://github.com/AMD-Ecosystem/flashinfer)
+   — the prefill correctness bug, the `-DUSE_ROCM` JIT flag, and the missing
+   `fast_decode_plan`. They are independent; the second is a trivial fix and
+   the first is the one that blocks use.
 2. Ask whether `fa2` prefill is expected to be functional in 0.5.3+amd.1 at all,
    or whether AITER is the only supported prefill route on gfx942 today. The
    README's feature matrix lists `fa2` prefill as supported (✅), which is what

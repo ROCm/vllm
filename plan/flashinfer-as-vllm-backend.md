@@ -8,7 +8,7 @@
 | 1 — register backend | **GATE PASS** — 30/30 checks (`gate_phase1.py`) |
 | 2 — builder + forward | **GATE PASS** — end-to-end coherent text on TinyLlama, eager |
 | 3 — correctness | **layers 1–2 PASS**; layer 3 (GSM8K) not run |
-| 4 — benchmarks | **DONE (latency)** — on par with AITER, 8–16% faster than Triton. See [`benchmark-results.md`](./benchmark-results.md). Throughput/serve not run. |
+| 4 — benchmarks | **DONE (latency, eager)** — on par with AITER, 8–16% faster than Triton *in eager mode only*; the ranking changes once graphs are on, see Phase 6 and [`benchmark-results.md`](./benchmark-results.md). Throughput/serve not run. |
 | 5 — Dockerfile | **Not started** — recipe known and working, but images are `docker commit` snapshots and not reproducible |
 | 6 — optimization | **CUDA graphs DONE** (4.6× on decode_bs1). Remaining gap vs AITER at small batch is host-side `plan()`; the CUDA fix `fast_decode_plan` **does not exist in the ROCm build** |
 | 7 | Not started |
@@ -35,7 +35,9 @@ candidates are an *exact bf16 tie* under `ROCM_FLASHINFER`
 accumulation orders, not incorrectness. Earlier read — that AITER and
 TRITON agreeing meant ours was wrong — did not survive the measurement.
 
-**Layer 3 — GSM8K:** not run. Needs the dataset, and this host is offline.
+**Layer 3 — GSM8K:** not run. It needed the dataset while the host was
+offline; huggingface.co is reachable again, so this is now unblocked and is
+the remaining work to close Phase 3.
 
 ### Environment: a three-way version squeeze (resolved)
 
