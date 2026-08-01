@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tensor-parallel all-reduce must not depend on the number of tokens.
 
-NCCL and RCCL pick their algorithm, channel count and chunk boundaries from the
-message size, so the order in which a given element's contributions are summed
-changes with the batch size. Under ``VLLM_BATCH_INVARIANT`` the communicator is
-expected to route around that.
+Library collectives pick their algorithm, channel count and chunk boundaries
+from the message size, so the order in which a given element's contributions are
+summed changes with the batch size. Under ``VLLM_BATCH_INVARIANT`` the
+communicator is expected to route around that, whichever backend it lands on.
 
 Requires at least 4 GPUs: a 2-rank sum is order independent, so TP=2 passes even
 with a batch-variant collective.
@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 import ray
 import torch
-from utils import skip_unsupported
 
 from tests.utils import (
     init_test_distributed_environment,
@@ -25,20 +24,37 @@ from tests.utils import (
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import set_custom_all_reduce
+from vllm.platforms import current_platform
 
-# Token counts spanning the small-message thresholds where the library
-# all-reduce switches protocol and chunking.
+# Token counts spanning the small-message thresholds where the collectives
+# switch protocol, chunking, or algorithm.
 TOKEN_COUNTS = [1, 2, 3, 4, 5, 8, 16, 17, 32, 64, 128, 256, 512]
 HIDDEN_SIZE = 4096
 
+# Row 0 always sits at offset 0, so it lands in the first chunk of every
+# decomposition and stays invariant even when the rest of the tensor does not.
+# Checking it alone hides real failures.
+CHECK_ROWS = [0, 1, 2, 3, 7, 15, 31]
 
-@ray.remote(num_gpus=1, max_calls=1)
-def all_reduce_batch_invariance_worker(
+# (dtype, exponent_spread). The spread widens the operand range so that the fp32
+# accumulator inside the reduction has to round: reduction order is only
+# irrelevant while the accumulator has headroom over the input significand,
+# which fp32 inputs never have and bf16 loses once activations have outliers.
+CASES = [
+    (torch.bfloat16, 0),
+    (torch.bfloat16, 20),
+    (torch.float16, 10),
+    (torch.float32, 0),
+]
+
+
+def _check_all_reduce(
     monkeypatch: pytest.MonkeyPatch,
     tp_size: int,
     pp_size: int,
     rank: int,
     distributed_init_port: str,
+    use_custom_all_reduce: bool,
 ):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
@@ -46,44 +62,78 @@ def all_reduce_batch_invariance_worker(
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
 
-    # ParallelConfig turns custom all-reduce off under batch invariance, which
-    # leaves the library collective in charge. Match that here, otherwise this
-    # exercises CustomAllreduce and passes no matter what the fallback does.
-    set_custom_all_reduce(False)
+    # Both paths have to hold: the custom all-reduce serves messages under its
+    # size limit, the library collective (and the batch-invariant fallback
+    # around it) serves everything above.
+    set_custom_all_reduce(use_custom_all_reduce)
     init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
 
-    generator = torch.Generator(device=device).manual_seed(1234 + rank)
-    full = torch.randn(
-        max(TOKEN_COUNTS),
-        HIDDEN_SIZE,
-        generator=generator,
-        device=device,
-        dtype=torch.bfloat16,
+    failures = []
+    for dtype, spread in CASES:
+        generator = torch.Generator(device=device).manual_seed(1234 + rank)
+        full = torch.randn(
+            max(TOKEN_COUNTS), HIDDEN_SIZE, generator=generator, device=device
+        )
+        if spread:
+            exponents = torch.randint(
+                -spread,
+                spread,
+                full.shape,
+                generator=generator,
+                device=device,
+                dtype=torch.int32,
+            )
+            full = full * torch.exp2(exponents.float())
+        full = full.to(dtype)
+
+        reduced = {
+            num_tokens: tensor_model_parallel_all_reduce(full[:num_tokens].clone())
+            for num_tokens in TOKEN_COUNTS
+        }
+        for row in CHECK_ROWS:
+            # A row is only comparable across launches that actually contain it.
+            counts = [n for n in TOKEN_COUNTS if n > row]
+            reference = reduced[counts[0]][row]
+            variant = [n for n in counts if not torch.equal(reduced[n][row], reference)]
+            if variant:
+                failures.append(
+                    f"{dtype} spread=+-{spread} row={row} changed at token "
+                    f"counts {variant}"
+                )
+
+    assert not failures, (
+        f"all-reduce depends on the token count over {tp_size} ranks "
+        f"(custom_all_reduce={use_custom_all_reduce}):\n  " + "\n  ".join(failures)
     )
 
-    # The first row is present in every launch, so its all-reduced value is the
-    # same mathematical sum each time and may only differ by reduction order.
-    first_rows = {
-        num_tokens: tensor_model_parallel_all_reduce(full[:num_tokens].clone())[0]
-        for num_tokens in TOKEN_COUNTS
-    }
 
-    reference = first_rows[TOKEN_COUNTS[0]]
-    variant = [n for n, row in first_rows.items() if not torch.equal(row, reference)]
-    assert not variant, (
-        f"all-reduce of row 0 changed with the token count at {variant} "
-        f"(reduced over {tp_size} ranks, hidden size {HIDDEN_SIZE})"
-    )
+# multi_process_parallel does not forward extra arguments to the remote, so bind
+# the two collective paths as separate workers.
+@ray.remote(num_gpus=1, max_calls=1)
+def custom_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
+    _check_all_reduce(monkeypatch, tp_size, pp_size, rank, port, True)
 
 
-@skip_unsupported
+@ray.remote(num_gpus=1, max_calls=1)
+def library_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
+    _check_all_reduce(monkeypatch, tp_size, pp_size, rank, port, False)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(),
+    reason="requires a CUDA-alike device",
+)
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 4,
     reason="a 2-rank sum is order independent, so this needs at least 4 GPUs",
 )
 @pytest.mark.parametrize("tp_size", [4])
+@pytest.mark.parametrize(
+    "worker", [custom_ar_worker, library_ar_worker], ids=["custom_ar", "library_ar"]
+)
 def test_tp_all_reduce_is_batch_invariant(
     tp_size: int,
+    worker,
     monkeypatch: pytest.MonkeyPatch,
 ):
     # multi_process_parallel forwards PYTHONPATH to the ray workers, which have
@@ -93,4 +143,4 @@ def test_tp_all_reduce_is_batch_invariant(
         "PYTHONPATH",
         os.pathsep.join(filter(None, [test_dir, os.environ.get("PYTHONPATH")])),
     )
-    multi_process_parallel(monkeypatch, tp_size, 1, all_reduce_batch_invariance_worker)
+    multi_process_parallel(monkeypatch, tp_size, 1, worker)

@@ -1278,21 +1278,27 @@ def enable_batch_invariant_mode():
 
 
 def override_envs_for_invariance():
-    os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-    # NCCL determinism settings
-    os.environ["NCCL_LAUNCH_MODE"] = "GROUP"
-    os.environ["NCCL_COLLNET_ENABLE"] = "0"
-    os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["NCCL_P2P_NET_DISABLE"] = "1"
-
     if not current_platform.is_rocm():
+        # None of this block is applied on ROCm. Symmetric memory is only
+        # reachable behind an is_cuda() check, CUBLAS_WORKSPACE_CONFIG is not
+        # read by hipBLASLt, and under batch invariance every reduction is
+        # served either by the custom all-reduce, which sums in a fixed rank
+        # order, or by all-gather plus a fixed-order local sum -- the remaining
+        # collectives move data without arithmetic and so are bitwise
+        # reproducible whatever algorithm, protocol or channel count the library
+        # picks. NVLS is NVIDIA-only, CollNet is a multi-node network offload,
+        # and RCCL spells the P2P knob RCCL_P2P_NET_DISABLE.
+        os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        os.environ["NCCL_LAUNCH_MODE"] = "GROUP"
+        os.environ["NCCL_COLLNET_ENABLE"] = "0"
+        os.environ["NCCL_NVLS_ENABLE"] = "0"
+        os.environ["NCCL_P2P_NET_DISABLE"] = "1"
+
         # Pinning the algorithm, protocol and channel count serialises the
         # reduction so that it does not depend on the message size. On ROCm it
         # does neither half of that job and is very expensive, so it is skipped
-        # below -- see the comment there.
+        # -- see the comment below.
         os.environ["NCCL_MIN_NCHANNELS"] = "1"
         os.environ["NCCL_MAX_NCHANNELS"] = "1"
         os.environ["NCCL_PROTO"] = "Simple"
@@ -1315,14 +1321,17 @@ def override_envs_for_invariance():
         # pins only throttle it. Dropping them makes that all-reduce 26x faster
         # at 8192 tokens (34.7ms -> 1.3ms over 4 ranks) with identical output.
 
-        # The ROCm skinny GEMMs pick a kernel from the token count, so a row's
-        # result depends on how many rows it was launched with.
-        # rocm_unquantized_gemm_impl short-circuits under batch invariance, but
+        # Defensive rather than load-bearing: with the current kernel selection
+        # nothing reaches a skinny GEMM under batch invariance anyway, and
+        # removing this changes no measured result. It is kept because the
+        # skinny GEMMs pick a kernel from the token count, so anything that does
+        # reach one gets a row whose value depends on how many rows shared its
+        # launch. rocm_unquantized_gemm_impl short-circuits in code, but
         # ROCmFP8ScaledMMLinearKernel is only kept out by forcing a different
-        # kernel, and that forcing silently falls back to the platform list when
-        # the forced kernel cannot implement a layer. This closes that door.
-        # Note it does not reach the RDNA hybrid W4A16 kernel, which switches on
-        # M without consulting this flag.
+        # kernel, and that forcing falls back to the platform list when the
+        # forced kernel cannot implement a layer. Note this flag does not reach
+        # the RDNA hybrid W4A16 kernel, which switches on M without consulting
+        # it; that one is excluded in can_implement instead.
         os.environ["VLLM_ROCM_USE_SKINNY_GEMM"] = "0"
 
         # No VLLM_CUSTOM_ALLREDUCE_ALGO pin is needed: both custom all-reduce
