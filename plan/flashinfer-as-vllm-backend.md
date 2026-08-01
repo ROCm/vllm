@@ -9,7 +9,9 @@
 | 2 — builder + forward | **GATE PASS** — end-to-end coherent text on TinyLlama, eager |
 | 3 — correctness | **layers 1–2 PASS**; layer 3 (GSM8K) not run |
 | 4 — benchmarks | **DONE (latency)** — on par with AITER, 8–16% faster than Triton. See [`benchmark-results.md`](./benchmark-results.md). Throughput/serve not run. |
-| 5–7 | Not started |
+| 5 — Dockerfile | **Not started** — recipe known and working, but images are `docker commit` snapshots and not reproducible |
+| 6 — optimization | **CUDA graphs DONE** (4.6× on decode_bs1). Remaining gap vs AITER at small batch is host-side `plan()`; the CUDA fix `fast_decode_plan` **does not exist in the ROCm build** |
+| 7 | Not started |
 
 Working branch: `rocm-flashinfer`, based on upstream `bebf918044` (v0.26.1rc0).
 Built as `0.26.1rc1.dev180+gbebf91804...rocm723`.

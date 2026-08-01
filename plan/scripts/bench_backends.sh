@@ -13,6 +13,10 @@ set -uo pipefail
 
 MODEL="${MODEL:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
 OUTDIR="${OUTDIR:-/vllm/bench-results}"
+# EAGER=1 forces --enforce-eager for every backend (the only fair comparison
+# while a backend has cudagraph support disabled). EAGER=0 runs each backend in
+# its default configuration, which is what users actually get.
+EAGER="${EAGER:-1}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.10}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-2048}"
 ITERS="${ITERS:-5}"
@@ -40,12 +44,15 @@ for cfg in $CONFIGS; do
     log="$OUTDIR/${name}__${be}.log"
     echo "=== $name / $be (isl=$isl osl=$osl bs=$bs)"
     before=$(gpu_use)
+    eager_flag=""
+    [ "$EAGER" = "1" ] && eager_flag="--enforce-eager"
+    # shellcheck disable=SC2086
     VLLM_ROCM_USE_FLASHINFER=1 vllm bench latency \
       --model "$MODEL" \
       --attention-backend "$be" \
       --input-len "$isl" --output-len "$osl" --batch-size "$bs" \
       --num-iters-warmup "$WARMUP" --num-iters "$ITERS" \
-      --enforce-eager \
+      $eager_flag \
       --max-model-len "$MAX_MODEL_LEN" \
       --gpu-memory-utilization "$GPU_MEM_UTIL" \
       > "$log" 2>&1

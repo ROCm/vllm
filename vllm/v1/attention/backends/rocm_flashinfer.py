@@ -35,7 +35,7 @@ from flashinfer import (
     BatchPrefillWithPagedKVCacheWrapper,
 )
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
@@ -259,10 +259,12 @@ def _copy_page_indices_kernel(
 
 
 class RocmFlashInferMetadataBuilder(AttentionMetadataBuilder[RocmFlashInferMetadata]):
-    # CUDA graph support is deliberately deferred: get correctness first, then
-    # raise this to UNIFORM_SINGLE_TOKEN_DECODE together with the persistent
-    # decode-wrapper cache that it requires.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # Graphs are captured for pure single-token-decode batches only. Prefill
+    # plans depend on qo_indptr, which varies per step, and spec-decode
+    # (query_len > 1) is not wired up here.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    )
 
     def __init__(
         self,
@@ -306,6 +308,23 @@ class RocmFlashInferMetadataBuilder(AttentionMetadataBuilder[RocmFlashInferMetad
         self._prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = None
         self._decode_wrapper: BatchDecodeWithPagedKVCacheWrapper | None = None
 
+        # Full-decode CUDA graphs need one wrapper per captured batch size:
+        # the wrapper binds its index buffers at construction, and replay
+        # requires those addresses to stay fixed.
+        compilation_config = vllm_config.compilation_config
+        self.enable_cuda_graph = (
+            compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        )
+        self._decode_wrappers_cudagraph: dict[
+            int, BatchDecodeWithPagedKVCacheWrapper
+        ] = {}
+        self._decode_cudagraph_max_bs = max_num_reqs
+        if compilation_config.max_cudagraph_capture_size is not None:
+            self._decode_cudagraph_max_bs = min(
+                self._decode_cudagraph_max_bs,
+                compilation_config.max_cudagraph_capture_size,
+            )
+
     def _make_buffer(self, size: int) -> CpuGpuBuffer:
         return CpuGpuBuffer(
             size, dtype=torch.int32, device=self.device, pin_memory=PIN_MEMORY
@@ -329,17 +348,45 @@ class RocmFlashInferMetadataBuilder(AttentionMetadataBuilder[RocmFlashInferMetad
             )
         return self._prefill_wrapper
 
-    def _get_decode_wrapper(self) -> BatchDecodeWithPagedKVCacheWrapper:
-        if self._decode_wrapper is None:
-            self._decode_wrapper = BatchDecodeWithPagedKVCacheWrapper(
+    def _get_decode_wrapper(
+        self, batch_size: int, use_cudagraph: bool = False
+    ) -> BatchDecodeWithPagedKVCacheWrapper:
+        if use_cudagraph:
+            wrapper = self._decode_wrappers_cudagraph.get(batch_size)
+        else:
+            wrapper = self._decode_wrapper
+
+        if wrapper is None:
+            if use_cudagraph:
+                # Bind the persistent buffers. plan() then writes into these
+                # exact allocations, so a captured graph keeps reading the
+                # right addresses on replay.
+                indptr_buf = self.paged_kv_indptr.gpu[: batch_size + 1]
+                indices_buf = self.paged_kv_indices.gpu
+                last_page_len_buf = self.paged_kv_last_page_len.gpu[:batch_size]
+            else:
+                indptr_buf = None
+                indices_buf = None
+                last_page_len_buf = None
+
+            wrapper = BatchDecodeWithPagedKVCacheWrapper(
                 self._get_workspace_buffer(),
                 "NHD",
+                use_cuda_graph=use_cudagraph,
+                paged_kv_indptr_buffer=indptr_buf,
+                paged_kv_indices_buffer=indices_buf,
+                paged_kv_last_page_len_buffer=last_page_len_buf,
                 # use_tensor_cores=True disqualifies the AITER route and is not
                 # needed by the HIP decode kernels.
                 use_tensor_cores=False,
                 backend=_DECODE_BACKEND,
             )
-        return self._decode_wrapper
+            if use_cudagraph:
+                self._decode_wrappers_cudagraph[batch_size] = wrapper
+            else:
+                self._decode_wrapper = wrapper
+
+        return wrapper
 
     def _build_paged_kv_indices(
         self,
@@ -414,11 +461,29 @@ class RocmFlashInferMetadataBuilder(AttentionMetadataBuilder[RocmFlashInferMetad
 
         # Decodes occupy [0, num_decodes); prefills occupy [num_decodes, num_reqs).
         if num_decodes > 0:
-            decode_wrapper = self._get_decode_wrapper()
+            # Only a pure-decode batch can be replayed: a mixed batch replans
+            # the prefill wrapper every step, and its qo_indptr is not fixed.
+            use_cudagraph = (
+                self.enable_cuda_graph
+                and num_prefills == 0
+                and num_decodes <= self._decode_cudagraph_max_bs
+            )
+            decode_wrapper = self._get_decode_wrapper(num_decodes, use_cudagraph)
+            if use_cudagraph:
+                # Hand plan() the persistent buffers themselves, not the
+                # equal-valued slices above, so the addresses match the ones
+                # bound into the wrapper at construction.
+                decode_indptr = self.paged_kv_indptr.gpu[: num_decodes + 1]
+                decode_indices = self.paged_kv_indices.gpu
+                decode_last_page_len = self.paged_kv_last_page_len.gpu[:num_decodes]
+            else:
+                decode_indptr = indptr[: num_decodes + 1]
+                decode_indices = indices
+                decode_last_page_len = last_page_len[:num_decodes]
             decode_wrapper.plan(
-                indptr[: num_decodes + 1],
-                indices,
-                last_page_len[:num_decodes],
+                decode_indptr,
+                decode_indices,
+                decode_last_page_len,
                 self.num_qo_heads,
                 self.num_kv_heads,
                 self.head_dim,
@@ -458,6 +523,20 @@ class RocmFlashInferMetadataBuilder(AttentionMetadataBuilder[RocmFlashInferMetad
             attn_metadata.prefill_wrapper = prefill_wrapper
 
         return attn_metadata
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> RocmFlashInferMetadata:
+        # Capture is decode-only, one query token per request.
+        num_reqs = common_attn_metadata.num_reqs
+        assert common_attn_metadata.num_actual_tokens == num_reqs, (
+            "ROCM_FLASHINFER only captures pure single-token-decode batches; "
+            f"got {common_attn_metadata.num_actual_tokens} tokens for "
+            f"{num_reqs} requests."
+        )
+        return self.build(
+            common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        )
 
     def use_cascade_attention(self, *args, **kwargs) -> bool:
         # MultiLevelCascadeAttentionWrapper is absent from the HIP build.
