@@ -1287,14 +1287,34 @@ def override_envs_for_invariance():
     os.environ["NCCL_COLLNET_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
     os.environ["NCCL_P2P_NET_DISABLE"] = "1"
-    os.environ["NCCL_MIN_NCHANNELS"] = "1"
-    os.environ["NCCL_MAX_NCHANNELS"] = "1"
-    os.environ["NCCL_PROTO"] = "Simple"
-    os.environ["NCCL_ALGO"] = "allreduce:tree"
-    os.environ["NCCL_NTHREADS"] = "1"
-    os.environ["NCCL_SOCKET_NTHREADS"] = "1"
+
+    if not current_platform.is_rocm():
+        # Pinning the algorithm, protocol and channel count serialises the
+        # reduction so that it does not depend on the message size. On ROCm it
+        # does neither half of that job and is very expensive, so it is skipped
+        # below -- see the comment there.
+        os.environ["NCCL_MIN_NCHANNELS"] = "1"
+        os.environ["NCCL_MAX_NCHANNELS"] = "1"
+        os.environ["NCCL_PROTO"] = "Simple"
+        os.environ["NCCL_ALGO"] = "allreduce:tree"
+        os.environ["NCCL_NTHREADS"] = "1"
+        os.environ["NCCL_SOCKET_NTHREADS"] = "1"
 
     if current_platform.is_rocm():
+        # RCCL does not become batch invariant under those pins: an all-reduce
+        # of [N, 4096] bf16 over 4 ranks still gives 5 distinct results for some
+        # rows, because ring chunk boundaries are recomputed from the message
+        # size (rccl/src/device/all_reduce.h). NCCL_ALGO=allreduce:tree is a
+        # no-op here as well -- Tree has zero bandwidth for AllReduce in RCCL's
+        # gfx950 tuning table, so it silently falls back to Ring -- and
+        # NCCL_NTHREADS=1 is clamped straight back up to the maximum.
+        #
+        # They are not merely useless. Under batch invariance all_reduce is
+        # served by all_reduce_batch_invariant, whose all-gather is pure data
+        # movement and so is bitwise reproducible whatever the algorithm; the
+        # pins only throttle it. Dropping them makes that all-reduce 26x faster
+        # at 8192 tokens (34.7ms -> 1.3ms over 4 ranks) with identical output.
+
         # The ROCm skinny GEMMs pick a kernel from the token count, so a row's
         # result depends on how many rows it was launched with.
         # rocm_unquantized_gemm_impl short-circuits under batch invariance, but
