@@ -26,6 +26,29 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 
+# Ceiling on the IPC buffer the custom all-reduce registers per rank, so a
+# pathological max_num_batched_tokens cannot reserve an unbounded amount.
+_MAX_BATCH_INVARIANT_CA_BYTES = 128 * 1024 * 1024
+
+
+def _max_allreduce_bytes() -> int | None:
+    """Largest tensor a TP all-reduce can see, from the scheduler and model."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None or config.model_config is None:
+        return None
+    max_tokens = config.scheduler_config.max_num_batched_tokens
+    if not max_tokens:
+        return None
+    hidden = config.model_config.get_hidden_size()
+    itemsize = config.model_config.dtype.itemsize
+    # +1 token of slack: the custom all-reduce bound is strict (`<`).
+    return min(
+        (max_tokens + 1) * hidden * itemsize, _MAX_BATCH_INVARIANT_CA_BYTES
+    )
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
@@ -116,12 +139,26 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
+            ca_kwargs = {}
+            if envs.VLLM_BATCH_INVARIANT:
+                # The 8MB default is the point where NCCL's ring overtakes the
+                # one-shot kernel, which moves world_size times the buffer
+                # rather than twice it. Batch invariance cannot use the ring,
+                # and its fallback -- all-gather plus a local sum -- moves the
+                # same volume as one-shot while also materialising the gathered
+                # buffer, so one-shot stays ahead at every size measured (0.70x
+                # to 0.90x of the fallback out to 128MB, still bitwise
+                # invariant there). Size the buffer for the largest all-reduce
+                # the scheduler can produce instead.
+                if (max_bytes := _max_allreduce_bytes()) is not None:
+                    ca_kwargs["max_size"] = max_bytes
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
+                **ca_kwargs,
             )
 
         if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
