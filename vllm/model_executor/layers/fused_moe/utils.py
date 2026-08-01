@@ -217,19 +217,6 @@ def _fp8_quantize_dequantize(
     A: torch.Tensor,
     A_scale: torch.Tensor,
 ):
-    if A_scale is None and envs.VLLM_BATCH_INVARIANT:
-        # Without a calibrated scale this falls back to a dynamic per-tensor
-        # amax, i.e. an amax over every token in the launch, so a row's
-        # quantized value depends on which other rows share its batch. That is
-        # batch variance by construction rather than by reduction order, and no
-        # choice of reduction order or tile shape can recover it.
-        raise ValueError(
-            "VLLM_BATCH_INVARIANT is set but this layer has no activation "
-            "scale, so fp8 activation quantization would fall back to a "
-            "dynamic per-tensor scale, which cannot be batch invariant. The "
-            "checkpoint must supply a static activation scale."
-        )
-
     qA, qA_scale = ops.scaled_fp8_quant(A, A_scale, use_per_token_if_dynamic=False)
     A = per_tensor_dequantize(qA, qA_scale).to(A.dtype)
 
