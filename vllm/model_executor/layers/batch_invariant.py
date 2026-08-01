@@ -446,6 +446,74 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
 
 
 @triton.jit
+def _softmax_kernel(
+    input_ptr,
+    output_ptr,
+    input_row_stride,
+    output_row_stride,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Softmax over the last dimension, one row per program.
+
+    Mirrors ``_log_softmax_kernel``: each row is reduced by a single program in
+    a fixed block order, so the result never depends on the row count.
+    """
+    row_idx = tl.program_id(0).to(tl.int64)
+    row_start_ptr = input_ptr + row_idx * input_row_stride
+    output_row_start_ptr = output_ptr + row_idx * output_row_stride
+
+    max_val = -float("inf")
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=-float("inf"))
+        max_val = tl.max(tl.maximum(vals, max_val))
+
+    sum_exp = 0.0
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        exp_vals = tl.exp(vals.to(tl.float32) - max_val)
+        sum_exp += tl.sum(tl.where(mask, exp_vals, 0.0))
+
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(row_start_ptr + col_idx, mask=mask)
+        output = tl.exp(vals.to(tl.float32) - max_val) / sum_exp
+        tl.store(
+            output_row_start_ptr + col_idx,
+            output.to(output_ptr.dtype.element_ty),
+            mask=mask,
+        )
+
+
+def softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Compute softmax along the last dimension using a Triton kernel."""
+    if dim != -1 and dim != input.ndim - 1:
+        raise ValueError(
+            "This implementation only supports softmax along the last dimension"
+        )
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    output = torch.empty_like(input_2d)
+
+    n_rows, n_cols = input_2d.shape
+    _softmax_kernel[(n_rows,)](
+        input_2d,
+        output,
+        input_2d.stride(0),
+        output.stride(0),
+        n_cols,
+        BLOCK_SIZE=1024,
+    )
+    return output.reshape(original_shape)
+
+
+@triton.jit
 def mean_kernel(
     input_ptr,
     output_ptr,
@@ -738,8 +806,11 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 
 
 def softmax_batch_invariant(input, dim, dtype=None):
-    # Compute softmax in a deterministic way
-    # First subtract max for numerical stability (standard practice)
+    if dim == -1 or dim == input.ndim - 1:
+        return softmax(input, dim=-1)
+
+    # Reducing over an interior dimension: torch.sum picks its split count from
+    # the tensor shape, so this path is only incidentally batch invariant.
     input_max = torch.amax(input, dim=dim, keepdim=True)
     input = input - input_max
     exp_x = torch.exp(input)
@@ -894,6 +965,241 @@ def linear_batch_invariant(input, weight, bias=None):
     return output
 
 
+@triton.jit(launch_metadata=_matmul_launch_metadata)
+def scaled_mm_kernel_persistent(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    bias_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    A_SCALE_PER_TOKEN: tl.constexpr,
+    B_SCALE_PER_CHANNEL: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    """Persistent fp8 GEMM with an fp32 accumulator and a dequant epilogue.
+
+    Same fixed tiling as ``matmul_kernel_persistent``: the tile shape and the
+    K-loop order are compile-time constants, so a given output tile is summed
+    in the same order no matter how many rows the launch has.
+    """
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M)
+        offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        offs_am = tl.where(offs_am < M, offs_am, 0)
+        offs_bn = tl.where(offs_bn < N, offs_bn, 0)
+        offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+        offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for ki in range(k_tiles):
+            offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+            a_ptrs = a_ptr + (
+                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
+            )
+            b_ptrs = b_ptr + (
+                offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
+            k_valid = offs_k_for_mask < K - ki * BLOCK_SIZE_K
+            a = tl.load(a_ptrs, mask=k_valid[None, :], other=0.0)
+            b = tl.load(b_ptrs, mask=k_valid[:, None], other=0.0)
+            accumulator = tl.dot(a, b, accumulator)
+
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+
+        if A_SCALE_PER_TOKEN:
+            a_scale = tl.load(a_scale_ptr + offs_cm, mask=offs_cm < M, other=0.0)
+        else:
+            a_scale = tl.load(a_scale_ptr)
+        if B_SCALE_PER_CHANNEL:
+            b_scale = tl.load(b_scale_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+        else:
+            b_scale = tl.load(b_scale_ptr)
+
+        if A_SCALE_PER_TOKEN and B_SCALE_PER_CHANNEL:
+            accumulator = accumulator * a_scale[:, None] * b_scale[None, :]
+        elif A_SCALE_PER_TOKEN:
+            accumulator = accumulator * a_scale[:, None] * b_scale
+        elif B_SCALE_PER_CHANNEL:
+            accumulator = accumulator * a_scale * b_scale[None, :]
+        else:
+            accumulator = accumulator * a_scale * b_scale
+
+        if HAS_BIAS:
+            bias = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+            accumulator += bias.to(tl.float32)
+
+        c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty), mask=c_mask)
+
+
+def scaled_mm_batch_invariant(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Batch-invariant replacement for ``torch._scaled_mm``.
+
+    ``a`` is ``(M, K)`` fp8 with per-tensor or per-token scales, ``b`` is
+    ``(K, N)`` fp8 with per-tensor or per-channel scales.
+    """
+    M, K = a.shape
+    _, N = b.shape
+    NUM_SMS = num_compute_units(a.device.index)
+
+    a_scale_per_token = a_scale.numel() > 1
+    b_scale_per_channel = b_scale.numel() > 1
+    assert not a_scale_per_token or a_scale.numel() == M, (
+        f"activation scale must be per-tensor or per-token, got {a_scale.shape}"
+    )
+    assert not b_scale_per_channel or b_scale.numel() == N, (
+        f"weight scale must be per-tensor or per-channel, got {b_scale.shape}"
+    )
+
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype)
+
+    cfg = {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 8,
+        "num_stages": 2,
+        "num_warps": 8,
+    }
+
+    def grid(META):
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, META["BLOCK_SIZE_M"])
+                * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+            ),
+        )
+
+    scaled_mm_kernel_persistent[grid](
+        a,
+        b,
+        c,
+        a_scale.contiguous().view(-1),
+        b_scale.contiguous().view(-1),
+        bias,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        NUM_SMS=NUM_SMS,
+        A_SCALE_PER_TOKEN=a_scale_per_token,
+        B_SCALE_PER_CHANNEL=b_scale_per_channel,
+        HAS_BIAS=bias is not None,
+        **cfg,
+    )
+    return c
+
+
+@triton.jit
+def _fixed_order_sum_kernel(
+    src_ptr,  # (WORLD_SIZE, numel) gathered contributions, rank-major
+    out_ptr,  # (numel,)
+    numel,
+    stride_rank,
+    WORLD_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    LARGE: tl.constexpr,
+):
+    """Sum ``WORLD_SIZE`` contributions in ascending rank order, fp32 accumulator.
+
+    The accumulation order is a compile-time constant, so the result depends only
+    on the rank ordering and never on how many elements are being reduced.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if LARGE:
+        offs = offs.to(tl.int64)
+    mask = offs < numel
+
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for r in tl.static_range(WORLD_SIZE):
+        vals = tl.load(src_ptr + r * stride_rank + offs, mask=mask, other=0.0)
+        acc += vals.to(tl.float32)
+
+    tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def all_reduce_batch_invariant(
+    input_: torch.Tensor, group: "torch.distributed.ProcessGroup | None" = None
+) -> torch.Tensor:
+    """Sum all-reduce whose result does not depend on the message size.
+
+    Library all-reduces (NCCL/RCCL) pick their algorithm, channel count and chunk
+    boundaries from the message size, so the order in which a given element's
+    contributions are summed changes with the number of tokens in the batch. On
+    8x gfx950 an ``allreduce`` of ``[N, 4096]`` bf16 yields eight distinct results
+    across ``N in 1..512``, even with ``NCCL_ALGO=allreduce:tree`` and a single
+    channel.
+
+    Instead, all-gather the contributions -- pure data movement, so bitwise
+    reproducible at any size -- and reduce them locally in ascending rank order.
+    """
+    import torch.distributed as dist
+
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        return input_
+
+    x = input_.contiguous()
+    numel = x.numel()
+    gathered = torch.empty((world_size, numel), dtype=x.dtype, device=x.device)
+    dist.all_gather_into_tensor(gathered, x.view(-1), group=group)
+
+    out = torch.empty_like(x)
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(numel, BLOCK_SIZE),)
+    _fixed_order_sum_kernel[grid](
+        gathered,
+        out.view(-1),
+        numel,
+        numel,
+        WORLD_SIZE=world_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        LARGE=gathered.numel() > 2**31,
+    )
+    return out
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _fp16_block_size_n = 256
@@ -926,6 +1232,17 @@ def enable_batch_invariant_mode():
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
             os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
 
+        _fp16_block_size_n = 256 if get_max_shared_memory_bytes() > 106496 else 128
+    elif current_platform.is_rocm():
+        # hipBLASLt is not batch invariant on gfx942/gfx950 and exposes no
+        # equivalent of the cuBLAS workspace knob that serializes split-k, so
+        # take the same route as SM80 and route the GEMMs through Triton.
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, key)
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, key)
+        _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, key)
+        _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, key)
+
+        # gfx950 has 160KB of LDS, gfx942 64KB.
         _fp16_block_size_n = 256 if get_max_shared_memory_bytes() > 106496 else 128
     elif current_platform.is_xpu():
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, key)

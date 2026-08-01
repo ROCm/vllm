@@ -1567,6 +1567,21 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        if envs.VLLM_BATCH_INVARIANT:
+            # These passes rewrite the collective the communicator would have
+            # run: sequence parallelism and AsyncTP turn an all-reduce into
+            # reduce-scatter + all-gather, and the fusion passes replace it with
+            # a fused all-reduce+RMSNorm kernel. Either way the batch-invariant
+            # all-reduce is bypassed and the reduction order goes back to being
+            # message-size dependent.
+            pass_config = self.compilation_config.pass_config
+            for name in ("enable_sp", "fuse_gemm_comms", "fuse_allreduce_rms"):
+                if getattr(pass_config, name, False):
+                    setattr(pass_config, name, False)
+                    logger.warning_once(
+                        "Disabling %s when VLLM_BATCH_INVARIANT is enabled.", name
+                    )
+
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [

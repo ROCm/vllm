@@ -34,6 +34,13 @@ DEVICE_BACKENDS: dict[str, DeviceConfig] = {
         available=current_platform.is_xpu() and HAS_TRITON,
         backends=["TRITON_ATTN"],
     ),
+    # ROCm reports device_type "cuda" but is_cuda() is False, so it needs its
+    # own entry. The AITER and ROCm custom attention backends do not declare
+    # supports_batch_invariance(), leaving the Triton backends.
+    "rocm": DeviceConfig(
+        available=current_platform.is_rocm() and HAS_TRITON,
+        backends=["TRITON_ATTN"],
+    ),
 }
 
 DEFAULT_MODEL = "Qwen/Qwen3-1.7B"
@@ -52,6 +59,10 @@ if os.getenv("VLLM_TEST_MODEL"):
             available=DEVICE_BACKENDS["xpu"].available,
             backends=[],
         )
+        DEVICE_BACKENDS["rocm"] = DeviceConfig(
+            available=DEVICE_BACKENDS["rocm"].available,
+            backends=["TRITON_MLA"],
+        )
 
 # Only include backends for devices that are actually available.
 BACKENDS: list[str] = sorted(
@@ -60,12 +71,19 @@ BACKENDS: list[str] = sorted(
 
 skip_unsupported = pytest.mark.skipif(
     not any(cfg.available for cfg in DEVICE_BACKENDS.values()),
-    reason="Requires CUDA >= Ampere (SM80) or Intel XPU with Triton",
+    reason="Requires CUDA >= Ampere (SM80), ROCm, or Intel XPU with Triton",
 )
 
 skip_if_not_cuda = pytest.mark.skipif(
     not DEVICE_BACKENDS["cuda"].available,
     reason="Requires CUDA >= Ampere (SM80)",
+)
+
+# For tests that only need a CUDA-alike GPU, i.e. anything whose kernels are
+# Triton or HIP-portable rather than NVIDIA-specific.
+skip_if_not_cuda_alike = pytest.mark.skipif(
+    not (DEVICE_BACKENDS["cuda"].available or DEVICE_BACKENDS["rocm"].available),
+    reason="Requires CUDA >= Ampere (SM80) or ROCm",
 )
 
 

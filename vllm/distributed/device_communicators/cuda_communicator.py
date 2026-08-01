@@ -273,6 +273,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        if envs.VLLM_BATCH_INVARIANT:
+            # Library all-reduces choose their reduction order from the message
+            # size, which makes the result depend on the number of tokens in the
+            # batch. Fall back to all-gather plus a fixed rank-order local sum.
+            from vllm.model_executor.layers.batch_invariant import (
+                all_reduce_batch_invariant,
+            )
+
+            return all_reduce_batch_invariant(input_, self.device_group)
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
