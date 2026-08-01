@@ -173,7 +173,11 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             global_num_experts=global_num_experts,
             expert_map=expert_map,
             a1q_scale=None,
-            a2_scale=None,
+            # The second GEMM quantizes from this argument rather than from the
+            # quant config, so dropping it sent the w_mxfp4_a_fp8 scheme down
+            # scaled_fp8_quant's dynamic path even though the checkpoint
+            # calibrated a static per-tensor scale.
+            a2_scale=a2_scale,
             workspace13=workspace13,
             workspace2=workspace2,
             expert_tokens_meta=expert_tokens_meta,

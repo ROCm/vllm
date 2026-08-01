@@ -40,7 +40,6 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
         dtype="auto",
         tensor_parallel_size=int(os.getenv("VLLM_MXFP4_TEST_TP_SIZE", "1")),
         enable_prefix_caching=False,
-        enforce_eager=True,
         attention_config={"backend": backend},
     )
 
