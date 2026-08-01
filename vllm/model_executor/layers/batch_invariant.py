@@ -1325,13 +1325,9 @@ def override_envs_for_invariance():
         # M without consulting this flag.
         os.environ["VLLM_ROCM_USE_SKINNY_GEMM"] = "0"
 
-        # The custom all-reduce stays enabled on ROCm under batch invariance,
-        # but only its one-shot algorithm sums every element in plain rank
-        # order. The two-shot one reduces a slice of width size/world_size with
-        # the order rotated by the owning rank, so an element's reduction order
-        # moves as the message grows. Selection between them is otherwise made
-        # by byte count.
-        os.environ["VLLM_CUSTOM_ALLREDUCE_ALGO"] = "1stage"
+        # No VLLM_CUSTOM_ALLREDUCE_ALGO pin is needed: both custom all-reduce
+        # kernels now reduce in plain rank order, so they agree bitwise and the
+        # size-based choice between them is invisible.
 
     # torch.compile settings
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"

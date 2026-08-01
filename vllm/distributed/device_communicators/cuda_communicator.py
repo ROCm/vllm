@@ -27,8 +27,11 @@ logger = init_logger(__name__)
 
 
 # Ceiling on the IPC buffer the custom all-reduce registers per rank, so a
-# pathological max_num_batched_tokens cannot reserve an unbounded amount.
-_MAX_BATCH_INVARIANT_CA_BYTES = 128 * 1024 * 1024
+# pathological max_num_batched_tokens cannot reserve an unbounded amount. This
+# bounds memory, not speed: one-shot was still 0.92x the all-gather fallback at
+# 1GB, with no crossover anywhere in range, and the fallback's own scratch is
+# world_size times the message. Raise it if a model needs more.
+_MAX_BATCH_INVARIANT_CA_BYTES = 1024 * 1024 * 1024
 
 
 def _max_allreduce_bytes() -> int | None:
@@ -315,13 +318,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # size, which makes the result depend on the number of tokens in the
             # batch.
             #
-            # The one-shot custom all-reduce does not: it sums the peer buffers
-            # in rank order for every element, independent of the size (see
-            # cross_device_reduce_1stage). Its two-shot sibling does vary --
-            # each rank reduces a slice whose width is size/world_size and
-            # rotates the order by its own rank -- so batch-invariant mode pins
-            # VLLM_CUSTOM_ALLREDUCE_ALGO=1stage. Prefer it where it applies; it
-            # is 3.6x faster than the all-gather path at one token.
+            # The custom all-reduce does not: both its kernels sum the peer
+            # buffers in plain rank order for every element, independent of the
+            # size, so they agree bitwise and the size-based choice between them
+            # is invisible. Prefer it wherever it applies -- 3.6x faster than
+            # the all-gather path at one token, 2.1x at 64MB.
             ca_comm = self.ca_comm
             if (
                 ca_comm is not None
