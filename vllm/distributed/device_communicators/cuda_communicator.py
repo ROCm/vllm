@@ -47,9 +47,7 @@ def _max_allreduce_bytes() -> int | None:
     hidden = config.model_config.get_hidden_size()
     itemsize = config.model_config.dtype.itemsize
     # +1 token of slack: the custom all-reduce bound is strict (`<`).
-    return min(
-        (max_tokens + 1) * hidden * itemsize, _MAX_BATCH_INVARIANT_CA_BYTES
-    )
+    return min((max_tokens + 1) * hidden * itemsize, _MAX_BATCH_INVARIANT_CA_BYTES)
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -143,18 +141,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             ca_kwargs = {}
-            if envs.VLLM_BATCH_INVARIANT:
-                # The 8MB default is the point where NCCL's ring overtakes the
-                # one-shot kernel, which moves world_size times the buffer
-                # rather than twice it. Batch invariance cannot use the ring,
-                # and its fallback -- all-gather plus a local sum -- moves the
-                # same volume as one-shot while also materialising the gathered
-                # buffer, so one-shot stays ahead at every size measured (0.70x
-                # to 0.90x of the fallback out to 128MB, still bitwise
-                # invariant there). Size the buffer for the largest all-reduce
-                # the scheduler can produce instead.
-                if (max_bytes := _max_allreduce_bytes()) is not None:
-                    ca_kwargs["max_size"] = max_bytes
+            # The 8MB default is the point where NCCL's ring overtakes the
+            # one-shot kernel, which moves world_size times the buffer rather
+            # than twice it. Batch invariance cannot use the ring, and its
+            # fallback -- all-gather plus a local sum -- moves the same volume
+            # as one-shot while also materialising the gathered buffer, so
+            # one-shot stays ahead at every size measured (0.70x to 0.90x of the
+            # fallback out to 128MB, still bitwise invariant there). Size the
+            # buffer for the largest all-reduce the scheduler can produce.
+            if (
+                envs.VLLM_BATCH_INVARIANT
+                and (max_bytes := _max_allreduce_bytes()) is not None
+            ):
+                ca_kwargs["max_size"] = max_bytes
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
@@ -318,11 +317,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # size, which makes the result depend on the number of tokens in the
             # batch.
             #
-            # The custom all-reduce does not: both its kernels sum the peer
-            # buffers in plain rank order for every element, independent of the
-            # size, so they agree bitwise and the size-based choice between them
-            # is invisible. Prefer it wherever it applies -- 3.6x faster than
-            # the all-gather path at one token, 2.1x at 64MB.
+            # The custom all-reduce does not. Both its kernels sum a given
+            # element over exactly world_size values in a fixed order, so
+            # neither depends on the message size and the size-based choice
+            # between them is invisible. Measured bitwise invariant for
+            # N in 1..16384 at world_size 4 and 8, under each kernel and under
+            # the default heuristic. Prefer it wherever it applies -- 3.6x
+            # faster than the all-gather path at one token, 2.7x at 64MB.
             ca_comm = self.ca_comm
             if (
                 ca_comm is not None

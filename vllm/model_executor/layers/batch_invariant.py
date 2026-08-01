@@ -1326,8 +1326,8 @@ def override_envs_for_invariance():
         os.environ["VLLM_ROCM_USE_SKINNY_GEMM"] = "0"
 
         # No VLLM_CUSTOM_ALLREDUCE_ALGO pin is needed: both custom all-reduce
-        # kernels now reduce in plain rank order, so they agree bitwise and the
-        # size-based choice between them is invisible.
+        # kernels reduce a given element over world_size values in a fixed
+        # order, so the size-based choice between them is invisible.
 
     # torch.compile settings
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
