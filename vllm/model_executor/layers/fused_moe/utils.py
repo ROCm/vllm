@@ -217,6 +217,14 @@ def _fp8_quantize_dequantize(
     A: torch.Tensor,
     A_scale: torch.Tensor,
 ):
+    if A_scale is None and envs.VLLM_BATCH_INVARIANT:
+        # A dynamic per-tensor scale is an amax over every token in the launch,
+        # so a row's quantized value depends on which other rows it shares the
+        # batch with -- batch variance by construction rather than by reduction
+        # order. Per-token scales are row-local, so they survive rebatching.
+        qA, qA_scale = ops.scaled_fp8_quant(A, None, use_per_token_if_dynamic=True)
+        return (qA.to(torch.float32) * qA_scale).to(A.dtype), None
+
     qA, qA_scale = ops.scaled_fp8_quant(A, A_scale, use_per_token_if_dynamic=False)
     A = per_tensor_dequantize(qA, qA_scale).to(A.dtype)
 
