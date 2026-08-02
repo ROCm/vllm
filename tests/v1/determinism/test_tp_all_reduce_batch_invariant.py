@@ -63,17 +63,29 @@ CHECK_ROWS = [0, 1, 2, 3, 7, 15, 31]
 # was removed rather than widened because message size and kernel selection
 # depend only on the dtype and the token count, both of which (bfloat16, 20)
 # already covers identically.
-# fp16 carries 16 rather than the 10 it started with. `_order_sensitive_elements`
+# fp16 carries 14 rather than the 10 it started with. `_order_sensitive_elements`
 # keeps every case honest, but at 10 it was one seed away from tripping it: over
 # the checked rows at world size 4, seeds 1234/1/2/3/4 give 2/1/0/0/0 sensitive
 # elements, so the sweep asserted almost nothing for fp16 on the seed it happens
-# to use and would have failed outright on three of the five. At 16 the same
-# seeds give 7/10/4/7/5. bf16 at 20 gives 8/8/6/8/10 and is fine; fp32 needs no
-# spread at all -- its operands leave the accumulator no headroom, so it moves
-# ~10,700 elements and is by far the strongest detector here.
+# to use and would have failed outright on three of the five. At 14 the same
+# seeds give 4/4/5/4/2.
+#
+# 14 and not more: fp16 saturates at 65504, so from spread 15 the operands
+# themselves start overflowing to +-inf (15 to 18 of them per seed, ~11900 at
+# 16). That is worth avoiding for two reasons. The sweep would be exercising
+# overflow rather than reduction order, and an inf + -inf pair yields NaN, which
+# `!=` reports as differing -- so it would register as sensitivity in the vacuity
+# check while also failing the invariance comparison, for reasons having nothing
+# to do with the collective. Widening the spread buys detection only up to that
+# ceiling.
+#
+# bf16 at 20 gives 8/8/6/8/10 with no overflow -- its exponent range is far
+# wider -- and fp32 needs no spread at all, since fp32 operands leave the
+# accumulator no headroom: it moves ~10,700 elements and is much the strongest
+# detector here.
 CASES = [
     (torch.bfloat16, 20),
-    (torch.float16, 16),
+    (torch.float16, 14),
     (torch.float32, 0),
 ]
 
