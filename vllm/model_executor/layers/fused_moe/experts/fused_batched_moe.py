@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -825,7 +826,18 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
         )
 
         supported: list[tuple[QuantKey | None, QuantKey | None]] = [(None, None)]
-        if device_supports_fp8:
+        # The fp8 schemes are withheld under batch invariance, and not because
+        # of batch composition: this class is not run-to-run *reproducible* in
+        # fp8 at all. Measured on gfx950, `apply()` produced 2 distinct results
+        # over 4 identical calls, differing in every valid row and only in
+        # valid rows, while `invoke_moe_batched_triton_kernel` given the same
+        # quantized operands produced 1 result over 8 calls -- so the defect is
+        # in the quantization around the GEMM, not the GEMM. Batch invariance
+        # is a weaker claim than determinism, so a path that cannot repeat
+        # itself cannot honour it whatever the batch does. Only the
+        # unquantized path below was certified; see
+        # `_supports_batch_invariance`.
+        if device_supports_fp8 and not envs.VLLM_BATCH_INVARIANT:
             supported += [
                 (kFp8Static128BlockSym, kFp8Dynamic128Sym),
                 (kFp8StaticChannelSym, kFp8DynamicTokenSym),
@@ -850,6 +862,49 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        return True
+
+    @staticmethod
+    def _supports_batch_invariance() -> bool:
+        """Unquantized only; `_supports_quant_scheme` withholds fp8 under the
+        mode for a reason recorded there.
+
+        This is the only experts class reachable with
+        `FusedMoEActivationFormat.BatchedExperts` on ROCm, so it is what
+        decides whether DeepEP low latency can be brought up under the mode.
+        It runs a different kernel from `fused_moe_kernel` on an
+        `E x max_num_tokens x K` layout, so nothing measured for the plain
+        expert GEMM carries over and all of the below was measured directly.
+
+        `batched_triton_kernel` has no split-K, no `tl.atomic_*` and no
+        `@triton.autotune` anywhere in this file; each CTA owns a disjoint
+        `[BLOCK_M, BLOCK_N]` tile and runs the whole K loop into one fp32
+        accumulator. The grid is keyed on `max_num_tokens` -- the dispatch
+        buffer's size, a deployment constant -- not on the runtime token count,
+        so token r always lands in tile `r // BLOCK_M`. The batch reaches the
+        kernel only through `mask_m` and two early exits.
+
+        Measured on gfx950, E=8/K=1024/N=512, over bf16 (exponent spread +-20),
+        bf16 flat, fp16 (+-14) and fp32 flat:
+
+          * 41 launch configurations -- each block size varied alone, a
+            BLOCK_K x num_warps cross, and extreme tiles down to 16x16 with 8
+            warps -- gave exactly 1 bitwise result per shape.
+          * 17 token counts from 1 to 256, straddling both BLOCK_M boundaries,
+            plus uneven per-expert counts: no row changed.
+          * A per-expert row derangement (68% of rows changing tile) moved no
+            bits once un-permuted. All2all dispatch assigns slots by atomic
+            increment, so this one is load bearing.
+          * Whole class through `BatchedPrepareAndFinalize`: 0 of 2426 rows
+            moved across 14 batch sizes, both by appending tokens and by
+            dropping them from the front (~1750 slot relocations).
+
+        Non-vacuity, since an exactly-summable operand set cannot detect a
+        reordering: forward, reverse and split-K fp32 reductions over the same
+        products disagreed bitwise in every arm, and the same comparisons
+        without the un-permute (kernel) or without the slot remap (class)
+        reported differences on exactly the rows that moved.
+        """
         return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:

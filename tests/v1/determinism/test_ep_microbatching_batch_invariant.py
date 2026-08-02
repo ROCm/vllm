@@ -63,11 +63,12 @@ conditions and not in others, and `maybe_create_ubatch_slices` must have
 returned real slices.
 
 Not covered: `deepep_low_latency` and `nixl_ep`, the other two backends
-microbatching accepts. The first is refused under the mode for the reason
-recorded in `test_ep_all2all_batch_invariant.py` (it forces
-`BatchedExperts`, whose only experts class does not support batch invariance);
-the second needs its kernels. `--ubatch-size` > 2 is also untested; only DBO's
-two-way split is exercised here.
+microbatching accepts. The first is no longer *refused* under the mode --
+`BatchedTritonExperts` now declares batch invariance for its unquantized path
+and `test_ep_all2all_batch_invariant.py` asserts DeepEP LL end to end -- so it
+is now reachable here and simply untested, which is a weaker gap than it was
+and worth closing. The second still needs its kernels. `--ubatch-size` > 2 is
+also untested; only DBO's two-way split is exercised here.
 """
 
 import json

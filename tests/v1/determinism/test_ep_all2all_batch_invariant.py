@@ -22,16 +22,26 @@ cudagraphs on, needle pinned to DP rank 2:
   all four ranks, while its own rank's padded token count went 40 -> 367. With
   the mode off the same comparison moved 31 of 32 positions (max |delta|
   3.1e-2), so the metric is not blind.
-- **deepep_low_latency**: *cannot* be brought up under the mode. It forces
-  `FusedMoEActivationFormat.BatchedExperts`
+- **deepep_low_latency**: brought up under the mode and asserted here. It
+  forces `FusedMoEActivationFormat.BatchedExperts`
   (`FusedMoEParallelConfig.use_batched_activation_format`), whose only experts
-  class is `BatchedTritonExperts`, which does not override
-  `_supports_batch_invariance()` and so inherits `False` from
-  `FusedMoEExperts`. The oracle then finds no candidate and raises
+  class on ROCm is `BatchedTritonExperts` -- so that one class decided whether
+  this backend was reachable at all, and until it was measured it inherited
+  `_supports_batch_invariance() -> False` and the oracle raised
   `NotImplementedError: No Unquantized MoE backend supports the deployment
-  configuration`. With the mode off it runs and is demonstrably variant (31 of
-  32 positions, max |delta| 3.5e-2), so this is a real gap and not an absent
-  feature.
+  configuration`. It now declares `True` for the unquantized path on the
+  evidence recorded in that method, and withholds its fp8 schemes for a
+  separate reason recorded in `_supports_quant_scheme` -- those are not batch
+  variant, they are not run-to-run reproducible, which is a stronger defect.
+  This arm is therefore bf16 only, which is what OLMoE is.
+
+  Measured: 0 of 32 logprobs moved while the needle rank's padded token count
+  went 40 -> 220, reproduced over two runs. With the mode off the same
+  comparison moved 31 of 32 (max |delta| 3.5e-2) at padding 40 -> 256, so the
+  metric is not blind. This is the only arm whose experts class is
+  `BatchedTritonExperts` rather than `TritonExperts`, and the
+  (prepare_finalize, experts) pair is asserted so a silent fallback cannot
+  pass it.
 - **mori_high_throughput**: brought up under the mode and asserted here, but
   only after two things were fixed. `RoutedExperts.expert_map` used to hand the
   experts AITER's 0/1 mask whenever `VLLM_ROCM_USE_AITER_MOE` was set rather
@@ -63,8 +73,10 @@ cudagraphs on, needle pinned to DP rank 2:
   on the backend literal), so the low-latency literal exercises the same
   kernel.
 
-`deepep_low_latency` is recorded above rather than skipped silently so that a
-change which makes it admissible is noticed.
+`deepep_low_latency` was recorded here as inadmissible for as long as it was,
+rather than skipped silently, which is how the change that made it admissible
+got noticed. Its fp8 schemes are still inadmissible and are still recorded
+rather than skipped, for the same reason.
 
 The third arm covers MoE **LoRA** on top of EP, which is a different failure
 than a variant combine and is the regression this file's LoRA test exists for.
@@ -607,6 +619,19 @@ def deepep_ht_server(tmp_path, enable_batch_invariant_mode):
 
 
 @pytest.fixture
+def deepep_ll_server(tmp_path, enable_batch_invariant_mode):
+    """A DP=4 + EP server on the DeepEP low-latency all2all.
+
+    Function-scoped for the same reason as `deepep_ht_server`.
+
+    This is the only arm whose experts class is `BatchedTritonExperts` rather
+    than `TritonExperts`: DeepEP LL forces the batched activation format, and
+    the assertion below is what keeps that from silently falling back.
+    """
+    yield from _ep_server(tmp_path, "deepep_low_latency")
+
+
+@pytest.fixture
 def mori_ht_server(tmp_path, enable_batch_invariant_mode):
     """A DP=4 + EP server on MoRI.
 
@@ -798,6 +823,13 @@ def _assert_needle_does_not_see_the_batch(
         for i, (a, b) in enumerate(zip(alone["logprobs"], loaded["logprobs"]))
         if a != b
     ]
+    # Printed on success too: the docstrings above quote these numbers, and a
+    # passing run is the only place the exposure actually achieved is visible.
+    print(
+        f"\n{prepare_finalize_cls}/{experts_cls}: {len(moved)}/"
+        f"{len(alone['logprobs'])} logprobs moved, needle-rank padding "
+        f"{max(alone_pads)} -> {max(loaded_pads)}"
+    )
     assert not moved, (
         f"the needle's logprobs changed at positions {moved} because unrelated "
         f"traffic was in flight: its own rank's padded token count went from "
@@ -815,6 +847,30 @@ def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server)
         manager_cls="DeepEPHTAll2AllManager",
         prepare_finalize_cls="DeepEPHTPrepareAndFinalize",
         experts_cls="TritonExperts",
+    )
+
+
+def test_deepep_low_latency_combine_does_not_see_the_batch(deepep_ll_server):
+    """The needle keeps its logprobs on the batched-format experts path.
+
+    This is the end-to-end half of the `BatchedTritonExperts` certification.
+    The kernel-level evidence is in `_supports_batch_invariance`; what only a
+    server can show is that the pieces around it -- DeepEP LL's atomic slot
+    assignment, its weighted combine, and the token count each expert is handed
+    varying with the cluster's load -- do not reintroduce the dependence.
+
+    `experts_cls` is asserted because the whole point of this arm is the
+    batched class: a fallback to `TritonExperts` would pass while measuring the
+    backend that `test_deepep_high_throughput_combine_does_not_see_the_batch`
+    already covers.
+    """
+    server, log_prefix = deepep_ll_server
+    _assert_needle_does_not_see_the_batch(
+        server,
+        log_prefix,
+        manager_cls="DeepEPLLAll2AllManager",
+        prepare_finalize_cls="DeepEPLLPrepareAndFinalize",
+        experts_cls="BatchedTritonExperts",
     )
 
 
