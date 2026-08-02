@@ -63,9 +63,17 @@ CHECK_ROWS = [0, 1, 2, 3, 7, 15, 31]
 # was removed rather than widened because message size and kernel selection
 # depend only on the dtype and the token count, both of which (bfloat16, 20)
 # already covers identically.
+# fp16 carries 16 rather than the 10 it started with. `_order_sensitive_elements`
+# keeps every case honest, but at 10 it was one seed away from tripping it: over
+# the checked rows at world size 4, seeds 1234/1/2/3/4 give 2/1/0/0/0 sensitive
+# elements, so the sweep asserted almost nothing for fp16 on the seed it happens
+# to use and would have failed outright on three of the five. At 16 the same
+# seeds give 7/10/4/7/5. bf16 at 20 gives 8/8/6/8/10 and is fine; fp32 needs no
+# spread at all -- its operands leave the accumulator no headroom, so it moves
+# ~10,700 elements and is by far the strongest detector here.
 CASES = [
     (torch.bfloat16, 20),
-    (torch.float16, 10),
+    (torch.float16, 16),
     (torch.float32, 0),
 ]
 
