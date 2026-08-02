@@ -62,10 +62,15 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
                 in_zero_points->size(1), "]");
   }
   TORCH_CHECK(K_in % 16 == 0, "K must be divisible by 16");
+  // load_act_into_lds walks the activation as one flat K*N run, i.e. it already
+  // assumes stride(0) == K.  Nothing enforced that until now.
+  TORCH_CHECK(in_x.is_contiguous(), "Activation must be contiguous");
 
   const int max_lds_len = get_lds_size_int4() / 2;
-  TORCH_CHECK(K_in * N_in <= (int64_t)(max_lds_len * 1.2),
-              "K*N exceeds LDS capacity (medium limit). K=", K_in, " N=", N_in);
+  // No upper bound on K*N: the medium body reads whatever does not fit in LDS
+  // straight from global (see the `k_ + K * n < max_lds_len` split in
+  // wvSplitK_int4_compute_), so it is correct for any K*N -- just slower the
+  // further past LDS it goes.
 
   auto out_c = torch::empty(
       {N_in, M_in},

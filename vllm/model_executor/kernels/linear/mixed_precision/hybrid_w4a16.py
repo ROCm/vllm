@@ -37,10 +37,10 @@ logger = init_logger(__name__)
 SUPPORTED_GROUP_SIZES = [32, 64, 128]
 
 # Maximum batch size M for the HIP skinny kernel path (C++ supports N_in
-# up to 5).  When M exceeds this AND K*M fits in LDS, the skinny kernel is
-# used; otherwise the Triton prefill path handles the GEMM.
+# up to 5).  Above this the Triton prefill path handles the GEMM.  There is no
+# longer a K*M bound: the skinny kernel reads whatever does not fit in LDS from
+# global memory itself.
 MAX_SKINNY_BATCH_SIZE = 5
-LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
 
 # ---------------------------------------------------------------------------
@@ -688,9 +688,12 @@ def _hybrid_w4a16_apply_impl(
     # Emitting g<group_size> and sym/asym makes the label self-describing.
     _gz = f"g{group_size} {'asym' if w_zp is not None else 'sym'}"
 
-    # Use the HIP skinny kernel for small batch sizes (fast decode path),
-    # but only when K*M fits in LDS.  Otherwise fall through to Triton.
-    if M <= MAX_SKINNY_BATCH_SIZE and K * M <= LDS_CAPACITY_ELEMENTS:
+    # Use the HIP skinny kernel for small batch sizes (fast decode path).
+    #
+    # There is no LDS bound here: the kernel handles the overflow itself (the
+    # part of the activation that does not fit in LDS is read from global), so
+    # the batch size is the only thing that has to be bounded.
+    if M <= MAX_SKINNY_BATCH_SIZE:
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
