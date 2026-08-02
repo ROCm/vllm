@@ -3,12 +3,13 @@
 """The native MX linear kernels must not depend on the number of rows.
 
 Batch-invariant mode keeps both GEMMs rather than substituting a Triton kernel,
-so the tile selectors -- which are keyed on M -- decide the property. For MXFP4
-it holds as written: AITER changes tile shape across seven M buckets and asks
-for a four-way split-K below M=9, and none of that reorders an output element's
-accumulation. For MXFP8 it does not: BLOCK_K is the one parameter that does
-reorder it, so ``_mxfp8_dot_scaled_linear`` pins BLOCK_K under batch invariance
-and these tests run with the mode on.
+so the tile selectors -- which are keyed on M -- decide the property, and each
+selector needed one thing pinned. AITER's MXFP4 selector asks for a four-way
+split-K in its M <= 8 bucket and none above it, so ``gemm_with_dynamic_quant``
+pins NUM_KSPLIT to 1 and leaves the rest of the tuned tile alone. The native
+MXFP8 selector varies BLOCK_K across its M buckets, the one tile parameter that
+reorders an output element's accumulation, so ``_mxfp8_dot_scaled_linear`` pins
+BLOCK_K. These tests run with the mode on.
 
 Both fixes change which config the kernel runs, so accuracy is checked in that
 config rather than assumed: MXFP4 against a hand-decoded reference below, MXFP8
@@ -18,18 +19,18 @@ by ``test_mxfp8_native_linear`` in ``tests/kernels/test_minimax_m3_amd_ops.py``
 
 import pytest
 import torch
-from utils import requires_mx, skip_unsupported
+from utils import requires_mx
 
 from vllm.utils.torch_utils import set_random_seed
 
 SEED = 0
 
 # Half-width of the E8M0 block-scale exponent range, either side of 127.
-# This is what makes the sweeps able to see anything: MXFP4 operands carry four
-# mantissa bits and the block scales are powers of two, so with a narrow spread
-# the fp32 accumulation of a whole K row is *exact* and no reordering can change
-# the result. Measured on gfx950 -- forcing a four-way split-K changes nothing at
-# +-7, and 11 of 32 probe rows at +-15. test_mxfp4_scale_spread_exposes_reordering
+# This is what makes the sweeps able to see anything: MXFP4 operands are four
+# bits wide and the block scales are powers of two, so with a narrow spread the
+# fp32 accumulation of a whole K row is *exact* and no reordering can change the
+# result. Measured on gfx950 -- forcing a four-way split-K changes nothing at
+# +-7, and 11 of 32 probe rows at +-15. test_scale_spread_exposes_reordering
 # keeps this honest.
 SCALE_SPREAD = 15
 
@@ -115,6 +116,31 @@ def _dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor, k: int) -> torch.T
     return values * torch.exp2(scale.float() - 127).repeat_interleave(32, dim=-1)
 
 
+def _mxfp4_weights(n: int, k: int, use_asm_gemm: bool):
+    """Weights laid out as AiterMxfp4LinearKernel.process_weights_after_loading."""
+    weight = torch.randint(0, 255, (n, k // 2), dtype=torch.uint8, device="cuda")
+    weight_scale = torch.randint(
+        127 - SCALE_SPREAD,
+        128 + SCALE_SPREAD,
+        (n, k // 32),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    if not use_asm_gemm:
+        return weight, weight_scale.T.contiguous()
+
+    from aiter.ops.shuffle import shuffle_weight
+
+    sm, sn = weight_scale.shape
+    weight_scale = (
+        weight_scale.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+        .permute(0, 3, 5, 2, 4, 1, 6)
+        .contiguous()
+        .view(sm, sn)
+    )
+    return shuffle_weight(weight, layout=(16, 16)), weight_scale
+
+
 def _mxfp8_weights(n: int, k: int):
     """E4M3 weights with E8M0 block scales, as the MXFP8 layer stores them."""
     weight = (torch.randn(n, k, device="cuda") / 8).to(torch.float8_e4m3fn)
@@ -156,7 +182,6 @@ def _reference_operands(fmt: str, n: int, k: int):
     )
 
 
-@skip_unsupported
 @requires_mx
 @pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8"])
 def test_scale_spread_exposes_reordering(fmt: str):
@@ -179,10 +204,13 @@ def test_scale_spread_exposes_reordering(fmt: str):
     )
 
 
-@skip_unsupported
 @requires_mx
 @pytest.mark.parametrize("n,k", [(4096, 2048), (512, 1024)])
-def test_mxfp4_linear_matches_dequant_reference(n: int, k: int):
+# M=8 is the only bucket whose config batch invariance changes (NUM_KSPLIT 4 ->
+# 1), so it is the one the reference has to cover; M=256 pins a bucket the mode
+# leaves alone.
+@pytest.mark.parametrize("m", [8, 256])
+def test_mxfp4_linear_matches_dequant_reference(m: int, n: int, k: int):
     """The AITER MXFP4 GEMM against a hand-decoded reference, in the pinned config.
 
     Batch invariance drops the kernel's split-K, so the accuracy of what it
@@ -197,7 +225,7 @@ def test_mxfp4_linear_matches_dequant_reference(n: int, k: int):
 
     set_random_seed(SEED)
     weight, weight_scale = _mxfp4_weights(n, k, use_asm_gemm=False)
-    x = torch.randn(256, k, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
 
     got = torch.ops.vllm.gemm_with_dynamic_quant(
         x, weight, weight_scale, False, torch.bfloat16
@@ -212,36 +240,10 @@ def test_mxfp4_linear_matches_dequant_reference(n: int, k: int):
     error = ((got.float() - reference).norm() / reference.norm()).item()
     assert error < 5e-3, (
         f"MXFP4 linear is {error:.2e} from the dequantized reference "
-        f"(N={n}, K={k}); bf16 output rounding alone is ~2e-3"
+        f"(M={m}, N={n}, K={k}); bf16 output rounding alone is ~2e-3"
     )
 
 
-def _mxfp4_weights(n: int, k: int, use_asm_gemm: bool):
-    """Weights laid out as AiterMxfp4LinearKernel.process_weights_after_loading."""
-    weight = torch.randint(0, 255, (n, k // 2), dtype=torch.uint8, device="cuda")
-    weight_scale = torch.randint(
-        127 - SCALE_SPREAD,
-        128 + SCALE_SPREAD,
-        (n, k // 32),
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    if not use_asm_gemm:
-        return weight, weight_scale.T.contiguous()
-
-    from aiter.ops.shuffle import shuffle_weight
-
-    sm, sn = weight_scale.shape
-    weight_scale = (
-        weight_scale.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-        .permute(0, 3, 5, 2, 4, 1, 6)
-        .contiguous()
-        .view(sm, sn)
-    )
-    return shuffle_weight(weight, layout=(16, 16)), weight_scale
-
-
-@skip_unsupported
 @requires_mx
 @pytest.mark.parametrize("n,k,use_asm_gemm", MXFP4_CASES)
 def test_mxfp4_linear_is_batch_invariant(n: int, k: int, use_asm_gemm: bool):
@@ -270,7 +272,6 @@ def test_mxfp4_linear_is_batch_invariant(n: int, k: int, use_asm_gemm: bool):
     )
 
 
-@skip_unsupported
 @requires_mx
 @pytest.mark.parametrize(
     "n,k", [(4096, 2048), (2048, 6144), (1024, 768), (1536, 1024), (1024, 384)]

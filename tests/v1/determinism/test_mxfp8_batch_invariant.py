@@ -1,18 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end batch invariance for an MXFP8-quantised model.
+"""End-to-end batch invariance for MXFP8-quantised models.
 
 `test_mx_linear_batch_invariant.py` pins the MXFP8 GEMM at the kernel level;
-this runs a real MXFP8 checkpoint through the engine so attention, the sampler
-and the ROCm dot_scaled linear path are covered together.
+this runs real MXFP8 checkpoints through the engine so attention, the sampler
+and the ROCm dot_scaled linear path are covered together. The dense Qwen3 is
+the cheap one; the JoyAI checkpoint is MoE and is the only coverage of
+``Mxfp8NativeTritonExperts`` and of MLA under batch invariance.
+
+When the MoE checkpoint is added back, keep it at TP=1: its
+moe_intermediate_size is 768, and the native grouped GEMM needs the
+per-partition intermediate divisible by 128, so TP=2 still works (384) but
+TP=4 (192) silently falls back to the BF16 emulation backend -- the test would
+pass while covering nothing it was added for.
 
 The prompts have to be long. ``RocmDotScaledMxfp8LinearKernel`` picks BLOCK_K
 from M, and for this model's shapes it only changes above M=256 -- with the
 short prompts the other e2e tests use, the batch never reaches that band and
 the test passes with VLLM_BATCH_INVARIANT unset, i.e. asserts nothing. Measured
-on gfx950 with the defaults below, the needle's logprobs move with the batch
-size in 6 of 8 trials when the mode is off, and are bitwise stable in all of
-them when it is on. Shortening the padding or the batch makes it pass either
+on gfx950 with the padding and batch size below, the needle's logprobs move with
+the batch size in 6 of 8 trials when the mode is off, and are bitwise stable in
+all of them when it is on. Shortening the padding or the batch makes it pass either
 way -- if this test is ever made cheaper, re-check that it still fails with
 VLLM_BATCH_INVARIANT unset.
 """
@@ -27,16 +35,27 @@ from utils import _extract_step_logprobs, requires_mx
 
 from vllm import LLM, SamplingParams
 
-MXFP8_TEST_MODEL = os.getenv("VLLM_TEST_MXFP8_MODEL", "mgoin/Qwen3-0.6B-MXFP8")
+# (model, attention backend). The MoE checkpoint is 55GB, hence the size gate;
+# it needs MLA, which is selected from model_type and rejects TRITON_ATTN.
+MXFP8_CASES = [
+    pytest.param("mgoin/Qwen3-0.6B-MXFP8", "TRITON_ATTN", id="qwen3-dense"),
+    # TODO: mawong-amd/JoyAI-LLM-Flash-MXFP8-last-6-BF16-fixed (MoE + MLA,
+    # marks=large_gpu_mark(min_gb=80), TRITON_MLA, TP=1) is the only coverage of
+    # Mxfp8NativeTritonExperts, but it is batch *variant* today: invariant at
+    # batch<=8 or short prompts, and 2/3 needle trials differ at batch 16 with
+    # the padding below (delta ~0.3). Both MX kernels are pinned and measured
+    # invariant, so the suspect is MLA chunked prefill -- the num_splits guard
+    # covers only _is_vllm_fa, not TRITON_MLA. Add it once that is fixed.
+]
 
 # Long enough that a batch crosses the M band where BLOCK_K changes; see above.
 _PROMPT_PADDING = "Some background context for the question that follows. "
 _PADDING_REPEATS = int(os.getenv("VLLM_MXFP8_PROMPT_REPEATS", "400"))
 
 
-def _make_llm(max_num_seqs: int, backend: str) -> LLM:
+def _make_llm(model: str, max_num_seqs: int, backend: str) -> LLM:
     return LLM(
-        model=MXFP8_TEST_MODEL,
+        model=model,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=float(
             os.getenv("VLLM_MXFP8_TEST_GPU_MEMORY_UTILIZATION", "0.3")
@@ -50,8 +69,8 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 
 @requires_mx
-@pytest.mark.parametrize("backend", ["TRITON_ATTN"])
-def test_mxfp8_generation_is_bitwise_invariant_across_batch_sizes_e2e(backend):
+@pytest.mark.parametrize("model,backend", MXFP8_CASES)
+def test_mxfp8_generation_is_bitwise_invariant_across_batch_sizes_e2e(model, backend):
     """The needle's per-step logprobs must be bitwise equal at bs=1 and bs=N.
 
     The needle is never placed at batch index 0: that position keeps its token
@@ -76,7 +95,7 @@ def test_mxfp8_generation_is_bitwise_invariant_across_batch_sizes_e2e(backend):
 
     llm = None
     try:
-        llm = _make_llm(max_num_seqs=max_batch_size, backend=backend)
+        llm = _make_llm(model, max_num_seqs=max_batch_size, backend=backend)
         baseline_output = llm.generate([needle_prompt], sampling, use_tqdm=False)[0]
         baseline_completion = baseline_output.outputs[0]
         baseline_logprobs, baseline_token_ids = _extract_step_logprobs(baseline_output)

@@ -20,14 +20,28 @@ import torch
 
 from tests.utils import (
     init_test_distributed_environment,
+    multi_gpu_marks,
     multi_process_parallel,
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import set_custom_all_reduce
 from vllm.platforms import current_platform
 
+# multi_gpu_test would also wrap the test in create_new_process_for_each_test,
+# whose re-import breaks the ray workers below, so take its marks alone: the
+# registered `distributed` selector keeps `-m distributed` picking this test up,
+# and its skipif enforces the 4 GPUs the module docstring explains are needed.
+pytestmark = [
+    pytest.mark.skipif(
+        not current_platform.is_cuda_alike(), reason="requires a CUDA-alike device"
+    ),
+    *multi_gpu_marks(num_gpus=4),
+]
+
 # Token counts spanning the small-message thresholds where the collectives
-# switch protocol, chunking, or algorithm.
+# switch protocol, chunking, or algorithm. At world size 4 the custom all-reduce
+# switches from its one-shot to its two-shot kernel at 512KiB, i.e. between 32
+# and 64 tokens for the 16-bit cases and between 17 and 32 for fp32.
 TOKEN_COUNTS = [1, 2, 3, 4, 5, 8, 16, 17, 32, 64, 128, 256, 512]
 HIDDEN_SIZE = 4096
 
@@ -62,9 +76,11 @@ def _check_all_reduce(
     device = torch.device(f"cuda:{rank}")
     torch.accelerator.set_device_index(device)
 
-    # Both paths have to hold: the custom all-reduce serves messages under its
-    # size limit, the library collective (and the batch-invariant fallback
-    # around it) serves everything above.
+    # Both of the paths batch invariance can take have to hold. With the custom
+    # all-reduce enabled it serves everything under its size limit; with it
+    # disabled -- and above its limit either way -- every message falls through
+    # to all-gather plus a fixed rank-order sum. The library collective is never
+    # reached under the mode.
     set_custom_all_reduce(use_custom_all_reduce)
     init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
 
@@ -108,28 +124,20 @@ def _check_all_reduce(
 
 
 # multi_process_parallel does not forward extra arguments to the remote, so bind
-# the two collective paths as separate workers.
+# the two paths as separate workers.
 @ray.remote(num_gpus=1, max_calls=1)
 def custom_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
     _check_all_reduce(monkeypatch, tp_size, pp_size, rank, port, True)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
-def library_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
+def fallback_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
     _check_all_reduce(monkeypatch, tp_size, pp_size, rank, port, False)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(),
-    reason="requires a CUDA-alike device",
-)
-@pytest.mark.skipif(
-    torch.accelerator.device_count() < 4,
-    reason="a 2-rank sum is order independent, so this needs at least 4 GPUs",
-)
 @pytest.mark.parametrize("tp_size", [4])
 @pytest.mark.parametrize(
-    "worker", [custom_ar_worker, library_ar_worker], ids=["custom_ar", "library_ar"]
+    "worker", [custom_ar_worker, fallback_ar_worker], ids=["custom_ar", "fallback_ar"]
 )
 def test_tp_all_reduce_is_batch_invariant(
     tp_size: int,
