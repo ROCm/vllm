@@ -261,15 +261,26 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
       for (int i = 0; i < YTILE; i++)
         for (int n = 0; n < N; n++) sum[n][i] = 0;
 
-      bigTypeA bigA[N][UNRL];
-      bigTypeW bigB[YTILE][UNRL];
-
-      for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
+      // K is a runtime value, so `k_ >= K` (k_ depends on threadIdx.x) is a
+      // divergent condition the compiler must honour on every unrolled step:
+      // it wraps each k2 in its own exec-mask block, which stops it clausing
+      // the UNRL*YTILE weight loads together and forces full vmcnt(0) drains
+      // between them.  Instantiate the body twice -- unchecked for the whole
+      // blocks, checked for the single ragged tail block.
+      // Split into issue and consume halves so the driver below can keep one
+      // block's weight loads in flight while the previous block is being
+      // reduced.  Without that, the loop ends on a vmcnt(0) drain and no
+      // memory request survives into the next iteration.
+      auto k_load = [&](auto CHECK_T, bigTypeW(&bigB)[YTILE][UNRL],
+                        uint32_t k1) {
+        constexpr bool CHECK = decltype(CHECK_T)::value;
   #pragma unroll
         for (uint32_t k2 = 0; k2 < UNRL; k2++) {
           uint32_t k = k1 + k2 * THRDS * A_CHUNK;
           uint32_t k_ = k + threadIdx.x * A_CHUNK;
-          if (k_ >= K) break;
+          if constexpr (CHECK) {
+            if (k_ >= K) break;
+          }
 
           const uint8_t* B_ = &B_packed[(m + 0) * B_row_stride_bytes + k_ / 2];
           for (int y = 0; y < YTILE; y++) {
@@ -279,12 +290,20 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
               bigB[y][k2].f[i] = loadnt((float*)&src[i]);
           }
         }
+      };
+
+      auto k_compute = [&](auto CHECK_T, const bigTypeW(&bigB)[YTILE][UNRL],
+                           uint32_t k1) {
+        constexpr bool CHECK = decltype(CHECK_T)::value;
+        bigTypeA bigA[N][UNRL];
 
   #pragma unroll
         for (uint32_t k2 = 0; k2 < UNRL; k2++) {
           uint32_t k = k1 + k2 * THRDS * A_CHUNK;
           uint32_t k_ = k + threadIdx.x * A_CHUNK;
-          if (k_ >= K) break;
+          if constexpr (CHECK) {
+            if (k_ >= K) break;
+          }
 
           for (int n = 0; n < N; n++) {
             // K % 16 == 0 (host-checked) and k_ is a multiple of A_CHUNK (16),
@@ -302,7 +321,9 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
         for (uint32_t k2 = 0; k2 < UNRL; k2++) {
           uint32_t k = k1 + k2 * THRDS * A_CHUNK;
           uint32_t k_ = k + threadIdx.x * A_CHUNK;
-          if (k_ >= K) break;
+          if constexpr (CHECK) {
+            if (k_ >= K) break;
+          }
 
   #pragma unroll
           for (uint32_t n = 0; n < N; n++) {
@@ -414,6 +435,23 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
             }
           }
         }
+      };
+
+      constexpr uint32_t K_STEP = THRDS * A_CHUNK * UNRL;
+      const uint32_t K_whole = K - K % K_STEP;
+
+      // The loads are split out of the compute so the block issues its whole
+      // weight burst before touching any of it.
+      //
+      bigTypeW bigB[YTILE][UNRL];
+      uint32_t k1 = 0;
+      for (; k1 < K_whole; k1 += K_STEP) {
+        k_load(std::false_type{}, bigB, k1);
+        k_compute(std::false_type{}, bigB, k1);
+      }
+      if (K_whole < K) {
+        k_load(std::true_type{}, bigB, K_whole);
+        k_compute(std::true_type{}, bigB, K_whole);
       }
 
   #if defined(__HIP__GFX1X__)
