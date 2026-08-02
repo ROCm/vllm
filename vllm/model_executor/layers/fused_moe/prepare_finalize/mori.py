@@ -29,6 +29,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        # MoRI's own view of the dispatched expert ids, handed straight back to
+        # combine. See prepare() for why the experts get a different tensor.
+        self._combine_topk_ids: torch.Tensor | None = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -98,11 +101,43 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
         )
 
+        # `dispatch_ids` is a view of MoRI's receive buffer, sized
+        # `max_num_tokens_to_recv()` = EP size x max_num_batched_tokens and
+        # written only for the rows that actually arrived. The tail is never
+        # cleared, so it holds the previous step's expert ids -- which are in
+        # range, so `moe_align_block_size` counts them as real tokens,
+        # `num_tokens_post_padded` never shrinks below the whole buffer and
+        # every experts backend that derives its work from `topk_ids` runs the
+        # full padded M on every step.
+        #
+        # Marking the tail invalid is enough to fix that: the align kernel
+        # skips ids outside [0, num_experts) (`get_local_expert_id`), so they
+        # drop out of the per-expert counts, and `fused_moe_kernel` already
+        # loads `num_tokens_post_padded` from device memory and early-exits
+        # the blocks past it. The row count is read on device, so this costs
+        # no host sync -- which is the whole reason the buffer is fixed-size.
+        #
+        # The tail rows themselves stay garbage: nothing writes them, so the
+        # experts leave uninitialised workspace in those rows of the output.
+        # That is already the contract -- combine only reads
+        # `totalRecvTokenNum` rows back.
+        rows = torch.arange(
+            dispatch_ids.size(0), device=dispatch_ids.device, dtype=torch.int32
+        )
+        expert_topk_ids = torch.where(
+            (rows < dispatch_recv_token_num).unsqueeze(1), dispatch_ids, -1
+        )
+        # Combine keeps MoRI's untouched ids. The intranode kernel ignores them
+        # entirely (it routes off `dispDestTokIdMap`), but the internode ones
+        # do read `args.tokenIndices`, and feeding those a -1 is a change this
+        # single-node work cannot test.
+        self._combine_topk_ids = dispatch_ids
+
         return (
             dispatch_a1,
             dispatch_scale,
             expert_tokens_meta,
-            dispatch_ids,
+            expert_topk_ids,
             dispatch_weights,
         )
 
@@ -116,9 +151,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
         num_token = output.shape[0]
+        combine_topk_ids = self._combine_topk_ids
+        assert combine_topk_ids is not None, "finalize called without a prepare"
+        self._combine_topk_ids = None
         result = self.mori_op.combine(
             fused_expert_output,
             None,
-            topk_ids,
+            combine_topk_ids,
         )[0]
         output.copy_(result[:num_token])

@@ -1454,35 +1454,39 @@ class FusedMoEConfig:
             # which `MoriPrepareAndFinalize.prepare` puts in
             # `ExpertTokensMetadata.expert_num_tokens` -- note that despite
             # the field name it is a single total, not per-expert counts.
-            # `AiterExperts` is the only experts class that can consume a
-            # device-side count without a host sync: it forwards it as AITER's
-            # `num_local_tokens`. Every other class ignores it and computes the
-            # whole padded buffer.
+            # `AiterExperts` consumes that count directly, as AITER's
+            # `num_local_tokens`. Every other class ignores it; the buffer
+            # stays full size for them, but `MoriPrepareAndFinalize.prepare`
+            # marks the rows past the count invalid in `topk_ids`, so
+            # `moe_align_block_size` drops them from `num_tokens_post_padded`
+            # and the expert GEMMs skip them -- see that method.
             #
-            # Doing that is correct, not wrong: the rows past the count are
-            # never read back by `mori_op.combine`. Measured on 4x gfx950,
-            # OLMoE-1B-7B bf16, DP=4/EP=4 under VLLM_BATCH_INVARIANT=1, MoRI
-            # high throughput + TritonExperts is *bitwise identical* to
-            # allgather_reducescatter + TritonExperts across 4 prompts x 24
-            # logprobs and a 32-token needle. It is also batch invariant
-            # (0/32 positions moved under load; 32/32 moved with the mode off,
-            # max |delta| 6.7e-2).
+            # Correctness does not depend on any of this: the rows past the
+            # count are never read back by `mori_op.combine`. Measured on
+            # 4x gfx950, OLMoE-1B-7B bf16, DP=4/EP=4 under
+            # VLLM_BATCH_INVARIANT=1, MoRI high throughput + TritonExperts is
+            # *bitwise identical* to allgather_reducescatter + TritonExperts,
+            # with and without the trim, across 5 prompts x 24 logprobs and a
+            # 32-token needle. It is also batch invariant (0/32 positions
+            # moved under load; 32/32 moved with the mode off).
             #
-            # It is, however, much slower: Triton runs every step at the full
-            # padded M (measured: exactly 8192 rows on every one of 2000 calls
-            # at max_num_batched_tokens=2048, EP=4) where the
-            # allgather_reducescatter path ran the same model at M between 4
-            # and 1751. Warn rather than refuse -- a correct slow
-            # configuration is the caller's tradeoff to make, and refusing it
-            # is what kept an entire all2all backend out of batch-invariant
-            # mode, since `AiterExperts` declares no batch invariance.
+            # What is left is the elementwise work, which still runs at the
+            # full padded M: the activation, the intermediate quantization and
+            # `moe_sum` are all sized by the buffer rather than by the count.
+            # Measured at max_num_batched_tokens=2048, EP=4, 60s of saturating
+            # load: 3946 -> 10968 tok/s with the trim, against 12157 for
+            # allgather_reducescatter on the same box. Warn rather than
+            # refuse -- refusing is what kept an entire all2all backend out of
+            # batch-invariant mode, since `AiterExperts` declares no batch
+            # invariance.
             if not self.rocm_aiter_fmoe_enabled:
                 logger.warning_once(
-                    "MoRI is paired with a non-AITER experts backend. Only "
-                    "AiterExperts consumes MoRI's device-side received-token "
-                    "count, so the expert GEMMs will run at MoRI's full "
-                    "padded receive size (%d rows) on every step regardless "
-                    "of the batch. Output is correct; throughput is not.",
+                    "MoRI is paired with a non-AITER experts backend. The "
+                    "expert GEMMs skip MoRI's padded rows, but the "
+                    "activation, intermediate quantization and reduction are "
+                    "still sized by its full receive buffer (%d rows) rather "
+                    "than by the batch. Output is correct; throughput is "
+                    "below AITER's.",
                     self.max_num_tokens * self.moe_parallel_config.ep_size,
                 )
             assert not self.aiter_fmoe_shared_expert_enabled, (

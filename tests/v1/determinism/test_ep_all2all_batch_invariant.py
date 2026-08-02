@@ -48,11 +48,14 @@ cudagraphs on, needle pinned to DP rank 2:
 
   `--max-num-batched-tokens` is pinned low for this arm on purpose. MoRI hands
   the experts a fixed-size receive buffer of `ep_size *
-  max_num_batched_tokens` rows and only `AiterExperts` truncates it, so
-  `TritonExperts` runs every step at that full M -- measured at exactly 8192
-  rows on every one of 2000 calls, where the allgather_reducescatter arm on the
-  same model ran M between 4 and 1751. Leaving the default would make this test
-  slow and memory-hungry for no extra coverage.
+  max_num_batched_tokens` rows, so `TritonExperts` sees M = 8192 on every step
+  where the allgather_reducescatter arm on the same model ran M between 4 and
+  8192 over 526 distinct values. `MoriPrepareAndFinalize.prepare` now marks the
+  undelivered rows invalid so the expert GEMMs skip them (mean
+  `num_tokens_post_padded` 67662 -> 2866, against 2960 for
+  allgather_reducescatter), but the buffer, the workspaces and the elementwise
+  work are still sized by it. Leaving the default would make this test slow and
+  memory-hungry for no extra coverage.
 
 - **mori_low_latency**: not a second test. Both single-node MoRI variants were
   observed selecting `EpDispatchCombineKernelType.IntraNode`
