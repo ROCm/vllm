@@ -4,6 +4,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -131,6 +132,31 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 (kFp8StaticTensorSym, kFp8DynamicTokenSym),
                 (kFp8StaticTensorSym, kFp8StaticTensorSym),
                 (kFp8StaticTensorSym, kFp8DynamicTensorSym),
+            ]
+        if envs.VLLM_BATCH_INVARIANT:
+            # A dynamic per-tensor activation scale is an amax over every row
+            # the kernel was handed: the whole local batch without expert
+            # parallelism, and whatever the all2all delivered with it under EP.
+            # So a token's quantized activation -- and therefore its output --
+            # depends on what else was batched with it. Both GEMMs are
+            # affected: the a1 scale comes from the prepare step, the a2 scale
+            # from the amax over intermediate_cache2 below, which spans
+            # num_tokens * top_k rows.
+            #
+            # There is no fixed-order repair, because the scale is simply not a
+            # function of the token. Nor can the activation be promoted to
+            # per-token on its own: the kernel takes per_channel_quant from
+            # this same config and uses it for the *weight* scale too, and a
+            # per-tensor weight scale is 1-D [E], so stride_bse collapses to 0
+            # and every expert would read b_scale[0]. Promoting would mean
+            # reshaping the weight scales as well, which is a change of its own.
+            #
+            # Static per-tensor and dynamic per-token/per-block schemes are
+            # unaffected and stay supported.
+            supported = [
+                (w, a)
+                for w, a in supported
+                if a not in (kFp8DynamicTensorSym, kInt8DynamicTensorSym)
             ]
         return (weight_key, activation_key) in supported
 
