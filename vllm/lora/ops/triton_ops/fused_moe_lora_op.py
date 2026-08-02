@@ -13,7 +13,7 @@ from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import supports_pdl, supports_tma
+from .utils import is_batch_invariant, supports_pdl, supports_tma
 
 
 @triton.jit
@@ -1479,10 +1479,16 @@ def _fused_moe_lora(
     # Fast path: single fused kernel
     if not fully_sharded:
         M_pairs = topk_weights.numel()
+        # M_pairs == num_tokens * top_k, so this gate is keyed on the batch
+        # size: the same token takes the small-batch kernel in a small batch
+        # and the one-shot kernel in a large one. The two kernels are not
+        # bitwise equal (measured ~1 bf16 ulp apart), so under batch
+        # invariance we pin the one-shot kernel for every batch size.
         if (
             sorted_token_ids is None
             and max_lora_rank <= 64
             and M_pairs * max_lora_rank <= 1024
+            and not is_batch_invariant
         ):
             _run_fused_moe_lora_small_batch(
                 output,
