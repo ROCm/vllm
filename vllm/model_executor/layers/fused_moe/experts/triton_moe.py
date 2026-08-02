@@ -274,6 +274,25 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quantization_emulation=self.quantization_emulation,
             )
 
+        # A quantized scheme needs either quantized activations or a scale to
+        # make them with, and neither is guaranteed. The prepare step decides
+        # whether to quantize on dispatch from its own view of the config --
+        # MoRI leaves use_fp8_dispatch False for a dynamic per-tensor scheme --
+        # while this kernel only quantizes for itself when
+        # expects_unquantized_inputs, which today requires LoRA. With both
+        # absent the null scale reaches Triton and fails inside the kernel,
+        # several frames from the cause.
+        assert not (
+            self.quant_dtype is not None
+            and not self.expects_unquantized_inputs
+            and hidden_states.dtype != self.quant_dtype
+            and a1q_scale is None
+        ), (
+            f"activations arrived as {hidden_states.dtype} with no scale for a "
+            f"{self.quant_dtype} scheme: the prepare step did not quantize them "
+            "and this kernel was not asked to"
+        )
+
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
