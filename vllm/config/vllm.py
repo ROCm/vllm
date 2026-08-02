@@ -1597,54 +1597,43 @@ class VllmConfig:
             )
 
         if envs.VLLM_BATCH_INVARIANT:
-            dcp_size = self.parallel_config.decode_context_parallel_size
             pcp_size = self.parallel_config.prefill_context_parallel_size
-            # DCP's "a2a" backend is exempt: dcp_a2a_lse_reduce does not reduce
-            # across ranks in a collective at all. It exchanges the partial
-            # outputs and their LSEs with one all_to_all_single -- pure data
-            # movement, bitwise reproducible however the library chunks it --
-            # then combines them locally in a Triton kernel with one program per
-            # (token, head) that walks the ranks in tl.static_range, so the
-            # reduction order is fixed and cannot follow the batch.
-            dcp_needs_gate = dcp_size > 1 and (
-                self.parallel_config.dcp_comm_backend != "a2a"
-            )
-            if dcp_needs_gate or pcp_size > 1:
-                # Everything else recombines a request's partial attention with
-                # a reduce-scatter -- GroupCoordinator for DCP's default ag_rs
-                # backend, get_pcp_group() for a PCP MoE -- and reduce_scatter
-                # has no batch-invariant path the way all_reduce does. Its
-                # message is sized by the token count, so the reduction order
-                # moves with batch composition. The rescale that precedes the
-                # combine is fine: the Triton kernel in
-                # vllm/v1/attention/ops/common.py walks the ranks in a static
-                # order. ag_rs measured variant at TP=4/DCP=4 and invariant at
-                # DCP=1 with nothing else changed; a2a measured invariant at the
-                # same layout with ag_rs dirty in the same session. PCP keeps
-                # the reduce-scatter and stays gated structurally: it is
-                # unmeasured because the V2 runner rejects it before this point,
-                # so that branch is unreachable by default and only bites once
-                # that changes.
+            # Decode context parallelism is supported under both of its combine
+            # backends. "a2a" never reduces across ranks in a collective:
+            # dcp_a2a_lse_reduce exchanges the partial outputs and their LSEs
+            # with one all_to_all_single -- pure data movement, bitwise
+            # reproducible however the library chunks it -- then combines them
+            # locally in a Triton kernel with one program per (token, head)
+            # that walks the ranks in tl.static_range. "ag_rs" does end in a
+            # collective reduction, `cp_lse_ag_out_rs` -> GroupCoordinator
+            # .reduce_scatter, which is why it used to be refused: a library
+            # reduce-scatter picks its reduction order from the message size,
+            # and that size follows the number of tokens in the batch.
+            # CudaCommunicator.reduce_scatter now routes the mode away from the
+            # library entirely -- to the custom all-reduce's one-shot kernel
+            # where the group owns IPC buffers, and to an all-to-all plus a
+            # fixed rank-order fp32 sum where it does not -- so the order is
+            # fixed at every message size. Measured on 4x gfx950, TRITON_MLA,
+            # TP=4/DCP=4: 20/20 needle rows bitwise equal under either kernel,
+            # against 20/20 differing with the same build and batch when only
+            # the DCP reduce-scatter is pointed back at ncclReduceScatter.
+            if pcp_size > 1:
+                # Prefill context parallelism recombines a PCP MoE's partial
+                # attention through get_pcp_group() and stays gated
+                # structurally: it is unmeasured because the V2 runner rejects
+                # it before this point, so that branch is unreachable by
+                # default and only bites once that changes.
                 #
                 # Raise rather than override to 1, unlike the guards below:
-                # those cost throughput, these change the deployment. Clearing
-                # DCP unshards the KV cache, so per-rank cache memory grows
-                # dcp-fold and a configuration that fit no longer does.
+                # those cost throughput, this changes the deployment.
                 raise ValueError(
-                    "Context parallelism is not supported with "
-                    "VLLM_BATCH_INVARIANT (decode_context_parallel_size="
-                    f"{dcp_size}, prefill_context_parallel_size={pcp_size}, "
-                    f"dcp_comm_backend={self.parallel_config.dcp_comm_backend!r}"
-                    "). It recombines each request's partial attention across "
-                    "ranks with a reduce-scatter, and the collective library "
-                    "picks that reduction's order from the message size, which "
-                    "scales with the number of tokens in the batch -- so a "
-                    "token's output would depend on what else was batched with "
-                    "it. There is no batch-invariant reduce-scatter to route "
-                    "to, as there is for all-reduce. For decode context "
-                    "parallelism, --dcp-comm-backend a2a combines locally "
-                    "instead and is supported. Otherwise set both sizes to 1, "
-                    "raising --tensor-parallel-size to keep the same GPU "
+                    "Prefill context parallelism is not supported with "
+                    "VLLM_BATCH_INVARIANT (prefill_context_parallel_size="
+                    f"{pcp_size}). It recombines each request's partial "
+                    "attention across ranks with a collective whose reduction "
+                    "order has not been measured under the mode. Set it to 1, "
+                    "raising --tensor-parallel-size or "
+                    "--decode-context-parallel-size to keep the same GPU "
                     "count, or unset VLLM_BATCH_INVARIANT."
                 )
 

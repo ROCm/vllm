@@ -55,6 +55,85 @@ def _max_allreduce_bytes() -> int | None:
     return min((max_tokens + 1) * hidden * itemsize, _MAX_BATCH_INVARIANT_CA_BYTES)
 
 
+def _max_dcp_reduce_scatter_bytes() -> int | None:
+    """Largest tensor the DCP attention combine's reduce-scatter can see.
+
+    `cp_lse_ag_out_rs` reduce-scatters the decode attention output after the
+    head-dim all-gather, so the operand is
+    `[decode_tokens, heads_per_rank * dcp, head_size]`. Unlike a TP all-reduce,
+    which carries the whole prefill batch, this only ever sees tokens that are
+    decoding, so the running-sequence limit bounds it far more tightly than
+    max_num_batched_tokens does.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None or config.model_config is None:
+        return None
+    parallel_config = config.parallel_config
+    dcp_size = parallel_config.decode_context_parallel_size
+    if dcp_size <= 1:
+        return None
+    model_config = config.model_config
+    dtype = model_config.dtype
+    if not isinstance(dtype, torch.dtype):
+        return None
+    heads = model_config.get_num_attention_heads(parallel_config) * dcp_size
+    head_size = model_config.get_head_size()
+    if heads <= 0 or head_size <= 0:
+        return None
+    scheduler_config = config.scheduler_config
+    # One decode token per running sequence, times the draft length when
+    # speculating, and never more than a scheduler step can hold.
+    tokens_per_seq = 1
+    if config.speculative_config is not None:
+        tokens_per_seq += config.speculative_config.num_speculative_tokens or 0
+    max_tokens = scheduler_config.max_num_seqs * tokens_per_seq
+    if scheduler_config.max_num_batched_tokens:
+        max_tokens = min(max_tokens, scheduler_config.max_num_batched_tokens)
+    if max_tokens <= 0:
+        return None
+    # +1 token of slack: the custom all-reduce bound is strict (`<`).
+    return min(
+        (max_tokens + 1) * heads * head_size * dtype.itemsize,
+        _MAX_BATCH_INVARIANT_CA_BYTES,
+    )
+
+
+def _dcp_custom_allreduce_bytes(unique_name: str) -> int | None:
+    """IPC buffer size for the DCP group, or None if it should not get one.
+
+    Only the TP group runs a general-purpose all-reduce, which is why every
+    other group is denied the accelerated backends below. The DCP group is one
+    exception under batch invariance: its attention combine ends in a
+    reduce-scatter once per layer per decode step, and without IPC buffers of
+    its own that falls back to an all-to-all plus a local sum, which pays a
+    fixed extra Triton launch (~24us at 4 ranks) that the custom kernel does
+    not. Nothing else is turned on for the group -- no quick reduce, no AITER,
+    no symmetric memory -- because none of those promises a size-independent
+    reduction order.
+
+    `_ENABLE_CUSTOM_ALL_REDUCE` is what confines this to ROCm: ParallelConfig
+    forces `disable_custom_all_reduce` under the mode everywhere else, so the
+    custom kernels are unavailable on CUDA regardless of the group.
+    """
+    if not unique_name.startswith("dcp"):
+        return None
+    if not envs.VLLM_BATCH_INVARIANT:
+        return None
+
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
+
+    if not _ENABLE_CUSTOM_ALL_REDUCE:
+        return None
+    config = get_current_vllm_config_or_none()
+    if config is None or config.parallel_config.dcp_comm_backend == "a2a":
+        # a2a combines locally and never reaches a collective reduction.
+        return None
+    return _max_dcp_reduce_scatter_bytes()
+
+
 class CudaCommunicator(DeviceCommunicatorBase):
     def __init__(
         self,
@@ -76,6 +155,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_world_size,
             use_all2all=use_all2all,
         )
+        # Non-None only for the DCP group under batch invariance; see
+        # `_dcp_custom_allreduce_bytes`.
+        dcp_ca_bytes = _dcp_custom_allreduce_bytes(unique_name)
         if "tp" not in unique_name:
             # custom allreduce or torch symm mem can be used only by tp
             use_custom_allreduce = False
@@ -143,7 +225,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
+        if (
+            (use_custom_allreduce and self.aiter_ar_comm is None)
+            or dcp_ca_bytes is not None
+        ) and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             ca_kwargs = {}
             # The 8MB default is the point where NCCL's ring overtakes the
@@ -161,7 +246,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # moving it off its 16MB default costs no memory. It too beats both
             # alternatives everywhere measured (0.20x to 0.90x of the all-to-all
             # fallback and 0.32x to 0.94x of ncclReduceScatter, out to 1GB).
-            if (
+            #
+            # The DCP group is sized from its own, much smaller bound: its
+            # reduce-scatter only carries decode tokens. All three limits are
+            # set from it so the group's cost is exactly twice the bound
+            # (`meta_size() + max_size` plus `legacy_buffer_size`) rather than
+            # picking up the 2MB all-gather default it never uses.
+            if dcp_ca_bytes is not None:
+                ca_kwargs["max_size"] = dcp_ca_bytes
+                ca_kwargs["max_all_gather_size"] = dcp_ca_bytes
+                ca_kwargs["max_reduce_scatter_size"] = dcp_ca_bytes
+            elif (
                 envs.VLLM_BATCH_INVARIANT
                 and (max_bytes := _max_allreduce_bytes()) is not None
             ):
