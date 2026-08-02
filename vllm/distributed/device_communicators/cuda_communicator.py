@@ -45,7 +45,12 @@ def _max_allreduce_bytes() -> int | None:
     if not max_tokens:
         return None
     hidden = config.model_config.get_hidden_size()
-    itemsize = config.model_config.dtype.itemsize
+    # Declared as a str literal union too, though it is resolved to a dtype by
+    # the time any communicator exists.
+    dtype = config.model_config.dtype
+    if not isinstance(dtype, torch.dtype):
+        return None
+    itemsize = dtype.itemsize
     # +1 token of slack: the custom all-reduce bound is strict (`<`).
     return min((max_tokens + 1) * hidden * itemsize, _MAX_BATCH_INVARIANT_CA_BYTES)
 
@@ -474,7 +479,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        if should_nccl_symm_mem_ag_rs():
+        if envs.VLLM_BATCH_INVARIANT:
+            # Library reduce-scatters choose their chunking from the message
+            # size, so an output element's contributions are summed in an order
+            # that depends on the number of tokens in the batch. Take the
+            # all-to-all route instead (see reduce_scatter_batch_invariant).
+            from vllm.model_executor.layers.batch_invariant import (
+                reduce_scatter_batch_invariant,
+            )
+
+            output = reduce_scatter_batch_invariant(input_tensor, self.device_group)
+        elif should_nccl_symm_mem_ag_rs():
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(
@@ -512,7 +527,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # ncclCommWindowRegister is collective: asymmetric pool allocations
         # from variable per-rank sizes cause deadlocks.
         use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
-        if use_symm_mem:
+        if envs.VLLM_BATCH_INVARIANT:
+            # See reduce_scatter above. Variable shard sizes change which rows a
+            # rank receives, not the ascending-rank order they are summed in.
+            from vllm.model_executor.layers.batch_invariant import (
+                reduce_scatter_batch_invariant,
+            )
+
+            output = reduce_scatter_batch_invariant(
+                input_tensor, self.device_group, sizes=sizes
+            )
+        elif use_symm_mem:
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(

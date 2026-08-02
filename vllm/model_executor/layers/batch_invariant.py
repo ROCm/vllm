@@ -1260,6 +1260,83 @@ def all_reduce_batch_invariant(
     return out
 
 
+def reduce_scatter_batch_invariant(
+    input_: torch.Tensor,
+    group: "torch.distributed.ProcessGroup | None" = None,
+    sizes: list[int] | None = None,
+) -> torch.Tensor:
+    """Sum reduce-scatter over dim 0 whose result does not depend on the size.
+
+    ``ncclReduceScatter`` picks its chunking from the message size just as
+    ``ncclAllReduce`` does: on 4x gfx950 a ``[N, 4096]`` bf16 reduce-scatter
+    gives up to ten distinct values for a single output element across
+    ``N in 32..4096``.
+
+    Route around it the same way ``all_reduce_batch_invariant`` does. An
+    all-to-all sends rank ``d`` exactly the rows it owns from every rank -- pure
+    data movement, so bitwise reproducible however the library chunks it -- and
+    lands them rank-major, which is the layout ``_fixed_order_sum_kernel``
+    already consumes. Each output element then sums the same ``world_size``
+    contributions in ascending rank order with one rounding.
+
+    ``sizes`` (the reduce-scatterv case) changes only *which* rows a rank
+    receives, never how the received contributions are summed, so variable
+    shard sizes are invariant for the same reason.
+
+    Args:
+        input_: Contiguous full-size input; dim 0 is the scattered axis.
+        group: Process group, defaults to the world group.
+        sizes: Per-rank row counts. Uniform split when ``None``.
+
+    Returns:
+        This rank's shard of the sum.
+    """
+    import torch.distributed as dist
+
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        return input_
+
+    x = input_.contiguous()
+    if sizes is None:
+        assert x.shape[0] % world_size == 0
+        sizes = [x.shape[0] // world_size] * world_size
+    else:
+        assert len(sizes) == world_size
+        assert x.shape[0] == sum(sizes)
+
+    rows = sizes[dist.get_rank(group)]
+    out = torch.empty((rows, *x.shape[1:]), dtype=x.dtype, device=x.device)
+    recv = torch.empty(
+        (world_size * rows, *x.shape[1:]), dtype=x.dtype, device=x.device
+    )
+    # Every rank takes part even when its own shard is empty: it still has rows
+    # to send to the others.
+    dist.all_to_all_single(
+        recv,
+        x,
+        output_split_sizes=[rows] * world_size,
+        input_split_sizes=sizes,
+        group=group,
+    )
+
+    numel = out.numel()
+    if numel == 0:
+        return out
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(numel, BLOCK_SIZE),)
+    _fixed_order_sum_kernel[grid](
+        recv.view(-1),
+        out.view(-1),
+        numel,
+        numel,
+        WORLD_SIZE=world_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        LARGE=recv.numel() > 2**31,
+    )
+    return out
+
+
 _batch_invariant_MODE = False
 _batch_invariant_LIB = None
 _fp16_block_size_n = 256
