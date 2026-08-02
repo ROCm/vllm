@@ -32,36 +32,36 @@ cudagraphs on, needle pinned to DP rank 2:
   configuration`. With the mode off it runs and is demonstrably variant (31 of
   32 positions, max |delta| 3.5e-2), so this is a real gap and not an absent
   feature.
-- **mori_high_throughput / mori_low_latency**: *cannot* be brought up under the
-  mode either, for a different reason. `FusedMoEConfig.__post_init__` asserts
-  `rocm_aiter_fmoe_enabled` for MoRI, and setting `VLLM_ROCM_USE_AITER` at all
-  makes both MoE oracles commit to the AITER backend with no fallback
-  (`oracle/unquantized.py`, `oracle/fp8.py`: `return _return_or_raise(AITER,
-  ...)`). `AiterExperts` also inherits `_supports_batch_invariance() == False`,
-  so startup dies with "Unquantized MoE backend ROCm AITER does not support the
-  deployment configuration since kernel does not support batch invariance".
-  Passing `--moe-backend triton` gets the engine up -- and MoRI's IntraNode
-  combine was in fact bitwise invariant there (0 of 32 positions moved, with a
-  BI=0 control that moved 32 of 32 and the needle rank's padding going 40 ->
-  367) -- but that configuration is not usable: its output is degenerate. That
-  is not MoRI's doing. `RoutedExperts.expert_map` hands the experts
-  `self.expert_mask` instead of `self._expert_map` whenever
-  `rocm_aiter_fmoe_enabled`, which is the *environment variable* and not the
-  MoE backend the oracle picked, so `--moe-backend triton` with
-  `VLLM_ROCM_USE_AITER_MOE=1` feeds AITER's 0/1 mask to Triton's local-index
-  expert map. It reproduces on DeepEP with the same override (degenerate and
-  batch variant both with the mode on and off) and disappears at DP=1, where
-  there is no expert map. Since MoRI *requires* the AITER env, there is no
-  configuration in which it is both correct and invariant on this stack.
+- **mori_high_throughput**: brought up under the mode and asserted here, but
+  only after two things were fixed. `RoutedExperts.expert_map` used to hand the
+  experts AITER's 0/1 mask whenever `VLLM_ROCM_USE_AITER_MOE` was set rather
+  than when AITER was actually *selected*, which made the only previously
+  reachable MoRI measurement (via `--moe-backend triton`) degenerate; and
+  `FusedMoEConfig.__post_init__` asserted `rocm_aiter_fmoe_enabled` for MoRI,
+  which is now a warning. See that comment for why the coupling is a
+  performance contract and not a data-format one. With both in place MoRI's
+  IntraNode combine is bitwise invariant: 0 of 32 positions moved, against a
+  mode-off control at the *same* load exposure (needle rank padding 40 -> 48 in
+  both arms) that moved 32 of 32, max |delta| 3.6e-2. Its output is also
+  bitwise identical to the allgather_reducescatter path on the same prompts
+  (4 prompts x 24 logprobs plus the 32-token needle, max |delta| exactly 0).
 
-  The two single-node MoRI variants are also not two independent tests: both
-  were observed selecting `EpDispatchCombineKernelType.IntraNode`
+  `--max-num-batched-tokens` is pinned low for this arm on purpose. MoRI hands
+  the experts a fixed-size receive buffer of `ep_size *
+  max_num_batched_tokens` rows and only `AiterExperts` truncates it, so
+  `TritonExperts` runs every step at that full M -- measured at exactly 8192
+  rows on every one of 2000 calls, where the allgather_reducescatter arm on the
+  same model ran M between 4 and 1751. Leaving the default would make this test
+  slow and memory-hungry for no extra coverage.
+
+- **mori_low_latency**: not a second test. Both single-node MoRI variants were
+  observed selecting `EpDispatchCombineKernelType.IntraNode`
   (`MoriAll2AllManager._make_all2all_kwargs` branches on `self.internode`, not
-  on the backend literal).
+  on the backend literal), so the low-latency literal exercises the same
+  kernel.
 
-Only `deepep_high_throughput` is asserted here, because it is the only one that
-can currently run under the mode. The others are recorded above rather than
-skipped silently so that a change which makes them admissible is noticed.
+`deepep_low_latency` is recorded above rather than skipped silently so that a
+change which makes it admissible is noticed.
 
 Why a server rather than the offline `LLM` API: all2all kernels need
 `dp_size > 1` (`FusedMoEParallelConfig.use_all2all_kernels`), and `LLM()`
@@ -104,6 +104,13 @@ DP = 4
 NEEDLE_RANK = 2
 NEEDLE_MAX_TOKENS = 32
 LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LOAD_CONCURRENCY", "24"))
+# The MoRI arm needs more. What the guard below wants is for the needle's
+# prefill step to have company, and that arm runs the whole padded receive
+# buffer through Triton every step -- it served roughly a third as many
+# requests as the others in the same wall clock. At the shared default the
+# needle's prefill got a step to itself in both conditions and the guard
+# (correctly) refused the verdict; at this exposure it does not.
+MORI_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_MORI_LOAD_CONCURRENCY", "96"))
 LOAD_RAMP_SECONDS = float(os.getenv("VLLM_EP_LOAD_RAMP_SECONDS", "12"))
 # The load must drag the needle rank's padded token count at least this far
 # above what it ran alone, otherwise the needle saw identical shapes twice.
@@ -206,9 +213,35 @@ def _patch_all2all(module):
         cls.__init__ = make(name, original_init)
 
 
+def _patch_modular_kernel(module):
+    """Record the (prepare/finalize, experts) pair the MoE was built from.
+
+    The manager record above only proves which all2all was constructed. It
+    says nothing about which experts class consumed it, and the pairing is
+    exactly what is under test here: MoRI with `AiterExperts` is a different
+    claim from MoRI with `TritonExperts`, and only the latter runs under the
+    mode.
+    """
+    cls = getattr(module, "FusedMoEKernelModularImpl", None)
+    if cls is None:
+        return
+    original_init = cls.__init__
+
+    def wrapper(self, prepare_finalize, fused_experts, *args, **kwargs):
+        original_init(self, prepare_finalize, fused_experts, *args, **kwargs)
+        _emit(
+            event="mk",
+            pf=type(prepare_finalize).__name__,
+            experts=type(fused_experts).__name__,
+        )
+
+    cls.__init__ = wrapper
+
+
 _PATCHES = {
     "vllm.v1.worker.dp_utils": _patch_dp_utils,
     "vllm.distributed.device_communicators.all2all": _patch_all2all,
+    "vllm.model_executor.layers.fused_moe.modular_kernel": _patch_modular_kernel,
 }
 
 
@@ -335,20 +368,14 @@ def _needle_rank_pads(records: list[dict], needle: dict) -> list[int]:
     ]
 
 
-@pytest.fixture
-def deepep_ht_server(tmp_path, enable_batch_invariant_mode):
-    """A DP=4 + EP server on the DeepEP high-throughput all2all.
-
-    Function-scoped and explicitly dependent on the autouse
-    `enable_batch_invariant_mode` fixture. A module-scoped server is built
-    before that function-scoped fixture runs, so it would launch with
-    VLLM_BATCH_INVARIANT unset while this process believes it is set -- and
-    a copy of this file that overrides the fixture would not actually flip
-    the arm. The `modes` assertion below catches that, and did.
+def _ep_server(tmp_path, all2all_backend: str, extra_args: list[str] | None = None):
+    """A DP=4 + EP server on `all2all_backend`.
 
     `VLLM_ROCM_USE_AITER` is deliberately left *unset* rather than set to 0:
     the MoE oracles treat the variable being set at all as a request to commit
     to the AITER backend, so exporting it either way changes kernel selection.
+    Leaving it unset is also what makes the MoRI arm select `TritonExperts`
+    without a `--moe-backend` override.
     """
     (tmp_path / "sitecustomize.py").write_text(_INSTRUMENTATION)
     log_prefix = str(tmp_path / "ep_a2a")
@@ -360,7 +387,7 @@ def deepep_ht_server(tmp_path, enable_batch_invariant_mode):
         str(DP),
         "--enable-expert-parallel",
         "--all2all-backend",
-        "deepep_high_throughput",
+        all2all_backend,
         "--max-model-len",
         "4096",
         "--max-num-seqs",
@@ -370,6 +397,7 @@ def deepep_ht_server(tmp_path, enable_batch_invariant_mode):
         "--no-enable-prefix-caching",
         "--gpu-memory-utilization",
         os.getenv("VLLM_EP_TEST_GPU_MEMORY_UTILIZATION", "0.55"),
+        *(extra_args or []),
     ]
     # RemoteOpenAIServer launches the `vllm` console script off PATH rather
     # than `sys.executable -m`, so it does not inherit this process's
@@ -390,9 +418,47 @@ def deepep_ht_server(tmp_path, enable_batch_invariant_mode):
         yield server, log_prefix
 
 
-def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server):
+@pytest.fixture
+def deepep_ht_server(tmp_path, enable_batch_invariant_mode):
+    """A DP=4 + EP server on the DeepEP high-throughput all2all.
+
+    Function-scoped and explicitly dependent on the autouse
+    `enable_batch_invariant_mode` fixture. A module-scoped server is built
+    before that function-scoped fixture runs, so it would launch with
+    VLLM_BATCH_INVARIANT unset while this process believes it is set -- and
+    a copy of this file that overrides the fixture would not actually flip
+    the arm. The `modes` assertion below catches that, and did.
+    """
+    yield from _ep_server(tmp_path, "deepep_high_throughput")
+
+
+@pytest.fixture
+def mori_ht_server(tmp_path, enable_batch_invariant_mode):
+    """A DP=4 + EP server on MoRI.
+
+    Function-scoped for the same reason as `deepep_ht_server`.
+
+    `--max-num-batched-tokens` is pinned because MoRI's receive buffer is
+    `ep_size * max_num_batched_tokens` rows and `TritonExperts` runs the whole
+    thing every step; see the module docstring.
+    """
+    yield from _ep_server(
+        tmp_path,
+        "mori_high_throughput",
+        ["--max-num-batched-tokens", "2048"],
+    )
+
+
+def _assert_needle_does_not_see_the_batch(
+    server,
+    log_prefix: str,
+    *,
+    manager_cls: str,
+    prepare_finalize_cls: str,
+    experts_cls: str,
+    load_concurrency: int = LOAD_CONCURRENCY,
+) -> None:
     """The needle's logprobs must not move when the rest of the server does."""
-    server, log_prefix = deepep_ht_server
     url = server.url_for("v1/completions")
 
     # Discarded: keeps first-request state out of the comparison.
@@ -400,7 +466,7 @@ def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server)
 
     with _Load(url, 0):
         alone = _needle(url)
-    with _Load(url, LOAD_CONCURRENCY) as load:
+    with _Load(url, load_concurrency) as load:
         loaded = _needle(url)
     assert not load.errors, (
         f"the background load did not run cleanly: {load.errors[:3]}"
@@ -422,10 +488,18 @@ def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server)
     )
 
     managers = {r["cls"] for r in records if r.get("event") == "manager"}
-    assert managers == {"DeepEPHTAll2AllManager"}, (
-        f"the workers built {managers or 'no'} all2all manager(s). A fallback "
-        "to AllGather+ReduceScatter would pass this test while proving nothing "
-        "about DeepEP."
+    assert managers == {manager_cls}, (
+        f"the workers built {managers or 'no'} all2all manager(s), not "
+        f"{manager_cls}. A fallback to AllGather+ReduceScatter would pass this "
+        "test while proving nothing about the backend under test."
+    )
+
+    # The manager alone does not pin the measurement: it is the (prepare,
+    # experts) pair that decides what the combine feeds and what consumes it.
+    pairs = {(r["pf"], r["experts"]) for r in records if r.get("event") == "mk"}
+    assert pairs == {(prepare_finalize_cls, experts_cls)}, (
+        f"the workers built MoE kernels {pairs}, not "
+        f"{{('{prepare_finalize_cls}', '{experts_cls}')}}."
     )
 
     # Vacuity: if the load never changed the needle rank's shapes then it ran
@@ -442,7 +516,7 @@ def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server)
         f"rank {NEEDLE_RANK}'s padded token count did not move (alone: max "
         f"{max(alone_pads)}, loaded: max {max(loaded_pads)}), so it dispatched "
         "the same shapes in both conditions and this verdict would be vacuous. "
-        "Raise VLLM_EP_LOAD_CONCURRENCY."
+        "Raise VLLM_EP_LOAD_CONCURRENCY (or VLLM_EP_MORI_LOAD_CONCURRENCY)."
     )
 
     assert loaded["tokens"] == alone["tokens"], (
@@ -460,4 +534,27 @@ def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server)
         f"{max(alone_pads)} to {max(loaded_pads)} while its request was "
         f"byte-identical. max |delta| = "
         f"{max(abs(alone['logprobs'][i] - loaded['logprobs'][i]) for i in moved)}"
+    )
+
+
+def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server):
+    server, log_prefix = deepep_ht_server
+    _assert_needle_does_not_see_the_batch(
+        server,
+        log_prefix,
+        manager_cls="DeepEPHTAll2AllManager",
+        prepare_finalize_cls="DeepEPHTPrepareAndFinalize",
+        experts_cls="TritonExperts",
+    )
+
+
+def test_mori_high_throughput_combine_does_not_see_the_batch(mori_ht_server):
+    server, log_prefix = mori_ht_server
+    _assert_needle_does_not_see_the_batch(
+        server,
+        log_prefix,
+        manager_cls="MoriAll2AllManager",
+        prepare_finalize_cls="MoriPrepareAndFinalize",
+        experts_cls="TritonExperts",
+        load_concurrency=MORI_LOAD_CONCURRENCY,
     )

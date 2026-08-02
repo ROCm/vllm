@@ -1443,9 +1443,48 @@ class FusedMoEConfig:
             )
 
         if self.use_mori_kernels:
-            assert self.rocm_aiter_fmoe_enabled, (
-                "Mori needs to be used with aiter fused_moe for now."
-            )
+            # MoRI used to assert `rocm_aiter_fmoe_enabled` here. It is a
+            # dispatch/combine library and AITER is an expert GEMM, and the
+            # coupling turns out to be a performance contract rather than a
+            # data-format one.
+            #
+            # What MoRI's prepare actually hands the experts is a *fixed-size*
+            # receive buffer of `max_num_tokens_to_recv()` rows (= EP size x
+            # max_num_batched_tokens) plus a device-side scalar row count,
+            # which `MoriPrepareAndFinalize.prepare` puts in
+            # `ExpertTokensMetadata.expert_num_tokens` -- note that despite
+            # the field name it is a single total, not per-expert counts.
+            # `AiterExperts` is the only experts class that can consume a
+            # device-side count without a host sync: it forwards it as AITER's
+            # `num_local_tokens`. Every other class ignores it and computes the
+            # whole padded buffer.
+            #
+            # Doing that is correct, not wrong: the rows past the count are
+            # never read back by `mori_op.combine`. Measured on 4x gfx950,
+            # OLMoE-1B-7B bf16, DP=4/EP=4 under VLLM_BATCH_INVARIANT=1, MoRI
+            # high throughput + TritonExperts is *bitwise identical* to
+            # allgather_reducescatter + TritonExperts across 4 prompts x 24
+            # logprobs and a 32-token needle. It is also batch invariant
+            # (0/32 positions moved under load; 32/32 moved with the mode off,
+            # max |delta| 6.7e-2).
+            #
+            # It is, however, much slower: Triton runs every step at the full
+            # padded M (measured: exactly 8192 rows on every one of 2000 calls
+            # at max_num_batched_tokens=2048, EP=4) where the
+            # allgather_reducescatter path ran the same model at M between 4
+            # and 1751. Warn rather than refuse -- a correct slow
+            # configuration is the caller's tradeoff to make, and refusing it
+            # is what kept an entire all2all backend out of batch-invariant
+            # mode, since `AiterExperts` declares no batch invariance.
+            if not self.rocm_aiter_fmoe_enabled:
+                logger.warning_once(
+                    "MoRI is paired with a non-AITER experts backend. Only "
+                    "AiterExperts consumes MoRI's device-side received-token "
+                    "count, so the expert GEMMs will run at MoRI's full "
+                    "padded receive size (%d rows) on every step regardless "
+                    "of the batch. Output is correct; throughput is not.",
+                    self.max_num_tokens * self.moe_parallel_config.ep_size,
+                )
             assert not self.aiter_fmoe_shared_expert_enabled, (
                 "Mori does not support fusion shared expert now. "
                 "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"
