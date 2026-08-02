@@ -8,11 +8,10 @@ and the ROCm dot_scaled linear path are covered together. The dense Qwen3 is
 the cheap one; the JoyAI checkpoint is MoE and is the only coverage of
 ``Mxfp8NativeTritonExperts`` and of MLA under batch invariance.
 
-When the MoE checkpoint is added back, keep it at TP=1: its
-moe_intermediate_size is 768, and the native grouped GEMM needs the
-per-partition intermediate divisible by 128, so TP=2 still works (384) but
-TP=4 (192) silently falls back to the BF16 emulation backend -- the test would
-pass while covering nothing it was added for.
+Keep the MoE case at TP=1: its moe_intermediate_size is 768, and the native
+grouped GEMM needs the per-partition intermediate divisible by 128, so TP=2
+still works (384) but TP=4 (192) silently falls back to the BF16 emulation
+backend -- the test would pass while covering nothing it was added for.
 
 The prompts have to be long. ``RocmDotScaledMxfp8LinearKernel`` picks BLOCK_K
 from M, and for this model's shapes it only changes above M=256 -- with the
@@ -33,19 +32,24 @@ import pytest
 import torch
 from utils import _extract_step_logprobs, requires_mx
 
+from tests.utils import large_gpu_mark
 from vllm import LLM, SamplingParams
 
 # (model, attention backend). The MoE checkpoint is 55GB, hence the size gate;
 # it needs MLA, which is selected from model_type and rejects TRITON_ATTN.
 MXFP8_CASES = [
     pytest.param("mgoin/Qwen3-0.6B-MXFP8", "TRITON_ATTN", id="qwen3-dense"),
-    # TODO: mawong-amd/JoyAI-LLM-Flash-MXFP8-last-6-BF16-fixed (MoE + MLA,
-    # marks=large_gpu_mark(min_gb=80), TRITON_MLA, TP=1) is the only coverage of
-    # Mxfp8NativeTritonExperts, but it is batch *variant* today: invariant at
-    # batch<=8 or short prompts, and 2/3 needle trials differ at batch 16 with
-    # the padding below (delta ~0.3). Both MX kernels are pinned and measured
-    # invariant, so the suspect is MLA chunked prefill -- the num_splits guard
-    # covers only _is_vllm_fa, not TRITON_MLA. Add it once that is fixed.
+    # The only coverage of Mxfp8NativeTritonExperts, and of MLA under the mode.
+    # It was batch variant until MLA prefill stopped splitting at the scheduler's
+    # batch-dependent chunk boundary: 2/3 needle trials differed at this batch
+    # and padding before that fix, 0/3 after, with 3/3 still differing when the
+    # mode is off.
+    pytest.param(
+        "mawong-amd/JoyAI-LLM-Flash-MXFP8-last-6-BF16-fixed",
+        "TRITON_MLA",
+        marks=large_gpu_mark(min_gb=80),
+        id="joyai-moe",
+    ),
 ]
 
 # Long enough that a batch crosses the M band where BLOCK_K changes; see above.
