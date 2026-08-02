@@ -52,6 +52,50 @@ def _quantize_and_setup_dispatch(
     return a1q, scales, a1q_scale
 
 
+def _check_act_scale_is_dispatchable(fused_experts: mk.FusedMoEExperts) -> None:
+    """Refuse a scheme whose activation scale this dispatch cannot carry.
+
+    `prepare` appends the activation scale to the tensors handed to
+    `all_gatherv`, which sizes every one of them by the *token* count of the
+    rank that contributed it. That holds for a per-token or block scale, which
+    has a row per token, and for a calibrated per-tensor scale, which is a 0-dim
+    scalar and is skipped. A dynamic per-tensor scale is neither: it is one
+    element, computed from this rank's rows alone, so the gather is being asked
+    to treat a single amax as a rank's worth of tokens.
+
+    Unevenly loaded ranks then die inside `_all_gather_single` on
+    `1 != <this rank's token count>`, after the model has loaded and captured
+    graphs. Evenly loaded ranks are worse: `all_gatherv` drops `sizes` when
+    every rank contributes the same count, which skips that assertion, and the
+    ranks' amaxes are concatenated into a `[world_size]` vector whose first
+    element the kernel then applies to everyone's tokens. Refuse here, where
+    the scheme is visible, rather than in either of those places.
+
+    Widening the skip in `_quantize_and_setup_dispatch` is not the fix. It would
+    leave each rank quantizing the gathered batch with its own local amax, which
+    is the silent-wrong-output case above, reached deliberately.
+    """
+    if fused_experts.expects_unquantized_inputs:
+        # The experts quantize for themselves, so `prepare` dispatches
+        # unquantized activations and produces no scale to gather.
+        return
+
+    quant_config = fused_experts.quant_config
+    if quant_config is None or not quant_config.is_dynamic_per_tensor_act:
+        return
+
+    raise ValueError(
+        f"A dynamic per-tensor {quant_config.quant_dtype} activation scheme "
+        f"cannot be served by the AllGather+ReduceScatter MoE dispatch. Its "
+        f"scale is one element per rank, computed from that rank's own tokens, "
+        f"but the dispatch all-gathers it alongside the activations and sizes "
+        f"every tensor by each rank's token count. Use a checkpoint with "
+        f"calibrated activation scales, a per-token or block-quantized scheme, "
+        f"or an all2all backend that carries the scale itself "
+        f"(--all2all-backend=deepep_high_throughput)."
+    )
+
+
 def _unwrap_scale_and_prepare_for_moe(
     scales: list[torch.Tensor] | None,
     quant_config: FusedMoEQuantConfig,
@@ -108,6 +152,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
 
     def output_is_reduced(self) -> bool:
         return False
+
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
+        _check_act_scale_is_dispatchable(fused_experts)
 
     def prepare(
         self,
@@ -241,6 +288,9 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
 
     def output_is_reduced(self) -> bool:
         return False
+
+    def post_init_setup(self, fused_experts: mk.FusedMoEExperts) -> None:
+        _check_act_scale_is_dispatchable(fused_experts)
 
     def prepare(
         self,
