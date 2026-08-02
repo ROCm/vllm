@@ -73,8 +73,10 @@ CASES = [
 # takes the all-gather fallback even in the custom_ar worker, which makes its
 # comparison against the reference -- read from a smaller, custom-served count --
 # a bitwise cross-check of the two implementations rather than a batch-invariance
-# check of one. Both are fp32 rank-order sums, so they do agree, and the extra
-# coverage is worth keeping. Pinned below so that a change to max_size,
+# check of one. They do agree -- `implementations_agree` measures exactly that,
+# for every dtype here rather than only the one that happens to cross this
+# boundary -- and the extra coverage is worth keeping. Pinned below so that a
+# change to max_size,
 # HIDDEN_SIZE or TOKEN_COUNTS surfaces here instead of silently moving which
 # implementation the sweep is testing.
 #
@@ -239,6 +241,100 @@ def custom_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
     _check_all_reduce(monkeypatch, tp_size, pp_size, rank, port, True)
 
 
+def _check_implementations_agree(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    """The custom kernel and the all-gather fallback must be interchangeable.
+
+    Batch invariance serves messages below the custom all-reduce's ``max_size``
+    with the custom kernel and everything above it with all-gather plus a fixed
+    rank-order sum. That is a size-dependent switch between two *implementations*
+    -- benign only while they agree bitwise, and a batch-variance bug otherwise,
+    since the switch point is a token count.
+
+    Both sum ``world_size`` contributions in ascending rank order into an fp32
+    accumulator and round once. That is a per-element property, independent of
+    message size, so comparing them below ``max_size`` -- where the custom kernel
+    can actually serve the call -- settles the boundary wherever
+    ``CudaCommunicator`` places it for a given engine config.
+    """
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    set_custom_all_reduce(True)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.model_executor.layers.batch_invariant import all_reduce_batch_invariant
+
+    ca_comm = get_tp_group().device_communicator.ca_comm
+    assert ca_comm is not None and not ca_comm.disabled, (
+        "custom all-reduce is not live, so there is no second implementation "
+        "to compare against and this test asserts nothing"
+    )
+
+    failures = []
+    compared = 0
+    for dtype, spread in CASES:
+        generator = torch.Generator(device=device).manual_seed(1234 + rank)
+        full = torch.randn(
+            max(TOKEN_COUNTS), HIDDEN_SIZE, generator=generator, device=device
+        )
+        if spread:
+            exponents = torch.randint(
+                -spread,
+                spread,
+                full.shape,
+                generator=generator,
+                device=device,
+                dtype=torch.int32,
+            )
+            full = full * torch.exp2(exponents.float())
+        full = full.to(dtype)
+
+        for num_tokens in TOKEN_COUNTS:
+            probe = full[:num_tokens].contiguous()
+            if not ca_comm.should_custom_ar(probe):
+                continue
+            # Only rows whose accumulation is inexact can tell the two
+            # implementations apart; the rest agree for free and would let this
+            # pass while blind.
+            sensitive = _order_sensitive_elements(probe)
+            custom = ca_comm.custom_all_reduce(probe.clone())
+            assert custom is not None
+            fallback = all_reduce_batch_invariant(
+                probe.clone(), get_tp_group().device_group
+            )
+            for row in CHECK_ROWS:
+                if row >= num_tokens or not sensitive[row].any():
+                    continue
+                compared += 1
+                if not torch.equal(custom[row], fallback[row]):
+                    failures.append(
+                        f"{dtype} spread=+-{spread} tokens={num_tokens} row={row}"
+                    )
+
+    assert compared, (
+        "no order-sensitive row was served by the custom all-reduce, so the two "
+        "implementations were never actually compared"
+    )
+    assert not failures, (
+        "the custom all-reduce and the all-gather fallback disagree, so the "
+        "size-based switch between them is itself batch variance:\n  "
+        + "\n  ".join(failures)
+    )
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def implementations_agree_worker(monkeypatch, tp_size, pp_size, rank, port):
+    _check_implementations_agree(monkeypatch, tp_size, pp_size, rank, port)
+
+
 @ray.remote(num_gpus=1, max_calls=1)
 def fallback_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
     _check_all_reduce(monkeypatch, tp_size, pp_size, rank, port, False)
@@ -246,7 +342,9 @@ def fallback_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
 
 @pytest.mark.parametrize("tp_size", [4])
 @pytest.mark.parametrize(
-    "worker", [custom_ar_worker, fallback_ar_worker], ids=["custom_ar", "fallback_ar"]
+    "worker",
+    [custom_ar_worker, fallback_ar_worker, implementations_agree_worker],
+    ids=["custom_ar", "fallback_ar", "implementations_agree"],
 )
 def test_tp_all_reduce_is_batch_invariant(
     tp_size: int,
