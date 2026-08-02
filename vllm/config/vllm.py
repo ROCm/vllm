@@ -1599,21 +1599,32 @@ class VllmConfig:
         if envs.VLLM_BATCH_INVARIANT:
             dcp_size = self.parallel_config.decode_context_parallel_size
             pcp_size = self.parallel_config.prefill_context_parallel_size
-            if dcp_size > 1 or pcp_size > 1:
-                # Context parallelism recombines a request's partial attention
-                # across ranks with a reduce-scatter -- GroupCoordinator for
-                # DCP's default ag_rs backend, get_pcp_group() for a PCP MoE --
-                # and reduce_scatter has no batch-invariant path the way
-                # all_reduce does. Its message is sized by the token count, so
-                # the reduction order moves with batch composition. The rescale
-                # that precedes the combine is fine: the Triton kernel in
+            # DCP's "a2a" backend is exempt: dcp_a2a_lse_reduce does not reduce
+            # across ranks in a collective at all. It exchanges the partial
+            # outputs and their LSEs with one all_to_all_single -- pure data
+            # movement, bitwise reproducible however the library chunks it --
+            # then combines them locally in a Triton kernel with one program per
+            # (token, head) that walks the ranks in tl.static_range, so the
+            # reduction order is fixed and cannot follow the batch.
+            dcp_needs_gate = dcp_size > 1 and (
+                self.parallel_config.dcp_comm_backend != "a2a"
+            )
+            if dcp_needs_gate or pcp_size > 1:
+                # Everything else recombines a request's partial attention with
+                # a reduce-scatter -- GroupCoordinator for DCP's default ag_rs
+                # backend, get_pcp_group() for a PCP MoE -- and reduce_scatter
+                # has no batch-invariant path the way all_reduce does. Its
+                # message is sized by the token count, so the reduction order
+                # moves with batch composition. The rescale that precedes the
+                # combine is fine: the Triton kernel in
                 # vllm/v1/attention/ops/common.py walks the ranks in a static
-                # order. DCP measured variant at TP=4/DCP=4 and invariant at
-                # DCP=1 with nothing else changed. PCP is gated structurally
-                # and unmeasured: the V2 runner rejects it before this point,
-                # so the pcp branch is unreachable by default and only bites
-                # once that changes. DCP's "a2a" backend reduces locally after
-                # an all-to-all and may turn out to be exempt, also unmeasured.
+                # order. ag_rs measured variant at TP=4/DCP=4 and invariant at
+                # DCP=1 with nothing else changed; a2a measured invariant at the
+                # same layout with ag_rs dirty in the same session. PCP keeps
+                # the reduce-scatter and stays gated structurally: it is
+                # unmeasured because the V2 runner rejects it before this point,
+                # so that branch is unreachable by default and only bites once
+                # that changes.
                 #
                 # Raise rather than override to 1, unlike the guards below:
                 # those cost throughput, these change the deployment. Clearing
@@ -1622,14 +1633,17 @@ class VllmConfig:
                 raise ValueError(
                     "Context parallelism is not supported with "
                     "VLLM_BATCH_INVARIANT (decode_context_parallel_size="
-                    f"{dcp_size}, prefill_context_parallel_size={pcp_size}). "
-                    "Both recombine each request's partial attention across "
+                    f"{dcp_size}, prefill_context_parallel_size={pcp_size}, "
+                    f"dcp_comm_backend={self.parallel_config.dcp_comm_backend!r}"
+                    "). It recombines each request's partial attention across "
                     "ranks with a reduce-scatter, and the collective library "
                     "picks that reduction's order from the message size, which "
                     "scales with the number of tokens in the batch -- so a "
                     "token's output would depend on what else was batched with "
                     "it. There is no batch-invariant reduce-scatter to route "
-                    "to, as there is for all-reduce. Set both sizes to 1, "
+                    "to, as there is for all-reduce. For decode context "
+                    "parallelism, --dcp-comm-backend a2a combines locally "
+                    "instead and is supported. Otherwise set both sizes to 1, "
                     "raising --tensor-parallel-size to keep the same GPU "
                     "count, or unset VLLM_BATCH_INVARIANT."
                 )
