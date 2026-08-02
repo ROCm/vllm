@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FUSED_MOE_UNQUANTIZED_CONFIG,
     FusedMoEQuantConfig,
     _get_config_dtype_str,
+    maybe_promote_act_quant_for_batch_invariance,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
@@ -1622,6 +1623,11 @@ def fused_experts(
     """Run fused MoE expert computation using Triton kernels."""
     if quant_config is None:
         quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
+
+    # Same defect as the modular path: a dynamic per-tensor activation scale is
+    # an amax over the whole launch. This entry point has no setup hook, so the
+    # promotion happens here.
+    quant_config = maybe_promote_act_quant_for_batch_invariance(quant_config)
 
     return torch.ops.vllm.fused_experts(
         hidden_states=hidden_states,
