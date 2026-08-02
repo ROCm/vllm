@@ -2,105 +2,297 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The native MX linear kernels must not depend on the number of rows.
 
-Batch-invariant mode leaves the MXFP4 and MXFP8 GEMMs in place rather than
-substituting a Triton kernel, because both reduce K sequentially within a single
-workgroup: their tile selection is keyed on M, but only cross-workgroup split-K
-would reorder an output element's accumulation. That is a property of the
-kernels, not a contract they declare, so pin it here -- if AITER or the native
-launcher starts splitting K, batch invariance breaks silently otherwise.
+Batch-invariant mode keeps both GEMMs rather than substituting a Triton kernel,
+so the tile selectors -- which are keyed on M -- decide the property. For MXFP4
+it holds as written: AITER changes tile shape across seven M buckets and asks
+for a four-way split-K below M=9, and none of that reorders an output element's
+accumulation. For MXFP8 it does not: BLOCK_K is the one parameter that does
+reorder it, so ``_mxfp8_dot_scaled_linear`` pins BLOCK_K under batch invariance
+and these tests run with the mode on.
+
+Both fixes change which config the kernel runs, so accuracy is checked in that
+config rather than assumed: MXFP4 against a hand-decoded reference below, MXFP8
+by ``test_mxfp8_native_linear`` in ``tests/kernels/test_minimax_m3_amd_ops.py``
+(pinning BLOCK_K does not change what the tile computes, only how K is chunked).
 """
 
 import pytest
 import torch
-from utils import skip_unsupported
+from utils import requires_mx, skip_unsupported
 
-from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
 
-# Row counts spanning the M buckets the tile selectors switch on.
-TOKEN_COUNTS = [1, 32, 64, 65, 128, 256, 257, 512, 1024, 1025, 2048]
+SEED = 0
 
-requires_mx = pytest.mark.skipif(
-    not (current_platform.is_rocm() and current_platform.supports_mx()),
-    reason="requires a ROCm device with native MX support (gfx95x)",
-)
+# Half-width of the E8M0 block-scale exponent range, either side of 127.
+# This is what makes the sweeps able to see anything: MXFP4 operands carry four
+# mantissa bits and the block scales are powers of two, so with a narrow spread
+# the fp32 accumulation of a whole K row is *exact* and no reordering can change
+# the result. Measured on gfx950 -- forcing a four-way split-K changes nothing at
+# +-7, and 11 of 32 probe rows at +-15. test_mxfp4_scale_spread_exposes_reordering
+# keeps this honest.
+SCALE_SPREAD = 15
+
+# (N, K, use_asm_gemm). gemm_with_dynamic_quant fans out to four AITER entry
+# points and the row counts below reach all of them:
+#   asm=False       dynamic_mxfp4_quant + gemm_afp4wfp4, which asks for a
+#                   four-way split-K in its M <= 8 bucket
+#   (8192, 2048)    per_1x32_f4_quant_hip + gemm_afp4wfp4_preshuffled_weight_scales
+#                   for M <= 64 -- shuffle=False below M=32, True from 32 --
+#                   and gemm_a4w4 above it
+#   (8192, 1024)    gemm_a4w4 at every M, reaching both its asm kernels and the
+#                   CK gemm_a4w4_blockscale kernel (M in 513..1024)
+MXFP4_CASES = [
+    (4096, 2048, False),
+    (2048, 6144, False),
+    (512, 1024, False),
+    (8192, 2048, True),
+    (8192, 1024, True),
+]
+
+# The AITER MXFP4 selector switches on M alone -- the config is identical for
+# every (N, K) probed -- at 1/9/33/65/129/257/513, and M <= 8 is the only band
+# that splits K (NUM_KSPLIT=4). Straddle every boundary.
+MXFP4_TOKEN_COUNTS = [
+    1,
+    2,
+    8,
+    9,
+    16,
+    32,
+    33,
+    64,
+    65,
+    128,
+    129,
+    256,
+    257,
+    512,
+    513,
+    1024,
+    2048,
+]
+
+# The native MXFP8 selector keys on all of M, N and K. Together with the shapes
+# below these counts cover 11 distinct tile configurations, spanning every
+# BLOCK_K it can choose (128/256/512/1024) and BLOCK_M of 16, 64 and 128.
+MXFP8_TOKEN_COUNTS = [1, 32, 64, 65, 128, 129, 256, 257, 512, 1024, 1025, 2048]
+
+# Row 0 always sits at offset 0, so it lands in the first tile of every
+# decomposition and stays invariant even when the rest of the output does not.
+# Checking it alone hides real failures.
+CHECK_ROWS = [0, 1, 2, 3, 7, 15, 31]
 
 
-def _first_row_classes(rows: dict[int, torch.Tensor]) -> list[list[int]]:
-    """Group row counts by bitwise-identical output, most common case: one class."""
-    classes: list[tuple[torch.Tensor, list[int]]] = []
-    for num_tokens, row in rows.items():
-        for representative, members in classes:
-            if torch.equal(row, representative):
-                members.append(num_tokens)
-                break
-        else:
-            classes.append((row, [num_tokens]))
-    return [members for _, members in classes]
+def _probe(out: torch.Tensor) -> torch.Tensor:
+    """The leading rows of an output, kept so the sweep does not hold every GEMM."""
+    return out[: CHECK_ROWS[-1] + 1].clone()
+
+
+def _variant_rows(probes: dict[int, torch.Tensor]) -> list[str]:
+    """Rows whose contents changed with the number of rows in the launch."""
+    failures = []
+    for row in CHECK_ROWS:
+        # A row is only comparable across launches that actually contain it.
+        counts = [n for n in sorted(probes) if n > row]
+        if not counts:
+            continue
+        reference = probes[counts[0]][row]
+        variant = [n for n in counts if not torch.equal(probes[n][row], reference)]
+        if variant:
+            failures.append(f"row {row} changed at row counts {variant}")
+    return failures
+
+
+def _dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor, k: int) -> torch.Tensor:
+    """Decode E2M1 pairs (low nibble first) scaled by their E8M0 block exponent."""
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=packed.device
+    ).repeat(2)
+    lut[8:] *= -1
+    nibbles = torch.stack([packed & 0xF, (packed >> 4) & 0xF], dim=-1)
+    values = lut[nibbles.long()].view(*packed.shape[:-1], k)
+    return values * torch.exp2(scale.float() - 127).repeat_interleave(32, dim=-1)
+
+
+def _mxfp8_weights(n: int, k: int):
+    """E4M3 weights with E8M0 block scales, as the MXFP8 layer stores them."""
+    weight = (torch.randn(n, k, device="cuda") / 8).to(torch.float8_e4m3fn)
+    weight_scale = torch.randint(
+        127 - SCALE_SPREAD,
+        128 + SCALE_SPREAD,
+        (n, k // 32),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    return weight, weight_scale
+
+
+def _reference_operands(fmt: str, n: int, k: int):
+    """Dequantized (activation, weight) for the operands the sweeps below use."""
+    if fmt == "mxfp4":
+        pytest.importorskip("aiter")
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+        weight, weight_scale = _mxfp4_weights(n, k, use_asm_gemm=False)
+        x = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+        x_q, x_s = dynamic_mxfp4_quant(x)
+        return (
+            _dequant_mxfp4(x_q, x_s, k),
+            _dequant_mxfp4(weight, weight_scale.T.contiguous(), k),
+        )
+
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        dequant_mxfp8_to_bf16,
+        mxfp8_e4m3_quantize,
+    )
+
+    weight, weight_scale = _mxfp8_weights(n, k)
+    x = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+    x_q, x_s = mxfp8_e4m3_quantize(x)
+    return (
+        dequant_mxfp8_to_bf16(x_q, x_s).float(),
+        dequant_mxfp8_to_bf16(weight, weight_scale).float(),
+    )
 
 
 @skip_unsupported
 @requires_mx
-@pytest.mark.parametrize("n,k", [(4096, 2048), (2048, 6144)])
-def test_mxfp4_linear_is_batch_invariant(n: int, k: int):
+@pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8"])
+def test_scale_spread_exposes_reordering(fmt: str):
+    """The sweeps are only meaningful if their operands can see a reordering.
+
+    Summing one K row in the opposite order has to move the bf16 result at
+    SCALE_SPREAD, or the invariance sweeps below are asserting nothing. MXFP4
+    needs the wide spread for this; MXFP8 carries enough mantissa that it holds
+    at any spread.
+    """
+    set_random_seed(SEED)
+    a, b = _reference_operands(fmt, 512, 2048)
+
+    forward = torch.einsum("mk,nk->mn", a, b).to(torch.bfloat16)
+    reverse = torch.einsum("mk,nk->mn", a.flip(-1), b.flip(-1)).to(torch.bfloat16)
+    assert not torch.equal(forward, reverse), (
+        f"reversing the K order leaves every {fmt} output bit unchanged at "
+        f"SCALE_SPREAD={SCALE_SPREAD}: the fp32 accumulation is exact for these "
+        f"operands, so the batch-invariance sweeps cannot fail"
+    )
+
+
+@skip_unsupported
+@requires_mx
+@pytest.mark.parametrize("n,k", [(4096, 2048), (512, 1024)])
+def test_mxfp4_linear_matches_dequant_reference(n: int, k: int):
+    """The AITER MXFP4 GEMM against a hand-decoded reference, in the pinned config.
+
+    Batch invariance drops the kernel's split-K, so the accuracy of what it
+    actually runs under the mode is not what ``tests/evals/gsm8k`` measures.
+    Quark's ``mx.dq_mxfp4`` disagrees with AITER on the activation path, so
+    ``_dequant_mxfp4`` is the oracle here.
+    """
+    import vllm.model_executor.kernels.linear.mxfp4.aiter  # noqa: F401
+
+    pytest.importorskip("aiter")
+    from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+    set_random_seed(SEED)
+    weight, weight_scale = _mxfp4_weights(n, k, use_asm_gemm=False)
+    x = torch.randn(256, k, device="cuda", dtype=torch.bfloat16)
+
+    got = torch.ops.vllm.gemm_with_dynamic_quant(
+        x, weight, weight_scale, False, torch.bfloat16
+    )
+    # The op quantizes x internally; repeating it here is bit-exact.
+    x_q, x_s = dynamic_mxfp4_quant(x)
+    reference = (
+        _dequant_mxfp4(x_q, x_s, k)
+        @ _dequant_mxfp4(weight, weight_scale.T.contiguous(), k).T
+    )
+
+    error = ((got.float() - reference).norm() / reference.norm()).item()
+    assert error < 5e-3, (
+        f"MXFP4 linear is {error:.2e} from the dequantized reference "
+        f"(N={n}, K={k}); bf16 output rounding alone is ~2e-3"
+    )
+
+
+def _mxfp4_weights(n: int, k: int, use_asm_gemm: bool):
+    """Weights laid out as AiterMxfp4LinearKernel.process_weights_after_loading."""
+    weight = torch.randint(0, 255, (n, k // 2), dtype=torch.uint8, device="cuda")
+    weight_scale = torch.randint(
+        127 - SCALE_SPREAD,
+        128 + SCALE_SPREAD,
+        (n, k // 32),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    if not use_asm_gemm:
+        return weight, weight_scale.T.contiguous()
+
+    from aiter.ops.shuffle import shuffle_weight
+
+    sm, sn = weight_scale.shape
+    weight_scale = (
+        weight_scale.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
+        .permute(0, 3, 5, 2, 4, 1, 6)
+        .contiguous()
+        .view(sm, sn)
+    )
+    return shuffle_weight(weight, layout=(16, 16)), weight_scale
+
+
+@skip_unsupported
+@requires_mx
+@pytest.mark.parametrize("n,k,use_asm_gemm", MXFP4_CASES)
+def test_mxfp4_linear_is_batch_invariant(n: int, k: int, use_asm_gemm: bool):
     # Importing the module registers torch.ops.vllm.gemm_with_dynamic_quant.
     import vllm.model_executor.kernels.linear.mxfp4.aiter  # noqa: F401
 
     pytest.importorskip("aiter")
 
-    device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(0)
-    weight = torch.randint(
-        0, 255, (n, k // 2), dtype=torch.uint8, device=device, generator=generator
-    )
-    # Stored transposed, matching AiterMxfp4LinearKernel.process_weights_after_loading.
-    weight_scale = torch.randint(
-        120, 134, (k // 32, n), dtype=torch.uint8, device=device, generator=generator
-    )
-    x = torch.randn(
-        max(TOKEN_COUNTS), k, device=device, dtype=torch.bfloat16, generator=generator
-    )
+    set_random_seed(SEED)
+    weight, weight_scale = _mxfp4_weights(n, k, use_asm_gemm)
+    x = torch.randn(max(MXFP4_TOKEN_COUNTS), k, device="cuda", dtype=torch.bfloat16)
 
-    rows = {
-        num_tokens: torch.ops.vllm.gemm_with_dynamic_quant(
-            x[:num_tokens].contiguous(), weight, weight_scale, False, torch.bfloat16
-        )[0].clone()
-        for num_tokens in TOKEN_COUNTS
+    probes = {
+        num_tokens: _probe(
+            torch.ops.vllm.gemm_with_dynamic_quant(
+                x[:num_tokens], weight, weight_scale, use_asm_gemm, torch.bfloat16
+            )
+        )
+        for num_tokens in MXFP4_TOKEN_COUNTS
     }
 
-    classes = _first_row_classes(rows)
-    assert len(classes) == 1, (
-        f"MXFP4 linear row 0 changed with the row count: {classes} (N={n}, K={k})"
+    failures = _variant_rows(probes)
+    assert not failures, (
+        f"MXFP4 linear depends on the row count "
+        f"(N={n}, K={k}, asm={use_asm_gemm}):\n  " + "\n  ".join(failures)
     )
 
 
 @skip_unsupported
 @requires_mx
-@pytest.mark.parametrize("n,k", [(4096, 2048), (2048, 6144)])
+@pytest.mark.parametrize(
+    "n,k", [(4096, 2048), (2048, 6144), (1024, 768), (1536, 1024), (1024, 384)]
+)
 def test_mxfp8_linear_is_batch_invariant(n: int, k: int):
     from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
         _mxfp8_dot_scaled_linear,
     )
 
-    device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(0)
-    weight = (torch.randn(n, k, device=device, generator=generator) / 8).to(
-        torch.float8_e4m3fn
-    )
-    weight_scale = torch.randint(
-        120, 134, (n, k // 32), dtype=torch.uint8, device=device, generator=generator
-    )
-    x = torch.randn(
-        max(TOKEN_COUNTS), k, device=device, dtype=torch.bfloat16, generator=generator
-    )
+    set_random_seed(SEED)
+    weight, weight_scale = _mxfp8_weights(n, k)
+    x = torch.randn(max(MXFP8_TOKEN_COUNTS), k, device="cuda", dtype=torch.bfloat16)
 
-    rows = {
-        num_tokens: _mxfp8_dot_scaled_linear(
-            x[:num_tokens].contiguous(), weight, weight_scale
-        )[0].clone()
-        for num_tokens in TOKEN_COUNTS
+    probes = {
+        num_tokens: _probe(
+            _mxfp8_dot_scaled_linear(x[:num_tokens], weight, weight_scale)
+        )
+        for num_tokens in MXFP8_TOKEN_COUNTS
     }
 
-    classes = _first_row_classes(rows)
-    assert len(classes) == 1, (
-        f"MXFP8 linear row 0 changed with the row count: {classes} (N={n}, K={k})"
+    failures = _variant_rows(probes)
+    assert not failures, (
+        f"MXFP8 linear depends on the row count (N={n}, K={k}):\n  "
+        + "\n  ".join(failures)
     )
