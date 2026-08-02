@@ -38,6 +38,16 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M):
     return pid_m, pid_n
 
 
+def _vector_stride(tensor: torch.Tensor) -> int:
+    """Stride between entries of a scalar or single-axis tensor.
+
+    Flattening instead would be wrong: ``reshape(-1)`` on an ``(M, 1)`` slice
+    returns a strided view that a kernel would read as unit stride.
+    """
+    strides = [s for s, size in zip(tensor.stride(), tensor.shape) if size > 1]
+    return strides[0] if strides else 1
+
+
 @triton.jit(launch_metadata=_matmul_launch_metadata)
 def matmul_kernel_persistent(
     a_ptr,
@@ -53,6 +63,7 @@ def matmul_kernel_persistent(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_bias,
     BLOCK_SIZE_M: tl.constexpr,  #
     BLOCK_SIZE_N: tl.constexpr,  #
     BLOCK_SIZE_K: tl.constexpr,  #
@@ -122,7 +133,7 @@ def matmul_kernel_persistent(
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         if HAS_BIAS:
-            bias_ptrs = bias_ptr + offs_cn
+            bias_ptrs = bias_ptr + offs_cn * stride_bias
             bias = tl.load(bias_ptrs, mask=offs_cn < N, other=0.0).to(tl.float32)
             accumulator += bias
         c = accumulator.to(c_ptr.dtype.element_ty)
@@ -195,6 +206,7 @@ def matmul_persistent(
         b.stride(1),  #
         c.stride(0),
         c.stride(1),  #
+        _vector_stride(bias) if bias is not None else 1,
         NUM_SMS=NUM_SMS,  #
         A_LARGE=a.numel() > 2**31,
         B_LARGE=b.numel() > 2**31,
@@ -343,6 +355,7 @@ def _log_softmax_kernel(
     input_ptr,
     output_ptr,
     input_row_stride,
+    input_col_stride,
     output_row_stride,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
@@ -365,7 +378,9 @@ def _log_softmax_kernel(
         mask = col_idx < n_cols
 
         # Load values
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=-float("inf"))
+        vals = tl.load(
+            row_start_ptr + col_idx * input_col_stride, mask=mask, other=-float("inf")
+        )
 
         # Update maximum
         max_val = tl.max(tl.maximum(vals, max_val))
@@ -377,7 +392,7 @@ def _log_softmax_kernel(
         mask = col_idx < n_cols
 
         # Load values
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        vals = tl.load(row_start_ptr + col_idx * input_col_stride, mask=mask, other=0.0)
 
         # Compute exp(x - max_val) and accumulate
         exp_vals = tl.exp(vals - max_val)
@@ -392,7 +407,7 @@ def _log_softmax_kernel(
         mask = col_idx < n_cols
 
         # Load values
-        vals = tl.load(row_start_ptr + col_idx, mask=mask)
+        vals = tl.load(row_start_ptr + col_idx * input_col_stride, mask=mask)
 
         # Compute log_softmax
         output = vals - max_val - log_sum_exp
@@ -421,12 +436,11 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     # Flatten all dimensions except the last one
     original_shape = input.shape
     input_2d = input.reshape(-1, input.shape[-1])
-    input_2d = input_2d.contiguous()
 
     n_rows, n_cols = input_2d.shape
 
     # Allocate output tensor
-    output = torch.empty_like(input_2d)
+    output = torch.empty((n_rows, n_cols), dtype=input_2d.dtype, device=input_2d.device)
 
     # Choose block size based on the number of columns
     BLOCK_SIZE = 1024
@@ -437,6 +451,7 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
         input_2d,
         output,
         input_2d.stride(0),
+        input_2d.stride(1),
         output.stride(0),
         n_cols,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -450,6 +465,7 @@ def _softmax_kernel(
     input_ptr,
     output_ptr,
     input_row_stride,
+    input_col_stride,
     output_row_stride,
     n_cols,
     BLOCK_SIZE: tl.constexpr,
@@ -457,7 +473,10 @@ def _softmax_kernel(
     """Softmax over the last dimension, one row per program.
 
     Mirrors ``_log_softmax_kernel``: each row is reduced by a single program in
-    a fixed block order, so the result never depends on the row count.
+    a fixed block order, so the result never depends on the row count. Both
+    input strides are runtime arguments so that a non-contiguous view is read
+    in place; Triton specializes a stride of 1 into a constant, so the
+    contiguous case compiles to the same code as an unstrided kernel.
     """
     row_idx = tl.program_id(0).to(tl.int64)
     row_start_ptr = input_ptr + row_idx * input_row_stride
@@ -467,21 +486,23 @@ def _softmax_kernel(
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=-float("inf"))
+        vals = tl.load(
+            row_start_ptr + col_idx * input_col_stride, mask=mask, other=-float("inf")
+        )
         max_val = tl.max(tl.maximum(vals, max_val))
 
     sum_exp = 0.0
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
-        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        vals = tl.load(row_start_ptr + col_idx * input_col_stride, mask=mask, other=0.0)
         exp_vals = tl.exp(vals.to(tl.float32) - max_val)
         sum_exp += tl.sum(tl.where(mask, exp_vals, 0.0))
 
     for col_offset in range(0, n_cols, BLOCK_SIZE):
         col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
         mask = col_idx < n_cols
-        vals = tl.load(row_start_ptr + col_idx, mask=mask)
+        vals = tl.load(row_start_ptr + col_idx * input_col_stride, mask=mask)
         output = tl.exp(vals.to(tl.float32) - max_val) / sum_exp
         tl.store(
             output_row_start_ptr + col_idx,
@@ -498,14 +519,15 @@ def softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
         )
 
     original_shape = input.shape
-    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
-    output = torch.empty_like(input_2d)
-
+    input_2d = input.reshape(-1, input.shape[-1])
     n_rows, n_cols = input_2d.shape
+    output = torch.empty((n_rows, n_cols), dtype=input_2d.dtype, device=input_2d.device)
+
     _softmax_kernel[(n_rows,)](
         input_2d,
         output,
         input_2d.stride(0),
+        input_2d.stride(1),
         output.stride(0),
         n_cols,
         BLOCK_SIZE=1024,
@@ -982,6 +1004,9 @@ def scaled_mm_kernel_persistent(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_as,
+    stride_bs,
+    stride_bias,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -1033,11 +1058,15 @@ def scaled_mm_kernel_persistent(
         offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
         if A_SCALE_PER_TOKEN:
-            a_scale = tl.load(a_scale_ptr + offs_cm, mask=offs_cm < M, other=0.0)
+            a_scale = tl.load(
+                a_scale_ptr + offs_cm * stride_as, mask=offs_cm < M, other=0.0
+            )
         else:
             a_scale = tl.load(a_scale_ptr)
         if B_SCALE_PER_CHANNEL:
-            b_scale = tl.load(b_scale_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+            b_scale = tl.load(
+                b_scale_ptr + offs_cn * stride_bs, mask=offs_cn < N, other=0.0
+            )
         else:
             b_scale = tl.load(b_scale_ptr)
 
@@ -1051,7 +1080,9 @@ def scaled_mm_kernel_persistent(
             accumulator = accumulator * a_scale * b_scale
 
         if HAS_BIAS:
-            bias = tl.load(bias_ptr + offs_cn, mask=offs_cn < N, other=0.0)
+            bias = tl.load(
+                bias_ptr + offs_cn * stride_bias, mask=offs_cn < N, other=0.0
+            )
             accumulator += bias.to(tl.float32)
 
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
@@ -1109,8 +1140,8 @@ def scaled_mm_batch_invariant(
         a,
         b,
         c,
-        a_scale.contiguous().view(-1),
-        b_scale.contiguous().view(-1),
+        a_scale,
+        b_scale,
         bias,
         M,
         N,
@@ -1121,6 +1152,9 @@ def scaled_mm_batch_invariant(
         b.stride(1),
         c.stride(0),
         c.stride(1),
+        _vector_stride(a_scale),
+        _vector_stride(b_scale),
+        _vector_stride(bias) if bias is not None else 1,
         NUM_SMS=NUM_SMS,
         A_SCALE_PER_TOKEN=a_scale_per_token,
         B_SCALE_PER_CHANNEL=b_scale_per_channel,
