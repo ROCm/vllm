@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -121,6 +122,26 @@ class Scheduler(SchedulerInterface):
         self.num_sampled_tokens_per_step = (
             1 if not vllm_config.model_config.is_diffusion else 0
         )
+
+        # Batch invariance: a prefill chunk's length must be a function of the
+        # request alone. Shrinking it to whatever token budget the rest of the
+        # batch left over moves the request's chunk boundaries with the batch,
+        # and MLA prefill splits its attention at exactly those boundaries
+        # (context chunks merged with the causal new-token chunk), so the
+        # logprobs move too. Cap chunks at a size that always fits once the
+        # other slots are decoding and defer instead of truncating.
+        # Without chunked prefill a prompt is scheduled whole or not at all, so
+        # there is no boundary to pin and the cap would only introduce one.
+        self.batch_invariant_prefill_chunk = 0
+        if envs.VLLM_BATCH_INVARIANT and self.scheduler_config.enable_chunked_prefill:
+            # A decode slot is the sampled token plus its draft tokens.
+            decode_slot = 1 + vllm_config.num_speculative_tokens
+            self.batch_invariant_prefill_chunk = max(
+                # The cap is also applied to running decodes; below one decode
+                # slot it would silently drop their draft tokens.
+                decode_slot,
+                self.max_num_scheduled_tokens - self.max_num_running_reqs * decode_slot,
+            )
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
@@ -520,6 +541,12 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+            if chunk_cap := self.batch_invariant_prefill_chunk:
+                num_new_tokens = min(num_new_tokens, chunk_cap)
+                if num_new_tokens > token_budget:
+                    # Defer rather than shrink; see batch_invariant_prefill_chunk.
+                    req_index += 1
+                    continue
             num_new_tokens = min(num_new_tokens, token_budget)
 
             # Make sure the input position does not exceed the max model len.
@@ -909,6 +936,13 @@ class Scheduler(SchedulerInterface):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
                         break
+
+                    if chunk_cap := self.batch_invariant_prefill_chunk:
+                        num_new_tokens = min(num_new_tokens, chunk_cap)
+                        if num_new_tokens > token_budget:
+                            # Defer rather than shrink; see
+                            # batch_invariant_prefill_chunk.
+                            break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0

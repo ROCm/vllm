@@ -205,6 +205,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             dcp_world_size=self.dcp_world_size,
             dcp_local_block_size=self.dcp_local_block_size,
             dcp_virtual_block_size=self.dcp_virtual_block_size,
+            max_concurrent_prefills=self.vllm_config.scheduler_config.max_num_seqs,
         )
 
     def build(
