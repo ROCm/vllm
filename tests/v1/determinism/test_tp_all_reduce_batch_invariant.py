@@ -8,7 +8,8 @@ summed changes with the batch size. Under ``VLLM_BATCH_INVARIANT`` the
 communicator is expected to route around that, whichever backend it lands on.
 
 Requires at least 4 GPUs: a 2-rank sum is order independent, so TP=2 passes even
-with a batch-variant collective.
+with a batch-variant collective. Runs again at 8 where they are available, which
+is the more sensitive probe -- see the parametrization note below.
 """
 
 import os
@@ -340,7 +341,14 @@ def fallback_ar_worker(monkeypatch, tp_size, pp_size, rank, port):
     _check_all_reduce(monkeypatch, tp_size, pp_size, rank, port, False)
 
 
-@pytest.mark.parametrize("tp_size", [4])
+# Eight ranks where the hardware allows: an fp32 accumulator often sums four
+# contributions exactly, so world size 4 is the weaker probe. Doubling the ranks
+# roughly doubles how many checked rows can observe a reordering at all --
+# measured on gfx950, 148 order-sensitive comparisons at 4 and 256 at 8, fp32
+# rising from 68 to 136 because fp32 operands leave the accumulator no headroom.
+@pytest.mark.parametrize(
+    "tp_size", [4, pytest.param(8, marks=multi_gpu_marks(num_gpus=8))]
+)
 @pytest.mark.parametrize(
     "worker",
     [custom_ar_worker, fallback_ar_worker, implementations_agree_worker],
