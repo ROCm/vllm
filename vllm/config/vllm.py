@@ -1637,6 +1637,54 @@ class VllmConfig:
                     "count, or unset VLLM_BATCH_INVARIANT."
                 )
 
+            if self.parallel_config.enable_eplb:
+                redundant = self.parallel_config.eplb_config.num_redundant_experts
+                if redundant > 0:
+                    # A redundant expert gives a logical expert more than one
+                    # physical replica, and the router picks between them by
+                    # hashing the token's *row index in the current forward*
+                    # (`_eplb_map_and_record_i32_kernel`: `token_idx = offs //
+                    # num_active_experts`, `replica_idx = hashed %
+                    # replica_count`). The replicas hold the same weights, so
+                    # the choice is mathematically irrelevant and numerically
+                    # is not: it moves the token to a different rank's GEMM and
+                    # a different position in the combine. A token's output
+                    # then depends on what else was in its batch, which is the
+                    # property this mode exists to provide.
+                    #
+                    # Measured on 4x gfx950, DeepSeek-V2-Lite, DP=4 x EP=4,
+                    # num_redundant_experts=8 (max replica count 2), with
+                    # expert placement held still -- zero committed
+                    # rearrangements across the whole comparison: 64 of 64
+                    # needle logprobs moved when 32 companions shared its rank,
+                    # and 0 of 64 when 24 companions ran on the *other* three
+                    # ranks instead. Only companions that change the needle's
+                    # own row index move it, which is the signature of that
+                    # hash and not of the collective. The same sweep with
+                    # num_redundant_experts=0 moved 0 of 64 in every condition.
+                    raise ValueError(
+                        "EPLB with redundant experts is not supported with "
+                        "VLLM_BATCH_INVARIANT "
+                        f"(eplb_config.num_redundant_experts={redundant}). A "
+                        "logical expert with more than one physical replica is "
+                        "routed by hashing the token's index within the batch, "
+                        "so which replica -- and therefore which rank -- serves "
+                        "a token depends on what else is batched with it. Set "
+                        "num_redundant_experts to 0, which is batch invariant, "
+                        "or unset VLLM_BATCH_INVARIANT."
+                    )
+                logger.warning_once(
+                    "EPLB is enabled with VLLM_BATCH_INVARIANT. Output is "
+                    "invariant to batch composition, but not reproducible "
+                    "across runs: EPLB moves experts between ranks based on "
+                    "the load it has observed, so a request's output depends "
+                    "on the traffic that preceded it. Measured on "
+                    "DeepSeek-V2-Lite at DP=4 x EP=4: two identical solo "
+                    "requests either side of a rearrangement sampled different "
+                    "tokens. Disable EPLB if you need run-to-run "
+                    "reproducibility."
+                )
+
             # These passes rewrite the collective the communicator would have
             # run: sequence parallelism and AsyncTP turn an all-reduce into
             # reduce-scatter + all-gather, and the fusion passes replace it with
