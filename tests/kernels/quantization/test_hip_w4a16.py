@@ -543,3 +543,114 @@ def test_hip_w4a16_symmetric_correctness(
     ).to(y.dtype)
 
     torch.testing.assert_close(y, y_ref, rtol=1e-2, atol=2e-1)
+
+
+# ---------------------------------------------------------------------------
+# wvSplitK_int4_g: packed 4-bit zero-points
+# ---------------------------------------------------------------------------
+# The skinny GEMM consumes zero-points in the packed 4-bit form the checkpoint
+# ships ([N/8, K/G] int32, row n's nibble at word[n/8] bits 4*(n%8)) rather than
+# expanded to the activation dtype.  Nothing else in the suite checks the VALUES
+# this kernel produces, so a wrong nibble index would be silent -- these tests
+# pin the packing convention against a reference dequant.
+
+
+def _pack_zp_along_n(zp_raw: torch.Tensor) -> torch.Tensor:
+    """[N, G] uint4 values -> [N/8, G] int32, matching packed_dim=0.
+
+    Inverse of unpack_quantized_values_into_int32(..., packed_dim=0), whose
+    convention is res[n] = (word[n // 8] >> 4 * (n % 8)) & 0xF.
+    """
+    n, g = zp_raw.shape
+    assert n % 8 == 0, "N must be divisible by 8 to pack zero-points"
+    packed = torch.zeros((n // 8, g), dtype=torch.int32, device=zp_raw.device)
+    for i in range(8):
+        packed |= (zp_raw[i::8, :] & 0xF) << (4 * i)
+    return packed
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops._rocm_C, "wvSplitK_int4_g"),
+    reason="wvSplitK_int4_g not built",
+)
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (5376, 2048),  # N % 8 == 0, small
+        # K matches gemma-4-31B gate_up (168 groups at g=32); N is kept small
+        # because the fp32 reference dequant is [N, K] and the real N=43008
+        # would need ~3.7 GB of intermediates for no extra coverage -- the
+        # nibble index is per-row, so any N divisible by 8 exercises it.
+        (1024, 5376),
+        (8, 256),  # N == 8: exactly one packed word per group
+    ],
+)
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("act_dtype", [torch.float16, torch.bfloat16])
+def test_wvsplitk_int4_g_packed_zero_points(
+    n: int, k: int, group_size: int, act_dtype: torch.dtype
+) -> None:
+    """Asymmetric skinny GEMM against a reference dequant.
+
+    Guards the packed zero-point layout: a wrong nibble index still produces
+    plausible-looking output, so this compares actual values.
+    """
+    import vllm._custom_ops as ops
+    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+        pack_skinny_int4,
+    )
+    from vllm.utils.platform_utils import num_compute_units
+
+    set_random_seed(0)
+    device = "cuda"
+    num_groups = k // group_size
+
+    nibbles = torch.randint(0, 16, (n, k), dtype=torch.int32, device=device)
+    w_q_skinny, _ = pack_skinny_int4(nibbles)
+    scale = torch.rand(n, num_groups, dtype=act_dtype, device=device) * 0.02 - 0.01
+    zp_raw = torch.randint(0, 16, (n, num_groups), dtype=torch.int32, device=device)
+    zp_packed = _pack_zp_along_n(zp_raw)
+    x = (torch.rand(1, k, dtype=act_dtype, device=device) - 0.5) * 0.05
+
+    y = ops.wvSplitK_int4_g(
+        w_q_skinny, x, scale, num_compute_units(), group_size, zp_packed, None
+    )
+
+    # Reference: dequant = (nibble - zp_raw) * scale, per group.
+    zp_exp = zp_raw.to(torch.float32).repeat_interleave(group_size, dim=1)
+    scale_exp = scale.to(torch.float32).repeat_interleave(group_size, dim=1)
+    dequant = (nibbles.to(torch.float32) - zp_exp) * scale_exp
+    y_ref = (x.to(torch.float32) @ dequant.t()).to(y.dtype)
+
+    torch.testing.assert_close(y, y_ref, rtol=1e-2, atol=2e-1)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops._rocm_C, "wvSplitK_int4_g"),
+    reason="wvSplitK_int4_g not built",
+)
+def test_wvsplitk_int4_g_rejects_unpacked_zero_points() -> None:
+    """The op must reject act-dtype zero-points rather than misread them.
+
+    Before the packed layout the kernel took [N, K/G] in the activation dtype;
+    silently accepting that shape now would read garbage nibbles.
+    """
+    import vllm._custom_ops as ops
+    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+        pack_skinny_int4,
+    )
+    from vllm.utils.platform_utils import num_compute_units
+
+    n, k, group_size = 64, 256, 32
+    device = "cuda"
+    num_groups = k // group_size
+    nibbles = torch.randint(0, 16, (n, k), dtype=torch.int32, device=device)
+    w_q_skinny, _ = pack_skinny_int4(nibbles)
+    scale = torch.rand(n, num_groups, dtype=torch.float16, device=device)
+    x = torch.rand(1, k, dtype=torch.float16, device=device)
+    bad_zp = torch.zeros(n, num_groups, dtype=torch.float16, device=device)
+
+    with pytest.raises(RuntimeError, match="int32"):
+        ops.wvSplitK_int4_g(
+            w_q_skinny, x, scale, num_compute_units(), group_size, bad_zp, None
+        )

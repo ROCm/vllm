@@ -628,7 +628,8 @@ def _hybrid_w4a16_apply_impl(
       w_q:     [N, K//8] int8 (ExLlama shuffle, for skinny kernel)
       w_q_i32: [N, K//8] int32 (same data viewed as int32, for triton)
       w_s:     [N, K//G] fp16/bf16 (skinny-layout scales)
-      w_zp:    [N, K//G] raw zero-points (zp_raw) in act dtype,
+      w_zp:    [N//8, K//G] int32, raw zero-points packed 8x uint4 along N
+               (row n -> word[n/8], bits 4*(n%8)),
                or None for symmetric. Both HIP skinny and Triton use this
                single format: dequant = (nibble - zp_raw) * scale.
       packed_scale_zp: [N, K//G] fp32 carrier packing scale + zero-point per
@@ -821,14 +822,22 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             w_zp_raw = getattr(layer, self.w_zp_name)
             # Normalize zp layout to (N, num_groups)
             permute_param_layout_(w_zp_raw, input_dim=1, output_dim=0, packed_dim=0)
+            # zp_unpacked: [N, num_groups] with raw uint4 values [0..15].
+            # Only needed transiently below to build the Triton scale/zp
+            # carrier and the optional dense dequant copy.
             zp_unpacked = unpack_quantized_values_into_int32(
                 w_zp_raw.data, c.weight_type, packed_dim=0
             )
-            # zp_unpacked: [N, num_groups] with raw uint4 values [0..15]
-            # Store raw zero-points in activation dtype.
-            # Both kernels dequant as (nibble - zp_raw) * scale.
-            w_zp = zp_unpacked.to(c.act_type).contiguous()
-            self._transform_param(layer, self.w_zp_name, lambda x: w_zp)
+            # The HIP skinny kernel reads the zero-points in their PACKED 4-bit
+            # form -- [N/8, num_groups] int32, row n's nibble at word[n/8] bits
+            # 4*(n%8) -- rather than expanded to the activation dtype.  These
+            # values only span 0..15; storing them at 2 bytes cost 4x the DRAM
+            # traffic (14.5 MB vs 3.6 MB per call on gemma-4-31B gate_up), and
+            # the kernel is memory-bound, so that is time.  Both kernels still
+            # dequant as (nibble - zp_raw) * scale.
+            w_zp_packed = w_zp_raw.data.contiguous()
+            w_zp = w_zp_packed
+            self._transform_param(layer, self.w_zp_name, lambda x: w_zp_packed)
 
         # ---- Store on layer ----
         # Replace w_q with skinny int8 (primary weights for skinny kernel)
@@ -858,12 +867,12 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             scale_u16 = w_s_skinny.view(torch.uint16).to(torch.int32) & 0xFFFF
             if c.act_type == torch.float16:
                 w_s_f32 = w_s_skinny.to(torch.float32)
-                scaled_zp_f32 = (w_zp.to(torch.float32) - 8.0) * w_s_f32
+                scaled_zp_f32 = (zp_unpacked.to(torch.float32) - 8.0) * w_s_f32
                 bias_eff = (-(8.0 * w_s_f32 + scaled_zp_f32)).to(c.act_type)
                 bias_u16 = bias_eff.contiguous().view(torch.uint16)
                 hi_u16 = bias_u16.to(torch.int32) & 0xFFFF
             else:
-                hi_u16 = w_zp.to(torch.int32) & 0xFFFF  # raw zp 0..15
+                hi_u16 = zp_unpacked.to(torch.int32) & 0xFFFF  # raw zp 0..15
             packed_scale_zp = (
                 ((hi_u16 << 16) | scale_u16).view(torch.float32).contiguous()
             )
@@ -884,7 +893,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         dequant_mode = get_current_vllm_config().model_config.w4a16_prefill_dequant
         if dequant_mode != "off" and unpacked.device.type == "cuda":
             self._maybe_cache_dequant_prefill_weight(
-                layer, unpacked, w_s_skinny, w_zp, dequant_mode
+                layer, unpacked, w_s_skinny, zp_unpacked, dequant_mode
             )
 
     def _maybe_cache_dequant_prefill_weight(

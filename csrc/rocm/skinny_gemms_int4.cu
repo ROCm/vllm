@@ -45,14 +45,19 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
               "Scale must be [M, K/group_size] = [", M_in, ", ", num_groups,
               "] but got [", in_scale.size(0), ", ", in_scale.size(1), "]");
   if (in_zero_points.has_value()) {
-    TORCH_CHECK(in_zero_points->dtype() == in_x.dtype(),
-                "Zero points dtype must match activation dtype");
+    // Zero points stay in the packed 4-bit form the checkpoint ships:
+    // [M/8, K/group_size] int32, row m's nibble at word[m/8] bits 4*(m%8).
+    TORCH_CHECK(in_zero_points->dtype() == at::kInt,
+                "Zero points must be int32 (packed 8x uint4 along dim 0), got ",
+                in_zero_points->dtype());
     TORCH_CHECK(in_zero_points->dim() == 2,
-                "Zero points must be 2D [M, K/group_size], got shape ",
+                "Zero points must be 2D [M/8, K/group_size], got shape ",
                 in_zero_points->sizes());
-    TORCH_CHECK(in_zero_points->size(0) == M_in &&
+    TORCH_CHECK(M_in % 8 == 0,
+                "M must be divisible by 8 for packed zero points, got ", M_in);
+    TORCH_CHECK(in_zero_points->size(0) == M_in / 8 &&
                     in_zero_points->size(1) == num_groups,
-                "Zero points must be [M, K/group_size] = [", M_in, ", ",
+                "Zero points must be [M/8, K/group_size] = [", M_in / 8, ", ",
                 num_groups, "] but got [", in_zero_points->size(0), ", ",
                 in_zero_points->size(1), "]");
   }
@@ -78,9 +83,9 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
         const fptype* aptr = reinterpret_cast<const fptype*>(in_x.data_ptr());
         const fptype* sptr =
             reinterpret_cast<const fptype*>(in_scale.data_ptr());
-        const fptype* zpptr =
+        const uint32_t* zpptr =
             in_zero_points.has_value()
-                ? reinterpret_cast<const fptype*>(in_zero_points->data_ptr())
+                ? reinterpret_cast<const uint32_t*>(in_zero_points->data_ptr())
                 : nullptr;
         const fptype* biasptr =
             (in_bias.has_value() && in_bias->numel() > 0)
@@ -160,8 +165,8 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
         const uint8_t* wptr = reinterpret_cast<const uint8_t*>(w.data_ptr());
         const fptype* aptr = reinterpret_cast<const fptype*>(a.data_ptr());
         const fptype* sptr = reinterpret_cast<const fptype*>(scales.data_ptr());
-        const fptype* zpptr =
-            has_zp ? reinterpret_cast<const fptype*>(zero_points.data_ptr())
+        const uint32_t* zpptr =
+            has_zp ? reinterpret_cast<const uint32_t*>(zero_points.data_ptr())
                    : nullptr;
         fptype* cptr = reinterpret_cast<fptype*>(c.data_ptr());
         const int* eidptr = expert_ids.data_ptr<int32_t>();
