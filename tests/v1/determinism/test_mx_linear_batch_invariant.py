@@ -276,14 +276,22 @@ def test_mxfp4_linear_is_batch_invariant(n: int, k: int, use_asm_gemm: bool):
 @pytest.mark.parametrize(
     "n,k", [(4096, 2048), (2048, 6144), (1024, 768), (1536, 1024), (1024, 384)]
 )
-def test_mxfp8_linear_is_batch_invariant(n: int, k: int):
+# The kernel writes the fp32 accumulator out in the activation dtype, so fp16
+# rounds the same reordering differently -- and sees more of it. With
+# VLLM_BATCH_INVARIANT=0 on gfx950 the unpinned BLOCK_K moves probe rows in
+# 4 of the 5 shapes under fp16 against 3 under bf16, K=768 being visible only
+# in fp16. K=384 moves in neither, and not for lack of sensitivity: 384 is not
+# a multiple of 256, so _select_cfg returns BLOCK_K=128 in every M bucket and
+# there is no reordering to pin.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mxfp8_linear_is_batch_invariant(n: int, k: int, dtype: torch.dtype):
     from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
         _mxfp8_dot_scaled_linear,
     )
 
     set_random_seed(SEED)
     weight, weight_scale = _mxfp8_weights(n, k)
-    x = torch.randn(max(MXFP8_TOKEN_COUNTS), k, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(max(MXFP8_TOKEN_COUNTS), k, device="cuda", dtype=dtype)
 
     probes = {
         num_tokens: _probe(
@@ -294,6 +302,6 @@ def test_mxfp8_linear_is_batch_invariant(n: int, k: int):
 
     failures = _variant_rows(probes)
     assert not failures, (
-        f"MXFP8 linear depends on the row count (N={n}, K={k}):\n  "
+        f"MXFP8 linear depends on the row count (N={n}, K={k}, {dtype}):\n  "
         + "\n  ".join(failures)
     )
