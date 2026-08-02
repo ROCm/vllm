@@ -65,11 +65,13 @@ import os
 import random
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import requests
 from utils import skip_if_not_cuda_alike
 
+import vllm
 import vllm.envs as envs
 from tests.utils import RemoteOpenAIServer, large_gpu_mark, multi_gpu_marks
 
@@ -134,8 +136,11 @@ def _patch(module):
         try:
             import vllm.envs as envs
 
+            import vllm
+
             record = {
                 "t": time.time(),
+                "vllm_file": vllm.__file__,
                 "dp_rank": parallel_config.data_parallel_rank,
                 "unpadded": int(num_tokens_unpadded),
                 "padded": (
@@ -278,15 +283,15 @@ def _rank0_decode_pads(log_prefix: str, needle: dict) -> list[int]:
     return pads
 
 
-def _worker_modes(log_prefix: str) -> set[bool]:
+def _worker_field(log_prefix: str, field: str) -> set:
     directory, prefix = os.path.split(log_prefix)
-    modes = set()
+    values = set()
     for name in os.listdir(directory):
         if name.startswith(prefix + "."):
             with open(os.path.join(directory, name)) as f:
                 for line in f:
-                    modes.add(json.loads(line)["batch_invariant"])
-    return modes
+                    values.add(json.loads(line)[field])
+    return values
 
 
 @pytest.fixture
@@ -318,9 +323,20 @@ def dp_server(tmp_path, enable_batch_invariant_mode):
         "--gpu-memory-utilization",
         os.getenv("VLLM_DP_TEST_GPU_MEMORY_UTILIZATION", "0.45"),
     ]
+    # The repo root goes on PYTHONPATH ahead of everything else because
+    # RemoteOpenAIServer launches the `vllm` console script off PATH rather than
+    # `sys.executable -m`, so the server does not inherit this process's
+    # interpreter or its venv. Without this it resolves `vllm` from whatever the
+    # script's shebang interpreter happens to have on its path -- on a machine
+    # with an unrelated vLLM checkout wired in through a user-site
+    # `easy-install.pth`, that is a *different tree*, and the test would measure
+    # a build nobody is asking about while passing. `_assert_server_runs_this_tree`
+    # below is the check that keeps this honest; the path entry only makes the
+    # common case work.
+    repo_root = str(Path(vllm.__file__).resolve().parent.parent)
     env = {
         "PYTHONPATH": os.pathsep.join(
-            [str(tmp_path), os.environ.get("PYTHONPATH", "")]
+            [str(tmp_path), repo_root, os.environ.get("PYTHONPATH", "")]
         ).rstrip(os.pathsep),
         "DP_COORD_LOG": log_prefix,
         "VLLM_ATTENTION_BACKEND": "TRITON_ATTN",
@@ -344,7 +360,17 @@ def test_dp_padding_from_a_peer_replica_does_not_change_logprobs(dp_server):
         with_peer = _needle(url)
     assert not peer.errors, f"the peer load did not run cleanly: {peer.errors[:3]}"
 
-    modes = _worker_modes(log_prefix)
+    # The server is a separate process launched off PATH, so it can silently be
+    # a different vLLM than the one under test. Then everything below would
+    # measure someone else's build and pass.
+    served = _worker_field(log_prefix, "vllm_file")
+    assert served == {vllm.__file__}, (
+        f"the server imported vLLM from {served}, but this test process is "
+        f"{vllm.__file__}. The server subprocess is running a different tree, "
+        f"so nothing it reports is evidence about this one."
+    )
+
+    modes = _worker_field(log_prefix, "batch_invariant")
     assert modes == {envs.VLLM_BATCH_INVARIANT}, (
         f"the server's effective VLLM_BATCH_INVARIANT is {modes}, but this "
         f"process has {envs.VLLM_BATCH_INVARIANT}; the two arms of this test "
