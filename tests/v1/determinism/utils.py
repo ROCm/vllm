@@ -86,6 +86,12 @@ skip_if_not_cuda_alike = pytest.mark.skipif(
     reason="Requires CUDA >= Ampere (SM80) or ROCm",
 )
 
+# For the native MX kernels, which need CDNA4 microscaling instructions.
+requires_mx = pytest.mark.skipif(
+    not (current_platform.is_rocm() and current_platform.supports_mx()),
+    reason="requires a ROCm device with native MX support (gfx95x)",
+)
+
 
 def _random_prompt(min_words: int = 1024, max_words: int = 1024 * 2) -> str:
     # Generate more realistic prompts that will actually produce varied tokens
