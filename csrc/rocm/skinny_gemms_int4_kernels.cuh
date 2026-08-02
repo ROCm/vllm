@@ -147,6 +147,42 @@ __device__ __forceinline__ void load_act_into_lds(
   __syncthreads();
 }
 
+// Chunked variant of load_act_into_lds, for wvSplitK_int4_compute_sml_'s
+// CHUNKED mode: copies A[kBase, kBase+KFIT) of *every* one of the N activation
+// rows into a KFIT-strided LDS band, so the compute body reads every row from
+// LDS even when the whole activation does not fit.  Row n lives at
+// s[n * KFIT + (k - kBase)].
+//
+// Two differences from load_act_into_lds, both load-bearing:
+//   * strides by the *runtime* _WvPrGrp.  CHUNKED returns the waves above
+//     _WvPrGrp before the first barrier, so the compile-time WvPrGrp rows are
+//     no longer all present to cover the copy.
+//   * no trailing __syncthreads() -- the caller owns the barrier on both sides
+//     of the reload.
+//
+// Requires K % A_CHUNK == 0 (host-gated): the final chunk's span is K - kBase,
+// and a non-multiple would read past the end of the last row.
+template <typename scalar_t, int THRDS, int A_CHUNK, int N, uint32_t KFIT>
+__device__ __forceinline__ void load_act_chunk_into_lds(
+    scalar_t* s, const scalar_t* __restrict__ A, const int K,
+    const uint32_t kBase, const int _WvPrGrp) {
+  union bigTypeA {
+    scalar_t h[A_CHUNK];
+    float f[A_CHUNK / 2];
+  };
+  const uint32_t span = min__(KFIT, (uint32_t)K - kBase);
+  const uint32_t step = THRDS * A_CHUNK * _WvPrGrp;
+  const uint32_t off = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
+  for (uint32_t k = 0; k < span; k += step) {
+    uint32_t k_in = k + off;
+    if (k_in >= span) break;
+  #pragma unroll
+    for (int n = 0; n < N; n++)
+      *((bigTypeA*)(&s[n * KFIT + k_in])) =
+          *((const bigTypeA*)(&A[(uint32_t)K * n + kBase + k_in]));
+  }
+}
+
 // Variant of load_act_into_lds that fuses the silu_and_mul preamble.
 // The source activation tensor has K*2 columns per row, packed as
 // [gate(K) | up(K)].  This routine reads both halves and writes
@@ -220,7 +256,8 @@ __device__ __forceinline__ uint32_t zp_nibble(const uint32_t* zp_packed,
 // it before this function reads from it.
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
+          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
+          bool CHUNKED = false, uint32_t LDS_LEN = LDS_SIZE / 2>
 __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
@@ -230,6 +267,11 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
   // B_row_stride_bytes is the per-row byte stride of the packed weights;
   // pass K/2 for the contiguous default, or K/2 + pad for the padded layout
   // (see gfx1151 K%2048 cliff workaround).
+  //
+  // CHUNKED walks K in LDS-sized chunks so that all N activation rows can be
+  // read from LDS even when K*N exceeds it.  LDS_LEN is a template parameter
+  // rather than an argument so kFit below is a compile-time constant and
+  // kFit*n folds into the LDS address immediate.
 
   union bigTypeA {
     scalar_t h[A_CHUNK];
@@ -241,6 +283,17 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
     uint32_t u32[A_CHUNK / 8];
     float f[A_CHUNK / 8];
   };
+
+  // CHUNKED puts __syncthreads() *inside* the m-loop, and s_barrier is untagged
+  // on gfx11 (split barriers are gfx12+).  A wave parked at the trailing
+  // barrier of the guarded section below would satisfy a reload barrier and
+  // silently break the LDS write->read ordering, so remove the inactive waves
+  // from the barrier population up front instead -- the same thing the fp16
+  // wvSplitK_hf_big_ does.  Safe because CHUNKED is never combined with the
+  // re-entrant MoE caller, which passes CHUNKED=false explicitly.
+  if constexpr (CHUNKED) {
+    if (threadIdx.y >= _WvPrGrp) return;
+  }
 
   // Guarded section (replaces an early 'return' for threadIdx.y >= _WvPrGrp)
   // so every thread reaches the trailing __syncthreads() at the bottom of
@@ -257,7 +310,29 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
 
     float sum[N][YTILE];
 
-    while (m < M) {
+    // Per-row LDS window for CHUNKED, rounded *down* to a whole number of k1
+    // steps so a chunk boundary can only ever fall between two iterations.
+    constexpr uint32_t TUC = THRDS * UNRL * A_CHUNK;
+    constexpr uint32_t kFit = (LDS_LEN / N) - (LDS_LEN / N) % TUC;
+    static_assert(!CHUNKED || kFit >= TUC,
+                  "CHUNKED needs at least one k1 step of LDS per row");
+    static_assert(!CHUNKED || (uint64_t)kFit * N <= LDS_LEN,
+                  "CHUNKED LDS band overruns the caller's s[]");
+    [[maybe_unused]] uint32_t kBase = 0;
+
+    // Live waves must run the m-loop the same number of times, or the ones
+    // that finish early would stop arriving at the reload barriers.  Rounding
+    // M up to a whole YTILE*_WvPrGrp cannot split a workgroup's window: within
+    // a workgroup m0 is in [bx*YW, bx*YW + YW - YTILE], the stride is
+    // CuCount*YW, and Mrndp mod that stride is a multiple of YW, so the
+    // rounded bound never lands strictly inside the window.
+    uint32_t mEnd = M;
+    if constexpr (CHUNKED) {
+      const uint32_t YW = YTILE * _WvPrGrp;
+      mEnd = (M % YW == 0) ? M : (M - M % YW + YW);
+    }
+
+    while (m < mEnd) {
       for (int i = 0; i < YTILE; i++)
         for (int n = 0; n < N; n++) sum[n][i] = 0;
 
@@ -311,9 +386,18 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
             // lets it widen the LDS read to ds_load_b128 for every activation
             // row instead of falling back to ds_load_2addr_b32 for rows n >= 1
             // (whose K*n offset it otherwise can't prove aligned, since K is a
-            // runtime value).
+            // runtime value).  The CHUNKED form keeps that: kBase is a
+            // multiple of kFit and kFit of A_CHUNK.  Note the scale and
+            // zero-point lookups below stay on the *absolute* k_ -- only the
+            // LDS address is chunk-relative.
+            uint32_t a_idx;
+            if constexpr (CHUNKED) {
+              a_idx = (k_ - kBase) + kFit * n;
+            } else {
+              a_idx = k_ + K * n;
+            }
             bigA[n][k2] = *((const bigTypeA*)__builtin_assume_aligned(
-                &(s[k_ + K * n]), sizeof(bigTypeA)));
+                &(s[a_idx]), sizeof(bigTypeA)));
           }
         }
 
@@ -461,15 +545,46 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
         if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
       };
 
+      // Refill the LDS band when k1 crosses a chunk boundary.  The predicate
+      // is wave-uniform (k1 and kBase are), so every live wave reaches both
+      // barriers together.  kFit is a multiple of K_STEP, so a boundary always
+      // falls between iterations and never inside one.
+      auto maybe_reload = [&](uint32_t k1) {
+        if constexpr (CHUNKED) {
+          if (k1 == 0 || k1 == kBase + kFit) {
+            if (k1 != 0) kBase += kFit;
+            __syncthreads();
+            load_act_chunk_into_lds<scalar_t, THRDS, A_CHUNK, N, kFit>(
+                s, A, K, kBase, _WvPrGrp);
+            __syncthreads();
+          }
+        }
+      };
+
       bigTypeW bigB[YTILE][UNRL];
       uint32_t k1 = 0;
       for (; k1 < K_whole; k1 += K_STEP) {
+        maybe_reload(k1);
+        // Waves past the real M still had to reach the barriers above; from
+        // here on they have no rows to reduce.
+        if constexpr (CHUNKED) {
+          if (m >= M) continue;
+        }
         prio_hi();
         k_load(std::false_type{}, bigB, k1);
         prio_lo();
         k_compute(std::false_type{}, bigB, k1);
       }
+      if constexpr (CHUNKED) {
+        if (m >= M) {
+          if (K_whole < K) maybe_reload(K_whole);
+          m += CuCount * _WvPrGrp * YTILE;
+          kBase = 0;
+          continue;
+        }
+      }
       if (K_whole < K) {
+        maybe_reload(K_whole);
         prio_hi();
         k_load(std::true_type{}, bigB, K_whole);
         prio_lo();
@@ -539,6 +654,7 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
       }
   #endif  // defined(__HIP__GFX1X__)
       m += CuCount * _WvPrGrp * YTILE;
+      if constexpr (CHUNKED) kBase = 0;
     }
   }  // end of guarded section (threadIdx.y < _WvPrGrp)
   // Rendezvous all 16 y-rows before the caller may re-enter this body for
@@ -551,7 +667,8 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
 // Original __global__ kernel: thin wrapper around the device function.
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
+          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
+          bool CHUNKED = false, uint32_t LDS_LEN = LDS_SIZE / 2>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_int4_hf_sml_(const int K, const int M, const int Bx, const int By,
                           const uint8_t* B_packed,
@@ -560,17 +677,21 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                           const scalar_t* __restrict__ BIAS, scalar_t* C,
                           const int _WvPrGrp, const int CuCount,
                           const int B_row_stride_bytes) {
-  constexpr int max_lds_len = LDS_SIZE / 2;
+  constexpr int max_lds_len = LDS_LEN;
   __shared__ scalar_t s[max_lds_len];
-  load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(s, A, K, max_lds_len);
+  // CHUNKED fills s[] itself, once per chunk, from inside the compute body.
+  if constexpr (!CHUNKED)
+    load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(s, A, K,
+                                                            max_lds_len);
   wvSplitK_int4_compute_sml_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
-                             GROUP_SIZE, HAS_ZERO_POINTS>(
+                             GROUP_SIZE, HAS_ZERO_POINTS, CHUNKED, LDS_LEN>(
       K, M, Bx, By, B_packed, A, scale, zero_points, BIAS, C, _WvPrGrp, CuCount,
       s, B_row_stride_bytes);
 }
 #else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
+          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
+          bool CHUNKED = false, uint32_t LDS_LEN = LDS_SIZE / 2>
 __global__ void wvSplitK_int4_hf_sml_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
@@ -967,6 +1088,53 @@ static int mindiv_int4(int N, int div1, int div2) {
 #define WVSPLITK_INT4G_LAUNCH(_THRDS, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
   WVSPLITK_INT4G_LAUNCH_W_AC(_THRDS, _YTILE, 16, 16, _UNRL, _N, _GS, _HAS_ZP)
 
+// Launch for shapes whose activation does not fit LDS in one go: walk K in
+// LDS-sized chunks so every activation row is still read from LDS, and fall
+// back to the medium kernel when the chunk geometry or M rules it out.
+//
+// Kept as its own macro rather than a third arm of WVSPLITK_INT4G_LAUNCH_W_AC
+// so the CHUNKED=true instantiations exist only for the one tuple the
+// doesn't-fit branch selects, instead of for every tuple in the dispatch.
+#define WVSPLITK_INT4G_LAUNCH_CHUNKED(_THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS, \
+                                      _HAS_ZP)                                 \
+  {                                                                            \
+    dim3 block(_THRDS, _W);                                                    \
+    int __wvPrGrp = mindiv_int4(M_in, CuCount * _YTILE, _W);                   \
+    /* The compute body declares s[LDS_SIZE/2], while the host max_lds_len is  \
+       get_lds_size_int4()/2 -- larger on gfx950.  Gate on what the body       \
+       actually allocates. */                                                  \
+    constexpr int __ldsElems = LDS_SIZE / 2;                                   \
+    constexpr int __tuc = (_THRDS) * (_UNRL) * (_AC);                          \
+    constexpr int __kFit = (__ldsElems / (_N)) - (__ldsElems / (_N)) % __tuc;  \
+    /* K % A_CHUNK: the last chunk's span is K - kBase, and a non-multiple     \
+       would make load_act_chunk_into_lds read past the final row. */          \
+    if (M_in % (_YTILE) == 0 && __kFit >= __tuc && K_in % (_AC) == 0)          \
+      wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,   \
+                            _HAS_ZP, /*CHUNKED=*/true, __ldsElems>             \
+          <<<grid, block, 0, stream>>>(K_in, M_in, Bx_in, By_in, wptr, aptr,   \
+                                       sptr, zpptr, biasptr, cptr, __wvPrGrp,  \
+                                       CuCount, b_row_stride_bytes_i32);       \
+    else                                                                       \
+      wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,       \
+                        _HAS_ZP><<<grid, block, 0, stream>>>(                  \
+          K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,    \
+          __wvPrGrp, CuCount, b_row_stride_bytes_i32);                         \
+  }
+
+#define WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, _GS, _HAS_ZP)                \
+  if (is_gfx1x_int4())                                                         \
+    WVSPLITK_INT4G_LAUNCH_CHUNKED(32, _YTILE, 16, 16, _UNRL, _N, _GS, _HAS_ZP) \
+  else                                                                         \
+    WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
+
+#define WVSPLIT_INT4G_GS_CHUNKED(_YTILE, _UNRL, _N, _HAS_ZP) \
+  if (group_size == 32)                                      \
+    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 32, _HAS_ZP)   \
+  else if (group_size == 64)                                 \
+    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 64, _HAS_ZP)   \
+  else                                                       \
+    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 128, _HAS_ZP)
+
 #define WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
   if (is_gfx1x_int4())                                         \
     WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
@@ -998,9 +1166,9 @@ static int mindiv_int4(int N, int div1, int div2) {
   {                                                                   \
     if (K_in * N_in > max_lds_len) {                                  \
       if (_sYT < 30)                                                  \
-        WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                          \
+        WVSPLIT_INT4G_GS_CHUNKED(4, 2, __N, _HAS_ZP)                  \
       else                                                            \
-        WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                          \
+        WVSPLIT_INT4G_GS_CHUNKED(4, 1, __N, _HAS_ZP)                  \
     } else if (__N >= 4 && _sYT >= 480)                               \
       WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                            \
     else if (__N >= 3 && _sYT >= 40)                                  \
@@ -1141,10 +1309,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
       last_src_row = src_row;
     }
 
+    // CHUNKED=false is spelled out, not defaulted: this caller re-enters the
+    // compute body per expert block and relies on the guarded section's
+    // trailing barrier, which CHUNKED replaces with an early return.
     wvSplitK_int4_compute_sml_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL,
-                               N, GROUP_SIZE, HAS_ZERO_POINTS>(
-        K, M, 1, 1, B, A, S, ZP, nullptr, C, _WvPrGrp, CuCount, s,
-        b_row_stride_bytes);
+                               N, GROUP_SIZE, HAS_ZERO_POINTS,
+                               /*CHUNKED=*/false>(K, M, 1, 1, B, A, S, ZP,
+                                                  nullptr, C, _WvPrGrp, CuCount,
+                                                  s, b_row_stride_bytes);
   }
 }
 
