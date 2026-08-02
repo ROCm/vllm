@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+    maybe_promote_act_quant_for_batch_invariance,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
@@ -137,6 +138,16 @@ def maybe_make_prepare_finalize(
     #   * maybe_make_prepare_finalize() is called from the oracle. We
     #     always return a PrepareAndFinalize object and the quant method
     #     holds the ModularKernel.
+    # The experts promote a dynamic per-tensor activation scheme to per-token
+    # under batch invariance, in their __init__ -- which runs after this. Some
+    # backends decide here, from the config, what the prepare step will do:
+    # `use_fp8_dispatch` below is exactly `is_per_act_token or
+    # is_block_quantized`. Promoting there and not here would leave the two
+    # halves disagreeing, with the all2all dispatching bf16 while the experts
+    # expect per-token scales. Promote once, before anything reads the scheme.
+    if quant_config is not None:
+        quant_config = maybe_promote_act_quant_for_batch_invariance(quant_config)
+
     if not moe.moe_parallel_config.use_all2all_kernels:
         if not allow_new_interface:
             return None
