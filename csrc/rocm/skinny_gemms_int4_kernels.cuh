@@ -178,8 +178,14 @@ __device__ __forceinline__ void load_act_chunk_into_lds(
     if (k_in >= span) break;
   #pragma unroll
     for (int n = 0; n < N; n++)
-      *((bigTypeA*)(&s[n * KFIT + k_in])) =
-          *((const bigTypeA*)(&A[(uint32_t)K * n + kBase + k_in]));
+      // bigTypeA is a union over float, so its natural alignment is 4 and the
+      // LDS store degrades to a pair of ds_store_2addr_b32 per 16 bytes.  Both
+      // sides are really 32-byte aligned -- k_in and KFIT are multiples of
+      // A_CHUNK, kBase of KFIT, and K of 16 (host-checked) -- so say so and
+      // get ds_store_b128 / global_load_b128.
+      *((bigTypeA*)__builtin_assume_aligned(&s[n * KFIT + k_in], 16)) =
+          *((const bigTypeA*)__builtin_assume_aligned(
+              &A[(uint32_t)K * n + kBase + k_in], 16));
   }
 }
 
