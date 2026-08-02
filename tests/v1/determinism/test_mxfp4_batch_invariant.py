@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""End-to-end batch invariance for an MXFP4-quantised MoE model.
+"""End-to-end batch invariance for MXFP4-quantised MoE models.
 
 `test_mx_linear_batch_invariant.py` pins the MX GEMMs at the kernel level; this
-runs a real MXFP4 checkpoint through the engine so the MoE path, attention and
+runs real MXFP4 checkpoints through the engine so the MoE path, attention and
 the sampler are all covered at once.
+
+Both checkpoints are sensitive at the short prompts used here -- measured on
+gfx950, the needle's logprobs move with the batch size in 6 of 6 trials
+(Llama-4-Scout) and 3 of 3 (gpt-oss) when VLLM_BATCH_INVARIANT is unset, and
+are bitwise stable in all of them when it is set. Unlike the MXFP8 e2e test,
+no prompt padding is needed to reach that sensitivity: the router turns a small
+numerical difference into a different expert choice.
 """
 
 import contextlib
@@ -13,25 +20,22 @@ import random
 
 import pytest
 import torch
-from utils import _extract_step_logprobs, _random_prompt
+from utils import _extract_step_logprobs, _random_prompt, requires_mx
 
 from vllm import LLM, SamplingParams
-from vllm.platforms import current_platform
 
-MXFP4_TEST_MODEL = os.getenv(
-    "VLLM_TEST_MXFP4_MODEL",
-    "mawong-amd/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4",
-)
-
-requires_mx = pytest.mark.skipif(
-    not (current_platform.is_rocm() and current_platform.supports_mx()),
-    reason="requires a ROCm device with native MX support (gfx95x)",
-)
+# The 2-layer Scout is the cheap one; gpt-oss additionally exercises fp8
+# activations and an fp8 KV cache alongside the MXFP4 weights.
+MXFP4_TEST_MODELS = os.getenv(
+    "VLLM_TEST_MXFP4_MODELS",
+    "mawong-amd/Llama-4-Scout-17B-16E-Instruct-2-layers-mxfp4,"
+    "amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8",
+).split(",")
 
 
-def _make_llm(max_num_seqs: int, backend: str) -> LLM:
+def _make_llm(model: str, max_num_seqs: int, backend: str) -> LLM:
     return LLM(
-        model=MXFP4_TEST_MODEL,
+        model=model,
         max_num_seqs=max_num_seqs,
         gpu_memory_utilization=float(
             os.getenv("VLLM_MXFP4_TEST_GPU_MEMORY_UTILIZATION", "0.6")
@@ -46,7 +50,10 @@ def _make_llm(max_num_seqs: int, backend: str) -> LLM:
 
 @requires_mx
 @pytest.mark.parametrize("backend", ["TRITON_ATTN"])
-def test_mxfp4_moe_generation_is_bitwise_invariant_across_batch_sizes_e2e(backend):
+@pytest.mark.parametrize("model", MXFP4_TEST_MODELS)
+def test_mxfp4_moe_generation_is_bitwise_invariant_across_batch_sizes_e2e(
+    model, backend
+):
     """The needle's per-step logprobs must be bitwise equal at bs=1 and bs=N.
 
     The needle is never placed at batch index 0: that position keeps its token
@@ -73,7 +80,7 @@ def test_mxfp4_moe_generation_is_bitwise_invariant_across_batch_sizes_e2e(backen
 
     llm = None
     try:
-        llm = _make_llm(max_num_seqs=max_batch_size, backend=backend)
+        llm = _make_llm(model, max_num_seqs=max_batch_size, backend=backend)
         baseline_output = llm.generate([needle_prompt], sampling, use_tqdm=False)[0]
         baseline_completion = baseline_output.outputs[0]
         baseline_logprobs, baseline_token_ids = _extract_step_logprobs(baseline_output)
