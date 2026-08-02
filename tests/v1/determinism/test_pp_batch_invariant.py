@@ -39,8 +39,8 @@ tokens, two chunks, TRITON_MLA) and is bitwise stable 3 trials of 3 with the mod
 on and differs 3 of 3 with it off, but the model is 55GB and adds nothing this
 case does not once the chunk boundaries are pinned.
 
-Not covered here: PP together with TP or DP (needs more than 2 GPUs), and PP
-over more than 2 stages.
+Not covered here: PP together with DP, and PP over more than 2 stages. PP=2 x
+TP=4 is covered separately in `test_pp_tp_batch_invariant`, which needs 8 GPUs.
 """
 
 import contextlib
