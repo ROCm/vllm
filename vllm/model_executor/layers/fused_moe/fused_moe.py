@@ -760,6 +760,27 @@ def invoke_fused_moe_wna16_triton_kernel(
     )
 
 
+def _as_per_channel_weight_scale(
+    B_scale: torch.Tensor | None, E: int, N: int
+) -> torch.Tensor | None:
+    """Widen a per-tensor weight scale for the kernel's per-channel branch.
+
+    ``per_channel_quant`` selects the activation *and* the weight indexing, so
+    a per-token activation forces the weight scale through
+    ``b_scale[off_experts * stride_bse + offs_bn * stride_bsn]``. A per-tensor
+    MoE weight scale is 1-D ``[E]``, for which both strides collapse to 0 and
+    every expert reads ``b_scale[0]``. Return a stride-0 ``[E, N]`` view so
+    each expert reads its own scale; per-channel scales (already >= 2-D) pass
+    through untouched.
+    """
+    if B_scale is None or B_scale.ndim >= 2:
+        return B_scale
+    if B_scale.numel() == 1:
+        return B_scale.reshape(1, 1).expand(E, N)
+    assert B_scale.numel() == E, f"unexpected weight scale shape {B_scale.shape}"
+    return B_scale.reshape(E, 1).expand(E, N)
+
+
 def invoke_fused_moe_triton_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -812,6 +833,8 @@ def invoke_fused_moe_triton_kernel(
         assert block_shape is None or triton.cdiv(
             B.size(-1), block_shape[1]
         ) == B_scale.size(-1)
+        if per_channel_quant and block_shape is None:
+            B_scale = _as_per_channel_weight_scale(B_scale, B.size(0), B.size(1))
     elif use_int8_w8a16 or use_int4_w4a16:
         assert B_scale is not None
         assert block_shape is None or block_shape[0] == 0
