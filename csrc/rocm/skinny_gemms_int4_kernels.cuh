@@ -312,11 +312,21 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
 
               if constexpr (std::is_same_v<scalar_t, half>) {
                 constexpr uint32_t FP16_MAGIC = 0x64006400u;
-                constexpr uint32_t BIAS_LO =
-                    HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
                 constexpr uint32_t SCALE16 = 0x2C002C00u;
-                constexpr uint32_t BIAS_HI =
-                    HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+                // The unpack already subtracts a constant, so the zero-point
+                // rides along in that constant instead of costing a separate
+                // A_CHUNK-wide subtract afterwards.  Both edits are exact in
+                // fp16: 1024+zp has ulp 1 (0x6400+zp) and 64+zp has ulp 1/16
+                // (0x5400+(zp<<4)), with the sign bit already set for the
+                // negation in BIAS_HI.
+                uint32_t BIAS_LO = HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
+                uint32_t BIAS_HI = HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                  uint32_t zp = zp_nibble(zero_points, m + y, k_ / GROUP_SIZE,
+                                          num_groups);
+                  BIAS_LO += zp * 0x00010001u;
+                  BIAS_HI += (zp << 4) * 0x00010001u;
+                }
   #pragma unroll
                 for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                   uint32_t qa = bigB[y][k2].u32[w];
@@ -357,18 +367,6 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                   qa >>= 4;
                   *(uint32_t*)&cvtB.f[w * 4 + 3] =
                       (qa & 0x000F000Fu) | BF16_MAGIC;
-                }
-              }
-
-              if constexpr (!std::is_same_v<scalar_t, __hip_bfloat16>) {
-                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                  uint32_t group_idx = k_ / GROUP_SIZE;
-                  scalar_t zp = __float2s<scalar_t>((float)zp_nibble(
-                      zero_points, m + y, group_idx, num_groups));
-  #pragma unroll
-                  for (uint32_t b = 0; b < A_CHUNK; b++) {
-                    cvtB.h[b] = cvtB.h[b] - zp;
-                  }
                 }
               }
 
@@ -630,11 +628,21 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
 
               if constexpr (std::is_same_v<scalar_t, half>) {
                 constexpr uint32_t FP16_MAGIC = 0x64006400u;
-                constexpr uint32_t BIAS_LO =
-                    HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
                 constexpr uint32_t SCALE16 = 0x2C002C00u;
-                constexpr uint32_t BIAS_HI =
-                    HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+                // The unpack already subtracts a constant, so the zero-point
+                // rides along in that constant instead of costing a separate
+                // A_CHUNK-wide subtract afterwards.  Both edits are exact in
+                // fp16: 1024+zp has ulp 1 (0x6400+zp) and 64+zp has ulp 1/16
+                // (0x5400+(zp<<4)), with the sign bit already set for the
+                // negation in BIAS_HI.
+                uint32_t BIAS_LO = HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
+                uint32_t BIAS_HI = HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+                  uint32_t zp = zp_nibble(zero_points, m + y, k_ / GROUP_SIZE,
+                                          num_groups);
+                  BIAS_LO += zp * 0x00010001u;
+                  BIAS_HI += (zp << 4) * 0x00010001u;
+                }
   #pragma unroll
                 for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                   uint32_t qa = bigB[y][k2].u32[w];
@@ -675,18 +683,6 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
                   qa >>= 4;
                   *(uint32_t*)&cvtB.f[w * 4 + 3] =
                       (qa & 0x000F000Fu) | BF16_MAGIC;
-                }
-              }
-
-              if constexpr (!std::is_same_v<scalar_t, __hip_bfloat16>) {
-                if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                  uint32_t group_idx = k_ / GROUP_SIZE;
-                  scalar_t zp = __float2s<scalar_t>((float)zp_nibble(
-                      zero_points, m + y, group_idx, num_groups));
-  #pragma unroll
-                  for (uint32_t b = 0; b < A_CHUNK; b++) {
-                    cvtB.h[b] = cvtB.h[b] - zp;
-                  }
                 }
               }
 
