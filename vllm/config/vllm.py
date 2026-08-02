@@ -1567,6 +1567,35 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
+        if (
+            self.model_config
+            and self.model_config.use_mla
+            and envs.VLLM_BATCH_INVARIANT
+            and self.cache_config.enable_prefix_caching
+        ):
+            # An MLA prefill splits its attention at the boundary between the
+            # already-computed context and the new tokens -- non-causal flash
+            # attention over the context, causal over the new tokens, merged
+            # with merge_attn_states -- instead of one causal pass. A prefix
+            # cache hit puts that boundary at whatever length the cache
+            # happened to hold, which is a function of every request that ran
+            # before, so the same prompt gets a different (mathematically
+            # equivalent, numerically different) decomposition run to run.
+            # Unlike the chunked-prefill split this cannot be made a function
+            # of the request alone by capping the chunk, because the hit
+            # length is not the scheduler's to choose. Measured on a DeepSeek
+            # MLA model: hits of 512/1024/1536 tokens each moved a needle
+            # prompt's logprobs, 4 trials out of 4.
+            self.cache_config.enable_prefix_caching = False
+            logger.warning(
+                "Disabling prefix caching: it is not compatible with "
+                "VLLM_BATCH_INVARIANT for MLA models, because a cache hit "
+                "moves the context/new-token split that MLA prefill "
+                "decomposes its attention at. Throughput on repeated "
+                "prefixes will drop. Unset VLLM_BATCH_INVARIANT to get "
+                "prefix caching back."
+            )
+
         if envs.VLLM_BATCH_INVARIANT:
             # These passes rewrite the collective the communicator would have
             # run: sequence parallelism and AsyncTP turn an all-reduce into

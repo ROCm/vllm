@@ -463,18 +463,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        # Backstop for the VllmConfig guard, which keys off model_config.use_mla
+        # and so misses an MLA model that does not declare itself one. Only
+        # effective in-process; the authoritative disable is in VllmConfig.
         if (
             cache_config is not None
             and cache_config.enable_prefix_caching
             and envs.VLLM_BATCH_INVARIANT
-            and (
-                self.attn_backend.get_name() == "TRITON_MLA"
-                or self.attn_backend.get_name() == "FLASHINFER"
-            )
         ):
             logger.warning_once(
-                "Disabling prefix caching for TRITON_MLA / FLASHINFER "
-                "with batch invariance, as it is not yet supported.",
+                "Disabling prefix caching for MLA with batch invariance; "
+                "see VllmConfig.__post_init__ for why.",
             )
             cache_config.enable_prefix_caching = False
 
