@@ -821,6 +821,32 @@ def addmm_batch_invariant(bias, a, b):
     return matmul_persistent(a, b, bias=bias)
 
 
+# Inductor lowers mm/addmm/bmm to ``extern_kernels.<op>(..., out=buf)``, which
+# dispatches the ``.out`` overload rather than the default one. Registering only
+# the default leaves the compiled path on the vendor GEMM: measured on gfx950,
+# a compiled ``torch.addmm`` is batch variant while the eager one is not.
+
+
+def mm_out_batch_invariant(a, b, *, out):
+    out.copy_(matmul_persistent(a, b))
+    return out
+
+
+def addmm_out_batch_invariant(bias, a, b, *, beta=1, alpha=1, out):
+    result = matmul_persistent(a, b)
+    if alpha != 1:
+        result = result * alpha
+    if beta != 0:
+        result = result + (bias if beta == 1 else beta * bias)
+    out.copy_(result)
+    return out
+
+
+def bmm_out_batch_invariant(a, b, *, out):
+    out.copy_(bmm_batch_invariant(a, b))
+    return out
+
+
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
     if _half_to_float:
         return log_softmax(input.float(), dim=dim)
@@ -1257,6 +1283,8 @@ def enable_batch_invariant_mode():
             # triton persistent matmul overrides for mm/addmm/matmul/linear.
             _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, key)
+            _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, key)
+            _batch_invariant_LIB.impl("aten::addmm.out", addmm_out_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, key)
         else:
@@ -1273,6 +1301,8 @@ def enable_batch_invariant_mode():
         # take the same route as SM80 and route the GEMMs through Triton.
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, key)
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, key)
+        _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, key)
+        _batch_invariant_LIB.impl("aten::addmm.out", addmm_out_batch_invariant, key)
         _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, key)
         _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, key)
 
@@ -1281,6 +1311,8 @@ def enable_batch_invariant_mode():
     elif current_platform.is_xpu():
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, key)
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, key)
+        _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, key)
+        _batch_invariant_LIB.impl("aten::addmm.out", addmm_out_batch_invariant, key)
         # TODO: register matmul and linear for XPU
         # once suitable Triton kernels are implemented
 
@@ -1295,6 +1327,9 @@ def enable_batch_invariant_mode():
     # to replace it at the dispatcher level.
     _batch_invariant_LIB.impl(
         "aten::bmm", bmm_batch_invariant, key, allow_override=True
+    )
+    _batch_invariant_LIB.impl(
+        "aten::bmm.out", bmm_out_batch_invariant, key, allow_override=True
     )
     torch.bmm = bmm_batch_invariant
 

@@ -480,10 +480,12 @@ def run_nvfp4_emulations(
 
     # matmul
     if envs.VLLM_BATCH_INVARIANT:
-        # Inductor lowers torch.matmul itself instead of going through the
-        # dispatcher, so the aten::matmul override installed by batch-invariant
-        # mode never runs inside a compiled region. Call the kernel directly,
-        # the same way UnquantizedLinearMethod.apply does.
+        # Call the kernel directly, the same way UnquantizedLinearMethod.apply
+        # does, rather than relying on the aten::matmul override. The override
+        # does now hold inside a compiled region -- Inductor dispatches the
+        # ``.out`` overloads, which batch-invariant mode registers -- so this is
+        # belt and braces, but it keeps the emulation path independent of which
+        # overloads a future Inductor emits.
         from vllm.model_executor.layers.batch_invariant import (
             matmul_batch_invariant,
         )
