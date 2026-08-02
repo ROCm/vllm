@@ -573,25 +573,57 @@ def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
     )
 
 
+# gfx1151 packed-weight row stride: throughput is a period-512 B function of the
+# stride, and wants a multiple of 128 that is not a multiple of 512.
+_CLIFF_PERIOD_BYTES = 512
+_CLIFF_ALIGN_BYTES = 128
+_CLIFF_TARGET_BYTES = 256
+
+
+def _cliff_pad_bytes(k_packed_bytes: int) -> int:
+    """Pad that moves the row stride out of a bad residue class, if it is in one.
+
+    Good means a multiple of 128 that is not a multiple of 512; 256 mod 512 is
+    the best of the good classes.
+
+    On an APU every padded byte comes out of the KV cache, so a stride already
+    in a good class is left alone and only a stride on the cliff is moved.
+    """
+    r = k_packed_bytes % _CLIFF_PERIOD_BYTES
+    if r == 0:
+        # Worst class: pay the extra 128 B to reach the best class rather than
+        # merely the nearest one.
+        return _CLIFF_TARGET_BYTES
+    if r % _CLIFF_ALIGN_BYTES == 0:
+        return 0  # already 128, 256 or 384 mod 512
+    # Not 128-aligned at all: step up to the nearest 128-multiple, and past it
+    # if that one is a 512-multiple.
+    pad = -k_packed_bytes % _CLIFF_ALIGN_BYTES
+    if (k_packed_bytes + pad) % _CLIFF_PERIOD_BYTES == 0:
+        pad += _CLIFF_ALIGN_BYTES
+    return pad
+
+
 def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
     Single source of truth for the skinny weight memory layout: ExLlama shuffle
-    to [N, K//8] int32, then -- on gfx1151 only, when K_packed (= K/2 bytes) is a
-    multiple of 2048 -- pad each row by +32 int32 (+128 B). That pad makes the
-    GEMM read a non-power-of-2 row stride, dodging the multi-row global-load
-    cliff (channel/MALL hash collisions). Used by both
+    to [N, K//8] int32, then -- on gfx1151 only -- pad each row so the packed
+    row stride lands on 256 bytes modulo 512. Used by both
     ``process_weights_after_loading`` and the perf benchmark so the benchmark can
     never drift from the production stride.
 
-    Returns ``(w_q_skinny, w_q_skinny_i32)``: an int8 view for the HIP skinny
-    kernel and the int32 view for the Triton kernel; both share stride(0).
+    Throughput is a period-512 function of the row stride, not a function of
+    how much padding was added, so the rule targets the residue class rather
+    than adding a fixed pad: the pad costs pad/(K/2) of weight memory, which
+    comes straight out of KV-cache space on an APU.
     """
     shuffled = pack_int4_exllama_shuffle(unpacked)
     n_rows, k8 = shuffled.shape
     k_packed_bytes = k8 * 4  # int32 -> bytes
-    pad_int32 = 32  # +128 B = one cache line, keeps each row cache-line aligned
-    if on_gfx1151() and k_packed_bytes % 2048 == 0 and shuffled.device.type == "cuda":
+    pad_bytes = _cliff_pad_bytes(k_packed_bytes)
+    pad_int32 = pad_bytes // 4
+    if on_gfx1151() and pad_int32 and shuffled.device.type == "cuda":
         padded = torch.empty(
             (n_rows, k8 + pad_int32), dtype=torch.int32, device=shuffled.device
         )
