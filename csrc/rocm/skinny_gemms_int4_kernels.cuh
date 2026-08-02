@@ -147,11 +147,32 @@ __device__ __forceinline__ void load_act_into_lds(
   __syncthreads();
 }
 
+  // LDS layout for the CHUNKED activation band.
+  //
+  // The compute body reads A_CHUNK halves per lane, but LDS can only move 16
+  // bytes per lane per cycle, so a 32-byte-per-lane chunk is issued as two
+  // ds_load_b128.  Laid out linearly, lane i's first piece starts at byte 32*i
+  // and covers banks (8i..8i+3) mod 32, so lanes 0/4/8/... all land on banks
+  // 0-3: a 4-way conflict that halves LDS read bandwidth.
+  //
+  // So store piece-major *within* a block of THRDS lanes: piece p of lane i
+  // goes to p*THRDS + i, i.e. byte 16*i within its piece plane.  Now lane i
+  // covers banks (4i..4i+3) mod 32 and eight consecutive lanes tile all 32
+  // banks exactly.  The block stride is unchanged at THRDS*A_CHUNK, so the
+  // permutation stays inside one block and the writer and reader agree lane by
+  // lane even when the final block is only partly filled.
+  #define ACT_LDS_PIECE 8  // halves per 16-byte LDS access
+struct alignas(16) lds_piece {
+  float f[ACT_LDS_PIECE / 2];
+};
+
 // Chunked variant of load_act_into_lds, for wvSplitK_int4_compute_sml_'s
-// CHUNKED mode: copies A[kBase, kBase+KFIT) of *every* one of the N activation
-// rows into a KFIT-strided LDS band, so the compute body reads every row from
-// LDS even when the whole activation does not fit.  Row n lives at
-// s[n * KFIT + (k - kBase)].
+// CHUNKED mode: copies A[kBase, kBase+chunkSpan) of *every* one of the N
+// activation rows into a KFIT-strided LDS band, so the compute body reads
+// every row from LDS even when the whole activation does not fit.  Row n
+// lives at s[n * KFIT + (k - kBase)].  KFIT is the band stride and is
+// compile-time; chunkSpan (<= KFIT) is how much is actually copied, and is
+// balanced across the chunks by the caller.
 //
 // Two differences from load_act_into_lds, both load-bearing:
 //   * strides by the *runtime* _WvPrGrp.  CHUNKED returns the waves above
@@ -165,27 +186,31 @@ __device__ __forceinline__ void load_act_into_lds(
 template <typename scalar_t, int THRDS, int A_CHUNK, int N, uint32_t KFIT>
 __device__ __forceinline__ void load_act_chunk_into_lds(
     scalar_t* s, const scalar_t* __restrict__ A, const int K,
-    const uint32_t kBase, const int _WvPrGrp) {
+    const uint32_t kBase, const uint32_t chunkSpan, const int _WvPrGrp) {
   union bigTypeA {
     scalar_t h[A_CHUNK];
     float f[A_CHUNK / 2];
   };
-  const uint32_t span = min__(KFIT, (uint32_t)K - kBase);
+  const uint32_t span = min__(chunkSpan, (uint32_t)K - kBase);
   const uint32_t step = THRDS * A_CHUNK * _WvPrGrp;
   const uint32_t off = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
   for (uint32_t k = 0; k < span; k += step) {
     uint32_t k_in = k + off;
     if (k_in >= span) break;
+    // Piece-major within a block, see act_lds_piece_offset.  k is a multiple
+    // of THRDS*A_CHUNK, so the block base is k + threadIdx.y*THRDS*A_CHUNK
+    // and this thread owns lane threadIdx.x of it -- no division needed.
+    const uint32_t blk = k + threadIdx.y * (THRDS * A_CHUNK);
   #pragma unroll
-    for (int n = 0; n < N; n++)
-      // bigTypeA is a union over float, so its natural alignment is 4 and the
-      // LDS store degrades to a pair of ds_store_2addr_b32 per 16 bytes.  Both
-      // sides are really 32-byte aligned -- k_in and KFIT are multiples of
-      // A_CHUNK, kBase of KFIT, and K of 16 (host-checked) -- so say so and
-      // get ds_store_b128 / global_load_b128.
-      *((bigTypeA*)__builtin_assume_aligned(&s[n * KFIT + k_in], 16)) =
-          *((const bigTypeA*)__builtin_assume_aligned(
-              &A[(uint32_t)K * n + kBase + k_in], 16));
+    for (int n = 0; n < N; n++) {
+      const auto* src = (const lds_piece*)__builtin_assume_aligned(
+          &A[(uint32_t)K * n + kBase + k_in], 16);
+      auto* dst = (lds_piece*)__builtin_assume_aligned(
+          &s[n * KFIT + blk + threadIdx.x * ACT_LDS_PIECE], 16);
+  #pragma unroll
+      for (uint32_t p = 0; p < A_CHUNK / ACT_LDS_PIECE; p++)
+        dst[p * THRDS] = src[p];
+    }
   }
 }
 
@@ -326,6 +351,19 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
                   "CHUNKED LDS band overruns the caller's s[]");
     [[maybe_unused]] uint32_t kBase = 0;
 
+    // kFit is the LDS *band stride*, so it has to stay compile-time for
+    // kFit*n to fold into the ds_load offset.  How much is actually copied
+    // per chunk does not, and taking kFit every time leaves a short final
+    // chunk whose inner k1 loop is too brief to amortise its own setup:
+    // K=21504 splits 8192/8192/5120, and that last 5-iteration loop costs
+    // more than the balanced split saves.  Spread K evenly instead --
+    // 7168/7168/7168 -- for the same chunk count and the same total copied.
+    [[maybe_unused]] uint32_t chunkSpan = kFit;
+    if constexpr (CHUNKED) {
+      const uint32_t nch = ((uint32_t)K + kFit - 1) / kFit;
+      chunkSpan = ((((uint32_t)K + nch - 1) / nch) + TUC - 1) / TUC * TUC;
+    }
+
     // Live waves must run the m-loop the same number of times, or the ones
     // that finish early would stop arriving at the reload barriers.  Rounding
     // M up to a whole YTILE*_WvPrGrp cannot split a workgroup's window: within
@@ -392,18 +430,23 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
             // lets it widen the LDS read to ds_load_b128 for every activation
             // row instead of falling back to ds_load_2addr_b32 for rows n >= 1
             // (whose K*n offset it otherwise can't prove aligned, since K is a
-            // runtime value).  The CHUNKED form keeps that: kBase is a
-            // multiple of kFit and kFit of A_CHUNK.  Note the scale and
-            // zero-point lookups below stay on the *absolute* k_ -- only the
-            // LDS address is chunk-relative.
-            uint32_t a_idx;
+            // runtime value).  Note the scale and zero-point lookups below
+            // stay on the *absolute* k_ -- only the LDS address is
+            // chunk-relative.
             if constexpr (CHUNKED) {
-              a_idx = (k_ - kBase) + kFit * n;
+              // Piece-major band, see ACT_LDS_PIECE.  k (not k_) is the block
+              // base; the lane offset moves in 16-byte pieces instead of
+              // A_CHUNK, and successive pieces sit a whole lane-plane apart.
+              const auto* src = (const lds_piece*)__builtin_assume_aligned(
+                  &s[kFit * n + (k - kBase) + threadIdx.x * ACT_LDS_PIECE], 16);
+              auto* dst = (lds_piece*)&bigA[n][k2];
+  #pragma unroll
+              for (uint32_t p = 0; p < A_CHUNK / ACT_LDS_PIECE; p++)
+                dst[p] = src[p * THRDS];
             } else {
-              a_idx = k_ + K * n;
+              bigA[n][k2] = *((const bigTypeA*)__builtin_assume_aligned(
+                  &(s[k_ + K * n]), sizeof(bigTypeA)));
             }
-            bigA[n][k2] = *((const bigTypeA*)__builtin_assume_aligned(
-                &(s[a_idx]), sizeof(bigTypeA)));
           }
         }
 
@@ -551,50 +594,57 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
         if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
       };
 
-      // Refill the LDS band when k1 crosses a chunk boundary.  The predicate
-      // is wave-uniform (k1 and kBase are), so every live wave reaches both
-      // barriers together.  kFit is a multiple of K_STEP, so a boundary always
-      // falls between iterations and never inside one.
-      auto maybe_reload = [&](uint32_t k1) {
-        if constexpr (CHUNKED) {
-          if (k1 == 0 || k1 == kBase + kFit) {
-            if (k1 != 0) kBase += kFit;
-            __syncthreads();
-            load_act_chunk_into_lds<scalar_t, THRDS, A_CHUNK, N, kFit>(
-                s, A, K, kBase, _WvPrGrp);
-            __syncthreads();
+      bigTypeW bigB[YTILE][UNRL];
+      if constexpr (CHUNKED) {
+        // The refill has to stay *outside* the k1 loop.  Folding it in behind
+        // a wave-uniform predicate cost 420 inner-loop instructions against
+        // 294 for the unchunked twin and 32 s_waitcnt against 15: the compiler
+        // has to be conservative about lgkmcnt/vmcnt across a barrier it
+        // cannot prove absent, even on the ~7 of 8 iterations that skip it.
+        // So drive the chunks explicitly and keep the inner loop barrier-free.
+        for (uint32_t kb = 0; kb < (uint32_t)K; kb += chunkSpan) {
+          __syncthreads();
+          load_act_chunk_into_lds<scalar_t, THRDS, A_CHUNK, N, kFit>(
+              s, A, K, kb, chunkSpan, _WvPrGrp);
+          __syncthreads();
+          kBase = kb;
+          // Waves past the real M still had to reach the barriers above; from
+          // here on they have no rows to reduce.
+          if (m >= M) continue;
+          const uint32_t kStop = min__(K_whole, kb + chunkSpan);
+          for (uint32_t k1 = kb; k1 < kStop; k1 += K_STEP) {
+            prio_hi();
+            k_load(std::false_type{}, bigB, k1);
+            prio_lo();
+            k_compute(std::false_type{}, bigB, k1);
+          }
+          // chunkSpan is a multiple of K_STEP, so the ragged k1 tail
+          // [K_whole, K) always falls inside the final chunk.
+          if (kb + chunkSpan >= (uint32_t)K && K_whole < (uint32_t)K) {
+            prio_hi();
+            k_load(std::true_type{}, bigB, K_whole);
+            prio_lo();
+            k_compute(std::true_type{}, bigB, K_whole);
           }
         }
-      };
-
-      bigTypeW bigB[YTILE][UNRL];
-      uint32_t k1 = 0;
-      for (; k1 < K_whole; k1 += K_STEP) {
-        maybe_reload(k1);
-        // Waves past the real M still had to reach the barriers above; from
-        // here on they have no rows to reduce.
-        if constexpr (CHUNKED) {
-          if (m >= M) continue;
-        }
-        prio_hi();
-        k_load(std::false_type{}, bigB, k1);
-        prio_lo();
-        k_compute(std::false_type{}, bigB, k1);
-      }
-      if constexpr (CHUNKED) {
         if (m >= M) {
-          if (K_whole < K) maybe_reload(K_whole);
           m += CuCount * _WvPrGrp * YTILE;
-          kBase = 0;
           continue;
         }
-      }
-      if (K_whole < K) {
-        maybe_reload(K_whole);
-        prio_hi();
-        k_load(std::true_type{}, bigB, K_whole);
-        prio_lo();
-        k_compute(std::true_type{}, bigB, K_whole);
+      } else {
+        uint32_t k1 = 0;
+        for (; k1 < K_whole; k1 += K_STEP) {
+          prio_hi();
+          k_load(std::false_type{}, bigB, k1);
+          prio_lo();
+          k_compute(std::false_type{}, bigB, k1);
+        }
+        if (K_whole < K) {
+          prio_hi();
+          k_load(std::true_type{}, bigB, K_whole);
+          prio_lo();
+          k_compute(std::true_type{}, bigB, K_whole);
+        }
       }
 
   #if defined(__HIP__GFX1X__)
@@ -660,7 +710,6 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
       }
   #endif  // defined(__HIP__GFX1X__)
       m += CuCount * _WvPrGrp * YTILE;
-      if constexpr (CHUNKED) kBase = 0;
     }
   }  // end of guarded section (threadIdx.y < _WvPrGrp)
   // Rendezvous all 16 y-rows before the caller may re-enter this body for
