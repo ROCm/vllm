@@ -452,7 +452,16 @@ class CustomAllreduce:
         return out
 
     def should_custom_reduce_scatter(self, inp: torch.Tensor) -> bool:
-        if self.disabled or not current_platform.is_cuda():
+        # ROCm was excluded only because nobody had run it there.
+        # cross_device_reduce_scatter is plain portable code in the same
+        # translation unit as the all-reduce kernels ROCm already serves, and
+        # CMake has always compiled it for HIP. Measured on 4x gfx950 with no
+        # rebuild: bitwise equal to an fp32 ascending-rank sum for
+        # fp32/fp16/bf16 over token counts 32..4096, and 0.32x-0.94x of
+        # ncclReduceScatter from 128KiB out to 1GB. Only gfx950 was measured,
+        # and this also moves the Kimi-K3 sequence-parallel reduce-scatter off
+        # the library collective on ROCm.
+        if self.disabled or not current_platform.is_cuda_alike():
             return False
         if self.world_size == 16 and not self.mnnvl_only:
             return False

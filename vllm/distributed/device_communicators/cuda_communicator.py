@@ -154,11 +154,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # one-shot stays ahead at every size measured (0.70x to 0.90x of the
             # fallback out to 128MB, still bitwise invariant there). Size the
             # buffer for the largest all-reduce the scheduler can produce.
+            #
+            # The reduce-scatter kernel takes the same input as an all-reduce --
+            # the full [tokens, hidden] tensor -- so the same bound sizes it,
+            # and the shared buffer is already max() over the three limits, so
+            # moving it off its 16MB default costs no memory. It too beats both
+            # alternatives everywhere measured (0.20x to 0.90x of the all-to-all
+            # fallback and 0.32x to 0.94x of ncclReduceScatter, out to 1GB).
             if (
                 envs.VLLM_BATCH_INVARIANT
                 and (max_bytes := _max_allreduce_bytes()) is not None
             ):
                 ca_kwargs["max_size"] = max_bytes
+                ca_kwargs["max_reduce_scatter_size"] = max_bytes
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
@@ -482,13 +490,31 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if envs.VLLM_BATCH_INVARIANT:
             # Library reduce-scatters choose their chunking from the message
             # size, so an output element's contributions are summed in an order
-            # that depends on the number of tokens in the batch. Take the
-            # all-to-all route instead (see reduce_scatter_batch_invariant).
-            from vllm.model_executor.layers.batch_invariant import (
-                reduce_scatter_batch_invariant,
+            # that depends on the number of tokens in the batch.
+            #
+            # The custom all-reduce's reduce-scatter kernel does not: an output
+            # element sums exactly world_size values in ascending rank order
+            # into an fp32 accumulator and rounds once, whatever the message
+            # size. It slices the flat buffer by size/world_size, which is this
+            # rank's shard because the input has already been canonicalised to
+            # dim 0 and made contiguous above. Prefer it: measured through this
+            # entry point on 4x gfx950, 0.37x-0.39x of the all-to-all path below
+            # 1MB and 0.54x-0.74x of ncclReduceScatter out to its bound.
+            ca_comm = self.ca_comm
+            output = (
+                None if ca_comm is None else ca_comm.custom_reduce_scatter(input_tensor)
             )
+            if output is None:
+                # Above the custom kernel's size bound, fall back to an
+                # all-to-all plus a fixed rank-order local sum. That is a
+                # size-dependent choice of implementation, so it is only benign
+                # while the two agree bitwise -- measured, see
+                # tests/v1/determinism/test_tp_reduce_scatter_batch_invariant.py.
+                from vllm.model_executor.layers.batch_invariant import (
+                    reduce_scatter_batch_invariant,
+                )
 
-            output = reduce_scatter_batch_invariant(input_tensor, self.device_group)
+                output = reduce_scatter_batch_invariant(input_tensor, self.device_group)
         elif should_nccl_symm_mem_ag_rs():
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:

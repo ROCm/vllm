@@ -28,7 +28,7 @@ from tests.utils import (
 from tests.v1.determinism.test_tp_all_reduce_batch_invariant import (
     _order_sensitive_elements,
 )
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_tp_group, set_custom_all_reduce
 from vllm.platforms import current_platform
 
 pytestmark = [
@@ -39,7 +39,12 @@ pytestmark = [
 ]
 
 # Divisible by 8 so the same counts work at both world sizes, and spread across
-# the small-message thresholds where the collective changes protocol.
+# the small-message thresholds where the collective changes protocol. They also
+# straddle the custom kernel's default 16MiB bound -- bf16/fp16 above 2048
+# tokens and fp32 above 1024 take the all-to-all fallback instead -- so the
+# sweep below spans both implementations rather than one. That is deliberate
+# extra coverage; `implementations_agree` is what settles the switch itself,
+# wherever a given engine config places it.
 TOKEN_COUNTS = [32, 40, 64, 128, 256, 512, 1024, 3000, 4096]
 HIDDEN_SIZE = 4096
 
@@ -218,9 +223,89 @@ def _check_default_unchanged(
         )
 
 
+def _check_implementations_agree(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    pp_size: int,
+    rank: int,
+    distributed_init_port: str,
+):
+    """The custom kernel and the all-to-all fallback must be interchangeable.
+
+    Batch invariance serves reduce-scatters below the custom all-reduce's
+    ``max_reduce_scatter_size`` with ``cross_device_reduce_scatter`` and
+    everything above it with an all-to-all plus a fixed rank-order sum. That is
+    a size-dependent switch between two *implementations* -- benign only while
+    they agree bitwise, and a batch-variance bug otherwise, since the switch
+    point is a token count.
+
+    Both sum ``world_size`` contributions in ascending rank order into an fp32
+    accumulator and round once, which is a per-element property independent of
+    message size, so comparing them below the bound settles the boundary
+    wherever ``CudaCommunicator`` places it for a given engine config.
+    """
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+
+    device = torch.device(f"cuda:{rank}")
+    torch.accelerator.set_device_index(device)
+    set_custom_all_reduce(True)
+    init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
+    group = get_tp_group()
+
+    from vllm.model_executor.layers.batch_invariant import (
+        reduce_scatter_batch_invariant,
+    )
+
+    ca_comm = group.device_communicator.ca_comm
+    assert ca_comm is not None and not ca_comm.disabled, (
+        "custom all-reduce is not live, so there is no second implementation "
+        "to compare against and this test asserts nothing"
+    )
+
+    failures = []
+    compared = 0
+    for dtype, spread in CASES:
+        full = _make_input(max(TOKEN_COUNTS), dtype, spread, device, 1234 + rank)
+        for num_tokens in TOKEN_COUNTS:
+            probe = full[:num_tokens].contiguous()
+            custom = ca_comm.custom_reduce_scatter(probe)
+            if custom is None:
+                continue
+            # Only elements whose accumulation is inexact can tell the two
+            # implementations apart; the rest agree for free.
+            sensitive = _order_sensitive_elements(probe)
+            fallback = reduce_scatter_batch_invariant(probe, group.device_group)
+            offset = rank * (num_tokens // tp_size)
+            for row in range(custom.shape[0]):
+                if not sensitive[offset + row].any():
+                    continue
+                compared += 1
+                if not torch.equal(custom[row], fallback[row]):
+                    failures.append(
+                        f"{dtype} spread=+-{spread} tokens={num_tokens} "
+                        f"row={offset + row}"
+                    )
+
+    assert compared, (
+        "no order-sensitive row was served by the custom kernel, so the two "
+        "implementations were never actually compared"
+    )
+    assert not failures, (
+        "the custom reduce-scatter and the all-to-all fallback disagree, so the "
+        "size-based switch between them is itself batch variance:\n  "
+        + "\n  ".join(failures)
+    )
+
+
 @ray.remote(num_gpus=1, max_calls=1)
 def reduce_scatter_worker(monkeypatch, tp_size, pp_size, rank, port):
     _check_reduce_scatter(monkeypatch, tp_size, pp_size, rank, port)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def implementations_agree_worker(monkeypatch, tp_size, pp_size, rank, port):
+    _check_implementations_agree(monkeypatch, tp_size, pp_size, rank, port)
 
 
 @ray.remote(num_gpus=1, max_calls=1)
@@ -233,8 +318,8 @@ def default_worker(monkeypatch, tp_size, pp_size, rank, port):
 )
 @pytest.mark.parametrize(
     "worker",
-    [reduce_scatter_worker, default_worker],
-    ids=["batch_invariant", "default"],
+    [reduce_scatter_worker, implementations_agree_worker, default_worker],
+    ids=["batch_invariant", "implementations_agree", "default"],
 )
 def test_tp_reduce_scatter_is_batch_invariant(
     tp_size: int,
