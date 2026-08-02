@@ -443,14 +443,36 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
       // The loads are split out of the compute so the block issues its whole
       // weight burst before touching any of it.
       //
+      // Raise wave priority across the load burst so a wave is not descheduled
+      // part-way through issuing its YTILE*UNRL loads, then drop it so the
+      // other waves on the SIMD can issue theirs while this one reduces.
+      // k_load only issues; every s_waitcnt lives in k_compute.
+      //
+      // Holding priority only pays when the burst is long relative to the
+      // compute that follows it, which rules out A_CHUNK=32 (twice the data
+      // per instruction) and N>=2 (a short burst against a compute phase N
+      // times longer).
+      constexpr bool PRIO = (A_CHUNK <= 16) && (N == 1);
+      // s_setprio takes a literal, so the level cannot be a lambda parameter.
+      auto prio_hi = [] {
+        if constexpr (PRIO) __builtin_amdgcn_s_setprio(1);
+      };
+      auto prio_lo = [] {
+        if constexpr (PRIO) __builtin_amdgcn_s_setprio(0);
+      };
+
       bigTypeW bigB[YTILE][UNRL];
       uint32_t k1 = 0;
       for (; k1 < K_whole; k1 += K_STEP) {
+        prio_hi();
         k_load(std::false_type{}, bigB, k1);
+        prio_lo();
         k_compute(std::false_type{}, bigB, k1);
       }
       if (K_whole < K) {
+        prio_hi();
         k_load(std::true_type{}, bigB, K_whole);
+        prio_lo();
         k_compute(std::true_type{}, bigB, K_whole);
       }
 
