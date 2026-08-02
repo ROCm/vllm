@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 import ray
 import torch
+import torch.distributed as dist
 
 from tests.utils import (
     init_test_distributed_environment,
@@ -24,7 +25,7 @@ from tests.utils import (
     multi_process_parallel,
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.distributed.parallel_state import set_custom_all_reduce
+from vllm.distributed.parallel_state import get_tp_group, set_custom_all_reduce
 from vllm.platforms import current_platform
 
 # multi_gpu_test would also wrap the test in create_new_process_for_each_test,
@@ -54,12 +55,69 @@ CHECK_ROWS = [0, 1, 2, 3, 7, 15, 31]
 # accumulator inside the reduction has to round: reduction order is only
 # irrelevant while the accumulator has headroom over the input significand,
 # which fp32 inputs never have and bf16 loses once activations have outliers.
+# `_order_sensitive_elements` keeps every entry honest. (bfloat16, 0) used to be
+# here and was dropped: reversing the rank order over 512x4096 elements moved 10
+# of the fp32 accumulations and not one bf16 result, so no reordering the
+# collective can perform is observable and the sweep asserted nothing for it. It
+# was removed rather than widened because message size and kernel selection
+# depend only on the dtype and the token count, both of which (bfloat16, 20)
+# already covers identically.
 CASES = [
-    (torch.bfloat16, 0),
     (torch.bfloat16, 20),
     (torch.float16, 10),
     (torch.float32, 0),
 ]
+
+# fp32 at 512 tokens is 512 * 4096 * 4 = exactly 8MiB, the custom all-reduce's
+# default max_size, and its bound is strict (`<`). That single point therefore
+# takes the all-gather fallback even in the custom_ar worker, which makes its
+# comparison against the reference -- read from a smaller, custom-served count --
+# a bitwise cross-check of the two implementations rather than a batch-invariance
+# check of one. Both are fp32 rank-order sums, so they do agree, and the extra
+# coverage is worth keeping. Pinned below so that a change to max_size,
+# HIDDEN_SIZE or TOKEN_COUNTS surfaces here instead of silently moving which
+# implementation the sweep is testing.
+#
+# The boundary is a property of this harness, not of the mode: max_size is the
+# library default because the process group is built without an engine config,
+# whereas CudaCommunicator sizes it from max_num_batched_tokens under batch
+# invariance so that the largest all-reduce the scheduler can produce still
+# fits. The fallback is covered deliberately by fallback_ar, which is also the
+# only path CUDA takes under the mode, custom all-reduce staying disabled there.
+FALLBACK_POINTS = {(torch.float32, 512)}
+
+
+def _order_sensitive_elements(probe: torch.Tensor) -> torch.Tensor:
+    """Mask of probe elements whose reduction depends on the rank order.
+
+    Both implementations sum the ``world_size`` contributions of an element in
+    rank order with an fp32 accumulator and round once on the way out, so an
+    element can only notice a reordering if that accumulation is inexact for its
+    operands. Summing the gathered contributions in the opposite order is the
+    strongest reordering available and bounds what any other one can do: where it
+    changes nothing, the invariance sweep cannot fail either.
+
+    The all-gather is pure data movement, so every rank sees the same
+    contributions and computes the same mask.
+    """
+    world_size = get_tp_group().world_size
+    gathered = torch.empty(
+        (world_size * probe.shape[0], *probe.shape[1:]),
+        dtype=probe.dtype,
+        device=probe.device,
+    )
+    dist.all_gather_into_tensor(
+        gathered, probe.contiguous(), group=get_tp_group().device_group
+    )
+    gathered = gathered.view(world_size, *probe.shape)
+
+    ascending = torch.zeros(probe.shape, dtype=torch.float32, device=probe.device)
+    for contribution in gathered:
+        ascending += contribution.float()
+    descending = torch.zeros_like(ascending)
+    for contribution in gathered.flip(0):
+        descending += contribution.float()
+    return ascending.to(probe.dtype) != descending.to(probe.dtype)
 
 
 def _check_all_reduce(
@@ -84,7 +142,26 @@ def _check_all_reduce(
     set_custom_all_reduce(use_custom_all_reduce)
     init_test_distributed_environment(tp_size, pp_size, rank, distributed_init_port)
 
+    # Without this the two parametrizations can silently become the same test:
+    # the custom all-reduce disables itself when P2P is unavailable, and on ROCm
+    # an enabled AITER custom all-reduce leaves `ca_comm` unset as well. Batch
+    # invariance dispatches through `ca_comm` alone, so in either case every
+    # message would take the all-gather fallback and both workers would pass
+    # having covered one path.
+    ca_comm = get_tp_group().device_communicator.ca_comm
+    if use_custom_all_reduce:
+        assert ca_comm is not None and not ca_comm.disabled, (
+            "custom all-reduce is not live, so this worker exercises the same "
+            "all-gather fallback as fallback_ar and covers nothing extra"
+        )
+    else:
+        assert ca_comm is None, (
+            "custom all-reduce was constructed with set_custom_all_reduce(False)"
+        )
+
     failures = []
+    vacuous = []
+    fell_through: set[tuple[torch.dtype, int]] = set()
     for dtype, spread in CASES:
         generator = torch.Generator(device=device).manual_seed(1234 + rank)
         full = torch.randn(
@@ -102,6 +179,25 @@ def _check_all_reduce(
             full = full * torch.exp2(exponents.float())
         full = full.to(dtype)
 
+        # Row 0 is excluded: it never moves under a decomposition, so its
+        # sensitivity would not make the sweep able to fail.
+        sensitive = _order_sensitive_elements(full[: CHECK_ROWS[-1] + 1])[
+            CHECK_ROWS[1:]
+        ]
+        if not sensitive.any():
+            vacuous.append(
+                f"{dtype} spread=+-{spread}: reversing the rank order leaves "
+                f"every checked element unchanged, so the fp32 accumulation is "
+                f"exact for these operands and no reordering is observable"
+            )
+
+        if ca_comm is not None:
+            fell_through.update(
+                (dtype, num_tokens)
+                for num_tokens in TOKEN_COUNTS
+                if not ca_comm.should_custom_ar(full[:num_tokens])
+            )
+
         reduced = {
             num_tokens: tensor_model_parallel_all_reduce(full[:num_tokens].clone())
             for num_tokens in TOKEN_COUNTS
@@ -116,6 +212,19 @@ def _check_all_reduce(
                     f"{dtype} spread=+-{spread} row={row} changed at token "
                     f"counts {variant}"
                 )
+
+    assert not vacuous, (
+        "these cases cannot observe a reduction reordering, so their sweep "
+        "below passes without asserting anything:\n  " + "\n  ".join(vacuous)
+    )
+
+    if ca_comm is not None:
+        assert fell_through == FALLBACK_POINTS, (
+            f"which token counts the custom all-reduce serves has moved: it "
+            f"declines {sorted((str(d), n) for d, n in fell_through)}, expected "
+            f"{sorted((str(d), n) for d, n in FALLBACK_POINTS)} (max_size="
+            f"{ca_comm.max_size})"
+        )
 
     assert not failures, (
         f"all-reduce depends on the token count over {tp_size} ranks "
