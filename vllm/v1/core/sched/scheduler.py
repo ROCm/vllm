@@ -142,6 +142,24 @@ class Scheduler(SchedulerInterface):
                 decode_slot,
                 self.max_num_scheduled_tokens - self.max_num_running_reqs * decode_slot,
             )
+            # This does not cover multimodal requests. _try_schedule_encoder_inputs
+            # can shrink num_new_tokens again below, from a per-step encoder
+            # compute budget and a shared encoder cache, and neither is a
+            # function of the request alone. Measured on Kimi-VL-A3B (MLA +
+            # MoonViT, TRITON_MLA, gfx950): the cap admits one prefill chunk per
+            # step at max_num_batched_tokens=2048 / max_num_seqs=16, so the
+            # encoder budget never binds and a needle is bitwise invariant from
+            # batch 1 to 8 -- with the mode off the same sweep differs, so that
+            # is a real null. But when the chunk is shorter than one item's
+            # embeddings (long_prefill_token_threshold=256, or
+            # max_num_batched_tokens=1536 with max_num_seqs=1024, against a
+            # 1024-embed image) siblings exhaust the budget and the chunk is cut
+            # back to the item's offset -- 256 -> 99 -- moving the prefill
+            # boundary from 2560 to 2403 and the MLA merge_attn_states split with
+            # it: max |delta logprob| 1.4e-1 to 1.8e-1 at the first sampled
+            # token. The vision tower is not the cause; a needle whose image is
+            # encoded alongside another is bitwise identical to batch 1 when its
+            # own chunk boundary does not move.
 
         # Create KVConnector for the Scheduler. Note that each Worker
         # will have a corresponding KVConnector with Role=WORKER.
