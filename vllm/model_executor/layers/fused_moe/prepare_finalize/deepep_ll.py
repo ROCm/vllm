@@ -49,6 +49,52 @@ def dequant_fp8(
     return (expert_x_fp32 * expert_x_scales).view(expert_x_fp8.size())
 
 
+def _delivered_rows_mask(
+    x: torch.Tensor, expert_num_tokens: torch.Tensor
+) -> torch.Tensor:
+    """Mark the rows of a low-latency receive buffer that hold a token.
+
+    `x` is `[num_local_experts, max_tokens_per_rank * num_ranks, hidden]` and
+    only the first `expert_num_tokens[e]` rows of each expert were written.
+    """
+    num_experts, max_rows, _ = x.size()
+    rows = torch.arange(max_rows, device=x.device).view(1, max_rows)
+    return rows < expert_num_tokens.view(num_experts, 1).to(rows.dtype)
+
+
+def _dynamic_per_tensor_scale(
+    x: torch.Tensor, expert_num_tokens: torch.Tensor, quant_dtype: torch.dtype
+) -> torch.Tensor:
+    """A per-tensor amax over the rows the all2all actually delivered.
+
+    The amax is taken per row first, so no buffer-sized temporary is
+    materialized, then masked down to the delivered rows. `aminmax` rather
+    than a separate `amax` and `amin` so this is a single pass over the
+    buffer, which keeps total traffic at what the dynamic path already cost:
+    one reduction pass plus the quantization pass, the latter now static
+    because the scale is supplied.
+    """
+    row_min, row_max = torch.aminmax(x, dim=-1)
+    row_amax = torch.maximum(row_max, row_min.neg())
+    # `amax` propagates NaN where the quantization kernels' `fmaxf` reduction
+    # drops it. Match the kernels, so a NaN that is already in the buffer
+    # cannot newly poison the whole layer through the scale. This runs on the
+    # [num_experts, max_rows] reduction, not on the buffer.
+    row_amax = torch.nan_to_num(row_amax, nan=0.0)
+    delivered = _delivered_rows_mask(x, expert_num_tokens)
+    amax = torch.where(delivered, row_amax, torch.zeros_like(row_amax)).amax()
+
+    if quant_dtype.is_floating_point:
+        qmax = torch.finfo(quant_dtype).max
+    else:
+        qmax = torch.iinfo(quant_dtype).max
+
+    # The floor only bites when there is nothing to quantize, where any
+    # positive scale is equally correct. It keeps the kernel's reciprocal
+    # finite; `_int8_quantize` floors its own dynamic scale the same way.
+    return (amax.to(torch.float32) / qmax).clamp(min=1e-10).view(1)
+
+
 class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     Prepare/Finalize using DeepEP low-latency kernels.
@@ -160,6 +206,7 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def _do_quant(
         self,
         x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        expert_num_tokens: torch.Tensor,
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -206,11 +253,29 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             assert isinstance(x, torch.Tensor)
             num_experts, max_tokens, hidden_dim = x.size()
 
+            a1_scale = quant_config.a1_scale
+            if (
+                a1_scale is None
+                and isinstance(q_dtype, torch.dtype)
+                and not quant_config.per_act_token_quant
+                and quant_config.block_shape is None
+                and x.numel() > 0
+            ):
+                # A dynamic per-tensor amax over the whole buffer would be
+                # taken over rows the all2all never wrote. Those rows are not
+                # cleared between calls and this buffer is shared by every MoE
+                # layer, so the scale would come from whichever layer last
+                # dispatched the largest activation. Confine it to the rows
+                # that were delivered. Every other scheme here is per-token,
+                # per-block or calibrated, and none of them can be poisoned by
+                # a row they do not cover.
+                a1_scale = _dynamic_per_tensor_scale(x, expert_num_tokens, q_dtype)
+
             # TODO (varun): Optimization - Use a batched version of quant
             x = x.view((-1, hidden_dim))
             x, x_scales = moe_kernel_quantize_input(
                 x,
-                quant_config.a1_scale,
+                a1_scale,
                 q_dtype,
                 quant_config.per_act_token_quant,
                 quant_config.block_shape,
@@ -333,7 +398,9 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         a1_dtype: torch.dtype,
         quant_config: FusedMoEQuantConfig,
     ) -> mk.PrepareResultType:
-        expert_x, expert_x_scale = self._do_quant(expert_x, a1_dtype, quant_config)
+        expert_x, expert_x_scale = self._do_quant(
+            expert_x, expert_num_tokens, a1_dtype, quant_config
+        )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
