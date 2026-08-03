@@ -1123,8 +1123,14 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
         )
 
-        intermediate_cache2.fill_(0)
-
+        # No zero-fill of intermediate_cache2 here: the activation below writes
+        # every element of the same view, so the fill was dead. What keeps the
+        # fp8 path's padded rows finite is `intermediate_cache1.fill_(0)`
+        # above, not this -- so a future pad-aware activation must zero the
+        # rows it skips, because `batched_moe_kernel_quantize_input` ignores
+        # `expert_num_tokens` under cudagraphs and takes an amax over the whole
+        # buffer.
+        #
         # TODO (bnell): use triton utility from batched deep gemm.
         self.activation(
             activation,
