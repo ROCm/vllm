@@ -4,7 +4,9 @@
 import mori
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.platforms import current_platform
@@ -70,6 +72,75 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def supports_async(self) -> bool:
         return False
 
+    def _max_rows_to_recv(self, local_num_tokens: int, buffer_rows: int) -> int:
+        """Upper bound on the rows MoRI's dispatch can deliver to this rank.
+
+        MoRI sizes its receive buffer for the worst case, `ep_size *
+        max_num_batched_tokens`: every token in the step could route an expert
+        onto this rank, and the dispatch sends at most *one* row per (token,
+        destination rank) pair -- it deduplicates a token's topk before
+        claiming a slot, which is why the worst case is not multiplied by topk.
+        So the bound is the total tokens across the EP ranks, and the per-step
+        bound is that same formula with the step's actual counts substituted
+        for the maxima.
+
+        Those counts are host-known, in `num_tokens_across_dp_cpu`. This uses
+        `ep_size * max(...)` rather than the sum: the two agree whenever DP
+        padding is on, which is whenever cudagraphs are (see
+        `_synchronize_dp_ranks`), so the shape stays static per captured graph;
+        the max is still an upper bound when padding is off; and it remains one
+        under TP and sequence parallelism, where an EP rank carries at most one
+        DP rank's worth of rows. It is the same quantity `DeepEPV2` bounds its
+        own worst-case buffer with, minus the power-of-two rounding, which
+        exists there because DeepEP compiles a kernel per size. MoRI compiles
+        one per kernel type, so an odd bound is free and rounding would only
+        cost looseness.
+        """
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            rows_per_sender = local_num_tokens
+        else:
+            rows_per_sender = int(dp_metadata.num_tokens_across_dp_cpu.max())
+        # Never zero. A zero would only arise if every DP rank were empty, but
+        # it would hand the modular kernel M == 0, a branch MoRI could not
+        # previously reach because its M was the whole buffer. One dead row is
+        # cheaper than reasoning about that.
+        return max(1, min(self.num_dispatchers_ * rows_per_sender, buffer_rows))
+
+    def _verify_recv_bound(
+        self, dispatch_recv_token_num: torch.Tensor, recv_rows: int
+    ) -> None:
+        """Check the trimmed buffer really covers what arrived, and log slack.
+
+        Gated on `VLLM_MORI_VERIFY_RECV_BOUND`, and a check rather than an
+        alternate path: the trimming in `prepare` is identical either way, so
+        there are not two behaviours to drift apart. Never runs while a
+        cudagraph is capturing -- see the call site.
+
+        Exceeding the bound is the one way this can be wrong, and it is silent:
+        the experts would simply never write rows past it, and combine would
+        read whatever the workspace happened to hold. Nothing raises. So the
+        validation runs check it directly rather than inferring it from output
+        quality, at the cost of a device sync per layer.
+
+        The ratio is logged because a formula error shows up as slack trending
+        to zero before it shows up as a violation. A balanced rank receives
+        about `min(topk, ep_size) / ep_size` of the bound.
+        """
+        recv = int(dispatch_recv_token_num.item())
+        logger.info(
+            "MoRI recv bound: %d / %d rows (%.3f of bound)",
+            recv,
+            recv_rows,
+            recv / recv_rows if recv_rows else 0.0,
+        )
+        assert recv <= recv_rows, (
+            f"MoRI delivered {recv} rows but prepare trimmed its receive "
+            f"buffer to {recv_rows}. The rows past the bound were never "
+            f"computed by the experts and combine will read uninitialised "
+            f"workspace for them."
+        )
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -119,21 +190,67 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_num_tokens=dispatch_recv_token_num, expert_num_tokens_cpu=None
         )
 
-        # `dispatch_ids` is a view of MoRI's receive buffer, sized
-        # `max_num_tokens_to_recv()` = EP size x max_num_batched_tokens and
-        # written only for the rows that actually arrived. The tail is never
-        # cleared, so it holds the previous step's expert ids -- which are in
-        # range, so `moe_align_block_size` counts them as real tokens,
+        # Hand the experts a prefix of MoRI's worst-case receive buffer rather
+        # than the whole thing. `_max_rows_to_recv` explains why the prefix is
+        # still an upper bound on what arrived; the slicing is free because the
+        # dispatch outputs are views onto MoRI's symmetric buffers, so a row
+        # prefix keeps both the pointer and the row stride.
+        #
+        # `combine` does not see the narrowing. It takes the input pointer and
+        # `size(1)` and reads exactly `totalRecvTokenNum` rows, so as long as
+        # the bound holds every row it reads is one the experts computed. The
+        # ids it gets are left alone entirely -- see below.
+        recv_rows = self._max_rows_to_recv(a1.size(0), dispatch_a1.size(0))
+        # Read at call time, not at import: the knob is for validation runs and
+        # nothing should have to be re-imported to turn it on.
+        #
+        # Not during capture. The check reads the count back to the host, and a
+        # device sync inside a capturing stream aborts the capture with "CUDA
+        # error: operation not permitted when stream is capturing" -- which is
+        # how this guard was found. Skipping capture also loses nothing: the
+        # rows are dummy, and at *replay* this Python does not run at all, so
+        # under cudagraphs the check only ever covers non-captured steps.
+        # Validation runs that need it to cover real serving traffic have to
+        # ask for `--enforce-eager`.
+        if (
+            envs.VLLM_MORI_VERIFY_RECV_BOUND
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            self._verify_recv_bound(dispatch_recv_token_num, recv_rows)
+        dispatch_a1 = dispatch_a1[:recv_rows]
+        dispatch_weights = dispatch_weights[:recv_rows]
+        if dispatch_scale is not None:
+            dispatch_scale = dispatch_scale[:recv_rows]
+        recv_ids = dispatch_ids[:recv_rows]
+
+        # Only the rows that actually arrived are written; the gap between the
+        # received count and the bound is never cleared, so it holds the
+        # previous step's expert ids -- which are in range, so
+        # `moe_align_block_size` counts them as real tokens,
         # `num_tokens_post_padded` never shrinks below the whole buffer and
         # every experts backend that derives its work from `topk_ids` runs the
         # full padded M on every step.
         #
-        # Marking the tail invalid is enough to fix that: the align kernel
-        # skips ids outside [0, num_experts) (`get_local_expert_id`), so they
-        # drop out of the per-expert counts, and `fused_moe_kernel` already
-        # loads `num_tokens_post_padded` from device memory and early-exits
-        # the blocks past it. The row count is read on device, so this costs
-        # no host sync -- which is the whole reason the buffer is fixed-size.
+        # Narrowing shrinks that gap but does not close it, and cannot: a token
+        # reaches at most `topk` of the EP ranks while the bound has to assume
+        # it could reach all of them. How much is left is not
+        # `min(topk, ep_size) / ep_size` -- that was the first guess here and
+        # it is wrong, because several of a token's topk picks routinely land
+        # on the same rank. Under uniform routing a rank fills
+        # `1 - C(E - E/ep, topk) / C(E, topk)`, which for OLMoE at ep_size 4 is
+        # 0.915 rather than 1.0, and 0.227 for a 256-expert model at ep_size
+        # 32. Measured on this config it is lower still -- mean 0.692, median
+        # 0.750 over 8128 dispatches -- because real routing clusters and small
+        # batches are discrete. So about 30% of the narrowed buffer is padding
+        # even at the width where the naive formula predicted none.
+        # `DeepEPV2PrepareAndFinalize` marks its own tail for the same reason.
+        #
+        # Marking the tail invalid is enough: the align kernel skips ids
+        # outside [0, num_experts) (`get_local_expert_id`), so they drop out of
+        # the per-expert counts, and `fused_moe_kernel` already loads
+        # `num_tokens_post_padded` from device memory and early-exits the
+        # blocks past it. The row count is read on device, so this costs no
+        # host sync -- which is the whole reason the buffer is fixed-size.
         #
         # The tail rows themselves stay garbage: nothing writes them, so the
         # experts leave uninitialised workspace in those rows of the output.
@@ -144,30 +261,30 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # runs on every layer of every step, and at 8192x8 the two-kernel form
         # measured 20us against 11us for this one, which is 0.15ms per step on
         # a 16-layer model.
-        if dispatch_ids.is_contiguous():
-            expert_topk_ids = torch.empty_like(dispatch_ids)
+        if recv_ids.is_contiguous():
+            expert_topk_ids = torch.empty_like(recv_ids)
             BLOCK_SIZE = 1024
-            numel = dispatch_ids.numel()
+            numel = recv_ids.numel()
             _trim_topk_ids_kernel[(triton.cdiv(numel, BLOCK_SIZE),)](
-                dispatch_ids,
+                recv_ids,
                 expert_topk_ids,
                 dispatch_recv_token_num,
                 numel,
-                dispatch_ids.size(1),
+                recv_ids.size(1),
                 BLOCK_SIZE=BLOCK_SIZE,
             )
         else:
             rows = torch.arange(
-                dispatch_ids.size(0), device=dispatch_ids.device, dtype=torch.int32
+                recv_ids.size(0), device=recv_ids.device, dtype=torch.int32
             )
             expert_topk_ids = torch.where(
-                (rows < dispatch_recv_token_num).unsqueeze(1), dispatch_ids, -1
+                (rows < dispatch_recv_token_num).unsqueeze(1), recv_ids, -1
             )
 
-        # Combine keeps MoRI's untouched ids. The intranode kernel ignores them
-        # entirely (it routes off `dispDestTokIdMap`), but the internode ones
-        # do read `args.tokenIndices`, and feeding those a -1 is a change this
-        # single-node work cannot test.
+        # Combine keeps MoRI's ids, full length and untouched. The intranode
+        # kernel ignores them entirely (it routes off `dispDestTokIdMap`), but
+        # the internode ones do read `args.tokenIndices`, and neither the -1
+        # marking nor the narrowing above is testable on one node.
         self._combine_topk_ids = dispatch_ids
 
         return (

@@ -1448,47 +1448,42 @@ class FusedMoEConfig:
             # coupling turns out to be a performance contract rather than a
             # data-format one.
             #
-            # What MoRI's prepare actually hands the experts is a *fixed-size*
-            # receive buffer of `max_num_tokens_to_recv()` rows (= EP size x
-            # max_num_batched_tokens) plus a device-side scalar row count,
+            # What MoRI's prepare hands the experts is a slice of a worst-case
+            # receive buffer -- `max_num_tokens_to_recv()` rows, EP size x
+            # max_num_batched_tokens -- plus a device-side scalar row count,
             # which `MoriPrepareAndFinalize.prepare` puts in
-            # `ExpertTokensMetadata.expert_num_tokens` -- note that despite
-            # the field name it is a single total, not per-expert counts.
-            # `AiterExperts` consumes that count directly, as AITER's
-            # `num_local_tokens`. Every other class ignores it; the buffer
-            # stays full size for them, but `MoriPrepareAndFinalize.prepare`
-            # marks the rows past the count invalid in `topk_ids`, so
-            # `moe_align_block_size` drops them from `num_tokens_post_padded`
-            # and the expert GEMMs skip them -- see that method.
+            # `ExpertTokensMetadata.expert_num_tokens`; despite the field name
+            # it is a single total, not per-expert counts. `AiterExperts`
+            # consumes that count directly, as AITER's `num_local_tokens`, and
+            # every other class ignores it. What keeps the cost off those
+            # classes is two things in `prepare`: the buffer is narrowed to
+            # `ep_size x` this step's DP token count, which is host-known, and
+            # the rows past the received count are marked invalid in
+            # `topk_ids`, so `moe_align_block_size` drops them from
+            # `num_tokens_post_padded` and the expert GEMMs, the pad-aware
+            # activation and the pad-aware reduction all skip them.
             #
-            # Correctness does not depend on any of this: the rows past the
-            # count are never read back by `mori_op.combine`. Measured on
-            # 4x gfx950, OLMoE-1B-7B bf16, DP=4/EP=4 under
-            # VLLM_BATCH_INVARIANT=1, MoRI high throughput + TritonExperts is
-            # *bitwise identical* to allgather_reducescatter + TritonExperts,
-            # with and without the trim, across 5 prompts x 24 logprobs and a
-            # 32-token needle. It is also batch invariant (0/32 positions
-            # moved under load; 32/32 moved with the mode off).
+            # Correctness does not depend on any of it: the rows past the count
+            # are never read back by `mori_op.combine`. Measured on 4x gfx950,
+            # OLMoE-1B-7B bf16, DP=4/EP=4 under VLLM_BATCH_INVARIANT=1, MoRI
+            # high throughput + TritonExperts is *bitwise identical* to
+            # allgather_reducescatter + TritonExperts, at every stage of that
+            # work, across 5 prompts x 24 logprobs and a 32-token needle. It is
+            # also batch invariant (0/32 positions moved under load; 32/32
+            # moved with the mode off).
             #
-            # What is left is the elementwise work, which still runs at the
-            # full padded M: the activation, the intermediate quantization and
-            # `moe_sum` are all sized by the buffer rather than by the count.
-            # Measured at max_num_batched_tokens=2048, EP=4, 60s of saturating
-            # load: 3946 -> 10968 tok/s with the trim, against 12157 for
-            # allgather_reducescatter on the same box. Warn rather than
-            # refuse -- refusing is what kept an entire all2all backend out of
-            # batch-invariant mode, since `AiterExperts` declares no batch
-            # invariance.
-            if not self.rocm_aiter_fmoe_enabled:
-                logger.warning_once(
-                    "MoRI is paired with a non-AITER experts backend. The "
-                    "expert GEMMs skip MoRI's padded rows, but the "
-                    "activation, intermediate quantization and reduction are "
-                    "still sized by its full receive buffer (%d rows) rather "
-                    "than by the batch. Output is correct; throughput is "
-                    "below AITER's.",
-                    self.max_num_tokens * self.moe_parallel_config.ep_size,
-                )
+            # There is no warning here any more, and that is a measurement
+            # rather than an omission. It used to say the activation, the
+            # intermediate quantization and the reduction still ran at the full
+            # padded M. The first and third no longer do; the second never did
+            # on a bf16 model, where the quantize call is a no-op. At
+            # max_num_batched_tokens=2048, EP=4, 60s of saturating load, the
+            # pairing went 3946 -> 12030 tok/s, which is 103.2% of
+            # allgather_reducescatter on the same box -- so telling an operator
+            # to avoid it would now be steering them off the faster path. What
+            # is left is `moe_align_block_size` scanning every id in the
+            # narrowed buffer, 0.42 ms/step, which needs a device-side row
+            # bound in csrc.
             assert not self.aiter_fmoe_shared_expert_enabled, (
                 "Mori does not support fusion shared expert now. "
                 "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"
