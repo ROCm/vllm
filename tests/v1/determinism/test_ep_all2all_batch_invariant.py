@@ -47,23 +47,27 @@ cudagraphs on, needle pinned to DP rank 2:
   than when AITER was actually *selected*, which made the only previously
   reachable MoRI measurement (via `--moe-backend triton`) degenerate; and
   `FusedMoEConfig.__post_init__` asserted `rocm_aiter_fmoe_enabled` for MoRI,
-  which is now a warning. See that comment for why the coupling is a
-  performance contract and not a data-format one. With both in place MoRI's
+  which is now neither an assert nor a warning. See that comment for why the
+  coupling is a performance contract and not a data-format one. With both in
+  place MoRI's
   IntraNode combine is bitwise invariant: 0 of 32 positions moved, against a
   mode-off control at the *same* load exposure (needle rank padding 40 -> 48 in
   both arms) that moved 32 of 32, max |delta| 3.6e-2. Its output is also
   bitwise identical to the allgather_reducescatter path on the same prompts
   (4 prompts x 24 logprobs plus the 32-token needle, max |delta| exactly 0).
 
-  `--max-num-batched-tokens` is pinned low for this arm on purpose. MoRI hands
-  the experts a fixed-size receive buffer of `ep_size *
-  max_num_batched_tokens` rows, so `TritonExperts` sees M = 8192 on every step
-  where the allgather_reducescatter arm on the same model ran M between 4 and
-  8192 over 526 distinct values. `MoriPrepareAndFinalize.prepare` now marks the
-  undelivered rows invalid so the expert GEMMs skip them (mean
+  `--max-num-batched-tokens` is pinned low for this arm on purpose. MoRI
+  allocates a receive buffer of `ep_size * max_num_batched_tokens` rows, and
+  `TritonExperts` used to see M = 8192 on every step where the
+  allgather_reducescatter arm on the same model ran M between 4 and 8192 over
+  526 distinct values. It no longer does: `MoriPrepareAndFinalize.prepare`
+  marks the undelivered rows invalid, so the expert GEMMs, the pad-aware
+  activation and the pad-aware reduction skip them (mean
   `num_tokens_post_padded` 67662 -> 2866, against 2960 for
-  allgather_reducescatter), but the buffer, the workspaces and the elementwise
-  work are still sized by it. Leaving the default would make this test slow and
+  allgather_reducescatter), and it hands the experts only the first
+  `ep_size *` (this step's DP token count) rows, so M tracks the batch. What is
+  still sized by `max_num_batched_tokens` is MoRI's own symmetric allocation,
+  which is what the pin is for -- leaving the default would make this test
   memory-hungry for no extra coverage.
 
 - **mori_low_latency**: not a second test. Both single-node MoRI variants were
@@ -1018,14 +1022,36 @@ def test_deepep_low_latency_fp8_promotion_engages_end_to_end(deepep_ll_fp8_serve
     Seen in 2 of 2 mode-off runs that got that far, once on the loaded needle
     and once on the idle one, and never in any mode-on run.
 
-    That is consistent with the promotion's own rationale rather than
-    mysterious. With the mode off the activation scale stays a dynamic
-    per-tensor amax, and on this path the amax is taken over the whole
-    `E x max_num_tokens` dispatch buffer -- including rows DeepEP LL never
-    delivered. Under the mode the scale is per-token and an undelivered row
-    can only poison itself. **Not diagnosed further, and not claimed as
-    proven**: it means the arm above is uncontrolled, which is the thing a
-    reader needs to know.
+    An earlier version of this docstring attributed the NaN to the activation
+    scale, since with the mode off it stays a dynamic per-tensor amax taken
+    over the whole `E x max_num_tokens` dispatch buffer -- including rows
+    DeepEP LL never delivered -- while under the mode it is per-token and an
+    undelivered row can only poison itself. **That attribution has since been
+    measured and excluded, and both halves are worth recording.**
+
+    The scale defect is real: device-side, in all 16 of OLMoE's MoE layers,
+    the buffer amax is achieved on an *undelivered* row, so the scale is never
+    set by the data being quantized, with inflation up to 22.75x on serving
+    traffic. The undelivered rows are not uninitialised -- one DeepEP LL
+    buffer is shared by every layer, so they hold whichever layer last
+    dispatched the largest activation (40.75, identical across all 16 layers).
+
+    But it does not cause this. Replacing the scale with an amax over
+    delivered rows only, as a static scale, changing nothing else, leaves the
+    NaN exactly as it was: 6 of 6 requests after the first. No NaN or Inf ever
+    enters the quantizer either.
+
+    What the NaN is instead, so far: it is in the forward pass and not in
+    logprob serialization (with `logprobs` omitted the same request returns
+    200 and garbage text), it is in prefill, and it is **one-way persistent**
+    -- the first request after startup is always clean and every request after
+    it is NaN, in 4 of 4 server runs, with no load required. That signature
+    points at persistent state rather than at arithmetic on one batch, and
+    `--enforce-eager` is the control that would separate a cudagraph
+    capture/replay defect from a kernel one. Not run.
+
+    The arm above is uncontrolled either way, which is the thing a reader
+    needs to know.
     """
     server, log_prefix = deepep_ll_fp8_server
     _assert_needle_does_not_see_the_batch(
