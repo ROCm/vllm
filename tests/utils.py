@@ -1513,7 +1513,15 @@ def error_on_warning(category: type[Warning] = Warning):
 
 
 def get_physical_device_indices(devices: list[int]):
-    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    # HIP_VISIBLE_DEVICES first: on ROCm it takes precedence over
+    # CUDA_VISIBLE_DEVICES in the HIP runtime, so torch's device order follows
+    # it. Reading only CUDA_VISIBLE_DEVICES made every amdsmi query in this
+    # module report the *wrong physical GPUs* whenever a run was pinned with
+    # HIP_VISIBLE_DEVICES alone -- e.g. HIP_VISIBLE_DEVICES=5,6 was polled as
+    # physical 0,1, which on a shared machine is somebody else's memory.
+    visible_devices = os.environ.get("HIP_VISIBLE_DEVICES") or os.environ.get(
+        "CUDA_VISIBLE_DEVICES"
+    )
     if visible_devices is None:
         return devices
 
