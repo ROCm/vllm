@@ -164,6 +164,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_gptq_gemm_rdna3", torch::kCUDA, &moe_gptq_gemm_rdna3);
 #endif
 
+#ifdef VLLM_ROCM_GFX115X
+  // Gated delta net prefill in one launch (RDNA3.5). `g` is the raw per-token
+  // log decay; the cumsum is taken inside the kernel.
+  rocm_ops.def(
+      "gdn_chunked(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
+      "Tensor? initial_state, Tensor cu_seqlens, Tensor! out, "
+      "Tensor! final_state, float scale) -> ()");
+  rocm_ops.impl("gdn_chunked", torch::kCUDA, &gdn_chunked);
+#endif
+
   // W4A16 MoE prefill WMMA GEMM for AMD RDNA3 (gfx11). Always registered; the
   // kernel body is gfx11-only (stub elsewhere) and Python gates calls on
   // on_gfx1x(). Mutates c in place; an unsupported shape raises via TORCH_CHECK

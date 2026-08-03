@@ -1354,6 +1354,17 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/moe_q_gemm_rdna3.cu")
   endif()
 
+  # Single-kernel gated delta net prefill.  The block layout assumes wave32
+  # throughout, so the source is only built where it is valid; the host
+  # function rechecks gcnArchName at launch, because the device-side fallbacks
+  # would otherwise let it run and return wrong numbers on wave64.
+  set(VLLM_ROCM_HAS_GFX115X OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx115[01]")
+    set(VLLM_ROCM_HAS_GFX115X ON)
+    list(APPEND VLLM_ROCM_EXT_SRC
+      "csrc/rocm/gdn_chunked.cu")
+  endif()
+
   define_extension_target(
     _rocm_C
     DESTINATION vllm
@@ -1374,6 +1385,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(VLLM_ROCM_HAS_GFX1100)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1100)
+  endif()
+  if(VLLM_ROCM_HAS_GFX115X)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX115X)
   endif()
 endif()
 
