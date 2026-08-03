@@ -10,11 +10,28 @@ depends on what else was batched with it, so the mode refuses the
 configuration. Plain EPLB keeps the same routing for every token and is
 admitted with a warning.
 
-This module is the cheap half of that coverage: it constructs the config
-objects directly, costs milliseconds and needs neither a model nor a device,
-so it can run in a single-GPU CI job. The end-to-end measurement behind the
-gate lives in `test_eplb_batch_invariant.py`, which needs four GPUs and a
-30 GB checkpoint and will not run in the same places.
+Note what is *not* refused, because it is the distinction the gate turns on.
+EPLB's load-driven rearrangement makes a request's output depend on the
+traffic that preceded it -- but `eplb_step()` runs after the forward pass, so
+every token in a step sees the same placement. That is a **temporal**
+dependence, and batch invariance does not forbid it; it forbids a token's
+output depending on its *batch-mates*. The replica hash is the only part of
+EPLB that does that, and it is the only part refused here. An earlier
+four-GPU module asserted the rest end to end and was removed as a green test
+of a property that follows structurally from where `eplb_step()` sits.
+
+The measurement behind the refusal, which no longer has a test of its own:
+4x gfx950, DeepSeek-V2-Lite, DP=4 x EP=4, `num_redundant_experts=8`, expert
+placement held still with zero committed rearrangements across the whole
+comparison -- 64 of 64 needle logprobs moved when 32 companions shared its
+rank, and 0 of 64 when 24 companions ran on the other three ranks instead.
+Only companions that change the needle's own row index move it, which is the
+signature of the hash rather than of the collective. The same sweep at
+`num_redundant_experts=0` moved 0 of 64 in every condition.
+
+This module is deliberately cheap: it constructs the config objects directly,
+costs milliseconds, and needs neither a model nor a device, so it runs in a
+single-GPU CI job.
 
 The warning on plain EPLB is deliberately not asserted: `warning_once` caches
 per process, so whether it is emitted depends on what ran before it in the

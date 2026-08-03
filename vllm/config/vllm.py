@@ -1673,19 +1673,20 @@ class VllmConfig:
                         "num_redundant_experts to 0, which is batch invariant, "
                         "or unset VLLM_BATCH_INVARIANT."
                     )
+                # Rearrangement is a *temporal* dependence, not a batch one:
+                # `eplb_step()` runs after the forward pass, so every token in
+                # a step sees the same placement and a request's output depends
+                # on the traffic that preceded it rather than on its
+                # batch-mates. Batch invariance does not forbid that, which is
+                # why this warns rather than refusing -- but users set this
+                # mode for reproducibility, and EPLB removes it.
                 logger.warning_once(
-                    "EPLB is enabled with VLLM_BATCH_INVARIANT. It is not "
-                    "reproducible across runs: EPLB moves experts between "
-                    "ranks based on the load it has observed, so a request's "
-                    "output depends on the traffic that preceded it. Measured "
-                    "on DeepSeek-V2-Lite at DP=4 x EP=4 with "
-                    "eplb_config.use_async=false: two identical solo requests "
-                    "either side of a rearrangement sampled different tokens, "
-                    "while output was invariant to batch composition with "
-                    "placement held still. With use_async=true -- the default "
-                    "-- placement never settles under load, so batch "
-                    "invariance there is unmeasured rather than established. "
-                    "Disable EPLB if you need reproducibility."
+                    "EPLB is enabled with VLLM_BATCH_INVARIANT. Output remains "
+                    "invariant to batch composition, but not reproducible "
+                    "across runs: EPLB moves experts between ranks based on "
+                    "the load it has observed, so a request's output depends "
+                    "on the traffic that preceded it. Disable EPLB if you need "
+                    "run-to-run reproducibility."
                 )
 
             # These passes rewrite the collective the communicator would have
