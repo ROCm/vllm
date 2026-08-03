@@ -8,8 +8,26 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _trim_topk_ids_kernel(
+    src_ptr,  # [num_rows, topk], MoRI's receive buffer view
+    dst_ptr,  # [num_rows, topk]
+    recv_token_num_ptr,  # device-side scalar row count
+    numel,
+    topk,
+    BLOCK_SIZE: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < numel
+    recv_token_num = tl.load(recv_token_num_ptr)
+    ids = tl.load(src_ptr + offsets, mask=mask, other=0)
+    delivered = (offsets // topk) < recv_token_num
+    tl.store(dst_ptr + offsets, tl.where(delivered, ids, -1), mask=mask)
 
 
 class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -121,12 +139,31 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # experts leave uninitialised workspace in those rows of the output.
         # That is already the contract -- combine only reads
         # `totalRecvTokenNum` rows back.
-        rows = torch.arange(
-            dispatch_ids.size(0), device=dispatch_ids.device, dtype=torch.int32
-        )
-        expert_topk_ids = torch.where(
-            (rows < dispatch_recv_token_num).unsqueeze(1), dispatch_ids, -1
-        )
+        #
+        # One kernel rather than an arange plus a broadcast `torch.where`: this
+        # runs on every layer of every step, and at 8192x8 the two-kernel form
+        # measured 20us against 11us for this one, which is 0.15ms per step on
+        # a 16-layer model.
+        if dispatch_ids.is_contiguous():
+            expert_topk_ids = torch.empty_like(dispatch_ids)
+            BLOCK_SIZE = 1024
+            numel = dispatch_ids.numel()
+            _trim_topk_ids_kernel[(triton.cdiv(numel, BLOCK_SIZE),)](
+                dispatch_ids,
+                expert_topk_ids,
+                dispatch_recv_token_num,
+                numel,
+                dispatch_ids.size(1),
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+        else:
+            rows = torch.arange(
+                dispatch_ids.size(0), device=dispatch_ids.device, dtype=torch.int32
+            )
+            expert_topk_ids = torch.where(
+                (rows < dispatch_recv_token_num).unsqueeze(1), dispatch_ids, -1
+            )
+
         # Combine keeps MoRI's untouched ids. The intranode kernel ignores them
         # entirely (it routes off `dispDestTokIdMap`), but the internode ones
         # do read `args.tokenIndices`, and feeding those a -1 is a change this

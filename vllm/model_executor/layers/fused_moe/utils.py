@@ -566,6 +566,107 @@ def _swiglu_limit_pad_aware(
     )
 
 
+@triton.jit
+def _silu_and_mul_pad_aware_kernel(
+    input_ptr,  # [num_rows, 2 * hidden_size]
+    output_ptr,  # [num_rows, hidden_size]
+    topk_ids_ptr,  # [num_rows], flattened [num_tokens, topk]
+    expert_map_ptr,  # global -> local expert id, or -1 if non-local
+    hidden_size,
+    input_row_stride,
+    num_rows,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_stride = tl.num_programs(0)
+    column_tile = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = column_tile < hidden_size
+
+    for row in tl.range(pid, num_rows, row_stride):
+        expert_id = tl.load(topk_ids_ptr + row)
+        should_compute = expert_id >= 0
+        if HAS_EXPERT_MAP:
+            local_expert_id = tl.load(
+                expert_map_ptr + expert_id, mask=expert_id >= 0, other=-1
+            )
+            should_compute = should_compute & (local_expert_id >= 0)
+
+        if should_compute:
+            gate_offsets = row.to(tl.int64) * input_row_stride + column_tile
+            gate = tl.load(input_ptr + gate_offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            up = tl.load(input_ptr + gate_offsets + hidden_size, mask=mask, other=0.0)
+            up = up.to(tl.float32)
+            # Two details make this bit-for-bit with torch.ops._C.silu_and_mul.
+            # `packed_silu_kernel` returns the storage dtype, so silu is rounded
+            # before the multiply and only then widened again; and the CUDA
+            # kernel multiplies by `up + beta` with beta = 0.0, which turns a
+            # -0.0 up into +0.0. Both are load-bearing.
+            silu = gate / (1.0 + tl.exp(-gate))
+            silu = silu.to(output_ptr.dtype.element_ty).to(tl.float32)
+            up = tl.where(up == 0.0, 0.0, up)
+            tl.store(
+                output_ptr + row.to(tl.int64) * hidden_size + column_tile,
+                (silu * up).to(output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
+
+def silu_and_mul_is_pad_aware(input: torch.Tensor) -> bool:
+    """Whether `silu_and_mul_pad_aware` reproduces the CUDA kernel exactly.
+
+    bfloat16 only, and that is not conservatism. Triton's `exp` is not HIP's
+    `expf`: in fp32 the two disagree on 39% of inputs by about an ulp. bf16
+    rounds that away -- checked exhaustively, over all 2^32 (gate, up) pairs,
+    zero mismatches -- but fp16 keeps enough mantissa to expose it (0.02% of
+    elements, up to 2 ulp) and fp32 shows it outright. So the fast path is
+    restricted to the dtype where equality is proven rather than likely.
+    """
+    return input.dtype == torch.bfloat16
+
+
+def silu_and_mul_pad_aware(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+) -> None:
+    """`torch.ops._C.silu_and_mul` that skips rows no expert GEMM will read.
+
+    Rows are token-expert slots: `input` is `[num_tokens * topk, 2 * hidden]`
+    and `topk_ids` is the matching `[num_tokens, topk]`. A slot is skipped when
+    its expert id is negative (an unrouted or padded row) or maps outside this
+    rank. `fused_moe_kernel` never reads those slots -- a block whose expert is
+    non-local returns after `write_zeros_to_output`, and a slot with a negative
+    id is not in `sorted_token_ids` at all -- so the output there is dead.
+
+    Callers must check `silu_and_mul_is_pad_aware` first; the computed slots are
+    bit-identical to the CUDA kernel only for the dtype it admits.
+    """
+    assert silu_and_mul_is_pad_aware(input)
+    num_rows, gate_up_size = input.shape
+    hidden_size = gate_up_size // 2
+    if num_rows == 0:
+        return
+
+    BLOCK_SIZE = 1024
+    grid = (min(num_rows, 2048), triton.cdiv(hidden_size, BLOCK_SIZE))
+    _silu_and_mul_pad_aware_kernel[grid](
+        input,
+        output,
+        topk_ids,
+        expert_map,
+        hidden_size,
+        gate_up_size,
+        num_rows,
+        HAS_EXPERT_MAP=expert_map is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+    )
+
+
 def swiglu_limit_func(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
