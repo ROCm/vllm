@@ -549,7 +549,13 @@ def _swiglu_limit_pad_aware(
         return
 
     BLOCK_SIZE = 1024
-    grid = (min(num_tokens, 256), triton.cdiv(hidden_size, BLOCK_SIZE))
+    # 2048, matching the `silu_and_mul_pad_aware` twin below. This kernel is
+    # persistent over rows, so this cap is the number of workgroups per column
+    # tile: at 256 it is one per CU on a gfx950 and the part is starved of
+    # anything to overlap the loads with. Raising it is worth 1.4x-3.8x above
+    # 8192 rows, on every dtype, and is exactly neutral below the cap where it
+    # does not bind. `min` keeps the small-batch grid unchanged.
+    grid = (min(num_tokens, 2048), triton.cdiv(hidden_size, BLOCK_SIZE))
     _swiglu_limit_pad_aware_kernel[grid](
         input,
         output,
