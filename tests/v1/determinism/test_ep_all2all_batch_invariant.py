@@ -155,6 +155,14 @@ MORI_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_MORI_LOAD_CONCURRENCY", "96"))
 # The LoRA arm is eager, so it serves fewer requests per second and needs more
 # in flight to reach the same exposure.
 LORA_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LORA_LOAD_CONCURRENCY", "48"))
+# The fp8 arms need more for the opposite reason to MoRI: fp8 weights and GEMMs
+# make each step cheaper, so at the shared default the server drains the queue
+# between the needle's steps and its prefill again gets a step to itself. The
+# block arm was observed refusing its verdict on exactly that -- padded count 40
+# alone and 40 loaded -- and passing at this exposure. Marginal either way is
+# not good enough for a suite that wants gating status, so both fp8 arms are
+# raised rather than only the one seen to fail.
+FP8_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_FP8_LOAD_CONCURRENCY", "96"))
 LOAD_RAMP_SECONDS = float(os.getenv("VLLM_EP_LOAD_RAMP_SECONDS", "12"))
 # The load must drag the needle rank's padded token count at least this far
 # above what it ran alone, otherwise the needle saw identical shapes twice.
@@ -1032,6 +1040,7 @@ def test_deepep_low_latency_fp8_promotion_engages_end_to_end(deepep_ll_fp8_serve
             "per_act_token_quant": True,
             "block_shape": None,
         },
+        load_concurrency=FP8_LOAD_CONCURRENCY,
     )
 
 
@@ -1082,6 +1091,7 @@ def test_deepep_low_latency_fp8_block_dispatch_engages_end_to_end(
             "per_act_token_quant": False,
             "block_shape": [128, 128],
         },
+        load_concurrency=FP8_LOAD_CONCURRENCY,
     )
 
 
