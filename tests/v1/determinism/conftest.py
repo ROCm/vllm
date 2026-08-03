@@ -28,9 +28,27 @@ def settle_gpu_memory_between_modules():
     and the amdsmi query behind this costs enough (~2s) that paying it per test
     would add more to a 564-item run than the model loads it protects.
 
+    Best effort, deliberately. `wait_for_rocm_memory_to_settle` raises when the
+    devices are still busy at its timeout, and as a teardown fixture that turns
+    somebody else's slow reclaim into an ERROR against a module whose own tests
+    all passed. A full-suite run did exactly that: nine modules errored, every
+    one of them at teardown, each having waited the full 240s first. The point
+    here is to *give* reclaim a chance, not to assert that it happened -- if the
+    memory is genuinely still held, the next module that needs it will say so,
+    and with a message about the memory it actually wanted.
+
     No-op off ROCm.
     """
     yield
+    import logging
+
     from tests.utils import wait_for_rocm_memory_to_settle
 
-    wait_for_rocm_memory_to_settle()
+    try:
+        wait_for_rocm_memory_to_settle()
+    except Exception as exc:  # noqa: BLE001 - teardown must not fail the module
+        logging.getLogger(__name__).warning(
+            "GPU memory had not settled when this module finished, continuing "
+            "anyway: %s",
+            exc,
+        )
