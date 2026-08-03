@@ -66,6 +66,26 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
   // assumes stride(0) == K.  Nothing enforced that until now.
   TORCH_CHECK(in_x.is_contiguous(), "Activation must be contiguous");
 
+  // Scale and packed zero points share one row stride, in groups.  It is not
+  // required to equal num_groups: the layer pads it so the row does not land
+  // on a power-of-two byte stride (see _group_stride_pad).  Rows themselves
+  // must stay contiguous -- the kernel indexes within a row with a plain
+  // offset.
+  const int64_t group_stride = in_scale.stride(0);
+  TORCH_CHECK(in_scale.stride(1) == 1, "Scale rows must be contiguous");
+  TORCH_CHECK(group_stride >= num_groups, "Scale row stride (", group_stride,
+              ") must be at least K/group_size=", num_groups);
+  TORCH_CHECK(std::in_range<int>(group_stride), "Scale row stride (",
+              group_stride, ") exceeds int range");
+  const int group_stride_i32 = static_cast<int>(group_stride);
+  if (in_zero_points.has_value()) {
+    TORCH_CHECK(in_zero_points->stride(1) == 1,
+                "Zero-point rows must be contiguous");
+    TORCH_CHECK(in_zero_points->stride(0) == group_stride,
+                "Zero points must share the scale row stride (", group_stride,
+                "), got ", in_zero_points->stride(0));
+  }
+
   const int max_lds_len = get_lds_size_int4() / 2;
   // No upper bound on K*N: the medium body reads whatever does not fit in LDS
   // straight from global (see the `k_ + K * n < max_lds_len` split in

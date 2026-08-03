@@ -96,6 +96,8 @@ def _triton_w4a16_skinny_fmt_kernel(
     K8,  # K // 8
     stride_bn,  # per-row stride of b_ptr (in int32 elements)
     num_groups,  # K // group_size
+    stride_sn,  # per-row stride of scales_ptr
+    stride_pn,  # per-row stride of packed_scale_zp_ptr
     group_size,
     HAS_ZP: tl.constexpr,  # asym: read the scale/zp carrier; sym: scales + (-8)
     # Block sizes
@@ -201,7 +203,7 @@ def _triton_w4a16_skinny_fmt_kernel(
         if HAS_ZP:
             # Asymmetric: packed scale/zp carrier (one fp32/group folds scale + zp).
             psz = tl.load(
-                packed_scale_zp_ptr + offs_n * num_groups + g_idx,
+                packed_scale_zp_ptr + offs_n * stride_pn + g_idx,
                 mask=scale_mask,
                 other=0,
             )
@@ -225,7 +227,7 @@ def _triton_w4a16_skinny_fmt_kernel(
             # Symmetric: the -8 offset is constant (no zp to fold), so read the
             # scale directly — no carrier overhead.
             scales = tl.load(
-                scales_ptr + offs_n * num_groups + g_idx, mask=scale_mask, other=1.0
+                scales_ptr + offs_n * stride_sn + g_idx, mask=scale_mask, other=1.0
             )
             if a.dtype == tl.float16:
                 # (nibble - 8) * scale == (b_raw - (1024+8)) * scale, via magic.
@@ -405,7 +407,7 @@ def triton_w4a16_skinny_fmt_gemm(
     # b_q may be a row-padded view (stride(0) > K//8) when the K_packed%2048
     # cliff workaround is active; only require the last dim to be unit-stride.
     assert b_q.stride(1) == 1, "Weight matrix must be unit-stride on K axis"
-    assert scales.is_contiguous(), "Scales must be contiguous"
+    assert scales.stride(1) == 1, "Scale rows must be contiguous"
 
     M, K = a.shape
     N = b_q.shape[0]
@@ -414,12 +416,18 @@ def triton_w4a16_skinny_fmt_gemm(
 
     assert b_q.shape == (N, K8), f"b_q shape mismatch: {b_q.shape} vs ({N}, {K8})"
     stride_bn = b_q.stride(0)
+    # Metadata rows may be padded off the 512 B cliff, see
+    # _group_stride_pad; scales and the carrier share one row stride.
+    stride_sn = scales.stride(0)
+    # The carrier is built separately and is not padded, so it keeps its own
+    # row stride -- feeding it the scales' padded stride reads out of bounds.
+    stride_pn = packed_scale_zp.stride(0) if packed_scale_zp is not None else stride_sn
     assert scales.shape == (N, num_groups), (
         f"scales shape mismatch: {scales.shape} vs ({N}, {num_groups})"
     )
     has_zp = packed_scale_zp is not None
     if packed_scale_zp is not None:
-        assert packed_scale_zp.is_contiguous(), "packed_scale_zp must be contiguous"
+        assert packed_scale_zp.stride(1) == 1, "packed_scale_zp rows must be contiguous"
         assert packed_scale_zp.shape == (N, num_groups), (
             f"packed_scale_zp shape mismatch: {packed_scale_zp.shape} "
             f"vs ({N}, {num_groups})"
@@ -460,6 +468,8 @@ def triton_w4a16_skinny_fmt_gemm(
             K8,
             stride_bn,
             num_groups,
+            stride_sn,
+            stride_pn,
             group_size=group_size,
             HAS_ZP=has_zp,
             BLOCK_M=block_m,
@@ -537,6 +547,8 @@ def triton_w4a16_skinny_fmt_gemm(
         K8,
         stride_bn,
         num_groups,
+        stride_sn,
+        stride_pn,
         group_size=group_size,
         HAS_ZP=has_zp,
         BLOCK_M=BLOCK_M,
@@ -602,6 +614,29 @@ def _cliff_pad_bytes(k_packed_bytes: int) -> int:
     if (k_packed_bytes + pad) % _CLIFF_PERIOD_BYTES == 0:
         pad += _CLIFF_ALIGN_BYTES
     return pad
+
+
+def _group_stride_pad(num_groups: int, elem_bytes: int) -> int:
+    """Groups to add so a metadata row does not land on a 512 B multiple.
+
+    The scale and zero-point rows sit on the same period-512 B cliff as the
+    packed weight rows (see ``_cliff_pad_bytes``).  Padding a row that is
+    already in a good class makes it slower, so the pad is spent only on rows
+    whose byte size is a multiple of 512; +128 B lands them on 128 mod 512.
+    """
+    if (num_groups * elem_bytes) % _CLIFF_PERIOD_BYTES:
+        return 0
+    return _CLIFF_ALIGN_BYTES // elem_bytes
+
+
+def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
+    """Re-lay-out ``t`` so each row is ``pad_groups`` columns further apart."""
+    if not pad_groups:
+        return t.contiguous()
+    rows, cols = t.shape
+    buf = torch.empty((rows, cols + pad_groups), dtype=t.dtype, device=t.device)
+    buf[:, :cols].copy_(t)
+    return buf[:, :cols]  # inherits stride(0) = cols + pad_groups
 
 
 def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -848,7 +883,15 @@ class HybridW4A16LinearKernel(MPLinearKernel):
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
         permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
-        w_s_skinny = w_s_raw.data.contiguous()
+        # gfx1151: keep the metadata row off the 512 B cliff.  Scales and the
+        # packed zero points must share one row stride -- the HIP kernel reads
+        # both with the same group_stride.
+        _gpad = (
+            _group_stride_pad(w_s_raw.data.shape[1], w_s_raw.data.element_size())
+            if on_gfx1151() and w_s_raw.data.device.type == "cuda"
+            else 0
+        )
+        w_s_skinny = _pad_group_rows(w_s_raw.data, _gpad)
 
         # ---- Process zero-points for asymmetric quantization ----
         w_zp = None
@@ -870,7 +913,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             # traffic (14.5 MB vs 3.6 MB per call on gemma-4-31B gate_up), and
             # the kernel is memory-bound, so that is time.  Both kernels still
             # dequant as (nibble - zp_raw) * scale.
-            w_zp_packed = w_zp_raw.data.contiguous()
+            w_zp_packed = _pad_group_rows(w_zp_raw.data, _gpad)
             w_zp = w_zp_packed
             self._transform_param(layer, self.w_zp_name, lambda x: w_zp_packed)
 

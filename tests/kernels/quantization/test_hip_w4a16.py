@@ -654,3 +654,58 @@ def test_wvsplitk_int4_g_rejects_unpacked_zero_points() -> None:
         ops.wvSplitK_int4_g(
             w_q_skinny, x, scale, num_compute_units(), group_size, bad_zp, None
         )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops._rocm_C, "wvSplitK_int4_g"),
+    reason="wvSplitK_int4_g not built",
+)
+@pytest.mark.parametrize("k", [16384, 21504])
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_wvsplitk_int4_g_padded_group_stride(k: int, group_size: int) -> None:
+    """Padded scale/zero-point rows must give the same answer as contiguous.
+
+    ``_group_stride_pad`` moves a metadata row off the 512 B cache cliff, which
+    means scales and zero points are no longer contiguous: the kernel has to
+    take the row stride from the tensor rather than assume K/group_size. Cover
+    both a K where the rule fires (16384 at group_size=32 -> 1024 B rows) and
+    one where it does not, and force a pad in either case so the strided path
+    is exercised regardless.
+    """
+    import vllm._custom_ops as ops
+    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+        pack_skinny_int4,
+    )
+    from vllm.utils.platform_utils import num_compute_units
+
+    set_random_seed(0)
+    device = "cuda"
+    n = 512
+    num_groups = k // group_size
+
+    nibbles = torch.randint(0, 16, (n, k), dtype=torch.int32, device=device)
+    w_q_skinny, _ = pack_skinny_int4(nibbles)
+    scale = torch.rand(n, num_groups, dtype=torch.float16, device=device) * 0.02 - 0.01
+    zp_raw = torch.randint(0, 16, (n, num_groups), dtype=torch.int32, device=device)
+    zp_packed = _pack_zp_along_n(zp_raw)
+    x = (torch.rand(4, k, dtype=torch.float16, device=device) - 0.5) * 0.05
+
+    y_contig = ops.wvSplitK_int4_g(
+        w_q_skinny, x, scale, num_compute_units(), group_size, zp_packed, None
+    )
+
+    # Same values, rows spaced further apart.
+    pad = 64
+    sbuf = torch.empty(n, num_groups + pad, dtype=scale.dtype, device=device)
+    sbuf[:, :num_groups] = scale
+    scale_p = torch.as_strided(sbuf, (n, num_groups), (num_groups + pad, 1))
+    zbuf = torch.empty(n // 8, num_groups + pad, dtype=torch.int32, device=device)
+    zbuf[:, :num_groups] = zp_packed
+    zp_p = torch.as_strided(zbuf, (n // 8, num_groups), (num_groups + pad, 1))
+
+    y_padded = ops.wvSplitK_int4_g(
+        w_q_skinny, x, scale_p, num_compute_units(), group_size, zp_p, None
+    )
+
+    # Identical inputs in a different layout must give identical bits.
+    assert torch.equal(y_contig, y_padded)
