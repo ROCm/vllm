@@ -43,12 +43,11 @@ Not covered here: PP together with DP, and PP over more than 2 stages. PP=2 x
 TP=4 is covered separately in `test_pp_tp_batch_invariant`, which needs 8 GPUs.
 """
 
-import contextlib
 import os
 import random
 
 import torch
-from utils import _extract_step_logprobs, skip_if_not_cuda_alike
+from utils import _extract_step_logprobs, shutdown_llm, skip_if_not_cuda_alike
 
 from tests.utils import multi_gpu_marks
 from vllm import LLM, SamplingParams
@@ -156,8 +155,7 @@ def test_batch_invariance_is_installed_on_every_pipeline_rank():
         reports = llm.collective_rpc("probe_batch_invariance")
     finally:
         if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
+            shutdown_llm(llm)
 
     assert {report["pp_rank"] for report in reports} == {0, 1}, (
         f"expected one report per pipeline stage, got {reports}"
@@ -243,5 +241,4 @@ def test_pipeline_parallel_generation_is_batch_invariant():
             )
     finally:
         if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
+            shutdown_llm(llm)

@@ -28,27 +28,26 @@ def settle_gpu_memory_between_modules():
     and the amdsmi query behind this costs enough (~2s) that paying it per test
     would add more to a 564-item run than the model loads it protects.
 
-    Best effort, deliberately. `wait_for_rocm_memory_to_settle` raises when the
-    devices are still busy at its timeout, and as a teardown fixture that turns
-    somebody else's slow reclaim into an ERROR against a module whose own tests
-    all passed. A full-suite run did exactly that: nine modules errored, every
-    one of them at teardown, each having waited the full 240s first. The point
-    here is to *give* reclaim a chance, not to assert that it happened -- if the
-    memory is genuinely still held, the next module that needs it will say so,
-    and with a message about the memory it actually wanted.
+    It asserts, rather than warning. This briefly did not: a full-suite run
+    errored nine modules here, all at teardown, each after the full 240s, and
+    the fixture was made best-effort in response. That was treating the
+    symptom. The cause was a single test holding 86 GiB in the pytest process
+    itself for the rest of the session -- see
+    `test_mxfp8_mla_multi_chunk_context_is_batch_invariant` -- which no amount
+    of waiting could clear and which a warning would have let through again.
+    With that fixed, an engine's VRAM comes back within about 20s of the test
+    dropping its reference, so reaching this timeout means something is
+    genuinely still holding memory and the run should say so at the module that
+    caused it, not at some later module that merely inherited it.
+
+    The threshold is 10% of total VRAM, so the ~8 GiB of allocator and Triton
+    residue that the kernel-level modules legitimately leave in-process passes
+    comfortably; it takes something on the order of a whole engine to trip it.
 
     No-op off ROCm.
     """
     yield
-    import logging
 
     from tests.utils import wait_for_rocm_memory_to_settle
 
-    try:
-        wait_for_rocm_memory_to_settle()
-    except Exception as exc:  # noqa: BLE001 - teardown must not fail the module
-        logging.getLogger(__name__).warning(
-            "GPU memory had not settled when this module finished, continuing "
-            "anyway: %s",
-            exc,
-        )
+    wait_for_rocm_memory_to_settle()

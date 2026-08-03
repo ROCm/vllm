@@ -14,13 +14,12 @@ no prompt padding is needed to reach that sensitivity: the router turns a small
 numerical difference into a different expert choice.
 """
 
-import contextlib
 import os
 import random
 
 import pytest
 import torch
-from utils import _extract_step_logprobs, _random_prompt, requires_mx
+from utils import _extract_step_logprobs, _random_prompt, requires_mx, shutdown_llm
 
 from vllm import LLM, SamplingParams
 
@@ -113,5 +112,4 @@ def test_mxfp4_moe_generation_is_bitwise_invariant_across_batch_sizes_e2e(
             )
     finally:
         if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
+            shutdown_llm(llm)

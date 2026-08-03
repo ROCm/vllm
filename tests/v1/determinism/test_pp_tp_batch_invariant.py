@@ -40,12 +40,11 @@ four ranks under PP, and MLA/MoE checkpoints (the JoyAI MXFP8 checkpoint used
 elsewhere in this suite is TP=1 only).
 """
 
-import contextlib
 import os
 import random
 
 import torch
-from utils import _extract_step_logprobs, skip_if_not_cuda_alike
+from utils import _extract_step_logprobs, shutdown_llm, skip_if_not_cuda_alike
 
 from tests.utils import multi_gpu_marks
 from vllm import LLM, SamplingParams
@@ -181,8 +180,7 @@ def test_tp_all_reduce_path_under_pipeline_parallelism():
         served = llm.collective_rpc("drain_all_reduce_counter")
     finally:
         if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
+            shutdown_llm(llm)
 
     assert {(r["pp_rank"], r["tp_rank"]) for r in reports} == {
         (pp, tp) for pp in range(PP_SIZE) for tp in range(TP_SIZE)
@@ -277,5 +275,4 @@ def test_pp_tp_generation_is_batch_invariant():
             )
     finally:
         if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
+            shutdown_llm(llm)

@@ -34,16 +34,15 @@ compilation. float32 is out of reach for every MXFP8 path: online quantization
 supports ``[bfloat16, float16]``.
 """
 
-import contextlib
 import os
 import random
 from typing import NamedTuple
 
 import pytest
 import torch
-from utils import _extract_step_logprobs, requires_mx
+from utils import _extract_step_logprobs, requires_mx, shutdown_llm
 
-from tests.utils import large_gpu_mark
+from tests.utils import create_new_process_for_each_test, large_gpu_mark
 from vllm import LLM, SamplingParams
 
 
@@ -169,15 +168,13 @@ def test_mxfp8_generation_is_bitwise_invariant_across_batch_sizes_e2e(case: Case
         _assert_needle_is_invariant(llm, max_batch_size)
     finally:
         if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
+            shutdown_llm(llm)
 
 
 @requires_mx
 @large_gpu_mark(min_gb=80)
-def test_mxfp8_mla_multi_chunk_context_is_batch_invariant(
-    monkeypatch: pytest.MonkeyPatch,
-):
+@create_new_process_for_each_test()
+def test_mxfp8_mla_multi_chunk_context_is_batch_invariant():
     """MLA prefill must be invariant when a context is merged over >1 chunk.
 
     ``build_mla_chunked_context_metadata`` splits a prefill's context into
@@ -202,11 +199,33 @@ def test_mxfp8_mla_multi_chunk_context_is_batch_invariant(
     numerically inert.
 
     The engine runs in-process so the chunk counter is visible; the other e2e
-    cases keep the default multiprocessing engine.
+    cases keep the default multiprocessing engine. That is also why the whole
+    test runs in a spawned interpreter: an in-process engine's VRAM is *not*
+    recoverable within the process that built it. Measured on gfx950 with a
+    0.6B model at the same gpu_memory_utilization, ``engine_core.shutdown()``,
+    ``del``, ``gc.unfreeze()``, ``gc.collect()``, ``empty_cache()`` and
+    ``cleanup_dist_env_and_memory()`` -- in that order and in every other --
+    leave the allocator's reported live bytes at 27.91 of 27.92 GiB, because the
+    compiled artifacts pin the model and the KV cache from module-level lists
+    in Inductor-generated code; ``LLMEngine._cleanup_instance_caches`` only
+    unhooks the bytecode hook and does not reach them. The same teardown with
+    ``enforce_eager=True`` frees all of it, which is what identifies torch
+    compilation as the holder. Left in-process this test therefore parked
+    gpu_memory_utilization x total VRAM -- 86 GiB here -- in the pytest process
+    for the rest of the session, and every module after it in a full-suite run
+    started short of memory. Spawn, not fork: the parent has a live HIP context
+    by the time this runs, so ``os.fork`` gives "Cannot re-initialize CUDA in
+    forked subprocess".
     """
+    import os as _os
+
     from vllm.model_executor.layers.attention import mla_attention
 
-    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # The child interpreter gets no pytest fixtures, so the autouse
+    # `enable_batch_invariant_mode` does not apply here; the parent's setenv
+    # is inherited through the environment, and this makes that explicit.
+    _os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    _os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     num_chunks_seen: set[int] = set()
     build = mla_attention.build_mla_chunked_context_metadata
@@ -217,9 +236,10 @@ def test_mxfp8_mla_multi_chunk_context_is_batch_invariant(
             num_chunks_seen.add(int(metadata.seq_lens.shape[0]))
         return metadata
 
-    monkeypatch.setattr(
-        mla_attention, "build_mla_chunked_context_metadata", counting_build
-    )
+    # Plain assignment rather than the monkeypatch fixture: this body runs in a
+    # child interpreter that exits at the end of the test, so there is nothing
+    # to restore, and the fixture would have to survive being pickled into it.
+    mla_attention.build_mla_chunked_context_metadata = counting_build
 
     max_batch_size = int(os.getenv("VLLM_MXFP8_NEEDLE_BATCH_SIZE", "16"))
     llm = None
@@ -233,8 +253,7 @@ def test_mxfp8_mla_multi_chunk_context_is_batch_invariant(
         _assert_needle_is_invariant(llm, max_batch_size)
     finally:
         if llm is not None:
-            with contextlib.suppress(Exception):
-                llm.shutdown()
+            shutdown_llm(llm)
 
     assert max(num_chunks_seen, default=0) > 1, (
         "the chunked-context merge never ran with more than one chunk "

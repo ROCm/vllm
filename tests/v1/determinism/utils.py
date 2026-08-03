@@ -8,10 +8,6 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.transformers_utils.config import get_config
-from vllm.transformers_utils.model_arch_config_convertor import (
-    ModelArchConfigConvertorBase,
-)
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 
@@ -48,6 +44,19 @@ TEST_MODEL = os.getenv("VLLM_TEST_MODEL", DEFAULT_MODEL)
 
 # Override backends for MLA models (MLA only supported on CUDA).
 if os.getenv("VLLM_TEST_MODEL"):
+    # Imported here, not at module scope. `model_arch_config_convertor` and
+    # `vllm.config` import each other, so whichever is reached first has to be
+    # reached through `vllm.config`; importing the convertor at the top of this
+    # file makes it the first vllm import in any interpreter that imports a test
+    # module before vllm itself -- which is what a spawned test subprocess does,
+    # and it dies with a partially-initialized-module ImportError. Under pytest
+    # the conftest happens to import vllm first, so this only ever showed up in
+    # the subprocess. Both names are used solely in this branch anyway.
+    from vllm.transformers_utils.config import get_config
+    from vllm.transformers_utils.model_arch_config_convertor import (
+        ModelArchConfigConvertorBase,
+    )
+
     config = get_config(TEST_MODEL, trust_remote_code=False)
     if ModelArchConfigConvertorBase(config, config.get_text_config()).is_deepseek_mla():
         DEVICE_BACKENDS["cuda"] = DeviceConfig(
@@ -157,3 +166,26 @@ def _extract_step_logprobs(request_output):
 
 def is_device_capability_below_90() -> bool:
     return not current_platform.has_device_capability(90)
+
+
+def shutdown_llm(llm) -> None:
+    """Tear an ``LLM`` down so the next model load has its VRAM back.
+
+    Deliberately not wrapped in ``contextlib.suppress``. Ten call sites in this
+    suite used to read ``with contextlib.suppress(Exception): llm.shutdown()``
+    -- and ``LLM`` has no ``shutdown`` method, so every one of them raised
+    ``AttributeError``, swallowed it, and tore down nothing. A suppressed broad
+    exception around a call that does not exist is indistinguishable from
+    working cleanup: it survived a full green suite and was only found by
+    measuring VRAM. If this entrypoint moves again the tests must say so.
+
+    With the default multiprocessing engine this asks the engine-core child to
+    exit and the VRAM comes back with the child, a second or two after the
+    caller's last reference to ``llm`` is dropped. It is not instant, which is
+    what the inter-module settle in ``conftest.py`` is there to absorb.
+
+    In-process engines (``VLLM_ENABLE_V1_MULTIPROCESSING=0``) are a different
+    problem and this does not solve them; see the note on
+    ``test_mxfp8_mla_multi_chunk_context_is_batch_invariant``.
+    """
+    llm.llm_engine.engine_core.shutdown()
