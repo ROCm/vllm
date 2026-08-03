@@ -101,7 +101,12 @@ def build_moe_tensors(M, K, block_size_m, dtype, device):
     # Round-robin expert assignment for the sweep (real router would
     # produce a different distribution; for kernel timing the assignment
     # pattern is irrelevant — the kernel processes one block per WG).
-    expert_ids = torch.arange(num_slots, dtype=torch.int32, device=device) % NUM_EXPERTS
+    # One expert block per top_k assignment; each block consumes block_size_m
+    # rows of `a`, so the block count is num_slots // block_size_m.
+    num_expert_blocks = num_slots // block_size_m
+    expert_ids = (
+        torch.arange(num_expert_blocks, dtype=torch.int32, device=device) % NUM_EXPERTS
+    )
     return a, w, scales, c, expert_ids
 
 

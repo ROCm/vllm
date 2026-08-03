@@ -16,11 +16,18 @@ Usage:
 import argparse
 import csv
 import itertools
+import json
+import pathlib
 import time
 
 import torch
 
 import vllm._custom_ops as ops
+from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+    _group_stride_pad,
+    _pad_group_rows,
+    pack_skinny_int4,
+)
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import num_compute_units as get_cu_count
 
@@ -63,7 +70,37 @@ UNRLS = [1, 2, 4]
 ACHUNKS = [8, 16, 32]
 WVPRGRPS = [8, 12, 16]
 
+# Overridden by --group-size.  The golden perf suite guards both 32 and 128;
+# a sweep that can only express 128 cannot tune half of what it guards.
 GROUP_SIZE = 128
+
+# Golden baselines the perf regression test compares against.  Reading the
+# shape list from there with --from-golden keeps this sweep from drifting out
+# of sync with what is actually guarded -- 18 of the 38 golden shapes, and
+# every one of its group_size=32 entries, were missing from SHAPES below.
+_GOLDEN_DIR = (
+    pathlib.Path(__file__).resolve().parents[2] / "tests/kernels/quantization/golden"
+)
+
+
+def golden_shapes(group_size, gpu=None):
+    """[(M, K, label)] from the golden JSON, filtered to one group size."""
+    files = sorted(
+        _GOLDEN_DIR.glob(f"hybrid_w4a16_{gpu}.json" if gpu else "hybrid_w4a16_*.json")
+    )
+    if not files:
+        raise SystemExit(f"no golden JSON under {_GOLDEN_DIR}")
+    out = []
+    for sh in json.loads(files[0].read_text())["shapes"]:
+        if sh["group_size"] != group_size:
+            continue
+        k, m = sh["in_features"], sh["out_features"]
+        out.append((m, k, sh.get("comment") or f"{m}x{k}"))
+    if not out:
+        raise SystemExit(f"{files[0].name} has no group_size={group_size} shapes")
+    return out
+
+
 LDS_CAPACITY = 64 * 1024 // 2
 LDS_MEDIUM = int(LDS_CAPACITY * 1.2)
 
@@ -167,9 +204,18 @@ def run_sweep(shapes, batch_sizes, warmup, rep, csv_path, medium_only=False):
                     skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
                     continue
 
-            values_int4 = torch.randint(-8, 8, (M, K), dtype=torch.int8, device="cuda")
-            weight_packed = pack_int4(values_int4)
+            # Pack through the production helper, not the local pack_int4: that
+            # one leaves the row stride contiguous, which for K=8192 lands on
+            # 4096 B -- a multiple of 512 and squarely on the gfx1151 cache
+            # cliff.  Sweeping there tunes a layout production never uses and
+            # reads ~43% slow (169 us vs 118 for 5376x8192 at (2,2)).  Same for
+            # the scale rows, which the layer pads off the same cliff.
+            values_int4 = torch.randint(0, 16, (M, K), dtype=torch.int32, device="cuda")
+            weight_packed, _ = pack_skinny_int4(values_int4)
             scale = torch.rand(M, num_groups, dtype=dtype, device="cuda") * 0.02 - 0.01
+            scale = _pad_group_rows(
+                scale, _group_stride_pad(num_groups, scale.element_size())
+            )
             activation = (torch.rand(N, K, dtype=dtype, device="cuda") - 0.5) * 0.01
 
             weight_bytes = M * K // 2
@@ -478,6 +524,19 @@ def main():
         action="store_true",
         help="Sweep medium (hf) kernel variant for shapes where K*N exceeds sml LDS",
     )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=128,
+        choices=[32, 64, 128],
+        help="Quantization group size to sweep (default: 128)",
+    )
+    parser.add_argument(
+        "--from-golden",
+        action="store_true",
+        help="Take the shape list from the perf-suite golden JSON, filtered to "
+        "--group-size, instead of the built-in SHAPES",
+    )
     parser.add_argument("--warmup", type=int, default=25, help="Warmup iterations")
     parser.add_argument("--rep", type=int, default=100, help="Benchmark repetitions")
     parser.add_argument(
@@ -488,7 +547,14 @@ def main():
     )
     args = parser.parse_args()
 
-    shapes = args.shapes if args.shapes else SHAPES
+    global GROUP_SIZE
+    GROUP_SIZE = args.group_size
+    if args.shapes:
+        shapes = args.shapes
+    elif args.from_golden:
+        shapes = golden_shapes(args.group_size)
+    else:
+        shapes = SHAPES
     suffix = "_medium" if args.medium else ""
     csv_path = args.csv or f"int4g128_sweep{suffix}_results.csv"
     run_sweep(
