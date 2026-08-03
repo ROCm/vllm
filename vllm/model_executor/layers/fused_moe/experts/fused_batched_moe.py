@@ -468,15 +468,15 @@ def invoke_moe_batched_triton_kernel(
     )
 
     if B_scale is not None:
-        if B_scale.ndim == 1:
-            stride_bse = 1
-            stride_bsk = 0
-            stride_bsn = 0
-        else:
-            stride_bse = B_scale.stride(0)
-            stride_bsk = B_scale.stride(2)
-            stride_bsn = B_scale.stride(1)
-
+        stride_bse = B_scale.stride(0)
+        # `moe_mmk` indexes the weight scale as
+        # `b_scale[expert * stride_bse + offs_bn * stride_bsn]`, unmasked, with
+        # `offs_bn` spanning N. A per-tensor scale is 1-D `[E]`, viewed as
+        # `[E, 1, 1]` above, whose contiguous strides are all 1 -- so that read
+        # runs up to N elements past an E-element tensor. A size-1 dimension is
+        # a broadcast and its stride must be 0.
+        stride_bsn = B_scale.stride(1) if B_scale.size(1) > 1 else 0
+        stride_bsk = B_scale.stride(2) if B_scale.size(2) > 1 else 0
     else:
         stride_bse = 0
         stride_bsk = 0
