@@ -30,10 +30,9 @@ cudagraphs on, needle pinned to DP rank 2:
   `_supports_batch_invariance() -> False` and the oracle raised
   `NotImplementedError: No Unquantized MoE backend supports the deployment
   configuration`. It now declares `True` for the unquantized path on the
-  evidence recorded in that method, and withholds its fp8 schemes for a
-  separate reason recorded in `_supports_quant_scheme` -- those are not batch
-  variant, they are not run-to-run reproducible, which is a stronger defect.
-  This arm is therefore bf16 only, which is what OLMoE is.
+  evidence recorded in that method, and withholds its fp8 schemes as unmeasured
+  under the mode, for the reason recorded in `_supports_quant_scheme`. This arm
+  is therefore bf16 only, which is what OLMoE is.
 
   Measured: 0 of 32 logprobs moved while the needle rank's padded token count
   went 40 -> 220, reproduced over two runs. With the mode off the same

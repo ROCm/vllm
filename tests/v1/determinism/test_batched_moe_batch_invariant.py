@@ -32,8 +32,10 @@ This file keeps the kernel-level half of that, which is the cheap half: it needs
 one GPU and no model. Of the four distributions it keeps three, dropping bf16
 flat as strictly the weakest -- it is the same dtype as the spread arm with less
 accumulator slack to expose. The fp8 schemes are deliberately absent: they are
-withheld under the mode by `_supports_quant_scheme` because that path is not
-run-to-run reproducible, which is recorded there.
+withheld under the mode by `_supports_quant_scheme` as unmeasured, for the
+reason recorded there. They were originally withheld as *irreproducible*, which
+turned out to be an unmasked out-of-bounds read of the weight scale in the
+launcher rather than anything about the arithmetic.
 
 Three structural facts about the kernel, from reading it, that the numbers
 below are testing rather than assuming:

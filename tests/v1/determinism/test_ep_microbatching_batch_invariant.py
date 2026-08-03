@@ -63,12 +63,32 @@ conditions and not in others, and `maybe_create_ubatch_slices` must have
 returned real slices.
 
 Not covered: `deepep_low_latency` and `nixl_ep`, the other two backends
-microbatching accepts. The first is no longer *refused* under the mode --
+microbatching accepts. `nixl_ep` still needs its kernels.
+
+`deepep_low_latency` is no longer *refused* under the mode --
 `BatchedTritonExperts` now declares batch invariance for its unquantized path
-and `test_ep_all2all_batch_invariant.py` asserts DeepEP LL end to end -- so it
-is now reachable here and simply untested, which is a weaker gap than it was
-and worth closing. The second still needs its kernels. `--ubatch-size` > 2 is
-also untested; only DBO's two-way split is exercised here.
+and `test_ep_all2all_batch_invariant.py` asserts DeepEP LL end to end -- but it
+is still not covered here, because **`--enable-dbo` together with
+`--all2all-backend deepep_low_latency` does not start at all.** Measured on
+4x gfx950, DP=4, OLMoE-1B-7B, otherwise identical arguments to the fixture
+below: the four engine cores never report ready, each logging
+`No available shared memory broadcast block found in 60 seconds` until the API
+servers give up at the 600s `VLLM_ENGINE_READY_TIMEOUT_S`. Controls, one
+variable at a time:
+
+  * the same arguments with `--enable-dbo` removed reach
+    `Application startup complete` on all four ranks in about five minutes, so
+    it is not DeepEP LL and not the model or the parallel layout;
+  * it hangs identically at `--gpu-memory-utilization` 0.30 and 0.55, and the
+    workers are alive holding ~95 GiB each when it does, so it is not an
+    allocation shortfall;
+  * it hangs identically with `VLLM_BATCH_INVARIANT=0`, so it is **not a
+    batch-invariance defect** -- it is a pre-existing upstream one that this
+    branch merely made reachable, and it should be filed as such.
+
+So this arm would be a test that can never pass, and it is recorded here
+rather than added as a permanent skip. `--ubatch-size` > 2 is also untested;
+only DBO's two-way split is exercised here.
 """
 
 import json

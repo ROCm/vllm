@@ -826,17 +826,25 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
         )
 
         supported: list[tuple[QuantKey | None, QuantKey | None]] = [(None, None)]
-        # The fp8 schemes are withheld under batch invariance, and not because
-        # of batch composition: this class is not run-to-run *reproducible* in
-        # fp8 at all. Measured on gfx950, `apply()` produced 2 distinct results
-        # over 4 identical calls, differing in every valid row and only in
-        # valid rows, while `invoke_moe_batched_triton_kernel` given the same
-        # quantized operands produced 1 result over 8 calls -- so the defect is
-        # in the quantization around the GEMM, not the GEMM. Batch invariance
-        # is a weaker claim than determinism, so a path that cannot repeat
-        # itself cannot honour it whatever the batch does. Only the
-        # unquantized path below was certified; see
-        # `_supports_batch_invariance`.
+        # The fp8 schemes are withheld under batch invariance because none of
+        # them has been measured under it, not because any is known to fail.
+        #
+        # They were withheld originally for a stronger reason -- this class was
+        # not run-to-run *reproducible* in fp8, 2 distinct results over 4
+        # identical calls -- and that reason is now gone: the cause was an
+        # unmasked out-of-bounds read of the weight scale in
+        # `invoke_moe_batched_triton_kernel`, fixed above, and the one scheme
+        # reachable in tree afterwards (per-tensor weights promoted to
+        # per-token activations) then moved 0 of 2426 rows across a batch sweep
+        # with 1745 slot relocations. Note what the first diagnosis got wrong,
+        # because it is the trap here: the kernel replayed deterministically on
+        # captured inputs, which read as "the GEMM is fine, the quantization
+        # around it is not". The varying input was memory that is not an
+        # argument at all.
+        #
+        # So this is now an ordinary unmeasured-configuration withholding, of
+        # the four remaining advertised pairs. Certify them the way the
+        # unquantized path was certified, or delete them from this list.
         if device_supports_fp8 and not envs.VLLM_BATCH_INVARIANT:
             supported += [
                 (kFp8Static128BlockSym, kFp8Dynamic128Sym),
