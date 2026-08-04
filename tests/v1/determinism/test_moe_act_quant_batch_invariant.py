@@ -15,7 +15,7 @@ move *between* batches, and it is deliberately not row 0 of either.
 
 The int8 tests measure the same promotion for the other w8a8 dtype the guard
 covers, on the legacy ``fused_experts`` entry, because ``TritonExperts`` cannot
-execute int8 at all -- see ``test_triton_experts_cannot_execute_int8``.
+execute int8 at all -- see the two ``test_triton_experts_*`` tests.
 
 The last one is end to end. No local fp8 MoE checkpoint uses this scheme (the
 ``-FP8`` convention is static per-tensor and ``-FP8-dynamic`` is per-token,
@@ -195,7 +195,7 @@ def _build_int8(device: torch.device, weight_scale_layout: str = "per_tensor"):
     """The int8 twin of ``_build``, on the legacy ``fused_experts`` entry.
 
     Not on ``TritonExperts``: that class cannot execute int8 at all -- see
-    ``test_triton_experts_cannot_execute_int8`` -- while this entry applies the
+    the two ``test_triton_experts_*`` tests -- while this entry applies the
     same promotion and reaches the same Triton kernel with the same weight-scale
     widening, so it is where the promoted int8 scheme is measurable.
 
@@ -332,27 +332,21 @@ def test_per_tensor_weight_scale_widening_is_batch_invariant(workspace_init):
     )
 
 
-@skip_if_not_cuda_alike
-def test_triton_experts_cannot_execute_int8(workspace_init):
-    """Why the promoted int8 scheme is not declared in ``_supports_quant_scheme``.
+class _DeferQuantTritonExperts(TritonExperts):
+    """``TritonExperts`` in its quantize-inside-``apply`` configuration.
 
-    ``TritonExperts.__init__`` promotes a dynamic per-tensor int8 config to
-    per-token, which leaves it executing ``(kInt8StaticTensorSym,
-    kInt8DynamicTokenSym)`` -- a pair it does not list. Declaring that pair
-    would be an unmeasured claim in the strongest sense: the class cannot run
-    any int8 w8a8 scheme at all, listed or not. The prepare step hands it int8
-    activations, which its dtype allowlist rejects; quantizing inside ``apply``
-    instead gets one step further and then fails deriving ``compute_type`` from
-    the now-int8 tensor. Both of its declared int8 rows are unreachable the same
-    way, and no production config sends it int8 w8a8 anyway --
-    ``make_int8_moe_quant_config`` returns an int8 *w8a16* config whenever the
-    activation scales are dynamic.
-
-    When int8 starts executing here, this test fails, and the declaration
-    question is worth reopening -- with the arms above rerun against this class.
+    In production that is LoRA plus a DP/EP all2all. The scheme, the scales and
+    the batch the amax spans are identical either way; only the step that
+    quantizes moves.
     """
-    assert envs.VLLM_BATCH_INVARIANT
-    device = torch.device(f"{current_platform.device_type}:0")
+
+    @property
+    def expects_unquantized_inputs(self) -> bool:
+        return self.quant_dtype is not None
+
+
+def _int8_triton_experts_call(device: torch.device, experts_cls: type[TritonExperts]):
+    """A one-token int8 w8a8 call into ``TritonExperts``, ready to raise."""
     torch.manual_seed(0)
     w1q, w1s = _quantize_per_expert_int8(
         torch.randn(E, 2 * INTERMEDIATE, K, device=device, dtype=torch.float32) / 8
@@ -374,17 +368,17 @@ def test_triton_experts_cannot_execute_int8(workspace_init):
         routing_method=RoutingMethodType.TopK,
         max_num_tokens=1,
     )
-    experts = TritonExperts(
+    experts = experts_cls(
         moe_config,
         int8_w8a8_moe_quant_config(
             w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None
         ),
     )
     assert experts.per_act_token_quant, "promoted, so the undeclared pair is live"
-
     kernel = FusedMoEKernel(MoEPrepareAndFinalizeNoDPEPModular(), experts)
-    with pytest.raises((AssertionError, ValueError)):
-        kernel.apply(
+
+    def call():
+        return kernel.apply(
             torch.randn(1, K, device=device, dtype=INT8_ACT_DTYPE),
             w1q,
             w2q,
@@ -395,6 +389,63 @@ def test_triton_experts_cannot_execute_int8(workspace_init):
             expert_map=None,
             apply_router_weight_on_input=False,
         )
+
+    return call
+
+
+# Why the promoted int8 scheme is not declared in ``_supports_quant_scheme``:
+# ``TritonExperts.__init__`` promotes a dynamic per-tensor int8 config to
+# per-token, which leaves it executing ``(kInt8StaticTensorSym,
+# kInt8DynamicTokenSym)`` -- a pair it does not list. Declaring that pair would
+# be an unmeasured claim in the strongest sense, because the class cannot run
+# any int8 w8a8 scheme at all, listed or not. Both of its *declared* int8 rows
+# die at the same two places the next two tests pin, and no production config
+# sends it int8 w8a8 anyway: ``make_int8_moe_quant_config`` returns an int8
+# *w8a16* config whenever the activation scales are dynamic.
+#
+# These two pin the raising statement, not just the exception type. A bare
+# ``pytest.raises`` would also pass on a shape mismatch or a typo in the
+# fixture above, which would leave the negative claim resting on an unrelated
+# failure. When either stops raising, the declaration question is worth
+# reopening -- with the arms above rerun against this class.
+
+
+@skip_if_not_cuda_alike
+def test_triton_experts_rejects_int8_activations_from_the_prepare_step(workspace_init):
+    """The prepare step quantizes, and the dtype allowlist has no int8 in it."""
+    assert envs.VLLM_BATCH_INVARIANT
+    device = torch.device(f"{current_platform.device_type}:0")
+    call = _int8_triton_experts_call(device, TritonExperts)
+
+    with pytest.raises(AssertionError) as excinfo:
+        call()
+
+    # The assert carries no message, so pin it by its source instead.
+    frame = excinfo.traceback[-1]
+    statement = " ".join(str(frame.statement).split())
+    assert frame.path.name == "triton_moe.py" and frame.name == "apply", (
+        f"expected the dtype allowlist in TritonExperts.apply, got {frame.path}"
+        f":{frame.lineno + 1} in {frame.name}"
+    )
+    assert statement.startswith("assert hidden_states.dtype in"), (
+        f"raised somewhere else in apply: {statement}"
+    )
+
+
+@skip_if_not_cuda_alike
+def test_triton_experts_cannot_type_its_own_int8_activations(workspace_init):
+    """Quantizing inside ``apply`` clears the allowlist and dies one step later.
+
+    ``compute_type`` is derived from ``hidden_states`` *after* that variable has
+    been rebound to the quantized tensor, so int8 reaches a branch that has no
+    case for it.
+    """
+    assert envs.VLLM_BATCH_INVARIANT
+    device = torch.device(f"{current_platform.device_type}:0")
+    call = _int8_triton_experts_call(device, _DeferQuantTritonExperts)
+
+    with pytest.raises(ValueError, match="Unsupported compute_type: torch.int8"):
+        call()
 
 
 # 13GB in BF16; ``quantization="fp8"`` halves that on the device but the
