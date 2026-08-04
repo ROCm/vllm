@@ -7,11 +7,15 @@ handed, so a token's quantized activation -- and its output -- depends on what
 else was batched with it. Under ``VLLM_BATCH_INVARIANT`` the scheme is promoted
 to per-token, which is a function of the token alone.
 
-The first two tests are kernel-level: they drive ``TritonExperts`` through the
+The fp8 tests are kernel-level: they drive ``TritonExperts`` through the
 modular kernel directly, so they need no fp8 MoE checkpoint. The amax itself is
 deterministic (``scaled_fp8_quant`` reduces with ``atomicMaxFloat``, and max is
 order independent), so the same batch twice always agrees -- the needle has to
 move *between* batches, and it is deliberately not row 0 of either.
+
+The int8 tests measure the same promotion for the other w8a8 dtype the guard
+covers, on the legacy ``fused_experts`` entry, because ``TritonExperts`` cannot
+execute int8 at all -- see ``test_triton_experts_cannot_execute_int8``.
 
 The last one is end to end. No local fp8 MoE checkpoint uses this scheme (the
 ``-FP8`` convention is static per-tensor and ``-FP8-dynamic`` is per-token,
@@ -35,8 +39,11 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     RoutingMethodType,
     fp8_w8a8_moe_quant_config,
+    int8_w8a8_moe_quant_config,
+    maybe_promote_act_quant_for_batch_invariance,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
 from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
     MoEPrepareAndFinalizeNoDPEPModular,
@@ -160,6 +167,234 @@ def test_dynamic_per_tensor_moe_act_quant_moves_without_the_mode(
 
     assert not experts.per_act_token_quant
     assert not torch.equal(small, large)
+
+
+# The int8 arms below run in fp32, not BF16: `ops.scaled_int8_quant`, which is
+# what a *dynamic per-tensor* int8 activation scheme calls, rejects BFloat16
+# ("expected scalar type Float"), so the mode-off control -- the arm that has to
+# move for the mode-on arm to mean anything -- cannot be built in BF16 at all.
+# (The mode-on arm can: per-token int8 quantization does accept BF16, so the
+# promotion turns a configuration that raises into one that runs.)
+INT8_ACT_DTYPE = torch.float32
+# Lower than the fp8 arm's 8.0 on purpose. At 8.0 the per-tensor amax is so far
+# above the needle that the needle quantizes to all zeros, and the control then
+# "moves" only because the batched output is identically zero, which proves
+# nothing about the scale.
+INT8_FILLER_SCALE = 2.0
+
+
+def _quantize_per_expert_int8(w: torch.Tensor):
+    """[E, R, C] -> int8 with one scale per expert, stored 1-D [E] as vLLM does."""
+    amax = w.abs().amax(dim=(1, 2)).to(torch.float32)
+    scale = (amax / 127.0).clamp(min=1e-12)
+    q = (w.to(torch.float32) / scale.view(-1, 1, 1)).round().clamp(-127, 127)
+    return q.to(torch.int8), scale
+
+
+def _build_int8(device: torch.device, weight_scale_layout: str = "per_tensor"):
+    """The int8 twin of ``_build``, on the legacy ``fused_experts`` entry.
+
+    Not on ``TritonExperts``: that class cannot execute int8 at all -- see
+    ``test_triton_experts_cannot_execute_int8`` -- while this entry applies the
+    same promotion and reaches the same Triton kernel with the same weight-scale
+    widening, so it is where the promoted int8 scheme is measurable.
+
+    ``weight_scale_layout`` selects what the kernel's per-channel weight-scale
+    branch is handed: the 1-D ``[E]`` scale it widens itself, the same values
+    materialized as a contiguous ``[E, N]``, or every expert collapsed onto
+    ``w_scale[0]`` -- the read the widening exists to prevent.
+    """
+    torch.manual_seed(0)
+    w1 = torch.randn(E, 2 * INTERMEDIATE, K, device=device, dtype=torch.float32) / 8
+    w2 = torch.randn(E, K, INTERMEDIATE, device=device, dtype=torch.float32) / 8
+    for e in range(E):
+        w1[e] *= 2.0 ** (e - 4)
+        w2[e] *= 2.0 ** (4 - e)
+    w1q, w1s = _quantize_per_expert_int8(w1)
+    w2q, w2s = _quantize_per_expert_int8(w2)
+    if weight_scale_layout == "materialized":
+        w1s = w1s.reshape(E, 1).expand(E, 2 * INTERMEDIATE).contiguous()
+        w2s = w2s.reshape(E, 1).expand(E, K).contiguous()
+    elif weight_scale_layout == "collapsed":
+        w1s = w1s[0].reshape(1, 1).expand(E, 2 * INTERMEDIATE).contiguous()
+        w2s = w2s[0].reshape(1, 1).expand(E, K).contiguous()
+    else:
+        assert weight_scale_layout == "per_tensor"
+
+    needle = torch.randn(1, K, device=device, dtype=INT8_ACT_DTYPE) / 4
+    filler = (
+        torch.randn(FILLER, K, device=device, dtype=INT8_ACT_DTYPE) * INT8_FILLER_SCALE
+    )
+    big = torch.cat([filler[:NEEDLE_POS], needle, filler[NEEDLE_POS:]])
+
+    gen = torch.Generator(device="cpu").manual_seed(1234)
+    ids = torch.stack(
+        [torch.randperm(E, generator=gen)[:TOPK] for _ in range(1 + FILLER)]
+    ).to(device)
+    big_ids = torch.cat([ids[1 : 1 + NEEDLE_POS], ids[0:1], ids[1 + NEEDLE_POS :]])
+    weights = torch.full((1 + FILLER, TOPK), 0.5, device=device, dtype=torch.float32)
+
+    quant_config = int8_w8a8_moe_quant_config(
+        w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None
+    )
+
+    def run(a, topk_weights, topk_ids):
+        return fused_experts(
+            a,
+            w1q,
+            w2q,
+            topk_weights,
+            topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=E,
+            expert_map=None,
+            quant_config=quant_config,
+        )
+
+    # ``fused_experts`` promotes internally; this is the same call it makes.
+    promoted = maybe_promote_act_quant_for_batch_invariance(quant_config)
+    small = run(needle, weights[0:1], ids[0:1])[0]
+    large_all = run(big, weights, big_ids)
+    return promoted, small, large_all
+
+
+@skip_if_not_cuda_alike
+def test_dynamic_per_tensor_int8_moe_act_quant_is_promoted(workspace_init):
+    """The int8 twin of the fp8 arm: repeatable first, then invariant.
+
+    Repeatability comes first because a path that cannot reproduce itself
+    cannot be batch invariant, and calling it variant would understate the
+    defect.
+
+    What this does *not* show is that the int8 GEMM is insensitive to reduction
+    order. int8 x int8 products accumulate exactly in fp32 for any realistic
+    activation: measured on gfx950, the largest partial sum over K=32768 of
+    Gaussian activations is ~1.4e6 against the 2^24 where fp32 stops
+    representing integers, and forward, reversed, permuted and differently
+    tiled reductions over those products are all bitwise equal. Reordering only
+    becomes detectable with near-saturated same-sign products (K >= 2048 at
+    |a| = |b| = 127). So the activation scale is the only batch-variance channel
+    this scheme has, and it is the one measured here.
+    """
+    assert envs.VLLM_BATCH_INVARIANT
+    device = torch.device(f"{current_platform.device_type}:0")
+    promoted, small, large_all = _build_int8(device)
+
+    assert promoted.per_act_token_quant, (
+        "the mode should have promoted the dynamic per-tensor activation scheme"
+    )
+    _, small_again, large_again = _build_int8(device)
+    torch.testing.assert_close(small, small_again, atol=0, rtol=0)
+    torch.testing.assert_close(large_all, large_again, atol=0, rtol=0)
+    torch.testing.assert_close(small, large_all[NEEDLE_POS], atol=0, rtol=0)
+
+
+@skip_if_not_cuda_alike
+def test_dynamic_per_tensor_int8_moe_act_quant_moves_without_the_mode(
+    monkeypatch, workspace_init
+):
+    """Without the mode the int8 needle moves, and not by rounding.
+
+    Measured on gfx950 at K=512: all 512 outputs differ, max |delta| 13.5
+    against a needle output of magnitude 19.3. Same at K=4096 and K=8192.
+    """
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    device = torch.device(f"{current_platform.device_type}:0")
+    promoted, small, large_all = _build_int8(device)
+
+    assert not promoted.per_act_token_quant
+    assert not torch.equal(small, large_all[NEEDLE_POS])
+
+
+@skip_if_not_cuda_alike
+def test_per_tensor_weight_scale_widening_is_batch_invariant(workspace_init):
+    """``_as_per_channel_weight_scale`` is what makes the promoted path work.
+
+    Promotion sends a per-tensor weight scale down the kernel's per-channel
+    branch, where a 1-D ``[E]`` scale would have both strides collapse to 0 and
+    every expert would read ``w_scale[0]``. The widening returns a stride-0
+    ``[E, N]`` view instead. Two things have to hold: the view must compute
+    exactly what a materialized ``[E, N]`` scale computes, and it must actually
+    change the answer relative to the collapse -- otherwise the first check
+    passes for free.
+    """
+    assert envs.VLLM_BATCH_INVARIANT
+    device = torch.device(f"{current_platform.device_type}:0")
+    _, widened, widened_all = _build_int8(device)
+    _, materialized, materialized_all = _build_int8(device, "materialized")
+    _, collapsed, _ = _build_int8(device, "collapsed")
+
+    torch.testing.assert_close(widened, materialized, atol=0, rtol=0)
+    torch.testing.assert_close(widened_all, materialized_all, atol=0, rtol=0)
+    assert not torch.equal(widened, collapsed), (
+        "every expert already read w_scale[0], so the widening is untested here"
+    )
+
+
+@skip_if_not_cuda_alike
+def test_triton_experts_cannot_execute_int8(workspace_init):
+    """Why the promoted int8 scheme is not declared in ``_supports_quant_scheme``.
+
+    ``TritonExperts.__init__`` promotes a dynamic per-tensor int8 config to
+    per-token, which leaves it executing ``(kInt8StaticTensorSym,
+    kInt8DynamicTokenSym)`` -- a pair it does not list. Declaring that pair
+    would be an unmeasured claim in the strongest sense: the class cannot run
+    any int8 w8a8 scheme at all, listed or not. The prepare step hands it int8
+    activations, which its dtype allowlist rejects; quantizing inside ``apply``
+    instead gets one step further and then fails deriving ``compute_type`` from
+    the now-int8 tensor. Both of its declared int8 rows are unreachable the same
+    way, and no production config sends it int8 w8a8 anyway --
+    ``make_int8_moe_quant_config`` returns an int8 *w8a16* config whenever the
+    activation scales are dynamic.
+
+    When int8 starts executing here, this test fails, and the declaration
+    question is worth reopening -- with the arms above rerun against this class.
+    """
+    assert envs.VLLM_BATCH_INVARIANT
+    device = torch.device(f"{current_platform.device_type}:0")
+    torch.manual_seed(0)
+    w1q, w1s = _quantize_per_expert_int8(
+        torch.randn(E, 2 * INTERMEDIATE, K, device=device, dtype=torch.float32) / 8
+    )
+    w2q, w2s = _quantize_per_expert_int8(
+        torch.randn(E, K, INTERMEDIATE, device=device, dtype=torch.float32) / 8
+    )
+    moe_config = FusedMoEConfig(
+        num_experts=E,
+        experts_per_token=TOPK,
+        hidden_dim=K,
+        intermediate_size=INTERMEDIATE,
+        num_local_experts=E,
+        num_logical_experts=E,
+        moe_parallel_config=FusedMoEParallelConfig.make_no_parallel(),
+        activation=MoEActivation.SILU,
+        in_dtype=INT8_ACT_DTYPE,
+        device=device.type,
+        routing_method=RoutingMethodType.TopK,
+        max_num_tokens=1,
+    )
+    experts = TritonExperts(
+        moe_config,
+        int8_w8a8_moe_quant_config(
+            w1_scale=w1s, w2_scale=w2s, a1_scale=None, a2_scale=None
+        ),
+    )
+    assert experts.per_act_token_quant, "promoted, so the undeclared pair is live"
+
+    kernel = FusedMoEKernel(MoEPrepareAndFinalizeNoDPEPModular(), experts)
+    with pytest.raises((AssertionError, ValueError)):
+        kernel.apply(
+            torch.randn(1, K, device=device, dtype=INT8_ACT_DTYPE),
+            w1q,
+            w2q,
+            torch.full((1, TOPK), 0.5, device=device, dtype=torch.float32),
+            torch.tensor([[0, 1]], device=device),
+            activation=MoEActivation.SILU,
+            global_num_experts=E,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
 
 
 # 13GB in BF16; ``quantization="fp8"`` halves that on the device but the
