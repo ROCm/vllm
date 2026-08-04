@@ -4,7 +4,9 @@
 
 import torch
 
+import vllm.model_executor.layers.fused_moe.fp8_nan_probe as fp8_nan_probe
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -743,6 +745,26 @@ def batched_moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # TEMPORARY: investigation scaffolding, inert unless VLLM_FP8_NAN_* is set.
+    # Deliberately placed *above* the capture check, because the whole point of
+    # the `triton` arm is that one implementation serves eager and capture
+    # alike -- routing it inside the branch would preserve the divergence it
+    # exists to remove. See fp8_nan_probe.py; delete both before any PR.
+    if fp8_nan_probe.handles(A_scale, qtype, per_act_token_quant, block_shape, A):
+        assert qtype is not None
+        if fp8_nan_probe.probe_path() == fp8_nan_probe.PATH_TRITON:
+            return fp8_nan_probe.triton_batched_quantize(A, expert_num_tokens, qtype)
+        A_q_scale = fp8_nan_probe.batched_dynamic_per_expert_scale(
+            A, expert_num_tokens, qtype
+        )
+        A_q = torch.empty_like(A, dtype=qtype)
+        # A static python loop over a compile-time constant, writing into slices
+        # of one allocation: no host sync, no data-dependent control flow, and
+        # each call is the same kernel the eager loop uses with the same scale.
+        for e in range(A.size(0)):
+            ops.scaled_fp8_quant(A[e], A_q_scale[e].view(1), output=A_q[e])
+        return A_q, A_q_scale
+
     if _is_capturing_or_compiling():
         # Note: this does a bunch of extra work because expert_num_tokens is
         # ignored but it does support torch.compile + cudagraphs.
