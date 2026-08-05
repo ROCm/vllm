@@ -173,7 +173,7 @@ def _run_exllama_moe(
         num_experts=e,
         experts_per_token=topk,
         hidden_dim=k,
-        intermediate_size_per_partition=n,
+        intermediate_size=n,
         in_dtype=torch.float16,
     )
 
