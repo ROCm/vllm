@@ -6,6 +6,8 @@ import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import get_current_vllm_config
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -70,6 +72,16 @@ class QuantFP8(CustomOp):
 
         self.use_aiter = rocm_aiter_ops.is_linear_fp8_enabled()
 
+        # Sequence-parallel MoE shards the token dimension across TP ranks
+        # while `ForwardContext.is_padding` stays full-batch, so the mask no
+        # longer describes these rows.  Read once, from config: a shape
+        # comparison here would specialize the dynamic batch dimension under
+        # torch.compile, which is why `_bounded_per_tensor_scale` slices the
+        # mask rather than checking its length.
+        self.sequence_parallel_moe = (
+            get_current_vllm_config().parallel_config.use_sequence_parallel_moe
+        )
+
         self.is_group_quant = group_shape.is_per_group()
         if self.is_group_quant:
             self.group_size = group_shape.col
@@ -80,6 +92,63 @@ class QuantFP8(CustomOp):
                     "Only per-token or per-tensor scales are supported for dynamic "
                     "non-group quantization."
                 )
+
+    def _bounded_per_tensor_scale(self, x: torch.Tensor) -> torch.Tensor | None:
+        """A dynamic per-tensor scale taken over the real rows only.
+
+        A dynamic *per-tensor* activation scale is one amax over every row of
+        the batch, so it is the one quantization granularity whose reduction
+        crosses rows the token does not own.  Under cudagraphs the trailing
+        padding rows are not merely unused: they are a persistent graph-pool
+        allocation that no producer wrote this step, so they hold the previous
+        replay's contents.  One such row is enough to set the scale for the
+        whole tensor and drive every real row's quantized value toward zero.
+
+        Per-token and per-group scales do not have this problem -- their
+        reduction is bounded by construction -- and neither does a static
+        scale, so this returns None for all of them and the caller is
+        unchanged.
+
+        Deliberately not gated on `VLLM_MOE_SKIP_PADDING`: that flag controls
+        whether kernels skip work for padding rows, and this is not an
+        optimization.
+
+        The mask is *sliced* to the leading dimension rather than compared
+        against it, which matters under torch.compile: comparing a concrete
+        `is_padding.shape[0]` with a symbolic `x.shape[0]` specializes the
+        dynamic batch dimension to whatever it held at trace time, and the
+        model then fails to compile at all.  This is the same idiom the fused
+        topk routers use on the same mask.
+        """
+        if self.static or not self.group_shape.is_per_tensor():
+            return None
+        if self.sequence_parallel_moe:
+            # The mask describes the whole batch; these rows are one shard of
+            # it.  Leaving the reduction unbounded is wrong, but bounding it
+            # with a mask that does not describe these rows is worse, and
+            # silent.  Proper support belongs where the chunking happens.
+            return None
+        if not is_forward_context_available():
+            return None
+        ctx = get_forward_context()
+        # The unsliced buffer, because this runs inside a compiled region and a
+        # varying length would be baked in as a wrong constant.  See
+        # `ForwardContext.is_padding_full`.
+        is_padding = ctx.is_padding_full
+        if is_padding is None or x.ndim < 2:
+            return None
+        x_2d = x.view(-1, x.shape[-1])
+
+        row_amax = x_2d.abs().amax(dim=-1).to(torch.float32)
+        is_padding = is_padding[: row_amax.shape[0]]
+        amax = torch.where(is_padding, row_amax.new_zeros(()), row_amax).max()
+        # Widen for the divide, then narrow: `amax / _FP8_MAX` in fp32 lowers to
+        # a reciprocal multiply, which differs from the correctly-rounded
+        # quotient the HIP kernel computes on about half of all inputs.
+        # Only a divide-by-zero guard here -- the shipped per-tensor kernel
+        # applies no `_FP8_MIN_SCALING_FACTOR` floor, and adding one would
+        # change results on inputs that have nothing to do with padding.
+        return (amax.double() / _FP8_MAX).float().clamp(min=1e-12).reshape(1)
 
     def forward_cuda(
         self,
@@ -121,9 +190,14 @@ class QuantFP8(CustomOp):
             and scale_ub.numel() == 1
         )
 
+        # A [1] scale makes this the static per-tensor kernel, which is the same
+        # arithmetic the dynamic one performs after its own amax -- the only
+        # difference is which rows the amax spanned.
+        bounded_scale = self._bounded_per_tensor_scale(x) if scale is None else None
+
         return ops.scaled_fp8_quant(
             x,
-            scale,
+            scale if bounded_scale is None else bounded_scale,
             num_token_padding=self.num_token_padding,
             scale_ub=scale_ub,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
@@ -150,6 +224,9 @@ class QuantFP8(CustomOp):
         if use_aiter_per_group_quant:
             return rocm_aiter_ops.group_fp8_quant(x, self.group_size)
         if use_aiter_per_tensor_quant:
+            if scale is None:
+                # Same unbounded amax as the HIP kernel, in AITER.
+                scale = self._bounded_per_tensor_scale(x)
             return rocm_aiter_ops.per_tensor_quant(x, _FP8_DTYPE, scale)
         if use_aiter_per_token_quant:
             return rocm_aiter_ops.per_token_quant(x, _FP8_DTYPE, scale)
@@ -200,10 +277,12 @@ class QuantFP8(CustomOp):
                 x_max = x_max.unsqueeze(-1).to(torch.float32)
                 if scale_ub is not None:
                     x_max = x_max.clamp(max=scale_ub)
+                scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
             else:
-                x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
-
-            scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
+                scale = self._bounded_per_tensor_scale(x)
+                if scale is None:
+                    x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
+                    scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
         else:
             scale = prep_scale_for_group_broadcast(scale, x, self.group_shape)
 
