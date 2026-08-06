@@ -4,9 +4,8 @@
 
 import torch
 
-import vllm.model_executor.layers.fused_moe.fp8_nan_probe as fp8_nan_probe
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fused_moe import batched_activation, dynamic_quant
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -745,25 +744,32 @@ def batched_moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    # TEMPORARY: investigation scaffolding, inert unless VLLM_FP8_NAN_* is set.
-    # Deliberately placed *above* the capture check, because the whole point of
-    # the `triton` arm is that one implementation serves eager and capture
-    # alike -- routing it inside the branch would preserve the divergence it
-    # exists to remove. See fp8_nan_probe.py; delete both before any PR.
-    if fp8_nan_probe.handles(A_scale, qtype, per_act_token_quant, block_shape, A):
-        assert qtype is not None
-        if fp8_nan_probe.probe_path() == fp8_nan_probe.PATH_TRITON:
-            return fp8_nan_probe.triton_batched_quantize(A, expert_num_tokens, qtype)
-        A_q_scale = fp8_nan_probe.batched_dynamic_per_expert_scale(
-            A, expert_num_tokens, qtype
+    # One implementation for eager and for capture.  Placed above the capture
+    # check on purpose: routing it inside the branch would preserve the
+    # divergence it exists to remove.
+    #
+    # The capture branch below ignores `expert_num_tokens` and takes one amax
+    # over the whole [E, max_num_tokens, N] buffer.  Rows past an expert's
+    # delivered count were written by no producer this step, and under
+    # cudagraphs the buffer is a persistent graph-pool allocation, so they hold
+    # the previous replay's contents.  The eager branch bounds the reduction
+    # correctly but only by paying an `.item()` host sync per expert, which is
+    # why it cannot be captured -- so the two branches computed different
+    # scales from the same inputs, and only one of them was right.
+    if (
+        qtype is not None
+        and A_scale is None
+        and not per_act_token_quant
+        and block_shape is None
+        and A.ndim == 3
+    ):
+        return dynamic_quant.dynamic_quantize(
+            A,
+            qtype,
+            granularity=dynamic_quant.PER_EXPERT,
+            mask_mode=dynamic_quant.MASK_DELIVERED,
+            expert_num_tokens=expert_num_tokens,
         )
-        A_q = torch.empty_like(A, dtype=qtype)
-        # A static python loop over a compile-time constant, writing into slices
-        # of one allocation: no host sync, no data-dependent control flow, and
-        # each call is the same kernel the eager loop uses with the same scale.
-        for e in range(A.size(0)):
-            ops.scaled_fp8_quant(A[e], A_q_scale[e].view(1), output=A_q[e])
-        return A_q, A_q_scale
 
     if _is_capturing_or_compiling():
         # Note: this does a bunch of extra work because expert_num_tokens is
@@ -1121,10 +1127,6 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             workspace2, (E, max_num_tokens, activation_out_dim)
         )
 
-        # TODO(bnell): should this be done for any quantized type?
-        if self.quant_config.use_fp8_w8a8:
-            intermediate_cache1.fill_(0)
-
         a1q_scale = normalize_batched_scales_shape(a1q_scale, E)
 
         # MM1
@@ -1145,20 +1147,32 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
         )
 
-        # No zero-fill of intermediate_cache2 here: the activation below writes
-        # every element of the same view, so the fill was dead. What keeps the
-        # fp8 path's padded rows finite is `intermediate_cache1.fill_(0)`
-        # above, not this -- so a future pad-aware activation must zero the
-        # rows it skips, because `batched_moe_kernel_quantize_input` ignores
-        # `expert_num_tokens` under cudagraphs and takes an amax over the whole
-        # buffer.
+        # Neither cache is zero-filled.  `intermediate_cache1.fill_(0)` used to
+        # run above under fp8, and it was not defensive: it was what kept the
+        # padded rows finite for a a2 amax that spanned the whole buffer.  That
+        # reduction is now bounded by `expert_num_tokens`, so the fill has
+        # nothing left to protect and the elementwise work below can skip the
+        # rows MM1 never wrote -- 80-90% of the buffer at a realistic live
+        # fraction.
         #
-        # TODO (bnell): use triton utility from batched deep gemm.
-        self.activation(
-            activation,
-            intermediate_cache2.view(-1, activation_out_dim),
-            intermediate_cache1.view(-1, N),
-        )
+        # These two changes are not separable.  A pad-aware activation leaves
+        # the rows it skips holding whatever the shared workspace held, so
+        # making the producer pad-aware while the consumer still reduces over
+        # every row recreates the exact defect the bound removes.
+        if (
+            activation == MoEActivation.SILU
+            and batched_activation.silu_mul_batched_is_exact(intermediate_cache2.dtype)
+            and intermediate_cache1.dtype == intermediate_cache2.dtype
+        ):
+            batched_activation.silu_mul_batched(
+                intermediate_cache2, intermediate_cache1, expert_num_tokens
+            )
+        else:
+            self.activation(
+                activation,
+                intermediate_cache2.view(-1, activation_out_dim),
+                intermediate_cache1.view(-1, N),
+            )
 
         qintermediate_cache2, a2q_scale = batched_moe_kernel_quantize_input(
             intermediate_cache2,
