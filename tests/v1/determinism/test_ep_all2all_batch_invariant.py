@@ -167,6 +167,15 @@ LORA_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LORA_LOAD_CONCURRENCY", "48"))
 # not good enough for a suite that wants gating status, so both fp8 arms are
 # raised rather than only the one seen to fail.
 FP8_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_FP8_LOAD_CONCURRENCY", "96"))
+# The bf16 low-latency arm needs it for the same reason its fp8 siblings above
+# do, and it was left on the shared default only because it had not been seen to
+# fail there. It has now: running the file in order it refused its verdict on the
+# same signature, padded count 40 alone and 40 loaded, twice out of two, while
+# passing twice out of two when selected on its own -- the low-latency path is
+# cheap enough per step that the server drains between the needle's steps, and it
+# is the second server in the process, so its compile caches are warm and the
+# needle returns sooner. At this exposure it passes in file order.
+LL_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LL_LOAD_CONCURRENCY", "96"))
 LOAD_RAMP_SECONDS = float(os.getenv("VLLM_EP_LOAD_RAMP_SECONDS", "12"))
 # The load must drag the needle rank's padded token count at least this far
 # above what it ran alone, otherwise the needle saw identical shapes twice.
@@ -991,6 +1000,7 @@ def test_deepep_low_latency_combine_does_not_see_the_batch(deepep_ll_server):
         manager_cls="DeepEPLLAll2AllManager",
         prepare_finalize_cls="DeepEPLLPrepareAndFinalize",
         experts_cls="BatchedTritonExperts",
+        load_concurrency=LL_LOAD_CONCURRENCY,
     )
 
 
