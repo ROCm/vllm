@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import math
 import os
 from collections.abc import Callable
@@ -1496,9 +1497,67 @@ _autotuned_kernels: list[str] = []
 _autotune_watch_installed = False
 
 
+_compile_cache_dir: str | None = None
+_AUTOTUNED_MARKER = "autotuned_kernels.json"
+
+
 def autotuned_kernels() -> list[str]:
     """Kernels whose config this process settled by timing, in order."""
     return list(_autotuned_kernels)
+
+
+def _warn_autotuned(kernels: list[str], from_cache: bool) -> None:
+    logger.warning_once(
+        "Inductor chose the config for %d kernel(s) by timing candidates on a "
+        "device%s, e.g. %s. The winner is per process and cached per rank, so "
+        "data-parallel replicas can disagree bitwise on the same request even "
+        "though each is internally batch invariant. Pass "
+        "triton.autotune_pointwise=False in inductor_compile_config to pin it; "
+        "see batch_invariant._watch_for_autotune_races.",
+        len(kernels),
+        " when this cache entry was built" if from_cache else "",
+        kernels[0],
+    )
+
+
+def note_compile_cache_dir(cache_dir: str | None) -> None:
+    """Attach the autotune report to a compile cache entry.
+
+    Called by the compile backend once the cache directory for this rank is
+    known and before anything is compiled into it. Two jobs: say so if a
+    previous process already recorded races for this entry, and give the watch
+    somewhere to record its own.
+
+    Without this the report is only ever emitted on the compile that makes the
+    decision, never on the restarts that inherit it -- and inheriting it is the
+    normal case, because vLLM reloads its serialized artifacts without running
+    Inductor codegen at all.
+    """
+    global _compile_cache_dir
+    if not envs.VLLM_BATCH_INVARIANT or cache_dir is None:
+        return
+    _compile_cache_dir = cache_dir
+    marker = os.path.join(cache_dir, _AUTOTUNED_MARKER)
+    try:
+        if os.path.exists(marker):
+            with open(marker) as f:
+                kernels = json.load(f)
+            if kernels:
+                _warn_autotuned(kernels, from_cache=True)
+    except (OSError, ValueError):
+        logger.debug("Could not read %s", marker)
+
+
+def _record_autotuned_to_cache() -> None:
+    if _compile_cache_dir is None:
+        return
+    marker = os.path.join(_compile_cache_dir, _AUTOTUNED_MARKER)
+    try:
+        os.makedirs(_compile_cache_dir, exist_ok=True)
+        with open(marker, "w") as f:
+            json.dump(sorted(set(_autotuned_kernels)), f, indent=2)
+    except OSError:
+        logger.debug("Could not record autotuned kernels to %s", marker)
 
 
 def _watch_for_autotune_races(data_parallel_size: int | None) -> None:
@@ -1588,20 +1647,15 @@ def _watch_for_autotune_races(data_parallel_size: int | None) -> None:
             state,
         )
 
+        # Recorded into the cache entry so a later process that reloads these
+        # artifacts, and so never reaches this code, still learns of it.
+        _record_autotuned_to_cache()
+
         # Captured when the watch was installed: the config context is live
         # during worker startup but not during a forward pass, so looking it up
         # here would find nothing and report nothing.
         if data_parallel_size is None or data_parallel_size > 1:
-            logger.warning_once(
-                "Inductor is choosing the config for at least one kernel "
-                "(%s) by timing candidates on a device. The winner is per "
-                "process and cached per rank, so data-parallel replicas can "
-                "disagree bitwise on the same request even though each is "
-                "internally batch invariant. Pass "
-                "triton.autotune_pointwise=False in inductor_compile_config to "
-                "pin it; see batch_invariant._watch_for_autotune_races.",
-                name,
-            )
+            _warn_autotuned(sorted(set(_autotuned_kernels)), from_cache=False)
         return result
 
     triton_heuristics.check_autotune_cache = check_autotune_cache
