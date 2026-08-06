@@ -1263,8 +1263,14 @@ class SpecDecodeBaseProposer:
                     target_model.config.media_placeholder_token_id
                 )
             else:
-                self.model.config.image_token_index = (
-                    target_model.config.image_token_index
+                # Some multimodal targets (e.g. MiniCPM-V) do not expose an
+                # `image_token_index` on their config -- they merge multimodal
+                # embeddings via placeholder patterns rather than a single token
+                # id, and the draft model never reads this value. Resolve it
+                # defensively so a non-allow-listed target does not abort engine
+                # init.
+                self.model.config.image_token_index = getattr(
+                    target_model.config, "image_token_index", None
                 )
             target_language_model = cast(
                 SupportsMultiModal, target_model

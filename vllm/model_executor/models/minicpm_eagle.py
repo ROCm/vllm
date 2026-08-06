@@ -201,8 +201,15 @@ class EagleMiniCPMModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        input_embeds = self.embed_input_ids(input_ids)
+        # For multimodal targets the proposer merges image embeddings into
+        # `inputs_embeds` and passes them in; text-only drafting leaves it None
+        # and we embed the token ids ourselves.
+        if inputs_embeds is not None:
+            input_embeds = inputs_embeds
+        else:
+            input_embeds = self.embed_input_ids(input_ids)
         input_embeds = self.input_norm1(input_embeds)
         hidden_states = self.input_norm2(hidden_states)
 
@@ -360,8 +367,11 @@ class EagleMiniCPMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, hidden_states2 = self.model(input_ids, positions, hidden_states)
+        hidden_states, hidden_states2 = self.model(
+            input_ids, positions, hidden_states, inputs_embeds
+        )
         hidden_states = hidden_states / self.scale_width
         hidden_states2 = hidden_states2 / self.scale_width
         return hidden_states, hidden_states2
