@@ -45,10 +45,12 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
               "Scale must be [M, K/group_size] = [", M_in, ", ", num_groups,
               "] but got [", in_scale.size(0), ", ", in_scale.size(1), "]");
   if (in_zero_points.has_value()) {
-    // Zero points stay in the packed 4-bit form the checkpoint ships:
-    // [M/8, K/group_size] int32, row m's nibble at word[m/8] bits 4*(m%8).
-    TORCH_CHECK(in_zero_points->dtype() == at::kInt,
-                "Zero points must be int32 (packed 8x uint4 along dim 0), got ",
+    // Row m's nibble sits at word[m/8] bits 4*(m%8).  The kernel reads the
+    // words as uint32, so either signedness of 32-bit integer is accepted.
+    TORCH_CHECK(in_zero_points->dtype() == at::kInt ||
+                    in_zero_points->dtype() == at::kUInt32,
+                "Zero points must be int32 or uint32 (packed 8x uint4 along "
+                "dim 0), got ",
                 in_zero_points->dtype());
     TORCH_CHECK(in_zero_points->dim() == 2,
                 "Zero points must be 2D [M/8, K/group_size], got shape ",
@@ -62,8 +64,8 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
                 in_zero_points->size(1), "]");
   }
   TORCH_CHECK(K_in % 16 == 0, "K must be divisible by 16");
-  // load_act_into_lds walks the activation as one flat K*N run, i.e. it already
-  // assumes stride(0) == K.  Nothing enforced that until now.
+  // load_act_into_lds walks the activation as one flat K*N run, i.e. it
+  // assumes stride(0) == K.
   TORCH_CHECK(in_x.is_contiguous(), "Activation must be contiguous");
 
   // Scale and packed zero points share one row stride, in groups.  It is not

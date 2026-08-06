@@ -204,12 +204,12 @@ def run_sweep(shapes, batch_sizes, warmup, rep, csv_path, medium_only=False):
                     skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
                     continue
 
-            # Pack through the production helper, not the local pack_int4: that
-            # one leaves the row stride contiguous, which for K=8192 lands on
-            # 4096 B -- a multiple of 512 and squarely on the gfx1151 cache
-            # cliff.  Sweeping there tunes a layout production never uses and
-            # reads ~43% slow (169 us vs 118 for 5376x8192 at (2,2)).  Same for
-            # the scale rows, which the layer pads off the same cliff.
+            # Pack with pack_skinny_int4, the helper production uses, rather
+            # than the local pack_int4: pack_int4 leaves the row stride
+            # contiguous, so at K=8192 the stride is 4096 B -- a multiple of
+            # 512, squarely on the gfx1151 cache cliff.  Sweeping there would
+            # tune a layout production never sees.  The scale rows get the
+            # same treatment, since the layer pads them off the same cliff.
             values_int4 = torch.randint(0, 16, (M, K), dtype=torch.int32, device="cuda")
             weight_packed, _ = pack_skinny_int4(values_int4)
             scale = torch.rand(M, num_groups, dtype=dtype, device="cuda") * 0.02 - 0.01
