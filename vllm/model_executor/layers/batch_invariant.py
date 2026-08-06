@@ -8,11 +8,15 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+
+logger = init_logger(__name__)
 
 
 def _matmul_launch_metadata(
@@ -1488,11 +1492,134 @@ def override_envs_for_invariance():
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
 
-def init_batch_invariance():
+_autotuned_kernels: list[str] = []
+_autotune_watch_installed = False
+
+
+def autotuned_kernels() -> list[str]:
+    """Kernels whose config this process settled by timing, in order."""
+    return list(_autotuned_kernels)
+
+
+def _watch_for_autotune_races(data_parallel_size: int | None) -> None:
+    """Report kernels whose config was chosen by an on-device race.
+
+    Inductor settles some kernels by timing their candidate configs at first
+    call, in the process that will then serve with the winner. Which candidate
+    wins is decided by whatever else the machine was doing at that moment, and
+    it is frozen for the life of the process afterwards.
+
+    That is not a batch dependence and the mode's contract survives it: every
+    token in a process meets the same kernel whatever it was batched with, and
+    each replica is bitwise repeatable against itself. What it costs is
+    agreement *between* replicas, which is usually what a data-parallel
+    deployment wanted when it turned the mode on. It is the same class as
+    EPLB's rearrangement -- a reproducibility property rather than this one --
+    so it is reported rather than refused.
+
+    Measured on 4x gfx950, OLMoE-1B-7B bf16, DP=4, one prompt pinned to each
+    rank: two pointwise kernels raced per rank, one rank took XBLOCK=4096 where
+    three took 512 with the candidates 28-30 ms apart, and 15 of 64 logprobs
+    moved between the two groups. Elementwise as Triton source -- XBLOCK only
+    enters the index arithmetic -- but not once compiled: the candidates leave
+    the backend with 6, 10, 36 and 72 FMA instructions, and a multiply-add
+    contracted in one variant and not another rounds differently.
+
+    This counts what happened rather than listing what causes it, because that
+    list does not stay correct: none of this reproduced on torch 2.11, and
+    `TORCHINDUCTOR_DETERMINISTIC=1` does not cover it -- that filters the
+    reduction config lists and gates `_dynamic_scale_rblock`, but exempts
+    pointwise autotuning as a vetted scenario. To pin it today, pass
+    `triton.autotune_pointwise=False` in `inductor_compile_config`, measured
+    sufficient for the model above (no kernel raced at all, and every rank
+    agreed at DP=4 and DP=8); add `deterministic=True` for a model that races
+    the reduction families instead.
+
+    Watching the race itself would under-report, because it usually does not
+    happen here. `check_autotune_cache` collapses the candidate list to the
+    winner whenever one is on disk, and that cache is per rank -- the generated
+    source carries the device ordinal, so each rank keys its own entry. So the
+    race runs once on a cold cache and every later process inherits the result,
+    which is why a rank keeps its answer across restarts and why the split
+    between ranks looks stable. Watching the cache check instead reports the
+    kernel whether its config is being decided now or was decided by some
+    earlier process on this machine.
+
+    Known gap: this is silent when vLLM's own compile cache is warm. That path
+    reloads serialized artifacts with the choice already baked in, so Inductor
+    codegen never runs and there is nothing to intercept. The warning therefore
+    fires on the compile that makes the decision and not on the restarts that
+    inherit it -- which is the wrong way round for an operator who has just
+    restarted a server, and worth closing by recording the fact in the compile
+    cache entry and re-emitting it on load. Measured: 2 warnings naming
+    `..._unsqueeze_view_2` on a cold compile at DP=2, 0 on the warm one that
+    diverged identically.
+    """
+    global _autotune_watch_installed
+    if _autotune_watch_installed:
+        return
+    try:
+        from torch._inductor.runtime import triton_heuristics
+
+        original = triton_heuristics.check_autotune_cache
+    except (AttributeError, ImportError):
+        # Inductor's internals are not a stable interface. Losing the report is
+        # not worth failing startup over, but say so, because a silent absence
+        # reads exactly like "nothing was raced".
+        logger.debug(
+            "Could not watch Inductor's autotuner; this process cannot report "
+            "whether any kernel config was chosen by an on-device race."
+        )
+        return
+
+    def check_autotune_cache(configs, filename, inductor_meta):
+        result = original(configs, filename, inductor_meta)
+        if len(configs) <= 1:
+            # Nothing to choose between, so nothing to be non-deterministic about.
+            return result
+        name = (inductor_meta or {}).get("kernel_name", "<unnamed>")
+        state = (result[2] or {}).get("autotune_cache_state", "unknown")
+        _autotuned_kernels.append(name)
+        logger.debug(
+            "Kernel %s has %d candidate configs; chosen by on-device timing "
+            "(autotune cache %s).",
+            name,
+            len(configs),
+            state,
+        )
+
+        # Captured when the watch was installed: the config context is live
+        # during worker startup but not during a forward pass, so looking it up
+        # here would find nothing and report nothing.
+        if data_parallel_size is None or data_parallel_size > 1:
+            logger.warning_once(
+                "Inductor is choosing the config for at least one kernel "
+                "(%s) by timing candidates on a device. The winner is per "
+                "process and cached per rank, so data-parallel replicas can "
+                "disagree bitwise on the same request even though each is "
+                "internally batch invariant. Pass "
+                "triton.autotune_pointwise=False in inductor_compile_config to "
+                "pin it; see batch_invariant._watch_for_autotune_races.",
+                name,
+            )
+        return result
+
+    triton_heuristics.check_autotune_cache = check_autotune_cache
+    _autotune_watch_installed = True
+
+
+def init_batch_invariance(vllm_config=None):
     # this will hit all the csrc overrides as well
     if envs.VLLM_BATCH_INVARIANT:
         override_envs_for_invariance()
         enable_batch_invariant_mode()
+        if vllm_config is None:
+            vllm_config = get_current_vllm_config_or_none()
+        _watch_for_autotune_races(
+            vllm_config.parallel_config.data_parallel_size
+            if vllm_config is not None
+            else None
+        )
 
         # Disable TF32 for batch invariance - it causes non-deterministic rounding
         torch.backends.cuda.matmul.fp32_precision = "ieee"
