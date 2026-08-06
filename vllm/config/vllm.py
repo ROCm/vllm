@@ -1678,15 +1678,24 @@ class VllmConfig:
                 # a step sees the same placement and a request's output depends
                 # on the traffic that preceded it rather than on its
                 # batch-mates. Batch invariance does not forbid that, which is
-                # why this warns rather than refusing -- but users set this
-                # mode for reproducibility, and EPLB removes it.
+                # why this warns rather than refusing.
+                #
+                # Stated as a possibility, because enabling EPLB is not itself
+                # the loss: a server whose load stays balanced enough never
+                # commits a rearrangement, and its runs do reproduce each
+                # other. `eplb_state._note_rearrangement_committed` says so
+                # when one is actually committed. A warning keyed on
+                # configuration rather than on occurrence fires on every EPLB
+                # deployment, and one that always fires is one nobody reads.
                 logger.warning_once(
                     "EPLB is enabled with VLLM_BATCH_INVARIANT. Output remains "
-                    "invariant to batch composition, but not reproducible "
-                    "across runs: EPLB moves experts between ranks based on "
-                    "the load it has observed, so a request's output depends "
-                    "on the traffic that preceded it. Disable EPLB if you need "
-                    "run-to-run reproducibility."
+                    "invariant to batch composition, but may stop being "
+                    "reproducible across runs: EPLB moves experts between "
+                    "ranks based on the load it has observed, so once it does "
+                    "so a request's output depends on the traffic that "
+                    "preceded it. Disable EPLB if you need run-to-run "
+                    "reproducibility; the rearrangement that costs it is "
+                    "logged when it happens."
                 )
 
             # These passes rewrite the collective the communicator would have

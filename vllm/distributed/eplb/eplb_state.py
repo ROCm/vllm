@@ -34,6 +34,7 @@ from dataclasses import dataclass
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
 from vllm.distributed.parallel_state import (
@@ -59,6 +60,40 @@ from .rebalance_execute import (
 )
 
 logger = init_logger(__name__)
+
+_committed_rearrangements = 0
+
+
+def _note_rearrangement_committed() -> None:
+    """Report the moment EPLB actually costs a deployment its reproducibility.
+
+    Enabling EPLB under batch invariance is not by itself a loss. Rearrangement
+    is a temporal dependence rather than a batch one -- `eplb_step()` runs after
+    the forward pass, so every token in a step sees the same placement -- and a
+    server whose load stayed balanced enough never commits one at all, in which
+    case its runs do reproduce each other. The startup warning has to speak of
+    what might happen; this speaks of what did.
+
+    Which is the distinction worth keeping, because a warning that fires on
+    configuration rather than on occurrence fires on every EPLB deployment, and
+    a warning that always fires is one nobody reads.
+    """
+    global _committed_rearrangements
+    if not envs.VLLM_BATCH_INVARIANT:
+        return
+    _committed_rearrangements += 1
+    logger.warning_once(
+        "EPLB has committed an expert rearrangement while "
+        "VLLM_BATCH_INVARIANT is set. Output stays invariant to batch "
+        "composition, but a request's answer now also depends on the traffic "
+        "that preceded it, so this run no longer reproduces earlier ones. "
+        "Disable EPLB if you need that. Later rearrangements are logged at "
+        "debug rather than repeating this."
+    )
+    logger.debug(
+        "[EPLB] committed rearrangement #%d under batch invariance",
+        _committed_rearrangements,
+    )
 
 
 @dataclass
@@ -900,6 +935,7 @@ class EplbState:
                             eplb_model_state,
                             new_physical_to_logical_map=new_physical_to_logical_map,
                         )
+                        _note_rearrangement_committed()
 
                 if is_main_rank:
                     assert start_event is not None
