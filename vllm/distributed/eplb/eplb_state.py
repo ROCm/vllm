@@ -74,6 +74,17 @@ def _note_rearrangement_committed() -> None:
     case its runs do reproduce each other. The startup warning has to speak of
     what might happen; this speaks of what did.
 
+    That rests on the placement a run *starts* from being the same every time,
+    which it is: `build_initial_global_physical_to_logical_map` is
+    `range(num_routed_experts)` plus `i % num_routed_experts` for the redundant
+    tail, with nothing sampled and nothing read from load, and the only startup
+    call is `rearrange(is_profile=True)`, whose map is never committed because
+    `_commit_eplb_maps` is gated on `not is_profile`. Under this mode the tail
+    is empty anyway, since `num_redundant_experts > 0` is refused. So zero
+    committed rearrangements really does mean two runs placed experts
+    identically, rather than merely never having moved them from wherever they
+    happened to land.
+
     Which is the distinction worth keeping, because a warning that fires on
     configuration rather than on occurrence fires on every EPLB deployment, and
     a warning that always fires is one nobody reads.
