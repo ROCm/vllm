@@ -34,7 +34,6 @@ bitwise against the same prompt run solo, with the DBO thresholds lowered to 8
   peers_32                   1 / 1            0/64     64/64  (1.1e-1)
   all_48                    65 / 64           0/64     64/64  (6.1e-2)
   solo_again                 1 / 0            0/64      0/64
-  other_rank_solo            0 / 0            0/64      0/64
 
 256 moved positions in the mode-off arm, none in the mode-on arm, with the two
 arms taking *identical* microbatching decisions -- the middle column is the same
@@ -61,6 +60,21 @@ the assertions below are on the observed decisions rather than on the load
 having been applied: the needle rank must have been microbatched in some
 conditions and not in others, and `maybe_create_ubatch_slices` must have
 returned real slices.
+
+An `other_rank_solo` condition used to sit at the end of the plan, sending the
+needle to a different DP rank and expecting the same logprobs. It has been
+removed, because it asserts the wrong axis: no microbatching happens in it (0
+proposed, 0 ubatched on the needle's rank in the original measurement) and it
+varies nothing about any batch. What it actually measures is whether two
+replicas agree, and they need not -- Inductor settles some kernel configs by
+timing candidates on the device, once per process, so two ranks can freeze
+different winners. Each rank stays bitwise repeatable against itself, so a
+token's output still does not depend on its batch-mates and this mode's
+contract is intact; see `batch_invariant._watch_for_autotune_races`, which
+reports when a process has done it. Measured on 4x gfx950: it moved 15 of 64
+logprobs, and it moved them identically at `c0fa34beee`, where the table above
+records 0 of 64 -- so the row was recorded under an image that no longer
+exists, not broken by a later commit.
 
 Not covered: `deepep_low_latency` and `nixl_ep`, the other two backends
 microbatching accepts. `nixl_ep` still needs its kernels.
@@ -466,8 +480,6 @@ def test_microbatched_needle_is_invariant_to_batch_composition(dbo_server):
         with _Load(url, ranks, concurrency, seed) as load:
             conditions[label] = _needle(url)
         loads[label] = load
-
-    conditions["other_rank_solo"] = _needle(url, (NEEDLE_RANK + 1) % DP_SIZE)
 
     for label, load in loads.items():
         assert not load.errors, f"{label} companions failed: {load.errors[:3]}"
