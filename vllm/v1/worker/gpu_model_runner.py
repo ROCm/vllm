@@ -765,6 +765,14 @@ class GPUModelRunner(
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
+        # Marks trailing cudagraph-padding rows so kernels can skip work for
+        # them.  `VLLM_MOE_SKIP_PADDING` defaults to True and the mask is
+        # already consumed by the fused topk routers, but only the
+        # `v1/worker/gpu/` runner populated it -- on this runner every consumer
+        # saw `None` and silently fell back to treating padding as real.
+        self.is_padding = torch.zeros(
+            self.max_num_tokens, dtype=torch.bool, device=self.device
+        )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1052,6 +1060,48 @@ class GPUModelRunner(
             device=self.device,
             with_numpy=numpy,
         )
+
+    def _make_is_padding(
+        self, num_tokens_unpadded: int, num_tokens_padded: int
+    ) -> torch.Tensor | None:
+        """The cudagraph-padding mask for this step, or None when disabled.
+
+        Rows ``[num_tokens_unpadded, num_tokens_padded)`` exist only to reach a
+        captured graph size.  They carry no request, their attention metadata is
+        undefined and their contents are whatever the previous replay left in
+        the graph pool -- so any reduction that spans them is reading another
+        step's data.  Consumers that take a per-tensor reduction over the batch
+        need to be told where the real rows stop; this is that signal.
+
+        Written into a persistent buffer rather than allocated per step because
+        it is captured into cudagraphs and must keep the same address.  For the
+        same reason the fills are unconditional: a captured graph reads this
+        buffer at replay, so skipping the writes on a step that happens to have
+        no padding would have it read the capturing step's values instead.
+
+        Deliberately *not* gated on `VLLM_MOE_SKIP_PADDING`.  That flag selects
+        whether kernels skip work for padding rows, which is an optimization;
+        whether a reduction is allowed to span rows the token does not own is
+        correctness.  Consumers that want the optimization check the flag
+        themselves.
+        """
+        self.is_padding[:num_tokens_unpadded].fill_(False)
+        self.is_padding[num_tokens_unpadded:num_tokens_padded].fill_(True)
+        return self.is_padding[:num_tokens_padded]
+
+    def _make_is_padding_full(
+        self, num_tokens_unpadded: int, num_tokens_padded: int
+    ) -> torch.Tensor | None:
+        """`_make_is_padding`'s buffer, unsliced, for consumers inside a graph.
+
+        Its length is `max_num_tokens` on every step.  That matters because a
+        tensor reached through the forward context is a *global* read: Dynamo
+        specializes its length to whatever it was at trace time, and a length
+        that tracks the cudagraph size makes that constant wrong on every size
+        but the one traced.  A fixed length has nothing to get wrong.
+        """
+        self._make_is_padding(num_tokens_unpadded, num_tokens_padded)
+        return self.is_padding
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
@@ -4440,6 +4490,12 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                is_padding=self._make_is_padding(
+                    num_tokens_unpadded, num_tokens_padded
+                ),
+                is_padding_full=self._make_is_padding_full(
+                    num_tokens_unpadded, num_tokens_padded
+                ),
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -6143,6 +6199,12 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    # A dummy run carries no real tokens, so every row is
+                    # padding.  Capture happens through this path, and a graph
+                    # captured with the mask all-False would bake in the
+                    # unbounded behaviour for every later replay.
+                    is_padding=self._make_is_padding(0, num_tokens_padded),
+                    is_padding_full=self._make_is_padding_full(0, num_tokens_padded),
                 ),
             ):
                 outputs = self.model(

@@ -27,7 +27,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -935,13 +934,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
-        if envs.VLLM_MOE_SKIP_PADDING:
-            # Mark trailing cudagraph-padding rows so kernels can skip work for
-            # them when supported.
-            self.input_buffers.is_padding[:num_tokens].fill_(False)
-            self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
-                True
-            )
+        # Mark trailing cudagraph-padding rows.  Not gated on
+        # VLLM_MOE_SKIP_PADDING: that flag selects whether kernels skip work for
+        # these rows, which is an optimization, while consumers that must not
+        # reduce across them need the mask regardless.  The optimization
+        # consumers check the flag themselves.
+        self.input_buffers.is_padding[:num_tokens].fill_(False)
+        self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(True)
         num_tokens_per_req = scheduler_output.num_scheduled_tokens
         num_reqs = len(num_tokens_per_req)
 
