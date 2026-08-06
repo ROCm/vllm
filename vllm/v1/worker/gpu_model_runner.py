@@ -226,6 +226,8 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunne
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
+    align_ubatch_splits_to_requests,
+    can_align_ubatch_split,
     check_ubatch_thresholds,
     maybe_create_ubatch_slices,
     split_attn_metadata,
@@ -4060,6 +4062,17 @@ class GPUModelRunner(
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode.value,
+                    # Batch invariance needs the microbatch cut to land on a request
+                    # boundary; a batch with none cannot be split without moving an
+                    # MLA prefill's context boundary. All ranks must agree, so this
+                    # is answered here rather than at slice-creation time.
+                    can_align_ubatch_split=(
+                        not align_ubatch_splits_to_requests(self.vllm_config)
+                        or can_align_ubatch_split(
+                            num_scheduled_tokens_np,
+                            self.parallel_config.num_ubatches,
+                        )
+                    ),
                 )
             )
 
@@ -4346,6 +4359,9 @@ class GPUModelRunner(
                 num_tokens_padded,
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
+                align_to_request_boundaries=align_ubatch_splits_to_requests(
+                    self.vllm_config
+                ),
             )
 
             logger.debug(
@@ -6033,6 +6049,9 @@ class GPUModelRunner(
             num_tokens_padded,
             num_reqs_padded,
             self.vllm_config.parallel_config.num_ubatches,
+            align_to_request_boundaries=align_ubatch_splits_to_requests(
+                self.vllm_config
+            ),
         )
         logger.debug(
             "ubatch_slices: %s, ubatch_slices_padded: %s",

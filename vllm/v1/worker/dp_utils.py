@@ -38,17 +38,19 @@ def _run_ar(
     orig_num_tokens_per_ubatch: int,
     padded_num_tokens_per_ubatch: int,
     cudagraph_mode: int,
+    can_align_ubatch_split: bool,
     parallel_config: ParallelConfig,
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
     # Populate this rank's contribution on CPU to reduce GPU syncs.
-    tensor_cpu = torch.zeros(4, dp_size, dtype=torch.int32)
+    tensor_cpu = torch.zeros(5, dp_size, dtype=torch.int32)
     tensor_cpu[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
+    tensor_cpu[4][dp_rank] = 1 if can_align_ubatch_split else 0
     tensor = tensor_cpu.to(device, non_blocking=True)
     dist.all_reduce(tensor, group=group)
     return tensor
@@ -61,6 +63,15 @@ def _post_process_ubatch(tensor: torch.Tensor, num_ubatches: int) -> bool:
     # First determine if we are going to be ubatching.
     should_ubatch: bool = bool(torch.all(tensor[2] == 1).item())
     if not should_ubatch:
+        return False
+
+    # Under batch invariance the cut has to land on a request boundary, so a rank
+    # with no interior boundary vetoes the split for everyone -- the decision is
+    # collective, and a rank that unilaterally declined would leave its peers
+    # waiting on microbatched collectives it never enters. Ranks report True when
+    # the mode is off, so this is a no-op there.
+    if not bool(torch.all(tensor[4] == 1).item()):
+        logger.debug("Aborting ubatching: a DP rank has no interior request boundary")
         return False
     # If the DP ranks are planning to ubatch, make sure that
     # there are no "empty" second ubatches
@@ -104,6 +115,7 @@ def _synchronize_dp_ranks(
     should_attempt_ubatching: bool,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
+    can_align_ubatch_split: bool = True,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     1. Decides if each DP rank is going to microbatch. Either all ranks
@@ -133,6 +145,7 @@ def _synchronize_dp_ranks(
         orig_num_tokens_per_ubatch=num_tokens_unpadded,
         padded_num_tokens_per_ubatch=num_tokens_padded,
         cudagraph_mode=cudagraph_mode,
+        can_align_ubatch_split=can_align_ubatch_split,
         parallel_config=parallel_config,
     )
 
@@ -168,6 +181,7 @@ def coordinate_batch_across_dp(
     num_tokens_padded: int | None = None,
     uniform_decode: bool | None = None,
     cudagraph_mode: int = 0,
+    can_align_ubatch_split: bool = True,
 ) -> tuple[bool, torch.Tensor | None, int]:
     """
     Coordinates amongst all DP ranks to determine if and how the full batch
@@ -183,6 +197,10 @@ def coordinate_batch_across_dp(
             only contains single token decodes
         cudagraph_mode: The cudagraph mode for this rank (0=NONE, 1=PIECEWISE, 2=FULL).
             DP padding is enabled when synced cudagraph mode across ranks is not NONE.
+        can_align_ubatch_split: Whether this rank's batch can be split on a request
+            boundary. Only meaningful under batch invariance, which requires it;
+            callers pass True otherwise. Any rank answering False vetoes
+            microbatching for the whole group, since the decision must be unanimous.
 
     Returns: tuple[
         ubatch_slices: if this is set then all DP ranks have agreed to
@@ -219,6 +237,7 @@ def coordinate_batch_across_dp(
             should_attempt_ubatching,
             cudagraph_mode,
             parallel_config,
+            can_align_ubatch_split,
         )
     )
 

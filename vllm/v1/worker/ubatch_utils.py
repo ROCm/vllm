@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import TYPE_CHECKING, TypeAlias
 
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backend import CommonAttentionMetadata
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 @dataclass
@@ -46,6 +50,112 @@ def check_ubatch_thresholds(
         return num_tokens >= config.dbo_prefill_token_threshold
 
 
+def align_ubatch_splits_to_requests(vllm_config: "VllmConfig") -> bool:
+    """Whether microbatch cuts must land on request boundaries.
+
+    Scoped to DeepEP high throughput rather than to every microbatching backend,
+    for a reason that has to be fixed before it can be widened.
+    `GPUUBatchWrapper.__call__` builds each microbatch's DP metadata by *fabricating*
+    the cross-rank vector from its own slice:
+
+        ubatch_num_tokens_across_dp = torch.tensor(
+            [ubatch_slice.num_tokens] * dp_size, ...)
+
+    which is true today only because every rank cuts at
+    `num_tokens_padded // num_ubatches` and so lands on the same size. A snapped cut
+    is a function of the local request boundaries, so the ranks no longer agree and
+    that vector becomes wrong on all of them. High throughput does not read it -- its
+    per-rank counts come from `Buffer.get_dispatch_layout`, a real device-side
+    negotiation -- which is why alignment is admitted here and measured here. The
+    batched formats that low latency selects do read it (`estimate_expected_m`), so
+    widening this needs the real per-rank sizes carried in the collective first.
+
+    Also note this implies `cudagraph_mode` is NONE: `CompilationConfig` forces NONE
+    for high throughput at `data_parallel_size > 1`. That matters because
+    `GPUUBatchWrapper` keys captured microbatched graphs on the total token count
+    alone, so a graph captured under one split would be replayed under another.
+    """
+    parallel_config = vllm_config.parallel_config
+    return (
+        envs.VLLM_BATCH_INVARIANT
+        and parallel_config.use_ubatching
+        and parallel_config.data_parallel_size > 1
+        and parallel_config.all2all_backend == "deepep_high_throughput"
+    )
+
+
+def can_align_ubatch_split(num_scheduled_tokens: np.ndarray, num_ubatches: int) -> bool:
+    """Whether this batch has enough requests to split on request boundaries.
+
+    One boundary is needed per split point, and only the interior ones count, so
+    `num_ubatches` non-empty requests are the minimum. A batch prefilling a single
+    request has none, and cannot be microbatched without cutting that request --
+    which is what `request_aligned_split_points` refuses to do. All DP ranks have
+    to agree before any of them splits, so this is answered before the collective
+    rather than at slice-creation time.
+    """
+    return int((np.asarray(num_scheduled_tokens) > 0).sum()) >= num_ubatches
+
+
+def request_aligned_split_points(
+    num_scheduled_tokens: np.ndarray,
+    num_tokens_padded: int,
+    num_ubatches: int,
+) -> list[int] | None:
+    """Split points on request boundaries, as near an even division as possible.
+
+    A microbatch boundary that lands inside a request makes that request's
+    continuation carry `seq_len` unchanged against a shortened `query_len` (see
+    `_make_metadata_with_slice`), so MLA reads a non-zero context length for it and
+    decomposes its prefill into a context pass plus a new-token pass merged by
+    log-sum-exp, instead of one causal pass. That is mathematically equivalent and
+    numerically different, and where the cut lands is a function of the DP peers'
+    load, so the same request gets a different answer run to run. It is the same
+    boundary `999ec9ee19` disabled prefix caching over and `b2501b5a94` pinned the
+    scheduler's chunk against; this is the third way to move it.
+
+    So under batch invariance the cut is snapped to a request boundary and the
+    straddling request is deferred to one side whole, following `b2501b5a94`'s rule
+    of deferring rather than shrinking. Measured on 2x gfx950, DeepSeek-V2-Lite-Chat
+    with DP=2/EP + deepep_high_throughput + DBO at the thresholds
+    `tests/v1/distributed/test_dbo.py` uses: 1932 slices over four GSM8K passes, no
+    request cut, and all four passes bitwise identical to the same server with
+    microbatching disabled entirely. Unaligned, the same run cut 60 of 60 and moved
+    5-8 of 64 completions per pass.
+
+    Returns None when there are not enough interior boundaries, which the caller
+    must treat as "do not microbatch" -- falling back to an even division would
+    reintroduce exactly the cut this avoids.
+    """
+    cu_num_tokens = np.zeros(len(num_scheduled_tokens) + 1, dtype=np.int64)
+    np.cumsum(num_scheduled_tokens, out=cu_num_tokens[1:])
+    total = int(cu_num_tokens[-1])
+
+    # Interior boundaries only: 0 or `total` would leave a microbatch empty, and
+    # duplicates come from requests scheduled zero tokens.
+    boundaries = np.unique(cu_num_tokens[1:-1])
+    boundaries = boundaries[(boundaries > 0) & (boundaries < total)]
+    if boundaries.size < num_ubatches - 1:
+        return None
+
+    split_points: list[int] = []
+    for i in range(1, num_ubatches):
+        # Target the even division of the *padded* count, because that is what the
+        # unaligned path splits on and what the DP ranks have agreed to run.
+        target = int(num_tokens_padded) * i // num_ubatches
+        lower = split_points[-1] if split_points else 0
+        available = boundaries[boundaries > lower]
+        # Leave one boundary behind for each split point still to be placed.
+        still_to_place = num_ubatches - 1 - len(split_points)
+        if available.size < still_to_place:
+            return None
+        if still_to_place > 1:
+            available = available[: available.size - (still_to_place - 1)]
+        split_points.append(int(available[np.argmin(np.abs(available - target))]))
+
+    return split_points
+
+
 # This pads the last ubatch slice out to the total number of tokens
 # (num_tokens + padding) since we do `create_ubatch_slices` before applying DP padding.
 def _pad_out_ubatch_slices(
@@ -67,14 +177,35 @@ def maybe_create_ubatch_slices(
     num_reqs_padded: int,
     num_ubatches: int,
     split_point: list[int] | int | None = None,
+    align_to_request_boundaries: bool = False,
 ) -> tuple[UBatchSlices | None, UBatchSlices | None]:
     if not should_ubatch:
         return None, None
 
+    if split_point is None and align_to_request_boundaries:
+        # None here means the batch has no interior request boundary. The DP ranks
+        # agree on that before they agree to microbatch (`can_align_ubatch_split`),
+        # so reaching this with alignment on means the two disagreed; splitting
+        # anyway would cut a request, which is the thing being avoided.
+        split_point = request_aligned_split_points(
+            num_scheduled_tokens, num_tokens_padded, num_ubatches
+        )
+        assert split_point is not None, (
+            "microbatching was agreed for a batch with no interior request "
+            "boundary; the DP coordination should have declined it"
+        )
+
     if split_point is None:
         split_point = int(num_tokens_padded) // num_ubatches
 
-    token_split_points = [split_point * i for i in range(1, num_ubatches)]
+    # A sequence is the cuts themselves; a scalar is a stride giving evenly spaced
+    # ones. Tested for as a sequence rather than as an `int` because callers reach
+    # here with numpy integers, which are not `int` instances and would silently
+    # take the wrong branch.
+    if isinstance(split_point, (list, tuple)):
+        token_split_points = [int(point) for point in split_point]
+    else:
+        token_split_points = [int(split_point) * i for i in range(1, num_ubatches)]
 
     # TODO(lucas): Refactor the gpu_model_runner.py so we can pass
     # in cu_num_tokens directly (i.e. query_start_loc)

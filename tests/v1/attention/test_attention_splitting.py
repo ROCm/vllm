@@ -9,10 +9,14 @@ from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
+from vllm.v1.worker.dp_utils import _post_process_ubatch
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
+    align_ubatch_splits_to_requests,
     _make_metadata_with_slice,
+    can_align_ubatch_split,
     maybe_create_ubatch_slices,
+    request_aligned_split_points,
     slice_query_start_locs,
     split_attn_metadata,
 )
@@ -460,3 +464,211 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
     assert not captured_is_prefilling[2]  # decode  (200 >= 200)
     assert not captured_is_prefilling[3]  # stale data (10 < 100) zeroed
     assert not captured_is_prefilling[4]  # stale data (20 < 200) zeroed
+
+
+@pytest.mark.parametrize(
+    "query_lens,num_tokens_padded,expected",
+    [
+        # The even division already lands on a boundary: nothing to move.
+        ([100, 100, 100, 100], 400, [200]),
+        # 225 falls inside request 1; both neighbours are 75 away, take the lower.
+        ([150, 150, 150], 450, [150]),
+        # DP padding pushes the target past every real boundary; the last one wins.
+        ([10, 10, 10], 600, [20]),
+        # Requests scheduled zero tokens do not contribute a distinct boundary.
+        ([100, 0, 100], 200, [100]),
+        # More than two microbatches needs one distinct boundary per cut.
+        ([100] * 8, 800, [200, 400, 600]),
+    ],
+)
+def test_request_aligned_split_points(query_lens, num_tokens_padded, expected):
+    """Split points must coincide with request boundaries."""
+    import numpy as np
+
+    num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
+    num_ubatches = len(expected) + 1
+    points = request_aligned_split_points(
+        num_scheduled_tokens, num_tokens_padded, num_ubatches
+    )
+    assert points == expected
+
+    cu = np.concatenate(([0], np.cumsum(num_scheduled_tokens)))
+    for point in points:
+        assert point in cu
+
+
+@pytest.mark.parametrize(
+    "query_lens,num_ubatches",
+    [
+        # A lone prefill has no interior boundary, so it cannot be cut at all.
+        ([900], 2),
+        ([900, 0], 2),
+        # Two requests give one boundary, one short of what three ubatches need.
+        ([100, 100], 3),
+    ],
+)
+def test_request_aligned_split_points_declines(query_lens, num_ubatches):
+    """With too few requests there is nowhere to cut, and None says so.
+
+    The caller must decline to microbatch rather than fall back to an even
+    division: falling back would reintroduce the mid-request cut this avoids.
+    `can_align_ubatch_split` is the pre-collective form of the same question and
+    has to agree, since the DP ranks decide before the split point is computed.
+    """
+    import numpy as np
+
+    num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
+    assert (
+        request_aligned_split_points(
+            num_scheduled_tokens, int(num_scheduled_tokens.sum()), num_ubatches
+        )
+        is None
+    )
+    assert not can_align_ubatch_split(num_scheduled_tokens, num_ubatches)
+
+
+@pytest.mark.parametrize(
+    "seq_lens,query_lens",
+    [
+        # Uneven, so the even split at 8 would land inside the second request
+        # and the aligned one has somewhere else to go.
+        ([32, 40], [5, 11]),
+        ([500, 900, 700], [500, 900, 700]),
+        ([64, 64, 64, 64], [7, 21, 3, 33]),
+    ],
+)
+def test_aligned_ubatch_slices_never_split_a_request(seq_lens, query_lens):
+    """The property the alignment exists for.
+
+    A slice whose first or last request is a continuation makes MLA read a
+    non-zero context length for it and decompose its prefill differently, which
+    is batch variant because the cut moves with the DP peers' load. Aligned
+    slices must leave every request whole, which shows up as an unchanged
+    seq_lens and a query_start_loc starting at zero.
+    """
+    import numpy as np
+
+    device = torch.device("cpu")
+    batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    common = create_common_attn_metadata(batch_spec, block_size=16, device=device)
+    num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
+    num_tokens = common.num_actual_tokens
+
+    ubatch_slices, _ = maybe_create_ubatch_slices(
+        True,
+        num_scheduled_tokens,
+        num_tokens,
+        len(query_lens),
+        num_ubatches=2,
+        align_to_request_boundaries=True,
+    )
+    assert ubatch_slices is not None and len(ubatch_slices) == 2
+
+    start_locs = common.query_start_loc_cpu
+    for ubatch_slice in ubatch_slices:
+        req_slice = ubatch_slice.request_slice
+        token_slice = ubatch_slice.token_slice
+        # Neither end of the slice may fall inside a request.
+        assert token_slice.start == start_locs[req_slice.start]
+        assert token_slice.stop == start_locs[req_slice.stop]
+
+        meta = _make_metadata_with_slice(ubatch_slice, common)
+        # A whole request keeps its sequence length and starts its own numbering.
+        assert meta.query_start_loc_cpu[0] == 0
+        torch.testing.assert_close(
+            meta.seq_lens, common.seq_lens[req_slice], rtol=0, atol=0
+        )
+
+    # Every token still gets computed exactly once.
+    assert sum(s.num_tokens for s in ubatch_slices) == num_tokens
+
+
+def test_unaligned_split_is_unchanged_by_default():
+    """Alignment is opt-in; the default path keeps cutting wherever it likes."""
+    import numpy as np
+
+    query_lens = [150, 150, 150]
+    num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
+
+    default, _ = maybe_create_ubatch_slices(
+        True, num_scheduled_tokens, 450, len(query_lens), num_ubatches=2
+    )
+    assert default is not None
+    # 225 is inside the second request, which is exactly what alignment avoids.
+    assert default[0].token_slice.stop == 225
+
+
+def _collective(should_ubatch, can_align, tokens=100, padded=None, dp_size=2):
+    """The reduced tensor `_post_process_ubatch` reads, without a DP group.
+
+    Rows are (orig tokens, padded tokens, should-ubatch, cudagraph mode,
+    can-align), summed across ranks by the caller's all-reduce; each column is
+    one rank.
+    """
+    tensor = torch.zeros(5, dp_size, dtype=torch.int32)
+    tensor[0, :] = tokens
+    tensor[1, :] = tokens if padded is None else padded
+    tensor[2, :] = torch.tensor(should_ubatch, dtype=torch.int32)
+    tensor[4, :] = torch.tensor(can_align, dtype=torch.int32)
+    return tensor
+
+
+def test_one_rank_without_a_boundary_vetoes_ubatching_for_everyone():
+    """The alignment decision has to be unanimous, not per rank.
+
+    A rank that cannot cut on a request boundary must stop its peers from
+    microbatching too. If it declined alone it would sit out collectives the
+    others had already entered, so the veto travels in the same all-reduce that
+    carries the should-ubatch flag.
+    """
+    assert _post_process_ubatch(_collective([1, 1], [1, 1]), num_ubatches=2)
+    assert not _post_process_ubatch(_collective([1, 1], [1, 0]), num_ubatches=2)
+    assert not _post_process_ubatch(_collective([1, 1], [0, 0]), num_ubatches=2)
+
+
+def test_ubatching_still_declines_for_its_own_reasons():
+    """The new row only ever removes microbatching, it cannot force it on.
+
+    Worth pinning because the veto is read before the empty-last-ubatch check:
+    a rank that says "I could align" must not thereby skip the older reasons to
+    decline.
+    """
+    assert not _post_process_ubatch(_collective([1, 0], [1, 1]), num_ubatches=2)
+    # Padding so far past the real token count that the second microbatch would
+    # be all padding -- declined before the new row is consulted.
+    assert not _post_process_ubatch(
+        _collective([1, 1], [1, 1], tokens=10, padded=100), num_ubatches=2
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_invariant,use_ubatching,dp_size,backend,expected",
+    [
+        (True, True, 2, "deepep_high_throughput", True),
+        # Off in the mode this exists to serve, and off for every backend whose
+        # microbatch DP metadata is fabricated from the local slice size.
+        (False, True, 2, "deepep_high_throughput", False),
+        (True, False, 2, "deepep_high_throughput", False),
+        (True, True, 1, "deepep_high_throughput", False),
+        (True, True, 2, "deepep_low_latency", False),
+    ],
+)
+def test_alignment_gate(
+    monkeypatch, batch_invariant, use_ubatching, dp_size, backend, expected
+):
+    """All four predicates are load-bearing, so each is pinned separately."""
+    from types import SimpleNamespace
+
+    import vllm.envs as envs
+    from vllm.v1.worker import ubatch_utils
+
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    monkeypatch.setattr(ubatch_utils.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            use_ubatching=use_ubatching,
+            data_parallel_size=dp_size,
+            all2all_backend=backend,
+        )
+    )
+    assert align_ubatch_splits_to_requests(config) is expected
