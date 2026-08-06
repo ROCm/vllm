@@ -532,6 +532,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 self.per_act_token_quant,
                 self.block_shape,
                 quantization_emulation=self.quantization_emulation,
+                # The rows MM2 will read.  A dynamic per-tensor scale is one
+                # amax over the whole buffer, so without these it also reduces
+                # over the unrouted and non-local slots the activation above
+                # just declined to write.
+                topk_ids=pad_aware_topk_ids,
+                expert_map=expert_map,
             )
 
         # LoRA w2: applied to intermediate_cache3 before moe_sum, using the

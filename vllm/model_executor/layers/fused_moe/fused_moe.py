@@ -1845,6 +1845,12 @@ def fused_experts_impl(
         quant_dtype=quant_dtype,
         per_act_token_quant=per_channel_quant,
         block_shape=block_shape,
+        # This entry passes `ignore_invalid_experts=True` above, so invalid
+        # token-expert slots never enter `sorted_token_ids` and are therefore
+        # neither written by MM1 nor zeroed by `write_zeros_to_output`.  A
+        # dynamic per-tensor amax over the whole buffer would read them.
+        topk_ids=topk_ids,
+        expert_map=expert_map,
     )
 
     if expert_map is not None:

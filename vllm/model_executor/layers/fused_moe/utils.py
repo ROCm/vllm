@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import dynamic_quant
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -140,12 +141,33 @@ def _fp8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform fp8 quantization on the inputs.  If a block_shape
     is provided, the output will be blocked.
     """
     if block_shape is None:
+        if (
+            A_scale is None
+            and not per_act_token
+            and topk_ids is not None
+            and topk_ids.numel() == A.shape[0]
+            and A.ndim == 2
+        ):
+            # Dynamic per-tensor: one amax over every row, including the
+            # token-expert slots no expert GEMM will read.  Bound it, and do
+            # the bound and the quantize in one pass rather than an amax in
+            # torch followed by a second read in the shipped kernel.
+            return dynamic_quant.dynamic_quantize(
+                A,
+                current_platform.fp8_dtype(),
+                granularity=dynamic_quant.PER_TENSOR,
+                mask_mode=dynamic_quant.MASK_ROUTED,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+            )
         # TODO(luka): use QuantFP8 custom op
         #  https://github.com/vllm-project/vllm/issues/20711
         A, A_scale = ops.scaled_fp8_quant(
@@ -166,6 +188,8 @@ def _int8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform int8 quantization on the inputs.  If a block_shape
@@ -181,6 +205,20 @@ def _int8_quantize(
         elif A_scale is not None:
             # Static per-tensor: use the optimized CUDA kernel
             A, A_scale, _ = ops.scaled_int8_quant(A, scale=A_scale)
+        elif topk_ids is not None and topk_ids.numel() == A.shape[0] and A.ndim == 2:
+            # Dynamic per-tensor, bounded: `A.abs().max()` below spans every
+            # row, including the token-expert slots no expert GEMM wrote.  On
+            # the legacy `fused_experts_impl` entry those are not even zeroed,
+            # because it passes `ignore_invalid_experts=True` so invalid blocks
+            # never reach `write_zeros_to_output`.
+            return dynamic_quant.dynamic_quantize(
+                A,
+                torch.int8,
+                granularity=dynamic_quant.PER_TENSOR,
+                mask_mode=dynamic_quant.MASK_ROUTED,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+            )
         elif A_scale is None:
             # Dynamic per-tensor: compute scale then quantize via kernel
             A_scale = torch.clamp(A.abs().max() / 127.0, min=1e-10)
@@ -283,7 +321,16 @@ def moe_kernel_quantize_input(
     ocp_mx_scheme: str | None = None,
     quantization_emulation: bool = False,
     mx_alignment: int = 0,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``topk_ids``/``expert_map`` bound the dynamic per-tensor fp8 reduction.
+
+    That is the only granularity here whose amax spans rows the token does not
+    own -- an unrouted or non-local token-expert slot that MM1 never wrote.
+    Every other branch is per-token, per-group or static and is already bounded,
+    so they ignore these.
+    """
     # Handle OCP MX scheme that requires QDQ (quantize-dequantize) for emulation
     if ocp_mx_scheme is not None:
         if ocp_mx_scheme in {"w_mxfp4", "w_mxfp4_a_mxfp4"}:
@@ -303,14 +350,18 @@ def moe_kernel_quantize_input(
         if quantization_emulation:
             return _fp8_quantize_dequantize(A, A_scale)
         else:
-            return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+            return _fp8_quantize(
+                A, A_scale, per_act_token_quant, block_shape, topk_ids, expert_map
+            )
     elif quant_dtype == torch.int8:
         if quantization_emulation:
             raise NotImplementedError(
                 "moe_kernel_quantize_input does not support quant_dtype=torch.int8"
                 " MOE quantization emulation. Please open an issue."
             )
-        return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
+        return _int8_quantize(
+            A, A_scale, per_act_token_quant, block_shape, topk_ids, expert_map
+        )
     elif quant_dtype == "nvfp4":
         if not quantization_emulation:
             return _nvfp4_quantize(A, A_scale, is_sf_swizzled_layout=is_scale_swizzled)
