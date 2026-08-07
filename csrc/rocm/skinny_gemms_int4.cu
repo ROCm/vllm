@@ -88,7 +88,11 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
                 "), got ", in_zero_points->stride(0));
   }
 
-  const int max_lds_len = get_lds_size_int4() / 2;
+  // The kernels declare s[LDS_SIZE / sizeof(scalar_t)], so the sml and chunked
+  // gates below have to use that.  get_lds_size_int4() reports what the device
+  // allows -- 160 KB on gfx950 -- which would pick the sml body for shapes
+  // whose activation does not fit the array that body actually declares.
+  const int max_lds_len = static_cast<int>(LDS_SIZE / in_x.element_size());
   // No upper bound on K*N: the medium body reads whatever does not fit in LDS
   // straight from global (see the `k_ + K * n < max_lds_len` split in
   // wvSplitK_int4_compute_), so it is correct for any K*N -- just slower the

@@ -32,7 +32,7 @@ torch::Tensor wvSplitK_int4g_sweep(
   TORCH_CHECK(K_in % achunk == 0, "K must be divisible by achunk=", achunk);
   TORCH_CHECK(M_in % ytile == 0, "M must be divisible by ytile=", ytile);
 
-  const int max_lds_len = get_lds_size_int4() / 2;
+  const int max_lds_len = static_cast<int>(LDS_SIZE / in_x.element_size());
   TORCH_CHECK(K_in * N_in <= max_lds_len, "K*N exceeds LDS capacity. K=", K_in,
               " N=", N_in);
 
