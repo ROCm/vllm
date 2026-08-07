@@ -79,30 +79,29 @@ exists, not broken by a later commit.
 Not covered: `deepep_low_latency` and `nixl_ep`, the other two backends
 microbatching accepts. `nixl_ep` still needs its kernels.
 
-`deepep_low_latency` is no longer *refused* under the mode --
-`BatchedTritonExperts` now declares batch invariance for its unquantized path
-and `test_ep_all2all_batch_invariant.py` asserts DeepEP LL end to end -- but it
-is still not covered here, because **`--enable-dbo` together with
-`--all2all-backend deepep_low_latency` does not start at all.** Measured on
-4x gfx950, DP=4, OLMoE-1B-7B, otherwise identical arguments to the fixture
-below: the four engine cores never report ready, each logging
-`No available shared memory broadcast block found in 60 seconds` until the API
-servers give up at the 600s `VLLM_ENGINE_READY_TIMEOUT_S`. Controls, one
-variable at a time:
+`deepep_low_latency` **is** covered now, as the second fixture arm. It used
+not to be: `--enable-dbo` with `--all2all-backend deepep_low_latency` did not
+start at all, the four engine cores logging `No available shared memory
+broadcast block found in 60 seconds` until the API servers gave up at the 600s
+`VLLM_ENGINE_READY_TIMEOUT_S`. That turned out to be two independent blockers
+stacked, and both are fixed:
 
-  * the same arguments with `--enable-dbo` removed reach
-    `Application startup complete` on all four ranks in about five minutes, so
-    it is not DeepEP LL and not the model or the parallel layout;
-  * it hangs identically at `--gpu-memory-utilization` 0.30 and 0.55, and the
-    workers are alive holding ~95 GiB each when it does, so it is not an
-    allocation shortfall;
-  * it hangs identically with `VLLM_BATCH_INVARIANT=0`, so it is **not a
-    batch-invariance defect** -- it is a pre-existing upstream one that this
-    branch merely made reachable, and it should be filed as such.
+  * DeepEP's low-latency `dispatch`/`combine` released their peers before the
+    zeroing of the next signalling slot had been written back out of L2, so a
+    peer's incoming flag was clobbered and the receiving rank spun forever.
+    That is why it reproduced with `VLLM_BATCH_INVARIANT=0` and looked like it
+    was "not a batch-invariance defect" -- it was not one. It needs a DeepEP
+    carrying the release/acquire restoration on both paths; against a DeepEP
+    without it this arm hangs at startup exactly as described above.
+  * once that cleared, the padding work added a second blocker at the same
+    configuration: the per-microbatch forward contexts were built without the
+    batch-wide padding mask, so it arrived as None where the traced graph had
+    baked a tensor. Fixed by giving each microbatch its own mask.
 
-So this arm would be a test that can never pass, and it is recorded here
-rather than added as a permanent skip. `--ubatch-size` > 2 is also untested;
-only DBO's two-way split is exercised here.
+Measured on 4x gfx950, DP=4, OLMoE-1B-7B, one variable at a time: with the
+DeepEP fix and without the mask fix the server does not start, failing at
+`assert_size_stride`; with both it starts and serves. `--ubatch-size` > 2 is
+still untested; only DBO's two-way split is exercised here.
 """
 
 import json
@@ -397,9 +396,23 @@ def _decisions(records: list[dict], window: dict) -> list[dict]:
     ]
 
 
-@pytest.fixture
-def dbo_server(tmp_path, enable_batch_invariant_mode):
-    """A DP=4 + EP server on DeepEP high throughput with DBO enabled.
+# The all2all manager each backend must build. Asserted rather than assumed:
+# a silent fallback to AllGather+ReduceScatter would not accept microbatching at
+# all, so the arm would pass while testing nothing.
+_EXPECTED_MANAGER = {
+    "deepep_high_throughput": "DeepEPHTAll2AllManager",
+    "deepep_low_latency": "DeepEPLLAll2AllManager",
+}
+
+
+@pytest.fixture(params=sorted(_EXPECTED_MANAGER))
+def dbo_server(request, tmp_path, enable_batch_invariant_mode):
+    """A DP=4 + EP server with DBO enabled, once per all2all backend.
+
+    The low-latency arm requires a DeepEP carrying the low-latency ordering
+    fix; see the module docstring. Without it the server does not start and
+    this arm times out rather than failing fast, which is the cost of covering
+    a configuration whose blocker lived in another repository.
 
     Function scoped and explicitly dependent on the autouse
     `enable_batch_invariant_mode` fixture: a module-scoped server is built
@@ -418,7 +431,7 @@ def dbo_server(tmp_path, enable_batch_invariant_mode):
         "--enable-expert-parallel",
         # Microbatching is rejected on allgather_reducescatter.
         "--all2all-backend",
-        "deepep_high_throughput",
+        request.param,
         "--enable-dbo",
         "--dbo-decode-token-threshold",
         str(DBO_DECODE_THRESHOLD),
@@ -451,12 +464,12 @@ def dbo_server(tmp_path, enable_batch_invariant_mode):
         MODEL, args, env_dict=env, seed=20240919, max_wait_seconds=1800
     )
     with server:
-        yield server, log_prefix
+        yield server, log_prefix, _EXPECTED_MANAGER[request.param]
 
 
 def test_microbatched_needle_is_invariant_to_batch_composition(dbo_server):
     """The needle must not move when DBO cuts its forward pass in two."""
-    server, log_prefix = dbo_server
+    server, log_prefix, expected_manager = dbo_server
     url = server.url_for("v1/completions")
     peers = [r for r in range(DP_SIZE) if r != NEEDLE_RANK]
 
@@ -500,9 +513,10 @@ def test_microbatched_needle_is_invariant_to_batch_composition(dbo_server):
         "are not running the mode they claim to."
     )
     managers = {r["cls"] for r in records if r.get("kind") == "manager"}
-    assert managers == {"DeepEPHTAll2AllManager"}, (
-        f"the workers built {managers or 'no'} all2all manager(s); a fallback "
-        "to AllGather+ReduceScatter would not accept microbatching at all."
+    assert managers == {expected_manager}, (
+        f"the workers built {managers or 'no'} all2all manager(s), not "
+        f"{expected_manager}; a fallback to AllGather+ReduceScatter would not "
+        "accept microbatching at all."
     )
 
     # Vacuity. A run in which no forward pass was ever split, or in which the
