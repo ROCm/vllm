@@ -113,23 +113,6 @@ def fits_medium(K, N):
     return K * N <= LDS_MEDIUM
 
 
-def pack_int4(values_int8):
-    """Pack signed int4 values using ExLlama shuffle for fast fp16 dequant."""
-    M, K = values_int8.shape
-    unsigned = (values_int8.to(torch.int16) + 8).to(torch.uint8)
-    g = unsigned.view(M, K // 8, 8).to(torch.int32)
-    shuffled = (
-        g[:, :, 0]
-        | (g[:, :, 2] << 4)
-        | (g[:, :, 4] << 8)
-        | (g[:, :, 6] << 12)
-        | (g[:, :, 1] << 16)
-        | (g[:, :, 3] << 20)
-        | (g[:, :, 5] << 24)
-        | (g[:, :, 7] << 28)
-    )
-    return shuffled.contiguous().view(torch.int8).contiguous()
-
 
 def parse_shape(s):
     parts = s.split("x")
@@ -204,12 +187,10 @@ def run_sweep(shapes, batch_sizes, warmup, rep, csv_path, medium_only=False):
                     skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
                     continue
 
-            # Pack with pack_skinny_int4, the helper production uses, rather
-            # than the local pack_int4: pack_int4 leaves the row stride
-            # contiguous, so at K=8192 the stride is 4096 B -- a multiple of
-            # 512, squarely on the gfx1151 cache cliff.  Sweeping there would
-            # tune a layout production never sees.  The scale rows get the
-            # same treatment, since the layer pads them off the same cliff.
+            # pack_skinny_int4 applies the gfx1151 row-stride padding, so the
+            # sweep measures the layout production actually runs.  The scale
+            # rows get the same treatment, since the layer pads them off the
+            # same cliff.
             values_int4 = torch.randint(0, 16, (M, K), dtype=torch.int32, device="cuda")
             weight_packed, _ = pack_skinny_int4(values_int4)
             scale = torch.rand(M, num_groups, dtype=dtype, device="cuda") * 0.02 - 0.01

@@ -14,6 +14,7 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <cstddef>  // std::byte
 #include <memory>   // std::assume_aligned
 #include <utility>  // std::in_range
 #include <type_traits>
@@ -32,11 +33,6 @@
 #endif
 
 #define LDS_SIZE 64 * 1024
-
-// Elements of a 16-bit activation that fit in the s[] the skinny kernels
-// declare.  Not the same as get_lds_size_int4()/2, which reports what the
-// device allows and is larger on gfx950; this is what the code allocates.
-inline constexpr uint32_t kActLdsElems = LDS_SIZE / 2;
 
 static int get_lds_size_int4() {
   static bool is_cached = false;
@@ -170,16 +166,10 @@ __device__ __forceinline__ void load_act_into_lds(
 // lane even when the final block is only partly filled.
 
 // One 16-byte LDS access, the widest the hardware offers (ds_load_b128 /
-// ds_store_b128).  Deliberately not an array of scalar_t: the element type is
-// irrelevant here, the alignment is what makes the compiler emit the wide
-// access, and scalar_t is half in one instantiation and bfloat16 in the other.
+// ds_store_b128).
 struct alignas(16) lds_piece {
-  float f[4];
+  std::byte bytes[16];
 };
-
-// Elements of scalar_t that one lds_piece covers.  Every activation type this
-// kernel supports is 2 bytes wide.
-inline constexpr uint32_t ACT_LDS_PIECE = sizeof(lds_piece) / 2;
 
 // Chunked variant of load_act_into_lds, for wvSplitK_int4_compute_sml_'s
 // CHUNKED mode: copies A[kBase, kBase+chunkSpan) of *every* one of the N
@@ -202,14 +192,16 @@ template <typename scalar_t, int THRDS, int A_CHUNK, int N, uint32_t KFIT>
 __device__ __forceinline__ void load_act_chunk_into_lds(
     scalar_t* s, const scalar_t* __restrict__ A, const uint32_t K,
     const uint32_t kBase, const uint32_t chunkSpan, const int _WvPrGrp) {
+  // Activation elements one lds_piece covers.
+  constexpr uint32_t PIECE = sizeof(lds_piece) / sizeof(scalar_t);
   const uint32_t span = min__(chunkSpan, K - kBase);
   const uint32_t step = THRDS * A_CHUNK * _WvPrGrp;
   const uint32_t off = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
   for (uint32_t k = 0; k < span; k += step) {
     uint32_t k_in = k + off;
     if (k_in >= span) break;
-    // Piece-major within a block, see ACT_LDS_PIECE.  k is a multiple of
-    // THRDS*A_CHUNK, so the block base is k + threadIdx.y*THRDS*A_CHUNK and
+    // Piece-major within a block, see the lds_piece comment.  k is a multiple
+    // of THRDS*A_CHUNK, so the block base is k + threadIdx.y*THRDS*A_CHUNK and
     // this thread owns lane threadIdx.x of it -- no division needed.
     const uint32_t blk = k + threadIdx.y * (THRDS * A_CHUNK);
   #pragma unroll
@@ -218,10 +210,9 @@ __device__ __forceinline__ void load_act_chunk_into_lds(
           reinterpret_cast<const lds_piece*>(&A[K * n + kBase + k_in]));
       auto* dst =
           std::assume_aligned<alignof(lds_piece)>(reinterpret_cast<lds_piece*>(
-              &s[n * KFIT + blk + threadIdx.x * ACT_LDS_PIECE]));
+              &s[n * KFIT + blk + threadIdx.x * PIECE]));
   #pragma unroll
-      for (uint32_t p = 0; p < A_CHUNK / ACT_LDS_PIECE; p++)
-        dst[p * THRDS] = src[p];
+      for (uint32_t p = 0; p < A_CHUNK / PIECE; p++) dst[p * THRDS] = src[p];
     }
   }
 }
@@ -302,22 +293,23 @@ __device__ __forceinline__ uint32_t zp_nibble(const uint32_t* zp_packed,
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
-          bool CHUNKED = false>
+          bool CHUNKED = false, size_t LDS_ELEMS = 0>
 __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
-    const int CuCount, scalar_t* s, const int B_row_stride_bytes,
+    const int CuCount, scalar_t (&s)[LDS_ELEMS], const int B_row_stride_bytes,
     const int group_stride) {
   // B_row_stride_bytes is the per-row byte stride of the packed weights;
   // pass K/2 for the contiguous default, or K/2 + pad for the padded layout
   // (see gfx1151 K%2048 cliff workaround).
   //
   // CHUNKED walks K in LDS-sized chunks so that all N activation rows can be
-  // read from LDS even when K*N exceeds it.  kActLdsElems is the size of the
-  // s[] the caller declares; it is a compile-time constant so that kFit below
-  // is too, and kFit*n folds into the LDS address immediate.
+  // read from LDS even when K*N exceeds it.  LDS_ELEMS is deduced from the
+  // caller's array -- the MoE caller stages a quarter of what the plain kernel
+  // does -- so kFit below is a compile-time constant that matches the buffer
+  // actually passed, and kFit*n folds into the LDS address immediate.
 
   union bigTypeA {
     scalar_t h[A_CHUNK];
@@ -361,10 +353,10 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
     // Per-row LDS window for CHUNKED, rounded *down* to a whole number of k1
     // steps so a chunk boundary can only ever fall between two iterations.
     constexpr uint32_t TUC = THRDS * UNRL * A_CHUNK;
-    constexpr uint32_t kFit = (kActLdsElems / N) - (kActLdsElems / N) % TUC;
+    constexpr uint32_t kFit = (LDS_ELEMS / N) - (LDS_ELEMS / N) % TUC;
     static_assert(!CHUNKED || kFit >= TUC,
                   "CHUNKED needs at least one k1 step of LDS per row");
-    static_assert(!CHUNKED || (uint64_t)kFit * N <= kActLdsElems,
+    static_assert(!CHUNKED || (uint64_t)kFit * N <= LDS_ELEMS,
                   "CHUNKED LDS band overruns the caller's s[]");
     [[maybe_unused]] uint32_t kBase = 0;
 
@@ -451,16 +443,16 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
             // stay on the *absolute* k_ -- only the LDS address is
             // chunk-relative.
             if constexpr (CHUNKED) {
-              // Piece-major band, see ACT_LDS_PIECE.  k (not k_) is the block
-              // base; the lane offset moves in 16-byte pieces instead of
+              // Piece-major band, see the lds_piece comment.  k (not k_) is the
+              // block base; the lane offset moves in 16-byte pieces instead of
               // A_CHUNK, and successive pieces sit a whole lane-plane apart.
+              constexpr uint32_t PIECE = sizeof(lds_piece) / sizeof(scalar_t);
               const auto* src = std::assume_aligned<alignof(lds_piece)>(
                   reinterpret_cast<const lds_piece*>(
-                      &s[kFit * n + (k - kBase) +
-                         threadIdx.x * ACT_LDS_PIECE]));
+                      &s[kFit * n + (k - kBase) + threadIdx.x * PIECE]));
               auto* dst = reinterpret_cast<lds_piece*>(&bigA[n][k2]);
   #pragma unroll
-              for (uint32_t p = 0; p < A_CHUNK / ACT_LDS_PIECE; p++)
+              for (uint32_t p = 0; p < A_CHUNK / PIECE; p++)
                 dst[p] = src[p * THRDS];
             } else {
               bigA[n][k2] = *((const bigTypeA*)__builtin_assume_aligned(
@@ -752,7 +744,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                           const int _WvPrGrp, const int CuCount,
                           const int B_row_stride_bytes,
                           const int group_stride) {
-  constexpr int max_lds_len = kActLdsElems;
+  constexpr int max_lds_len = LDS_SIZE / sizeof(scalar_t);
   __shared__ scalar_t s[max_lds_len];
   // CHUNKED fills s[] itself, once per chunk, from inside the compute body.
   if constexpr (!CHUNKED)
@@ -784,15 +776,18 @@ __global__ void wvSplitK_int4_hf_sml_(
 // LDS).
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false>
+          int UNRL, int N, int GROUP_SIZE = 0, bool HAS_ZERO_POINTS = false,
+          size_t LDS_ELEMS = 0>
 __device__ __forceinline__ void wvSplitK_int4_compute_(
     const int K, const int M, const int Bx, const int By,
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
-    const int CuCount, scalar_t* s, const int B_row_stride_bytes,
+    const int CuCount, scalar_t (&s)[LDS_ELEMS], const int B_row_stride_bytes,
     const int group_stride) {
-  constexpr int max_lds_len = LDS_SIZE / 2;
+  // How much of the activation is staged in LDS; the rest is read from global.
+  // Deduced from the caller's array so the split cannot drift from it.
+  constexpr int max_lds_len = LDS_ELEMS;
 
   union bigTypeA {
     scalar_t h[A_CHUNK];
@@ -1088,7 +1083,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                       const scalar_t* __restrict__ BIAS, scalar_t* C,
                       const int _WvPrGrp, const int CuCount,
                       const int B_row_stride_bytes, const int group_stride) {
-  constexpr int max_lds_len = LDS_SIZE / 2;
+  constexpr int max_lds_len = LDS_SIZE / sizeof(scalar_t);
   __shared__ scalar_t s[max_lds_len];
   load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(s, A, K, max_lds_len);
   wvSplitK_int4_compute_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
@@ -1178,11 +1173,11 @@ static int mindiv_int4(int N, int div1, int div2) {
   {                                                                            \
     dim3 block(_THRDS, _W);                                                    \
     int __wvPrGrp = mindiv_int4(M_in, CuCount * _YTILE, _W);                   \
-    /* Gate on kActLdsElems, what the body allocates, not on the host          \
-       max_lds_len, which is get_lds_size_int4()/2 and larger on gfx950. */    \
+    /* Gate on what the kernel allocates, not on the host max_lds_len,         \
+       which is get_lds_size_int4()/2 and larger on gfx950. */                 \
+    constexpr int __ldsElems = LDS_SIZE / sizeof(fptype);                      \
     constexpr int __tuc = (_THRDS) * (_UNRL) * (_AC);                          \
-    constexpr int __kFit =                                                     \
-        (kActLdsElems / (_N)) - (kActLdsElems / (_N)) % __tuc;                 \
+    constexpr int __kFit = (__ldsElems / (_N)) - (__ldsElems / (_N)) % __tuc;  \
     /* K % A_CHUNK: the last chunk's span is K - kBase, and a non-multiple     \
        would make load_act_chunk_into_lds read past the final row. */          \
     if (M_in % (_YTILE) == 0 && __kFit >= __tuc && K_in % (_AC) == 0)          \
