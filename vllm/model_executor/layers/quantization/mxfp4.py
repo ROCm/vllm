@@ -486,11 +486,10 @@ def _use_k3_situ_aiter(moe: FusedMoEConfig) -> bool:
         return False
     from vllm._aiter_ops import rocm_aiter_ops
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm.platforms.rocm import on_gfx950
-
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
     return (
         rocm_aiter_ops.is_fused_moe_enabled()
-        and on_gfx950()
+        and (on_gfx950() or on_gfx1250())
         and moe.activation == MoEActivation.SITU
         and moe.activation_situ_linear_beta is not None
         and rocm_aiter_ops.get_aiter_activation_type("situ") is not None
@@ -534,6 +533,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     @property
     def supports_eplb(self) -> bool:
         return True
+
+    @property
+    def uses_triton_weight_format(self) -> bool:
+        """Whether `_setup_kernel` produced triton_kernels-wrapped weights."""
+        from vllm.platforms.rocm import on_gfx1250
+
+        if self.is_k3_situ_aiter:
+            return False
+        return self.mxfp4_backend in TRITON_BACKENDS or (
+            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and on_gfx1250()
+        )
 
     @property
     def skip_forward_padding(self) -> bool:
@@ -737,16 +747,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # For TRITON backends, weights are wrapped tensors from triton_kernels
         # that don't support .detach(). Manually assign parameters.
-        is_gfx1250 = False
-        if current_platform.is_rocm():
-            from vllm.platforms.rocm import on_gfx1250
-
-            is_gfx1250 = on_gfx1250()
-
-        uses_triton_weight_format = self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and is_gfx1250
-        )
-        if not uses_triton_weight_format:
+        if not self.uses_triton_weight_format:
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             replace_parameter(layer, "w13_weight_scale", w13_scale)
@@ -783,6 +784,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from aiter.utility.fp4_utils import e8m0_shuffle
 
         from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.platforms.rocm import on_gfx1250
 
         fp4_dtype = torch.float4_e2m1fn_x2
         e8m0_dtype = torch.float8_e8m0fnu
@@ -792,18 +794,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # interleaved (_gui_) fp8 flydsl kernels, which need w13 weight+scale
         # in interleave layout. Default a16w4 keeps the separated layout.
         guinterleave = rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
-        w13 = rocm_aiter_ops.shuffle_weight_a16w4(
-            layer.w13_weight.data.view(fp4_dtype), 16, guinterleave
-        )
-        w2 = rocm_aiter_ops.shuffle_weight_a16w4(
-            layer.w2_weight.data.view(fp4_dtype), 16, False
-        )
+        w13_raw = layer.w13_weight.data.view(fp4_dtype)
+        w2_raw = layer.w2_weight.data.view(fp4_dtype)
         w13_scale_raw = layer.w13_weight_scale.data.view(e8m0_dtype)
         w2_scale_raw = layer.w2_weight_scale.data.view(e8m0_dtype)
-        w13_scale = rocm_aiter_ops.shuffle_scale_a16w4(
-            w13_scale_raw.view(-1, w13_scale_raw.shape[-1]), num_experts, guinterleave
-        )
-        w2_scale = e8m0_shuffle(w2_scale_raw.view(-1, w2_scale_raw.shape[-1]))
+        w13_scale_raw = w13_scale_raw.view(-1, w13_scale_raw.shape[-1])
+        w2_scale_raw = w2_scale_raw.view(-1, w2_scale_raw.shape[-1])
+
+        if on_gfx1250():
+            from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+
+            w13 = moe_shuffle_weight(
+                w13_raw, num_experts, is_guinterleave=guinterleave, gate_up=True
+            )
+            w2 = moe_shuffle_weight(
+                w2_raw, num_experts, is_guinterleave=False, gate_up=False
+            )
+            w13_scale = moe_shuffle_scale(
+                w13_scale_raw, num_experts, is_guinterleave=guinterleave, gate_up=True
+            )
+            w2_scale = moe_shuffle_scale(
+                w2_scale_raw, num_experts, is_guinterleave=False, gate_up=False
+            )
+        else:
+            w13 = rocm_aiter_ops.shuffle_weight_a16w4(w13_raw, 16, guinterleave)
+            w2 = rocm_aiter_ops.shuffle_weight_a16w4(w2_raw, 16, False)
+            w13_scale = rocm_aiter_ops.shuffle_scale_a16w4(
+                w13_scale_raw, num_experts, guinterleave
+            )
+            w2_scale = e8m0_shuffle(w2_scale_raw)
 
         w13.is_shuffled = True
         w2.is_shuffled = True
@@ -831,15 +850,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2_bias = getattr(layer, "w2_bias", None)
         swiglu_limit = getattr(layer, "swiglu_limit", None)
 
-        is_gfx1250 = False
-        if current_platform.is_rocm():
-            from vllm.platforms.rocm import on_gfx1250
-
-            is_gfx1250 = on_gfx1250()
-
-        if self.mxfp4_backend in TRITON_BACKENDS or (
-            self.mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and is_gfx1250
-        ):
+        if self.uses_triton_weight_format:
             # TRITON backends free w13/w2_weight_scale after swizzling; the
             # swizzled scales live inside the precision configs instead.
             assert self.w13_precision_config is not None
