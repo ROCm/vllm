@@ -37,6 +37,7 @@ on:
   pull_request:
     branches:
       - gfx11
+  workflow_dispatch:
 
 env:
   PYTORCH_INDEX_URL: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
