@@ -4,36 +4,38 @@
 import asyncio
 import signal
 import socket
-from http import HTTPStatus
-from typing import Any, Optional
+from functools import partial
+from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 
 from vllm import envs
-from vllm.engine.async_llm_engine import AsyncEngineDeadError
-from vllm.engine.multiprocessing import MQEngineDeadError
 from vllm.engine.protocol import EngineClient
-from vllm.entrypoints.constants import (H11_MAX_HEADER_COUNT_DEFAULT,
-                                        H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT)
-from vllm.entrypoints.ssl import SSLCertRefresher
+from vllm.entrypoints.serve.utils.constants import (
+    H11_MAX_HEADER_COUNT_DEFAULT,
+    H11_MAX_INCOMPLETE_EVENT_SIZE_DEFAULT,
+)
+from vllm.entrypoints.serve.utils.ssl import SSLCertRefresher
 from vllm.logger import init_logger
-from vllm.utils import find_process_using_port
-from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.utils.network_utils import find_process_using_port
 
 logger = init_logger(__name__)
 
 
-async def serve_http(app: FastAPI,
-                     sock: Optional[socket.socket],
-                     enable_ssl_refresh: bool = False,
-                     **uvicorn_kwargs: Any):
+async def serve_http(
+    app: FastAPI,
+    sock: socket.socket | None,
+    enable_ssl_refresh: bool = False,
+    **uvicorn_kwargs: Any,
+):
     """
     Start a FastAPI app using Uvicorn, with support for custom Uvicorn config
     options.  Supports http header limits via h11_max_incomplete_event_size and
     h11_max_header_count.
     """
     logger.info("Available routes are:")
+    # post endpoints
     for route in app.routes:
         methods = getattr(route, "methods", None)
         path = getattr(route, "path", None)
@@ -41,11 +43,23 @@ async def serve_http(app: FastAPI,
         if methods is None or path is None:
             continue
 
-        logger.info("Route: %s, Methods: %s", path, ', '.join(methods))
+        logger.info("Route: %s, Methods: %s", path, ", ".join(methods))
+
+    # other endpoints
+    for route in app.routes:
+        endpoint = getattr(route, "endpoint", None)
+        methods = getattr(route, "methods", None)
+        path = getattr(route, "path", None)
+
+        if endpoint is None or path is None or methods is not None:
+            continue
+
+        logger.info("Route: %s, Endpoint: %s", path, endpoint.__name__)
 
     # Extract header limit options if present
     h11_max_incomplete_event_size = uvicorn_kwargs.pop(
-        "h11_max_incomplete_event_size", None)
+        "h11_max_incomplete_event_size", None
+    )
     h11_max_header_count = uvicorn_kwargs.pop("h11_max_header_count", None)
 
     # Set safe defaults if not provided
@@ -60,33 +74,76 @@ async def serve_http(app: FastAPI,
     config.h11_max_header_count = h11_max_header_count
     config.load()
     server = uvicorn.Server(config)
-    _add_shutdown_handlers(app, server)
+    app.state.server = server
 
     loop = asyncio.get_running_loop()
 
-    watchdog_task = loop.create_task(
-        watchdog_loop(server, app.state.engine_client))
-    server_task = loop.create_task(
-        server.serve(sockets=[sock] if sock else None))
+    watchdog_task = loop.create_task(watchdog_loop(server, app.state.engine_client))
+    server_task = loop.create_task(server.serve(sockets=[sock] if sock else None))
 
-    ssl_cert_refresher = None if not enable_ssl_refresh else SSLCertRefresher(
-        ssl_context=config.ssl,
-        key_path=config.ssl_keyfile,
-        cert_path=config.ssl_certfile,
-        ca_path=config.ssl_ca_certs)
+    ssl_cert_refresher = (
+        None
+        if not enable_ssl_refresh
+        else SSLCertRefresher(
+            ssl_context=config.ssl,
+            key_path=config.ssl_keyfile,
+            cert_path=config.ssl_certfile,
+            ca_path=config.ssl_ca_certs,
+        )
+    )
+
+    # make sure uvicorn server signal handler has been registered.
+    # Otherwise the app signal handler below will be overwritten in server.serve.
+    # server.started is set to True after server complete server.startup.
+    # We need to constraint the time sequence.
+    logger.info("API server: waiting for HTTP server to start")
+    while not server.started and not server_task.done():
+        await asyncio.sleep(0.1)
+    if server_task.done():
+        # Propagate startup failure (e.g. port bind error) instead of hanging.
+        await server_task
+    logger.info("API server: HTTP server started")
+
+    shutdown_event = asyncio.Event()
 
     def signal_handler() -> None:
-        # prevents the uvicorn signal handler to exit early
-        server_task.cancel()
-        watchdog_task.cancel()
-        if ssl_cert_refresher:
-            ssl_cert_refresher.stop()
+        if shutdown_event.is_set():
+            return
+        logger.info_once("[shutdown] API server: shutdown triggered")
+        shutdown_event.set()
 
     async def dummy_shutdown() -> None:
         pass
 
     loop.add_signal_handler(signal.SIGINT, signal_handler)
     loop.add_signal_handler(signal.SIGTERM, signal_handler)
+
+    async def handle_shutdown() -> None:
+        await shutdown_event.wait()
+
+        engine_client = app.state.engine_client
+        timeout = engine_client.vllm_config.shutdown_timeout
+        mode = "abort" if timeout == 0 else "drain"
+
+        logger.info(
+            "[shutdown] API server: stopping engine client mode=%s timeout=%ss",
+            mode,
+            timeout,
+        )
+
+        await loop.run_in_executor(
+            None, partial(engine_client.shutdown, timeout=timeout)
+        )
+        logger.info_once("[shutdown] API server: engine client stopped")
+
+        server.should_exit = True
+        logger.info_once("[shutdown] API server: signalling HTTP server shutdown")
+        server_task.cancel()
+        watchdog_task.cancel()
+        if ssl_cert_refresher:
+            ssl_cert_refresher.stop()
+
+    shutdown_task = loop.create_task(handle_shutdown())
 
     try:
         await server_task
@@ -95,12 +152,16 @@ async def serve_http(app: FastAPI,
         port = uvicorn_kwargs["port"]
         process = find_process_using_port(port)
         if process is not None:
-            logger.debug(
+            logger.warning(
                 "port %s is used by process %s launched with command:\n%s",
-                port, process, " ".join(process.cmdline()))
-        logger.info("Shutting down FastAPI HTTP server.")
+                port,
+                process,
+                " ".join(process.cmdline()),
+            )
+        logger.info_once("[shutdown] API server: shutting down FastAPI HTTP server")
         return server.shutdown()
     finally:
+        shutdown_task.cancel()
         watchdog_task.cancel()
 
 
@@ -127,42 +188,3 @@ def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
     engine_errored = engine.errored and not engine.is_running
     if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:
         server.should_exit = True
-
-
-def _add_shutdown_handlers(app: FastAPI, server: uvicorn.Server) -> None:
-    """
-    VLLM V1 AsyncLLM catches exceptions and returns
-    only two types: EngineGenerateError and EngineDeadError.
-    
-    EngineGenerateError is raised by the per request generate()
-    method. This error could be request specific (and therefore
-    recoverable - e.g. if there is an error in input processing).
-    
-    EngineDeadError is raised by the background output_handler
-    method. This error is global and therefore not recoverable.
-    
-    We register these @app.exception_handlers to return nice
-    responses to the end user if they occur and shut down if needed.
-    See https://fastapi.tiangolo.com/tutorial/handling-errors/
-    for more details on how exception handlers work.
-
-    If an exception is encountered in a StreamingResponse
-    generator, the exception is not raised, since we already sent
-    a 200 status. Rather, we send an error message as the next chunk.
-    Since the exception is not raised, this means that the server
-    will not automatically shut down. Instead, we use the watchdog
-    background task for check for errored state.
-    """
-
-    @app.exception_handler(RuntimeError)
-    @app.exception_handler(AsyncEngineDeadError)
-    @app.exception_handler(MQEngineDeadError)
-    @app.exception_handler(EngineDeadError)
-    @app.exception_handler(EngineGenerateError)
-    async def runtime_exception_handler(request: Request, __):
-        terminate_if_errored(
-            server=server,
-            engine=request.app.state.engine_client,
-        )
-
-        return Response(status_code=HTTPStatus.INTERNAL_SERVER_ERROR)

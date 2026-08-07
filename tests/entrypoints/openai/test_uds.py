@@ -10,7 +10,7 @@ from vllm.version import __version__ as VLLM_VERSION
 
 from ...utils import RemoteOpenAIServer
 
-MODEL_NAME = "HuggingFaceH4/zephyr-7b-beta"
+MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module")
@@ -40,4 +40,5 @@ async def test_show_version(server: RemoteOpenAIServer):
     response = client.get(server.url_for("version"))
     response.raise_for_status()
 
-    assert response.json() == {"version": VLLM_VERSION}
+    # Tolerate additive fields (e.g. the Rust frontend reports its own version).
+    assert response.json()["version"] == VLLM_VERSION
