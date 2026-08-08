@@ -32,6 +32,10 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     ref_nvfp4_quant_dequant,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+    padding_bounded_amax,
+)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
 )
@@ -43,6 +47,8 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 
 logger = init_logger(__name__)
+
+_MOE_FP8_MAX = get_fp8_min_max()[1]
 
 
 @triton.jit
@@ -151,12 +157,26 @@ def _fp8_quantize(
     block_shape: list[int] | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    bound_cudagraph_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform fp8 quantization on the inputs.  If a block_shape
     is provided, the output will be blocked.
     """
     if block_shape is None:
+        if A_scale is None and not per_act_token and bound_cudagraph_padding:
+            # Token rows: the rows this reduction must not span are the
+            # cudagraph padding rows, which hold the previous replay's
+            # activations.  See `padding_bounded_amax`.
+            amax = padding_bounded_amax(A)
+            if amax is not None:
+                # Widen for the divide, then narrow, and no
+                # `_FP8_MIN_SCALING_FACTOR` floor: this is the same arithmetic
+                # `QuantFP8._bounded_per_tensor_scale` performs, and the
+                # shipped per-tensor kernel applies no floor either.
+                A_scale = (
+                    (amax.double() / _MOE_FP8_MAX).float().clamp(min=1e-12).reshape(1)
+                )
         if (
             A_scale is None
             and not per_act_token
@@ -198,6 +218,7 @@ def _int8_quantize(
     block_shape: list[int] | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    bound_cudagraph_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform int8 quantization on the inputs.  If a block_shape
@@ -208,6 +229,11 @@ def _int8_quantize(
     # activations apply per-token quantization. Otherwise, assume
     # activation tensor-wise fp8/int8 quantization, dynamic or static
     if block_shape is None:
+        if A_scale is None and not per_act_token and bound_cudagraph_padding:
+            amax = padding_bounded_amax(A)
+            if amax is not None:
+                # Same expression as the unbounded branch below, same floor.
+                A_scale = torch.clamp(amax / 127.0, min=1e-10)
         if per_act_token:
             A, A_scale = per_token_quant_int8(A)
         elif A_scale is not None:
@@ -331,6 +357,7 @@ def moe_kernel_quantize_input(
     mx_alignment: int = 0,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    bound_cudagraph_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """``topk_ids``/``expert_map`` bound the dynamic per-tensor fp8 reduction.
 
@@ -338,6 +365,12 @@ def moe_kernel_quantize_input(
     own -- an unrouted or non-local token-expert slot that MM1 never wrote.
     Every other branch is per-token, per-group or static and is already bounded,
     so they ignore these.
+
+    ``bound_cudagraph_padding`` says the leading dimension of ``A`` indexes
+    tokens, so the *other* rows this reduction must not span -- the cudagraph
+    padding rows -- can be excluded too.  It is False by default because the a2
+    input's rows are token-expert slots, which the padding mask does not
+    describe; only the a1 call sites set it.
     """
     # Handle OCP MX scheme that requires QDQ (quantize-dequantize) for emulation
     if ocp_mx_scheme is not None:
@@ -359,7 +392,13 @@ def moe_kernel_quantize_input(
             return _fp8_quantize_dequantize(A, A_scale)
         else:
             return _fp8_quantize(
-                A, A_scale, per_act_token_quant, block_shape, topk_ids, expert_map
+                A,
+                A_scale,
+                per_act_token_quant,
+                block_shape,
+                topk_ids,
+                expert_map,
+                bound_cudagraph_padding,
             )
     elif quant_dtype == torch.int8:
         if quantization_emulation:
@@ -368,7 +407,13 @@ def moe_kernel_quantize_input(
                 " MOE quantization emulation. Please open an issue."
             )
         return _int8_quantize(
-            A, A_scale, per_act_token_quant, block_shape, topk_ids, expert_map
+            A,
+            A_scale,
+            per_act_token_quant,
+            block_shape,
+            topk_ids,
+            expert_map,
+            bound_cudagraph_padding,
         )
     elif quant_dtype == "nvfp4":
         if not quantization_emulation:

@@ -7,12 +7,12 @@ import torch.nn.functional as F
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     get_fp8_min_max,
     group_broadcast,
+    padding_bounded_amax,
     prep_scale_for_group_broadcast,
 )
 from vllm.platforms import current_platform
@@ -128,20 +128,12 @@ class QuantFP8(CustomOp):
             # with a mask that does not describe these rows is worse, and
             # silent.  Proper support belongs where the chunking happens.
             return None
-        if not is_forward_context_available():
+        # `padding_bounded_amax` reads the *unsliced* mask buffer, because this
+        # runs inside a compiled region and a varying length would be baked in
+        # as a wrong constant.  See `ForwardContext.is_padding_full`.
+        amax = padding_bounded_amax(x)
+        if amax is None:
             return None
-        ctx = get_forward_context()
-        # The unsliced buffer, because this runs inside a compiled region and a
-        # varying length would be baked in as a wrong constant.  See
-        # `ForwardContext.is_padding_full`.
-        is_padding = ctx.is_padding_full
-        if is_padding is None or x.ndim < 2:
-            return None
-        x_2d = x.view(-1, x.shape[-1])
-
-        row_amax = x_2d.abs().amax(dim=-1).to(torch.float32)
-        is_padding = is_padding[: row_amax.shape[0]]
-        amax = torch.where(is_padding, row_amax.new_zeros(()), row_amax).max()
         # Widen for the divide, then narrow: `amax / _FP8_MAX` in fp32 lowers to
         # a reciprocal multiply, which differs from the correctly-rounded
         # quotient the HIP kernel computes on about half of all inputs.

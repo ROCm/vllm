@@ -177,3 +177,73 @@ def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch)
     # Disabled: identical to the unmasked path, bit for bit.
     assert torch.equal(scale, unbounded)
     assert float(scale) > 1e26
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
+)
+def test_moe_a1_scale_ignores_cudagraph_padding(vllm_config):
+    """The MoE's *first* activation quantize is one row per token.
+
+    `topk_ids` bounds the a2 buffer, whose rows are token-expert slots. It says
+    nothing about a1, whose rows are tokens -- and the rows a1 must not span are
+    the cudagraph padding ones. Left unbounded this cost DeepSeek-V2-Lite 52.5%
+    unparsable answers and 68% repetition loops at concurrency 8, with no
+    all2all in the graph at all.
+    """
+    device = current_platform.device_type
+    n_real, n_pad, hidden = 12, 4, 64
+    torch.manual_seed(23)
+    a = torch.randn(n_real + n_pad, hidden, device=device, dtype=torch.bfloat16)
+    a[n_real:] = SENTINEL
+
+    is_padding = torch.zeros(n_real + n_pad, dtype=torch.bool, device=device)
+    is_padding[n_real:] = True
+
+    fp8 = current_platform.fp8_dtype()
+    with set_forward_context(
+        None, vllm_config, num_tokens=n_real + n_pad, is_padding_full=is_padding
+    ):
+        _, bounded = moe_kernel_quantize_input(
+            a, None, fp8, False, None, bound_cudagraph_padding=True
+        )
+        # Opting out must be a true no-op, so the a2 call sites are unaffected.
+        _, opted_out = moe_kernel_quantize_input(a, None, fp8, False, None)
+    _, unbounded = moe_kernel_quantize_input(a, None, fp8, False, None)
+
+    want = float(a[:n_real].abs().amax()) / torch.finfo(fp8).max
+    assert float(bounded) == pytest.approx(want, rel=1e-6)
+    assert float(unbounded) > 1e26
+    assert torch.equal(opted_out, unbounded)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
+)
+def test_mask_shorter_than_the_batch_leaves_the_rest_unbounded(vllm_config):
+    """A mask that runs out must not be stretched over the rows it never saw.
+
+    At DP > 1 the tensor handed to a per-tensor quantize can have more rows than
+    the mask describes. Bounding the prefix and silently dropping the tail would
+    under-count the amax and clip real activations; reusing the mask cyclically
+    would attribute one row's padding bit to another. The uncovered rows are
+    included unbounded instead -- the behaviour with no mask at all.
+    """
+    device = current_platform.device_type
+    with set_current_vllm_config(vllm_config):
+        quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
+
+    n_rows, hidden = 16, 64
+    torch.manual_seed(29)
+    x = torch.randn(n_rows, hidden, device=device, dtype=torch.bfloat16)
+    x[n_rows - 1] = SENTINEL  # a real row the short mask never reaches
+
+    short = torch.zeros(4, dtype=torch.bool, device=device)
+    with set_forward_context(
+        None, vllm_config, num_tokens=n_rows, is_padding_full=short
+    ):
+        _, scale = quant(x)
+    _, unbounded = quant(x)
+
+    assert torch.equal(scale, unbounded)
+    assert float(scale) > 1e26

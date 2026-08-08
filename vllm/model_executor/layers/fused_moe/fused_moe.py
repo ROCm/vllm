@@ -1796,6 +1796,9 @@ def fused_experts_impl(
         quant_dtype=quant_dtype,
         per_act_token_quant=per_channel_quant,
         block_shape=block_shape,
+        # One row per token, so a dynamic per-tensor amax here spans the
+        # cudagraph padding rows unless it is told where the batch ends.
+        bound_cudagraph_padding=True,
     )
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = _prepare_expert_assignment(
