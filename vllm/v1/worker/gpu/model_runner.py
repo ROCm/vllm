@@ -1407,6 +1407,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                # The same mask, unsliced.  Consumers inside a compiled region
+                # cannot take the sliced one: Dynamo specializes a tensor
+                # reached through the forward context to the length it had at
+                # trace time, so a length that tracks the cudagraph size is a
+                # wrong constant on every other size.  Without this, every
+                # `is_padding_full` consumer -- including the bound on the
+                # dynamic per-tensor fp8 activation amax -- sees None on the V2
+                # runner and silently reduces across the padding rows.
+                is_padding_full=self.input_buffers.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
