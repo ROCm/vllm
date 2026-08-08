@@ -34,14 +34,26 @@ NUM_QUESTIONS = 256  # Fast eval for CI; but must be large enough to hit dbo thr
 NUM_SHOTS = 5  # Few-shot examples
 # The eval is not deterministic: it fires all questions concurrently, so batch
 # composition -- and with it the numerics -- differs between runs of the same
-# question set. Measured on 2x gfx950 over 13 post-warmup evals: mean 0.648,
-# stdev 0.018, min 0.621. A 0.62 floor sat about one stdev below the mean and
-# failed roughly one run in six. This floor is ~3.5 stdev down, which still
-# catches any real regression -- a broken DBO collapses accuracy, it does not
-# shave two points off it.
-MIN_ACCURACY = 0.58
+# question set.
+#
+# This floor was lowered to 0.58 when the failures looked numerical. They were
+# not: most of them were the server dying mid-eval, which returns accuracy 0.0
+# and reads as a very low score. The cause was a stream-ordering bug in DeepEP
+# (its start-of-op wait took `previous_event` instead of, rather than as well
+# as, the caller's stream, so under dual-batch overlap it never waited on the
+# stream its output tensors were allocated on). With that fixed, measured on
+# 2x gfx950 over 144 post-warmup evals across three configurations:
+#
+#     mean 0.6538-0.6567, stdev 0.0093-0.0132, min 0.6328, and 0 of 144 below
+#     0.62 -- against 1 genuine sub-0.62 in 44 evals before the fix, plus four
+#     crash-induced zeros.
+#
+# So 0.62 is defensible again and is restored. It sits ~1.8 stdev below the
+# observed minimum rather than the ~1 stdev it sat at before, because the
+# distribution did not move -- the crashes went away.
+MIN_ACCURACY = 0.62
 # A cold server answers its first burst badly: across five servers the opening
-# eval returned 2.7-3.5% unparseable answers against 0.4% once warm, costing up
+# eval returned 2.7-3.5% unparsable answers against 0.4% once warm, costing up
 # to seven points of accuracy. That is a distinct failure from a numerical
 # regression and is worth failing on separately rather than letting it show up
 # as a low score.
@@ -127,7 +139,7 @@ def test_dbo_dp_ep_gsm8k(all2all_backend: str, num_gpus_available):
         # so say which of the two went wrong.
         invalid_rate = results["invalid_rate"]
         assert invalid_rate <= MAX_INVALID_RATE, (
-            f"DBO+DP+EP produced too many unparseable answers "
+            f"DBO+DP+EP produced too many unparsable answers "
             f"({all2all_backend}): {invalid_rate:.3f} > {MAX_INVALID_RATE:.3f}"
         )
 
