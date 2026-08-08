@@ -52,6 +52,7 @@ def _count_expert_num_tokens(
     num_experts,
     topk_numel,
     expert_map,
+    expert_map_len,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -66,7 +67,13 @@ def _count_expert_num_tokens(
         expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)
         if HAS_EXPERT_MAP:
             expert_map_ptrs = expert_map + expert_ids
-            expert_map_mask = expert_ids >= 0
+            # Bound both ends, against the map's own length.  NOT against
+            # `num_experts`: this kernel is called with num_LOCAL_experts
+            # (see `count_expert_num_tokens` below, and the `curr_expert <
+            # num_experts` store guard), while `expert_ids` are GLOBAL ids --
+            # bounding by the local count would discard every id a rank > 0
+            # owns and silently return all zeros.
+            expert_map_mask = (expert_ids >= 0) & (expert_ids < expert_map_len)
             expert_ids = tl.load(expert_map_ptrs, mask=expert_map_mask, other=-1)
 
         has_curr_expert = tl.where(expert_ids == curr_expert, 1, 0)
@@ -110,6 +117,7 @@ def count_expert_num_tokens(
         num_local_experts,
         topk_ids.numel(),
         expert_map,
+        expert_map.numel() if expert_map is not None else 0,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
@@ -541,6 +549,7 @@ def _swiglu_limit_pad_aware_kernel(
     input_row_stride,
     num_tokens,
     swiglu_limit,
+    num_experts,
     HAS_LIMIT: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -558,7 +567,7 @@ def _swiglu_limit_pad_aware_kernel(
         if HAS_EXPERT_MAP:
             local_expert_id = tl.load(
                 expert_map_ptr + expert_id,
-                mask=expert_id >= 0,
+                mask=(expert_id >= 0) & (expert_id < num_experts),
                 other=-1,
             )
             should_compute = should_compute & (local_expert_id != -1)
@@ -616,6 +625,7 @@ def _swiglu_limit_pad_aware(
         gate_up_size,
         num_tokens,
         swiglu_limit,
+        expert_map.numel() if expert_map is not None else 0,
         HAS_LIMIT=swiglu_limit > 0,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -632,6 +642,7 @@ def _silu_and_mul_pad_aware_kernel(
     hidden_size,
     input_row_stride,
     num_rows,
+    num_experts,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -645,7 +656,9 @@ def _silu_and_mul_pad_aware_kernel(
         should_compute = expert_id >= 0
         if HAS_EXPERT_MAP:
             local_expert_id = tl.load(
-                expert_map_ptr + expert_id, mask=expert_id >= 0, other=-1
+                expert_map_ptr + expert_id,
+                mask=(expert_id >= 0) & (expert_id < num_experts),
+                other=-1,
             )
             should_compute = should_compute & (local_expert_id >= 0)
 
@@ -718,6 +731,7 @@ def silu_and_mul_pad_aware(
         hidden_size,
         gate_up_size,
         num_rows,
+        expert_map.numel() if expert_map is not None else 0,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=4,
