@@ -3981,6 +3981,132 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _microbatch_hazard_cuts(
+        self, num_reqs: int, num_scheduled_tokens_np: np.ndarray
+    ) -> np.ndarray | None:
+        """Request-index cut positions that would split a prefix from its writer.
+
+        A request can be admitted on a prefix cache hit against blocks another
+        request in the same batch is only computing now: `allocate_slots` caches
+        blocks at schedule time, not after they are computed. Run whole, the step
+        issues every KV write before any attention read and the hit holds.
+
+        Split, it does not, and not as a race. `dbo_yield` appears only in the
+        MoE, never in attention, so ubatch 0 runs attention and enters the MoE
+        before yielding, and both ubatches share one in-order compute stream.
+        Ubatch 0's attention is therefore enqueued strictly before ubatch 1's
+        `reshape_and_cache`, and a reader in ubatch 0 whose writer is in ubatch 1
+        reads zeros deterministically -- decided by arrival order at startup and
+        then fixed for the life of the server.
+
+        Only a reader that precedes its writer is at risk. For a hazard pair
+        (reader r, writer w) with r < w, a cut at k puts r in ubatch 0 and w in
+        ubatch 1 exactly when r < k <= w, so that pair forbids k in [r+1, w].
+        Pairs with w <= r are always safe: either both land together, or the
+        writer lands in the earlier ubatch, which is the order we want.
+
+        Returns a boolean mask over cut positions, or None when no pair exists.
+        """
+        if not self.parallel_config.use_ubatching or num_reqs < 2:
+            return None
+        computed = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+        query_lens = num_scheduled_tokens_np[:num_reqs]
+        # Step-level early-out. With every request scheduled a single token,
+        # nothing in this step writes a block another request could be reading.
+        # Deliberately not a per-request `query_len > reorder_batch_threshold`
+        # filter: a request admitted on a near-total prefix hit arrives with
+        # query_len == 1 and computed > 0, looking exactly like a decode.
+        if int(query_lens.max()) <= 1:
+            return None
+        readers = np.flatnonzero(computed > 0)
+        if readers.size == 0:
+            return None
+
+        forbidden = np.zeros(num_reqs + 1, dtype=bool)
+        found = False
+        for block_table in self.input_batch.block_table.block_tables:
+            block_size = block_table.block_size
+            table = block_table.get_numpy_array()
+            start = computed // block_size
+            stop = (computed + query_lens + block_size - 1) // block_size
+            span = int((stop - start).max())
+            columns = start[:, None] + np.arange(span)[None, :]
+            in_range = columns < stop[:, None]
+            ids = np.take_along_axis(
+                table[:num_reqs], np.minimum(columns, table.shape[1] - 1), axis=1
+            )
+            owner = np.broadcast_to(np.arange(num_reqs)[:, None], ids.shape)
+            wid, wof = ids[in_range], owner[in_range]
+            # Drop the null block: SWA and hybrid groups pad req_to_blocks with
+            # it and unallocated columns are also 0, so leaving it in would make
+            # every reader's padding match and veto unconditionally.
+            keep = wid != 0
+            wid, wof = wid[keep], wof[keep]
+            if wid.size == 0:
+                continue
+            order = np.argsort(wid, kind="stable")
+            wid, wof = wid[order], wof[order]
+
+            for r in readers:
+                # Whole blocks only: a reader ends inside a partly filled block,
+                # which is private to it and which it fills before reading.
+                whole = computed[r] // block_size
+                if whole == 0:
+                    continue
+                pos = np.searchsorted(wid, table[r, :whole])
+                pos = np.clip(pos, 0, wid.size - 1)
+                hit = wid[pos] == table[r, :whole]
+                if not hit.any():
+                    continue
+                writers = wof[pos[hit]]
+                later = writers[writers > r]
+                if later.size:
+                    found = True
+                    # Union of [r+1, w] over the writers is [r+1, max w].
+                    forbidden[r + 1 : int(later.max()) + 1] = True
+        return forbidden if found else None
+
+    def _microbatch_split_point(
+        self, num_reqs: int, num_scheduled_tokens_np: np.ndarray
+    ) -> tuple[bool, int | None]:
+        """(may we microbatch, token index to cut at).
+
+        `None` for the cut means "no constraint, use the default". Moving the
+        cut rather than vetoing the step is only safe where the DP ranks do not
+        have to agree on it. High throughput negotiates real per-rank counts via
+        `Buffer.get_dispatch_layout`, so a per-rank cut is fine; the batched
+        formats low latency selects read the fabricated
+        `ubatch_num_tokens_across_dp` and would be wrong. Same reasoning as
+        `align_ubatch_splits_to_requests`. Outside HT, fall back to vetoing.
+
+        The cut returned is always a request boundary, so it composes with
+        `align_to_request_boundaries`: supplying it skips
+        `request_aligned_split_points`, but what it supplies is an aligned cut
+        already -- chosen for hazard-avoidance among the boundaries rather than
+        purely for balance. With no hazard this returns None and that path is
+        untouched, which is the overwhelmingly common case (measured at ~1 step
+        in 10000 on DSV2-Lite + GSM8K).
+        """
+        forbidden = self._microbatch_hazard_cuts(num_reqs, num_scheduled_tokens_np)
+        if forbidden is None:
+            return True, None
+
+        per_rank_cut_ok = (
+            self.parallel_config.all2all_backend == "deepep_high_throughput"
+            and self.parallel_config.num_ubatches == 2
+        )
+        if not per_rank_cut_ok:
+            return False, None
+
+        # Interior cuts only; either end leaves a microbatch empty.
+        candidates = np.flatnonzero(~forbidden[1:num_reqs]) + 1
+        if candidates.size == 0:
+            return False, None
+        cu = np.cumsum(num_scheduled_tokens_np[:num_reqs])
+        target = cu[-1] / 2.0
+        best = candidates[np.argmin(np.abs(cu[candidates - 1] - target))]
+        return True, int(cu[best - 1])
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -4325,6 +4451,9 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            allow_microbatching, hazard_split_point = self._microbatch_split_point(
+                num_reqs, num_scheduled_tokens_np
+            )
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4338,6 +4467,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                allow_microbatching=allow_microbatching,
             )
 
             logger.debug(
@@ -4359,6 +4489,7 @@ class GPUModelRunner(
                 num_tokens_padded,
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
+                split_point=hazard_split_point,
                 align_to_request_boundaries=align_ubatch_splits_to_requests(
                     self.vllm_config
                 ),
