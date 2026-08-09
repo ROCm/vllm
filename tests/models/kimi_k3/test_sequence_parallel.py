@@ -359,3 +359,65 @@ def test_sp_collectives_fall_back_without_custom_kernel(monkeypatch):
     torch.testing.assert_close(sp_ops.sp_reduce_scatter(hidden_states), hidden_states)
     all_gather.assert_called_once_with(hidden_states, 0)
     reduce_scatter.assert_called_once_with(hidden_states, 0)
+
+
+def test_sp_padding_mask_accepts_a_longer_mask(monkeypatch):
+    """`ForwardContext.is_padding_full` is the unsliced `max_num_tokens` buffer.
+
+    Sharding it as-is would divide the buffer rather than the batch, so the
+    function slices to the token count first. This pins that, because the
+    caller B3 needs is the one that passes the full buffer.
+    """
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: 0)
+
+    hidden_states = torch.empty(5, 2)
+    full = torch.zeros(64, dtype=torch.bool)
+    full[5:] = True  # the buffer's stale tail, well past this step's batch
+
+    actual = sp_ops.sp_padding_mask(full, hidden_states)
+    # 5 tokens -> padded to 8 -> rank 0 gets rows 0,1. Both are real tokens.
+    torch.testing.assert_close(actual, torch.tensor([False, False]))
+
+
+def test_sp_padding_mask_compiles_with_a_dynamic_batch(monkeypatch):
+    """The length check this function used to carry made it uncompilable.
+
+    vLLM's `@support_torch_compile` marks the batch dimension dynamic, where
+    specializing it is a hard error rather than a silent recompile. The mask
+    here is the fixed-length `is_padding_full` buffer, so the old
+    `assert is_padding.shape[0] == num_tokens` compared a *concrete* length
+    against a *symbolic* batch dim and specialized it -- the same construct
+    that had to be removed from `QuantFP8._bounded_per_tensor_scale`.
+
+    Passing a mask of the same symbolic length would make the assert
+    `s0 == s0` and the test would pass with or without the fix, which is how
+    the first draft of this test managed to have no power at all. Neither of
+    the two models calling this is compiled today, so nothing else in the tree
+    would catch a regression.
+
+    Asserts a *value*, not merely that it compiled: the failure worth guarding
+    against is Dynamo returning a mask sharded for the traced size at every
+    other size.
+    """
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: 1)
+
+    max_num_tokens = 128
+    full = torch.zeros(max_num_tokens, dtype=torch.bool)
+
+    def fn(is_padding, hidden_states):
+        return sp_ops.sp_padding_mask(is_padding, hidden_states)
+
+    compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+
+    for num_tokens in (16, 32, 64):
+        full.fill_(False)
+        full[num_tokens - 3 : num_tokens] = True
+        hidden_states = torch.empty(num_tokens, 2)
+        torch._dynamo.mark_dynamic(hidden_states, 0)
+
+        got = compiled(full, hidden_states)
+        want = sp_ops.sp_padding_mask(full, hidden_states)
+        assert got.shape[0] == num_tokens // 4, (num_tokens, got.shape)
+        torch.testing.assert_close(got, want)

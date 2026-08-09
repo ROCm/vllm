@@ -54,15 +54,35 @@ def sp_padding_mask(
     is_padding: torch.Tensor | None,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
+    """This rank's slice of the padding mask, sharded exactly as `sp_shard`
+    shards the tokens.
+
+    `is_padding` must describe at least the rows of `hidden_states`; it may be
+    longer, so that `ForwardContext.is_padding_full` -- the unsliced
+    `max_num_tokens` buffer -- can be passed directly. It is *sliced* to the
+    token count rather than checked against it: comparing a concrete length
+    with a symbolic `hidden_states.shape[0]` specializes the dynamic batch
+    dimension to whatever it held at trace time, and under vLLM's
+    `@support_torch_compile` (which uses `mark_dynamic`, where specialization
+    is a hard error rather than a silent recompile) the model then fails to
+    compile at all. That is the same construct that had to be removed from
+    `QuantFP8._bounded_per_tensor_scale`, and it is safe here today only
+    because the two models that call this carry no `@support_torch_compile`.
+
+    The rows `sp_shard` invents to reach a multiple of the TP size are padded
+    with `True`, not `False`: they carry no token, so every consumer that
+    bounds a reduction by this mask must exclude them.
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+
     num_tokens = hidden_states.shape[0]
     if is_padding is None:
         is_padding = hidden_states.new_zeros(num_tokens, dtype=torch.bool)
-    assert is_padding.shape[0] == num_tokens
+    is_padding = is_padding[:num_tokens]
 
-    tp_size = get_tensor_model_parallel_world_size()
     sp_pad = (-num_tokens) % tp_size
     if sp_pad > 0:
         is_padding = torch.nn.functional.pad(is_padding, (0, sp_pad), value=True)
     chunk = is_padding.shape[0] // tp_size
-    tp_rank = get_tensor_model_parallel_rank()
     return is_padding[tp_rank * chunk : (tp_rank + 1) * chunk]
