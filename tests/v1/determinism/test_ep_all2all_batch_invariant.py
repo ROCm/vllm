@@ -1059,17 +1059,34 @@ def test_deepep_low_latency_fp8_promotion_engages_end_to_end(deepep_ll_fp8_serve
     NaN exactly as it was: 6 of 6 requests after the first. No NaN or Inf ever
     enters the quantizer either.
 
-    What the NaN is instead, so far: it is in the forward pass and not in
-    logprob serialization (with `logprobs` omitted the same request returns
-    200 and garbage text), it is in prefill, and it is **one-way persistent**
-    -- the first request after startup is always clean and every request after
-    it is NaN, in 4 of 4 server runs, with no load required. That signature
-    points at persistent state rather than at arithmetic on one batch, and
-    `--enforce-eager` is the control that would separate a cudagraph
-    capture/replay defect from a kernel one. Not run.
+    What the NaN was: it was in the forward pass and not in logprob
+    serialization (with `logprobs` omitted the same request returned 200 and
+    garbage text), it was in prefill, and it was **one-way persistent** -- the
+    first request after startup always clean and every request after it NaN,
+    in 4 of 4 server runs, with no load required. That signature points at
+    persistent state rather than at arithmetic on one batch.
 
-    The arm above is uncontrolled either way, which is the thing a reader
-    needs to know.
+    **It no longer reproduces (2026-08-09).** The `--enforce-eager` control
+    this docstring called for was finally run, together with the arm itself,
+    two servers each: 8 of 8 logprob requests clean on all four, with and
+    without eager. `first_request_ok` true everywhere, so none of them is the
+    dead-server case that looks the same.
+
+    The probe was positive-controlled rather than trusted: injecting a NaN into
+    `compute_logits` produced `Out of range float values are not JSON
+    compliant: nan` on 8 of 8 requests, the same string this arm used to fail
+    with. So the clean result is a real negative and not a blind instrument.
+
+    The likely cause is `8b5db7cb6d`, which fixed a **capture-only** defect
+    with exactly this signature: `batched_moe_kernel_quantize_input` ignored
+    `expert_num_tokens` under capture and amaxed the whole
+    `[E, max_num_tokens, N]` buffer, measured at 9.95e29 on 100% of calls,
+    while eager bounded it per expert. That is stated as the likely cause, not
+    a demonstrated one -- nobody bisected it, and "does not reproduce" is
+    weaker evidence than "reproduced, then fixed".
+
+    The mode-on arm above still has no mode-off control in the usual shape,
+    which remains the thing a reader needs to know.
     """
     server, log_prefix = deepep_ll_fp8_server
     _assert_needle_does_not_see_the_batch(
