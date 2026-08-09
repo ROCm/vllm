@@ -42,6 +42,7 @@ elsewhere in this suite is TP=1 only).
 
 import os
 import random
+import warnings
 
 import torch
 from utils import _extract_step_logprobs, shutdown_llm, skip_if_not_cuda_alike
@@ -157,7 +158,7 @@ def _make_llm(**overrides) -> LLM:
     return LLM(**kwargs)
 
 
-def test_tp_all_reduce_path_under_pipeline_parallelism():
+def test_tp_all_reduce_path_under_pipeline_parallelism(record_property):
     """Record which all-reduce implementation the composed run actually uses.
 
     Batch invariance dispatches to the custom all-reduce below its size limit
@@ -201,6 +202,15 @@ def test_tp_all_reduce_path_under_pipeline_parallelism():
         "no TP all-reduce was observed during generation, so this module's "
         f"needle test does not exercise the collective at all: {served}"
     )
+    # A mixed state is a real bug and nothing else here would notice it: half
+    # the ranks reducing through the custom kernel and half through the library
+    # is precisely the configuration whose reduction order is not pinned.
+    live = {report["ca_comm_live"] for report in reports}
+    assert len(live) == 1, (
+        "ranks disagree about whether the custom all-reduce is live, so this "
+        f"module is covering two different reduction paths at once: {reports}"
+    )
+
     if all(report["ca_comm_live"] for report in reports):
         # `CudaCommunicator` sizes max_size from max_num_batched_tokens under
         # the mode precisely so the custom kernel serves every message the
@@ -216,6 +226,18 @@ def test_tp_all_reduce_path_under_pipeline_parallelism():
             f"max_size no longer covers the scheduler's largest batch: "
             f"{fell_back}"
         )
+    else:
+        # Not a failure -- both paths are invariant, and the custom kernel is
+        # legitimately unavailable in some configurations. But this branch used
+        # to be an invisible pass with zero assertions, which reads exactly like
+        # a verified `max_size`. Say that it was not verified.
+        warnings.warn(
+            "the custom all-reduce is not live on any rank, so the max_size "
+            "coverage assertion above did not run and this module is covering "
+            "the library collective instead of the custom kernel.",
+            stacklevel=2,
+        )
+    record_property("ca_comm_live", sorted(live))
 
 
 def test_pp_tp_generation_is_batch_invariant():

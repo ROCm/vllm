@@ -23,6 +23,8 @@ Two guards keep the test from passing vacuously:
   * the same comparison without the un-permute must fail.
 """
 
+import warnings
+
 import pytest
 import torch
 from utils import skip_if_not_cuda_alike
@@ -205,7 +207,7 @@ def test_expert_gemm_is_row_permutation_invariant(
 )
 @torch.inference_mode()
 def test_expert_gemm_tolerates_native_sort_nondeterminism(
-    default_vllm_config, m: int, scheme: str
+    default_vllm_config, m: int, scheme: str, record_property
 ):
     """The same reordering happens without any all2all at all.
 
@@ -243,10 +245,18 @@ def test_expert_gemm_tolerates_native_sort_nondeterminism(
         sorted_ids, _, _ = moe_align_block_size(topk_ids, 64, E)
         reordered += int(not torch.equal(sorted_ids, sorted_baseline))
 
+    # Sixteen stability assertions just passed. Skipping here would throw all
+    # of them away and report the module as unrun, when what actually happened
+    # is that the weaker claim was verified and the stronger one was not armed:
+    # the sort's atomicAdd happened not to race. Report that, and pass.
+    record_property("row_reorderings_observed", reordered)
     if reordered == 0:
-        pytest.skip(
-            "moe_align_block_size happened to produce a stable order here, so "
-            "this run did not exercise row reordering"
+        warnings.warn(
+            "moe_align_block_size produced a stable order in all 16 trials, so "
+            "run-to-run stability was verified but invariance *under row "
+            "reordering* was not exercised. Not a failure, and not a skip "
+            "either: the assertions above did run.",
+            stacklevel=2,
         )
 
 

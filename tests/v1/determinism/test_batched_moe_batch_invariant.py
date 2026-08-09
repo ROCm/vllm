@@ -282,6 +282,31 @@ def mode_on(enable_batch_invariant_mode):
 
 
 # --------------------------------------------------------------------------- #
+
+# A launch config that will not fit is not a determinism result and has to be
+# skipped -- but a bare `except Exception` also swallows a compile error or a
+# kernel fault, and this sweep only requires `ran >= 20` out of ~40 configs, so
+# half of it could vanish and the test would still pass at the threshold. Name
+# the two things that are legitimately skippable and re-raise everything else.
+_SKIPPABLE_LAUNCH_ERRORS: tuple[type[BaseException], ...] = tuple(
+    e
+    for e in (
+        getattr(
+            __import__("triton.runtime.errors", fromlist=["OutOfResources"]),
+            "OutOfResources",
+            None,
+        ),
+        getattr(
+            __import__("triton.compiler.errors", fromlist=["CompilationError"]),
+            "CompilationError",
+            None,
+        ),
+    )
+    if e is not None
+)
+assert _SKIPPABLE_LAUNCH_ERRORS, "no Triton error types to narrow on"
+
+
 @skip_if_not_cuda_alike
 @pytest.mark.parametrize("name,dtype,spread", CASES)
 @torch.inference_mode()
@@ -318,20 +343,24 @@ def test_batched_expert_gemm_is_launch_config_invariant(mode_on, name, dtype, sp
         cfgs.add((bm, bn, 32, w, None))
 
     buckets: dict[str, list] = {}
+    skipped: list[tuple] = []
     ran = 0
     for bm, bn, bk, warps, stages in sorted(cfgs, key=str):
         C = _zeros(dtype)
         try:
             _launch(A, B, C, ent, bm, bn, bk, num_warps=warps, num_stages=stages)
             torch.accelerator.synchronize()
-        except Exception:
-            # out-of-resources / unsupported layout: not a determinism result
+        except _SKIPPABLE_LAUNCH_ERRORS as exc:
+            skipped.append((bm, bn, bk, warps, stages, type(exc).__name__))
             continue
         ran += 1
         key = "|".join(_digest(C[e, : int(ent[e])]) for e in range(E))
         buckets.setdefault(key, []).append((bm, bn, bk, warps, stages))
 
-    assert ran >= 20, f"{name}: only {ran} configurations compiled; too few to conclude"
+    assert ran >= 20, (
+        f"{name}: only {ran} configurations compiled; too few to conclude. "
+        f"Skipped for want of resources: {skipped}"
+    )
     assert len(buckets) == 1, (
         f"{name}: {ran} launch configurations produced {len(buckets)} distinct "
         f"bit patterns, so the accumulation order depends on the tiling: "
@@ -716,19 +745,24 @@ def test_batched_expert_fp8_gemm_is_launch_config_invariant(mode_on, scheme):
             cfgs.add((64, 64, bk))
 
     buckets: dict[str, list] = {}
+    skipped: list[tuple] = []
     ran = 0
     for bm, bn, bk in sorted(cfgs):
         C = _zeros(torch.bfloat16)
         try:
             _launch_fp8(scheme, ops, ent, C, bm, bn, bk)
             torch.accelerator.synchronize()
-        except Exception:
+        except _SKIPPABLE_LAUNCH_ERRORS as exc:
+            skipped.append((bm, bn, bk, type(exc).__name__))
             continue
         ran += 1
         key = "|".join(_digest(C[e, : int(ent[e])]) for e in range(E))
         buckets.setdefault(key, []).append((bm, bn, bk))
 
-    assert ran >= 9, f"{scheme}: only {ran} configurations compiled"
+    assert ran >= 9, (
+        f"{scheme}: only {ran} configurations compiled. "
+        f"Skipped for want of resources: {skipped}"
+    )
     assert len(buckets) == 1, (
         f"{scheme}: {ran} launch configurations produced {len(buckets)} "
         f"distinct bit patterns: { {k[:12]: v[:4] for k, v in buckets.items()} }"
