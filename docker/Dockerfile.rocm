@@ -750,6 +750,42 @@ ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 ENV UCX_RMA_PPLN_ENABLE=y
 ENV UCX_ROCM_COPY_SIGPOOL_MAX_ELEMS=inf
 
+# Disable HIP graph AQL packet capture: it faults inside libhsa-runtime64 on a
+# large full-cudagraph decode step. The fault is a 64-byte (AQL-packet-sized)
+# copy whose source index is ring-masked and whose destination index is not, so
+# the destination runs off the end of its buffer (SEGV_ACCERR, deterministic).
+# Reproduced with DeepSeek-V2-Lite, --quantization fp8 and data parallel >= 2 on
+# the default cudagraph_mode; low latency all2all is not required -- any EP
+# backend that leaves cudagraphs on will do, and DeepEP high throughput escapes
+# only because vLLM forces CUDAGraphMode.NONE for it.
+#
+# The gate has been renamed twice, so which variable disables it depends on the
+# ROCm the base image carries:
+#
+#   ROCm <= 7.2.3   DEBUG_CLR_GRAPH_PACKET_CAPTURE=0        (bool, default true)
+#   ROCm 7.2.4      DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=0    (uint, default 1;
+#                                                            0=Disable 1=Enable 2=Force)
+#   clr develop     DEBUG_HIP_GRAPH_CLASSIC_PATH=1          (bool, default false)
+#
+# Both release names are set here, and an unknown env var is silently ignored,
+# so the pair survives a 7.2.3 -> 7.2.4 base image bump with nothing to notice.
+#
+# The develop knob is deliberately NOT set. On develop
+# DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING survives with entirely different meaning --
+# it becomes a scheduling-mode selector within the segmented path
+# (0=Hybrid/auto, 1=Round-robin, 2=DFS, default 0), so the "=0" above stops
+# disabling anything and merely selects the default mode. Forcing the classic
+# path on a release that does not exist yet would be a permanent, silent
+# submission-rate loss against a bug that 7.2.4 has already partly fixed. If the
+# base image ever moves to a develop-derived ROCm, re-test rather than guess.
+#
+# Cost measured on 8x gfx950, two servers per configuration: -1.3% at
+# concurrency 1 (the launch-latency-bound worst case) and unresolved at
+# saturation, on a graph of 1381 nodes dominated by short elementwise kernels.
+# Revisit once a ROCm with the packet-capture fix is the base image.
+ENV DEBUG_CLR_GRAPH_PACKET_CAPTURE=0
+ENV DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=0
+
 # ROCm profiler limits workaround.
 RUN echo "ROCTRACER_MAX_EVENTS=10000000" > ${COMMON_WORKDIR}/libkineto.conf
 ENV KINETO_CONFIG="${COMMON_WORKDIR}/libkineto.conf"
@@ -851,6 +887,42 @@ ENV HIP_FORCE_DEV_KERNARG=1
 
 # Keep torch.cuda.is_available() fork-safe (see vllm/env_override.py).
 ENV PYTORCH_NVML_BASED_CUDA_CHECK=1
+
+# Disable HIP graph AQL packet capture: it faults inside libhsa-runtime64 on a
+# large full-cudagraph decode step. The fault is a 64-byte (AQL-packet-sized)
+# copy whose source index is ring-masked and whose destination index is not, so
+# the destination runs off the end of its buffer (SEGV_ACCERR, deterministic).
+# Reproduced with DeepSeek-V2-Lite, --quantization fp8 and data parallel >= 2 on
+# the default cudagraph_mode; low latency all2all is not required -- any EP
+# backend that leaves cudagraphs on will do, and DeepEP high throughput escapes
+# only because vLLM forces CUDAGraphMode.NONE for it.
+#
+# The gate has been renamed twice, so which variable disables it depends on the
+# ROCm the base image carries:
+#
+#   ROCm <= 7.2.3   DEBUG_CLR_GRAPH_PACKET_CAPTURE=0        (bool, default true)
+#   ROCm 7.2.4      DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=0    (uint, default 1;
+#                                                            0=Disable 1=Enable 2=Force)
+#   clr develop     DEBUG_HIP_GRAPH_CLASSIC_PATH=1          (bool, default false)
+#
+# Both release names are set here, and an unknown env var is silently ignored,
+# so the pair survives a 7.2.3 -> 7.2.4 base image bump with nothing to notice.
+#
+# The develop knob is deliberately NOT set. On develop
+# DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING survives with entirely different meaning --
+# it becomes a scheduling-mode selector within the segmented path
+# (0=Hybrid/auto, 1=Round-robin, 2=DFS, default 0), so the "=0" above stops
+# disabling anything and merely selects the default mode. Forcing the classic
+# path on a release that does not exist yet would be a permanent, silent
+# submission-rate loss against a bug that 7.2.4 has already partly fixed. If the
+# base image ever moves to a develop-derived ROCm, re-test rather than guess.
+#
+# Cost measured on 8x gfx950, two servers per configuration: -1.3% at
+# concurrency 1 (the launch-latency-bound worst case) and unresolved at
+# saturation, on a graph of 1381 nodes dominated by short elementwise kernels.
+# Revisit once a ROCm with the packet-capture fix is the base image.
+ENV DEBUG_CLR_GRAPH_PACKET_CAPTURE=0
+ENV DEBUG_HIP_GRAPH_SEGMENT_SCHEDULING=0
 
 # Workaround for ROCm profiler limits
 RUN echo "ROCTRACER_MAX_EVENTS=10000000" > ${COMMON_WORKDIR}/libkineto.conf
