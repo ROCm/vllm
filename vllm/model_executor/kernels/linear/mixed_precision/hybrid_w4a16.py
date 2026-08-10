@@ -37,10 +37,10 @@ logger = init_logger(__name__)
 SUPPORTED_GROUP_SIZES = [32, 64, 128]
 
 # Maximum batch size M for the HIP skinny kernel path (C++ supports N_in
-# up to 5).  When M exceeds this AND K*M fits in LDS, the skinny kernel is
-# used; otherwise the Triton prefill path handles the GEMM.
+# up to 5).  Above this the Triton prefill path handles the GEMM.  There is no
+# longer a K*M bound: the skinny kernel reads whatever does not fit in LDS from
+# global memory itself.
 MAX_SKINNY_BATCH_SIZE = 5
-LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,8 @@ def _triton_w4a16_skinny_fmt_kernel(
     K8,  # K // 8
     stride_bn,  # per-row stride of b_ptr (in int32 elements)
     num_groups,  # K // group_size
+    stride_sn,  # per-row stride of scales_ptr
+    stride_pn,  # per-row stride of packed_scale_zp_ptr
     group_size,
     HAS_ZP: tl.constexpr,  # asym: read the scale/zp carrier; sym: scales + (-8)
     # Block sizes
@@ -201,7 +203,7 @@ def _triton_w4a16_skinny_fmt_kernel(
         if HAS_ZP:
             # Asymmetric: packed scale/zp carrier (one fp32/group folds scale + zp).
             psz = tl.load(
-                packed_scale_zp_ptr + offs_n * num_groups + g_idx,
+                packed_scale_zp_ptr + offs_n * stride_pn + g_idx,
                 mask=scale_mask,
                 other=0,
             )
@@ -225,7 +227,7 @@ def _triton_w4a16_skinny_fmt_kernel(
             # Symmetric: the -8 offset is constant (no zp to fold), so read the
             # scale directly — no carrier overhead.
             scales = tl.load(
-                scales_ptr + offs_n * num_groups + g_idx, mask=scale_mask, other=1.0
+                scales_ptr + offs_n * stride_sn + g_idx, mask=scale_mask, other=1.0
             )
             if a.dtype == tl.float16:
                 # (nibble - 8) * scale == (b_raw - (1024+8)) * scale, via magic.
@@ -405,7 +407,7 @@ def triton_w4a16_skinny_fmt_gemm(
     # b_q may be a row-padded view (stride(0) > K//8) when the K_packed%2048
     # cliff workaround is active; only require the last dim to be unit-stride.
     assert b_q.stride(1) == 1, "Weight matrix must be unit-stride on K axis"
-    assert scales.is_contiguous(), "Scales must be contiguous"
+    assert scales.stride(1) == 1, "Scale rows must be contiguous"
 
     M, K = a.shape
     N = b_q.shape[0]
@@ -414,12 +416,18 @@ def triton_w4a16_skinny_fmt_gemm(
 
     assert b_q.shape == (N, K8), f"b_q shape mismatch: {b_q.shape} vs ({N}, {K8})"
     stride_bn = b_q.stride(0)
+    # Metadata rows may be padded off the 512 B cliff, see
+    # _group_stride_pad; scales and the carrier share one row stride.
+    stride_sn = scales.stride(0)
+    # The carrier is built separately and is not padded, so it keeps its own
+    # row stride -- feeding it the scales' padded stride reads out of bounds.
+    stride_pn = packed_scale_zp.stride(0) if packed_scale_zp is not None else stride_sn
     assert scales.shape == (N, num_groups), (
         f"scales shape mismatch: {scales.shape} vs ({N}, {num_groups})"
     )
     has_zp = packed_scale_zp is not None
     if packed_scale_zp is not None:
-        assert packed_scale_zp.is_contiguous(), "packed_scale_zp must be contiguous"
+        assert packed_scale_zp.stride(1) == 1, "packed_scale_zp rows must be contiguous"
         assert packed_scale_zp.shape == (N, num_groups), (
             f"packed_scale_zp shape mismatch: {packed_scale_zp.shape} "
             f"vs ({N}, {num_groups})"
@@ -460,6 +468,8 @@ def triton_w4a16_skinny_fmt_gemm(
             K8,
             stride_bn,
             num_groups,
+            stride_sn,
+            stride_pn,
             group_size=group_size,
             HAS_ZP=has_zp,
             BLOCK_M=block_m,
@@ -537,6 +547,8 @@ def triton_w4a16_skinny_fmt_gemm(
         K8,
         stride_bn,
         num_groups,
+        stride_sn,
+        stride_pn,
         group_size=group_size,
         HAS_ZP=has_zp,
         BLOCK_M=BLOCK_M,
@@ -573,25 +585,80 @@ def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
     )
 
 
+# gfx1151 packed-weight row stride: throughput is a period-512 B function of the
+# stride, and wants a multiple of 128 that is not a multiple of 512.
+_CLIFF_PERIOD_BYTES = 512
+_CLIFF_ALIGN_BYTES = 128
+_CLIFF_TARGET_BYTES = 256
+
+
+def _cliff_pad_bytes(k_packed_bytes: int) -> int:
+    """Pad that moves the row stride out of a bad residue class, if it is in one.
+
+    Good means a multiple of 128 that is not a multiple of 512; 256 mod 512 is
+    the best of the good classes.
+
+    On an APU every padded byte comes out of the KV cache, so a stride already
+    in a good class is left alone and only a stride on the cliff is moved.
+    """
+    r = k_packed_bytes % _CLIFF_PERIOD_BYTES
+    if r == 0:
+        # Worst class: pay the extra 128 B to reach the best class rather than
+        # merely the nearest one.
+        return _CLIFF_TARGET_BYTES
+    if r % _CLIFF_ALIGN_BYTES == 0:
+        return 0  # already 128, 256 or 384 mod 512
+    # Not 128-aligned at all: step up to the nearest 128-multiple, and past it
+    # if that one is a 512-multiple.
+    pad = -k_packed_bytes % _CLIFF_ALIGN_BYTES
+    if (k_packed_bytes + pad) % _CLIFF_PERIOD_BYTES == 0:
+        pad += _CLIFF_ALIGN_BYTES
+    return pad
+
+
+def _group_stride_pad(num_groups: int, elem_bytes: int) -> int:
+    """Groups to add so a metadata row does not land on a 512 B multiple.
+
+    The scale and zero-point rows sit on the same period-512 B cliff as the
+    packed weight rows (see ``_cliff_pad_bytes``).  Padding a row that is
+    already in a good class makes it slower, so the pad is spent only on rows
+    whose byte size is a multiple of 512; +128 B lands them on 128 mod 512.
+    """
+    if (num_groups * elem_bytes) % _CLIFF_PERIOD_BYTES:
+        return 0
+    return _CLIFF_ALIGN_BYTES // elem_bytes
+
+
+def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
+    """Re-lay-out ``t`` so each row is ``pad_groups`` columns further apart."""
+    if not pad_groups:
+        return t.contiguous()
+    rows, cols = t.shape
+    buf = torch.empty((rows, cols + pad_groups), dtype=t.dtype, device=t.device)
+    buf[:, :cols].copy_(t)
+    return buf[:, :cols]  # inherits stride(0) = cols + pad_groups
+
+
 def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
     Single source of truth for the skinny weight memory layout: ExLlama shuffle
-    to [N, K//8] int32, then -- on gfx1151 only, when K_packed (= K/2 bytes) is a
-    multiple of 2048 -- pad each row by +32 int32 (+128 B). That pad makes the
-    GEMM read a non-power-of-2 row stride, dodging the multi-row global-load
-    cliff (channel/MALL hash collisions). Used by both
+    to [N, K//8] int32, then -- on gfx1151 only -- pad each row so the packed
+    row stride lands on 256 bytes modulo 512. Used by both
     ``process_weights_after_loading`` and the perf benchmark so the benchmark can
     never drift from the production stride.
 
-    Returns ``(w_q_skinny, w_q_skinny_i32)``: an int8 view for the HIP skinny
-    kernel and the int32 view for the Triton kernel; both share stride(0).
+    Throughput is a period-512 function of the row stride, not a function of
+    how much padding was added, so the rule targets the residue class rather
+    than adding a fixed pad: the pad costs pad/(K/2) of weight memory, which
+    comes straight out of KV-cache space on an APU.
     """
     shuffled = pack_int4_exllama_shuffle(unpacked)
     n_rows, k8 = shuffled.shape
     k_packed_bytes = k8 * 4  # int32 -> bytes
-    pad_int32 = 32  # +128 B = one cache line, keeps each row cache-line aligned
-    if on_gfx1151() and k_packed_bytes % 2048 == 0 and shuffled.device.type == "cuda":
+    pad_bytes = _cliff_pad_bytes(k_packed_bytes)
+    pad_int32 = pad_bytes // 4
+    if on_gfx1151() and pad_int32 and shuffled.device.type == "cuda":
         padded = torch.empty(
             (n_rows, k8 + pad_int32), dtype=torch.int32, device=shuffled.device
         )
@@ -628,7 +695,8 @@ def _hybrid_w4a16_apply_impl(
       w_q:     [N, K//8] int8 (ExLlama shuffle, for skinny kernel)
       w_q_i32: [N, K//8] int32 (same data viewed as int32, for triton)
       w_s:     [N, K//G] fp16/bf16 (skinny-layout scales)
-      w_zp:    [N, K//G] raw zero-points (zp_raw) in act dtype,
+      w_zp:    [N//8, K//G] int32, raw zero-points packed 8x uint4 along N
+               (row n -> word[n/8], bits 4*(n%8)),
                or None for symmetric. Both HIP skinny and Triton use this
                single format: dequant = (nibble - zp_raw) * scale.
       packed_scale_zp: [N, K//G] fp32 carrier packing scale + zero-point per
@@ -655,9 +723,12 @@ def _hybrid_w4a16_apply_impl(
     # Emitting g<group_size> and sym/asym makes the label self-describing.
     _gz = f"g{group_size} {'asym' if w_zp is not None else 'sym'}"
 
-    # Use the HIP skinny kernel for small batch sizes (fast decode path),
-    # but only when K*M fits in LDS.  Otherwise fall through to Triton.
-    if M <= MAX_SKINNY_BATCH_SIZE and K * M <= LDS_CAPACITY_ELEMENTS:
+    # Use the HIP skinny kernel for small batch sizes (fast decode path).
+    #
+    # There is no LDS bound here: the kernel handles the overflow itself (the
+    # part of the activation that does not fit in LDS is read from global), so
+    # the batch size is the only thing that has to be bounded.
+    if M <= MAX_SKINNY_BATCH_SIZE:
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
@@ -812,7 +883,15 @@ class HybridW4A16LinearKernel(MPLinearKernel):
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
         permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
-        w_s_skinny = w_s_raw.data.contiguous()
+        # gfx1151: keep the metadata row off the 512 B cliff.  Scales and the
+        # packed zero points must share one row stride -- the HIP kernel reads
+        # both with the same group_stride.
+        _gpad = (
+            _group_stride_pad(w_s_raw.data.shape[1], w_s_raw.data.element_size())
+            if on_gfx1151() and w_s_raw.data.device.type == "cuda"
+            else 0
+        )
+        w_s_skinny = _pad_group_rows(w_s_raw.data, _gpad)
 
         # ---- Process zero-points for asymmetric quantization ----
         w_zp = None
@@ -821,14 +900,22 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             w_zp_raw = getattr(layer, self.w_zp_name)
             # Normalize zp layout to (N, num_groups)
             permute_param_layout_(w_zp_raw, input_dim=1, output_dim=0, packed_dim=0)
+            # zp_unpacked: [N, num_groups] with raw uint4 values [0..15].
+            # Only needed transiently below to build the Triton scale/zp
+            # carrier and the optional dense dequant copy.
             zp_unpacked = unpack_quantized_values_into_int32(
                 w_zp_raw.data, c.weight_type, packed_dim=0
             )
-            # zp_unpacked: [N, num_groups] with raw uint4 values [0..15]
-            # Store raw zero-points in activation dtype.
-            # Both kernels dequant as (nibble - zp_raw) * scale.
-            w_zp = zp_unpacked.to(c.act_type).contiguous()
-            self._transform_param(layer, self.w_zp_name, lambda x: w_zp)
+            # The HIP skinny kernel reads the zero-points in their PACKED 4-bit
+            # form -- [N/8, num_groups] int32, row n's nibble at word[n/8] bits
+            # 4*(n%8) -- rather than expanded to the activation dtype.  These
+            # values only span 0..15; storing them at 2 bytes cost 4x the DRAM
+            # traffic (14.5 MB vs 3.6 MB per call on gemma-4-31B gate_up), and
+            # the kernel is memory-bound, so that is time.  Both kernels still
+            # dequant as (nibble - zp_raw) * scale.
+            w_zp_packed = _pad_group_rows(w_zp_raw.data, _gpad)
+            w_zp = w_zp_packed
+            self._transform_param(layer, self.w_zp_name, lambda x: w_zp_packed)
 
         # ---- Store on layer ----
         # Replace w_q with skinny int8 (primary weights for skinny kernel)
@@ -858,12 +945,12 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             scale_u16 = w_s_skinny.view(torch.uint16).to(torch.int32) & 0xFFFF
             if c.act_type == torch.float16:
                 w_s_f32 = w_s_skinny.to(torch.float32)
-                scaled_zp_f32 = (w_zp.to(torch.float32) - 8.0) * w_s_f32
+                scaled_zp_f32 = (zp_unpacked.to(torch.float32) - 8.0) * w_s_f32
                 bias_eff = (-(8.0 * w_s_f32 + scaled_zp_f32)).to(c.act_type)
                 bias_u16 = bias_eff.contiguous().view(torch.uint16)
                 hi_u16 = bias_u16.to(torch.int32) & 0xFFFF
             else:
-                hi_u16 = w_zp.to(torch.int32) & 0xFFFF  # raw zp 0..15
+                hi_u16 = zp_unpacked.to(torch.int32) & 0xFFFF  # raw zp 0..15
             packed_scale_zp = (
                 ((hi_u16 << 16) | scale_u16).view(torch.float32).contiguous()
             )
@@ -884,7 +971,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         dequant_mode = get_current_vllm_config().model_config.w4a16_prefill_dequant
         if dequant_mode != "off" and unpacked.device.type == "cuda":
             self._maybe_cache_dequant_prefill_weight(
-                layer, unpacked, w_s_skinny, w_zp, dequant_mode
+                layer, unpacked, w_s_skinny, zp_unpacked, dequant_mode
             )
 
     def _maybe_cache_dequant_prefill_weight(

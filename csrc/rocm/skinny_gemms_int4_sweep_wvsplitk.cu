@@ -32,7 +32,7 @@ torch::Tensor wvSplitK_int4g_sweep(
   TORCH_CHECK(K_in % achunk == 0, "K must be divisible by achunk=", achunk);
   TORCH_CHECK(M_in % ytile == 0, "M must be divisible by ytile=", ytile);
 
-  const int max_lds_len = get_lds_size_int4() / 2;
+  const int max_lds_len = static_cast<int>(LDS_SIZE / in_x.element_size());
   TORCH_CHECK(K_in * N_in <= max_lds_len, "K*N exceeds LDS capacity. K=", K_in,
               " N=", N_in);
 
@@ -61,7 +61,7 @@ torch::Tensor wvSplitK_int4g_sweep(
       wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, \
                             _N, _GS><<<grid, block, 0, stream>>>(             \
           K_in, M_in, 1, 1, wptr, aptr, sptr, nullptr, biasptr, cptr,         \
-          __wvPrGrp, CuCount, b_row_stride_bytes_i32);                        \
+          __wvPrGrp, CuCount, b_row_stride_bytes_i32, in_scale.stride(0));    \
     }
 
   #define SWEEP_G_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _GS)       \

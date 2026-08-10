@@ -123,8 +123,12 @@ void fused_moe_wvSplitK_int4_gemm_sweep(
         const uint8_t* wptr = reinterpret_cast<const uint8_t*>(w.data_ptr());
         const fptype* aptr = reinterpret_cast<const fptype*>(a.data_ptr());
         const fptype* sptr = reinterpret_cast<const fptype*>(scales.data_ptr());
-        const fptype* zpptr =
-            has_zp ? reinterpret_cast<const fptype*>(zero_points.data_ptr())
+        // Packed 4-bit zero points, matching the production MoE op: these are
+        // [E, N/8, G] int32, not activation-dtype values.  This TU only
+        // compiles under VLLM_SKINNY_GEMM_SWEEP, so it kept the pre-packing
+        // type long after the kernels stopped accepting it.
+        const uint32_t* zpptr =
+            has_zp ? reinterpret_cast<const uint32_t*>(zero_points.data_ptr())
                    : nullptr;
         fptype* cptr = reinterpret_cast<fptype*>(c.data_ptr());
         const int* eidptr = expert_ids.data_ptr<int32_t>();

@@ -301,6 +301,26 @@ SHAPES: list[dict[str, Any]] = [
         "group_size": 32,
         "comment": "Gemma4-31B qkv_proj",
     },
+    {
+        "in_features": 8192,
+        "out_features": 5376,
+        "group_size": 32,
+        "comment": "Gemma4-31B o_proj",
+    },
+    {
+        "in_features": 16384,
+        "out_features": 5376,
+        "group_size": 32,
+        # K*N passes LDS capacity at N>=3, so this is the shape that exercises
+        # the chunked activation path; the three entries above never do.
+        "comment": "Gemma4-31B decode, chunked path from N=3",
+    },
+    {
+        "in_features": 5376,
+        "out_features": 20480,
+        "group_size": 32,
+        "comment": "Gemma4-31B decode",
+    },
 ]
 
 # Provider naming convention: "<base>[-zp][-bf16]". Suffix -zp selects the
@@ -323,7 +343,10 @@ def _provider_use_zp(provider: str) -> bool:
     return provider.startswith("hybrid-w4a16-zp")
 
 
-BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+# 3 is not a power of two on purpose: with num_speculative_tokens=3 the
+# verify batch is 4, but N=3 is where K=16384 first crosses LDS capacity
+# and switches to the chunked path, so it is the boundary worth guarding.
+BATCH_SIZES = [1, 2, 3, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 TFLOPS_TOLERANCE_PCT = {  # [low, high] allowed deviation from golden
     "default": [-8, 8],
     "hybrid_triton_w4a16": [-80, 80],  # TODO: Why does it vary so much?
@@ -409,6 +432,18 @@ def _validate_golden(data: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _pack_zp_along_n(zp_raw: torch.Tensor) -> torch.Tensor:
+    """[N, G] uint4 values -> [N/8, G] int32, row n's nibble at bits 4*(n%8).
+
+    The layout the HIP skinny kernel reads; keeping these at 4 bits instead of
+    expanding to the activation dtype is worth 4x the metadata traffic.
+    """
+    n, g = zp_raw.shape
+    v = zp_raw.view(n // 8, 8, g) & 0xF
+    shifts = (4 * torch.arange(8, device=zp_raw.device)).view(1, 8, 1)
+    return (v << shifts).sum(dim=1).to(torch.int32)
+
+
 def prepare_hybrid_weights(
     K: int,
     N: int,
@@ -422,6 +457,8 @@ def prepare_hybrid_weights(
     same fp16 vs bf16 code path it takes in production.
     """
     from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+        _group_stride_pad,
+        _pad_group_rows,
         pack_skinny_int4,
     )
 
@@ -434,15 +471,25 @@ def prepare_hybrid_weights(
     unpacked = torch.randint(0, 16, (N, K), dtype=torch.int32, device=device)
     w_q_skinny, w_q_skinny_i32 = pack_skinny_int4(unpacked)
     w_s_skinny = torch.randn(N, num_groups, dtype=dtype, device=device) * 0.01
-    w_zp = torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device).to(
-        dtype
-    )
+    # Raw 0..15 values, in the two layouts production keeps separate: the HIP op
+    # reads them packed 8-to-an-int32 down N, while the Triton carrier is built
+    # from the unpacked values.  Handing the op the unpacked tensor is what had
+    # silently broken every -zp variant of this benchmark.
+    w_zp_raw = torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device)
+    w_zp = _pack_zp_along_n(w_zp_raw)
+
+    # Same metadata row pad the layer applies at load time, so the benchmark
+    # measures the production stride rather than a contiguous one it never sees.
+    gpad = _group_stride_pad(num_groups, w_s_skinny.element_size())
+    w_s_skinny = _pad_group_rows(w_s_skinny, gpad)
+    w_zp = _pad_group_rows(w_zp, gpad)
 
     return {
         "w_q_skinny": w_q_skinny,
         "w_s_skinny": w_s_skinny,
         "w_q_skinny_i32": w_q_skinny_i32,
         "w_zp": w_zp,
+        "w_zp_raw": w_zp_raw,
     }
 
 
@@ -558,7 +605,7 @@ def measure_tflops(
     use_zp = _provider_use_zp(provider)
     # packing zero point and scales for faster access
     packed_scale_zp = _compute_packed_scale_zp(
-        weights["w_s_skinny"], weights["w_zp"] if use_zp else None, dtype
+        weights["w_s_skinny"], weights["w_zp_raw"] if use_zp else None, dtype
     )
 
     # Build N rotating copies of the (cold) weight operands; the dominant read is
