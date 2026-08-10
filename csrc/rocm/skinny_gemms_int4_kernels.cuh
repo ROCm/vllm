@@ -582,6 +582,17 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
       };
 
       constexpr uint32_t K_STEP = THRDS * A_CHUNK * UNRL;
+      // Whole blocks normally go through the unchecked instantiation, which
+      // is what lets the compiler clause the entire UNRL*YTILE weight burst.
+      //
+      // N=3 at UNRL=4 is the one combination that loses by it -- 6 to 17% on
+      // every shape reaching that tuple -- so it keeps the bound-checked loop
+      // over the whole K range.  The bound is as narrow as it is because it
+      // was measured, not guessed: N=1, 2, 4 and 5 all prefer the unchecked
+      // form (forcing the checked one costs up to 7% at N=5), and so does
+      // N=3 at UNRL=2 (about 3%).  Widening this predicate in either
+      // direction gives some of the regression back.
+      constexpr bool CHECKED_K_LOOP = (N == 3) && (UNRL >= 4);
       const uint32_t K_whole = K - K % K_STEP;
 
       // The loads are split out of the compute so the block issues its whole
@@ -641,6 +652,13 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
         if (m >= M) {
           m += CuCount * _WvPrGrp * YTILE;
           continue;
+        }
+      } else if constexpr (CHECKED_K_LOOP) {
+        for (uint32_t k1 = 0; k1 < (uint32_t)K; k1 += K_STEP) {
+          prio_hi();
+          k_load(std::true_type{}, bigB, k1);
+          prio_lo();
+          k_compute(std::true_type{}, bigB, k1);
         }
       } else {
         uint32_t k1 = 0;
