@@ -12,8 +12,8 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.worker.dp_utils import _post_process_ubatch
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlice,
-    align_ubatch_splits_to_requests,
     _make_metadata_with_slice,
+    align_ubatch_splits_to_requests,
     can_align_ubatch_split,
     maybe_create_ubatch_slices,
     request_aligned_split_points,
