@@ -135,6 +135,7 @@ from utils import skip_if_not_cuda_alike
 import vllm
 import vllm.envs as envs
 from tests.utils import RemoteOpenAIServer, large_gpu_mark, multi_gpu_marks
+from vllm.utils.import_utils import has_deep_ep, has_mori
 
 pytestmark = [
     skip_if_not_cuda_alike,
@@ -625,12 +626,22 @@ def _write_synthetic_moe_adapter(directory: Path) -> Path:
 def _ep_server(tmp_path, all2all_backend: str, extra_args: list[str] | None = None):
     """A DP=4 + EP server on `all2all_backend`.
 
+    Gated on the backend's optional package being importable. Without this the
+    engine fails to come up and `RemoteOpenAIServer` sits out its whole
+    `max_wait_seconds=1800`, so a machine with neither package spends three
+    hours producing six errors where six skips are the honest result.
+
     `VLLM_ROCM_USE_AITER` is deliberately left *unset* rather than set to 0:
     the MoE oracles treat the variable being set at all as a request to commit
     to the AITER backend, so exporting it either way changes kernel selection.
     Leaving it unset is also what makes the MoRI arm select `TritonExperts`
     without a `--moe-backend` override.
     """
+    if all2all_backend.startswith("deepep") and not has_deep_ep():
+        pytest.skip("requires the deep_ep package")
+    if all2all_backend.startswith("mori") and not has_mori():
+        pytest.skip("requires the mori package")
+
     (tmp_path / "sitecustomize.py").write_text(_INSTRUMENTATION)
     log_prefix = str(tmp_path / "ep_a2a")
 

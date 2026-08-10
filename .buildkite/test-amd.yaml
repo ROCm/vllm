@@ -241,24 +241,6 @@ steps:
 
 #------------------------------------------------------------  mi250 · v1  -------------------------------------------------------------#
 
-- label: Batch Invariance (H100-MI250) # TBD
-  timeout_in_minutes: 180
-  mirror_hardwares: [amdexperimental, amdproduction, amdgfx90anightly, amdmi250]
-  agent_pool: mi250_1
-  optional: true
-  working_dir: "/vllm-workspace/tests"
-  source_file_dependencies:
-  - vllm/v1/attention
-  - vllm/model_executor/layers
-  - tests/v1/determinism/
-  - vllm/_aiter_ops.py
-  - vllm/platforms/rocm.py
-  commands:
-  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
-  - pip install pytest-timeout pytest-forked
-  - pytest -v -s v1/determinism/test_batch_invariance.py
-  - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
-
 - label: Cudagraph # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx90anightly, amdmi250]
@@ -2493,6 +2475,34 @@ steps:
 
 #------------------------------------------------------------  mi300 · v1  -------------------------------------------------------------#
 
+# Replaces the former `Batch Invariance (H100-MI250)` step. gfx90a is dropped
+# rather than extended: every MX module skips there, and the batch-invariant
+# work being staged targets gfx942 and gfx950.
+#
+# `optional: true` while ROCm advertises no batch-invariance support and these
+# steps run little more than the two CUDA-alike modules upstream already has.
+# It comes off as the feature PRs land and each adds its pytest line here.
+- label: Batch Invariance (H100-MI300) # TBD
+  timeout_in_minutes: 180
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
+  dind: false
+  agent_pool: mi300_1
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention
+  - vllm/model_executor/layers
+  - tests/v1/determinism/
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  commands:
+  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  - pip install pytest-timeout pytest-forked
+  - pytest -v -s v1/determinism/test_batch_invariance.py
+  - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
+  - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
+  - pytest -v -s v1/determinism/test_online_batch_invariance.py
+
 - label: Acceptance Length Test (Large Models) # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
@@ -3659,6 +3669,97 @@ steps:
 #   - pytest -s -v tests/quantization/test_gfx950_moe.py
 
 #------------------------------------------------------------  mi355 · v1  -------------------------------------------------------------#
+
+# gfx950 mirrors of the four `Batch Invariance` steps in test_areas/misc.yaml.
+# The multi-GPU ones live only here and not on mi300: gfx950 is the
+# architecture the batch-invariant work has actually been measured on, so a red
+# gfx942 collective step would say nothing a reviewer could act on yet.
+#
+# All four are `optional: true` for the reason given on the mi300 step. Keep the
+# per-module pytest invocations separate; see the note in misc.yaml.
+- label: Batch Invariance (B200-MI355) # TBD
+  timeout_in_minutes: 180
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_1
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention
+  - vllm/model_executor/layers
+  - tests/v1/determinism/
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  commands:
+  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  - pip install pytest-timeout pytest-forked
+  - pytest -v -s v1/determinism/test_batch_invariance.py
+  - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
+  - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
+  - pytest -v -s v1/determinism/test_online_batch_invariance.py
+
+- label: Batch Invariance (2xH100-2xMI355) # TBD
+  timeout_in_minutes: 180
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_2
+  num_gpus: 2
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention
+  - vllm/model_executor/layers
+  - vllm/distributed
+  - tests/v1/determinism/
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  commands:
+  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  - pip install pytest-timeout pytest-forked
+  - pytest -v -s v1/determinism/test_pp_batch_invariant.py -m 'distributed(num_gpus=2)'
+  - pytest -v -s v1/determinism/test_dp_batch_invariant.py -m 'distributed(num_gpus=2)'
+
+- label: Batch Invariance (4xH100-4xMI355) # TBD
+  timeout_in_minutes: 180
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_4
+  num_gpus: 4
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention
+  - vllm/model_executor/layers
+  - vllm/distributed
+  - tests/v1/determinism/
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  commands:
+  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  - pip install pytest-timeout pytest-forked
+  - pytest -v -s v1/determinism/test_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
+  - pytest -v -s v1/determinism/test_prefix_cache_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
+  - pytest -v -s v1/determinism/test_ep_all2all_batch_invariant.py -m 'distributed(num_gpus=4)'
+
+- label: Batch Invariance (8xH100-8xMI355) # TBD
+  timeout_in_minutes: 180
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
+  dind: false
+  agent_pool: mi355_8
+  num_gpus: 8
+  optional: true
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - vllm/v1/attention
+  - vllm/model_executor/layers
+  - vllm/distributed
+  - tests/v1/determinism/
+  - vllm/_aiter_ops.py
+  - vllm/platforms/rocm.py
+  commands:
+  - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+  - pip install pytest-timeout pytest-forked
+  - pytest -v -s v1/determinism/test_pp_tp_batch_invariant.py -m 'distributed(num_gpus=8)'
 
 - label: V1 attention (B200-MI355) %N # TBD
   timeout_in_minutes: 180
