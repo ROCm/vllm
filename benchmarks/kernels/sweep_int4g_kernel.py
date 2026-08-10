@@ -113,7 +113,6 @@ def fits_medium(K, N):
     return K * N <= LDS_MEDIUM
 
 
-
 def parse_shape(s):
     parts = s.split("x")
     if len(parts) != 2:
