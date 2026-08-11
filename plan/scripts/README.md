@@ -10,6 +10,7 @@ developed against MI300X / gfx942.
 | `probe.py` | Full prefill/decode × fp16/bf16 × {auto, fa2, aiter} matrix against a torch SDPA reference. This is what found the fa2 prefill bug. |
 | `probe2.py` | Localizes that bug: paged vs ragged vs single entry points, page sizes 1/16/32/64, exact vs partial last page. |
 | `probe3.py` | Tests and refutes the "causal mask ignored" explanation for it. |
+| `probe4.py` | Proves bitwise that the *default* route (`backend` omitted, i.e. `auto`) resolves to `fa2` and not `aiter` — so the affected kernel is the one callers get without asking. |
 | `gate_phase1.py` | Backend registration: enum path, class attrs, KV shape/stride, `validate_configuration` rejections, env var, platform priority wiring. 30 checks. |
 | `gate_phase2.py` | End-to-end generation, and greedy-token comparison between two backends. Reports the top-2 logprob gap at any divergence so a tie can be told apart from a defect. |
 | `gate_phase3.py` | Drives vLLM's own `_test_backend_correctness` (SDPA reference) directly, because the packaged test parametrizes over a gated model. |

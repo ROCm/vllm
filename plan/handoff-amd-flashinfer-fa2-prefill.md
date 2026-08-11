@@ -102,6 +102,27 @@ Read this as: `aiter` lands on the correct reference in both mask modes
 (1.6e-2 causal, 3.9e-3 non-causal) and is far from the wrong one, exactly as it
 should. `fa2` is far from **both** references in **both** modes.
 
+### The default route is the affected one
+
+`auto` is the default value of `backend`, and it is a dispatch policy rather
+than a kernel. On ROCm prefill it resolves to `fa2`. Bitwise, not inferred
+from logs:
+
+```
+backend=<omitted>   max_abs_vs_sdpa = 3.5469e+00
+backend=auto        max_abs_vs_sdpa = 3.5469e+00
+backend=fa2         max_abs_vs_sdpa = 3.5469e+00
+backend=aiter       max_abs_vs_sdpa = 1.5625e-02
+
+torch.equal(omitted, fa2)   -> True
+torch.equal(omitted, aiter) -> False
+```
+
+Omitting `backend` entirely produces output byte-identical to `backend="fa2"`.
+This is what makes the bug dangerous in practice: callers do not write
+`backend="fa2"`, they simply do not pass the argument, and get wrong prefill
+with no error, no warning, and no indication that a route was chosen for them.
+
 For scale, the two references differ from each other by 3.816e+00 — so the `fa2`
 error is the same order as the entire causal-vs-non-causal difference.
 
