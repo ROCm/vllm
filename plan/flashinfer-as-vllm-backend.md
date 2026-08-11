@@ -1,21 +1,21 @@
 # Integrate rocm-flashinfer as a vLLM attention backend (`ROCM_FLASHINFER`)
 
-## Status (updated 2026-07-31)
+## Status (updated 2026-08-11)
 
 | Phase | State |
 |---|---|
-| 0 — env + baseline | Env **done**; flashinfer validated **done** (major finding below); vendor test suite **not run**; AITER baseline **not started** |
+| 0 — env + baseline | Env **done**; flashinfer validated **done** (major finding below); AITER baseline **done** (captured in Phase 4); vendor test suite **not run** |
 | 1 — register backend | **GATE PASS** — 30/30 checks (`gate_phase1.py`) |
 | 2 — builder + forward | **GATE PASS** — end-to-end coherent text on TinyLlama, eager |
-| 3 — correctness | **layers 1–2 PASS**; layer 3 (GSM8K) not run |
+| 3 — correctness | **PASS** — SDPA 18/18, greedy match vs AITER, GSM8K within 0.005 |
 | 4 — benchmarks | **DONE (latency, eager)** — on par with AITER, 8–16% faster than Triton *in eager mode only*; the ranking changes once graphs are on, see Phase 6 and [`benchmark-results.md`](./benchmark-results.md). Throughput/serve not run. |
-| 5 — Dockerfile | **Not started** — recipe known and working, but images are `docker commit` snapshots and not reproducible |
+| 5 — Dockerfile | **DONE** — `docker/Dockerfile.rocm_flashinfer`; gates re-verified inside the built image |
 | 6 — optimization | **CUDA graphs DONE** (4.6× on decode_bs1). Remaining gap vs AITER at small batch is host-side `plan()`; the CUDA fix `fast_decode_plan` **does not exist in the ROCm build** |
 | 7 | Not started |
 
-Working branch: `rocm-flashinfer`, based on upstream `bebf918044` (v0.26.1rc0).
-Built as `0.26.1rc1.dev180+gbebf91804...rocm723`.
-Gate scripts: `plan/scripts/gate_phase{1,2,3}.py`.
+Working branch: `rocm-flashinfer-backend`, based on upstream `bebf918044`
+(v0.26.1rc0). Build with `docker/Dockerfile.rocm_flashinfer`.
+Gate scripts: `plan/scripts/gate_phase{1,2,3}.py` and `gate_phase3_gsm8k.py`.
 
 ### Correctness: settled
 
@@ -23,9 +23,9 @@ Gate scripts: `plan/scripts/gate_phase{1,2,3}.py`.
 `_test_backend_correctness` harness, `atol=rtol=1e-2`, across
 single/small/medium/large decode, prefill, and mixed batch specs, with
 `TRITON_ATTN` run alongside as a control. Driven via `gate_phase3.py` because
-the packaged test parametrizes over gated `meta-llama/Meta-Llama-3-8B` and
-this host is offline; `large_prefill` is skipped since it needs
-`max_model_len=4096` and TinyLlama caps at 2048.
+the packaged test parametrizes over gated `meta-llama/Meta-Llama-3-8B`;
+`large_prefill` is skipped since it needs `max_model_len=4096` and TinyLlama
+caps at 2048. Re-verified inside the built image on torch 2.12.
 
 **Layer 2 — vs AITER end-to-end:** 2/3 prompts byte-identical greedy. The
 third was **investigated and cleared**: at the diverging step the top-2
@@ -35,9 +35,24 @@ candidates are an *exact bf16 tie* under `ROCM_FLASHINFER`
 accumulation orders, not incorrectness. Earlier read — that AITER and
 TRITON agreeing meant ours was wrong — did not survive the measurement.
 
-**Layer 3 — GSM8K:** not run. It needed the dataset while the host was
-offline; huggingface.co is reachable again, so this is now unblocked and is
-the remaining work to close Phase 3.
+**Layer 3 — GSM8K: PASS.** Mistral-7B-Instruct-v0.3, 400 questions, 5-shot,
+greedy, bf16, via `gate_phase3_gsm8k.py` (which drives the same
+`evaluate_gsm8k` the packaged test uses, against a server per backend —
+the packaged test parametrizes over quantized models and exposes no
+attention-backend knob).
+
+| backend | accuracy | invalid |
+|---|---|---|
+| `ROCM_FLASHINFER` | 0.4650 | 0.0075 |
+| `ROCM_AITER_FA` | 0.4700 | 0.0050 |
+
+|delta| = **0.0050**, against the plan's gate of ≤ 0.08. Both land where
+Mistral-7B is expected to on 5-shot GSM8K, so this is two working backends
+agreeing, not two broken ones agreeing.
+
+Caveat on precision: 400 questions puts the standard error on each accuracy
+near 2.5%, so this bounds the difference rather than resolving it — it rules
+out a meaningful quality regression, not a sub-1% one.
 
 ### Environment: a three-way version squeeze (resolved)
 
@@ -53,12 +68,14 @@ the remaining work to close Phase 3.
   `plan/scripts/patch_use_rocm.py`, which appends
   `-DUSE_ROCM` to `COMMON_HIPCC_FLAGS` in flashinfer's
   `compilation_context_hip.py`. **Report this to AMD.**
-- Images: `vllm-fi:base` (patched flashinfer, JIT cache warm) and
-  `vllm-fi:dev` (+ vLLM editable install).
-- Build gotchas: `pip install -r requirements/rocm.txt` will **replace ROCm
-  torch with a CUDA torch** unless constrained — pin torch/torchvision/
-  torchaudio/triton via `-c`. Also needs
-  `git config --global --add safe.directory /vllm` or setuptools-scm fails.
+- **All of this now lives in `docker/Dockerfile.rocm_flashinfer`.** The earlier
+  `vllm-fi:*` `docker commit` snapshots were pruned off the host, which is
+  what forced Phase 5. The base image has since moved to **torch 2.12.0** and
+  every gate still passes, so the backend is not pinned to one torch build.
+- Build gotchas the Dockerfile handles: `requirements/rocm.txt` replaces the
+  ROCm torch with a CUDA wheel unless the torch stack is pinned via `-c`;
+  setuptools-scm needs `git safe.directory`; and `/.deps` must be kept out of
+  the build context, since CMakeCache.txt hard-codes absolute paths.
 
 ### Two vLLM defects found and fixed on this branch
 
