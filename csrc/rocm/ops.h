@@ -132,7 +132,7 @@ void moe_gemm_w4a16(at::Tensor A, at::Tensor w_packed, at::Tensor w_scale,
                     int64_t block_m, int64_t num_blocks);
 
 // Gated delta net prefill (chunked delta rule / WY transform) in one launch.
-// RDNA3.5 only: built on gfx115x (CMake VLLM_ROCM_GFX115X) and the host
+// RDNA3.5 only: built there (CMake VLLM_ROCM_GDN_CHUNKED) and the host
 // function rechecks gcnArchName, since the block layout assumes wave32.
 // `g` is the raw per-token log decay; the cumsum is taken inside the kernel.
 // Mutates `out` and `final_state` in place.

@@ -9,28 +9,33 @@ one launch of ``torch.ops._rocm_C.gdn_chunked``.
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 
-from vllm.platforms.rocm import on_gfx1150, on_gfx1151
-
-# Set VLLM_GDN_HIP=0 to fall back to the Triton kernels.
-_ENABLED = os.getenv("VLLM_GDN_HIP", "1") == "1"
+import vllm.envs as envs
 
 
 @functools.cache
 def _available() -> bool:
     """Whether the op is in this build and the device can run it.
 
-    ``is_navi`` is too wide: it also matches gfx1100, gfx1103 and gfx12xx,
-    where the kernel's wave32 block layout does not hold.
+    The device test is the RDNA3.5 family rather than a broader question such
+    as "is this Navi": gfx1100, gfx1103 and gfx12xx would answer yes, and the
+    kernel's wave32 block layout does not hold on them.
     """
-    if not _ENABLED:
+    if not envs.VLLM_GDN_HIP:
         return False
-    if not (on_gfx1150() or on_gfx1151()):
+    if not hasattr(torch.ops, "_rocm_C") or not hasattr(
+        torch.ops._rocm_C, "gdn_chunked"
+    ):
         return False
-    return hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "gdn_chunked")
+    # Imported here rather than at module scope: this module is reached from
+    # chunk.py on every platform, and importing vllm.platforms.rocm syncs the
+    # HIP/CUDA visibility env vars and resolves the GCN arch at import time,
+    # which on a non-ROCm build falls back to torch.cuda and initialises CUDA.
+    from vllm.platforms.rocm import on_gfx115x
+
+    return on_gfx115x()
 
 
 def is_hip_gdn_supported(

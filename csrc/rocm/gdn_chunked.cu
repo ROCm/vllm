@@ -1,5 +1,14 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+// SPDX-FileCopyrightText: The ggml authors
+//
+// This file contains code ported from the llama.cpp project (ggml-cuda
+// 6417ef6b and d09a120e).  The original source code was licensed under the MIT
+// license and included the following copyright notice:
+// Copyright (c) 2023-2026 The ggml authors
+//
 // Chunked delta rule (WY representation / UT transform) for the scalar-gate
-// gated delta net, ported from llama.cpp (ggml-cuda 6417ef6b, RDNA3.5).
+// gated delta net, on RDNA3.5.
 //
 // The sequence is cut into chunks of GDN_CHUNK tokens and the rank-1 state
 // updates inside a chunk are folded into (I + A)^-1, so the recurrence's inner
@@ -42,6 +51,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <bit>
 #include <cstdint>
 #include <string>
 
@@ -64,18 +74,24 @@ constexpr int GDN_CHUNK_PITCH = GDN_CHUNK + 1;
 constexpr int GDN_COL_LANES = 16;
 constexpr int GDN_ROWS_PER_LANE = GDN_HEAD_DIM / GDN_COL_LANES;
 
-#if defined(__gfx1150__) || defined(__gfx1151__)
-  #define GDN_RDNA3_5 1
+// The whole RDNA3.5 family: wave32, four SIMDs and 128 KB of LDS per WGP,
+// which is what the block layout below assumes.  The four are spelled out
+// because there is no gfx11.5 family macro; the compiler defines a per-target
+// __gfxNNNN__ and __GFX11__, and the latter also covers gfx1100 through
+// gfx1103, which are RDNA3 and do not share that layout.
+#if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || \
+    defined(__gfx1153__)
+  #define GDN_SUPPORTED_ARCH 1
 #endif
 
-#ifdef GDN_RDNA3_5
+#ifdef GDN_SUPPORTED_ARCH
 template <int N>
 __device__ __forceinline__ float gdn_dpp_shl_add(float x) {
   // row_shl:N makes lane i read lane i+N within its row of 16, and the move
   // folds into the add
-  const int y = __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, x),
-                                            0x100 | N, 0xf, 0xf, true);
-  return x + __builtin_bit_cast(float, y);
+  const int y = __builtin_amdgcn_update_dpp(0, std::bit_cast<int>(x), 0x100 | N,
+                                            0xf, 0xf, true);
+  return x + std::bit_cast<float>(y);
 }
 #endif
 
@@ -85,7 +101,7 @@ __device__ __forceinline__ float gdn_dpp_shl_add(float x) {
 // free modifier on the add, while the portable shuffle lowers to
 // ds_bpermute_b32 and would contend with the staged tiles for the LDS pipe.
 __device__ __forceinline__ float gdn_sum_to_lane0(float x) {
-#ifdef GDN_RDNA3_5
+#ifdef GDN_SUPPORTED_ARCH
   static_assert(GDN_COL_LANES == 16,
                 "the row_shl chain below covers exactly 16 lanes");
   x = gdn_dpp_shl_add<1>(x);
@@ -114,44 +130,44 @@ __device__ __forceinline__ float gdn_exp2(float x) {
 }
 
 __device__ __forceinline__ float gdn_bf16_to_f32(uint16_t x) {
-  union {
-    uint32_t u;
-    float f;
-  } c;
-  c.u = static_cast<uint32_t>(x) << 16;
-  return c.f;
+  return std::bit_cast<float>(static_cast<uint32_t>(x) << 16);
 }
 
 // Round to nearest even.
 __device__ __forceinline__ uint16_t gdn_f32_to_bf16(float f) {
-  union {
-    float f;
-    uint32_t u;
-  } c;
-  c.f = f;
-  if ((c.u & 0x7fffffffu) > 0x7f800000u) {
+  const uint32_t u = std::bit_cast<uint32_t>(f);
+  if ((u & 0x7fffffffu) > 0x7f800000u) {
     return static_cast<uint16_t>(0x7fc0);  // quiet NaN
   }
-  const uint32_t rounded = c.u + 0x7fffu + ((c.u >> 16) & 1u);
+  const uint32_t rounded = u + 0x7fffu + ((u >> 16) & 1u);
   return static_cast<uint16_t>(rounded >> 16);
 }
 
-// On RDNA3.5 a block of GDN_BLOCK_SIZE threads is 32 waves, and two blocks per
-// WGP come to 16 waves per SIMD; requesting that caps the register allocation
-// at 1536/16 = 96, which is what keeps both blocks resident.  The kernel is
-// still compiled for every target in the build, and on those the request would
-// be unreachable and -Wpass-failed would turn it into a build error.
-#ifdef GDN_RDNA3_5
+// A block of GDN_BLOCK_SIZE threads is 32 waves, so two blocks per WGP come to
+// 16 waves per SIMD.  Requesting that caps the register allocation at
+// file_size/16, and the family is not uniform in file size: gfx1151 has 1536
+// registers per SIMD, so the cap lands at 96 and both blocks stay resident,
+// while the other three have 1024, where the same request caps at 64 and
+// spills 32 registers per thread.  Asking those for 8 gives 100 registers and
+// no spill, at one block per WGP.
+//
+// Measured with -Rpass-analysis=kernel-resource-usage; only gfx1151 has been
+// run on hardware.
+#if defined(__gfx1151__)
   #define GDN_MIN_WAVES_PER_SIMD 16
+#elif defined(GDN_SUPPORTED_ARCH)
+  #define GDN_MIN_WAVES_PER_SIMD 8
 #else
   #define GDN_MIN_WAVES_PER_SIMD 1
 #endif
 
 // CU mode confines a block to one CU, which halves the LDS contention domain.
 // It costs no residency: a WGP holds floor(128 KB / 57.25 KB) = 2 of these
-// blocks in WGP mode and 2*floor(64 KB / 57.25 KB) = 2 in CU mode.  It only
-// pays once every CU has a block to run, hence the launch-time choice below.
-#ifdef GDN_RDNA3_5
+// blocks in WGP mode and 2*floor(64 KB / 57.25 KB) = 2 in CU mode.  LDS is
+// what binds on gfx1151; on the 1024-register parts the register file binds
+// first and holds one block either way.  It only pays once every CU has a
+// block to run, hence the launch-time choice below.
+#ifdef GDN_SUPPORTED_ARCH
   #define GDN_CU_MODE __attribute__((target("cumode")))
 #else
   #define GDN_CU_MODE
@@ -513,7 +529,9 @@ void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
   // so without this check a wave64 device would launch and return wrong
   // numbers.
   const std::string arch(props->gcnArchName);  // e.g. "gfx1151:xnack-"
-  TORCH_CHECK(arch.rfind("gfx1150", 0) == 0 || arch.rfind("gfx1151", 0) == 0,
+  TORCH_CHECK(arch.rfind("gfx1150", 0) == 0 || arch.rfind("gfx1151", 0) == 0 ||
+                  arch.rfind("gfx1152", 0) == 0 ||
+                  arch.rfind("gfx1153", 0) == 0,
               "gdn_chunked is RDNA3.5-only (wave32 + DPP); device is ", arch);
   TORCH_CHECK(props->warpSize == GDN_WAVE,
               "gdn_chunked requires wave32; device reports warpSize ",

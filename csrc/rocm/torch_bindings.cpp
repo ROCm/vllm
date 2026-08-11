@@ -164,7 +164,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_gptq_gemm_rdna3", torch::kCUDA, &moe_gptq_gemm_rdna3);
 #endif
 
-#ifdef VLLM_ROCM_GFX115X
+#ifdef VLLM_ROCM_GDN_CHUNKED
   // Gated delta net prefill in one launch (RDNA3.5). `g` is the raw per-token
   // log decay; the cumsum is taken inside the kernel.
   rocm_ops.def(

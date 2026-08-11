@@ -17,14 +17,15 @@ if not current_platform.is_rocm():
         allow_module_level=True,
     )
 
-from vllm.platforms.rocm import on_gfx1150, on_gfx1151  # noqa: E402
+from vllm.platforms.rocm import on_gfx115x  # noqa: E402
 
-if not (on_gfx1150() or on_gfx1151()):
+if not on_gfx115x():
     pytest.skip(
-        reason="gdn_chunked is RDNA3.5 (gfx1150/gfx1151) only.",
+        reason="gdn_chunked is RDNA3.5 only.",
         allow_module_level=True,
     )
 
+import vllm.envs as envs  # noqa: E402
 import vllm.model_executor.layers.fla.ops.chunk_rocm as chunk_rocm  # noqa: E402
 from vllm.model_executor.layers.fla.ops import (  # noqa: E402
     chunk_gated_delta_rule,
@@ -46,9 +47,12 @@ def test_op_is_registered():
 @contextlib.contextmanager
 def _accelerated_paths_disabled():
     """Force ``chunk_gated_delta_rule`` onto the Triton kernels."""
-    saved_hip = chunk_rocm._ENABLED
-    chunk_rocm._ENABLED = False
+    saved_hip = envs.VLLM_GDN_HIP
+    envs.VLLM_GDN_HIP = False
     chunk_rocm._available.cache_clear()
+    # If this ever stops taking effect the reference below becomes the kernel
+    # under test, and every comparison passes by construction.
+    assert not chunk_rocm._available()
     saved_fused = None
     try:
         import vllm.model_executor.layers.fla.ops.chunk_fused as chunk_fused
@@ -60,7 +64,7 @@ def _accelerated_paths_disabled():
     try:
         yield
     finally:
-        chunk_rocm._ENABLED = saved_hip
+        envs.VLLM_GDN_HIP = saved_hip
         chunk_rocm._available.cache_clear()
         if chunk_fused is not None:
             chunk_fused._ENABLED = saved_fused
@@ -146,6 +150,9 @@ def _run_both(q, k, v, g, beta, initial_state, cu_seqlens):
         [32, 33, 64, 1],  # pins the 32-token chunk boundary
         [1, 300, 64, 65, 200],
         [137, 1, 941, 512],
+        # Plain decodes are reclassified as prefill when speculative decoding
+        # is active, arriving as a batch of single-token sequences.
+        [1] * 8,
     ],
 )
 @torch.inference_mode()

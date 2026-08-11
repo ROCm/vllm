@@ -96,15 +96,16 @@ class Inputs:
 
     def via_op(self, hip_enabled: bool):
         """Call the public op with the HIP kernel forced on or off."""
+        import vllm.envs as envs
         import vllm.model_executor.layers.fla.ops.chunk_rocm as cr
 
-        saved = cr._ENABLED
-        cr._ENABLED = hip_enabled
+        saved = envs.VLLM_GDN_HIP
+        envs.VLLM_GDN_HIP = hip_enabled
         cr._available.cache_clear()
         try:
             return self.baseline()
         finally:
-            cr._ENABLED = saved
+            envs.VLLM_GDN_HIP = saved
             cr._available.cache_clear()
 
     def baseline(self):

@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     VLLM_MOE_GPTQ_EXLLAMA: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
     VLLM_MOE_HIP: str | None = None
+    VLLM_GDN_HIP: bool = True
     VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
@@ -1140,6 +1141,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default-on wherever the kernel is built (gfx11), "1" forces on, "0" forces
     # the Triton path. Read via moe_hip_w4a16.is_enabled().
     "VLLM_MOE_HIP": lambda: os.environ.get("VLLM_MOE_HIP", None),
+    # Whether to use the single-kernel HIP gated delta net prefill on RDNA3.5.
+    # Set to 0 to fall back to the Triton kernels.
+    # By default is enabled.
+    "VLLM_GDN_HIP": lambda: (
+        os.getenv("VLLM_GDN_HIP", "True").lower() in ("true", "1")
+    ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (
