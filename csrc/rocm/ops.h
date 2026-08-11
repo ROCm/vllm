@@ -131,6 +131,17 @@ void moe_gemm_w4a16(at::Tensor A, at::Tensor w_packed, at::Tensor w_scale,
                     at::Tensor C, int64_t n_valid_tokens, int64_t top_k,
                     int64_t block_m, int64_t num_blocks);
 
+// Gated delta net prefill (chunked delta rule / WY transform) in one launch.
+// RDNA3.5 only: built there (CMake VLLM_ROCM_GDN_CHUNKED) and the host
+// function rechecks gcnArchName, since the block layout assumes wave32.
+// `g` is the raw per-token log decay; the cumsum is taken inside the kernel.
+// Mutates `out` and `final_state` in place.
+void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
+                 torch::Tensor& g, torch::Tensor& beta,
+                 std::optional<torch::Tensor> initial_state,
+                 torch::Tensor& cu_seqlens, torch::Tensor& out,
+                 torch::Tensor& final_state, double scale);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
