@@ -1,5 +1,11 @@
 /.venv
 /build
+# CMake FetchContent scratch. Already in .gitignore, but it also must not enter
+# a build context: its CMakeCache.txt files hard-code the absolute path they
+# were configured at, so copying them in makes the in-container build fail with
+# "current CMakeCache.txt directory is different than the directory where
+# CMakeCache.txt was created".
+/.deps
 dist
 vllm/*.so
 vllm/vllm-rs

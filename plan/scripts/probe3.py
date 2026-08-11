@@ -1,9 +1,8 @@
 """Is fa2 prefill ignoring causal=True? Compare against BOTH references."""
 
+import flashinfer
 import torch
 import torch.nn.functional as F
-
-import flashinfer
 
 torch.manual_seed(7)
 DEV, DT, HS, NQ, NKV = "cuda", torch.bfloat16, 128, 32, 8

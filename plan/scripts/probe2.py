@@ -8,10 +8,9 @@ Controls:
      to localize whether the bug is in paging or in the fa2 prefill kernel.
 """
 
+import flashinfer
 import torch
 import torch.nn.functional as F
-
-import flashinfer
 
 torch.manual_seed(0)
 DEV = "cuda"
@@ -72,8 +71,19 @@ def paged_prefill(backend, seq_lens, block_size, q):
     )
     ws = torch.empty(256 << 20, dtype=torch.uint8, device=DEV)
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend=backend)
-    w.plan(qo, indptr, indices, lpl, NQ, NKV, HS, block_size,
-           causal=True, q_data_type=DT, kv_data_type=DT)
+    w.plan(
+        qo,
+        indptr,
+        indices,
+        lpl,
+        NQ,
+        NKV,
+        HS,
+        block_size,
+        causal=True,
+        q_data_type=DT,
+        kv_data_type=DT,
+    )
     return w.run(q, kv.transpose(1, 2).split(HS, dim=-1)), ks, vs, qo
 
 
@@ -125,7 +135,10 @@ for be in ("fa2", "aiter"):
         o = flashinfer.single_prefill_with_kv_cache(q, k, v, causal=True, backend=be)
         print(f"  single_prefill      backend={be:<6} max_abs_vs_sdpa={d(o, ref):.3e}")
     except Exception as e:
-        print(f"  single_prefill      backend={be:<6} ERR {type(e).__name__}: {str(e)[:80]}")
+        print(
+            f"  single_prefill      backend={be:<6} "
+            f"ERR {type(e).__name__}: {str(e)[:80]}"
+        )
 
 for be in ("fa2", "aiter"):
     try:
@@ -136,7 +149,10 @@ for be in ("fa2", "aiter"):
         o = w.run(q, k, v)
         print(f"  ragged_prefill      backend={be:<6} max_abs_vs_sdpa={d(o, ref):.3e}")
     except Exception as e:
-        print(f"  ragged_prefill      backend={be:<6} ERR {type(e).__name__}: {str(e)[:80]}")
+        print(
+            f"  ragged_prefill      backend={be:<6} "
+            f"ERR {type(e).__name__}: {str(e)[:80]}"
+        )
 
 print("\n--- (3) decode control (expected: all good) ---")
 torch.manual_seed(3)
@@ -151,9 +167,13 @@ for be in (None, "fa2"):
     w.plan(indptr, indices, lpl, NQ, NKV, HS, 16, q_data_type=DT, kv_data_type=DT)
     o = w.run(qd, kv.transpose(1, 2).split(HS, dim=-1))
     rep = NQ // NKV
-    r = F.scaled_dot_product_attention(
-        qd.transpose(0, 1).unsqueeze(0).float(),
-        ks[0].repeat_interleave(rep, 1).transpose(0, 1).unsqueeze(0).float(),
-        vs[0].repeat_interleave(rep, 1).transpose(0, 1).unsqueeze(0).float(),
-    ).squeeze(0).transpose(0, 1)
+    r = (
+        F.scaled_dot_product_attention(
+            qd.transpose(0, 1).unsqueeze(0).float(),
+            ks[0].repeat_interleave(rep, 1).transpose(0, 1).unsqueeze(0).float(),
+            vs[0].repeat_interleave(rep, 1).transpose(0, 1).unsqueeze(0).float(),
+        )
+        .squeeze(0)
+        .transpose(0, 1)
+    )
     print(f"  decode backend={str(be):<6} max_abs_vs_sdpa={d(o, r):.3e}")

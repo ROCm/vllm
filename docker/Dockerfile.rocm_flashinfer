@@ -1,0 +1,131 @@
+# syntax=docker/dockerfile:1.7
+# vLLM on ROCm with the ROCM_FLASHINFER attention backend.
+#
+# Layers AMD's ROCm port of FlashInfer (the `amd-flashinfer` wheel, imported as
+# `flashinfer`) onto the same base image `docker/Dockerfile.rocm` uses, then
+# builds vLLM from the source tree in this repo.
+#
+#   docker build -f docker/Dockerfile.rocm_flashinfer -t vllm-rocm-flashinfer .
+#
+#   docker run --rm -it --device=/dev/kfd --device=/dev/dri --group-add video \
+#     --security-opt seccomp=unconfined --ipc=host --shm-size 32g \
+#     vllm-rocm-flashinfer
+#
+# The backend is opt-in: it is only eligible for selection when
+# VLLM_ROCM_USE_FLASHINFER=1, or when requested with
+# `--attention-backend ROCM_FLASHINFER`.
+#
+# Three steps here are not obvious and each one is load-bearing; see the
+# comments at their build stages:
+#   1. -DUSE_ROCM must be added to flashinfer's JIT flags on torch >= 2.11
+#   2. requirements/rocm.txt will replace the ROCm torch with a CUDA build
+#      unless the torch stack is pinned
+#   3. git safe.directory is needed or setuptools-scm cannot derive a version
+
+# Matches docker/Dockerfile.rocm. Provides ROCm 7.2.3, Ubuntu 22.04,
+# Python 3.12 and a source-built torch 2.11.0+gitd0c8b1f.
+ARG BASE_IMAGE=rocm/vllm-dev:base
+
+# amd-flashinfer is published on AMD's per-ROCm-version package index, not PyPI.
+ARG AMD_FLASHINFER_INDEX_URL=https://pypi.amd.com/rocm-7.2.0/simple
+ARG AMD_FLASHINFER_VERSION=0.5.3+amd.1
+
+# amd-flashinfer only supports gfx942 (MI300X/MI325X) and gfx950 (MI355X);
+# the backend refuses to load anywhere else, so do not pay to build for more.
+ARG PYTORCH_ROCM_ARCH="gfx942;gfx950"
+
+ARG COMMON_WORKDIR=/vllm-workspace
+ARG MAX_JOBS=16
+
+
+FROM ${BASE_IMAGE} AS flashinfer_install
+ARG AMD_FLASHINFER_INDEX_URL
+ARG AMD_FLASHINFER_VERSION
+ARG COMMON_WORKDIR
+
+# JIT-compiled kernels are cached under $HOME/.cache/flashinfer at runtime.
+ENV FLASHINFER_WORKSPACE_BASE=/root
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+        "amd-flashinfer==${AMD_FLASHINFER_VERSION}" \
+        --index-url "${AMD_FLASHINFER_INDEX_URL}"
+
+# PyTorch 2.11 moved the c10::hip hipify-v2 compatibility namespace behind
+# `#ifdef USE_ROCM` (c10/hip/HIPStream.h). amd-flashinfer's generated kernels
+# call c10::hip::getCurrentHIPStream() but its JIT never passes -DUSE_ROCM, so
+# on torch >= 2.11 *every* kernel fails to compile with:
+#   error: no member named 'getCurrentHIPStream' in namespace 'c10::hip'
+# This was invisible on torch 2.9/2.10, where the namespace was unguarded.
+# Idempotent, and a no-op once amd-flashinfer ships the flag itself.
+COPY plan/scripts/patch_use_rocm.py /tmp/patch_use_rocm.py
+RUN python3 /tmp/patch_use_rocm.py && rm /tmp/patch_use_rocm.py
+
+
+FROM flashinfer_install AS build_vllm
+ARG COMMON_WORKDIR
+ARG PYTORCH_ROCM_ARCH
+ARG MAX_JOBS
+
+ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
+ENV VLLM_TARGET_DEVICE=rocm
+ENV MAX_JOBS=${MAX_JOBS}
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${MAX_JOBS}
+
+WORKDIR ${COMMON_WORKDIR}
+COPY . ${COMMON_WORKDIR}
+
+# setuptools-scm shells out to git to derive the version. It refuses to read a
+# repository whose files it does not own, which is what happens when this tree
+# is bind-mounted from the host; the failure surfaces far from its cause, as
+# `metadata-generation-failed` during the editable install.
+RUN git config --global --add safe.directory ${COMMON_WORKDIR}
+
+# requirements/rocm.txt does not pin torch, and some transitive dependency
+# (compressed-tensors requires torch>=2.10) is enough for the resolver to
+# helpfully replace this image's ROCm torch with a CUDA wheel from PyPI --
+# taking torch.version.hip to None and breaking the build in a way that reads
+# as "Unknown runtime environment". Pin whatever the base image shipped.
+RUN for p in torch torchvision torchaudio triton; do \
+        v=$(python3 -c "import importlib.metadata as md; print(md.version('$p'))" \
+            2>/dev/null) && echo "$p==$v"; \
+    done > /tmp/torch-constraints.txt \
+    && cat /tmp/torch-constraints.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --no-build-isolation \
+        -c /tmp/torch-constraints.txt \
+        -r requirements/rocm.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cache/ccache \
+    python3 -m pip install --no-build-isolation --no-deps \
+        -c /tmp/torch-constraints.txt -e .
+
+
+FROM build_vllm AS final
+ARG COMMON_WORKDIR
+WORKDIR ${COMMON_WORKDIR}
+
+ENV RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES=1
+ENV TOKENIZERS_PARALLELISM=false
+ENV HIP_FORCE_DEV_KERNARG=1
+
+# Deliberately NOT setting VLLM_ROCM_USE_FLASHINFER: the backend stays opt-in
+# so that pulling this image does not silently change backend selection.
+
+# Record what actually went in, the way Dockerfile.rocm_base does.
+RUN mkdir -p /app \
+    && for p in torch triton amd-flashinfer amd-aiter vllm; do \
+         v=$(python3 -c "import importlib.metadata as md; print(md.version('$p'))" \
+             2>/dev/null || echo "<absent>"); \
+         echo "$p==$v"; \
+       done > /app/versions.txt \
+    && cat /app/versions.txt
+
+# Fail the build rather than ship an image whose flashinfer cannot compile.
+# Needs a GPU, so it only runs when the builder has --device=/dev/kfd; it is
+# a no-op otherwise. Verify manually with:
+#   docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+#     vllm-rocm-flashinfer python3 plan/scripts/gate_phase1.py
+CMD ["/bin/bash"]

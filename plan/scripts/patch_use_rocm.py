@@ -14,6 +14,7 @@ This was fine on torch 2.9/2.10, where the compat namespace was unguarded.
 Idempotent. Run inside the container after installing amd-flashinfer.
 """
 
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -21,10 +22,27 @@ from pathlib import Path
 FLAG = '"-DUSE_ROCM",'
 
 
-def main() -> int:
-    import flashinfer
+def _package_dir() -> Path | None:
+    """Locate flashinfer without importing it.
 
-    target = Path(flashinfer.__file__).parent / "compilation_context_hip.py"
+    Importing the package builds a JIT workspace path from
+    torch.cuda.get_device_properties(), which raises when no GPU is visible --
+    as in a `docker build` container, which is exactly where this patch needs
+    to run.
+    """
+    spec = importlib.util.find_spec("flashinfer")
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    return Path(next(iter(spec.submodule_search_locations)))
+
+
+def main() -> int:
+    pkg_dir = _package_dir()
+    if pkg_dir is None:
+        print("ERROR: flashinfer package not found", file=sys.stderr)
+        return 1
+
+    target = pkg_dir / "compilation_context_hip.py"
     if not target.exists():
         print(f"ERROR: {target} not found", file=sys.stderr)
         return 1

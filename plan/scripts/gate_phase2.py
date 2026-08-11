@@ -16,9 +16,11 @@ PROMPTS = [
     "The capital of France is",
     "Write one sentence about the ocean:",
     # long enough to span several 16-token pages and exercise chunked prefill
-    "Count from one to twenty in words: one, two, three, four, five, six, "
-    "seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, "
-    "sixteen, seventeen, eighteen, nineteen,",
+    (
+        "Count from one to twenty in words: one, two, three, four, five, six, "
+        "seven, eight, nine, ten, eleven, twelve, thirteen, fourteen, fifteen, "
+        "sixteen, seventeen, eighteen, nineteen,"
+    ),
 ]
 
 

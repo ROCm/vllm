@@ -9,22 +9,27 @@ Usage: python3 gate_phase3.py [MODEL]
 """
 
 import os
+import pathlib
 import sys
 import traceback
 
 os.environ.setdefault("VLLM_ROCM_USE_FLASHINFER", "1")
-sys.path.insert(0, "/vllm")
-sys.path.insert(0, "/vllm/tests")
 
-import torch  # noqa: E402
+# Derive the repo root from this file's location rather than hardcoding a
+# mount point: the checkout lives at /vllm when bind-mounted for development
+# and at /vllm-workspace inside the image built by
+# docker/Dockerfile.rocm_flashinfer.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT / "tests"))
 
-from vllm.config import VllmConfig  # noqa: E402
-from vllm.v1.attention.backends.registry import AttentionBackendEnum  # noqa: E402
 
 from tests.v1.attention.test_attention_backends import (  # noqa: E402
     BATCH_SPECS,
     _test_backend_correctness,
 )
+from vllm.config import VllmConfig  # noqa: E402
+from vllm.v1.attention.backends.registry import AttentionBackendEnum  # noqa: E402
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 

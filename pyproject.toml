@@ -58,6 +58,10 @@ include = ["vllm*"]
 "vllm/third_party/**" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
+# Standalone diagnostic scripts, not importable library code. They import
+# lazily and mid-file on purpose, to observe behaviour that depends on import
+# order and on environment variables set earlier in the same script.
+"plan/scripts/*.py" = ["E402"]
 
 [tool.ruff.lint]
 select = [

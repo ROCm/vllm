@@ -9,10 +9,9 @@ Reference is torch SDPA over the gathered (unpaged) KV.
 
 import inspect
 
+import flashinfer
 import torch
 import torch.nn.functional as F
-
-import flashinfer
 
 torch.manual_seed(0)
 DEV = "cuda"
@@ -101,8 +100,9 @@ def check(name, got, want, dtype):
     return ok
 
 
-def run_prefill(dtype, backend, num_qo_heads=32, num_kv_heads=8, head_size=128,
-                block_size=16):
+def run_prefill(
+    dtype, backend, num_qo_heads=32, num_kv_heads=8, head_size=128, block_size=16
+):
     seq_lens = [37, 128, 5]
     kv_cache, indptr, indices, lpl, ks, vs = make_paged_kv(
         seq_lens, num_kv_heads, head_size, block_size, dtype
@@ -118,9 +118,17 @@ def run_prefill(dtype, backend, num_qo_heads=32, num_kv_heads=8, head_size=128,
         kwargs["backend"] = backend
     w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", **kwargs)
     w.plan(
-        qo_indptr, indptr, indices, lpl,
-        num_qo_heads, num_kv_heads, head_size, block_size,
-        causal=True, q_data_type=dtype, kv_data_type=dtype,
+        qo_indptr,
+        indptr,
+        indices,
+        lpl,
+        num_qo_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        causal=True,
+        q_data_type=dtype,
+        kv_data_type=dtype,
     )
     out = w.run(q, as_tuple(kv_cache, head_size))
 
@@ -132,8 +140,9 @@ def run_prefill(dtype, backend, num_qo_heads=32, num_kv_heads=8, head_size=128,
     return ok
 
 
-def run_decode(dtype, backend, num_qo_heads=32, num_kv_heads=8, head_size=128,
-               block_size=16):
+def run_decode(
+    dtype, backend, num_qo_heads=32, num_kv_heads=8, head_size=128, block_size=16
+):
     seq_lens = [37, 128, 5]
     kv_cache, indptr, indices, lpl, ks, vs = make_paged_kv(
         seq_lens, num_kv_heads, head_size, block_size, dtype
@@ -149,9 +158,15 @@ def run_decode(dtype, backend, num_qo_heads=32, num_kv_heads=8, head_size=128,
         kwargs["use_tensor_cores"] = False
     w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", **kwargs)
     w.plan(
-        indptr, indices, lpl,
-        num_qo_heads, num_kv_heads, head_size, block_size,
-        q_data_type=dtype, kv_data_type=dtype,
+        indptr,
+        indices,
+        lpl,
+        num_qo_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        q_data_type=dtype,
+        kv_data_type=dtype,
     )
     out = w.run(q, as_tuple(kv_cache, head_size))
 
