@@ -894,7 +894,10 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         w_s_skinny = _pad_group_rows(w_s_raw.data, _gpad)
 
         # ---- Process zero-points for asymmetric quantization ----
+        # Both stay None on the symmetric path: w_zp is the packed form the
+        # kernels read, zp_unpacked the raw-nibble form the dequant cache wants.
         w_zp = None
+        zp_unpacked = None
         if c.zero_points:
             assert self.w_zp_name is not None
             w_zp_raw = getattr(layer, self.w_zp_name)
@@ -941,7 +944,9 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         #         plain integer. Consumed by the int-domain subtract (RDNA3 has no
         #         v_pk_fma_bf16). Bit-identical to the separate scale+zp loads.
         if c.zero_points and c.act_type in (torch.float16, torch.bfloat16):
-            assert w_zp is not None  # set above whenever c.zero_points is True
+            # both set above whenever c.zero_points is True
+            assert w_zp is not None
+            assert zp_unpacked is not None
             scale_u16 = w_s_skinny.view(torch.uint16).to(torch.int32) & 0xFFFF
             if c.act_type == torch.float16:
                 w_s_f32 = w_s_skinny.to(torch.float32)

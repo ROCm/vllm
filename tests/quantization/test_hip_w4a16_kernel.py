@@ -371,3 +371,69 @@ def test_compute_awq_gemv_padding_non128_group_size(group_size, K, N, monkeypatc
     assert not should_pad
     assert split_k == 0
     assert padded_groups == num_groups
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_hybrid_w4a16_process_weights_symmetric_with_prefill_dequant():
+    """Symmetric weights must survive process_weights_after_loading.
+
+    The dequant-prefill cache is handed the raw-nibble zero points, which only
+    exist on the asymmetric path, so the symmetric path has to pass None rather
+    than a name that was never bound.  Reachable only with
+    ``w4a16_prefill_dequant`` set, which is off by default.
+    """
+    from types import SimpleNamespace
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (  # noqa: E501
+        HybridW4A16LinearKernel,
+    )
+
+    _ensure_single_process_model_parallel()
+    N, K, group_size, pack_factor = 256, 512, 128, 8
+    weight_loader = lambda *_a, **_kw: None  # noqa: E731
+
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "weight_packed",
+        PackedvLLMParameter(
+            input_dim=1,
+            output_dim=0,
+            packed_dim=1,
+            packed_factor=pack_factor,
+            weight_loader=weight_loader,
+            data=torch.ones((N, K // pack_factor), dtype=torch.int32, device="cuda"),
+        ),
+    )
+    layer.register_parameter(
+        "weight_scale",
+        GroupQuantScaleParameter(
+            output_dim=0,
+            input_dim=1,
+            weight_loader=weight_loader,
+            data=torch.ones(N, K // group_size, dtype=torch.float16, device="cuda"),
+        ),
+    )
+
+    kernel = HybridW4A16LinearKernel(
+        MPLinearLayerConfig(
+            full_weight_shape=(K, N),
+            partition_weight_shape=(K, N),
+            weight_type=scalar_types.uint4b8,
+            act_type=torch.float16,
+            group_size=group_size,
+            zero_points=False,
+            has_g_idx=False,
+            out_type=None,
+        ),
+        w_q_param_name="weight_packed",
+        w_s_param_name="weight_scale",
+        w_zp_param_name=None,
+    )
+
+    # A real ModelConfig would need a downloadable model; this path reads one
+    # field off it.
+    vllm_config = VllmConfig()
+    vllm_config.model_config = SimpleNamespace(w4a16_prefill_dequant="soft")
+    with set_current_vllm_config(vllm_config):
+        kernel.process_weights_after_loading(layer)
