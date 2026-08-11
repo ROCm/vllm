@@ -6,16 +6,21 @@
 **Severity:** High — wrong numerical output, no error raised, on the **default** code path
 **Status:** Open, not reported upstream yet
 
-## Three findings in this document
+## Four findings in this document
 
-1. **HIP `fa2` prefill returns wrong results** — the main subject below.
-   Correctness bug, silent, on the default route. *High.*
-2. **JIT cannot compile against torch 2.11** — one missing `-DUSE_ROCM`.
+1. **HIP `fa2` prefill returns wrong results.** Silent, no error. *High.*
+2. **`auto` never routes prefill to AITER**, contrary to the README's feature
+   matrix — the router has no AITER branch, so every caller who does not pass
+   `backend="aiter"` explicitly gets finding #1. The ragged wrapper discards
+   `"aiter"` even when passed. *High, and it is what makes #1 reachable.*
+3. **JIT cannot compile against torch ≥2.11** — one missing `-DUSE_ROCM`.
    Blocks amd-flashinfer and current vLLM from coexisting at all. *Trivial fix.*
-3. **No `fast_decode_plan` on the ROCm path** — missing optimization, costs
+4. **No `fast_decode_plan` on the ROCm path** — missing optimization, costs
    ~37–42% on small-batch decode under CUDA graphs. *Enhancement.*
 
-They are independent; each can be filed separately.
+#1 and #2 compound and should probably be filed together: a wrong kernel that
+nothing selects would be low severity, and a routing gap that lands on a
+correct kernel would be cosmetic. #3 and #4 are independent.
 
 ---
 
@@ -40,7 +45,7 @@ ROCm is AITER underneath rather than FlashInfer's own kernels.
 |---|---|---|
 | `single_prefill_with_kv_cache` | **wrong** | correct |
 | `BatchPrefillWithPagedKVCacheWrapper` | **wrong** | correct |
-| `BatchPrefillWithRaggedKVCacheWrapper` | **wrong** | **wrong** (route appears not honored) |
+| `BatchPrefillWithRaggedKVCacheWrapper` | **wrong** | **wrong** — `"aiter"` is coerced to `fa2` in `__init__` |
 | `BatchDecodeWithPagedKVCacheWrapper` | correct | correct |
 
 Independent of: dtype (fp16 and bf16 both affected), page size (1, 16, 32, 64),
@@ -102,11 +107,39 @@ Read this as: `aiter` lands on the correct reference in both mask modes
 (1.6e-2 causal, 3.9e-3 non-causal) and is far from the wrong one, exactly as it
 should. `fa2` is far from **both** references in **both** modes.
 
-### The default route is the affected one
+### `auto` never reaches AITER on prefill — the documented routing is absent
 
-`auto` is the default value of `backend`, and it is a dispatch policy rather
-than a kernel. On ROCm prefill it resolves to `fa2`. Bitwise, not inferred
-from logs:
+This is the second half of the problem, and arguably the more important half.
+The README's feature matrix says prefill auto-routes to AITER for
+fp16/bf16 + NHD + `pos_encoding_mode="NONE"`. **The shipped code does not do
+that.** AITER is not reachable through `auto` at all, for any input.
+
+Behaviour differs by entry point, all in `flashinfer/prefill_rocm.py`:
+
+| entry point | how `backend` is resolved | effect of `auto` |
+|---|---|---|
+| `single_prefill_with_kv_cache` | `determine_attention_backend(...)` | → `fa2` |
+| `BatchPrefillWithPagedKVCacheWrapper` | `if backend not in ("fa2","aiter"): backend = "fa2"` | → `fa2`, router never consulted |
+| `BatchPrefillWithRaggedKVCacheWrapper` | `if backend != "fa2": backend = "fa2"` | → `fa2`, **and explicit `"aiter"` is silently discarded too** |
+
+The router the first row calls is the unmodified upstream CUDA one
+(`flashinfer/utils.py`):
+
+```python
+def determine_attention_backend(...) -> str:
+    if is_sm90a_supported(device) and is_fa3_backend_supported(...):
+        return "fa3"
+    else:
+        return "fa2"
+```
+
+`"aiter"` is not among its possible return values, and `is_sm90a_supported` is
+False on ROCm, so it returns `"fa2"` unconditionally. No dtype, layout,
+head-dim or positional-encoding property of the caller's input can change
+this.
+
+Confirmed bitwise rather than from logs — omitting `backend` entirely, which
+is what real callers do, gives output byte-identical to `backend="fa2"`:
 
 ```
 backend=<omitted>   max_abs_vs_sdpa = 3.5469e+00
@@ -118,10 +151,10 @@ torch.equal(omitted, fa2)   -> True
 torch.equal(omitted, aiter) -> False
 ```
 
-Omitting `backend` entirely produces output byte-identical to `backend="fa2"`.
-This is what makes the bug dangerous in practice: callers do not write
-`backend="fa2"`, they simply do not pass the argument, and get wrong prefill
-with no error, no warning, and no indication that a route was chosen for them.
+So the two defects compound: the kernel `auto` always lands on is the broken
+one, and the correct kernel cannot be selected without passing
+`backend="aiter"` explicitly — which is undocumented as a requirement, and
+which the ragged wrapper ignores even when you do.
 
 For scale, the two references differ from each other by 3.816e+00 — so the `fa2`
 error is the same order as the entire causal-vs-non-causal difference.
@@ -274,17 +307,24 @@ The `ROCM_FLASHINFER` backend in this branch
 
 ## Suggested next steps
 
-1. File all three issues against [AMD-Ecosystem/flashinfer](https://github.com/AMD-Ecosystem/flashinfer)
-   — the prefill correctness bug, the `-DUSE_ROCM` JIT flag, and the missing
-   `fast_decode_plan`. They are independent; the second is a trivial fix and
-   the first is the one that blocks use.
-2. Ask whether `fa2` prefill is expected to be functional in 0.5.3+amd.1 at all,
-   or whether AITER is the only supported prefill route on gfx942 today. The
-   README's feature matrix lists `fa2` prefill as supported (✅), which is what
-   made this surprising.
-3. Confirm whether the ragged-prefill AITER route is meant to dispatch to AITER;
-   the observed behavior suggests it silently falls back to `fa2`.
-4. Re-run the reproduction above against any new amd-flashinfer build before
+1. File against [AMD-Ecosystem/flashinfer](https://github.com/AMD-Ecosystem/flashinfer):
+   findings #1 and #2 together (the broken kernel and the routing that makes it
+   unavoidable), then #3 and #4 separately.
+2. **Decide which of #1 and #2 is the intended fix.** They admit different
+   answers, and it matters:
+   - If `fa2` prefill is *meant* to work, it is a kernel bug and the README is
+     right.
+   - If AITER is the only supported prefill route on gfx942 today, then the
+     kernel bug is lower priority but the README's feature matrix is wrong
+     (it lists `fa2` prefill as supported ✅), and `auto` should route to
+     AITER — or `fa2` prefill should raise rather than return wrong numbers.
+3. Confirm whether `BatchPrefillWithRaggedKVCacheWrapper` is meant to support
+   AITER at all. Today its `__init__` coerces any backend to `fa2`, so the
+   ragged path has no correct configuration.
+4. Consider making an unsupported/unimplemented route fail loudly. Every one of
+   these findings cost far more to diagnose than it would have if the library
+   had raised instead of silently substituting a kernel.
+5. Re-run the reproduction above against any new amd-flashinfer build before
    trusting prefill.
 
 ## Related
