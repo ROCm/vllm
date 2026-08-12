@@ -1853,6 +1853,22 @@ def _format_subprocess_exit(returncode: int) -> str:
 _SPAWN_CHILD_ENV = "VLLM_TEST_SPAWN_CHILD"
 
 
+def _rootdir_for_import(module_name: str) -> str | None:
+    """The `sys.path` entry a child needs to import `module_name`, if any.
+
+    pytest prepends a test file's directory to `sys.path` only when that
+    directory is not a package, in which case the module is imported under a
+    top-level name a child process cannot otherwise resolve. Mirroring that
+    rule matters in both directions: a packaged test directory must stay off
+    `sys.path`, or a sibling of its `__init__.py` shadows the installed
+    distribution of the same name (`tests/models/transformers/`).
+    """
+    module = sys.modules[module_name]
+    if "." in module_name or module.__file__ is None:
+        return None
+    return str(Path(module.__file__).resolve().parent)
+
+
 def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]:
     """Decorator to spawn a new process for each test function.
 
@@ -1887,6 +1903,7 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
             payload = cloudpickle.dumps(
                 {
                     "module": f.__module__,
+                    "module_dir": _rootdir_for_import(f.__module__),
                     "qualname": f.__qualname__,
                     "args": args,
                     "kwargs": kwargs,
@@ -1901,6 +1918,8 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
                 "except ImportError:\n"
                 "    class Skipped(BaseException): pass\n"
                 "data = cloudpickle.loads(sys.stdin.buffer.read())\n"
+                "if data['module_dir'] is not None:\n"
+                "    sys.path.insert(0, data['module_dir'])\n"
                 "mod = importlib.import_module(data['module'])\n"
                 "target = mod\n"
                 "for name in data['qualname'].split('.'):\n"
