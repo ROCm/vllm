@@ -89,11 +89,9 @@ class AiterMxfp8Experts(Mxfp8TritonExpertsBase):
     @staticmethod
     def _supports_batch_invariance() -> bool:
         # TritonExperts declares True, but this subclass runs aiter's FlyDSL
-        # two-stage grouped GEMM instead of the Triton one. Its tuned table
-        # picks the stage-2 kernel by token count, switching between reduce and
-        # atomic variants, and at the shape that table is tuned for (MiniMax-M3,
-        # measured on gfx950) the output is not reproducible even run to run at
-        # a fixed token count, let alone across batch sizes.
+        # two-stage grouped GEMM, whose tuned table picks the stage-2 kernel
+        # (reduce vs. atomic) by token count and is not even run-to-run
+        # reproducible at a fixed token count.
         return False
 
     @staticmethod

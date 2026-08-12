@@ -28,9 +28,8 @@ logger = init_logger(__name__)
 
 # Ceiling on the IPC buffer the custom all-reduce registers per rank, so a
 # pathological max_num_batched_tokens cannot reserve an unbounded amount. This
-# bounds memory, not speed: one-shot was still 0.92x the all-gather fallback at
-# 1GB, with no crossover anywhere in range, and the fallback's own scratch is
-# world_size times the message. Raise it if a model needs more.
+# bounds memory, not speed: the custom kernel beat the all-gather fallback at
+# every size measured. Raise it if a model needs more.
 _MAX_BATCH_INVARIANT_CA_BYTES = 1024 * 1024 * 1024
 
 
@@ -107,15 +106,14 @@ def _dcp_custom_allreduce_bytes(unique_name: str) -> int | None:
     other group is denied the accelerated backends below. The DCP group is one
     exception under batch invariance: its attention combine ends in a
     reduce-scatter once per layer per decode step, and without IPC buffers of
-    its own that falls back to an all-to-all plus a local sum, which pays a
-    fixed extra Triton launch (~24us at 4 ranks) that the custom kernel does
-    not. Nothing else is turned on for the group -- no quick reduce, no AITER,
-    no symmetric memory -- because none of those promises a size-independent
-    reduction order.
+    its own that falls back to an all-to-all plus a local sum, which pays an
+    extra Triton launch the custom kernel does not. Nothing else is turned on
+    for the group -- no quick reduce, no AITER, no symmetric memory -- because
+    none of those promises a size-independent reduction order.
 
-    `_ENABLE_CUSTOM_ALL_REDUCE` is what confines this to ROCm: ParallelConfig
-    forces `disable_custom_all_reduce` under the mode everywhere else, so the
-    custom kernels are unavailable on CUDA regardless of the group.
+    Confined to ROCm in practice: ParallelConfig forces
+    `disable_custom_all_reduce` under the mode elsewhere. `_ENABLE_CUSTOM_ALL_REDUCE`
+    still gates construction on top of this.
     """
     if not unique_name.startswith("dcp"):
         return None
@@ -231,27 +229,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ) and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             ca_kwargs = {}
-            # The 8MB default is the point where NCCL's ring overtakes the
-            # one-shot kernel, which moves world_size times the buffer rather
-            # than twice it. Batch invariance cannot use the ring, and its
-            # fallback -- all-gather plus a local sum -- moves the same volume
-            # as one-shot while also materialising the gathered buffer, so
-            # one-shot stays ahead at every size measured (0.70x to 0.90x of the
-            # fallback out to 128MB, still bitwise invariant there). Size the
-            # buffer for the largest all-reduce the scheduler can produce.
-            #
-            # The reduce-scatter kernel takes the same input as an all-reduce --
-            # the full [tokens, hidden] tensor -- so the same bound sizes it,
-            # and the shared buffer is already max() over the three limits, so
-            # moving it off its 16MB default costs no memory. It too beats both
-            # alternatives everywhere measured (0.20x to 0.90x of the all-to-all
-            # fallback and 0.32x to 0.94x of ncclReduceScatter, out to 1GB).
-            #
-            # The DCP group is sized from its own, much smaller bound: its
-            # reduce-scatter only carries decode tokens. All three limits are
-            # set from it so the group's cost is exactly twice the bound
-            # (`meta_size() + max_size` plus `legacy_buffer_size`) rather than
-            # picking up the 2MB all-gather default it never uses.
+            # Size the buffer for the largest all-reduce the scheduler can
+            # produce: the mode cannot use NCCL's ring, and its all-gather
+            # fallback moves the same volume as the custom kernel while also
+            # materialising the gathered buffer, so the custom kernel stays
+            # ahead past the 8MB default. The reduce-scatter kernel takes the
+            # same [tokens, hidden] operand, so the same bound sizes it, and the
+            # shared buffer is already max() over the three limits, so raising
+            # them off their defaults costs no memory. The DCP group gets its
+            # own, much smaller bound -- its reduce-scatter carries only decode
+            # tokens -- and sets all three limits from it rather than picking up
+            # the all-gather default it never uses.
             if dcp_ca_bytes is not None:
                 ca_kwargs["max_size"] = dcp_ca_bytes
                 ca_kwargs["max_all_gather_size"] = dcp_ca_bytes
@@ -421,17 +409,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def all_reduce(self, input_):
         if envs.VLLM_BATCH_INVARIANT:
-            # Library all-reduces choose their reduction order from the message
-            # size, which makes the result depend on the number of tokens in the
-            # batch.
-            #
-            # The custom all-reduce does not. Both its kernels sum a given
-            # element over exactly world_size values in a fixed order, so
-            # neither depends on the message size and the size-based choice
-            # between them is invisible. Measured bitwise invariant for
-            # N in 1..16384 at world_size 4 and 8, under each kernel and under
-            # the default heuristic. Prefer it wherever it applies -- 3.6x
-            # faster than the all-gather path at one token, 2.7x at 64MB.
+            # Library all-reduces pick their reduction order from the message
+            # size. Both custom kernels and the all-gather fallback sum in a
+            # fixed rank order instead; prefer the custom kernel where it
+            # applies, since it is the faster of the two at every size.
             ca_comm = self.ca_comm
             if (
                 ca_comm is not None
@@ -583,18 +564,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
         if envs.VLLM_BATCH_INVARIANT:
-            # Library reduce-scatters choose their chunking from the message
-            # size, so an output element's contributions are summed in an order
-            # that depends on the number of tokens in the batch.
-            #
-            # The custom all-reduce's reduce-scatter kernel does not: an output
-            # element sums exactly world_size values in ascending rank order
-            # into an fp32 accumulator and rounds once, whatever the message
-            # size. It slices the flat buffer by size/world_size, which is this
-            # rank's shard because the input has already been canonicalised to
-            # dim 0 and made contiguous above. Prefer it: measured through this
-            # entry point on 4x gfx950, 0.37x-0.39x of the all-to-all path below
-            # 1MB and 0.54x-0.74x of ncclReduceScatter out to its bound.
+            # Same as all_reduce above: the custom kernel's reduction order is
+            # size independent, the library's is not. It slices the flat buffer
+            # by size/world_size, which is this rank's shard because the input
+            # has already been canonicalised to dim 0 and made contiguous.
             ca_comm = self.ca_comm
             output = (
                 None if ca_comm is None else ca_comm.custom_reduce_scatter(input_tensor)
@@ -603,7 +576,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 # Above the custom kernel's size bound, fall back to an
                 # all-to-all plus a fixed rank-order local sum. That is a
                 # size-dependent choice of implementation, so it is only benign
-                # while the two agree bitwise -- measured, see
+                # while the two agree bitwise -- see
                 # tests/v1/determinism/test_tp_reduce_scatter_batch_invariant.py.
                 from vllm.model_executor.layers.batch_invariant import (
                     reduce_scatter_batch_invariant,

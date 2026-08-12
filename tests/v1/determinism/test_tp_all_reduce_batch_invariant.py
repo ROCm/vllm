@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import ray
 import torch
-import torch.distributed as dist
+from utils import order_sensitive_elements
 
 from tests.utils import (
     init_test_distributed_environment,
@@ -52,95 +52,27 @@ HIDDEN_SIZE = 4096
 # Checking it alone hides real failures.
 CHECK_ROWS = [0, 1, 2, 3, 7, 15, 31]
 
-# (dtype, exponent_spread). The spread widens the operand range so that the fp32
-# accumulator inside the reduction has to round: reduction order is only
-# irrelevant while the accumulator has headroom over the input significand,
-# which fp32 inputs never have and bf16 loses once activations have outliers.
-# `_order_sensitive_elements` keeps every entry honest. (bfloat16, 0) used to be
-# here and was dropped: reversing the rank order over 512x4096 elements moved 10
-# of the fp32 accumulations and not one bf16 result, so no reordering the
-# collective can perform is observable and the sweep asserted nothing for it. It
-# was removed rather than widened because message size and kernel selection
-# depend only on the dtype and the token count, both of which (bfloat16, 20)
-# already covers identically.
-# fp16 carries 14 rather than the 10 it started with. `_order_sensitive_elements`
-# keeps every case honest, but at 10 it was one seed away from tripping it: over
-# the checked rows at world size 4, seeds 1234/1/2/3/4 give 2/1/0/0/0 sensitive
-# elements, so the sweep asserted almost nothing for fp16 on the seed it happens
-# to use and would have failed outright on three of the five. At 14 the same
-# seeds give 4/4/5/4/2.
-#
-# 14 and not more: fp16 saturates at 65504, so from spread 15 the operands
-# themselves start overflowing to +-inf (15 to 18 of them per seed, ~11900 at
-# 16). That is worth avoiding for two reasons. The sweep would be exercising
-# overflow rather than reduction order, and an inf + -inf pair yields NaN, which
-# `!=` reports as differing -- so it would register as sensitivity in the vacuity
-# check while also failing the invariance comparison, for reasons having nothing
-# to do with the collective. Widening the spread buys detection only up to that
-# ceiling.
-#
-# bf16 at 20 gives 8/8/6/8/10 with no overflow -- its exponent range is far
-# wider -- and fp32 needs no spread at all, since fp32 operands leave the
-# accumulator no headroom: it moves ~10,700 elements and is much the strongest
-# detector here.
+# (dtype, exponent_spread). The spread widens the operand range until the fp32
+# accumulator inside the reduction has to round -- without that, reduction order
+# is unobservable and the sweep asserts nothing. `order_sensitive_elements`
+# enforces this per case. fp16 stops at 14: from 15 the operands themselves
+# overflow to +-inf, and inf + -inf gives NaN, which would register as
+# "sensitive" while failing the comparison for reasons unrelated to the
+# collective. fp32 needs no spread at all.
 CASES = [
     (torch.bfloat16, 20),
     (torch.float16, 14),
     (torch.float32, 0),
 ]
 
-# fp32 at 512 tokens is 512 * 4096 * 4 = exactly 8MiB, the custom all-reduce's
-# default max_size, and its bound is strict (`<`). That single point therefore
-# takes the all-gather fallback even in the custom_ar worker, which makes its
-# comparison against the reference -- read from a smaller, custom-served count --
-# a bitwise cross-check of the two implementations rather than a batch-invariance
-# check of one. They do agree -- `implementations_agree` measures exactly that,
-# for every dtype here rather than only the one that happens to cross this
-# boundary -- and the extra coverage is worth keeping. Pinned below so that a
-# change to max_size,
-# HIDDEN_SIZE or TOKEN_COUNTS surfaces here instead of silently moving which
-# implementation the sweep is testing.
-#
-# The boundary is a property of this harness, not of the mode: max_size is the
-# library default because the process group is built without an engine config,
-# whereas CudaCommunicator sizes it from max_num_batched_tokens under batch
-# invariance so that the largest all-reduce the scheduler can produce still
-# fits. The fallback is covered deliberately by fallback_ar, which is also the
-# only path CUDA takes under the mode, custom all-reduce staying disabled there.
+# fp32 at 512 tokens is exactly 8MiB, the custom all-reduce's default max_size,
+# whose bound is strict -- so that one point takes the all-gather fallback even
+# in the custom_ar worker. Pinned so that a change to max_size, HIDDEN_SIZE or
+# TOKEN_COUNTS surfaces here rather than silently moving which implementation
+# the sweep tests. (max_size is the library default here because the group is
+# built without an engine config; CudaCommunicator sizes it from
+# max_num_batched_tokens under the mode.)
 FALLBACK_POINTS = {(torch.float32, 512)}
-
-
-def _order_sensitive_elements(probe: torch.Tensor) -> torch.Tensor:
-    """Mask of probe elements whose reduction depends on the rank order.
-
-    Both implementations sum the ``world_size`` contributions of an element in
-    rank order with an fp32 accumulator and round once on the way out, so an
-    element can only notice a reordering if that accumulation is inexact for its
-    operands. Summing the gathered contributions in the opposite order is the
-    strongest reordering available and bounds what any other one can do: where it
-    changes nothing, the invariance sweep cannot fail either.
-
-    The all-gather is pure data movement, so every rank sees the same
-    contributions and computes the same mask.
-    """
-    world_size = get_tp_group().world_size
-    gathered = torch.empty(
-        (world_size * probe.shape[0], *probe.shape[1:]),
-        dtype=probe.dtype,
-        device=probe.device,
-    )
-    dist.all_gather_into_tensor(
-        gathered, probe.contiguous(), group=get_tp_group().device_group
-    )
-    gathered = gathered.view(world_size, *probe.shape)
-
-    ascending = torch.zeros(probe.shape, dtype=torch.float32, device=probe.device)
-    for contribution in gathered:
-        ascending += contribution.float()
-    descending = torch.zeros_like(ascending)
-    for contribution in gathered.flip(0):
-        descending += contribution.float()
-    return ascending.to(probe.dtype) != descending.to(probe.dtype)
 
 
 def _check_all_reduce(
@@ -204,9 +136,7 @@ def _check_all_reduce(
 
         # Row 0 is excluded: it never moves under a decomposition, so its
         # sensitivity would not make the sweep able to fail.
-        sensitive = _order_sensitive_elements(full[: CHECK_ROWS[-1] + 1])[
-            CHECK_ROWS[1:]
-        ]
+        sensitive = order_sensitive_elements(full[: CHECK_ROWS[-1] + 1])[CHECK_ROWS[1:]]
         if not sensitive.any():
             vacuous.append(
                 f"{dtype} spread=+-{spread}: reversing the rank order leaves "
@@ -325,7 +255,7 @@ def _check_implementations_agree(
             # Only rows whose accumulation is inexact can tell the two
             # implementations apart; the rest agree for free and would let this
             # pass while blind.
-            sensitive = _order_sensitive_elements(probe)
+            sensitive = order_sensitive_elements(probe)
             custom = ca_comm.custom_all_reduce(probe.clone())
             assert custom is not None
             fallback = all_reduce_batch_invariant(

@@ -29,9 +29,7 @@ SEED = 0
 # This is what makes the sweeps able to see anything: MXFP4 operands are four
 # bits wide and the block scales are powers of two, so with a narrow spread the
 # fp32 accumulation of a whole K row is *exact* and no reordering can change the
-# result. Measured on gfx950 -- forcing a four-way split-K changes nothing at
-# +-7, and 11 of 32 probe rows at +-15. test_scale_spread_exposes_reordering
-# keeps this honest.
+# result. test_scale_spread_exposes_reordering keeps this honest.
 SCALE_SPREAD = 15
 
 # (N, K, use_asm_gemm). gemm_with_dynamic_quant fans out to four AITER entry

@@ -19,14 +19,12 @@ import pytest
 import ray
 import torch
 import torch.distributed as dist
+from utils import order_sensitive_elements
 
 from tests.utils import (
     init_test_distributed_environment,
     multi_gpu_marks,
     multi_process_parallel,
-)
-from tests.v1.determinism.test_tp_all_reduce_batch_invariant import (
-    _order_sensitive_elements,
 )
 from vllm.distributed.parallel_state import get_tp_group, set_custom_all_reduce
 from vllm.platforms import current_platform
@@ -156,7 +154,7 @@ def _check_reduce_scatter(
     checked = 0
     for dtype, spread in CASES:
         full = _make_input(max(TOKEN_COUNTS), dtype, spread, device, 1234 + rank)
-        sensitive = _order_sensitive_elements(full[: CHECK_ROWS[-1] + 1])[CHECK_ROWS]
+        sensitive = order_sensitive_elements(full[: CHECK_ROWS[-1] + 1])[CHECK_ROWS]
         if not sensitive.any():
             vacuous.append(f"{dtype} spread=+-{spread}")
 
@@ -294,7 +292,7 @@ def _check_implementations_agree(
                 continue
             # Only elements whose accumulation is inexact can tell the two
             # implementations apart; the rest agree for free.
-            sensitive = _order_sensitive_elements(probe)
+            sensitive = order_sensitive_elements(probe)
             fallback = reduce_scatter_batch_invariant(probe, group.device_group)
             offset = rank * (num_tokens // tp_size)
             for row in range(custom.shape[0]):

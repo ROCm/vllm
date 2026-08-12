@@ -828,8 +828,8 @@ def addmm_batch_invariant(bias, a, b):
 
 # Inductor lowers mm/addmm/bmm to ``extern_kernels.<op>(..., out=buf)``, which
 # dispatches the ``.out`` overload rather than the default one. Registering only
-# the default leaves the compiled path on the vendor GEMM: measured on gfx950,
-# a compiled ``torch.addmm`` is batch variant while the eager one is not.
+# the default leaves the compiled path on the vendor GEMM, so a compiled
+# ``torch.addmm`` is batch variant while the eager one is not.
 
 
 def mm_out_batch_invariant(a, b, *, out):
@@ -1207,8 +1207,9 @@ def _fixed_order_sum_kernel(
 ):
     """Sum ``WORLD_SIZE`` contributions in ascending rank order, fp32 accumulator.
 
-    The accumulation order is a compile-time constant, so the result depends only
-    on the rank ordering and never on how many elements are being reduced.
+    An output element sums exactly ``WORLD_SIZE`` values in a compile-time
+    constant order and rounds once, so the result depends only on the rank
+    ordering and never on how many elements are being reduced.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -1231,13 +1232,11 @@ def all_reduce_batch_invariant(
 
     Library all-reduces (NCCL/RCCL) pick their algorithm, channel count and chunk
     boundaries from the message size, so the order in which a given element's
-    contributions are summed changes with the number of tokens in the batch. On
-    8x gfx950 an ``allreduce`` of ``[N, 4096]`` bf16 yields eight distinct results
-    across ``N in 1..512``, even with ``NCCL_ALGO=allreduce:tree`` and a single
-    channel.
+    contributions are summed changes with the number of tokens in the batch.
+    Pinning the algorithm, channel count and protocol does not fix it.
 
     Instead, all-gather the contributions -- pure data movement, so bitwise
-    reproducible at any size -- and reduce them locally in ascending rank order.
+    reproducible at any size -- and reduce them with ``_fixed_order_sum_kernel``.
     """
     import torch.distributed as dist
 
@@ -1273,16 +1272,11 @@ def reduce_scatter_batch_invariant(
     """Sum reduce-scatter over dim 0 whose result does not depend on the size.
 
     ``ncclReduceScatter`` picks its chunking from the message size just as
-    ``ncclAllReduce`` does: on 4x gfx950 a ``[N, 4096]`` bf16 reduce-scatter
-    gives up to ten distinct values for a single output element across
-    ``N in 32..4096``.
-
-    Route around it the same way ``all_reduce_batch_invariant`` does. An
-    all-to-all sends rank ``d`` exactly the rows it owns from every rank -- pure
-    data movement, so bitwise reproducible however the library chunks it -- and
-    lands them rank-major, which is the layout ``_fixed_order_sum_kernel``
-    already consumes. Each output element then sums the same ``world_size``
-    contributions in ascending rank order with one rounding.
+    ``ncclAllReduce`` does. Route around it the same way
+    ``all_reduce_batch_invariant`` does: an all-to-all sends rank ``d`` exactly
+    the rows it owns from every rank -- pure data movement, so bitwise
+    reproducible however the library chunks it -- and lands them rank-major,
+    which is the layout ``_fixed_order_sum_kernel`` already consumes.
 
     ``sizes`` (the reduce-scatterv case) changes only *which* rows a rank
     receives, never how the received contributions are summed, so variable
@@ -1430,15 +1424,10 @@ def enable_batch_invariant_mode():
 
 def override_envs_for_invariance():
     if not current_platform.is_rocm():
-        # None of this block is applied on ROCm. Symmetric memory is only
-        # reachable behind an is_cuda() check, CUBLAS_WORKSPACE_CONFIG is not
-        # read by hipBLASLt, and under batch invariance every reduction is
-        # served either by the custom all-reduce, which sums in a fixed rank
-        # order, or by all-gather plus a fixed-order local sum -- the remaining
-        # collectives move data without arithmetic and so are bitwise
-        # reproducible whatever algorithm, protocol or channel count the library
-        # picks. NVLS is NVIDIA-only, CollNet is a multi-node network offload,
-        # and RCCL spells the P2P knob RCCL_P2P_NET_DISABLE.
+        # Symmetric memory is only reachable behind an is_cuda() check and
+        # hipBLASLt does not read CUBLAS_WORKSPACE_CONFIG. NVLS is NVIDIA-only,
+        # CollNet is a multi-node network offload, and RCCL spells the P2P knob
+        # RCCL_P2P_NET_DISABLE.
         os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         os.environ["NCCL_LAUNCH_MODE"] = "GROUP"
@@ -1446,48 +1435,27 @@ def override_envs_for_invariance():
         os.environ["NCCL_NVLS_ENABLE"] = "0"
         os.environ["NCCL_P2P_NET_DISABLE"] = "1"
 
-        # Pinning the algorithm, protocol and channel count serialises the
-        # reduction so that it does not depend on the message size. On ROCm it
-        # does neither half of that job and is very expensive, so it is skipped
-        # -- see the comment below.
+        # Pinning the algorithm, protocol and channel count serialises NCCL's
+        # reduction so that it does not depend on the message size.
         os.environ["NCCL_MIN_NCHANNELS"] = "1"
         os.environ["NCCL_MAX_NCHANNELS"] = "1"
         os.environ["NCCL_PROTO"] = "Simple"
         os.environ["NCCL_ALGO"] = "allreduce:tree"
         os.environ["NCCL_NTHREADS"] = "1"
         os.environ["NCCL_SOCKET_NTHREADS"] = "1"
+    else:
+        # The pins above do not fix RCCL's reduction order -- ring chunk
+        # boundaries are recomputed from the message size, and Tree has zero
+        # AllReduce bandwidth in RCCL's tuning tables, so allreduce:tree falls
+        # back to Ring. They are also expensive, and unnecessary: under the mode
+        # every reduction is served by the custom all-reduce or by all-gather
+        # plus a fixed-order local sum, neither of which is size dependent.
 
-    if current_platform.is_rocm():
-        # RCCL does not become batch invariant under those pins: an all-reduce
-        # of [N, 4096] bf16 over 4 ranks still gives 5 distinct results for some
-        # rows, because ring chunk boundaries are recomputed from the message
-        # size (rccl/src/device/all_reduce.h). NCCL_ALGO=allreduce:tree is a
-        # no-op here as well -- Tree has zero bandwidth for AllReduce in RCCL's
-        # gfx950 tuning table, so it silently falls back to Ring -- and
-        # NCCL_NTHREADS=1 is clamped straight back up to the maximum.
-        #
-        # They are not merely useless. Under batch invariance all_reduce is
-        # served by all_reduce_batch_invariant, whose all-gather is pure data
-        # movement and so is bitwise reproducible whatever the algorithm; the
-        # pins only throttle it. Dropping them makes that all-reduce 26x faster
-        # at 8192 tokens (34.7ms -> 1.3ms over 4 ranks) with identical output.
-
-        # Defensive rather than load-bearing: with the current kernel selection
-        # nothing reaches a skinny GEMM under batch invariance anyway, and
-        # removing this changes no measured result. It is kept because the
-        # skinny GEMMs pick a kernel from the token count, so anything that does
-        # reach one gets a row whose value depends on how many rows shared its
-        # launch. rocm_unquantized_gemm_impl short-circuits in code, but
-        # ROCmFP8ScaledMMLinearKernel is only kept out by forcing a different
-        # kernel, and that forcing falls back to the platform list when the
-        # forced kernel cannot implement a layer. Note this flag does not reach
-        # the RDNA hybrid W4A16 kernel, which switches on M without consulting
-        # it; that one is excluded in can_implement instead.
+        # The ROCm skinny GEMMs pick a kernel from the token count. Nothing
+        # reaches one under the current kernel selection, but a forced kernel
+        # that cannot implement a layer falls back to the platform list, so keep
+        # them off.
         os.environ["VLLM_ROCM_USE_SKINNY_GEMM"] = "0"
-
-        # No VLLM_CUSTOM_ALLREDUCE_ALGO pin is needed: both custom all-reduce
-        # kernels reduce a given element over world_size values in a fixed
-        # order, so the size-based choice between them is invisible.
 
     # torch.compile settings
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"

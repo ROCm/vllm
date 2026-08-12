@@ -27,7 +27,7 @@ import warnings
 
 import pytest
 import torch
-from utils import skip_if_not_cuda_alike
+from utils import rows_that_differ, skip_if_not_cuda_alike
 
 from vllm.model_executor.layers.fused_moe import fused_experts, fused_topk
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -47,16 +47,6 @@ E = 8
 N = 512
 K = 256
 TOP_K = 2
-
-
-def _bits(t: torch.Tensor) -> torch.Tensor:
-    view = {1: torch.uint8, 2: torch.int16, 4: torch.int32}[t.element_size()]
-    return t.contiguous().view(view)
-
-
-def _rows_that_differ(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    ne = _bits(a) != _bits(b)
-    return torch.nonzero(ne.reshape(a.size(0), -1).any(dim=1)).flatten()
 
 
 def _derangement(m: int, generator: torch.Generator) -> torch.Tensor:
@@ -155,7 +145,7 @@ def test_expert_gemm_is_row_permutation_invariant(
         )
 
     baseline = run(x, topk_weights, topk_ids)
-    assert _rows_that_differ(baseline, run(x, topk_weights, topk_ids)).numel() == 0, (
+    assert rows_that_differ(baseline, run(x, topk_weights, topk_ids)).numel() == 0, (
         "the expert GEMM is not even run-to-run stable; nothing below is interpretable"
     )
 
@@ -178,7 +168,7 @@ def test_expert_gemm_is_row_permutation_invariant(
     inverse = torch.empty_like(pi)
     inverse[pi] = torch.arange(m, device=pi.device)
 
-    bad = _rows_that_differ(baseline, permuted[inverse])
+    bad = rows_that_differ(baseline, permuted[inverse])
     assert bad.numel() == 0, (
         f"{bad.numel()}/{m} output rows changed when the rows were permuted "
         f"within their experts (first offenders: {bad[:8].tolist()}). All2all "
@@ -188,7 +178,7 @@ def test_expert_gemm_is_row_permutation_invariant(
 
     # Positive control: without the un-permute the very same comparison must
     # fail, otherwise it is blind to row identity.
-    assert _rows_that_differ(baseline, permuted).numel() > 0
+    assert rows_that_differ(baseline, permuted).numel() > 0
 
 
 @skip_if_not_cuda_alike
@@ -237,7 +227,7 @@ def test_expert_gemm_tolerates_native_sort_nondeterminism(
 
     reordered = 0
     for _ in range(16):
-        bad = _rows_that_differ(baseline, run())
+        bad = rows_that_differ(baseline, run())
         assert bad.numel() == 0, (
             f"{bad.numel()}/{m} output rows are not run-to-run stable "
             f"(first offenders: {bad[:8].tolist()})"
@@ -245,10 +235,9 @@ def test_expert_gemm_tolerates_native_sort_nondeterminism(
         sorted_ids, _, _ = moe_align_block_size(topk_ids, 64, E)
         reordered += int(not torch.equal(sorted_ids, sorted_baseline))
 
-    # Sixteen stability assertions just passed. Skipping here would throw all
-    # of them away and report the module as unrun, when what actually happened
-    # is that the weaker claim was verified and the stronger one was not armed:
-    # the sort's atomicAdd happened not to race. Report that, and pass.
+    # Warn rather than skip: the 16 stability assertions above did run, and the
+    # only thing not exercised is invariance under a reordering that did not
+    # occur.
     record_property("row_reorderings_observed", reordered)
     if reordered == 0:
         warnings.warn(
@@ -314,7 +303,7 @@ def test_naive_and_aligned_block_assignment_agree(default_vllm_config, m: int):
         )
         return out.reshape(m, -1)
 
-    bad = _rows_that_differ(gemm(False), gemm(True))
+    bad = rows_that_differ(gemm(False), gemm(True))
     assert bad.numel() == 0, (
         f"{bad.numel()}/{m} rows differ between the naive and aligned block "
         f"assignments (first offenders: {bad[:8].tolist()})"

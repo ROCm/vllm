@@ -16,12 +16,9 @@ backend -- the test would pass while covering nothing it was added for.
 The prompts have to be long. ``RocmDotScaledMxfp8LinearKernel`` picks BLOCK_K
 from M, and for this model's shapes it only changes above M=256 -- with the
 short prompts the other e2e tests use, the batch never reaches that band and
-the test passes with VLLM_BATCH_INVARIANT unset, i.e. asserts nothing. Measured
-on gfx950 with the padding and batch size below, the needle's logprobs move with
-the batch size in 6 of 8 trials when the mode is off, and are bitwise stable in
-all of them when it is on. Shortening the padding or the batch makes it pass either
-way -- if this test is ever made cheaper, re-check that it still fails with
-VLLM_BATCH_INVARIANT unset.
+the test passes with VLLM_BATCH_INVARIANT unset, i.e. asserts nothing. Shorten
+the padding or the batch and it passes either way, so the needle's tokenised
+length is asserted below rather than left to whoever next makes this cheaper.
 
 Activation dtype is an axis here, not a free parameter. A serialized MXFP8
 checkpoint pins it: ``ModelOptMxFp8Config.get_supported_act_dtypes`` is
@@ -61,11 +58,8 @@ MXFP8_CASES = [
     # checkpoints reject half (see the module docstring), so this quantizes a BF16
     # Qwen3 to MXFP8 at load instead: same RocmDotScaledMxfp8LinearKernel, and the
     # unquantized logits GEMM -- the one the needle's logprobs come straight out
-    # of -- runs through matmul_persistent's fp16 config. Instrumented on gfx950,
-    # matmul_persistent is entered once per decode step with torch.float16
-    # operands and BLOCK_SIZE_N=256. The needle differs in 6 of 8 trials with
-    # VLLM_BATCH_INVARIANT=0 and 0 of 8 with it on -- 2 of 3 and 0 of 3 over the
-    # default VLLM_MXFP8_NEEDLE_TRIALS.
+    # of -- runs through matmul_persistent's fp16 config, which has its own
+    # BLOCK_SIZE_N and its own Triton compilation.
     pytest.param(
         Case("Qwen/Qwen3-1.7B", "TRITON_ATTN", dtype="float16", quantization="mxfp8"),
         id="qwen3-online-fp16",
@@ -85,6 +79,8 @@ MXFP8_CASES = [
 # Long enough that a batch crosses the M band where BLOCK_K changes; see above.
 _PROMPT_PADDING = "Some background context for the question that follows. "
 _PADDING_REPEATS = int(os.getenv("VLLM_MXFP8_PROMPT_REPEATS", "400"))
+# The M below which `_select_cfg` holds BLOCK_K fixed for these shapes.
+_M_BAND = 256
 
 
 def _make_llm(case: Case, max_num_seqs: int, **overrides) -> LLM:
@@ -113,7 +109,7 @@ def _assert_needle_is_invariant(llm: LLM, max_batch_size: int) -> None:
     offset between the solo and the batched run, so it can stay invariant even
     when the rest of the batch does not.
     """
-    random.seed(int(os.getenv("VLLM_TEST_SEED", "12345")))
+    rng = random.Random(int(os.getenv("VLLM_TEST_SEED", "12345")))
 
     num_trials = int(os.getenv("VLLM_MXFP8_NEEDLE_TRIALS", "3"))
     assert max_batch_size >= 3, "Batch size should be >= 3 to place the needle."
@@ -128,6 +124,13 @@ def _assert_needle_is_invariant(llm: LLM, max_batch_size: int) -> None:
     padding = _PROMPT_PADDING * _PADDING_REPEATS
     needle_prompt = padding + "Write one factual sentence about the moon."
 
+    prompt_tokens = len(llm.get_tokenizer().encode(needle_prompt))
+    assert prompt_tokens > _M_BAND, (
+        f"the needle prompt is {prompt_tokens} tokens, so every forward pass "
+        f"stays below M={_M_BAND} and BLOCK_K never changes -- this test would "
+        "pass with VLLM_BATCH_INVARIANT unset. Raise VLLM_MXFP8_PROMPT_REPEATS."
+    )
+
     baseline_output = llm.generate([needle_prompt], sampling, use_tqdm=False)[0]
     baseline_completion = baseline_output.outputs[0]
     baseline_logprobs, baseline_token_ids = _extract_step_logprobs(baseline_output)
@@ -135,8 +138,8 @@ def _assert_needle_is_invariant(llm: LLM, max_batch_size: int) -> None:
     assert baseline_token_ids is not None
 
     for _ in range(num_trials):
-        batch_size = random.randint(3, max_batch_size)
-        needle_pos = random.randint(1, batch_size - 1)
+        batch_size = rng.randint(3, max_batch_size)
+        needle_pos = rng.randint(1, batch_size - 1)
         prompts = [
             needle_prompt
             if idx == needle_pos

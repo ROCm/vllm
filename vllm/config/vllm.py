@@ -1581,34 +1581,15 @@ class VllmConfig:
 
         if envs.VLLM_BATCH_INVARIANT:
             pcp_size = self.parallel_config.prefill_context_parallel_size
-            # Decode context parallelism is supported under both of its combine
-            # backends. "a2a" never reduces across ranks in a collective:
-            # dcp_a2a_lse_reduce exchanges the partial outputs and their LSEs
-            # with one all_to_all_single -- pure data movement, bitwise
-            # reproducible however the library chunks it -- then combines them
-            # locally in a Triton kernel with one program per (token, head)
-            # that walks the ranks in tl.static_range. "ag_rs" does end in a
-            # collective reduction, `cp_lse_ag_out_rs` -> GroupCoordinator
-            # .reduce_scatter, which is why it used to be refused: a library
-            # reduce-scatter picks its reduction order from the message size,
-            # and that size follows the number of tokens in the batch.
-            # CudaCommunicator.reduce_scatter now routes the mode away from the
-            # library entirely -- to the custom all-reduce's one-shot kernel
-            # where the group owns IPC buffers, and to an all-to-all plus a
-            # fixed rank-order fp32 sum where it does not -- so the order is
-            # fixed at every message size. Measured on 4x gfx950, TRITON_MLA,
-            # TP=4/DCP=4: 20/20 needle rows bitwise equal under either kernel,
-            # against 20/20 differing with the same build and batch when only
-            # the DCP reduce-scatter is pointed back at ncclReduceScatter.
+            # Decode context parallelism is admitted: "a2a" combines locally
+            # and never reaches a collective reduction, and "ag_rs" goes
+            # through CudaCommunicator.reduce_scatter, which is size
+            # independent under the mode.
             if pcp_size > 1:
-                # Prefill context parallelism recombines a PCP MoE's partial
-                # attention through get_pcp_group() and stays gated
-                # structurally: it is unmeasured because the V2 runner rejects
-                # it before this point, so that branch is unreachable by
-                # default and only bites once that changes.
-                #
-                # Raise rather than override to 1, unlike the guards below:
-                # those cost throughput, this changes the deployment.
+                # Unmeasured rather than known-bad: the V2 runner rejects PCP
+                # before this point, so the branch only bites once that
+                # changes. Raise rather than override to 1, unlike the guards
+                # below: those cost throughput, this changes the deployment.
                 raise ValueError(
                     "Prefill context parallelism is not supported with "
                     "VLLM_BATCH_INVARIANT (prefill_context_parallel_size="
@@ -1682,14 +1663,13 @@ class VllmConfig:
                 )
 
             # These passes rewrite the collective the communicator would have
-            # run: sequence parallelism and AsyncTP turn an all-reduce into
-            # reduce-scatter + all-gather, and the fusion passes replace it with
-            # a fused all-reduce+RMSNorm kernel. Either way the batch-invariant
-            # all-reduce is bypassed and the reduction order goes back to being
-            # message-size dependent.
+            # run -- sequence parallelism and AsyncTP into reduce-scatter +
+            # all-gather, the fusions into a fused all-reduce+RMSNorm kernel --
+            # which bypasses the batch-invariant all-reduce. Disabled on every
+            # platform, so the mode costs this throughput everywhere.
             pass_config = self.compilation_config.pass_config
             for name in ("enable_sp", "fuse_gemm_comms", "fuse_allreduce_rms"):
-                if getattr(pass_config, name, False):
+                if getattr(pass_config, name):
                     setattr(pass_config, name, False)
                     logger.warning_once(
                         "Disabling %s when VLLM_BATCH_INVARIANT is enabled.", name

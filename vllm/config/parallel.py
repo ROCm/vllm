@@ -1001,9 +1001,10 @@ class ParallelConfig:
 
         # Enable batch invariance settings if requested
         if envs.VLLM_BATCH_INVARIANT and not current_platform.is_rocm():
-            # Kept for CUDA, where the one-shot kernel has not been measured.
-            # On ROCm the custom all-reduce is pinned to its one-shot algorithm
-            # and is batch invariant, so leaving it enabled is both correct and
+            # Kept on CUDA, where the custom kernels have not been measured
+            # under the mode. On ROCm both of them sum an element's world_size
+            # contributions in a fixed rank order, so the size-based choice
+            # between them is invisible and leaving them enabled is correct and
             # much faster than the all-gather fallback -- see
             # CudaCommunicator.all_reduce.
             self.disable_custom_all_reduce = True
