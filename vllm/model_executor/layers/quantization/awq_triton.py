@@ -1134,7 +1134,7 @@ def _awq_gemm_triton(
                     nullcontext()
                     if torch.compiler.is_compiling()
                     else torch.profiler.record_function(
-                        f"awq_gemv_hip {N}x{padded_K} gs={group_size} sk={split_k}"
+                        f"awq_gemv_hip {N}x{padded_K} g={group_size} split_k={split_k}"
                     )
                 )
                 with ctx:
@@ -1170,7 +1170,7 @@ def _awq_gemm_triton(
                 nullcontext()
                 if torch.compiler.is_compiling()
                 else torch.profiler.record_function(
-                    f"awq_gemv_no_split_k {N}x{K} gs={group_size}"
+                    f"awq_gemv_no_split_k {N}x{K} g={group_size}"
                 )
             )
             with ctx:
@@ -1189,7 +1189,7 @@ def _awq_gemm_triton(
             nullcontext()
             if torch.compiler.is_compiling()
             else torch.profiler.record_function(
-                f"awq_gemv_split_k {N}x{K} gs={group_size}"
+                f"awq_gemv_split_k {N}x{K} g={group_size}"
             )
         )
         with ctx:

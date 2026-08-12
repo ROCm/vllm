@@ -720,8 +720,10 @@ def _hybrid_w4a16_apply_impl(
     # tensors add N * (K/group_size) * 2 bytes each on top of the N*K/2 weight
     # bytes.  At g=32 asymmetric that surcharge is ~25% of the weight bytes, so
     # a trace that reports only MxNxK cannot be turned into a bandwidth number.
-    # Emitting g<group_size> and sym/asym makes the label self-describing.
-    _gz = f"g{group_size} {'asym' if w_zp is not None else 'sym'}"
+    # Emitting g=<group_size> and sym/asym makes the label self-describing.
+    # Use the same `key=value` spelling as every other quantized GEMM scope
+    # (the MoE ones, awq_gemv_*), so label consumers need one grammar.
+    _gz = f"g={group_size} {'asym' if w_zp is not None else 'sym'}"
 
     # Use the HIP skinny kernel for small batch sizes (fast decode path).
     #
