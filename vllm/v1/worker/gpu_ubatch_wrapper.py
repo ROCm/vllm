@@ -367,10 +367,9 @@ class UBatchWrapper:
             token_slice = ubatch_slice.token_slice
             n = token_slice.stop - token_slice.start
             buf = self._ubatch_is_padding[i]
-            # Unconditional fills, for the same reason the runner's are: a
-            # captured graph reads this buffer at replay, so skipping the write
-            # on a step that happens to have no padding would have it read the
-            # capturing step's values instead.
+            # Unconditional, like the runner's fills: a captured graph reads
+            # this buffer at replay, so a skipped write leaves it holding the
+            # capturing step's values.
             buf[:n].copy_(outer[token_slice])
             buf[n:].fill_(False)
             full.append(buf)

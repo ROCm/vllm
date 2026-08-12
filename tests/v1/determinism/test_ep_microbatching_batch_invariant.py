@@ -22,101 +22,52 @@ It still cannot run on the default `allgather_reducescatter`
 throughput is admissible under the mode -- see
 `test_ep_all2all_batch_invariant.py` -- so it is reachable there.
 
-Measured on 4x gfx950, OLMoE-1B-7B bf16, DP=4/TP=1 (EP=4), TRITON_ATTN,
-cudagraphs on, needle pinned to DP rank 2, 64 generated logprobs compared
-bitwise against the same prompt run solo, with the DBO thresholds lowered to 8
-(decode) and 32 (prefill) so the split is reachable at test scale:
+The DBO thresholds are lowered below so the split is reachable at test scale.
+`own_32` and `own_32_peers_32` put the same 32 companions on the needle's own
+rank, so it proposes microbatching on every coordination step in both. In the
+first the peers are idle, propose `False`, and cancel the split; in the second
+they are loaded and it goes through. The needle's forward pass was cut in two,
+or not, according to what three other replicas were doing.
 
-                        needle rank 2      mode on   mode off (max |delta|)
-  condition             proposed/ubatched
-  own_32                    65 / 0            0/64     64/64  (5.5e-2)
-  own_32_peers_32           65 / 64           0/64     64/64  (6.4e-2)
-  peers_32                   1 / 1            0/64     64/64  (1.1e-1)
-  all_48                    65 / 64           0/64     64/64  (6.1e-2)
-  solo_again                 1 / 0            0/64      0/64
+`peers_32` is the sharper version, and needs the asymmetry spelled out: a rank
+holding a single decode is below `dbo_decode_token_threshold` and can never
+*propose* a split. It can only have one forced on it during a step it does
+propose -- here its prefill -- so it ubatches where `solo_again` does not. Same
+local batch, opposite outcome, decided entirely off-rank.
 
-256 moved positions in the mode-off arm, none in the mode-on arm, with the two
-arms taking *identical* microbatching decisions -- the middle column is the same
-in both.
+The assertions below are on the observed decisions rather than on the load
+having been applied, since a run in which no forward pass was ever split would
+compare a shape against itself.
 
-The middle column is the point of the test. `own_32` and `own_32_peers_32` put
-the same 32 companions on the needle's own rank; the needle rank proposed
-microbatching on all 65 of its coordination steps in both. In the first, the
-peers were idle, they proposed `False`, and the split was cancelled on every
-step. In the second the peers were loaded and it went through on 64 of 65. The
-needle's forward pass was cut in two, or not, according to what three other
-replicas were doing, and its logprobs did not move either way.
+Deliberately not a condition: sending the needle to a *different* DP rank and
+expecting the same logprobs. That asserts the wrong axis -- it varies nothing
+about any batch, and what it measures is whether two replicas agree, which they
+need not. Inductor settles some kernel configs by timing candidates on the
+device, once per process, so two ranks can freeze different winners; see
+`batch_invariant._watch_for_autotune_races`. Each rank stays bitwise repeatable
+against itself, so this mode's contract is intact.
 
-`peers_32` is the sharper version of the same thing and needs the asymmetry
-spelled out: a rank holding a single decode has fewer tokens than
-`dbo_decode_token_threshold` and so can never *propose* a split. It can only
-have one forced on it during a step it does propose -- here its 33-token prefill
--- which is why that row proposes once and ubatches once, while `solo` proposes
-once and ubatches zero times. Same local batch, opposite outcome, decided
-entirely off-rank.
-
-A run in which no forward pass was ever actually split would prove nothing, so
-the assertions below are on the observed decisions rather than on the load
-having been applied: the needle rank must have been microbatched in some
-conditions and not in others, and `maybe_create_ubatch_slices` must have
-returned real slices.
-
-An `other_rank_solo` condition used to sit at the end of the plan, sending the
-needle to a different DP rank and expecting the same logprobs. It has been
-removed, because it asserts the wrong axis: no microbatching happens in it (0
-proposed, 0 ubatched on the needle's rank in the original measurement) and it
-varies nothing about any batch. What it actually measures is whether two
-replicas agree, and they need not -- Inductor settles some kernel configs by
-timing candidates on the device, once per process, so two ranks can freeze
-different winners. Each rank stays bitwise repeatable against itself, so a
-token's output still does not depend on its batch-mates and this mode's
-contract is intact; see `batch_invariant._watch_for_autotune_races`, which
-reports when a process has done it. Measured on 4x gfx950: it moved 15 of 64
-logprobs, and it moved them identically at `c0fa34beee`, where the table above
-records 0 of 64 -- so the row was recorded under an image that no longer
-exists, not broken by a later commit.
-
-Not covered: `deepep_low_latency` and `nixl_ep`, the other two backends
-microbatching accepts. `nixl_ep` still needs its kernels.
-
-`deepep_low_latency` **is** covered now, as the second fixture arm. It used
-not to be: `--enable-dbo` with `--all2all-backend deepep_low_latency` did not
-start at all, the four engine cores logging `No available shared memory
-broadcast block found in 60 seconds` until the API servers gave up at the 600s
-`VLLM_ENGINE_READY_TIMEOUT_S`. That turned out to be two independent blockers
-stacked, and both are fixed:
-
-  * DeepEP's low-latency `dispatch`/`combine` released their peers before the
-    zeroing of the next signalling slot had been written back out of L2, so a
-    peer's incoming flag was clobbered and the receiving rank spun forever.
-    That is why it reproduced with `VLLM_BATCH_INVARIANT=0` and looked like it
-    was "not a batch-invariance defect" -- it was not one. It needs a DeepEP
-    carrying the release/acquire restoration on both paths; against a DeepEP
-    without it this arm hangs at startup exactly as described above.
-  * once that cleared, the padding work added a second blocker at the same
-    configuration: the per-microbatch forward contexts were built without the
-    batch-wide padding mask, so it arrived as None where the traced graph had
-    baked a tensor. Fixed by giving each microbatch its own mask.
-
-Measured on 4x gfx950, DP=4, OLMoE-1B-7B, one variable at a time: with the
-DeepEP fix and without the mask fix the server does not start, failing at
-`assert_size_stride`; with both it starts and serves. `--ubatch-size` > 2 is
-still untested; only DBO's two-way split is exercised here.
+`nixl_ep`, the third backend microbatching accepts, is not covered: it still
+needs its kernels. `deepep_low_latency` requires a DeepEP whose low-latency
+`dispatch`/`combine` restore release/acquire ordering around the signalling
+slots; against one without it that arm hangs at startup rather than failing
+fast. `--ubatch-size` > 2 is untested; only DBO's two-way split runs here.
 """
 
-import json
 import os
-import random
-import threading
 import time
-from pathlib import Path
 
 import pytest
-import requests
-from utils import skip_if_not_cuda_alike
+from utils import (
+    INSTRUMENTATION_IMPORT_HOOK,
+    BackgroundLoad,
+    assert_server_ran_this_tree,
+    dp_completion,
+    instrumented_server_env,
+    read_records,
+    skip_if_not_cuda_alike,
+)
 
-import vllm
-import vllm.envs as envs
 from tests.utils import RemoteOpenAIServer, large_gpu_mark, multi_gpu_marks
 
 pytestmark = [
@@ -145,9 +96,7 @@ NEEDLE_PROMPT = (
     "where the main thermodynamic losses occur."
 )
 
-# Written to the server's PYTHONPATH as sitecustomize.py so it loads in the API
-# server, every engine core and every worker, including spawned ones.
-_INSTRUMENTATION = '''
+_PATCHERS = '''
 """Record the mode, the all2all manager, and every ubatch decision."""
 import json
 import os
@@ -276,96 +225,32 @@ _TARGETS = {
     "vllm.v1.worker.ubatch_utils": _patch_ubatch_utils,
     "vllm.distributed.device_communicators.all2all": _patch_all2all,
 }
-
-if _LOG:
-    import importlib.abc
-    import importlib.util
-
-    class _Finder(importlib.abc.MetaPathFinder):
-        def find_spec(self, name, path=None, target=None):
-            patcher = _TARGETS.get(name)
-            if patcher is None:
-                return None
-            sys.meta_path.remove(self)
-            try:
-                spec = importlib.util.find_spec(name)
-            finally:
-                sys.meta_path.insert(0, self)
-            if spec is None or spec.loader is None:
-                return None
-            original_exec = spec.loader.exec_module
-
-            def exec_module(module, _exec=original_exec, _patch=patcher):
-                _exec(module)
-                _patch(module)
-
-            spec.loader.exec_module = exec_module
-            return spec
-
-    sys.meta_path.insert(0, _Finder())
 '''
 
+_INSTRUMENTATION = _PATCHERS + INSTRUMENTATION_IMPORT_HOOK
 
-def _completion(url, prompt, max_tokens, rank, logprobs=None, timeout=900):
-    body = {
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "seed": 20240919,
-    }
-    if logprobs is not None:
-        body["logprobs"] = logprobs
-    response = requests.post(
-        url, json=body, headers={"X-data-parallel-rank": str(rank)}, timeout=timeout
+
+def _load(url, ranks, concurrency, seed=0) -> BackgroundLoad:
+    def send(rng, index):
+        prompt = " ".join(
+            str(rng.randint(0, 99999)) for _ in range(rng.randint(32, 96))
+        )
+        dp_completion(url, MODEL, prompt, 384, ranks[index % len(ranks)])
+
+    return BackgroundLoad(
+        send,
+        concurrency=concurrency,
+        ramp_seconds=RAMP_SECONDS,
+        drain_seconds=DRAIN_SECONDS,
+        seed=seed,
     )
-    response.raise_for_status()
-    return response.json()
-
-
-class _Load:
-    """Keeps `concurrency` unrelated requests in flight, spread over `ranks`."""
-
-    def __init__(self, url, ranks, concurrency, seed=0):
-        self.url, self.ranks, self.concurrency = url, ranks, concurrency
-        self.seed = seed
-        self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self.errors: list[str] = []
-
-    def _run(self, index: int) -> None:
-        rng = random.Random(self.seed * 1000 + index)
-        rank = self.ranks[index % len(self.ranks)]
-        while not self._stop.is_set():
-            prompt = " ".join(
-                str(rng.randint(0, 99999)) for _ in range(rng.randint(32, 96))
-            )
-            try:
-                _completion(self.url, prompt, 384, rank)
-            except Exception as e:
-                self.errors.append(repr(e))
-                time.sleep(0.5)
-
-    def __enter__(self) -> "_Load":
-        for i in range(self.concurrency):
-            thread = threading.Thread(target=self._run, args=(i,), daemon=True)
-            thread.start()
-            self._threads.append(thread)
-        if self.concurrency:
-            time.sleep(RAMP_SECONDS)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        for thread in self._threads:
-            thread.join(timeout=300)
-        # Let the queues drain so the next condition starts from idle.
-        time.sleep(DRAIN_SECONDS)
 
 
 def _needle(url, rank=NEEDLE_RANK) -> dict:
     started = time.time()
-    response = _completion(url, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, rank, logprobs=1)
+    response = dp_completion(
+        url, MODEL, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, rank, logprobs=1
+    )
     choice = response["choices"][0]
     return {
         "started": started,
@@ -373,16 +258,6 @@ def _needle(url, rank=NEEDLE_RANK) -> dict:
         "tokens": choice["logprobs"]["tokens"],
         "logprobs": choice["logprobs"]["token_logprobs"],
     }
-
-
-def _records(log_prefix: str) -> list[dict]:
-    directory, prefix = os.path.split(log_prefix)
-    out: list[dict] = []
-    for name in os.listdir(directory):
-        if name.startswith(prefix + "."):
-            with open(os.path.join(directory, name)) as f:
-                out.extend(json.loads(line) for line in f if line.strip())
-    return out
 
 
 def _decisions(records: list[dict], window: dict) -> list[dict]:
@@ -420,7 +295,6 @@ def dbo_server(request, tmp_path, enable_batch_invariant_mode):
     unset while this process believed it set. The `modes` assertion catches
     that, and has.
     """
-    (tmp_path / "sitecustomize.py").write_text(_INSTRUMENTATION)
     log_prefix = str(tmp_path / "ubatch")
 
     args = [
@@ -447,19 +321,7 @@ def dbo_server(request, tmp_path, enable_batch_invariant_mode):
         "--gpu-memory-utilization",
         os.getenv("VLLM_EP_TEST_GPU_MEMORY_UTILIZATION", "0.30"),
     ]
-    # RemoteOpenAIServer launches the `vllm` console script off PATH rather than
-    # `sys.executable -m`, so the server does not inherit this process's
-    # interpreter. Where an unrelated vLLM is wired in through a user-site
-    # `.pth` that resolves to a different tree. The path entry makes the common
-    # case work; the `vllm_file` assertion is what keeps it honest.
-    repo_root = str(Path(vllm.__file__).resolve().parent.parent)
-    env = {
-        "PYTHONPATH": os.pathsep.join(
-            [str(tmp_path), repo_root, os.environ.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep),
-        "UBATCH_LOG": log_prefix,
-        "VLLM_ATTENTION_BACKEND": "TRITON_ATTN",
-    }
+    env = instrumented_server_env(tmp_path, _INSTRUMENTATION, UBATCH_LOG=log_prefix)
     server = RemoteOpenAIServer(
         MODEL, args, env_dict=env, seed=20240919, max_wait_seconds=1800
     )
@@ -477,7 +339,6 @@ def test_microbatched_needle_is_invariant_to_batch_composition(dbo_server):
     _needle(url)
 
     conditions: dict[str, dict] = {}
-    loads: dict[str, _Load] = {}
     # `own_32` and `own_32_peers_32` put the same load on the needle's own
     # rank and differ only in whether the peers are busy, which is what
     # decides whether the proposed split actually happens.
@@ -490,27 +351,18 @@ def test_microbatched_needle_is_invariant_to_batch_composition(dbo_server):
         ("solo_again", 0, [NEEDLE_RANK], 0),
     ]
     for label, concurrency, ranks, seed in plan:
-        with _Load(url, ranks, concurrency, seed) as load:
+        with _load(url, ranks, concurrency, seed) as load:
             conditions[label] = _needle(url)
-        loads[label] = load
+        # Checked per condition: a peer throwing HTTP errors would otherwise
+        # burn the remaining conditions before saying so.
+        load.assert_ran_cleanly(f"{label} companions")
 
-    for label, load in loads.items():
-        assert not load.errors, f"{label} companions failed: {load.errors[:3]}"
+    records = read_records(log_prefix)
 
-    records = _records(log_prefix)
-
-    # The server is a separate process launched off PATH, so it can silently be
-    # a different vLLM tree or a different mode than the one under test.
-    served = {r["vllm_file"] for r in records if r.get("kind") == "env"}
-    assert served == {vllm.__file__}, (
-        f"the server imported vLLM from {served}, but this test process is "
-        f"{vllm.__file__}; nothing it reports is evidence about this tree."
-    )
-    modes = {r["batch_invariant"] for r in records if r.get("kind") == "env"}
-    assert modes == {envs.VLLM_BATCH_INVARIANT}, (
-        f"the server's effective VLLM_BATCH_INVARIANT is {modes}, but this "
-        f"process has {envs.VLLM_BATCH_INVARIANT}; the two arms of this test "
-        "are not running the mode they claim to."
+    env_records = [r for r in records if r.get("kind") == "env"]
+    assert_server_ran_this_tree(
+        {r["vllm_file"] for r in env_records},
+        {r["batch_invariant"] for r in env_records},
     )
     managers = {r["cls"] for r in records if r.get("kind") == "manager"}
     assert managers == {expected_manager}, (

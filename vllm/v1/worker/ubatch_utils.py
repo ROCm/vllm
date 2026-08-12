@@ -53,27 +53,19 @@ def check_ubatch_thresholds(
 def align_ubatch_splits_to_requests(vllm_config: "VllmConfig") -> bool:
     """Whether microbatch cuts must land on request boundaries.
 
-    Scoped to DeepEP high throughput rather than to every microbatching backend,
-    for a reason that has to be fixed before it can be widened.
-    `GPUUBatchWrapper.__call__` builds each microbatch's DP metadata by *fabricating*
-    the cross-rank vector from its own slice:
+    Scoped to DeepEP high throughput. `GPUUBatchWrapper.__call__` fabricates each
+    microbatch's cross-rank token vector from its own slice size, which is only
+    correct while every rank cuts at `num_tokens_padded // num_ubatches`. A snapped
+    cut is a function of the local request boundaries, so the ranks no longer agree.
+    High throughput never reads that vector -- its per-rank counts come from
+    `Buffer.get_dispatch_layout` -- but the batched formats low latency selects do
+    (`estimate_expected_m`), so widening this needs the real per-rank sizes carried
+    in the collective first.
 
-        ubatch_num_tokens_across_dp = torch.tensor(
-            [ubatch_slice.num_tokens] * dp_size, ...)
-
-    which is true today only because every rank cuts at
-    `num_tokens_padded // num_ubatches` and so lands on the same size. A snapped cut
-    is a function of the local request boundaries, so the ranks no longer agree and
-    that vector becomes wrong on all of them. High throughput does not read it -- its
-    per-rank counts come from `Buffer.get_dispatch_layout`, a real device-side
-    negotiation -- which is why alignment is admitted here and measured here. The
-    batched formats that low latency selects do read it (`estimate_expected_m`), so
-    widening this needs the real per-rank sizes carried in the collective first.
-
-    Also note this implies `cudagraph_mode` is NONE: `CompilationConfig` forces NONE
-    for high throughput at `data_parallel_size > 1`. That matters because
+    This also implies `cudagraph_mode` is NONE (`CompilationConfig` forces it for
+    high throughput at `data_parallel_size > 1`), which matters because
     `GPUUBatchWrapper` keys captured microbatched graphs on the total token count
-    alone, so a graph captured under one split would be replayed under another.
+    alone.
     """
     parallel_config = vllm_config.parallel_config
     return (
@@ -110,18 +102,11 @@ def request_aligned_split_points(
     decomposes its prefill into a context pass plus a new-token pass merged by
     log-sum-exp, instead of one causal pass. That is mathematically equivalent and
     numerically different, and where the cut lands is a function of the DP peers'
-    load, so the same request gets a different answer run to run. It is the same
-    boundary `999ec9ee19` disabled prefix caching over and `b2501b5a94` pinned the
-    scheduler's chunk against; this is the third way to move it.
+    load, so the same request gets a different answer run to run.
 
     So under batch invariance the cut is snapped to a request boundary and the
-    straddling request is deferred to one side whole, following `b2501b5a94`'s rule
-    of deferring rather than shrinking. Measured on 2x gfx950, DeepSeek-V2-Lite-Chat
-    with DP=2/EP + deepep_high_throughput + DBO at the thresholds
-    `tests/v1/distributed/test_dbo.py` uses: 1932 slices over four GSM8K passes, no
-    request cut, and all four passes bitwise identical to the same server with
-    microbatching disabled entirely. Unaligned, the same run cut 60 of 60 and moved
-    5-8 of 64 completions per pass.
+    straddling request is deferred to one side whole, matching the scheduler's rule
+    of deferring rather than shrinking.
 
     Returns None when there are not enough interior boundaries, which the caller
     must treat as "do not microbatch" -- falling back to an even division would
@@ -199,9 +184,7 @@ def maybe_create_ubatch_slices(
         split_point = int(num_tokens_padded) // num_ubatches
 
     # A sequence is the cuts themselves; a scalar is a stride giving evenly spaced
-    # ones. Tested for as a sequence rather than as an `int` because callers reach
-    # here with numpy integers, which are not `int` instances and would silently
-    # take the wrong branch.
+    # ones. Tested as a sequence because callers reach here with numpy integers.
     if isinstance(split_point, (list, tuple)):
         token_split_points = [int(point) for point in split_point]
     else:

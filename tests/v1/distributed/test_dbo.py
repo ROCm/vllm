@@ -32,31 +32,15 @@ DP_SIZE = 2
 # GSM8K eval configuration
 NUM_QUESTIONS = 256  # Fast eval for CI; but must be large enough to hit dbo thresholds
 NUM_SHOTS = 5  # Few-shot examples
-# The eval is not deterministic: it fires all questions concurrently, so batch
-# composition -- and with it the numerics -- differs between runs of the same
-# question set.
-#
-# This floor was lowered to 0.58 when the failures looked numerical. They were
-# not: most of them were the server dying mid-eval, which returns accuracy 0.0
-# and reads as a very low score. The cause was a stream-ordering bug in DeepEP
-# (its start-of-op wait took `previous_event` instead of, rather than as well
-# as, the caller's stream, so under dual-batch overlap it never waited on the
-# stream its output tensors were allocated on). With that fixed, measured on
-# 2x gfx950 over 144 post-warmup evals across three configurations:
-#
-#     mean 0.6538-0.6567, stdev 0.0093-0.0132, min 0.6328, and 0 of 144 below
-#     0.62 -- against 1 genuine sub-0.62 in 44 evals before the fix, plus four
-#     crash-induced zeros.
-#
-# So 0.62 is defensible again and is restored. It sits ~1.8 stdev below the
-# observed minimum rather than the ~1 stdev it sat at before, because the
-# distribution did not move -- the crashes went away.
+# The eval fires all questions concurrently, so batch composition -- and with
+# it the numerics -- differs between runs. Measured across 144 post-warmup
+# evals: mean 0.65, stdev 0.013, min 0.633. Before lowering this floor again,
+# check whether the failing runs scored near zero: that is a crashed request,
+# not numerics.
 MIN_ACCURACY = 0.62
-# A cold server answers its first burst badly: across five servers the opening
-# eval returned 2.7-3.5% unparsable answers against 0.4% once warm, costing up
-# to seven points of accuracy. That is a distinct failure from a numerical
-# regression and is worth failing on separately rather than letting it show up
-# as a low score.
+# A cold server answers its first burst badly (2.7-3.5% unparsable against 0.4%
+# once warm). Fail on that separately: a server that could not be parsed did
+# not measure accuracy.
 MAX_INVALID_RATE = 0.02
 
 # Increase max_num_seqs to trigger DBO for decode batches

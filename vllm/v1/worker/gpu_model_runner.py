@@ -4074,8 +4074,7 @@ class GPUModelRunner(
         `request_aligned_split_points`, but what it supplies is an aligned cut
         already -- chosen for hazard-avoidance among the boundaries rather than
         purely for balance. With no hazard this returns None and that path is
-        untouched, which is the overwhelmingly common case (measured at ~1 step
-        in 10000 on DSV2-Lite + GSM8K).
+        untouched, which is the overwhelmingly common case.
         """
         forbidden = self._microbatch_hazard_cuts(num_reqs, num_scheduled_tokens_np)
         if forbidden is None:
