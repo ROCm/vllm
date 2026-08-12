@@ -120,9 +120,7 @@ def try_get_optimal_moe_lora_config(
     # already pinned. get_moe_configs() returns None under
     # VLLM_BATCH_INVARIANT so the M-bucketed tuned table is never consulted,
     # and get_default_config() short-circuits to a fixed M-independent
-    # config. Verified by dropping a tuned table for this device on
-    # VLLM_TUNED_CONFIG_FOLDER: the shrink config changes at 8 M-boundaries
-    # with the mode off and at 0 with it on.
+    # config.
     raw_config = try_get_optimal_moe_config(w1_shape, w2_shape, top_k, dtype, M)
     config: dict[str, int | None] = dict(raw_config)
     if op_type in [

@@ -224,15 +224,8 @@ def get_lora_op_configs(
         # batch size and on run-to-run CTA scheduling. Pinning it to 1
         # switches the write-back to a plain tl.store.
         #
-        # block_k below stays batch-keyed on purpose. It was measured on
-        # gfx950 (bf16, K in {1792, 3200, 4096}, ranks 8/16/64, 1-4 slices,
-        # batches 1..2048): flipping it 256 <-> 32 does not change a single
-        # output bit, because mm_k walks K strictly sequentially into one
-        # fp32 accumulator regardless of the tile width. The same harness
-        # with split_k left alone (VLLM_BATCH_INVARIANT=0) does go variant
-        # at every probe row, so the null is a real null and not a blind
-        # metric. Don't pin block_k without re-measuring: it costs
-        # performance and buys nothing here.
+        # block_k stays batch-keyed: mm_k walks K sequentially into one fp32
+        # accumulator, so the tile width does not change the reduction order.
         split_k = 64 if batch < 128 else 8
         if is_batch_invariant:
             split_k = 1

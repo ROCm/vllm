@@ -88,9 +88,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         all-gathered activation, so that is the wrong set: a slot used only by
         another rank's tokens would be skipped and its delta silently dropped,
         which makes a token's output depend on what the rest of the cluster
-        happens to be running. Every rank holds every adapter in the same slot,
-        so enumerate them all and let `adapter_enabled` and the per-slot token
-        counts -- which come from the *dispatched* mapping -- do the filtering.
+        happens to be running. So enumerate every slot and let `adapter_enabled`
+        and the per-slot token counts -- which come from the *dispatched*
+        mapping -- do the filtering.
+
+        This assumes slot `k` names the same adapter on every DP rank. Nothing
+        enforces that today: `lora_index_to_id` is per-process LRU state.
 
         Shaped like `active_lora_ids` (max_loras + 1, with the "-1" no-LoRA
         entry first) so the align and Triton kernels see the layout they

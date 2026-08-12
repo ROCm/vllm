@@ -82,13 +82,11 @@ def _check_act_scale_is_dispatchable(fused_experts: mk.FusedMoEExperts) -> None:
         # The experts quantize for themselves, so `prepare` dispatches
         # unquantized activations and produces no scale to gather.
         #
-        # `expects_unquantized_inputs` alone is not enough to detect that here.
-        # It reads `_lora_context`, which `FusedMoEWithLoRA.set_mapping`
-        # installs *after* this hook has run inside FusedMoEKernelModular's
-        # constructor -- measured False at construction and True at call time
-        # for the same layer. So a LoRA layer would be refused on a scheme its
-        # experts would have quantized for themselves. `is_lora_enabled` is a
-        # config field and is settled before any of this is built.
+        # `expects_unquantized_inputs` alone is not usable here: it reads
+        # `_lora_context`, which `FusedMoEWithLoRA.set_mapping` installs after
+        # this hook runs in FusedMoEKernelModular's constructor, so a LoRA
+        # layer would be refused on a scheme its experts quantize themselves.
+        # `is_lora_enabled` is a config field, settled before any of this.
         return
 
     quant_config = fused_experts.quant_config

@@ -90,11 +90,9 @@ no adapter early-returned on `no_lora_flag` while it still owned experts
 serving everyone else's tokens, and the LoRA delta for those tokens was
 silently dropped. Which tokens lost it depended on what the rest of the cluster
 was running, so a lightly loaded server produced the *wrong* answer and a busy
-one the right one. Measured pre-fix at 32 of 32 logprobs moved *and the
-generated text changing*, which is what reverting the two fixed files makes
-this test report; post-fix 0 of 32. A mode-off control also moves 32 of 32 but
-keeps its tokens (max |delta| 2.9e-1) -- that is the reduction-order drift the
-rest of this file is about, not a delta that was never applied.
+one the right one. Pre-fix the needle's generated *text* changes, not just its
+logprobs, which is how this arm distinguishes a dropped delta from the
+reduction-order drift the rest of this file is about.
 
 Only `allgather_reducescatter` is testable here, and that is not a choice:
 `FusedMoEWithLoRA._ep_check` asserts that backend outright, so LoRA + DeepEP
@@ -104,9 +102,8 @@ The LoRA arm runs `--enforce-eager`, also not a preference. Its vacuity guard
 has to show that a rank with no LoRA tokens of its own was serving experts for
 tokens that had them, which means reading `add_lora_fused_moe`'s view of the
 metadata from Python -- and under cudagraphs that call stops executing on
-replay, so the needle's steps go unrecorded. Measured: with cudagraphs the
-needle window contained zero LoRA records, eager 1056 per rank. Both capture
-the bug (pre-fix moved 32 of 32 either way), only eager can prove it did.
+replay, so the needle's steps go unrecorded. The bug reproduces either way;
+only eager can prove the guard saw it.
 
 Why a server rather than the offline `LLM` API: all2all kernels need
 `dp_size > 1` (`FusedMoEParallelConfig.use_all2all_kernels`), and `LLM()`
