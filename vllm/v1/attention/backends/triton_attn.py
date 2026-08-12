@@ -193,26 +193,22 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # [num_seqs, num_heads, nseg, M, head_size], so a segment count that
         # disagreed with the launch would be a memory fault. The op re-derives
         # the count and checks it against partial_out.size(2).
-        # Probed at every query length the fast path can take: a shape can be
-        # declined at M=1 and accepted at M=4 (head_size 64 with 32 heads is),
-        # and allocating on the M=1 answer alone would leave the accepted case
-        # with no workspace.
+        # can_run() only bounds max_query_len against MAX_QUERY_LEN, so its
+        # verdict is the same for every query length the fast path can take;
+        # probing at 1 answers for all of them.
         self.rdna35_mha_partials: tuple[torch.Tensor, ...] | None = None
-        if any(
-            rdna35_causal_mha_attn.can_run(
-                num_heads=self.num_heads_q,
-                num_kv_heads=self.num_heads_kv,
-                head_size=self.headdim,
-                max_query_len=qlen,
-                dtype=model_config.dtype,
-                kv_quant_mode=kv_cache_spec.kv_quant_mode,
-                alibi_slopes=None,
-                sinks=None,
-                sliding_window=None,
-                output_scale=None,
-                kv_cache_layout=get_kv_cache_layout(),
-            )
-            for qlen in (1, rdna35_causal_mha_attn.KERNEL_M)
+        if rdna35_causal_mha_attn.can_run(
+            num_heads=self.num_heads_q,
+            num_kv_heads=self.num_heads_kv,
+            head_size=self.headdim,
+            max_query_len=1,
+            dtype=model_config.dtype,
+            kv_quant_mode=kv_cache_spec.kv_quant_mode,
+            alibi_slopes=None,
+            sinks=None,
+            sliding_window=None,
+            output_scale=None,
+            kv_cache_layout=get_kv_cache_layout(),
         ):
             # NOT max_num_seqs alone: under cudagraph capture the request count
             # is padded up to a capture size, and max_cudagraph_capture_size
