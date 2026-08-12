@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_kv_cache_layout,
 )
+from vllm.v1.attention.ops import rocm_wide_decode_attn
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -92,6 +93,10 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+
+    # fp32 partials for the gfx1151 wide MHA decode kernel, or None when this
+    # layer's shape cannot use it. See rocm_wide_decode_attn.
+    wide_decode_partials: tuple[torch.Tensor, ...] | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -181,6 +186,52 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
 
+        # Workspace for the gfx1151 wide MHA decode kernel, when this layer's
+        # shape can use it. Allocated here rather than in forward() so the
+        # buffers are stable across a cudagraph capture, and sized from the same
+        # helper the kernel's tuned rule uses -- the partials are indexed
+        # [num_seqs, num_heads, nseg, M, head_size], so a segment count that
+        # disagreed with the launch would be a memory fault. The op re-derives
+        # the count and checks it against partial_out.size(2).
+        # Probed at every query length the fast path can take, not just 1: a
+        # shape can lose at M=1 and win at M=4 (head_size 64 with 32 heads
+        # does), and allocating on the M=1 answer alone would leave the winning
+        # case with no workspace and silently off.
+        self.wide_decode_partials: tuple[torch.Tensor, ...] | None = None
+        if any(
+            rocm_wide_decode_attn.can_run(
+                num_heads=self.num_heads_q,
+                num_kv_heads=self.num_heads_kv,
+                head_size=self.headdim,
+                max_query_len=qlen,
+                dtype=model_config.dtype,
+                kv_quant_mode=kv_cache_spec.kv_quant_mode,
+                alibi_slopes=None,
+                sinks=None,
+                sliding_window=None,
+                output_scale=None,
+                kv_cache_layout=get_kv_cache_layout(),
+            )
+            for qlen in (1, rocm_wide_decode_attn.KERNEL_M)
+        ):
+            # NOT max_num_seqs alone: under cudagraph capture the request count
+            # is padded up to a capture size, and max_cudagraph_capture_size
+            # defaults to min(max_num_seqs*2, 512), so a captured batch can
+            # carry more rows than the scheduler's own limit. Size for the
+            # larger of the two or the kernel writes past the workspace.
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            all_capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes
+            if all_capture_sizes:
+                max_num_seqs = max(max_num_seqs, max(all_capture_sizes))
+            out_shape, stat_shape = rocm_wide_decode_attn.workspace_shapes(
+                max_num_seqs, self.num_heads_q, self.headdim, self.num_heads_kv
+            )
+            self.wide_decode_partials = (
+                torch.empty(out_shape, dtype=torch.float32, device=device),
+                torch.empty(stat_shape, dtype=torch.float32, device=device),
+                torch.empty(stat_shape, dtype=torch.float32, device=device),
+            )
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> TritonAttentionMetadata:
@@ -243,6 +294,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
+            wide_decode_partials=self.wide_decode_partials,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -253,6 +305,123 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             )
 
         return attn_metadata
+
+
+def _wide_decode_attn_forward(
+    *,
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    partials: tuple[torch.Tensor, ...],
+    num_reqs: int,
+    num_actual_tokens: int,
+    max_query_len: int,
+    scale: float,
+    softcap: float,
+) -> None:
+    """Run the gfx1151 wide MHA decode kernel over a decode-only batch.
+
+    The kernel wants a dense ``[num_seqs, M, num_heads, head_size]`` block with
+    a compile-time M, while vLLM's query is varlen and flat. At M=1 every
+    request contributes exactly one token, so the reshape is a free view. Above
+    that the rows are gathered into an M=4 block with the padding at the front
+    and scattered back afterwards -- see rocm_wide_decode_attn.build_gather_index
+    for why the padding goes where it does.
+
+    ``num_reqs`` drives everything, NOT ``seq_lens.shape[0]`` or
+    ``num_actual_tokens``. Under cudagraph capture those three are padded
+    independently: gpu_model_runner builds seq_lens as ``[num_reqs_padded]`` and
+    num_actual_tokens as ``num_tokens_padded``. num_reqs is the one that matches
+    both the block_table rows and the query_start_loc entries, and at M=1 it is
+    the row count of the query block -- taking the token count instead would
+    give the view a wrong shape whenever the two paddings differ.
+    """
+    num_seqs = num_reqs
+    num_heads, head_size = query.shape[1], query.shape[2]
+    partial_out, partial_max, partial_sum = partials
+    m = rocm_wide_decode_attn.KERNEL_M
+    nseg = partial_out.shape[2]
+
+    def carve(buf: torch.Tensor, *shape: int) -> torch.Tensor:
+        """A dense view of ``shape`` over the front of ``buf``'s storage.
+
+        The workspace is allocated at the worst case ([max_num_seqs, ..., M=4,
+        ...]) and a given launch needs a smaller dense block. Slicing would not
+        do: ``buf[:n, :, :, :1]`` keeps the parent's strides and the kernel
+        indexes its partials with raw pointer arithmetic, so it would read the
+        wrong elements. Flatten and re-view instead, which is dense by
+        construction and allocates nothing.
+        """
+        n = 1
+        for s in shape:
+            n *= s
+        return buf.view(-1)[:n].view(*shape)
+
+    if max_query_len == 1:
+        # One token per request, so the first num_seqs rows of the flat query
+        # are already the dense [num_seqs, 1, num_heads, head_size] block the
+        # kernel wants -- a view, no copy. Slice to num_seqs rather than to
+        # num_actual_tokens: with cudagraph token padding the latter can be
+        # larger, and .view() would then raise on the size mismatch.
+        q_in = query[:num_seqs].view(num_seqs, 1, num_heads, head_size)
+        out_view = output[:num_seqs].view(num_seqs, 1, num_heads, head_size)
+        torch.ops.vllm.rocm_wide_decode_attn(
+            out_view,
+            q_in,
+            key_cache,
+            value_cache,
+            block_table[:num_seqs],
+            seq_lens[:num_seqs],
+            carve(partial_out, num_seqs, num_heads, nseg, 1, head_size),
+            carve(partial_max, num_seqs, num_heads, nseg, 1),
+            carve(partial_sum, num_seqs, num_heads, nseg, 1),
+            scale,
+            softcap,
+        )
+        return
+
+    # The scatter sends padding rows to a scratch slot one past the real output
+    # rather than masking them out, so both index tensors keep a fixed
+    # num_seqs*M shape -- a boolean mask would make the shape data-dependent,
+    # which syncs and cannot be captured in a cudagraph.
+    rows, scatter_rows = rocm_wide_decode_attn.build_gather_index(
+        query_start_loc, num_seqs, scratch_row=num_actual_tokens
+    )
+    q_pad = (
+        query[:num_actual_tokens]
+        .index_select(0, rows)
+        .view(num_seqs, m, num_heads, head_size)
+    )
+    out_pad = torch.empty_like(q_pad)
+    torch.ops.vllm.rocm_wide_decode_attn(
+        out_pad,
+        q_pad,
+        key_cache,
+        value_cache,
+        block_table[:num_seqs],
+        seq_lens[:num_seqs],
+        carve(partial_out, num_seqs, num_heads, nseg, m, head_size),
+        carve(partial_max, num_seqs, num_heads, nseg, m),
+        carve(partial_sum, num_seqs, num_heads, nseg, m),
+        scale,
+        softcap,
+    )
+    # Scatter every padded row back, the padding ones onto the scratch row.
+    #
+    # index_scatter over a flat [num_actual_tokens + 1] destination: the extra
+    # row absorbs the padding writes and is dropped. Writing into a slice of
+    # `output` would be neater, but only if a spare row happened to exist past
+    # num_actual_tokens, and branching on that would reintroduce exactly the
+    # data-dependent control flow this formulation exists to avoid. A one-row
+    # scratch tensor is unconditional and costs a single row.
+    flat = out_pad.view(num_seqs * m, num_heads, head_size)
+    dest = output.new_empty(num_actual_tokens + 1, num_heads, head_size)
+    dest.index_copy_(0, scatter_rows, flat)
+    output[:num_actual_tokens].copy_(dest[:num_actual_tokens])
 
 
 class TritonAttentionBackend(AttentionBackend):
@@ -621,6 +790,72 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        # gfx1151 wide MHA decode kernel, when the whole batch is decode and the
+        # shape qualifies. The builder only allocates the partials for a layer
+        # that can use it, so a None here means "not this layer" and costs one
+        # attribute load. Everything else falls through to unified_attention
+        # below -- the fallback is literally the next statement.
+        #
+        # max_query_len <= 4 IS the decode-only test: it bounds every request in
+        # the batch, so no prefill can hide in it. That is the same predicate
+        # split_decodes_and_prefills uses (`max_query_len <= decode_threshold`
+        # short-circuits to "all decodes"). Do not add a check comparing against
+        # query_start_loc[-1] -- that is a device tensor, so the comparison
+        # would sync every layer of every forward and would not be capturable.
+        #
+        # A mixed batch is excluded rather than split because splitting needs
+        # the decodes contiguous, which needs reordering, and the reorder
+        # threshold is set on the builder and taken as a min across every
+        # attention group -- it would change batch ordering for every
+        # TRITON_ATTN user on every platform. Query lengths 2 and 3 are padded
+        # up to the M=4 kernel rather than instantiated, so no uniformity is
+        # required either.
+        if (
+            attn_metadata.wide_decode_partials is not None
+            and not attn_metadata.use_cascade
+            and max_seqlen_q <= rocm_wide_decode_attn.MAX_QUERY_LEN
+            # DECODER only. ENCODER/ENCODER_ONLY already returned above, but
+            # ENCODER_DECODER reaches here and its cross-attention is not
+            # causal, while the kernel's causal mask is unconditional.
+            and self.attn_type == AttentionType.DECODER
+            and rocm_wide_decode_attn.can_run(
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                max_query_len=max_seqlen_q,
+                dtype=query.dtype,
+                kv_quant_mode=self._kv_quant_mode,
+                alibi_slopes=self.alibi_slopes,
+                sinks=self.sinks,
+                # (-1, -1) is how this Impl spells "no window"; anything else is
+                # a real window, including the degenerate (0, 0) that a
+                # sliding_window of 1 produces. Pass the stored left extent
+                # rather than testing it against 0, or W=1 would slip through
+                # and the kernel would silently attend to the whole context.
+                sliding_window=None
+                if self.sliding_window == (-1, -1)
+                else self.sliding_window[0] + 1,
+                output_scale=output_scale,
+                kv_cache_layout=get_kv_cache_layout(),
+            )
+        ):
+            _wide_decode_attn_forward(
+                output=output,
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_table,
+                seq_lens=seqused_k,
+                query_start_loc=cu_seqlens_q,
+                partials=attn_metadata.wide_decode_partials,
+                num_reqs=seqused_k.shape[0],
+                num_actual_tokens=num_actual_tokens,
+                max_query_len=max_seqlen_q,
+                scale=self.scale,
+                softcap=self.logits_soft_cap or 0.0,
+            )
+            return output
 
         with create_attention_profiler_scope(
             backend_name="TRITON_ATTN",

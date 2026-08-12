@@ -184,6 +184,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int n_valid_tokens, int top_k, int block_m, int num_blocks) -> ()");
   rocm_ops.impl("moe_gemm_w4a16", torch::kCUDA, &moe_gemm_w4a16);
 
+  // Wide decode attention for MHA (num_heads == num_kv_heads) on AMD RDNA3
+  // (gfx11). Always registered; the kernel body is gfx11-only (stub elsewhere)
+  // and Python gates calls on on_gfx1151(). Mutates out and the three fp32
+  // partial buffers in place; an unsupported shape raises via TORCH_CHECK
+  // (callers gate via the Python rocm_wide_decode_attn.can_run predicate).
+  rocm_ops.def(
+      "wide_decode_attn(Tensor! out, Tensor query, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_table, Tensor seq_lens, "
+      "Tensor! partial_out, Tensor! partial_max, Tensor! partial_sum, "
+      "float scale, float softcap) -> ()");
+  rocm_ops.impl("wide_decode_attn", torch::kCUDA, &wide_decode_attn);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.
