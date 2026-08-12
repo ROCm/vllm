@@ -16,44 +16,19 @@ GEMM carries over. What this file measures is the kernel it actually launches,
 `batched_triton_kernel`, plus the whole class through the reference no-comms
 `BatchedPrepareAndFinalize`.
 
-The original sweep on gfx950 (E=8, K=1024, N=512, max_num_tokens=256) covered
-four operand distributions -- bf16 with an exponent spread of +-20, bf16 flat,
-fp16 +-14, fp32 flat. Every arm: 41 launch configurations collapsed to exactly 1
-bitwise result, 17 token counts from 1 to 256 moved no row, a per-expert row
-derangement relocating 68% of rows moved no bits once un-permuted, and 16
-repeats at a fixed count gave 1 result. The whole class through
-`BatchedPrepareAndFinalize` moved 0 of 2426 rows across 14 batch sizes, both by
-appending tokens and by dropping them from the front (~1750 slot relocations).
-End to end, `test_ep_all2all_batch_invariant.py` holds the needle bitwise over
-DeepEP LL while the needle rank's padding goes 40 -> 220, against a mode-off
-control that moves 31 of 32.
+This is the kernel-level half of the certification, and the cheap half: it needs
+one GPU and no model. The end-to-end half is in
+`test_ep_all2all_batch_invariant.py`, which runs the same class over DeepEP LL.
 
-This file keeps the kernel-level half of that, which is the cheap half: it needs
-one GPU and no model. Of the four distributions it keeps three, dropping bf16
-flat as strictly the weakest -- it is the same dtype as the spread arm with less
-accumulator slack to expose.
-
-The fp8 half is below, and it is what admits the fp8 pairs in
-`_supports_quant_scheme` under the mode. Those were originally withheld as
-*irreproducible*, which turned out to be an unmasked out-of-bounds read of the
-weight scale in the launcher rather than anything about the arithmetic; the
-regression guard for that read is
-`test_batched_moe_weight_scale_is_read_as_a_broadcast` at the end.
-
-**Gap, stated because this file is what admits those pairs: there is no fp8
-end-to-end arm.** The unquantized certification has one -- 0 of 32 logprobs
-over DeepEP LL against a mode-off control that moves 31 of 32 -- and fp8 has
-the kernel and the whole class through `BatchedPrepareAndFinalize`, which is
-the *no-comms* reference prepare/finalize. What that leaves unmeasured is
-precisely what DeepEP LL adds for fp8: `use_fp8_dispatch` quantizes inside
-`_do_quant` and carries the scales through the low-latency buffers, which is
-not the code the bf16 arm exercised. This matters more than an ordinary gap
-because the change it supports *widens* what the mode admits -- an fp8 batched
-deployment used to get a clear `NotImplementedError` and now runs. The arm to
-add is `--quantization fp8` on OLMoE, whose online per-tensor weights and
-activations the promotion turns into the one row here with no checkpoint
-producer, so a single 4-GPU server run covers both the promotion and the fp8
-dispatch.
+The fp8 arms are what admit the fp8 pairs in `_supports_quant_scheme` under the
+mode. They were originally withheld as *irreproducible*, which turned out to be
+an unmasked out-of-bounds read of the weight scale in the launcher rather than
+anything about the arithmetic; the regression guard for that read is
+`test_batched_moe_weight_scale_is_read_as_a_broadcast` at the end. Note that
+everything here goes through the no-comms `BatchedPrepareAndFinalize`, so it
+cannot reach `use_fp8_dispatch`, where DeepEP LL quantizes inside `_do_quant`
+and carries the scales through its buffers; that path has its own e2e arm,
+`test_deepep_low_latency_fp8_block_dispatch_engages_end_to_end`.
 
 Three structural facts about the kernel, from reading it, that the numbers
 below are testing rather than assuming:
@@ -89,7 +64,7 @@ import itertools
 
 import pytest
 import torch
-from utils import skip_if_not_cuda_alike
+from utils import bits, skip_if_not_cuda_alike
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -136,13 +111,8 @@ CASES = [
 ]
 
 
-def _bits(t: torch.Tensor) -> torch.Tensor:
-    view = {1: torch.uint8, 2: torch.int16, 4: torch.int32}[t.element_size()]
-    return t.contiguous().view(view)
-
-
 def _digest(t: torch.Tensor) -> str:
-    return hashlib.blake2b(_bits(t).cpu().numpy().tobytes(), digest_size=8).hexdigest()
+    return hashlib.blake2b(bits(t).cpu().numpy().tobytes(), digest_size=8).hexdigest()
 
 
 def _launch(A, B, C, ent, BM, BN, BK, num_warps=None, num_stages=None):
@@ -233,7 +203,7 @@ def _counts(m):
 
 
 def _rows_that_differ(x, y, e, upto):
-    ne = _bits(x[e, :upto]) != _bits(y[e, :upto])
+    ne = bits(x[e, :upto]) != bits(y[e, :upto])
     return torch.nonzero(ne.reshape(upto, -1).any(dim=1)).flatten()
 
 
@@ -250,7 +220,7 @@ def _reorder_is_detectable(A, B, e=1, m=7, n=3) -> bool:
         s = torch.zeros((), dtype=torch.float32)
         for v in xs:
             s = s + v
-        return int(_bits(s.reshape(1))[0])
+        return int(bits(s.reshape(1))[0])
 
     h = len(p) // 2
     fwd, rev = acc(p), acc(reversed(p))
@@ -260,7 +230,7 @@ def _reorder_is_detectable(A, B, e=1, m=7, n=3) -> bool:
     hi = torch.zeros((), dtype=torch.float32)
     for v in p[h:]:
         hi = hi + v
-    split = int(_bits((lo + hi).reshape(1))[0])
+    split = int(bits((lo + hi).reshape(1))[0])
     return fwd != rev and fwd != split
 
 
@@ -391,7 +361,7 @@ def test_batched_expert_gemm_is_token_count_invariant(mode_on, name, dtype, spre
     again = _zeros(dtype)
     _launch(A, B, again, _counts(T), 64, 64, 32)
     torch.accelerator.synchronize()
-    assert torch.equal(_bits(ref), _bits(again)), (
+    assert torch.equal(bits(ref), bits(again)), (
         f"{name}: the kernel is not even run-to-run stable at a fixed count; "
         "nothing below is interpretable"
     )
@@ -460,7 +430,7 @@ def test_batched_expert_gemm_is_row_permutation_invariant(mode_on, name, dtype, 
         inv = torch.empty_like(pis[e])
         inv[pis[e]] = ar
         un = perm[e, :m][inv]
-        ne = _bits(ref[e, :m]) != _bits(un)
+        ne = bits(ref[e, :m]) != bits(un)
         d = torch.nonzero(ne.reshape(m, -1).any(dim=1)).flatten()
         if d.numel():
             bad[e] = d[:8].tolist()
@@ -643,9 +613,9 @@ def _fp8_reorder_is_detectable(scheme, ops, e, m, n) -> bool:
     else:
         p = (aq * bq).tolist()
     h = len(p) // 2
-    fwd = int(_bits(_fp32_sum(p).reshape(1))[0])
-    rev = int(_bits(_fp32_sum(list(reversed(p))).reshape(1))[0])
-    split = int(_bits((_fp32_sum(p[:h]) + _fp32_sum(p[h:])).reshape(1))[0])
+    fwd = int(bits(_fp32_sum(p).reshape(1))[0])
+    rev = int(bits(_fp32_sum(list(reversed(p))).reshape(1))[0])
+    split = int(bits((_fp32_sum(p[:h]) + _fp32_sum(p[h:])).reshape(1))[0])
     return fwd != rev and fwd != split
 
 
@@ -853,7 +823,7 @@ def test_batched_expert_fp8_gemm_is_row_permutation_invariant(mode_on, scheme):
         inv = torch.empty_like(pis[e])
         inv[pis[e]] = ar
         un = perm[e, :m][inv]
-        ne = _bits(ref[e, :m]) != _bits(un)
+        ne = bits(ref[e, :m]) != bits(un)
         d = torch.nonzero(ne.reshape(m, -1).any(dim=1)).flatten()
         if d.numel():
             bad[e] = d[:8].tolist()
@@ -1044,7 +1014,7 @@ def _class_sweep(run, ids):
     for m in C_BATCHES:  # append arm
         out = run(0, m)
         torch.accelerator.synchronize()
-        d = (_bits(ref[:m]) != _bits(out)).any(dim=1)
+        d = (bits(ref[:m]) != bits(out)).any(dim=1)
         checked += m
         moved += int(d.sum())
         if int(d.sum()) and len(offenders) < 6:
@@ -1054,14 +1024,14 @@ def _class_sweep(run, ids):
         torch.accelerator.synchronize()
         here = _slots(ids, j, full)
         relocations += sum(1 for k, v in here.items() if base[k] != v)
-        d = (_bits(ref[j:]) != _bits(out)).any(dim=1)
+        d = (bits(ref[j:]) != bits(out)).any(dim=1)
         checked += full - j
         moved += int(d.sum())
         if int(d.sum()) and len(offenders) < 6:
             offenders.append(("drop", j, torch.nonzero(d).flatten()[:5].tolist()))
         # Positive control: the comparison is only meaningful because it lines
         # the rows up by token. Compared without the shift it must disagree.
-        assert not torch.equal(_bits(ref[: full - j]), _bits(out)), (
+        assert not torch.equal(bits(ref[: full - j]), bits(out)), (
             "dropping tokens from the front changed nothing at all, so this "
             "arm is not exercising the slot assignment it claims to"
         )
@@ -1321,4 +1291,4 @@ def test_batched_moe_block_quant_clamps_block_k_to_the_group(mode_on, requested_
         clamped = _zeros(torch.bfloat16)
         _launch_fp8("block", ops, _counts(T), clamped, 64, 64, GROUP)
         torch.accelerator.synchronize()
-        assert torch.equal(_bits(got), _bits(clamped))
+        assert torch.equal(bits(got), bits(clamped))

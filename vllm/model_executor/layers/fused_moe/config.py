@@ -628,14 +628,18 @@ def maybe_promote_act_quant_for_batch_invariance(
     and therefore its output -- then depends on what else was batched with it.
     Both GEMMs are affected: the a1 scale comes from the prepare step, the a2
     scale from the amax over ``intermediate_cache2``, which spans
-    ``num_tokens * top_k`` rows.
+    ``num_tokens * top_k`` rows. There is no fixed-order repair for this, the
+    way there is for a reduction: the scale is not a function of the token.
 
-    There is no fixed-order repair, because the scale is not a function of the
-    token. A calibrated scale is a constant and cannot follow the batch, so
-    static schemes need no repair and are left alone: only schemes with no
-    calibrated scale at all are promoted here, and only for the w8a8 dtypes
-    the Triton kernel quantizes itself (the MX and NVFP4 emulation paths
-    quantize elsewhere and ignore this flag).
+    Setting per-token activations is not only an activation change: the Triton
+    launchers pass ``per_channel_quant=quant_config.per_act_token_quant``, so
+    the weight scale is read down the per-channel path too. A per-tensor weight
+    scale must therefore be broadcast rather than indexed -- see
+    ``_as_per_channel_weight_scale``.
+
+    A calibrated scale is a constant and cannot follow the batch, so static
+    schemes are left alone, as are the MX and NVFP4 emulation paths, which
+    quantize elsewhere and ignore this flag.
     """
     if not envs.VLLM_BATCH_INVARIANT or not (
         quant_config.use_fp8_w8a8 or quant_config.use_int8_w8a8

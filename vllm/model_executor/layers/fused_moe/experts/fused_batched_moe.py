@@ -520,13 +520,9 @@ def invoke_moe_batched_triton_kernel(
         and (BLOCK_K & (BLOCK_K - 1)) == 0
     )
     if use_td and K % BLOCK_K != 0:
-        # Mirrored from `invoke_fused_moe_triton_kernel`, which documents a TD
-        # gather feeding `tl.dot` at a non-block-aligned K miscompiling on real
-        # hardware (~74% of output elements wrong). Not reproduced here -- on
-        # gfx950, K=1040 with BLOCK_K=32 gives the same answer with TD on and
-        # off -- but it is a compiler bug, the fallback costs only the TD path
-        # in a case the alignment gate already lets through, and the dense
-        # launcher's note was written against hardware this branch has none of.
+        # Mirrors `invoke_fused_moe_triton_kernel`: a TD gather feeding
+        # `tl.dot` at non-block-aligned K miscompiles. Not reproduced on
+        # gfx950, but the fallback only costs the TD path.
         use_td = False
     if use_td:
         set_triton_allocator(A.device)
@@ -881,30 +877,12 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
         )
 
         supported: list[tuple[QuantKey | None, QuantKey | None]] = [(None, None)]
-        # No batch-invariance predicate here: all five pairs are admitted under
-        # `VLLM_BATCH_INVARIANT`, each measured individually, and
-        # `_supports_batch_invariance` below records the numbers. They were
-        # withheld until the unmasked out-of-bounds read of the weight scale
-        # was found -- and note what the first diagnosis of *that* got wrong,
-        # because it is the trap in this file: the kernel replayed
-        # deterministically on captured inputs, which read as "the GEMM is
-        # fine, the quantization around it is not". The varying input was
-        # memory that is not an argument at all.
-        #
-        # Do not tidy (kFp8StaticTensorSym, kFp8DynamicTokenSym) away as
-        # unreachable. It is true that no in-tree method emits it --
-        # compressed-tensors rejects the combination outright, and Quark,
-        # ModelOpt and both online paths pair per-tensor weights with
-        # per-tensor activations -- but it is the form
-        # (kFp8StaticTensorSym, kFp8DynamicTensorSym) *executes in* under the
-        # mode, because `maybe_promote_act_quant_for_batch_invariance` returns
-        # `with_per_token_act_quant()`: per-token activations against a weight
-        # scale left per-tensor. So this row is where that pair's evidence
-        # lives, and it is also the shape the launcher's weight-scale stride
-        # was wrong for. The oracle currently asks with the pre-promotion keys,
-        # so deleting this entry would not break selection today; it would
-        # break the moment anything queries the promoted config, and it would
-        # orphan the measurement either way.
+        # Keep (kFp8StaticTensorSym, kFp8DynamicTokenSym) even though no
+        # in-tree quant method emits it: it is the form
+        # (kFp8StaticTensorSym, kFp8DynamicTensorSym) executes in under
+        # VLLM_BATCH_INVARIANT, where the activation is promoted to per-token
+        # and the weight scale stays per-tensor. See
+        # `maybe_promote_act_quant_for_batch_invariance`.
         if device_supports_fp8:
             supported += [
                 (kFp8Static128BlockSym, kFp8Dynamic128Sym),
@@ -936,77 +914,19 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
     def _supports_batch_invariance() -> bool:
         """Unquantized and all five fp8 pairs `_supports_quant_scheme` lists.
 
-        This is the only experts class reachable with
-        `FusedMoEActivationFormat.BatchedExperts` on ROCm, so it is what
-        decides whether DeepEP low latency can be brought up under the mode.
-        It runs a different kernel from `fused_moe_kernel` on an
-        `E x max_num_tokens x K` layout, so nothing measured for the plain
-        expert GEMM carries over and all of the below was measured directly.
+        This runs `batched_triton_kernel` on an `E x max_num_tokens x K`
+        layout, so nothing established for `fused_moe_kernel` carries over.
+        Here there is no split-K, no `tl.atomic_*` and no `@triton.autotune`;
+        each CTA owns a disjoint `[BLOCK_M, BLOCK_N]` tile and runs the whole K
+        loop into one fp32 accumulator; the grid is keyed on `max_num_tokens`, a
+        deployment constant, so token r always lands in tile `r // BLOCK_M`. The
+        batch reaches the kernel only through `mask_m` and two early exits.
 
-        `batched_triton_kernel` has no split-K, no `tl.atomic_*` and no
-        `@triton.autotune` anywhere in this file; each CTA owns a disjoint
-        `[BLOCK_M, BLOCK_N]` tile and runs the whole K loop into one fp32
-        accumulator. The grid is keyed on `max_num_tokens` -- the dispatch
-        buffer's size, a deployment constant -- not on the runtime token count,
-        so token r always lands in tile `r // BLOCK_M`. The batch reaches the
-        kernel only through `mask_m` and two early exits.
-
-        Measured on gfx950, E=8/K=1024/N=512, over bf16 (exponent spread +-20),
-        bf16 flat, fp16 (+-14) and fp32 flat:
-
-          * 41 launch configurations -- each block size varied alone, a
-            BLOCK_K x num_warps cross, and extreme tiles down to 16x16 with 8
-            warps -- gave exactly 1 bitwise result per shape.
-          * 17 token counts from 1 to 256, straddling both BLOCK_M boundaries,
-            plus uneven per-expert counts: no row changed.
-          * A per-expert row derangement (68% of rows changing tile) moved no
-            bits once un-permuted. All2all dispatch assigns slots by atomic
-            increment, so this one is load bearing.
-          * Whole class through `BatchedPrepareAndFinalize`: 0 of 2426 rows
-            moved across 14 batch sizes, both by appending tokens and by
-            dropping them from the front (~1750 slot relocations).
-
-        The fp8 pairs were measured the same way, on the same device, per
-        scheme -- four distinct scale layouts reach `moe_mmk`, since it
-        branches on the scale shapes and not on the pair:
-
-          * 16 identical calls gave 1 result for each. This is the arm that
-            used to fail, and it comes first: a path that cannot repeat itself
-            cannot be batch invariant, whatever the batch does.
-          * 9 to 13 launch configurations per scheme gave 1 bitwise result.
-            The blockwise scheme is scoped to the reachable BLOCK_K, which the
-            mode pins at 32 for every M: it applies the scales to each K chunk
-            *inside* the loop, so the K tile decides how the scaled partials
-            group, and BLOCK_K 16/32/64/128 give four correct but different
-            answers. The other three are invariant across the whole grid.
-          * 17 token counts from 1 to 256, and a row derangement moving 70% of
-            rows to another tile with the activation scale travelling with
-            them: no row changed.
-          * Whole class through `BatchedPrepareAndFinalize`: 0 of 2346 rows
-            over 14 batch sizes and 6 front-drops (2179 slot relocations), in
-            both branches of `batched_moe_kernel_quantize_input` -- the
-            per-expert loop and the whole-buffer one that cudagraphs and
-            torch.compile take.
-          * Control, since four of the five schemes could not have been batch
-            variant here whatever the kernel did: the fifth,
-            (kFp8StaticTensorSym, kFp8DynamicTensorSym), has an activation
-            amax over the batch and moves 661 of those same 2346 rows with the
-            mode off. With it on,
-            `maybe_promote_act_quant_for_batch_invariance` makes that scale
-            per-token and it moves none.
-
-        Non-vacuity, since an exactly-summable operand set cannot detect a
-        reordering: forward, reverse and split-K fp32 reductions over the same
-        products disagreed bitwise in every arm, and the same comparisons
-        without the un-permute (kernel) or without the slot remap (class)
-        reported differences on exactly the rows that moved. fp8 needs that
-        guard more than bf16 does, not less -- two e4m3 values multiply to
-        seven significand bits, and 1024 of those products sum *exactly* in
-        fp32 unless the operands' exponents are deliberately spread.
-
-        Not measured: no fp8 MoE end to end over DeepEP LL (the arm in
-        `test_ep_all2all_batch_invariant.py` is bf16, which is what OLMoE is),
-        and no int8 or MX scheme -- the constructor above asserts those NYI.
+        The fp8 pairs qualify only because
+        `maybe_promote_act_quant_for_batch_invariance` makes the activation
+        scale per-token; a batch-wide amax moves rows. The blockwise scheme is
+        scoped to BLOCK_K=32, which the mode pins, since it applies scales
+        inside the K loop.
         """
         return True
 

@@ -60,25 +60,10 @@ CHECK_ROWS = list(range(1, 32))
 # without which reordering it is unobservable and the sweep asserts nothing.
 # fp16 cannot go past 12 -- four operands at 2**14 overflow the dtype's range.
 #
-# Detection power is *not* monotone in world size, and it is not monotone in
-# the same direction for every dtype, so both sizes above are load bearing and
-# neither is redundant. Measured over 8 seed bases, sensitive rows of 31,
-# totalled: fp16 54 at ws=4 against 96 at ws=8 (1.78x, ws=8 stronger on all 8
-# bases), bf16 197 against 111 (0.56x, ws=8 *weaker* on all 8). Consistent
-# sign across every base in both dtypes, so this is a real effect and not the
-# small-count noise the row counts otherwise invite -- which also means the
-# ws=8 arm is the one that rescues fp16 from the thinness the note above
-# describes, while ws=4 is the stronger arm for bf16.
-#
-# Why bf16 weakens is *not* established. The obvious guess -- that a wide
-# spread lets one addend dominate, so no ordering of the rest can matter --
-# was measured and is wrong: dominance falls at ws=8 (40.9% to 16.5% of
-# elements at spread 20) while sensitivity falls too, so it cannot be the
-# cause. A plausible unproven alternative is that the extra addends grow the
-# sum's magnitude, and with it bf16's rounding quantum, faster than they grow
-# the fp32 accumulation error that has to cross it. Do not repeat the
-# dominance guess without re-measuring; at spread 24 bf16 recovers to 21/31 at
-# ws=8 if the arm ever needs strengthening (bf16 has no overflow ceiling here).
+# Detection power is not monotone in world size, and not in the same direction
+# for both dtypes (measured over 8 seed bases: fp16 1.78x stronger at ws=8,
+# bf16 0.56x), so neither world size is redundant. Raising bf16's spread to 24
+# strengthens the ws=8 arm if it ever needs it; bf16 has no overflow ceiling.
 CASES = [
     (torch.bfloat16, 20),
     (torch.float16, 12),

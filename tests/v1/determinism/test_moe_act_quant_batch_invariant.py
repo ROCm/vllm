@@ -28,7 +28,7 @@ import random
 
 import pytest
 import torch
-from utils import _extract_step_logprobs, skip_if_not_cuda_alike
+from utils import _extract_step_logprobs, shutdown_llm, skip_if_not_cuda_alike
 
 import vllm.envs as envs
 from tests.utils import large_gpu_mark
@@ -268,13 +268,11 @@ def test_dynamic_per_tensor_int8_moe_act_quant_is_promoted(workspace_init):
 
     What this does *not* show is that the int8 GEMM is insensitive to reduction
     order. int8 x int8 products accumulate exactly in fp32 for any realistic
-    activation: measured on gfx950, the largest partial sum over K=32768 of
-    Gaussian activations is ~1.4e6 against the 2^24 where fp32 stops
-    representing integers, and forward, reversed, permuted and differently
-    tiled reductions over those products are all bitwise equal. Reordering only
-    becomes detectable with near-saturated same-sign products (K >= 2048 at
-    |a| = |b| = 127). So the activation scale is the only batch-variance channel
-    this scheme has, and it is the one measured here.
+    activation -- a partial sum over K=32768 of Gaussian activations stays far
+    below the 2^24 where fp32 stops representing integers -- and only become
+    reorder-sensitive with near-saturated same-sign products. So the activation
+    scale is the only batch-variance channel this scheme has, and it is the one
+    measured here.
     """
     assert envs.VLLM_BATCH_INVARIANT
     device = torch.device(f"{current_platform.device_type}:0")
@@ -293,11 +291,8 @@ def test_dynamic_per_tensor_int8_moe_act_quant_is_promoted(workspace_init):
 def test_dynamic_per_tensor_int8_moe_act_quant_moves_without_the_mode(
     monkeypatch, workspace_init
 ):
-    """Without the mode the int8 needle moves, and not by rounding.
-
-    Measured on gfx950 at K=512: all 512 outputs differ, max |delta| 13.5
-    against a needle output of magnitude 19.3. Same at K=4096 and K=8192.
-    """
+    """Without the mode the int8 needle moves, and not by rounding: the whole
+    output row differs, by a magnitude comparable to the row itself."""
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     device = torch.device(f"{current_platform.device_type}:0")
@@ -465,42 +460,45 @@ def test_online_fp8_moe_generation_is_bitwise_invariant_e2e():
     activation scale anywhere for the promotion to defer to. Before the
     promotion existed this configuration was refused at startup under the mode.
 
-    Measured on gfx950: 3/3 needle trials bitwise equal with the mode on and
-    3/3 differing with it off, so the case is not numerically inert. The
-    control is only that -- with the mode off the run also picks different
-    attention and linear kernels, so it does not isolate the MoE scale. The
-    kernel-level tests above do.
+    The mode-off control is weak on its own -- it also picks different attention
+    and linear kernels, so it does not isolate the MoE scale. The kernel-level
+    tests above do.
     """
-    llm = LLM(
-        model=E2E_MODEL,
-        quantization="fp8",
-        max_num_seqs=16,
-        gpu_memory_utilization=0.35,
-        max_model_len=4096,
-        enable_prefix_caching=False,
-    )
-    sampling = SamplingParams(
-        temperature=0.6, top_p=0.95, max_tokens=16, seed=20240919, logprobs=5
-    )
-    needle = _PADDING + "Write one factual sentence about the moon."
-    baseline = llm.generate([needle], sampling, use_tqdm=False)[0]
-    base_logprobs, _ = _extract_step_logprobs(baseline)
-    assert base_logprobs is not None
-
-    random.seed(12345)
-    for _ in range(3):
-        batch_size = random.randint(3, 16)
-        # Never index 0: that position keeps its token offset between the solo
-        # and batched runs, so it can stay invariant on its own.
-        pos = random.randint(1, batch_size - 1)
-        prompts = [
-            needle if i == pos else _PADDING + f"Describe topic number {i}."
-            for i in range(batch_size)
-        ]
-        out = llm.generate(prompts, sampling, use_tqdm=False)[pos]
-        logprobs, _ = _extract_step_logprobs(out)
-        assert out.outputs[0].token_ids == baseline.outputs[0].token_ids
-        assert torch.equal(logprobs, base_logprobs), (
-            f"needle at position {pos} of batch {batch_size} moved: "
-            f"max |delta| = {(logprobs - base_logprobs).abs().max().item()}"
+    llm = None
+    try:
+        llm = LLM(
+            model=E2E_MODEL,
+            quantization="fp8",
+            max_num_seqs=16,
+            gpu_memory_utilization=0.35,
+            max_model_len=4096,
+            enable_prefix_caching=False,
         )
+        sampling = SamplingParams(
+            temperature=0.6, top_p=0.95, max_tokens=16, seed=20240919, logprobs=5
+        )
+        needle = _PADDING + "Write one factual sentence about the moon."
+        baseline = llm.generate([needle], sampling, use_tqdm=False)[0]
+        base_logprobs, _ = _extract_step_logprobs(baseline)
+        assert base_logprobs is not None
+
+        rng = random.Random(12345)
+        for _ in range(3):
+            batch_size = rng.randint(3, 16)
+            # Never index 0: that position keeps its token offset between the
+            # solo and batched runs, so it can stay invariant on its own.
+            pos = rng.randint(1, batch_size - 1)
+            prompts = [
+                needle if i == pos else _PADDING + f"Describe topic number {i}."
+                for i in range(batch_size)
+            ]
+            out = llm.generate(prompts, sampling, use_tqdm=False)[pos]
+            logprobs, _ = _extract_step_logprobs(out)
+            assert out.outputs[0].token_ids == baseline.outputs[0].token_ids
+            assert torch.equal(logprobs, base_logprobs), (
+                f"needle at position {pos} of batch {batch_size} moved: "
+                f"max |delta| = {(logprobs - base_logprobs).abs().max().item()}"
+            )
+    finally:
+        if llm is not None:
+            shutdown_llm(llm)

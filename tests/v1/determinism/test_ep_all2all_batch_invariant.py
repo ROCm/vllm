@@ -14,72 +14,31 @@ independent whatever the implementation does, so an EP=2 test passes against a
 batch-variant combine. Four ranks is the smallest size that measures anything,
 which is why this module asks for four GPUs.
 
-Measured on 8x gfx950, OLMoE-1B-7B bf16, DP=4/TP=1 (EP=4), TRITON_ATTN,
-cudagraphs on, needle pinned to DP rank 2:
+The arms:
 
-- **deepep_high_throughput**: brought up under the mode; the needle's 32
-  logprobs were bitwise identical between an idle server and one saturated on
-  all four ranks, while its own rank's padded token count went 40 -> 367. With
-  the mode off the same comparison moved 31 of 32 positions (max |delta|
-  3.1e-2), so the metric is not blind.
-- **deepep_low_latency**: brought up under the mode and asserted here. It
-  forces `FusedMoEActivationFormat.BatchedExperts`
+- **deepep_high_throughput**: the default DeepEP dispatch/combine, on
+  `TritonExperts`.
+- **deepep_low_latency**: forces `FusedMoEActivationFormat.BatchedExperts`
   (`FusedMoEParallelConfig.use_batched_activation_format`), whose only experts
-  class on ROCm is `BatchedTritonExperts` -- so that one class decided whether
-  this backend was reachable at all, and until it was measured it inherited
-  `_supports_batch_invariance() -> False` and the oracle raised
-  `NotImplementedError: No Unquantized MoE backend supports the deployment
-  configuration`. It now declares `True` for the unquantized path on the
-  evidence recorded in that method, and withholds its fp8 schemes as unmeasured
-  under the mode, for the reason recorded in `_supports_quant_scheme`. This arm
-  is therefore bf16 only, which is what OLMoE is.
-
-  Measured: 0 of 32 logprobs moved while the needle rank's padded token count
-  went 40 -> 220, reproduced over two runs. With the mode off the same
-  comparison moved 31 of 32 (max |delta| 3.5e-2) at padding 40 -> 256, so the
-  metric is not blind. This is the only arm whose experts class is
-  `BatchedTritonExperts` rather than `TritonExperts`, and the
-  (prepare_finalize, experts) pair is asserted so a silent fallback cannot
-  pass it.
-- **mori_high_throughput**: brought up under the mode and asserted here, but
-  only after two things were fixed. `RoutedExperts.expert_map` used to hand the
-  experts AITER's 0/1 mask whenever `VLLM_ROCM_USE_AITER_MOE` was set rather
-  than when AITER was actually *selected*, which made the only previously
-  reachable MoRI measurement (via `--moe-backend triton`) degenerate; and
-  `FusedMoEConfig.__post_init__` asserted `rocm_aiter_fmoe_enabled` for MoRI,
-  which is now neither an assert nor a warning. See that comment for why the
-  coupling is a performance contract and not a data-format one. With both in
-  place MoRI's
-  IntraNode combine is bitwise invariant: 0 of 32 positions moved, against a
-  mode-off control at the *same* load exposure (needle rank padding 40 -> 48 in
-  both arms) that moved 32 of 32, max |delta| 3.6e-2. Its output is also
-  bitwise identical to the allgather_reducescatter path on the same prompts
-  (4 prompts x 24 logprobs plus the 32-token needle, max |delta| exactly 0).
-
-  `--max-num-batched-tokens` is pinned low for this arm on purpose. MoRI
-  allocates a receive buffer of `ep_size * max_num_batched_tokens` rows, and
-  `TritonExperts` used to see M = 8192 on every step where the
-  allgather_reducescatter arm on the same model ran M between 4 and 8192 over
-  526 distinct values. It no longer does: `MoriPrepareAndFinalize.prepare`
-  marks the undelivered rows invalid, so the expert GEMMs, the pad-aware
-  activation and the pad-aware reduction skip them (mean
-  `num_tokens_post_padded` 67662 -> 2866, against 2960 for
-  allgather_reducescatter), and it hands the experts only the first
-  `ep_size *` (this step's DP token count) rows, so M tracks the batch. What is
-  still sized by `max_num_batched_tokens` is MoRI's own symmetric allocation,
-  which is what the pin is for -- leaving the default would make this test
-  memory-hungry for no extra coverage.
+  class on ROCm is `BatchedTritonExperts`, so that one class decides whether
+  this backend is reachable at all -- the oracle refuses the deployment unless
+  it declares support. It declares the unquantized path only, which is what
+  OLMoE is. It is also the only arm whose experts class is not `TritonExperts`,
+  and the (prepare_finalize, experts) pair is asserted so a silent fallback
+  cannot pass it.
+- **mori_high_throughput**: `--max-num-batched-tokens` is pinned low for this
+  arm on purpose: MoRI
+  allocates a symmetric receive buffer of `ep_size * max_num_batched_tokens`
+  rows, so leaving the default makes this test memory-hungry for no extra
+  coverage. The rows the all2all did not deliver are marked invalid by
+  `MoriPrepareAndFinalize.prepare`, so what the experts see still tracks the
+  batch.
 
 - **mori_low_latency**: not a second test. Both single-node MoRI variants were
   observed selecting `EpDispatchCombineKernelType.IntraNode`
   (`MoriAll2AllManager._make_all2all_kwargs` branches on `self.internode`, not
   on the backend literal), so the low-latency literal exercises the same
   kernel.
-
-`deepep_low_latency` was recorded here as inadmissible for as long as it was,
-rather than skipped silently, which is how the change that made it admissible
-got noticed. Its fp8 schemes are still inadmissible and are still recorded
-rather than skipped, for the same reason.
 
 The third arm covers MoE **LoRA** on top of EP, which is a different failure
 than a variant combine and is the regression this file's LoRA test exists for.
@@ -918,86 +877,16 @@ def test_deepep_low_latency_combine_does_not_see_the_batch(deepep_ll_server):
 def test_deepep_low_latency_fp8_promotion_engages_end_to_end(deepep_ll_fp8_server):
     """The fp8 batched-experts path, end to end, with the promotion asserted.
 
-    Named for what it establishes, which is that the path engages -- not for
-    batch invariance, which it cannot show. **These two fp8 arms are one-sided
-    guards**: they have no admissible mode-off control (see below), so passing
-    is not evidence that the mode achieved anything, while *failing* would be
-    real evidence of a batch dependence. Keep them for the second half. The
-    sibling bf16 arms in this file are the two-sided ones, and the difference
-    is deliberate rather than an oversight to be tidied away by renaming these
-    back to `..._does_not_see_the_batch`.
+    One-sided guard: there is no admissible mode-off control, so passing is not
+    evidence the mode achieved anything, while failing would be evidence of a
+    batch dependence. The two-sided arms in this file are the bf16 ones; the
+    name says `engages` rather than `does_not_see_the_batch` for that reason.
 
-    `BatchedTritonExperts`' fp8 schemes are admitted under the mode on
-    kernel-level and whole-class evidence recorded in
-    `_supports_batch_invariance`; what only a server shows is the pieces
-    around them. Here that is the promotion in particular: the checkpoint asks
-    for dynamic per-tensor activations, whose scale is an amax over whatever
-    the all2all delivered, and the mode replaces it with a per-token scale
-    before anything reads the scheme. `expect_quant` asserts the promoted
-    form rather than trusting it, because a per-tensor scale that survived to
-    the experts is precisely the batch dependence this arm would otherwise be
-    reporting as absent.
-
-    `use_fp8_dispatch` is False here and that is correct, not a fallback: it
-    requires a [128, 128] block shape. The `..._fp8_block_dispatch_engages...`
-    arm below is the one that covers the fp8 dispatch.
-
-    **This arm has no mode-off control, and cannot have one in the usual
-    shape.** Measured: 0 of 32 logprobs moved with the needle rank's padding
-    going 40 -> 112. The control was attempted three times and the same
-    configuration with `VLLM_BATCH_INVARIANT=0` does not produce comparable
-    numbers -- it produces `nan`, which the API rejects with
-    `BadRequestError: Out of range float values are not JSON compliant: nan`.
-    Seen in 2 of 2 mode-off runs that got that far, once on the loaded needle
-    and once on the idle one, and never in any mode-on run.
-
-    An earlier version of this docstring attributed the NaN to the activation
-    scale, since with the mode off it stays a dynamic per-tensor amax taken
-    over the whole `E x max_num_tokens` dispatch buffer -- including rows
-    DeepEP LL never delivered -- while under the mode it is per-token and an
-    undelivered row can only poison itself. **That attribution has since been
-    measured and excluded, and both halves are worth recording.**
-
-    The scale defect is real: device-side, in all 16 of OLMoE's MoE layers,
-    the buffer amax is achieved on an *undelivered* row, so the scale is never
-    set by the data being quantized, with inflation up to 22.75x on serving
-    traffic. The undelivered rows are not uninitialised -- one DeepEP LL
-    buffer is shared by every layer, so they hold whichever layer last
-    dispatched the largest activation (40.75, identical across all 16 layers).
-
-    But it does not cause this. Replacing the scale with an amax over
-    delivered rows only, as a static scale, changing nothing else, leaves the
-    NaN exactly as it was: 6 of 6 requests after the first. No NaN or Inf ever
-    enters the quantizer either.
-
-    What the NaN was: it was in the forward pass and not in logprob
-    serialization (with `logprobs` omitted the same request returned 200 and
-    garbage text), it was in prefill, and it was **one-way persistent** -- the
-    first request after startup always clean and every request after it NaN,
-    in 4 of 4 server runs, with no load required. That signature points at
-    persistent state rather than at arithmetic on one batch.
-
-    **It no longer reproduces (2026-08-09).** The `--enforce-eager` control
-    this docstring called for was finally run, together with the arm itself,
-    two servers each: 8 of 8 logprob requests clean on all four, with and
-    without eager. `first_request_ok` true everywhere, so none of them is the
-    dead-server case that looks the same.
-
-    The probe was positive-controlled rather than trusted: injecting a NaN into
-    `compute_logits` produced `Out of range float values are not JSON
-    compliant: nan` on 8 of 8 requests, the same string this arm used to fail
-    with. So the clean result is a real negative and not a blind instrument.
-
-    The likely cause is `8b5db7cb6d`, which fixed a **capture-only** defect
-    with exactly this signature: `batched_moe_kernel_quantize_input` ignored
-    `expert_num_tokens` under capture and amaxed the whole
-    `[E, max_num_tokens, N]` buffer, measured at 9.95e29 on 100% of calls,
-    while eager bounded it per expert. That is stated as the likely cause, not
-    a demonstrated one -- nobody bisected it, and "does not reproduce" is
-    weaker evidence than "reproduced, then fixed".
-
-    The mode-on arm above still has no mode-off control in the usual shape,
-    which remains the thing a reader needs to know.
+    The checkpoint asks for dynamic per-tensor activations; `expect_quant`
+    asserts the *promoted* per-token form actually reached the experts, since a
+    surviving per-tensor scale is exactly the dependence this arm would
+    otherwise report as absent. `use_fp8_dispatch` is False here and correctly
+    so -- it requires a [128, 128] block shape; the block arm below covers it.
     """
     server, log_prefix = deepep_ll_fp8_server
     _assert_needle_does_not_see_the_batch(
@@ -1033,17 +922,11 @@ def test_deepep_low_latency_fp8_block_dispatch_engages_end_to_end(
     it alone. `per_act_token_quant` is therefore False and the block shape is
     what carries the granularity.
 
-    **This arm's mode-off control runs, and says the metric is blind.**
-    Measured: 0 of 32 moved under the mode at padding 40 -> 198; with
-    `VLLM_BATCH_INVARIANT=0` at a *higher* exposure (40 -> 224) the same
-    comparison moved 1 of 32, max |delta| 6.0e-8. Against the bf16 arms, where
-    mode-off moves 31 of 32 at 3.5e-2, this configuration is already very
-    nearly batch invariant without the mode, so a passing verdict here is not
-    evidence that the mode is doing anything. Whether that is because block
+    **This arm's mode-off control runs, and says the metric is blind**: with
+    the mode off the same comparison barely moves, so a passing verdict here is
+    not evidence that the mode is doing anything. Whether that is because block
     quantization coarsens the arithmetic below the logprob quantum or because
-    the path genuinely has no batch dependence left is **not established** --
-    the two look identical from here, and only the second would license the
-    arm.
+    the path genuinely has no batch dependence left is not established.
 
     Kept rather than skipped, because what it does establish is mechanical and
     is asserted above: DeepEP LL really did dispatch fp8, the batched experts
