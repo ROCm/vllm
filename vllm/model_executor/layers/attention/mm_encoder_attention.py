@@ -529,6 +529,7 @@ class MMEncoderAttention(CustomOp):
             num_kv_heads=self.num_kv_heads,
             dtype=query.dtype,
             is_causal=False,  # ViT attention is non-causal
+            v_token_stride=value.stride(1),
         ):
             output = vit_torch_sdpa_wrapper(
                 q=query,
@@ -582,6 +583,7 @@ class MMEncoderAttention(CustomOp):
             num_kv_heads=self.num_kv_heads,
             dtype=query.dtype,
             is_causal=False,  # ViT attention is non-causal
+            v_token_stride=value.stride(1),
         ):
             output = vit_flash_attn_wrapper(
                 q=query,
@@ -633,6 +635,7 @@ class MMEncoderAttention(CustomOp):
             num_kv_heads=self.num_kv_heads,
             dtype=query.dtype,
             is_causal=False,  # ViT attention is non-causal
+            v_token_stride=value.stride(1),
         ):
             output = vit_triton_attn_wrapper(
                 q=query,

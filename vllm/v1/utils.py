@@ -747,6 +747,7 @@ def create_attention_profiler_scope(
     num_kv_heads: int,
     dtype: torch.dtype,
     is_causal: bool,
+    v_token_stride: int | None = None,
 ) -> AbstractContextManager:
     """Create a profiler scope for attention operations with metadata.
 
@@ -760,6 +761,13 @@ def create_attention_profiler_scope(
         num_kv_heads: Number of KV heads (for GQA/MQA)
         dtype: Data type of the tensors
         is_causal: Whether causal masking is applied
+        v_token_stride: Optional per-token stride of the V operand. Only
+            surfaced in the label when it is *not* the natural contiguous value
+            (num_kv_heads * head_size) -- i.e. the real ViT layout where V is a
+            non-contiguous slice of the fused QKV projection (token stride
+            mult*H*D, e.g. 3*H*D). This carries a measurable latency impact on
+            some GPUs (e.g. Strix Point cold cache); natural strides are omitted
+            to keep the scope label short.
 
     Returns:
         Context manager for the profiler scope
@@ -773,6 +781,13 @@ def create_attention_profiler_scope(
         f"H={num_heads} D={head_size} KV_H={num_kv_heads} "
         f"DT={dtype_str} BE={backend_name}"
     )
+    # Only surface the V operand token stride when it is *not* the natural
+    # contiguous value (num_kv_heads * head_size). The real ViT layout feeds a
+    # non-contiguous V sliced from the fused QKV projection (token stride
+    # mult*H*D), which is what we want visible in the profile; natural strides
+    # are omitted to keep the label short.
+    if v_token_stride is not None and v_token_stride != num_kv_heads * head_size:
+        scope_name += f" Vstride={v_token_stride}"
 
     return record_function_or_nullcontext(scope_name)
 

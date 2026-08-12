@@ -71,6 +71,7 @@ def flash_attn_maxseqlen_wrapper(
         num_kv_heads=num_kv_heads,
         dtype=q.dtype,
         is_causal=False,
+        v_token_stride=v.stride(0),
     ):
         output = flash_attn_varlen_func(
             q,
@@ -170,6 +171,7 @@ def triton_attn_wrapper(
         num_kv_heads=num_kv_heads,
         dtype=q.dtype,
         is_causal=False,
+        v_token_stride=v.stride(0),
     ):
         context_attention_fwd(
             q,
