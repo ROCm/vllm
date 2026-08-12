@@ -121,7 +121,7 @@ if TYPE_CHECKING:
     VLLM_MOE_HYBRID_W4A16: bool = False
     VLLM_MOE_HIP: str | None = None
     VLLM_GDN_HIP: bool = True
-    VLLM_ROCM_WIDE_DECODE_ATTN: str | None = None
+    VLLM_ROCM_RDNA35_CAUSAL_MHA: str | None = None
     VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
@@ -1161,9 +1161,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Wide decode attention for MHA on gfx1151. Tri-state: unset = default-on
     # wherever the kernel is built and the shape qualifies, "1" forces on, "0"
-    # forces the Triton path. Read via rocm_wide_decode_attn.is_enabled().
-    "VLLM_ROCM_WIDE_DECODE_ATTN": lambda: os.environ.get(
-        "VLLM_ROCM_WIDE_DECODE_ATTN", None
+    # forces the Triton path. Read via rdna35_causal_mha_attn.is_enabled().
+    "VLLM_ROCM_RDNA35_CAUSAL_MHA": lambda: os.environ.get(
+        "VLLM_ROCM_RDNA35_CAUSAL_MHA", None
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.

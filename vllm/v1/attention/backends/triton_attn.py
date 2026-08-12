@@ -34,7 +34,7 @@ from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_kv_cache_layout,
 )
-from vllm.v1.attention.ops import rocm_wide_decode_attn
+from vllm.v1.attention.ops import rdna35_causal_mha_attn
 from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -95,8 +95,8 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
 
     # fp32 partials for the gfx1151 wide MHA decode kernel, or None when this
-    # layer's shape cannot use it. See rocm_wide_decode_attn.
-    wide_decode_partials: tuple[torch.Tensor, ...] | None = None
+    # layer's shape cannot use it. See rdna35_causal_mha_attn.
+    rdna35_mha_partials: tuple[torch.Tensor, ...] | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -193,13 +193,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # [num_seqs, num_heads, nseg, M, head_size], so a segment count that
         # disagreed with the launch would be a memory fault. The op re-derives
         # the count and checks it against partial_out.size(2).
-        # Probed at every query length the fast path can take, not just 1: a
-        # shape can lose at M=1 and win at M=4 (head_size 64 with 32 heads
-        # does), and allocating on the M=1 answer alone would leave the winning
-        # case with no workspace and silently off.
-        self.wide_decode_partials: tuple[torch.Tensor, ...] | None = None
+        # Probed at every query length the fast path can take: a shape can be
+        # declined at M=1 and accepted at M=4 (head_size 64 with 32 heads is),
+        # and allocating on the M=1 answer alone would leave the accepted case
+        # with no workspace.
+        self.rdna35_mha_partials: tuple[torch.Tensor, ...] | None = None
         if any(
-            rocm_wide_decode_attn.can_run(
+            rdna35_causal_mha_attn.can_run(
                 num_heads=self.num_heads_q,
                 num_kv_heads=self.num_heads_kv,
                 head_size=self.headdim,
@@ -212,7 +212,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 output_scale=None,
                 kv_cache_layout=get_kv_cache_layout(),
             )
-            for qlen in (1, rocm_wide_decode_attn.KERNEL_M)
+            for qlen in (1, rdna35_causal_mha_attn.KERNEL_M)
         ):
             # NOT max_num_seqs alone: under cudagraph capture the request count
             # is padded up to a capture size, and max_cudagraph_capture_size
@@ -223,10 +223,10 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             all_capture_sizes = vllm_config.compilation_config.cudagraph_capture_sizes
             if all_capture_sizes:
                 max_num_seqs = max(max_num_seqs, max(all_capture_sizes))
-            out_shape, stat_shape = rocm_wide_decode_attn.workspace_shapes(
+            out_shape, stat_shape = rdna35_causal_mha_attn.workspace_shapes(
                 max_num_seqs, self.num_heads_q, self.headdim, self.num_heads_kv
             )
-            self.wide_decode_partials = (
+            self.rdna35_mha_partials = (
                 torch.empty(out_shape, dtype=torch.float32, device=device),
                 torch.empty(stat_shape, dtype=torch.float32, device=device),
                 torch.empty(stat_shape, dtype=torch.float32, device=device),
@@ -294,7 +294,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_output=self.softmax_segm_output,
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
-            wide_decode_partials=self.wide_decode_partials,
+            rdna35_mha_partials=self.rdna35_mha_partials,
         )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
@@ -307,7 +307,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         return attn_metadata
 
 
-def _wide_decode_attn_forward(
+def _rdna35_causal_mha_attn_forward(
     *,
     output: torch.Tensor,
     query: torch.Tensor,
@@ -329,7 +329,7 @@ def _wide_decode_attn_forward(
     a compile-time M, while vLLM's query is varlen and flat. At M=1 every
     request contributes exactly one token, so the reshape is a free view. Above
     that the rows are gathered into an M=4 block with the padding at the front
-    and scattered back afterwards -- see rocm_wide_decode_attn.build_gather_index
+    and scattered back afterwards -- see rdna35_causal_mha_attn.build_gather_index
     for why the padding goes where it does.
 
     ``num_reqs`` drives everything, NOT ``seq_lens.shape[0]`` or
@@ -343,7 +343,7 @@ def _wide_decode_attn_forward(
     num_seqs = num_reqs
     num_heads, head_size = query.shape[1], query.shape[2]
     partial_out, partial_max, partial_sum = partials
-    m = rocm_wide_decode_attn.KERNEL_M
+    m = rdna35_causal_mha_attn.KERNEL_M
     nseg = partial_out.shape[2]
 
     def carve(buf: torch.Tensor, *shape: int) -> torch.Tensor:
@@ -369,7 +369,7 @@ def _wide_decode_attn_forward(
         # larger, and .view() would then raise on the size mismatch.
         q_in = query[:num_seqs].view(num_seqs, 1, num_heads, head_size)
         out_view = output[:num_seqs].view(num_seqs, 1, num_heads, head_size)
-        torch.ops.vllm.rocm_wide_decode_attn(
+        torch.ops.vllm.rdna35_causal_mha_attn(
             out_view,
             q_in,
             key_cache,
@@ -388,7 +388,7 @@ def _wide_decode_attn_forward(
     # rather than masking them out, so both index tensors keep a fixed
     # num_seqs*M shape -- a boolean mask would make the shape data-dependent,
     # which syncs and cannot be captured in a cudagraph.
-    rows, scatter_rows = rocm_wide_decode_attn.build_gather_index(
+    rows, scatter_rows = rdna35_causal_mha_attn.build_gather_index(
         query_start_loc, num_seqs, scratch_row=num_actual_tokens
     )
     q_pad = (
@@ -397,7 +397,7 @@ def _wide_decode_attn_forward(
         .view(num_seqs, m, num_heads, head_size)
     )
     out_pad = torch.empty_like(q_pad)
-    torch.ops.vllm.rocm_wide_decode_attn(
+    torch.ops.vllm.rdna35_causal_mha_attn(
         out_pad,
         q_pad,
         key_cache,
@@ -812,14 +812,14 @@ class TritonAttentionImpl(AttentionImpl):
         # up to the M=4 kernel rather than instantiated, so no uniformity is
         # required either.
         if (
-            attn_metadata.wide_decode_partials is not None
+            attn_metadata.rdna35_mha_partials is not None
             and not attn_metadata.use_cascade
-            and max_seqlen_q <= rocm_wide_decode_attn.MAX_QUERY_LEN
+            and max_seqlen_q <= rdna35_causal_mha_attn.MAX_QUERY_LEN
             # DECODER only. ENCODER/ENCODER_ONLY already returned above, but
             # ENCODER_DECODER reaches here and its cross-attention is not
             # causal, while the kernel's causal mask is unconditional.
             and self.attn_type == AttentionType.DECODER
-            and rocm_wide_decode_attn.can_run(
+            and rdna35_causal_mha_attn.can_run(
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
@@ -840,7 +840,7 @@ class TritonAttentionImpl(AttentionImpl):
                 kv_cache_layout=get_kv_cache_layout(),
             )
         ):
-            _wide_decode_attn_forward(
+            _rdna35_causal_mha_attn_forward(
                 output=output,
                 query=query,
                 key_cache=key_cache,
@@ -848,7 +848,7 @@ class TritonAttentionImpl(AttentionImpl):
                 block_table=block_table,
                 seq_lens=seqused_k,
                 query_start_loc=cu_seqlens_q,
-                partials=attn_metadata.wide_decode_partials,
+                partials=attn_metadata.rdna35_mha_partials,
                 num_reqs=seqused_k.shape[0],
                 num_actual_tokens=num_actual_tokens,
                 max_query_len=max_seqlen_q,
