@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -78,8 +78,10 @@ class QuantFP8(CustomOp):
         # comparison here would specialize the dynamic batch dimension under
         # torch.compile, which is why `_bounded_per_tensor_scale` slices the
         # mask rather than checking its length.
+        # `_or_none`: benchmarks construct this op outside a config context.
+        config = get_current_vllm_config_or_none()
         self.sequence_parallel_moe = (
-            get_current_vllm_config().parallel_config.use_sequence_parallel_moe
+            config is not None and config.parallel_config.use_sequence_parallel_moe
         )
 
         self.is_group_quant = group_shape.is_per_group()

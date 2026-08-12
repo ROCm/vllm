@@ -55,6 +55,7 @@ def _row_mask(
     ent_ptr,
     tid_ptr,
     emap_ptr,
+    emap_len,
     MASK_MODE: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
 ):
@@ -69,6 +70,9 @@ def _row_mask(
         eid = tl.load(tid_ptr + e * T + offs_m, mask=ok, other=-1)
         routed = eid >= 0
         if HAS_EXPERT_MAP:
+            # Bound both ends: `eid` comes from device memory, and an id past
+            # the map's end indexes out of bounds just as a negative one does.
+            routed = routed & (eid < emap_len)
             routed = routed & (tl.load(emap_ptr + eid, mask=routed, other=-1) >= 0)
         ok = ok & routed
     return ok
@@ -80,6 +84,7 @@ def _masked_amax_kernel(
     ent_ptr,
     tid_ptr,
     emap_ptr,
+    emap_len,
     scale_ptr,
     part_ptr,
     T,
@@ -134,7 +139,7 @@ def _masked_amax_kernel(
             return
 
     row_ok = _row_mask(
-        e, offs_m, T, ent_ptr, tid_ptr, emap_ptr, MASK_MODE, HAS_EXPERT_MAP
+        e, offs_m, T, ent_ptr, tid_ptr, emap_ptr, emap_len, MASK_MODE, HAS_EXPERT_MAP
     )
 
     acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
@@ -176,6 +181,7 @@ def _masked_quant_kernel(
     ent_ptr,
     tid_ptr,
     emap_ptr,
+    emap_len,
     T,
     K,
     QLO,
@@ -235,7 +241,7 @@ def _masked_quant_kernel(
             return
 
     row_ok = _row_mask(
-        e, offs_m, T, ent_ptr, tid_ptr, emap_ptr, MASK_MODE, HAS_EXPERT_MAP
+        e, offs_m, T, ent_ptr, tid_ptr, emap_ptr, emap_len, MASK_MODE, HAS_EXPERT_MAP
     )
 
     zero_m = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -315,6 +321,11 @@ def _spec(dtype: torch.dtype) -> _QuantSpec:
     if dtype == torch.int8:
         info = torch.iinfo(dtype)
         return _QuantSpec(127.0, float(info.min), float(info.max), False, True)
+    if dtype == torch.float8_e4m3fnuz:
+        # Not `torch.finfo`, which says 240.0: the shipped kernel caps fnuz at
+        # 224.0 for accuracy (`quant_type_max` in csrc/quantization/utils.cuh),
+        # and `get_fp8_min_max` matches it on the Python side.
+        return _QuantSpec(224.0, -224.0, 224.0, True, False)
     info = torch.finfo(dtype)
     return _QuantSpec(info.max, -info.max, info.max, True, False)
 
@@ -394,6 +405,7 @@ def dynamic_quantize(
         if use_partials
         else None
     )
+    emap_len = expert_map.numel() if expert_map is not None else 0
     common = dict(
         NM=nm,
         USE_PARTIALS=use_partials,
@@ -413,12 +425,12 @@ def dynamic_quantize(
         else torch.zeros(n_scales, dtype=torch.float32, device=x.device)
     )
     _masked_amax_kernel[grid](
-        x, expert_num_tokens, topk_ids, expert_map, s_flat, part,
+        x, expert_num_tokens, topk_ids, expert_map, emap_len, s_flat, part,
         T, K, spec.qmax, sa[0], sa[1], sa[2], **common,
     )  # fmt: skip
 
     _masked_quant_kernel[grid](
-        x, q, s_flat, part, expert_num_tokens, topk_ids, expert_map,
+        x, q, s_flat, part, expert_num_tokens, topk_ids, expert_map, emap_len,
         T, K, spec.qlo, spec.qhi,
         sa[0], sa[1], sa[2], sq[0], sq[1], sq[2],
         USE_RECIPROCAL=spec.use_reciprocal,
