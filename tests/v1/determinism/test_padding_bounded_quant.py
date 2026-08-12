@@ -169,9 +169,7 @@ def test_moe_a1_scale_ignores_cudagraph_padding(vllm_config):
 
     `topk_ids` bounds the a2 buffer, whose rows are token-expert slots. It says
     nothing about a1, whose rows are tokens -- and the rows a1 must not span are
-    the cudagraph padding ones. Left unbounded this cost DeepSeek-V2-Lite 52.5%
-    unparsable answers and 68% repetition loops at concurrency 8, with no
-    all2all in the graph at all.
+    the cudagraph padding ones.
     """
     device = current_platform.device_type
     n_real, n_pad, hidden = 12, 4, 64
