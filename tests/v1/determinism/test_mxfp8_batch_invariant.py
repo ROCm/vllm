@@ -198,24 +198,12 @@ def test_mxfp8_mla_multi_chunk_context_is_batch_invariant():
     what creates the multi-chunk path; the control only shows the case is not
     numerically inert.
 
-    The engine runs in-process so the chunk counter is visible; the other e2e
-    cases keep the default multiprocessing engine. That is also why the whole
-    test runs in a spawned interpreter: an in-process engine's VRAM is *not*
-    recoverable within the process that built it. Measured on gfx950 with a
-    0.6B model at the same gpu_memory_utilization, ``engine_core.shutdown()``,
-    ``del``, ``gc.unfreeze()``, ``gc.collect()``, ``empty_cache()`` and
-    ``cleanup_dist_env_and_memory()`` -- in that order and in every other --
-    leave the allocator's reported live bytes at 27.91 of 27.92 GiB, because the
-    compiled artifacts pin the model and the KV cache from module-level lists
-    in Inductor-generated code; ``LLMEngine._cleanup_instance_caches`` only
-    unhooks the bytecode hook and does not reach them. The same teardown with
-    ``enforce_eager=True`` frees all of it, which is what identifies torch
-    compilation as the holder. Left in-process this test therefore parked
-    gpu_memory_utilization x total VRAM -- 86 GiB here -- in the pytest process
-    for the rest of the session, and every module after it in a full-suite run
-    started short of memory. Spawn, not fork: the parent has a live HIP context
-    by the time this runs, so ``os.fork`` gives "Cannot re-initialize CUDA in
-    forked subprocess".
+    The engine runs in-process so the chunk counter is visible, and the whole
+    test therefore runs in a spawned interpreter: an in-process engine's VRAM is
+    not recoverable within the process that built it -- torch.compile's generated
+    modules hold the model and KV cache from module-level lists that no teardown
+    reaches (``enforce_eager=True`` frees all of it). Spawn, not fork: the parent
+    already has a live HIP context.
     """
     import os as _os
 

@@ -123,17 +123,20 @@ call counts go quiet during exactly the steps being measured.
 
 import json
 import os
-import random
-import threading
 import time
 from pathlib import Path
 
 import pytest
-import requests
-from utils import skip_if_not_cuda_alike
+from utils import (
+    INSTRUMENTATION_IMPORT_HOOK,
+    BackgroundLoad,
+    assert_server_ran_this_tree,
+    dp_completion,
+    instrumented_server_env,
+    read_records,
+    skip_if_not_cuda_alike,
+)
 
-import vllm
-import vllm.envs as envs
 from tests.utils import RemoteOpenAIServer, large_gpu_mark, multi_gpu_marks
 from vllm.utils.import_utils import has_deep_ep, has_mori
 
@@ -203,7 +206,7 @@ NEEDLE_PROMPT = (
 
 # Written to the server's PYTHONPATH as sitecustomize.py so it loads in the API
 # server, every engine core and every worker, including spawned ones.
-_INSTRUMENTATION = '''
+_PATCHERS = '''
 """Log the mode as each process sees it, and every DP coordination decision."""
 import os
 import sys
@@ -396,7 +399,7 @@ def _patch_punica(module):
     cls.add_lora_fused_moe = wrapper
 
 
-_PATCHES = {
+_TARGETS = {
     "vllm.v1.worker.dp_utils": _patch_dp_utils,
     "vllm.distributed.device_communicators.all2all": _patch_all2all,
     "vllm.model_executor.layers.fused_moe.modular_kernel": _patch_modular_kernel,
@@ -406,101 +409,33 @@ _PATCHES = {
     "vllm.lora.punica_wrapper.punica_gpu": _patch_punica,
 }
 
-
-if _LOG:
-    import importlib.abc
-    import importlib.util
-
-    class _Finder(importlib.abc.MetaPathFinder):
-        def find_spec(self, name, path=None, target=None):
-            fn = _PATCHES.get(name)
-            if fn is None:
-                return None
-            sys.meta_path.remove(self)
-            try:
-                spec = importlib.util.find_spec(name)
-            finally:
-                sys.meta_path.insert(0, self)
-            if spec is None or spec.loader is None:
-                return None
-            original_exec = spec.loader.exec_module
-
-            def exec_module(module, _exec=original_exec, _fn=fn):
-                _exec(module)
-                _fn(module)
-
-            spec.loader.exec_module = exec_module
-            return spec
-
-    sys.meta_path.insert(0, _Finder())
 '''
 
+_INSTRUMENTATION = _PATCHERS + INSTRUMENTATION_IMPORT_HOOK
 
-def _completion(url, prompt, max_tokens, rank, logprobs=None, timeout=900, model=MODEL):
-    body = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "seed": 20240919,
-    }
-    if logprobs is not None:
-        body["logprobs"] = logprobs
-    response = requests.post(
-        url, json=body, headers={"X-data-parallel-rank": str(rank)}, timeout=timeout
+
+def _load(url: str, concurrency: int, model: str = MODEL) -> BackgroundLoad:
+    """Unrelated requests in flight across every DP rank."""
+
+    def send(rng, index):
+        prompt = " ".join(
+            str(rng.randint(0, 99999)) for _ in range(rng.choice([16, 48, 96, 160]))
+        )
+        dp_completion(url, model, prompt, rng.choice([64, 128, 256]), index % DP)
+
+    return BackgroundLoad(
+        send,
+        concurrency=concurrency,
+        ramp_seconds=LOAD_RAMP_SECONDS,
+        drain_seconds=6.0,
+        join_timeout=240,
     )
-    response.raise_for_status()
-    return response.json()
-
-
-class _Load:
-    """Keeps `concurrency` unrelated requests in flight across every DP rank."""
-
-    def __init__(self, url: str, concurrency: int, model: str = MODEL):
-        self.url, self.concurrency, self.model = url, concurrency, model
-        self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self.errors: list[str] = []
-
-    def _run(self, seed: int) -> None:
-        rng = random.Random(seed)
-        while not self._stop.is_set():
-            prompt = " ".join(
-                str(rng.randint(0, 99999)) for _ in range(rng.choice([16, 48, 96, 160]))
-            )
-            try:
-                _completion(
-                    self.url,
-                    prompt,
-                    rng.choice([64, 128, 256]),
-                    seed % DP,
-                    model=self.model,
-                )
-            except Exception as e:
-                self.errors.append(repr(e))
-                time.sleep(0.5)
-
-    def __enter__(self) -> "_Load":
-        for i in range(self.concurrency):
-            thread = threading.Thread(target=self._run, args=(i,), daemon=True)
-            thread.start()
-            self._threads.append(thread)
-        if self.concurrency:
-            time.sleep(LOAD_RAMP_SECONDS)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        for thread in self._threads:
-            thread.join(timeout=240)
-        # Let the queues drain so the next condition starts from idle.
-        time.sleep(6.0)
 
 
 def _needle(url, model: str = MODEL) -> dict:
     started = time.time()
-    response = _completion(
-        url, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, NEEDLE_RANK, logprobs=1, model=model
+    response = dp_completion(
+        url, model, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, NEEDLE_RANK, logprobs=1
     )
     choice = response["choices"][0]
     return {
@@ -509,21 +444,6 @@ def _needle(url, model: str = MODEL) -> dict:
         "tokens": choice["logprobs"]["tokens"],
         "logprobs": choice["logprobs"]["token_logprobs"],
     }
-
-
-def _records(log_prefix: str) -> list[dict]:
-    directory, prefix = os.path.split(log_prefix)
-    out = []
-    for name in os.listdir(directory):
-        if not name.startswith(prefix + "."):
-            continue
-        pid = name.split(".", 1)[1]
-        with open(os.path.join(directory, name)) as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    out.append({**json.loads(line), "pid": pid})
-    return out
 
 
 def _needle_rank_pads(records: list[dict], needle: dict) -> list[int]:
@@ -642,7 +562,6 @@ def _ep_server(tmp_path, all2all_backend: str, extra_args: list[str] | None = No
     if all2all_backend.startswith("mori") and not has_mori():
         pytest.skip("requires the mori package")
 
-    (tmp_path / "sitecustomize.py").write_text(_INSTRUMENTATION)
     log_prefix = str(tmp_path / "ep_a2a")
 
     args = [
@@ -664,21 +583,7 @@ def _ep_server(tmp_path, all2all_backend: str, extra_args: list[str] | None = No
         os.getenv("VLLM_EP_TEST_GPU_MEMORY_UTILIZATION", "0.55"),
         *(extra_args or []),
     ]
-    # RemoteOpenAIServer launches the `vllm` console script off PATH rather
-    # than `sys.executable -m`, so it does not inherit this process's
-    # interpreter. On a machine with an unrelated vLLM checkout wired in
-    # through a user-site `.pth`, that is a *different tree* and the test would
-    # measure a build nobody is asking about while passing. The path entry
-    # makes the common case work; the `vllm_file` assertion below is what keeps
-    # it honest.
-    repo_root = str(Path(vllm.__file__).resolve().parent.parent)
-    env = {
-        "PYTHONPATH": os.pathsep.join(
-            [str(tmp_path), repo_root, os.environ.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep),
-        "EP_A2A_LOG": log_prefix,
-        "VLLM_ATTENTION_BACKEND": "TRITON_ATTN",
-    }
+    env = instrumented_server_env(tmp_path, _INSTRUMENTATION, EP_A2A_LOG=log_prefix)
     with RemoteOpenAIServer(MODEL, args, env_dict=env, max_wait_seconds=1800) as server:
         yield server, log_prefix
 
@@ -866,27 +771,25 @@ def _assert_needle_does_not_see_the_batch(
     # Discarded: keeps first-request state out of the comparison.
     _needle(url, model)
 
-    with _Load(url, 0, model):
+    with _load(url, 0, model):
         alone = _needle(url, model)
-    with _Load(url, load_concurrency, model) as load:
+    with _load(url, load_concurrency, model) as load:
         loaded = _needle(url, model)
-    assert not load.errors, (
-        f"the background load did not run cleanly: {load.errors[:3]}"
-    )
+    load.assert_ran_cleanly()
 
-    records = _records(log_prefix)
+    records = read_records(log_prefix)
 
-    served = {r["vllm_file"] for r in records if r.get("event") == "env"}
-    assert served == {vllm.__file__}, (
-        f"the server imported vLLM from {served}, but this test process is "
-        f"{vllm.__file__}; nothing it reports is evidence about this tree."
-    )
+    # `quant_err` is a key inside an `mk` record, not an event of its own.
+    errors = [
+        r
+        for r in records
+        if str(r.get("event", "")).endswith("_err") or "quant_err" in r
+    ]
+    assert not errors, f"the instrumentation raised: {errors[:3]}"
 
-    modes = {r["batch_invariant"] for r in records if r.get("event") == "env"}
-    assert modes == {envs.VLLM_BATCH_INVARIANT}, (
-        f"the server's effective VLLM_BATCH_INVARIANT is {modes}, but this "
-        f"process has {envs.VLLM_BATCH_INVARIANT}; the two arms of this test "
-        "are not running the mode they claim to"
+    assert_server_ran_this_tree(
+        {r["vllm_file"] for r in records if r.get("event") == "env"},
+        {r["batch_invariant"] for r in records if r.get("event") == "env"},
     )
 
     managers = {r["cls"] for r in records if r.get("event") == "manager"}

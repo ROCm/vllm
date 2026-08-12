@@ -44,13 +44,16 @@ TP=4 is covered separately in `test_pp_tp_batch_invariant`, which needs 8 GPUs.
 """
 
 import os
-import random
 
 import torch
-from utils import _extract_step_logprobs, shutdown_llm, skip_if_not_cuda_alike
+from utils import (
+    assert_needle_is_batch_invariant,
+    shutdown_llm,
+    skip_if_not_cuda_alike,
+)
 
 from tests.utils import multi_gpu_marks
-from vllm import LLM, SamplingParams
+from vllm import LLM
 
 # multi_gpu_test would also wrap the test in create_new_process_for_each_test,
 # whose re-import would break the worker extension lookup below, so take its
@@ -185,60 +188,18 @@ def test_batch_invariance_is_installed_on_every_pipeline_rank():
 
 
 def test_pipeline_parallel_generation_is_batch_invariant():
-    """The needle's per-step logprobs must be bitwise equal at bs=1 and bs=N.
-
-    The needle is never placed at batch index 0: that position keeps its token
-    offset between the solo and the batched run, so it can stay invariant even
-    when the rest of the batch does not.
-    """
-    random.seed(int(os.getenv("VLLM_TEST_SEED", "12345")))
-    num_trials = int(os.getenv("VLLM_PP_NEEDLE_TRIALS", "3"))
-    assert MAX_BATCH_SIZE >= 3, "Batch size should be >= 3 to place the needle."
-
-    sampling = SamplingParams(
-        temperature=0.0,
-        max_tokens=int(os.getenv("VLLM_PP_NEEDLE_MAX_TOKENS", "24")),
-        seed=20240919,
-        logprobs=1,
-    )
-    padding = _PROMPT_PADDING * _PADDING_REPEATS
-    needle_prompt = padding + "Write one factual sentence about the moon."
-
     llm = None
     try:
         llm = _make_llm()
-        baseline_output = llm.generate([needle_prompt], sampling, use_tqdm=False)[0]
-        baseline_logprobs, baseline_token_ids = _extract_step_logprobs(baseline_output)
-        assert baseline_logprobs is not None
-
-        for _ in range(num_trials):
-            batch_size = random.randint(3, MAX_BATCH_SIZE)
-            needle_pos = random.randint(1, batch_size - 1)
-            prompts = []
-            for idx in range(batch_size):
-                if idx == needle_pos:
-                    prompts.append(needle_prompt)
-                    continue
-                # Staggered so the fillers finish prefilling on different steps
-                # and the needle shares its forward passes with a changing mix
-                # of prefill and decode.
-                repeats = max(20, _PADDING_REPEATS * (idx + 1) // batch_size)
-                prompts.append(
-                    _PROMPT_PADDING * repeats
-                    + f"Describe topic number {idx} in detail."
-                )
-
-            needle_output = llm.generate(prompts, sampling, use_tqdm=False)[needle_pos]
-            needle_logprobs, needle_token_ids = _extract_step_logprobs(needle_output)
-            assert needle_logprobs is not None
-
-            assert needle_output.prompt == needle_prompt
-            assert needle_token_ids == baseline_token_ids
-            assert torch.equal(needle_logprobs, baseline_logprobs), (
-                f"Logprobs differ at needle position {needle_pos} of batch "
-                f"{batch_size}: max |delta| = "
-                f"{(needle_logprobs - baseline_logprobs).abs().max().item()}"
-            )
+        assert_needle_is_batch_invariant(
+            llm,
+            padding_unit=_PROMPT_PADDING,
+            padding_repeats=_PADDING_REPEATS,
+            max_batch_size=MAX_BATCH_SIZE,
+            max_tokens=int(os.getenv("VLLM_PP_NEEDLE_MAX_TOKENS", "24")),
+            num_trials=int(os.getenv("VLLM_PP_NEEDLE_TRIALS", "3")),
+            seed=int(os.getenv("VLLM_TEST_SEED", "12345")),
+        )
     finally:
         if llm is not None:
             shutdown_llm(llm)

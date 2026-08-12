@@ -42,65 +42,27 @@ Sequence-parallel MoE would put the combine on the EP group and make DP=2 x TP=2
 a genuine 4-wide test, but `use_sequence_parallel_moe` is consulted per model
 and OLMoE does not pass it through, so that path is untested here.
 
-Measured on 4x gfx950, OLMoE-1B-7B bf16, TRITON_ATTN, cudagraphs on, needle
-pinned to DP rank 2 and compared bitwise over 64 generated logprobs against the
-same prompt run solo:
-
-                                  mode on   mode off (max |delta|)
-  32 companions, needle's rank      0/64      64/64  (1.4e-1)
-  96 companions, needle's rank      0/64      64/64  (5.4e-2)
-  24 companions, peer ranks only    0/64      63/64  (1.2e0, different token)
-  48 companions, all four ranks     0/64      64/64  (6.5e-2)
-  same prompt solo, other rank      0/64      64/64  (6.3e-2)
-  solo, repeated                    0/64       0/64
-
-447 moved positions in the mode-off arm, none in the mode-on arm. The last two
-rows are the ones that make the rest mean something. `solo` repeated is clean
-with the mode *off* as well, so the mode-off differences track batch composition
-rather than run-to-run noise: the metric is specific, not just sensitive. And
-with the mode off, merely which DP rank served an otherwise byte-identical
-request changes its logprobs.
-
-A second, sharper control was run outside this file, because the mode-off arm
-moves many things at once. With the mode left fully on and *only*
-`CudaCommunicator.reduce_scatterv` monkeypatched back onto the library path --
-which is exactly what upstream has, its `reduce_scatterv` having no
-`VLLM_BATCH_INVARIANT` branch -- the same protocol gives 320 moved positions
-across five of eight conditions. So the batch variance upstream reports in
-issue #30321 is attributable to that one function, and the fixed-order
-reduce-scatter is what closes it. Note also that three of those eight conditions
-came back *clean* under a combine that is genuinely variant: any single
-condition can pass by luck, which is why this test runs several and why a
-one-condition version of it would be worth very little.
+The `solo_again` and `other_rank_solo` conditions are what make the rest mean
+something: with the mode off the repeated solo run is clean while merely which
+DP rank served an otherwise byte-identical request moves its logprobs, so the
+comparison tracks batch composition rather than run-to-run noise. Several
+conditions rather than one, because a variant combine can leave any single
+condition clean by luck.
 
 `--quantization fp8` is covered as a second configuration because it is the only
 one that reaches the dynamic per-tensor activation scale, whose amax spans
-whatever the all2all delivered rather than just the local batch. Its mode-off
-arm cannot be collected, and the reason is worth knowing before someone tries:
-with the mode off the scale stays per-tensor, so `prepare` hands a 1-row scale
-to `all_gatherv` alongside a many-row activation
-(`naive_dp_ep._quantize_and_setup_dispatch` only skips the gather for `ndim == 0`
-scales), and `_all_gather_single` asserts `1 != <this rank's token count>` as
-soon as the DP ranks are unevenly loaded. Reproduced three times out of three,
-always on the first condition with concurrent load, and it kills the server. The
-promotion to per-token is what makes the shapes agree, so under the mode the
-configuration runs. The mode-on arm is therefore validated against a variant
-*reduce-scatter* instead, which is a control the configuration can survive: with
-the promotion left in place and only `reduce_scatterv` restored to the library
-path, the fp8 needle moves 319/512 positions across four conditions with max
-|delta| 2.7 and a different token sampled from position 2 onward. So the metric
-demonstrably detects batch variance in *this* configuration, not merely in the
-bf16 one.
+whatever the all2all delivered rather than just the local batch. It runs under
+the mode only: with the mode off the scale stays per-tensor, so `prepare` hands
+a 1-row scale to `all_gatherv` alongside a many-row activation and
+`_all_gather_single` asserts as soon as the DP ranks are unevenly loaded. The
+promotion to per-token is what makes the shapes agree.
 
 Scope, and what is deliberately not here:
 
 - **Only `allgather_reducescatter`, the default.** It is also the only backend
   reachable in this configuration: DeepEP and MoRI need their kernels installed.
-  Their combines are fixed-order by source audit (DeepEP HT walks source ranks
-  ascending after a full wait, DeepEP LL sums over top-k slot order after a grid
-  barrier, MoRI reduces via `WarpAccum` in ascending expert-slot order, all with
-  fp32 accumulators and no float atomics), but an audit is not a measurement and
-  none of them is exercised here.
+  Their combines look fixed-order by source audit, but an audit is not a
+  measurement; `test_ep_all2all_batch_invariant.py` is where they are measured.
 - **The combine only runs when DP > 1.** `use_all2all_kernels` is
   `use_ep and (dp_size > 1 or pcp_size > 1 or is_sequence_parallel)`, so TP=4
   plus `--enable-expert-parallel` with DP=1 shards the experts but never builds
@@ -111,33 +73,25 @@ Scope, and what is deliberately not here:
   time, which is a batch dependency of a different kind), microbatching
   (`--enable-dbo`, rejected on this backend), PCP, and sequence-parallel MoE.
 
-Two neighbouring configurations were measured while writing this and are green,
-but are not asserted here because neither exercises the combine: TP=4 + EP=4
-with DP=1 (0/64 with the mode on, 384 moved with it off) and DP=2 x TP=2 with
-EP=4 (0/64 on, 380 moved off, but only a 2-wide combine).
-
-The instrumentation is not decoration. A server that silently fell back to
-non-EP, or that imported a different vLLM checkout, would sail through the
-comparison below while proving nothing, and both have happened in this project.
-`_worker_facts` asserts the workers' `vllm.__file__` and effective
-`VLLM_BATCH_INVARIANT` against this process, and
-`test_ep_needle_is_invariant_to_batch_composition` fails if the AgRs combine was
+A server that silently fell back to non-EP, or that imported a different vLLM
+checkout, would sail through the comparison below while proving nothing. Hence
+`assert_server_ran_this_tree`, and hence the failure if the AgRs combine was
 never observed at world size 4.
 """
 
-import json
 import os
-import random
-import threading
-import time
-from pathlib import Path
 
 import pytest
-import requests
-from utils import skip_if_not_cuda_alike
+from utils import (
+    INSTRUMENTATION_IMPORT_HOOK,
+    BackgroundLoad,
+    assert_server_ran_this_tree,
+    dp_completion,
+    instrumented_server_env,
+    read_records,
+    skip_if_not_cuda_alike,
+)
 
-import vllm
-import vllm.envs as envs
 from tests.utils import RemoteOpenAIServer, large_gpu_mark, multi_gpu_marks
 
 pytestmark = [
@@ -162,9 +116,7 @@ NEEDLE_PROMPT = (
     "where the main thermodynamic losses occur."
 )
 
-# Written to the server's PYTHONPATH as sitecustomize.py so it loads in the API
-# server, every engine core and every worker, including spawned ones.
-_INSTRUMENTATION = '''
+_PATCHERS = '''
 """Record what the MoE layer was actually configured as, to $EP_LOG.<pid>."""
 import json
 import os
@@ -259,97 +211,33 @@ _TARGETS = {
     "vllm.model_executor.layers.fused_moe.config": _patch_moe_config,
     "vllm.distributed.device_communicators.all2all": _patch_all2all,
 }
-
-if _LOG:
-    import importlib.abc
-    import importlib.util
-
-    class _Finder(importlib.abc.MetaPathFinder):
-        def find_spec(self, name, path=None, target=None):
-            patcher = _TARGETS.get(name)
-            if patcher is None:
-                return None
-            sys.meta_path.remove(self)
-            try:
-                spec = importlib.util.find_spec(name)
-            finally:
-                sys.meta_path.insert(0, self)
-            if spec is None or spec.loader is None:
-                return None
-            original_exec = spec.loader.exec_module
-
-            def exec_module(module, _exec=original_exec, _patch=patcher):
-                _exec(module)
-                _patch(module)
-
-            spec.loader.exec_module = exec_module
-            return spec
-
-    sys.meta_path.insert(0, _Finder())
 '''
 
-
-class _Load:
-    """Keeps `concurrency` requests in flight, spread over `ranks`."""
-
-    def __init__(self, url, ranks, concurrency, seed=0):
-        self.url, self.ranks, self.concurrency = url, ranks, concurrency
-        self.seed = seed
-        self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self.errors: list[str] = []
-        self.completed = 0
-
-    def _run(self, index: int) -> None:
-        rng = random.Random(self.seed * 1000 + index)
-        rank = self.ranks[index % len(self.ranks)]
-        while not self._stop.is_set():
-            prompt = " ".join(
-                str(rng.randint(0, 99999)) for _ in range(rng.randint(32, 96))
-            )
-            try:
-                _completion(self.url, prompt, 384, rank)
-                self.completed += 1
-            except Exception as e:
-                self.errors.append(repr(e))
-                time.sleep(0.5)
-
-    def __enter__(self) -> "_Load":
-        for i in range(self.concurrency):
-            thread = threading.Thread(target=self._run, args=(i,), daemon=True)
-            thread.start()
-            self._threads.append(thread)
-        if self.concurrency:
-            time.sleep(RAMP_SECONDS)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        for thread in self._threads:
-            thread.join(timeout=300)
-        # Let the queues drain so the next condition starts from idle.
-        time.sleep(DRAIN_SECONDS)
+_INSTRUMENTATION = _PATCHERS + INSTRUMENTATION_IMPORT_HOOK
 
 
-def _completion(url, prompt, max_tokens, rank, logprobs=None, timeout=900):
-    body = {
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "seed": 20240919,
-    }
-    if logprobs is not None:
-        body["logprobs"] = logprobs
-    response = requests.post(
-        url, json=body, headers={"X-data-parallel-rank": str(rank)}, timeout=timeout
+def _load(url, ranks, concurrency, seed=0) -> BackgroundLoad:
+    """Companion requests spread over `ranks`, one rank per worker thread."""
+
+    def send(rng, index):
+        prompt = " ".join(
+            str(rng.randint(0, 99999)) for _ in range(rng.randint(32, 96))
+        )
+        dp_completion(url, MODEL, prompt, 384, ranks[index % len(ranks)])
+
+    return BackgroundLoad(
+        send,
+        concurrency=concurrency,
+        ramp_seconds=RAMP_SECONDS,
+        drain_seconds=DRAIN_SECONDS,
+        seed=seed,
     )
-    response.raise_for_status()
-    return response.json()
 
 
 def _needle(url, rank=NEEDLE_RANK) -> dict:
-    response = _completion(url, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, rank, logprobs=1)
+    response = dp_completion(
+        url, MODEL, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, rank, logprobs=1
+    )
     choice = response["choices"][0]
     return {
         "tokens": choice["logprobs"]["tokens"],
@@ -357,36 +245,7 @@ def _needle(url, rank=NEEDLE_RANK) -> dict:
     }
 
 
-def _records(log_prefix: str) -> list[dict]:
-    directory, prefix = os.path.split(log_prefix)
-    out: list[dict] = []
-    for name in os.listdir(directory):
-        if name.startswith(prefix + "."):
-            with open(os.path.join(directory, name)) as f:
-                out.extend(json.loads(line) for line in f)
-    return out
-
-
-def _worker_facts(records: list[dict]) -> None:
-    """The server is a separate process launched off PATH, so it can silently
-    be a different vLLM or a different mode than the one under test."""
-    served = {r["vllm_file"] for r in records}
-    assert served == {vllm.__file__}, (
-        f"the server imported vLLM from {served}, but this test process is "
-        f"{vllm.__file__}. The server subprocess is running a different tree, "
-        f"so nothing it reports is evidence about this one."
-    )
-    modes = {r["batch_invariant"] for r in records}
-    assert modes == {envs.VLLM_BATCH_INVARIANT}, (
-        f"the server's effective VLLM_BATCH_INVARIANT is {modes}, but this "
-        f"process has {envs.VLLM_BATCH_INVARIANT}; a copy of this file that "
-        f"overrides the mode fixture would otherwise run both arms the same way"
-    )
-
-
 def _make_server(tmp_path, extra_args):
-    instrumentation = tmp_path / "sitecustomize.py"
-    instrumentation.write_text(_INSTRUMENTATION)
     log_prefix = str(tmp_path / "ep_instr")
 
     args = [
@@ -406,21 +265,7 @@ def _make_server(tmp_path, extra_args):
         os.getenv("VLLM_EP_TEST_GPU_MEMORY_UTILIZATION", "0.20"),
         *extra_args,
     ]
-    # The repo root goes on PYTHONPATH ahead of everything else because
-    # RemoteOpenAIServer launches the `vllm` console script off PATH rather than
-    # `sys.executable -m`, so the server does not inherit this process's
-    # interpreter. On a machine with an unrelated vLLM wired in through a
-    # user-site `easy-install.pth` that resolves to a *different tree*.
-    # `_worker_facts` is the check that keeps this honest; the path entry only
-    # makes the common case work.
-    repo_root = str(Path(vllm.__file__).resolve().parent.parent)
-    env = {
-        "PYTHONPATH": os.pathsep.join(
-            [str(tmp_path), repo_root, os.environ.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep),
-        "EP_LOG": log_prefix,
-        "VLLM_ATTENTION_BACKEND": "TRITON_ATTN",
-    }
+    env = instrumented_server_env(tmp_path, _INSTRUMENTATION, EP_LOG=log_prefix)
     # `seed` is the constructor's business: RemoteOpenAIServer appends `--seed`
     # itself and rejects an explicit one in `vllm_serve_args`.
     server = RemoteOpenAIServer(
@@ -458,7 +303,6 @@ def test_ep_needle_is_invariant_to_batch_composition(ep_server):
     _needle(url)
 
     conditions: dict[str, dict] = {}
-    loads: dict[str, _Load] = {}
     # Companions on the needle's own rank change its local batch directly;
     # companions on peer ranks only change what the all-gather delivers into
     # *this* rank's expert GEMMs and what the combine has to reduce. Both are
@@ -471,20 +315,21 @@ def test_ep_needle_is_invariant_to_batch_composition(ep_server):
         ("solo_again", 0, [NEEDLE_RANK], 0),
     ]
     for label, concurrency, ranks, seed in plan:
-        with _Load(url, ranks, concurrency, seed) as load:
+        with _load(url, ranks, concurrency, seed) as load:
             conditions[label] = _needle(url)
-        loads[label] = load
+        # Checked per condition: a peer throwing HTTP errors would otherwise
+        # burn the remaining conditions before saying so.
+        load.assert_ran_cleanly(f"{label} companions")
 
     # Informational in spirit but asserted anyway: which replica served an
     # otherwise byte-identical request is as much "the batch" as anything else,
     # and with the mode off this one moves.
     conditions["other_rank_solo"] = _needle(url, (NEEDLE_RANK + 1) % DP_SIZE)
 
-    for label, load in loads.items():
-        assert not load.errors, f"{label} companions failed: {load.errors[:3]}"
-
-    records = _records(log_prefix)
-    _worker_facts(records)
+    records = read_records(log_prefix)
+    assert_server_ran_this_tree(
+        {r["vllm_file"] for r in records}, {r["batch_invariant"] for r in records}
+    )
 
     # Vacuity guards. A server that fell back to non-EP, or that never ran the
     # combine, would pass every comparison below without testing anything.

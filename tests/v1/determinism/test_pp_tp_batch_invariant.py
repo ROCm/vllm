@@ -14,26 +14,15 @@ here and nowhere else.
 TP must be 4. A 2-rank sum is order independent, so PP=2 x TP=2 would pass even
 against a fully batch-variant collective.
 
-Measured on 8x gfx950, Qwen3-1.7B bf16, TRITON_ATTN, 7208-token needle against
-the 2032-token `batch_invariant_prefill_chunk` (four prefill chunks):
-
-* the needle is bitwise stable in 4 of 4 trials with the mode on (batch sizes
-  9/16/15/16, needle at positions 1/14/5/6), and moves in 4 of 4 with
-  `VLLM_BATCH_INVARIANT=0` (max |delta| 6.9e-2 to 9.1e-2, same sampled tokens);
-* every TP all-reduce is served by the custom kernel -- `ca_comm` is live on all
-  eight ranks with `max_size` 8392704, sized from `max_num_batched_tokens` so
-  that a full 2048-token by 2048-hidden bf16 message still fits. The all-gather
-  fallback is therefore never reached in this configuration and is left to
-  `test_tp_all_reduce_batch_invariant`'s `fallback_ar` worker;
-* PP=2 does change which message sizes the collective sees relative to PP=1,
-  which is the mechanism this test exists to cover. Counting token counts at the
-  collective over one identical 8-prompt batch: PP=2 produces
-  215/445/677/908/1114/1116/1578/1808/2033/2034/2035/2036 and PP=1 produces
-  218/448/678/908/1117/1119/1579/1809/2034/2035/2036/2037/2038/2039 -- the two
-  sets share one element. The custom kernel is size independent, so the shifted
-  sizes cost nothing, but that is a measurement rather than a structural
-  guarantee, which is why the needle below is run at this layout and not
-  inferred from the PP=1 and TP-only results.
+In this configuration `ca_comm` is live on every rank, sized from
+`max_num_batched_tokens`, so the custom kernel serves every all-reduce and the
+all-gather fallback is left to `test_tp_all_reduce_batch_invariant`'s
+`fallback_ar` worker. PP=2 really does shift the token counts arriving at the
+collective relative to PP=1 -- over one identical batch the two sets of
+observed sizes share a single element -- and the custom kernel's size
+independence is a measurement rather than a structural guarantee, which is why
+the needle is run at this layout instead of inferred from the PP=1 and TP-only
+results.
 
 Not covered here: PP x TP x DP, PP over more than two stages, TP over more than
 four ranks under PP, and MLA/MoE checkpoints (the JoyAI MXFP8 checkpoint used
@@ -41,11 +30,13 @@ elsewhere in this suite is TP=1 only).
 """
 
 import os
-import random
 import warnings
 
-import torch
-from utils import _extract_step_logprobs, shutdown_llm, skip_if_not_cuda_alike
+from utils import (
+    assert_needle_is_batch_invariant,
+    shutdown_llm,
+    skip_if_not_cuda_alike,
+)
 
 from tests.utils import multi_gpu_marks
 from vllm import LLM, SamplingParams
@@ -241,60 +232,18 @@ def test_tp_all_reduce_path_under_pipeline_parallelism(record_property):
 
 
 def test_pp_tp_generation_is_batch_invariant():
-    """The needle's per-step logprobs must be bitwise equal at bs=1 and bs=N.
-
-    The needle is never placed at batch index 0: that position keeps its token
-    offset between the solo and the batched run, so it can stay invariant even
-    when the rest of the batch does not.
-    """
-    random.seed(int(os.getenv("VLLM_TEST_SEED", "12345")))
-    num_trials = int(os.getenv("VLLM_PP_TP_NEEDLE_TRIALS", "3"))
-    assert MAX_BATCH_SIZE >= 3, "Batch size should be >= 3 to place the needle."
-
-    sampling = SamplingParams(
-        temperature=0.0,
-        max_tokens=int(os.getenv("VLLM_PP_TP_NEEDLE_MAX_TOKENS", "24")),
-        seed=20240919,
-        logprobs=1,
-    )
-    padding = _PROMPT_PADDING * _PADDING_REPEATS
-    needle_prompt = padding + "Write one factual sentence about the moon."
-
     llm = None
     try:
         llm = _make_llm()
-        baseline_output = llm.generate([needle_prompt], sampling, use_tqdm=False)[0]
-        baseline_logprobs, baseline_token_ids = _extract_step_logprobs(baseline_output)
-        assert baseline_logprobs is not None
-
-        for _ in range(num_trials):
-            batch_size = random.randint(3, MAX_BATCH_SIZE)
-            needle_pos = random.randint(1, batch_size - 1)
-            prompts = []
-            for idx in range(batch_size):
-                if idx == needle_pos:
-                    prompts.append(needle_prompt)
-                    continue
-                # Staggered so the fillers finish prefilling on different steps
-                # and the needle shares its forward passes with a changing mix
-                # of prefill and decode.
-                repeats = max(20, _PADDING_REPEATS * (idx + 1) // batch_size)
-                prompts.append(
-                    _PROMPT_PADDING * repeats
-                    + f"Describe topic number {idx} in detail."
-                )
-
-            needle_output = llm.generate(prompts, sampling, use_tqdm=False)[needle_pos]
-            needle_logprobs, needle_token_ids = _extract_step_logprobs(needle_output)
-            assert needle_logprobs is not None
-
-            assert needle_output.prompt == needle_prompt
-            assert needle_token_ids == baseline_token_ids
-            assert torch.equal(needle_logprobs, baseline_logprobs), (
-                f"Logprobs differ at needle position {needle_pos} of batch "
-                f"{batch_size}: max |delta| = "
-                f"{(needle_logprobs - baseline_logprobs).abs().max().item()}"
-            )
+        assert_needle_is_batch_invariant(
+            llm,
+            padding_unit=_PROMPT_PADDING,
+            padding_repeats=_PADDING_REPEATS,
+            max_batch_size=MAX_BATCH_SIZE,
+            max_tokens=int(os.getenv("VLLM_PP_TP_NEEDLE_MAX_TOKENS", "24")),
+            num_trials=int(os.getenv("VLLM_PP_TP_NEEDLE_TRIALS", "3")),
+            seed=int(os.getenv("VLLM_TEST_SEED", "12345")),
+        )
     finally:
         if llm is not None:
             shutdown_llm(llm)

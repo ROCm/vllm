@@ -39,32 +39,15 @@ Two dependencies are screened, and the second is the novel one:
    `peercold`/`peerwarm` conditions below hold concurrency, prompt length and
    rank set fixed and vary only whether the peers' prompts are in cache.
 
-   Measured, and the direction is not the obvious one: with peers running cold
-   2000-token prefills the needle's padded width stayed at 16, because a
-   prefill-heavy step is not cudagraph-eligible and `should_dp_pad` is False;
-   with the peers' prompts served from cache they drop into uniform decode,
-   cudagraphs engage, and the needle was padded out to 72. The peers' cache
+   The direction is not the obvious one: peers running cold prefills induce no
+   padding at all, because a prefill-heavy step is not cudagraph-eligible and
+   `should_dp_pad` is False. Served from cache the peers drop into uniform
+   decode, cudagraphs engage, and the needle is padded out. The peers' cache
    state controls both *whether* DP padding fires and how wide it goes.
 
-Measured on 4x gfx950, OLMoE-1B-7B bf16, TRITON_ATTN, cudagraphs on, DP=4 x
-EP=4 on `allgather_reducescatter`, prefix caching left at its default, needle
-pinned to DP rank 2, 64 generated logprobs compared bitwise:
-
-                              mode on   mode off (max |delta|)
-  needle cold vs 400-hit        0/64      60/64  (6.6e-4)
-  needle cold vs full hit       0/64      57/64  (5.7e-4)
-  400-hit vs full hit           0/64      59/64  (6.9e-4)
-  800-hit vs 1600-hit           0/64      60/64  (2.4e-3)
-  peer cache state, needle cold 0/64      54/64  (7.7e-4)
-  peer cache state, needle warm 0/64      53/64  (1.1e-3)
-  baseline repeated             0/64       0/64
-
-Over the full 18-condition matrix that produced these, **all 153 pairwise
-comparisons were bitwise equal under the mode, and 150 of 153 differed with it
-off** -- the three that did not are exactly the repeats of the baseline. That
-last row is what makes the rest mean something: the mode-off differences track
-the cache and the batch rather than run-to-run noise, so the metric is specific
-and not merely sensitive.
+The repeated baseline condition is what makes the rest mean something: it is
+clean with the mode off as well, so the mode-off differences track the cache and
+the batch rather than run-to-run noise.
 
 Each condition uses a **unique `cache_salt`**. The salt enters only the block
 hash (`kv_cache_utils._gen_extra_hash_keys`, first block only, and the chain
@@ -74,9 +57,9 @@ control. Without that, conditions would contaminate each other -- the first run
 of the needle would warm the prefix for all the later ones -- and there would be
 no way to obtain a cold arm on a server that has already seen the prompt.
 
-The instrumentation is not decoration. With caching on it is very easy to build
-a comparison in which the needle takes an identical code path on both sides,
-which passes while asserting nothing. `test_prefix_cache_and_ep` therefore fails
+With caching on it is easy to build a comparison in which the needle takes an
+identical code path on both sides, which passes while asserting nothing.
+`test_prefix_cache_and_ep` therefore fails
 unless it observed at least four distinct cache-hit lengths, at least three
 distinct scheduled-token sequences, and a peer-induced change in this rank's
 padded token count -- as well as the usual checks that EP was really active at
@@ -90,20 +73,24 @@ the peers did could evict the needle's prefix, and a run that had to evict is a
 different experiment.
 """
 
-import json
 import os
 import random
-import threading
 import time
 import uuid
-from pathlib import Path
+import zlib
 
 import pytest
 import requests
-from utils import skip_if_not_cuda_alike
+from utils import (
+    INSTRUMENTATION_IMPORT_HOOK,
+    BackgroundLoad,
+    assert_server_ran_this_tree,
+    dp_completion,
+    instrumented_server_env,
+    read_records,
+    skip_if_not_cuda_alike,
+)
 
-import vllm
-import vllm.envs as envs
 from tests.utils import RemoteOpenAIServer, large_gpu_mark, multi_gpu_marks
 
 pytestmark = [
@@ -128,7 +115,7 @@ MAX_NUM_SEQS = 64
 RAMP_SECONDS = float(os.getenv("VLLM_PC_RAMP_SECONDS", "12"))
 DRAIN_SECONDS = float(os.getenv("VLLM_PC_DRAIN_SECONDS", "8"))
 
-_INSTRUMENTATION = '''
+_PATCHERS = '''
 """Record the cache hits, scheduled tokens and DP padding to $PC_LOG.<pid>."""
 import json
 import os
@@ -304,129 +291,71 @@ _TARGETS = {
     "vllm.v1.core.sched.scheduler": _patch_scheduler,
     "vllm.v1.worker.dp_utils": _patch_dp_utils,
 }
-
-if _LOG:
-    import importlib.abc
-    import importlib.util
-
-    class _Finder(importlib.abc.MetaPathFinder):
-        def find_spec(self, name, path=None, target=None):
-            patcher = _TARGETS.get(name)
-            if patcher is None:
-                return None
-            sys.meta_path.remove(self)
-            try:
-                spec = importlib.util.find_spec(name)
-            finally:
-                sys.meta_path.insert(0, self)
-            if spec is None or spec.loader is None:
-                return None
-            original_exec = spec.loader.exec_module
-
-            def exec_module(module, _exec=original_exec, _patch=patcher):
-                _exec(module)
-                _patch(module)
-
-            spec.loader.exec_module = exec_module
-            return spec
-
-    sys.meta_path.insert(0, _Finder())
 '''
+
+_INSTRUMENTATION = _PATCHERS + INSTRUMENTATION_IMPORT_HOOK
 
 
 def _completion(url, prompt, max_tokens, rank, salt, request_id, logprobs=None):
-    body = {
-        "model": MODEL,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "seed": 20240919,
-        "cache_salt": salt,
-    }
+    body = {"cache_salt": salt}
     if logprobs is not None:
-        body["logprobs"] = logprobs
         # The needle must emit exactly max_tokens in every condition, or an
         # early stop would silently truncate the comparison instead of failing.
         body["ignore_eos"] = True
-    response = requests.post(
+    return dp_completion(
         url,
-        json=body,
-        headers={"X-data-parallel-rank": str(rank), "X-Request-Id": request_id},
+        MODEL,
+        prompt,
+        max_tokens,
+        rank,
+        logprobs=logprobs,
         timeout=1200,
+        extra_body=body,
+        extra_headers={"X-Request-Id": request_id},
     )
-    response.raise_for_status()
-    return response.json()
 
 
-class _Load:
-    """Keeps `concurrency` requests in flight, spread over `ranks`.
+def _peer_load(url, ranks, concurrency, mode="cold", seed=0, warm_prompt=None):
+    """Companion load whose *cache state* is the only thing `mode` varies.
 
-    `mode` selects the *peers' cache state* while holding everything else
-    fixed: "cold" sends a fresh random prompt every time so every peer prefill
-    is a full miss, "warm" sends one pre-warmed prompt so every peer prefill is
-    a near-total hit. Same concurrency, same prompt length, same ranks.
+    "cold" sends a fresh random prompt every time so every peer prefill is a
+    full miss, "warm" sends one pre-warmed prompt so every peer prefill is a
+    near-total hit. Same concurrency, same prompt length, same ranks.
     """
 
-    def __init__(self, url, ranks, concurrency, mode="cold", seed=0, warm_prompt=None):
-        self.url, self.ranks, self.concurrency = url, ranks, concurrency
-        self.mode, self.seed, self.warm_prompt = mode, seed, warm_prompt
-        self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self.errors: list[str] = []
+    def send(rng, index):
+        if mode == "warm":
+            prompt, salt = warm_prompt, "peer-warm-shared"
+        else:
+            prompt = [rng.randint(1000, 30000) for _ in range(PEER_TOKENS)]
+            salt = f"peer-cold-{uuid.uuid4().hex}"
+        _completion(
+            url,
+            prompt,
+            PEER_MAX_TOKENS,
+            ranks[index % len(ranks)],
+            salt,
+            uuid.uuid4().hex,
+        )
 
-    def _run(self, index: int) -> None:
-        rng = random.Random(self.seed * 1000 + index)
-        rank = self.ranks[index % len(self.ranks)]
-        while not self._stop.is_set():
-            if self.mode == "warm":
-                prompt, salt = self.warm_prompt, "peer-warm-shared"
-            else:
-                prompt = [rng.randint(1000, 30000) for _ in range(PEER_TOKENS)]
-                salt = f"peer-cold-{uuid.uuid4().hex}"
-            try:
+    def prewarm():
+        # Every rank the load touches must already hold the shared prefix, or
+        # the first requests race each other and only partly hit.
+        if mode == "warm":
+            for rank in ranks:
                 _completion(
-                    self.url, prompt, PEER_MAX_TOKENS, rank, salt, uuid.uuid4().hex
+                    url, warm_prompt, 1, rank, "peer-warm-shared", uuid.uuid4().hex
                 )
-            except Exception as e:
-                self.errors.append(repr(e))
-                time.sleep(0.5)
 
-    def __enter__(self) -> "_Load":
-        if self.concurrency and self.mode == "warm":
-            # Every rank the load touches must already hold the shared prefix,
-            # or the first requests race each other and only partly hit.
-            for rank in self.ranks:
-                _completion(
-                    self.url,
-                    self.warm_prompt,
-                    1,
-                    rank,
-                    "peer-warm-shared",
-                    uuid.uuid4().hex,
-                )
-        for i in range(self.concurrency):
-            thread = threading.Thread(target=self._run, args=(i,), daemon=True)
-            thread.start()
-            self._threads.append(thread)
-        if self.concurrency:
-            time.sleep(RAMP_SECONDS)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        for thread in self._threads:
-            thread.join(timeout=600)
-        time.sleep(DRAIN_SECONDS)
-
-
-def _records(log_prefix: str) -> list[dict]:
-    directory, prefix = os.path.split(log_prefix)
-    out: list[dict] = []
-    for name in os.listdir(directory):
-        if name.startswith(prefix + "."):
-            with open(os.path.join(directory, name)) as f:
-                out.extend(json.loads(line) for line in f if line.strip())
-    return out
+    return BackgroundLoad(
+        send,
+        concurrency=concurrency,
+        ramp_seconds=RAMP_SECONDS,
+        drain_seconds=DRAIN_SECONDS,
+        join_timeout=600,
+        seed=seed,
+        prepare=prewarm,
+    )
 
 
 @pytest.fixture
@@ -442,8 +371,6 @@ def pc_server(tmp_path, enable_batch_invariant_mode):
     the `prefix_caching` assertion below reads back what the scheduler actually
     got rather than trusting the flag.
     """
-    instrumentation = tmp_path / "sitecustomize.py"
-    instrumentation.write_text(_INSTRUMENTATION)
     log_prefix = str(tmp_path / "pc_instr")
 
     args = [
@@ -463,20 +390,9 @@ def pc_server(tmp_path, enable_batch_invariant_mode):
         "--gpu-memory-utilization",
         os.getenv("VLLM_PC_TEST_GPU_MEMORY_UTILIZATION", "0.30"),
     ]
-    # RemoteOpenAIServer launches the `vllm` console script off PATH rather than
-    # `sys.executable -m`, so the server does not inherit this process's
-    # interpreter. On a box with an unrelated vLLM wired in through a user-site
-    # `easy-install.pth` that resolves to a *different tree*. The path entry
-    # makes the common case work; `_worker_facts` is what keeps it honest.
-    repo_root = str(Path(vllm.__file__).resolve().parent.parent)
-    env = {
-        "PYTHONPATH": os.pathsep.join(
-            [str(tmp_path), repo_root, os.environ.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep),
-        "PC_LOG": log_prefix,
-        "PC_DP_RANK": str(NEEDLE_RANK),
-        "VLLM_ATTENTION_BACKEND": "TRITON_ATTN",
-    }
+    env = instrumented_server_env(
+        tmp_path, _INSTRUMENTATION, PC_LOG=log_prefix, PC_DP_RANK=str(NEEDLE_RANK)
+    )
     with RemoteOpenAIServer(
         MODEL, args, env_dict=env, seed=20240919, max_wait_seconds=1800
     ) as server:
@@ -531,13 +447,17 @@ def test_prefix_cache_and_ep(pc_server):
 
     conditions: dict[str, dict] = {}
     windows: dict[str, tuple[float, float]] = {}
-    loads: dict[str, _Load] = {}
     for label, hit_target, concurrency, ranks, mode in plan:
         # A unique salt per condition: same tokens, different block hashes, so
         # conditions cannot warm each other and a cold arm stays available.
         salt = f"{label}-{uuid.uuid4().hex}"
-        with _Load(
-            url, ranks, concurrency, mode, hash(label) % 97, peer_warm_prompt
+        with _peer_load(
+            url,
+            ranks,
+            concurrency,
+            mode,
+            zlib.crc32(label.encode()) % 97,
+            peer_warm_prompt,
         ) as load:
             if hit_target is not None:
                 # Warm under the same load, so the hit is LRU-recent even while
@@ -562,7 +482,7 @@ def test_prefix_cache_and_ep(pc_server):
                 logprobs=1,
             )
             windows[label] = (started, time.time())
-        loads[label] = load
+        load.assert_ran_cleanly(f"{label} companions")
         choice = response["choices"][0]
         conditions[label] = {
             "tokens": choice["logprobs"]["tokens"],
@@ -572,24 +492,9 @@ def test_prefix_cache_and_ep(pc_server):
             ),
         }
 
-    for label, load in loads.items():
-        assert not load.errors, f"{label} companions failed: {load.errors[:3]}"
-
-    records = _records(log_prefix)
-
-    # The server is a separate process launched off PATH, so it can silently be
-    # a different vLLM or a different mode than the one under test.
-    served = {r["vllm_file"] for r in records}
-    assert served == {vllm.__file__}, (
-        f"the server imported vLLM from {served}, but this test process is "
-        f"{vllm.__file__}. The server subprocess is running a different tree, "
-        f"so nothing it reports is evidence about this one."
-    )
-    modes = {r["batch_invariant"] for r in records}
-    assert modes == {envs.VLLM_BATCH_INVARIANT}, (
-        f"the server's effective VLLM_BATCH_INVARIANT is {modes}, but this "
-        f"process has {envs.VLLM_BATCH_INVARIANT}; a copy of this file that "
-        f"overrides the mode fixture would otherwise run both arms the same way"
+    records = read_records(log_prefix)
+    assert_server_ran_this_tree(
+        {r["vllm_file"] for r in records}, {r["batch_invariant"] for r in records}
     )
 
     # --- the configuration really is the one this test is about -------------

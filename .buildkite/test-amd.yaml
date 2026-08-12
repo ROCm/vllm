@@ -2475,13 +2475,9 @@ steps:
 
 #------------------------------------------------------------  mi300 · v1  -------------------------------------------------------------#
 
-# Replaces the former `Batch Invariance (H100-MI250)` step. gfx90a is dropped
-# rather than extended: every MX module skips there, and the batch-invariant
-# work being staged targets gfx942 and gfx950.
-#
-# `optional: true` while ROCm advertises no batch-invariance support and these
-# steps run little more than the two CUDA-alike modules upstream already has.
-# It comes off as the feature PRs land and each adds its pytest line here.
+# Replaces the former `Batch Invariance (H100-MI250)` step: gfx90a is dropped
+# rather than extended because every MX module skips there. `optional: true`
+# until ROCm advertises batch-invariance support.
 - label: Batch Invariance (H100-MI300) # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
@@ -2502,6 +2498,7 @@ steps:
   - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
   - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
+  - pytest -v -s v1/determinism/test_eplb_config_batch_invariant.py
 
 - label: Acceptance Length Test (Large Models) # TBD
   timeout_in_minutes: 180
@@ -3670,13 +3667,9 @@ steps:
 
 #------------------------------------------------------------  mi355 · v1  -------------------------------------------------------------#
 
-# gfx950 mirrors of the four `Batch Invariance` steps in test_areas/misc.yaml.
-# The multi-GPU ones live only here and not on mi300: gfx950 is the
-# architecture the batch-invariant work has actually been measured on, so a red
-# gfx942 collective step would say nothing a reviewer could act on yet.
-#
-# All four are `optional: true` for the reason given on the mi300 step. Keep the
-# per-module pytest invocations separate; see the note in misc.yaml.
+# gfx950 mirrors of the `Batch Invariance` steps in test_areas/misc.yaml; the
+# multi-GPU ones have no AMD `test_areas` mirror yet, and all are
+# `optional: true` for the reason given on the mi300 step.
 - label: Batch Invariance (B200-MI355) # TBD
   timeout_in_minutes: 180
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx950nightly, amdmi355]
@@ -3697,6 +3690,7 @@ steps:
   - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
   - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
+  - pytest -v -s v1/determinism/test_eplb_config_batch_invariant.py
 
 - label: Batch Invariance (2xH100-2xMI355) # TBD
   timeout_in_minutes: 180
@@ -3740,6 +3734,9 @@ steps:
   - pytest -v -s v1/determinism/test_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
   - pytest -v -s v1/determinism/test_prefix_cache_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
   - pytest -v -s v1/determinism/test_ep_all2all_batch_invariant.py -m 'distributed(num_gpus=4)'
+  - pytest -v -s v1/determinism/test_ep_microbatching_batch_invariant.py -m 'distributed(num_gpus=4)'
+  - pytest -v -s v1/determinism/test_tp_all_reduce_batch_invariant.py -m 'distributed(num_gpus=4)'
+  - pytest -v -s v1/determinism/test_tp_reduce_scatter_batch_invariant.py -m 'distributed(num_gpus=4)'
 
 - label: Batch Invariance (8xH100-8xMI355) # TBD
   timeout_in_minutes: 180
@@ -3760,6 +3757,8 @@ steps:
   - export VLLM_WORKER_MULTIPROC_METHOD=spawn
   - pip install pytest-timeout pytest-forked
   - pytest -v -s v1/determinism/test_pp_tp_batch_invariant.py -m 'distributed(num_gpus=8)'
+  - pytest -v -s v1/determinism/test_tp_all_reduce_batch_invariant.py -m 'distributed(num_gpus=8)'
+  - pytest -v -s v1/determinism/test_tp_reduce_scatter_batch_invariant.py -m 'distributed(num_gpus=8)'
 
 - label: V1 attention (B200-MI355) %N # TBD
   timeout_in_minutes: 180
