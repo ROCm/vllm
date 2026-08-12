@@ -1566,9 +1566,7 @@ class VllmConfig:
             # equivalent, numerically different) decomposition run to run.
             # Unlike the chunked-prefill split this cannot be made a function
             # of the request alone by capping the chunk, because the hit
-            # length is not the scheduler's to choose. Measured on a DeepSeek
-            # MLA model: hits of 512/1024/1536 tokens each moved a needle
-            # prompt's logprobs, 4 trials out of 4.
+            # length is not the scheduler's to choose.
             self.cache_config.enable_prefix_caching = False
             logger.warning(
                 "Disabling prefix caching: it is not compatible with "

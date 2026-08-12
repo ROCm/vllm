@@ -53,9 +53,11 @@ def without_batch_invariance(test_fn):
     A prefill chunk normally shrinks to whatever token budget the rest of the
     batch left over. Under `VLLM_BATCH_INVARIANT` the scheduler instead caps
     chunks at a constant and defers a request whose chunk does not fit, so
-    tests that assert the shrinking contract only hold with the flag off.
-    `Scheduler.__init__` reads it once, so patching around `create_scheduler`
-    is enough. The batch-invariant contract has its own tests below.
+    tests that assert the shrinking contract only hold with the flag off; this
+    pins them so the file also passes when the suite is run with
+    `VLLM_BATCH_INVARIANT=1`. `Scheduler.__init__` reads the flag once, so
+    patching around `create_scheduler` is enough. The batch-invariant contract
+    has its own tests below.
     """
     return patch("vllm.envs.VLLM_BATCH_INVARIANT", False)(test_fn)
 
