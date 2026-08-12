@@ -58,16 +58,11 @@ def sp_padding_mask(
     shards the tokens.
 
     `is_padding` must describe at least the rows of `hidden_states`; it may be
-    longer, so that `ForwardContext.is_padding_full` -- the unsliced
-    `max_num_tokens` buffer -- can be passed directly. It is *sliced* to the
-    token count rather than checked against it: comparing a concrete length
-    with a symbolic `hidden_states.shape[0]` specializes the dynamic batch
-    dimension to whatever it held at trace time, and under vLLM's
-    `@support_torch_compile` (which uses `mark_dynamic`, where specialization
-    is a hard error rather than a silent recompile) the model then fails to
-    compile at all. That is the same construct that had to be removed from
-    `QuantFP8._bounded_per_tensor_scale`, and it is safe here today only
-    because the two models that call this carry no `@support_torch_compile`.
+    longer, so that `ForwardContext.is_padding_full` can be passed directly. It
+    is sliced to the token count rather than checked against it, because
+    comparing a concrete length with a symbolic `hidden_states.shape[0]`
+    specializes the dynamic batch dimension and `@support_torch_compile` makes
+    that a hard error.
 
     The rows `sp_shard` invents to reach a multiple of the TP size are padded
     with `True`, not `False`: they carry no token, so every consumer that

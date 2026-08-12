@@ -365,8 +365,7 @@ def test_sp_padding_mask_accepts_a_longer_mask(monkeypatch):
     """`ForwardContext.is_padding_full` is the unsliced `max_num_tokens` buffer.
 
     Sharding it as-is would divide the buffer rather than the batch, so the
-    function slices to the token count first. This pins that, because the
-    caller B3 needs is the one that passes the full buffer.
+    function slices to the token count first.
     """
     monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: 0)
@@ -381,24 +380,12 @@ def test_sp_padding_mask_accepts_a_longer_mask(monkeypatch):
 
 
 def test_sp_padding_mask_compiles_with_a_dynamic_batch(monkeypatch):
-    """The length check this function used to carry made it uncompilable.
+    """A concrete mask length must not specialize the symbolic batch dim.
 
-    vLLM's `@support_torch_compile` marks the batch dimension dynamic, where
-    specializing it is a hard error rather than a silent recompile. The mask
-    here is the fixed-length `is_padding_full` buffer, so the old
-    `assert is_padding.shape[0] == num_tokens` compared a *concrete* length
-    against a *symbolic* batch dim and specialized it -- the same construct
-    that had to be removed from `QuantFP8._bounded_per_tensor_scale`.
-
-    Passing a mask of the same symbolic length would make the assert
-    `s0 == s0` and the test would pass with or without the fix, which is how
-    the first draft of this test managed to have no power at all. Neither of
-    the two models calling this is compiled today, so nothing else in the tree
-    would catch a regression.
-
-    Asserts a *value*, not merely that it compiled: the failure worth guarding
-    against is Dynamo returning a mask sharded for the traced size at every
-    other size.
+    The mask is deliberately a fixed-length buffer: one of the same symbolic
+    length as `hidden_states` would specialize trivially and pass either way.
+    The result is compared by value, because the failure worth guarding against
+    is Dynamo returning a shard sized for the traced batch at every other size.
     """
     monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: 1)
