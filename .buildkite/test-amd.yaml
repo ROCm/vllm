@@ -2488,6 +2488,7 @@ steps:
   source_file_dependencies:
   - vllm/v1/attention
   - vllm/model_executor/layers
+  - vllm/model_executor/kernels
   - tests/v1/determinism/
   - vllm/_aiter_ops.py
   - vllm/platforms/rocm.py
@@ -2499,6 +2500,10 @@ steps:
   - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
   - pytest -v -s v1/determinism/test_eplb_config_batch_invariant.py
+  - pytest -v -s v1/determinism/test_padding_bounded_quant.py
+  - pytest -v -s v1/determinism/test_moe_row_permutation_batch_invariant.py
+  - pytest -v -s v1/determinism/test_batched_moe_batch_invariant.py
+  - pytest -v -s v1/determinism/test_moe_act_quant_batch_invariant.py
 
 - label: Acceptance Length Test (Large Models) # TBD
   timeout_in_minutes: 180
@@ -3680,6 +3685,7 @@ steps:
   source_file_dependencies:
   - vllm/v1/attention
   - vllm/model_executor/layers
+  - vllm/model_executor/kernels
   - tests/v1/determinism/
   - vllm/_aiter_ops.py
   - vllm/platforms/rocm.py
@@ -3691,6 +3697,14 @@ steps:
   - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
   - pytest -v -s v1/determinism/test_eplb_config_batch_invariant.py
+  - pytest -v -s v1/determinism/test_padding_bounded_quant.py
+  - pytest -v -s v1/determinism/test_moe_row_permutation_batch_invariant.py
+  - pytest -v -s v1/determinism/test_batched_moe_batch_invariant.py
+  - pytest -v -s v1/determinism/test_moe_act_quant_batch_invariant.py
+  # MX is gfx950 only; these self-skip elsewhere.
+  - pytest -v -s v1/determinism/test_mx_linear_batch_invariant.py
+  - pytest -v -s v1/determinism/test_mxfp8_batch_invariant.py
+  - pytest -v -s v1/determinism/test_mxfp4_batch_invariant.py
 
 - label: Batch Invariance (2xH100-2xMI355) # TBD
   timeout_in_minutes: 180
