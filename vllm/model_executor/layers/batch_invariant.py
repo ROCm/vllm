@@ -9,7 +9,6 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
-from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -1485,16 +1484,15 @@ def _warn_autotuned(kernels: list[str], from_cache: bool) -> None:
     _autotune_reported = True
     logger.warning(
         "Inductor chose the config for at least one kernel by timing candidates "
-        "on a device%s, e.g. %s. Every worker process holds its own race and "
-        "caches its own winner, so processes need not agree: replicas can answer "
-        "the same request differently, ranks of one model can compute a "
-        "replicated op differently, and a single process can change its answer "
-        "across a cache clear. Each process stays internally batch invariant "
-        "either way. See batch_invariant._watch_for_autotune_races for which "
-        "Inductor benchmarks to pin. Full list: %s",
+        "on a device%s. Every worker process holds its own race and caches its "
+        "own winner, so processes need not agree: replicas can answer the same "
+        "request differently, ranks of one model can compute a replicated op "
+        "differently, and a single process can change its answer across a cache "
+        "clear. Each process stays internally batch invariant either way. See "
+        "batch_invariant._watch_for_autotune_races for which Inductor benchmarks "
+        "to pin. Kernels: %s",
         " when this cache entry was built" if from_cache else "",
-        kernels[0],
-        _AUTOTUNED_MARKER,
+        ", ".join(kernels),
     )
 
 
@@ -1544,70 +1542,31 @@ def _watch_for_autotune_races() -> None:
     """Report kernels whose config was chosen by an on-device race.
 
     Inductor settles some kernels by timing their candidate configs at first
-    call, in the process that will then serve with the winner. Which candidate
-    wins is decided by whatever else the machine was doing at that moment, and
-    it is frozen for the life of the process afterwards.
+    call, in the process that will then serve with the winner, and freezes that
+    winner for the life of the process.
 
-    A block size looks like it should be numerically inert, and for a pointwise
-    kernel it ought to be: every output element is a function of its own index,
-    so the tile size only decides how many of them a program instance handles.
-    It is not inert in practice. With `enable_fp_fusion` the backend may
-    contract `a*b + c*d` into an FMA or not, and which it picks follows the
-    vectorisation width the tile size implies, so the packed-math instruction
-    counts scale with the tile while the scalar ones do not. Reciprocal square
-    root is a second route to the same place, being a 1-ulp approximation rather
-    than correctly rounded. Two processes that raced to different winners are
-    therefore running different arithmetic, and rope fused with an RMS-norm
-    scale is exactly the `a*b - c*d` shape that exposes it. Turning fp fusion
-    off does remove the disagreement -- Inductor exposes it as
-    `emulate_precision_casts` -- but it is a global that slows every Triton
-    kernel to fix one kernel's config sensitivity, and it leaves untouched the
-    general case of a raced knob that is not numerically neutral. The narrower
-    fix is for the processes to agree on the winner rather than each racing for
-    its own.
+    A tile size ought to be numerically inert for a pointwise kernel and is not:
+    with `enable_fp_fusion` the backend may contract `a*b + c*d` into an FMA or
+    not, and which it picks follows the vectorisation width the tile size
+    implies. Two processes that raced to different winners are therefore running
+    different arithmetic. Disabling fp fusion removes the disagreement, but it is
+    a global that slows every Triton kernel and leaves every other raced knob
+    untouched.
 
     That is not a batch dependence and the mode's contract survives it: every
-    token in a process meets the same kernel whatever it was batched with, and
-    each process is bitwise repeatable against itself. What it costs is
-    agreement *between* processes -- replicas of a data-parallel deployment,
-    ranks of one model computing a replicated op, and one process either side of
-    a cache clear. That is a reproducibility property rather than this one, the
-    same class as EPLB's rearrangement, so it is reported rather than refused.
+    token in a process meets the same kernel whatever it was batched with. What
+    it costs is agreement *between* processes -- data-parallel replicas, ranks
+    computing a replicated op, and one process either side of a cache clear.
+    That is reproducibility rather than batch invariance, the same class as
+    EPLB's rearrangement, so it is reported rather than refused.
 
-    This counts what happened rather than listing what causes it, because the
-    list is neither short nor stable. Inductor decides by benchmark in several
-    independent places, and in this build the ones live by default are
-    `triton.autotune_pointwise`, `triton.autotune_cublasLt`,
-    `benchmark_epilogue_fusion` and `dynamic_scale_rblock`, joined by
-    adds more. `deterministic=True` covers some and not others: it collapses
-    the reduction and persistent-reduction config lists and gates
-    `_dynamic_scale_rblock` and coordinate descent, but deliberately exempts
-    pointwise autotuning as a vetted scenario, which on gfx950 it is not.
-
-    Which of them actually races depends on the model's kernel mix. Where it
-    is pointwise alone, `triton.autotune_pointwise=False` leaves nothing raced
-    -- but that is a fact about a kernel mix rather than a recipe, and it is a
-    heavier hammer than it looks, since it also changes which config every
-    pointwise kernel runs. Nor is the set fixed across versions. Hence reporting
-    what a process did rather than prescribing what to switch off.
-
-    Watching the race itself would under-report, because it usually does not
-    happen here. `check_autotune_cache` collapses the candidate list to the
-    winner whenever one is on disk, and that cache is per rank -- the generated
-    source carries the device ordinal, so each rank keys its own entry. So the
-    race runs once on a cold cache and every later process inherits the result,
-    which is why a rank keeps its answer across restarts and why the split
-    between ranks looks stable. Watching the cache check instead reports the
-    kernel whether its config is being decided now or was decided by some
-    earlier process on this machine.
-
-Even that is not enough on its own: when vLLM's own compile cache is
-    warm it reloads serialized artifacts with the choice already baked in, so
-    Inductor codegen never runs and there is nothing to intercept. Reporting
-    only on the compile that makes the decision, and not on the restarts that
-    inherit it, is the wrong way round for an operator who has just restarted a
-    server, so the finding is also written into the compile cache entry and
-    re-emitted from there on load -- see `note_compile_cache_dir`.
+    The hook is `check_autotune_cache` rather than the race itself, because the
+    race usually does not run here -- the cache collapses the candidate list to
+    the winner whenever one is on disk, and it is keyed per rank. Watching the
+    cache check reports the kernel either way. vLLM's own compile cache reloads
+    serialized artifacts without running Inductor at all, so the finding is also
+    written into the cache entry and re-emitted from there -- see
+    `note_compile_cache_dir`.
     """
     global _autotune_watch_installed
     if _autotune_watch_installed:
@@ -1636,6 +1595,7 @@ Even that is not enough on its own: when vLLM's own compile cache is
             name = (inductor_meta or {}).get("kernel_name", "<unnamed>")
             info = result[2] if len(result) > 2 else None
             state = (info or {}).get("autotune_cache_state", "unknown")
+            first_sighting = name not in _autotuned_kernels
             _autotuned_kernels.append(name)
             logger.debug(
                 "Kernel %s has %d candidate configs; chosen by on-device timing "
@@ -1647,7 +1607,8 @@ Even that is not enough on its own: when vLLM's own compile cache is
 
             # Recorded into the cache entry so a later process that reloads these
             # artifacts, and so never reaches this code, still learns of it.
-            _record_autotuned_to_cache()
+            if first_sighting:
+                _record_autotuned_to_cache()
             _warn_autotuned(sorted(set(_autotuned_kernels)), from_cache=False)
         except Exception:
             # Reporting is not worth failing a compile over.
@@ -1658,13 +1619,11 @@ Even that is not enough on its own: when vLLM's own compile cache is
     _autotune_watch_installed = True
 
 
-def init_batch_invariance(vllm_config=None):
+def init_batch_invariance():
     # this will hit all the csrc overrides as well
     if envs.VLLM_BATCH_INVARIANT:
         override_envs_for_invariance()
         enable_batch_invariant_mode()
-        if vllm_config is None:
-            vllm_config = get_current_vllm_config_or_none()
         _watch_for_autotune_races()
 
         # Disable TF32 for batch invariance - it causes non-deterministic rounding

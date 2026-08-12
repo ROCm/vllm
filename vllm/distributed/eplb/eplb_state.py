@@ -69,25 +69,12 @@ def _note_rearrangement_committed() -> None:
 
     Enabling EPLB under batch invariance is not by itself a loss. Rearrangement
     is a temporal dependence rather than a batch one -- `eplb_step()` runs after
-    the forward pass, so every token in a step sees the same placement -- and a
-    server whose load stayed balanced enough never commits one at all, in which
-    case its runs do reproduce each other. The startup warning has to speak of
-    what might happen; this speaks of what did.
+    the forward pass -- and a server whose load stays balanced never commits
+    one, so warning on configuration would fire on every EPLB deployment.
 
-    That rests on the placement a run *starts* from being the same every time,
-    which it is: `build_initial_global_physical_to_logical_map` is
-    `range(num_routed_experts)` plus `i % num_routed_experts` for the redundant
-    tail, with nothing sampled and nothing read from load, and the only startup
-    call is `rearrange(is_profile=True)`, whose map is never committed because
-    `_commit_eplb_maps` is gated on `not is_profile`. Under this mode the tail
-    is empty anyway, since `num_redundant_experts > 0` is refused. So zero
-    committed rearrangements really does mean two runs placed experts
-    identically, rather than merely never having moved them from wherever they
-    happened to land.
-
-    Which is the distinction worth keeping, because a warning that fires on
-    configuration rather than on occurrence fires on every EPLB deployment, and
-    a warning that always fires is one nobody reads.
+    The initial placement is deterministic and the startup
+    `rearrange(is_profile=True)` is never committed, so zero commits really does
+    mean two runs placed experts identically.
     """
     global _committed_rearrangements
     if not envs.VLLM_BATCH_INVARIANT:

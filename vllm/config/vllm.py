@@ -1604,28 +1604,13 @@ class VllmConfig:
             if self.parallel_config.enable_eplb:
                 redundant = self.parallel_config.eplb_config.num_redundant_experts
                 if redundant > 0:
-                    # A redundant expert gives a logical expert more than one
-                    # physical replica, and the router picks between them by
-                    # hashing the token's *row index in the current forward*
-                    # (`_eplb_map_and_record_i32_kernel`: `token_idx = offs //
-                    # num_active_experts`, `replica_idx = hashed %
-                    # replica_count`). The replicas hold the same weights, so
-                    # the choice is mathematically irrelevant and numerically
-                    # is not: it moves the token to a different rank's GEMM and
-                    # a different position in the combine. A token's output
-                    # then depends on what else was in its batch, which is the
-                    # property this mode exists to provide.
-                    #
-                    # Measured on 4x gfx950, DeepSeek-V2-Lite, DP=4 x EP=4,
-                    # num_redundant_experts=8 (max replica count 2), with
-                    # expert placement held still -- zero committed
-                    # rearrangements across the whole comparison: 64 of 64
-                    # needle logprobs moved when 32 companions shared its rank,
-                    # and 0 of 64 when 24 companions ran on the *other* three
-                    # ranks instead. Only companions that change the needle's
-                    # own row index move it, which is the signature of that
-                    # hash and not of the collective. The same sweep with
-                    # num_redundant_experts=0 moved 0 of 64 in every condition.
+                    # The router picks between a logical expert's replicas by
+                    # hashing the token's row index in the current forward
+                    # (`_eplb_map_and_record_i32_kernel`). The replicas hold
+                    # the same weights, so the choice is mathematically
+                    # irrelevant and numerically is not: it moves the token to
+                    # a different rank's GEMM and a different position in the
+                    # combine.
                     raise ValueError(
                         "EPLB with redundant experts is not supported with "
                         "VLLM_BATCH_INVARIANT "
@@ -1638,19 +1623,13 @@ class VllmConfig:
                         "or unset VLLM_BATCH_INVARIANT."
                     )
                 # Rearrangement is a *temporal* dependence, not a batch one:
-                # `eplb_step()` runs after the forward pass, so every token in
-                # a step sees the same placement and a request's output depends
-                # on the traffic that preceded it rather than on its
-                # batch-mates. Batch invariance does not forbid that, which is
-                # why this warns rather than refusing.
-                #
-                # Stated as a possibility, because enabling EPLB is not itself
-                # the loss: a server whose load stays balanced enough never
-                # commits a rearrangement, and its runs do reproduce each
-                # other. `eplb_state._note_rearrangement_committed` says so
-                # when one is actually committed. A warning keyed on
-                # configuration rather than on occurrence fires on every EPLB
-                # deployment, and one that always fires is one nobody reads.
+                # `eplb_step()` runs after the forward pass, so a request's
+                # output depends on the traffic that preceded it rather than on
+                # its batch-mates. Warn rather than refuse, and state it as a
+                # possibility: a server whose load stays balanced never commits
+                # a rearrangement, and
+                # `eplb_state._note_rearrangement_committed` reports the ones
+                # that are.
                 logger.warning_once(
                     "EPLB is enabled with VLLM_BATCH_INVARIANT. Output remains "
                     "invariant to batch composition, but may stop being "
