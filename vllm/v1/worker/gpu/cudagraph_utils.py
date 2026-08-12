@@ -521,9 +521,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
-                    # Unsliced, and the same buffer the replay path passes, so
-                    # a captured consumer reads the mask this step wrote rather
-                    # than the one capture left behind.
+                    # Unsliced: a captured consumer must read the live buffer.
                     is_padding_full=input_buffers.is_padding,
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:

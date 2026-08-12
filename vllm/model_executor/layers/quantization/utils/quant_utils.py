@@ -32,10 +32,10 @@ def padding_bounded_amax(x: torch.Tensor) -> torch.Tensor | None:
     holding a previous replay's values is enough to set the scale for the whole
     tensor and drive every real row's quantized value toward zero.
 
-    Returns None when there is nothing to bound with (no forward context, no
-    padding mask, or a tensor that is not 2-D), leaving the caller unchanged.
-    `x`'s leading dimension must index tokens; callers whose rows are
-    token-expert slots want the routed bound instead.
+    Returns None when there is nothing to bound with -- no forward context, no
+    padding mask, or fewer than two dimensions -- leaving the caller unchanged.
+    `x` is flattened to 2-D, so its leading dimensions must index tokens; a
+    caller whose rows are token-expert slots needs a mask over those slots.
     """
     from vllm.forward_context import get_forward_context, is_forward_context_available
 
@@ -44,16 +44,15 @@ def padding_bounded_amax(x: torch.Tensor) -> torch.Tensor | None:
     is_padding = get_forward_context().is_padding_full
     if is_padding is None:
         return None
-    x_2d = x.view(-1, x.shape[-1])
+    x_2d = x.reshape(-1, x.shape[-1])
     row_amax = x_2d.abs().amax(dim=-1).to(torch.float32)
 
-    # Split rather than length-check: under torch.compile a concrete length
+    # Slice rather than length-check: under torch.compile a concrete length
     # compared against a symbolic `x.shape[0]` specializes the dynamic batch
-    # dimension, and `min(num_rows, len(mask))` gives `where` two operands
-    # carrying different symbols.  `covered` is the prefix the mask describes;
-    # `rest` is whatever it did not reach and stays unbounded, because a mask
-    # entry belonging to another row is worse than no mask at all.  `rest` is
-    # empty except on a DP-gathered or microbatch-local input.
+    # dimension.  `rest` is the rows past the mask, left unbounded, since a mask
+    # entry belonging to another row is worse than no mask at all.  Rows that
+    # are not a prefix of the batch -- a microbatch, a DP-gathered input -- are
+    # therefore not bounded here.
     mask = is_padding[: row_amax.shape[0]]
     covered = torch.where(mask, row_amax.new_zeros(()), row_amax[: mask.shape[0]])
     rest = row_amax[mask.shape[0] :]

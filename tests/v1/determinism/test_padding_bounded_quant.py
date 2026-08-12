@@ -2,21 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A dynamic per-tensor amax must not span rows the token does not own.
 
-This is a third property, distinct from the two the neighbouring files test.
-Batch invariance is "a token's output does not depend on what was batched with
-it"; run-to-run determinism is "the same batch twice agrees". This is neither:
-it is that a reduction must not read rows that belong to *no* token in the
-batch -- cudagraph padding, or a token-expert slot that was never routed.
+Neither batch invariance nor run-to-run determinism: the rows at issue belong to
+*no* token in the batch -- cudagraph padding, or an unrouted token-expert slot --
+and hold the previous replay's contents rather than nothing. Per-tensor is the
+one granularity whose reduction crosses them.
 
-Those rows are not merely unused. Under cudagraphs the buffer is a persistent
-graph-pool allocation, so a row no producer wrote this step holds the previous
-replay's contents; on the MoE path the slots MM1 skipped hold whatever the
-shared workspace held. A per-tensor scale is the one granularity whose
-reduction crosses them -- per-token and per-group are bounded by construction,
-and a static scale has no reduction at all.
-
-Each test carries a positive control that the *unbounded* form does move, so
-none of them can pass by being vacuous.
+Each test carries a positive control that the unbounded form does move, so none
+of them can pass by being vacuous.
 """
 
 import pytest
@@ -48,8 +40,7 @@ def vllm_config():
 )
 def test_linear_per_tensor_scale_ignores_cudagraph_padding(vllm_config):
     device = current_platform.device_type
-    with set_current_vllm_config(vllm_config):
-        quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
+    quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
 
     n_real, n_pad, hidden = 12, 4, 64
     torch.manual_seed(7)
@@ -81,8 +72,7 @@ def test_linear_per_tensor_scale_ignores_cudagraph_padding(vllm_config):
 def test_linear_per_tensor_scale_unchanged_when_nothing_is_padding(vllm_config):
     """An all-False mask must be a bitwise no-op, not merely a close one."""
     device = current_platform.device_type
-    with set_current_vllm_config(vllm_config):
-        quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
+    quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
 
     torch.manual_seed(11)
     x = torch.randn(16, 64, device=device, dtype=torch.bfloat16)
@@ -139,17 +129,10 @@ def test_moe_a2_scale_ignores_unrouted_slots(vllm_config):
     not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
 )
 def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch):
-    """Sequence-parallel MoE shards the tokens; the mask does not.
+    """Sequence-parallel MoE shards the tokens; the mask stays full-batch.
 
-    Under `use_sequence_parallel_moe` the token dimension is split across TP
-    ranks while `ForwardContext.is_padding` stays full-batch, so the mask no
-    longer describes these rows.  Slicing it would silently apply the *leading*
-    window to whatever shard the rank holds -- and since padding is trailing,
-    the shard that actually holds it would get an all-False mask and the bound
-    would quietly become a no-op.  Better to leave the reduction unbounded,
-    which is at least the documented pre-existing behaviour.
-
-    This pins the wiring: the bound must be *off*, not merely different.
+    Slicing it would apply the leading window to whatever shard the rank holds,
+    so the bound must be off here -- not merely different.
     """
     device = current_platform.device_type
     monkeypatch.setattr(
@@ -157,8 +140,7 @@ def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch)
         "use_sequence_parallel_moe",
         property(lambda self: True),
     )
-    with set_current_vllm_config(vllm_config):
-        quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
+    quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
     assert quant.sequence_parallel_moe is True
 
     n_real, n_pad, hidden = 12, 4, 64
@@ -223,15 +205,11 @@ def test_moe_a1_scale_ignores_cudagraph_padding(vllm_config):
 def test_mask_shorter_than_the_batch_leaves_the_rest_unbounded(vllm_config):
     """A mask that runs out must not be stretched over the rows it never saw.
 
-    At DP > 1 the tensor handed to a per-tensor quantize can have more rows than
-    the mask describes. Bounding the prefix and silently dropping the tail would
-    under-count the amax and clip real activations; reusing the mask cyclically
-    would attribute one row's padding bit to another. The uncovered rows are
-    included unbounded instead -- the behaviour with no mask at all.
+    Attributing one row's padding bit to another would clip real activations, so
+    the uncovered rows are included unbounded -- as if there were no mask.
     """
     device = current_platform.device_type
-    with set_current_vllm_config(vllm_config):
-        quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
+    quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
 
     n_rows, hidden = 16, 64
     torch.manual_seed(29)

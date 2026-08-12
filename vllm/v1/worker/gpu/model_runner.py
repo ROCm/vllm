@@ -935,10 +935,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
         # Mark trailing cudagraph-padding rows.  Not gated on
-        # VLLM_MOE_SKIP_PADDING: that flag selects whether kernels skip work for
-        # these rows, which is an optimization, while consumers that must not
-        # reduce across them need the mask regardless.  The optimization
-        # consumers check the flag themselves.
+        # VLLM_MOE_SKIP_PADDING: that flag is an optimization and its consumers
+        # check it themselves, while a reduction that must not span these rows
+        # needs the mask either way.
         self.input_buffers.is_padding[:num_tokens].fill_(False)
         self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(True)
         num_tokens_per_req = scheduler_output.num_scheduled_tokens

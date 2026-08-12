@@ -767,11 +767,9 @@ class GPUModelRunner(
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
-        # Marks trailing cudagraph-padding rows so kernels can skip work for
-        # them.  `VLLM_MOE_SKIP_PADDING` defaults to True and the mask is
-        # already consumed by the fused topk routers, but only the
-        # `v1/worker/gpu/` runner populated it -- on this runner every consumer
-        # saw `None` and silently fell back to treating padding as real.
+        # Marks trailing cudagraph-padding rows.  Consumers (the fused topk
+        # routers, the per-tensor activation amaxes) saw `None` here until now:
+        # only the `v1/worker/gpu/` runner populated this mask.
         self.is_padding = torch.zeros(
             self.max_num_tokens, dtype=torch.bool, device=self.device
         )
@@ -1069,27 +1067,16 @@ class GPUModelRunner(
         """Build the cudagraph-padding mask, sliced and unsliced.
 
         Rows ``[num_tokens_unpadded, num_tokens_padded)`` exist only to reach a
-        captured graph size.  They carry no request, their attention metadata is
-        undefined and their contents are whatever the previous replay left in
-        the graph pool, so any reduction that spans them reads another step's
-        data.  Consumers reducing over the batch need to be told where the real
-        rows stop; this is that signal.
-
-        The buffer is persistent because it is captured into cudagraphs and must
-        keep the same address, and the fills are unconditional for the same
-        reason: a replay reads the buffer, so skipping the writes on a step with
-        no padding would have it see the capturing step's values.
-
-        Not gated on `VLLM_MOE_SKIP_PADDING` -- that flag selects whether kernels
-        skip work for padding rows, an optimization, while bounding a reduction
-        to the rows a token owns is correctness.
+        captured graph size: they carry no request and hold whatever the
+        previous replay left in the graph pool.  The fills are unconditional
+        because the buffer is captured into the graph, so a step that skipped
+        them would replay the capturing step's values.
 
         Returns:
-            The mask sliced to `num_tokens_padded`, and the whole buffer.  The
-            unsliced view is for consumers reached through the forward context:
-            Dynamo specializes a global tensor's length at trace time, so a
-            length tracking the cudagraph size would be wrong on every other
-            size, while `max_num_tokens` is the same on every step.
+            The mask sliced to `num_tokens_padded`, and the whole buffer.  A
+            consumer reached through the forward context needs the unsliced one:
+            Dynamo bakes in the length, so a length that tracks the cudagraph
+            size is a wrong constant on every other size.
         """
         self.is_padding[:num_tokens_unpadded].fill_(False)
         self.is_padding[num_tokens_unpadded:num_tokens_padded].fill_(True)

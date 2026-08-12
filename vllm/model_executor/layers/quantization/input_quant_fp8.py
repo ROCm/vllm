@@ -72,16 +72,20 @@ class QuantFP8(CustomOp):
 
         self.use_aiter = rocm_aiter_ops.is_linear_fp8_enabled()
 
-        # Sequence-parallel MoE shards the token dimension across TP ranks
-        # while `ForwardContext.is_padding` stays full-batch, so the mask no
-        # longer describes these rows.  Read once, from config: a shape
-        # comparison here would specialize the dynamic batch dimension under
-        # torch.compile, which is why `_bounded_per_tensor_scale` slices the
-        # mask rather than checking its length.
-        # `_or_none`: benchmarks construct this op outside a config context.
+        # Sequence-parallel MoE shards the token dimension across TP ranks while
+        # `ForwardContext.is_padding` stays full-batch, so the mask no longer
+        # describes these rows.  Decided from config, not from a shape
+        # comparison, which would specialize the dynamic batch dimension under
+        # torch.compile.  The model-side predicate also admits mega-MoE at
+        # dp_size 1, which `use_sequence_parallel_moe` does not.
         config = get_current_vllm_config_or_none()
-        self.sequence_parallel_moe = (
-            config is not None and config.parallel_config.use_sequence_parallel_moe
+        self.sequence_parallel_moe = config is not None and (
+            config.parallel_config.use_sequence_parallel_moe
+            or (
+                config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+                and config.parallel_config.enable_expert_parallel
+                and config.parallel_config.tensor_parallel_size > 1
+            )
         )
 
         self.is_group_quant = group_shape.is_per_group()
@@ -98,35 +102,25 @@ class QuantFP8(CustomOp):
     def _bounded_per_tensor_scale(self, x: torch.Tensor) -> torch.Tensor | None:
         """A dynamic per-tensor scale taken over the real rows only.
 
-        A dynamic *per-tensor* activation scale is one amax over every row of
-        the batch, so it is the one granularity whose reduction crosses rows the
-        token does not own: under cudagraphs the trailing padding rows hold the
-        previous replay's contents, and one of them is enough to set the scale
-        for the whole tensor and drive every real row toward zero.  Returns None
-        for static, per-token and per-group scales, whose reductions are bounded
-        by construction, leaving the caller unchanged.
-
-        Not gated on `VLLM_MOE_SKIP_PADDING`: that flag controls whether kernels
-        skip work for padding rows, and this is not an optimization.
+        Per-tensor is the one granularity whose amax crosses rows the token does
+        not own, and under cudagraphs the trailing padding rows hold the previous
+        replay's contents. Returns None for static, per-token and per-group
+        scales, which are bounded by construction, leaving the caller unchanged.
         """
         if self.static or not self.group_shape.is_per_tensor():
             return None
         if self.sequence_parallel_moe:
-            # The mask describes the whole batch; these rows are one shard of
-            # it.  Leaving the reduction unbounded is wrong, but bounding it
-            # with a mask that does not describe these rows is worse, and
-            # silent.  Proper support belongs where the chunking happens.
+            # These rows are one shard of the batch the mask describes, so
+            # bounding with it would be silently wrong. Support belongs where
+            # the sharding happens.
             return None
         # Reads the unsliced mask buffer; see `ForwardContext.is_padding_full`.
         amax = padding_bounded_amax(x)
         if amax is None:
             return None
-        # Widen for the divide, then narrow: `amax / _FP8_MAX` in fp32 lowers to
-        # a reciprocal multiply, which differs from the correctly-rounded
-        # quotient the HIP kernel computes on about half of all inputs.
-        # Only a divide-by-zero guard here -- the shipped per-tensor kernel
-        # applies no `_FP8_MIN_SCALING_FACTOR` floor, and adding one would
-        # change results on inputs that have nothing to do with padding.
+        # Widen for the divide: `amax / _FP8_MAX` in fp32 lowers to a reciprocal
+        # multiply and does not match the kernel's correctly-rounded quotient.
+        # No `_FP8_MIN_SCALING_FACTOR` floor -- the kernel applies none either.
         return (amax.double() / _FP8_MAX).float().clamp(min=1e-12).reshape(1)
 
     def forward_cuda(
@@ -169,9 +163,8 @@ class QuantFP8(CustomOp):
             and scale_ub.numel() == 1
         )
 
-        # A [1] scale makes this the static per-tensor kernel, which is the same
-        # arithmetic the dynamic one performs after its own amax -- the only
-        # difference is which rows the amax spanned.
+        # A [1] scale takes the static per-tensor kernel, whose arithmetic is
+        # the dynamic one's minus the amax.
         bounded_scale = self._bounded_per_tensor_scale(x) if scale is None else None
 
         return ops.scaled_fp8_quant(
@@ -204,7 +197,7 @@ class QuantFP8(CustomOp):
             return rocm_aiter_ops.group_fp8_quant(x, self.group_size)
         if use_aiter_per_tensor_quant:
             if scale is None:
-                # Same unbounded amax as the HIP kernel, in AITER.
+                # AITER's per-tensor amax is unbounded like the HIP kernel's.
                 scale = self._bounded_per_tensor_scale(x)
             return rocm_aiter_ops.per_tensor_quant(x, _FP8_DTYPE, scale)
         if use_aiter_per_token_quant:

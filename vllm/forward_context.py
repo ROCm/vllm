@@ -159,7 +159,7 @@ class ForwardContext:
     # use this one: Dynamo bakes in the length of a tensor reached through the
     # forward context, and a length tracking the cudagraph size makes that
     # constant wrong on every other size.  Slice it to your own row count -- the
-    # rows past `num_tokens` are stale.
+    # rows past this step's padded length are stale.
     is_padding_full: torch.Tensor | None = None
 
     # If True, bypass the compiled model call, e.g. by using .forward() directly
