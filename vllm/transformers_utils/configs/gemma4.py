@@ -25,10 +25,10 @@ def gemma4_layer_config(
     layer = copy(text_config)
     if text_config.layer_types[layer_idx] == "full_attention":
         global_head_dim = getattr(text_config, "global_head_dim", None)
-        layer.head_dim = global_head_dim or text_config.head_dim
+        head_dim = getattr(text_config, "head_dim", None)
+        layer.head_dim = global_head_dim or head_dim
         if getattr(text_config, "attention_k_eq_v", False):
             global_kv_heads = getattr(text_config, "num_global_key_value_heads", None)
-            layer.num_key_value_heads = (
-                global_kv_heads or text_config.num_key_value_heads
-            )
+            num_kv_heads = getattr(text_config, "num_key_value_heads", None)
+            layer.num_key_value_heads = global_kv_heads or num_kv_heads
     return layer
