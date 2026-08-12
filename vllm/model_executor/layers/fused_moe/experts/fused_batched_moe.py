@@ -1149,16 +1149,16 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
 
         # Neither cache is zero-filled.  `intermediate_cache1.fill_(0)` used to
         # run above under fp8, and it was not defensive: it was what kept the
-        # padded rows finite for a a2 amax that spanned the whole buffer.  That
-        # reduction is now bounded by `expert_num_tokens`, so the fill has
-        # nothing left to protect and the elementwise work below can skip the
-        # rows MM1 never wrote -- 80-90% of the buffer at a realistic live
-        # fraction.
+        # padded rows finite for an a2 amax that spanned the whole buffer.
+        # That reduction is now bounded by `expert_num_tokens`, so the
+        # elementwise work below can skip the rows MM1 never wrote.
         #
         # These two changes are not separable.  A pad-aware activation leaves
         # the rows it skips holding whatever the shared workspace held, so
         # making the producer pad-aware while the consumer still reduces over
-        # every row recreates the exact defect the bound removes.
+        # every row recreates the exact defect the bound removes.  On the
+        # fallback branch the unmasked activation still reads the rows MM1
+        # skipped; its results land in rows no consumer reads.
         if (
             activation == MoEActivation.SILU
             and batched_activation.silu_mul_batched_is_exact(intermediate_cache2.dtype)

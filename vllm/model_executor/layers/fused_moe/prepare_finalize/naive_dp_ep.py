@@ -73,7 +73,7 @@ def _check_act_scale_is_dispatchable(fused_experts: mk.FusedMoEExperts) -> None:
 
     Widening the skip in `_quantize_and_setup_dispatch` is not the fix. It would
     leave each rank quantizing the gathered batch with its own local amax, which
-    is the silent-wrong-output case above, reached deliberately.
+    is the silent-wrong-output case above.
     """
     if fused_experts.expects_unquantized_inputs or (
         fused_experts.moe_config is not None

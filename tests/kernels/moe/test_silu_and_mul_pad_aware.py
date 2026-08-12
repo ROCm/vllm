@@ -5,14 +5,13 @@
 These two kernels skip the token-expert slots no expert GEMM will read. They
 had no coverage at all, and the gap mattered: `_silu_and_mul_pad_aware_kernel`
 indexed `expert_map` with `mask=expert_id >= 0`, bounding only the low end, so
-a corrupt id read arbitrarily far past the tensor. That is a SIGSEGV on
-gfx950 under DP+EP with DBO, where a torn `topk_ids` is reachable.
+a corrupt or out-of-range id read past the end of the tensor and faulted the
+device.
 """
 
 import pytest
 import torch
 
-from tests.kernels.utils import opcheck  # noqa: F401  (kept for parity)
 from vllm.model_executor.layers.fused_moe.utils import (
     silu_and_mul_is_pad_aware,
     silu_and_mul_pad_aware,

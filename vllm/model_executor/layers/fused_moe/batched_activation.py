@@ -12,9 +12,8 @@
     )
 
 with no mask arguments, so it writes **every** row of a
-``[E, max_num_tokens, N]`` buffer of which only **1303-3426 of 16384** rows
-were measured to have been written by MM1. ~80-90% of that
-elementwise work is on rows no GEMM will read.
+``[E, max_num_tokens, N]`` buffer of which only the rows MM1 was delivered were
+written; the rest is elementwise work on rows no GEMM will read.
 
 **This is not a new kernel.** It is ``_silu_mul_fp8_quant_deep_gemm``
 (``experts/batched_deep_gemm_moe.py``) with the scale side-output removed and
@@ -26,12 +25,10 @@ cannot do is serve a per-expert or per-tensor scale, which is a *global*
 reduction and cannot be finished inside a single token's iteration -- so the
 reduction stays with the quantizer and this kernel only writes activations.
 
-**SAFETY -- the ordering rule.** A pad-aware producer is only safe if its
-consumer is bounded. With ``mask=True`` this kernel leaves ``out``'s dead rows
-holding whatever the workspace held; ``batched_moe_kernel_quantize_input``'s
-capture branch takes one amax over the *whole* buffer. Using this kernel
-without that bound recreates exactly the defect it exists to avoid: measured
-without it, the unbounded amax read 9.953e29 on 100% of calls.
+**Safety.** This kernel leaves ``out``'s dead rows holding whatever the shared
+workspace held, so every consumer of ``out`` must be bounded to the delivered
+rows -- in particular the a2 quantize, whose per-tensor amax would otherwise
+take its value from an arbitrary earlier allocation.
 """
 
 import torch
@@ -61,16 +58,12 @@ def _silu_mul_masked_batched_kernel(
 ):
     """``silu(gate) * up`` over the rows the expert was actually delivered.
 
-    **The grid tiles the token dimension, and that is a deliberate departure
-    from the template.** ``_silu_mul_fp8_quant_deep_gemm`` uses a static grid
-    over (expert, H-group) with a device-side *loop* over tokens inside each
-    program, because it writes a per-(token, group) scale and each program must
-    own a whole row of its group. This kernel writes activations only, so the
-    token dimension is free -- and it must be taken: at ``E=16, H=1024,
-    BLOCK_H=1024``
-    the template's shape is **16 workgroups on a 256-CU part**, and it was
-    measured 4-8x *slower* than the unmasked CUDA kernel it replaces before
-    this was fixed.
+    The grid tiles the token dimension, unlike the template
+    ``_silu_mul_fp8_quant_deep_gemm``, which loops tokens on the device because
+    each program must own a whole row of its group to write a per-(token,
+    group) scale. This kernel writes activations only, so the token dimension
+    is free -- and it must be taken: the template's grid is one workgroup per
+    (expert, H-group), which underfills a large GPU at realistic E and H.
 
     Two lines are load-bearing and are *not* ulp fussiness -- they are what
     makes this bit-identical to ``torch.ops._C.silu_and_mul`` in bf16
@@ -82,7 +75,7 @@ def _silu_mul_masked_batched_kernel(
       ``beta = 0.0``, which turns a ``-0.0`` up into ``+0.0``.  ``ops.moe_sum``'s
       exactness argument is "an accumulator initialised to +0.0 cannot become
       -0.0"; ``_swiglu_limit_pad_aware_kernel``, which lacks this line, violates
-      that on 100% of such elements.
+      it.
 
     Note the divide: ``gate / (1 + exp(-gate))``, which is the form measured
     bit-exact against the CUDA kernel.  ``_silu_mul_fp8_quant_deep_gemm`` writes
@@ -150,17 +143,12 @@ def _silu_mul_masked_batched_kernel(
 def silu_mul_batched_is_exact(dtype: torch.dtype) -> bool:
     """Whether this kernel reproduces ``torch.ops._C.silu_and_mul`` bit for bit.
 
-    Same gate, and the same reason, as ``silu_and_mul_is_pad_aware``: Triton's
-    ``exp`` is not HIP's ``expf`` -- in fp32 they disagree on 39% of inputs by
-    about an ulp, and *no* spelling closes it (``tl.exp2(x*log2e)`` is
-    bit-identical to ``tl.exp`` on this backend; ``libdevice.exp`` is 39.02% vs
-    39.19%; ``tl.sigmoid`` is worse).  bf16 rounds it away.
-
-    This is a claim about **bitwise** agreement only.  The deviation at fp16 and
-    fp32 is sized (0.02% at max 2 ULP; 21% at max 15 ULP but max *relative*
-    9e-7) and it survives quantization almost entirely -- 6 of 4.19M fp8 bytes
-    at fp16, 1 of 4.19M at fp32, **a2 scale unchanged**.  So the gate is what
-    the *acceptance test* keys on, not a correctness requirement.
+    Same gate and the same reason as ``silu_and_mul_is_pad_aware``: no spelling
+    of the Triton side reproduces HIP's ``expf`` in fp32, and bf16 rounds the
+    difference away.  A bitwise claim only -- the fp16 and fp32 deviation stays
+    under 1e-6 relative and all but a handful of elements per 4M survive fp8
+    quantization unchanged, so this gates the acceptance test rather than
+    correctness.
     """
     return dtype == torch.bfloat16
 
@@ -179,7 +167,7 @@ def silu_mul_batched(
     """In-place ``out[e, :n_e] = silu(inp[e, :n_e, :H]) * inp[e, :n_e, H:]``.
 
     Rows ``>= expert_num_tokens[e]`` are **left untouched** when a mask is
-    given. See the module docstring's SAFETY note before calling with one.
+    given. See the module docstring's safety note before calling with one.
     """
     assert inp.ndim == 3 and out.ndim == 3, (inp.shape, out.shape)
     E, T, H2 = inp.shape

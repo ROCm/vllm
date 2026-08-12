@@ -17,8 +17,10 @@ from tests.kernels.utils import torch_experts
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
+    batched_moe_kernel_quantize_input,
     invoke_moe_batched_triton_kernel,
 )
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.torch_utils import set_random_seed
@@ -545,10 +547,6 @@ _SENTINEL = 1e30
 
 
 def _batched_a2_scale(a, counts, poison_dead_rows):
-    from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
-        batched_moe_kernel_quantize_input,
-    )
-
     a = a.clone()
     if poison_dead_rows:
         for e in range(a.shape[0]):
@@ -583,8 +581,6 @@ def test_batched_a2_quantize_ignores_undelivered_rows(e, t, k):
     # Positive control, so this cannot pass by being vacuous: the *unbounded*
     # reduction -- one amax over the flattened buffer, which is what the
     # capture path used to do -- must be visibly moved by the same sentinel.
-    from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-
     poisoned_a = a.clone()
     for i in range(e):
         poisoned_a[i, int(counts[i]) :] = _SENTINEL
@@ -617,6 +613,7 @@ def test_batched_a2_quantize_eager_matches_capture():
     counts = torch.full((e,), t // 4, dtype=torch.int32, device=device)
 
     eager = _batched_a2_scale(a, counts, poison_dead_rows=False)
+    assert float(eager.max()) < 1e26, "the bound did not hold in either arm"
 
     torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()

@@ -154,14 +154,12 @@ class ForwardContext:
     # tokens. Consumers can use it to skip work for padded tokens. None when
     # the producer does not set it.
     is_padding: torch.Tensor | None = None
-    # The same mask, but the whole persistent buffer rather than a view of its
-    # first `num_tokens` rows -- so its length is `max_num_tokens` on every
-    # step.  A consumer inside a compiled region must use this one: a tensor
-    # reached through the forward context is a global read, so Dynamo bakes its
-    # length in as a constant, and a length that changes with the cudagraph
-    # size then makes that constant wrong on every size but one.  Slice it to
-    # your own row count; the rows past `num_tokens` are stale and must not be
-    # read.
+    # The same mask as the whole persistent buffer, so its length is
+    # `max_num_tokens` on every step.  A consumer inside a compiled region must
+    # use this one: Dynamo bakes in the length of a tensor reached through the
+    # forward context, and a length tracking the cudagraph size makes that
+    # constant wrong on every other size.  Slice it to your own row count -- the
+    # rows past `num_tokens` are stale.
     is_padding_full: torch.Tensor | None = None
 
     # If True, bypass the compiled model call, e.g. by using .forward() directly

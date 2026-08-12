@@ -368,11 +368,10 @@ __device__ __forceinline__ bool moe_sum_pad_aware_skip(
   if (expert_id < 0) return true;
   if (expert_map != nullptr) {
     // `expert_id` comes from device memory, so unlike every other address in
-    // this kernel it is not bounded by host-supplied metadata.  `expert_map`
+    // this kernel it is not bounded by host-supplied metadata. `expert_map`
     // has one entry per global expert, so an id outside [0, num_experts) is
-    // not routable to this rank by definition -- and without the upper bound a
+    // not routable to this rank by definition, and without the upper bound a
     // corrupt id indexes arbitrarily far past the tensor.
-    // `get_local_expert_id` above already bounds both ends; this did not.
     if (expert_id >= static_cast<int64_t>(num_experts)) return true;
     if (expert_map[expert_id] < 0) return true;
   }

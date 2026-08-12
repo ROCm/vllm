@@ -1444,46 +1444,12 @@ class FusedMoEConfig:
 
         if self.use_mori_kernels:
             # MoRI used to assert `rocm_aiter_fmoe_enabled` here. It is a
-            # dispatch/combine library and AITER is an expert GEMM, and the
-            # coupling turns out to be a performance contract rather than a
-            # data-format one.
-            #
-            # What MoRI's prepare hands the experts is a slice of a worst-case
-            # receive buffer -- `max_num_tokens_to_recv()` rows, EP size x
-            # max_num_batched_tokens -- plus a device-side scalar row count,
-            # which `MoriPrepareAndFinalize.prepare` puts in
-            # `ExpertTokensMetadata.expert_num_tokens`; despite the field name
-            # it is a single total, not per-expert counts. `AiterExperts`
-            # consumes that count directly, as AITER's `num_local_tokens`, and
-            # every other class ignores it. What keeps the cost off those
-            # classes is two things in `prepare`: the buffer is narrowed to
-            # `ep_size x` this step's DP token count, which is host-known, and
-            # the rows past the received count are marked invalid in
-            # `topk_ids`, so `moe_align_block_size` drops them from
-            # `num_tokens_post_padded` and the expert GEMMs, the pad-aware
-            # activation and the pad-aware reduction all skip them.
-            #
-            # Correctness does not depend on any of it: the rows past the count
-            # are never read back by `mori_op.combine`. Measured on 4x gfx950,
-            # OLMoE-1B-7B bf16, DP=4/EP=4 under VLLM_BATCH_INVARIANT=1, MoRI
-            # high throughput + TritonExperts is *bitwise identical* to
-            # allgather_reducescatter + TritonExperts, at every stage of that
-            # work, across 5 prompts x 24 logprobs and a 32-token needle. It is
-            # also batch invariant (0/32 positions moved under load; 32/32
-            # moved with the mode off).
-            #
-            # There is no warning here any more, and that is a measurement
-            # rather than an omission. It used to say the activation, the
-            # intermediate quantization and the reduction still ran at the full
-            # padded M. The first and third no longer do; the second never did
-            # on a bf16 model, where the quantize call is a no-op. At
-            # max_num_batched_tokens=2048, EP=4, 60s of saturating load, the
-            # pairing went 3946 -> 12030 tok/s, which is 103.2% of
-            # allgather_reducescatter on the same box -- so telling an operator
-            # to avoid it would now be steering them off the faster path. What
-            # is left is `moe_align_block_size` scanning every id in the
-            # narrowed buffer, 0.42 ms/step, which needs a device-side row
-            # bound in csrc.
+            # dispatch/combine library and AITER is an expert GEMM, so that
+            # assertion was a performance contract, not a data-format one.
+            # `ExpertTokensMetadata.expert_num_tokens` from MoRI's `prepare` is
+            # a single device-side total rather than per-expert counts, and
+            # only `AiterExperts` reads it; every other experts class ignores
+            # it and produces correct output, so the coupling is dropped.
             assert not self.aiter_fmoe_shared_expert_enabled, (
                 "Mori does not support fusion shared expert now. "
                 "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"

@@ -99,10 +99,9 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             and (quant_config.a1_scale is None or quant_config.a2_scale is None)
         ):
             # These schemes are calibrated per-tensor static. Without the scale
-            # the fp8 activation quantization falls back to a dynamic
-            # per-tensor amax, taken over every token in the launch, so a row's
-            # output depends on the rest of its batch. That is batch variance by
-            # construction, not by reduction order, so no kernel can recover it.
+            # the activation quantization takes a dynamic amax over every token
+            # in the launch, so a row's output depends on the rest of its batch
+            # by construction and no kernel can recover it.
             raise ValueError(
                 f"VLLM_BATCH_INVARIANT is set but {self.ocp_mx_scheme} has no "
                 "calibrated activation scale, so fp8 activation quantization "

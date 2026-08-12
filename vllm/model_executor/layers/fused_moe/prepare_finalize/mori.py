@@ -124,8 +124,10 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quality, at the cost of a device sync per layer.
 
         The ratio is logged because a formula error shows up as slack trending
-        to zero before it shows up as a violation. A balanced rank receives
-        about `min(topk, ep_size) / ep_size` of the bound.
+        to zero before it shows up as a violation. Well under 1.0 is expected
+        even when routing is balanced: the bound assumes every peer sends every
+        token, while a rank actually receives only the tokens that picked at
+        least one of its experts.
         """
         recv = int(dispatch_recv_token_num.item())
         logger.info(
@@ -205,10 +207,9 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         # nothing should have to be re-imported to turn it on.
         #
         # Not during capture. The check reads the count back to the host, and a
-        # device sync inside a capturing stream aborts the capture with "CUDA
-        # error: operation not permitted when stream is capturing" -- which is
-        # how this guard was found. Skipping capture also loses nothing: the
-        # rows are dummy, and at *replay* this Python does not run at all, so
+        # device sync inside a capturing stream aborts the capture. Skipping
+        # capture also loses nothing: the rows are dummy, and at *replay* this
+        # Python does not run at all, so
         # under cudagraphs the check only ever covers non-captured steps.
         # Validation runs that need it to cover real serving traffic have to
         # ask for `--enforce-eager`.
@@ -223,44 +224,20 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             dispatch_scale = dispatch_scale[:recv_rows]
         recv_ids = dispatch_ids[:recv_rows]
 
-        # Only the rows that actually arrived are written; the gap between the
-        # received count and the bound is never cleared, so it holds the
-        # previous step's expert ids -- which are in range, so
-        # `moe_align_block_size` counts them as real tokens,
-        # `num_tokens_post_padded` never shrinks below the whole buffer and
-        # every experts backend that derives its work from `topk_ids` runs the
-        # full padded M on every step.
-        #
-        # Narrowing shrinks that gap but does not close it, and cannot: a token
-        # reaches at most `topk` of the EP ranks while the bound has to assume
-        # it could reach all of them. How much is left is not
-        # `min(topk, ep_size) / ep_size` -- that was the first guess here and
-        # it is wrong, because several of a token's topk picks routinely land
-        # on the same rank. Under uniform routing a rank fills
-        # `1 - C(E - E/ep, topk) / C(E, topk)`, which for OLMoE at ep_size 4 is
-        # 0.915 rather than 1.0, and 0.227 for a 256-expert model at ep_size
-        # 32. Measured on this config it is lower still -- mean 0.692, median
-        # 0.750 over 8128 dispatches -- because real routing clusters and small
-        # batches are discrete. So about 30% of the narrowed buffer is padding
-        # even at the width where the naive formula predicted none.
-        # `DeepEPV2PrepareAndFinalize` marks its own tail for the same reason.
-        #
-        # Marking the tail invalid is enough: the align kernel skips ids
-        # outside [0, num_experts) (`get_local_expert_id`), so they drop out of
-        # the per-expert counts, and `fused_moe_kernel` already loads
-        # `num_tokens_post_padded` from device memory and early-exits the
-        # blocks past it. The row count is read on device, so this costs no
-        # host sync -- which is the whole reason the buffer is fixed-size.
-        #
-        # The tail rows themselves stay garbage: nothing writes them, so the
-        # experts leave uninitialised workspace in those rows of the output.
-        # That is already the contract -- combine only reads
-        # `totalRecvTokenNum` rows back.
+        # The receive buffer is sized to a worst-case bound and only the rows
+        # that arrived are written, so the tail still holds the previous step's
+        # expert ids -- in range, so `moe_align_block_size` counts them as real
+        # tokens and every experts backend runs the full padded M every step.
+        # Marking the tail invalid drops it: the align kernel skips ids outside
+        # [0, num_experts) and `fused_moe_kernel` early-exits past
+        # `num_tokens_post_padded`. The row count is read on device, so this
+        # costs no host sync, which is why the buffer is fixed-size at all.
+        # The tail rows stay uninitialised, as before -- combine only reads
+        # `totalRecvTokenNum` rows back. `DeepEPV2PrepareAndFinalize` marks its
+        # own tail for the same reason.
         #
         # One kernel rather than an arange plus a broadcast `torch.where`: this
-        # runs on every layer of every step, and at 8192x8 the two-kernel form
-        # measured 20us against 11us for this one, which is 0.15ms per step on
-        # a 16-layer model.
+        # runs on every layer of every step.
         if recv_ids.is_contiguous():
             expert_topk_ids = torch.empty_like(recv_ids)
             BLOCK_SIZE = 1024

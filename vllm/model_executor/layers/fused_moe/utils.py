@@ -654,12 +654,9 @@ def _swiglu_limit_pad_aware(
         return
 
     BLOCK_SIZE = 1024
-    # 2048, matching the `silu_and_mul_pad_aware` twin below. This kernel is
-    # persistent over rows, so this cap is the number of workgroups per column
-    # tile: at 256 it is one per CU on a gfx950 and the part is starved of
-    # anything to overlap the loads with. Raising it is worth 1.4x-3.8x above
-    # 8192 rows, on every dtype, and is exactly neutral below the cap where it
-    # does not bind. `min` keeps the small-batch grid unchanged.
+    # Persistent over rows, so the workgroup count per column tile is the cap;
+    # 2048 fills a large GPU and `min` leaves the small-batch grid unchanged.
+    # Matches the `silu_and_mul_pad_aware` twin below.
     grid = (min(num_tokens, 2048), triton.cdiv(hidden_size, BLOCK_SIZE))
     _swiglu_limit_pad_aware_kernel[grid](
         input,
@@ -733,10 +730,9 @@ def silu_and_mul_is_pad_aware(input: torch.Tensor) -> bool:
     """Whether `silu_and_mul_pad_aware` reproduces the CUDA kernel exactly.
 
     bfloat16 only, and that is not conservatism. Triton's `exp` is not HIP's
-    `expf`: in fp32 the two disagree on 39% of inputs by about an ulp. bf16
-    rounds that away -- checked exhaustively, over all 2^32 (gate, up) pairs,
-    zero mismatches -- but fp16 keeps enough mantissa to expose it (0.02% of
-    elements, up to 2 ulp) and fp32 shows it outright. So the fast path is
+    `expf` and no spelling of the Triton side closes the gap; bf16 rounds the
+    difference away -- checked exhaustively over all 2^32 (gate, up) pairs --
+    while fp16 and fp32 keep enough mantissa to expose it. So the fast path is
     restricted to the dtype where equality is proven rather than likely.
     """
     return input.dtype == torch.bfloat16

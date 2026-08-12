@@ -28,11 +28,9 @@ def padding_bounded_amax(x: torch.Tensor) -> torch.Tensor | None:
     """`x.abs().max()` taken over the rows that carry a real token.
 
     A dynamic *per-tensor* scale is the one quantization granularity whose
-    reduction crosses rows the token does not own. Under cudagraphs the batch
-    is padded up to a captured size, and rows
-    ``[num_tokens_unpadded, num_tokens_padded)`` hold whatever the previous
-    replay left in the graph pool -- one of them is enough to set the scale for
-    the whole tensor and drive every real row's quantized value toward zero.
+    reduction crosses rows the token does not own: one cudagraph padding row
+    holding a previous replay's values is enough to set the scale for the whole
+    tensor and drive every real row's quantized value toward zero.
 
     Returns None when there is nothing to bound with (no forward context, no
     padding mask, or a tensor that is not 2-D), leaving the caller unchanged.
@@ -49,21 +47,13 @@ def padding_bounded_amax(x: torch.Tensor) -> torch.Tensor | None:
     x_2d = x.view(-1, x.shape[-1])
     row_amax = x_2d.abs().amax(dim=-1).to(torch.float32)
 
-    # The mask is sliced to the rows rather than length-checked against them:
-    # comparing a concrete length with a symbolic `x.shape[0]` specializes the
-    # dynamic batch dimension under torch.compile to whatever it held at trace
-    # time.  But Dynamo cannot prove `min(num_rows, len(mask)) == num_rows`
-    # either, so the two operands of `where` carry different symbols and the
-    # broadcast fails at trace time.  Split instead: `covered` is the prefix the
-    # mask describes -- both operands there are `mask.shape[0]` long, the same
-    # symbol -- and `rest` is whatever the mask did not reach.
-    #
-    # `rest` is empty whenever the mask is at least as long as the batch, which
-    # is the normal case, and this is then exactly a masked amax.  When it is
-    # not empty the mask does not describe those rows (a DP-gathered or
-    # microbatch-local input), and they are included unbounded, which is the
-    # behaviour with no mask at all.  Never bound a row with a mask entry that
-    # belongs to some other row.
+    # Split rather than length-check: under torch.compile a concrete length
+    # compared against a symbolic `x.shape[0]` specializes the dynamic batch
+    # dimension, and `min(num_rows, len(mask))` gives `where` two operands
+    # carrying different symbols.  `covered` is the prefix the mask describes;
+    # `rest` is whatever it did not reach and stays unbounded, because a mask
+    # entry belonging to another row is worse than no mask at all.  `rest` is
+    # empty except on a DP-gathered or microbatch-local input.
     mask = is_padding[: row_amax.shape[0]]
     covered = torch.where(mask, row_amax.new_zeros(()), row_amax[: mask.shape[0]])
     rest = row_amax[mask.shape[0] :]

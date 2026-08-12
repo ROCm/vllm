@@ -97,28 +97,15 @@ class QuantFP8(CustomOp):
         """A dynamic per-tensor scale taken over the real rows only.
 
         A dynamic *per-tensor* activation scale is one amax over every row of
-        the batch, so it is the one quantization granularity whose reduction
-        crosses rows the token does not own.  Under cudagraphs the trailing
-        padding rows are not merely unused: they are a persistent graph-pool
-        allocation that no producer wrote this step, so they hold the previous
-        replay's contents.  One such row is enough to set the scale for the
-        whole tensor and drive every real row's quantized value toward zero.
+        the batch, so it is the one granularity whose reduction crosses rows the
+        token does not own: under cudagraphs the trailing padding rows hold the
+        previous replay's contents, and one of them is enough to set the scale
+        for the whole tensor and drive every real row toward zero.  Returns None
+        for static, per-token and per-group scales, whose reductions are bounded
+        by construction, leaving the caller unchanged.
 
-        Per-token and per-group scales do not have this problem -- their
-        reduction is bounded by construction -- and neither does a static
-        scale, so this returns None for all of them and the caller is
-        unchanged.
-
-        Deliberately not gated on `VLLM_MOE_SKIP_PADDING`: that flag controls
-        whether kernels skip work for padding rows, and this is not an
-        optimization.
-
-        The mask is *sliced* to the leading dimension rather than compared
-        against it, which matters under torch.compile: comparing a concrete
-        `is_padding.shape[0]` with a symbolic `x.shape[0]` specializes the
-        dynamic batch dimension to whatever it held at trace time, and the
-        model then fails to compile at all.  This is the same idiom the fused
-        topk routers use on the same mask.
+        Not gated on `VLLM_MOE_SKIP_PADDING`: that flag controls whether kernels
+        skip work for padding rows, and this is not an optimization.
         """
         if self.static or not self.group_shape.is_per_tensor():
             return None
@@ -128,9 +115,7 @@ class QuantFP8(CustomOp):
             # with a mask that does not describe these rows is worse, and
             # silent.  Proper support belongs where the chunking happens.
             return None
-        # `padding_bounded_amax` reads the *unsliced* mask buffer, because this
-        # runs inside a compiled region and a varying length would be baked in
-        # as a wrong constant.  See `ForwardContext.is_padding_full`.
+        # Reads the unsliced mask buffer; see `ForwardContext.is_padding_full`.
         amax = padding_bounded_amax(x)
         if amax is None:
             return None
