@@ -23,6 +23,8 @@ import json
 import math
 import os
 
+import torch
+
 from vllm import envs
 from vllm.logger import init_logger
 
@@ -254,3 +256,44 @@ def compute_awq_gemv_padding(
             return True, padded, runtime_sk
 
     return False, num_groups, target_split_k
+
+
+def maybe_pad_awq_weights(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Zero-pad AWQ weights along K so num_groups divides the target split-k.
+
+    The awq_gemv_hip kernel parallelises over split-k, which requires
+    num_groups to be divisible by the split-k factor; padding with zero groups
+    buys a higher factor when the natural shape does not divide. Returns the
+    tensors unchanged when padding is not applicable or not worth it.
+
+    The matching input-side padding lives in ``_awq_gemm``, which detects
+    ``qweight.shape[0] > K`` and pads the activation to match.
+    """
+    if group_size != 128:
+        return qweight, qzeros, scales
+
+    K = qweight.shape[0]
+    N = qweight.shape[1] * 8  # unpack factor
+    num_groups = qzeros.shape[0]
+
+    should_pad, padded_groups, _split_k = compute_awq_gemv_padding(num_groups, K, N)
+    if not should_pad or padded_groups <= num_groups:
+        return qweight, qzeros, scales
+
+    pad_groups = padded_groups - num_groups
+
+    def _pad(t: torch.Tensor, rows: int) -> torch.Tensor:
+        out = torch.zeros((rows, t.shape[1]), dtype=t.dtype, device=t.device)
+        out[: t.shape[0]] = t
+        return out
+
+    return (
+        _pad(qweight, K + pad_groups * group_size),
+        _pad(qzeros, padded_groups),
+        _pad(scales, padded_groups),
+    )
