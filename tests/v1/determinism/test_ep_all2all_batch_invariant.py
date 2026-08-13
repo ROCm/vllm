@@ -118,22 +118,13 @@ MORI_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_MORI_LOAD_CONCURRENCY", "96"))
 # The LoRA arm is eager, so it serves fewer requests per second and needs more
 # in flight to reach the same exposure.
 LORA_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LORA_LOAD_CONCURRENCY", "48"))
-# The fp8 arms need more for the opposite reason to MoRI: fp8 weights and GEMMs
-# make each step cheaper, so at the shared default the server drains the queue
-# between the needle's steps and its prefill again gets a step to itself. The
-# block arm was observed refusing its verdict on exactly that -- padded count 40
-# alone and 40 loaded -- and passing at this exposure. Marginal either way is
-# not good enough for a suite that wants gating status, so both fp8 arms are
-# raised rather than only the one seen to fail.
+# The fp8 arms need more for the opposite reason to MoRI: each step is cheaper,
+# so the server drains the queue between the needle's steps and its prefill
+# again ends up alone. Both are raised, not just the one seen to fail.
 FP8_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_FP8_LOAD_CONCURRENCY", "96"))
-# The bf16 low-latency arm needs it for the same reason its fp8 siblings above
-# do, and it was left on the shared default only because it had not been seen to
-# fail there. It has now: running the file in order it refused its verdict on the
-# same signature, padded count 40 alone and 40 loaded, twice out of two, while
-# passing twice out of two when selected on its own -- the low-latency path is
-# cheap enough per step that the server drains between the needle's steps, and it
-# is the second server in the process, so its compile caches are warm and the
-# needle returns sooner. At this exposure it passes in file order.
+# The bf16 low-latency arm is cheap per step for the same reason, and it is the
+# second server in the process, so its caches are warm and the needle returns
+# sooner still.
 LL_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LL_LOAD_CONCURRENCY", "96"))
 LOAD_RAMP_SECONDS = float(os.getenv("VLLM_EP_LOAD_RAMP_SECONDS", "12"))
 # The load must drag the needle rank's padded token count at least this far

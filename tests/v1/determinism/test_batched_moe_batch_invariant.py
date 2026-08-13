@@ -64,7 +64,7 @@ import itertools
 
 import pytest
 import torch
-from utils import bits, skip_if_not_cuda_alike
+from utils import bits, rows_that_differ, skip_if_not_cuda_alike
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -200,11 +200,6 @@ def _zeros(dtype):
 
 def _counts(m):
     return torch.full((E,), m, device=torch.device(DEVICE_TYPE), dtype=torch.int32)
-
-
-def _rows_that_differ(x, y, e, upto):
-    ne = bits(x[e, :upto]) != bits(y[e, :upto])
-    return torch.nonzero(ne.reshape(upto, -1).any(dim=1)).flatten()
 
 
 def _reorder_is_detectable(A, B, e=1, m=7, n=3) -> bool:
@@ -372,7 +367,7 @@ def test_batched_expert_gemm_is_token_count_invariant(mode_on, name, dtype, spre
         _launch(A, B, C, _counts(m), 64, 64, 32)
         torch.accelerator.synchronize()
         for e in range(E):
-            d = _rows_that_differ(ref, C, e, m)
+            d = rows_that_differ(ref[e, :m], C[e, :m])
             if d.numel():
                 bad[(m, e)] = d[:8].tolist()
     assert not bad, (
@@ -436,7 +431,7 @@ def test_batched_expert_gemm_is_row_permutation_invariant(mode_on, name, dtype, 
             bad[e] = d[:8].tolist()
         # Positive control: without the un-permute the same comparison must
         # fail, otherwise it is blind to row identity.
-        assert _rows_that_differ(ref, perm, e, m).numel() > 0
+        assert rows_that_differ(ref[e, :m], perm[e, :m]).numel() > 0
     assert not bad, (
         f"{name}: {len(bad)} experts changed bits when their rows were "
         f"permuted (first offenders: {list(bad.items())[:4]})"
@@ -479,8 +474,7 @@ def test_batched_expert_gemm_is_row_permutation_invariant(mode_on, name, dtype, 
 # `_FP8_B_SPREAD` exist for that reason and `_assert_fp8_reorder_is_detectable`
 # enforces it. Detectability is a property of the row, not of the scheme, so it
 # is sampled over six (expert, token, out-channel) triples and a majority is
-# required; measured at the spreads below, block 5/6, channel 5/6,
-# tensor_w_token_a 6/6, tensor 5/6.
+# required, which the spreads below achieve in every scheme.
 # --------------------------------------------------------------------------- #
 
 GROUP = 128
@@ -763,7 +757,7 @@ def test_batched_expert_fp8_gemm_is_token_count_invariant(mode_on, scheme):
         _launch_fp8(scheme, ops, _counts(m), C)
         torch.accelerator.synchronize()
         for e in range(E):
-            d = _rows_that_differ(ref, C, e, m)
+            d = rows_that_differ(ref[e, :m], C[e, :m])
             if d.numel():
                 bad[(m, e)] = d[:8].tolist()
     assert not bad, (
@@ -828,7 +822,7 @@ def test_batched_expert_fp8_gemm_is_row_permutation_invariant(mode_on, scheme):
         if d.numel():
             bad[e] = d[:8].tolist()
         # Positive control: without the un-permute the comparison must fail.
-        assert _rows_that_differ(ref, perm, e, m).numel() > 0
+        assert rows_that_differ(ref[e, :m], perm[e, :m]).numel() > 0
     assert not bad, (
         f"{scheme}: {len(bad)} experts changed bits when their rows were "
         f"permuted (first offenders: {list(bad.items())[:4]})"
@@ -1268,8 +1262,6 @@ def test_batched_moe_block_quant_clamps_block_k_to_the_group(mode_on, requested_
     """
     ops = _fp8_operands("block")
     A, B, a_scale, b_scale = ops
-    ref = _zeros(torch.bfloat16)
-    _launch_fp8("block", ops, _counts(T), ref, 64, 64, 32)
     got = _zeros(torch.bfloat16)
     _launch_fp8("block", ops, _counts(T), got, 64, 64, requested_bk)
     torch.accelerator.synchronize()
