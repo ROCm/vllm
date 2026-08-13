@@ -43,9 +43,8 @@ Deliberately not a condition: sending the needle to a *different* DP rank and
 expecting the same logprobs. That asserts the wrong axis -- it varies nothing
 about any batch, and what it measures is whether two replicas agree, which they
 need not. Inductor settles some kernel configs by timing candidates on the
-device, once per process, so two ranks can freeze different winners; see
-`batch_invariant._watch_for_autotune_races`. Each rank stays bitwise repeatable
-against itself, so this mode's contract is intact.
+device, once per process, so two ranks can freeze different winners. Each rank
+stays bitwise repeatable against itself, so this mode's contract is intact.
 
 `nixl_ep`, the third backend microbatching accepts, is not covered: it still
 needs its kernels. `deepep_low_latency` requires a DeepEP whose low-latency
