@@ -1854,19 +1854,21 @@ _SPAWN_CHILD_ENV = "VLLM_TEST_SPAWN_CHILD"
 
 
 def _rootdir_for_import(module_name: str) -> str | None:
-    """The `sys.path` entry a child needs to import `module_name`, if any.
+    """The `sys.path` entry pytest prepended in order to import `module_name`.
 
-    pytest prepends a test file's directory to `sys.path` only when that
-    directory is not a package, in which case the module is imported under a
-    top-level name a child process cannot otherwise resolve. Mirroring that
-    rule matters in both directions: a packaged test directory must stay off
-    `sys.path`, or a sibling of its `__init__.py` shadows the installed
-    distribution of the same name (`tests/models/transformers/`).
+    A child interpreter that re-imports a test module by name has to insert the
+    same directory, and no other: the first one above the file that is not a
+    package. Inserting the file's own directory instead would put a sibling of
+    its `__init__.py` ahead of an installed distribution of the same name
+    (`tests/models/transformers/`).
     """
     module = sys.modules[module_name]
-    if "." in module_name or module.__file__ is None:
+    if module.__file__ is None:
         return None
-    return str(Path(module.__file__).resolve().parent)
+    rootdir = Path(module.__file__).resolve().parent
+    while (rootdir / "__init__.py").exists():
+        rootdir = rootdir.parent
+    return str(rootdir)
 
 
 def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]:
