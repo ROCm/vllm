@@ -475,8 +475,13 @@ class AiterExperts(mk.FusedMoEExpertsModular):
         if weight_key == kMxfp4Static:
             from vllm.platforms.rocm import on_gfx950, on_gfx1250
 
-            if not (on_gfx950() or on_gfx1250()):
-                return False
+            if on_gfx950():
+                return True
+            
+            if on_gfx1250():
+                return activation_key is None # TODO (JMATHIAS): This is a quick workaround patch to allow AiterExpers for Kimi k3
+            
+            return False
         return True
 
     @staticmethod
