@@ -224,9 +224,23 @@ class RoutedExperts(PluggableLayer):
 
     @property
     def expert_map(self) -> torch.Tensor | None:
-        return (
-            self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
+        # AITER's fused MoE wants a 0/1 mask over global experts; every other
+        # experts class wants a local-index map, and the two are not
+        # interchangeable. `rocm_aiter_fmoe_enabled` follows the environment,
+        # which is the wrong predicate on its own: an explicit --moe-backend
+        # makes the oracle return that backend before it ever reaches its AITER
+        # branch (see select_unquantized_moe_backend and its fp8 counterpart),
+        # so VLLM_ROCM_USE_AITER_MOE=1 with --moe-backend triton handed Triton
+        # the mask and produced silently wrong output under expert parallelism.
+        aiter_selected = (
+            self.rocm_aiter_fmoe_enabled
+            and self.moe_config.moe_backend
+            in (
+                "auto",
+                "aiter",
+            )
         )
+        return self.expert_mask if aiter_selected else self._expert_map
 
     def update_expert_map_info(self):
         # Update local attributes from ExpertMapManager
