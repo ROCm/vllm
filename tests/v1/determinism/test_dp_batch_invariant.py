@@ -106,12 +106,18 @@ def _patch(module):
     original = module._synchronize_dp_ranks
     path = f"{_LOG}.{os.getpid()}"
 
+    # Forwarded blind rather than by name: this instrument only reads the first
+    # five arguments, and a wrapper that restates the whole signature turns any
+    # later addition to it into a TypeError inside the server, which surfaces as
+    # an unexplained "Server exited unexpectedly" at fixture setup.
     def wrapper(
         num_tokens_unpadded,
         num_tokens_padded,
         should_attempt_ubatching,
         cudagraph_mode,
         parallel_config,
+        *args,
+        **kwargs,
     ):
         out = original(
             num_tokens_unpadded,
@@ -119,6 +125,8 @@ def _patch(module):
             should_attempt_ubatching,
             cudagraph_mode,
             parallel_config,
+            *args,
+            **kwargs,
         )
         should_ubatch, after_padding, synced_cudagraph_mode = out
         try:

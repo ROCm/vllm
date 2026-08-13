@@ -129,6 +129,13 @@ class UBatchWrapper:
 
         self.cudagraphs: dict[int, CUDAGraphMetaData] = {}
 
+        # One padding mask per ubatch, allocated on first use (see
+        # `_ubatch_is_padding`).  Each microbatch needs its own buffer because
+        # the two ubatch threads run concurrently against their own forward
+        # contexts, and persistent because these are captured into cudagraphs
+        # and must keep the same address across replays.
+        self._ubatch_is_padding: list[torch.Tensor] | None = None
+
         self.cudagraph_wrapper = None
         if runtime_mode is not CUDAGraphMode.NONE:
             self.cudagraph_wrapper = CUDAGraphWrapper(
@@ -154,16 +161,6 @@ class UBatchWrapper:
     @staticmethod
     def _create_sm_control_context(vllm_config: VllmConfig):
         comm_sms: int = envs.VLLM_DBO_COMM_SMS
-        rocm_deepep_ht_dbo = (
-            current_platform.is_rocm()
-            and vllm_config.parallel_config.enable_dbo
-            and vllm_config.parallel_config.all2all_backend == "deepep_high_throughput"
-        )
-        if rocm_deepep_ht_dbo:
-            # On ROCm, reserving CUs for DeepEP HT communication under DBO
-            # corrupts DP+EP generation accuracy. Keep the backend active, but
-            # leave all CUs visible to the compute and communication kernels.
-            comm_sms = 0
 
         set_comm_sms = lambda sms: None
         if vllm_config.parallel_config.enable_expert_parallel:
@@ -340,6 +337,45 @@ class UBatchWrapper:
         result = _cat_ubatch_outputs(sorted_results)
         return result
 
+    def _ubatch_padding_masks(self, ubatch_slices):
+        """Per-ubatch views of the batch-wide padding mask.
+
+        The batch-wide mask lives in the *outer* forward context and is indexed
+        by global token.  Consumers inside the model index it microbatch-locally
+        (`is_padding[:num_rows]` against the rows they were handed), so each
+        ubatch needs entry `j` to mean "token `j` of this microbatch" -- a plain
+        forward of the outer mask would attribute ubatch 1's rows to ubatch 0's
+        tokens.
+
+        Returns `(None, None)` when the outer context carries no mask, which is
+        the pre-existing behaviour for models that never populate it.
+        """
+        outer = get_forward_context().is_padding_full
+        if outer is None:
+            return None, None
+
+        if self._ubatch_is_padding is None:
+            # Sized from the outer mask, which is `max_num_tokens` long by
+            # construction -- no separate config lookup to fall out of step.
+            self._ubatch_is_padding = [
+                torch.zeros_like(outer)
+                for _ in range(self.vllm_config.parallel_config.num_ubatches)
+            ]
+
+        full, sliced = [], []
+        for i, ubatch_slice in enumerate(ubatch_slices):
+            token_slice = ubatch_slice.token_slice
+            n = token_slice.stop - token_slice.start
+            buf = self._ubatch_is_padding[i]
+            # Unconditional, like the runner's fills: a captured graph reads
+            # this buffer at replay, so a skipped write leaves it holding the
+            # capturing step's values.
+            buf[:n].copy_(outer[token_slice])
+            buf[n:].fill_(False)
+            full.append(buf)
+            sliced.append(buf[:n])
+        return full, sliced
+
     def _make_ubatch_metadata(
         self,
         ubatch_slices,
@@ -359,6 +395,7 @@ class UBatchWrapper:
         # slot_mapping can be None, an empty dict (from create_forward_context
         # converting None to {}), or a list of dicts (one per ubatch)
         has_slot_mapping = slot_mapping and isinstance(slot_mapping, list)
+        is_padding_full, is_padding = self._ubatch_padding_masks(ubatch_slices)
         for i, ubatch_slice in enumerate(ubatch_slices):
             forward_contexts.append(
                 create_forward_context(
@@ -368,6 +405,10 @@ class UBatchWrapper:
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     slot_mapping=slot_mapping[i] if has_slot_mapping else None,
+                    is_padding=is_padding[i] if is_padding is not None else None,
+                    is_padding_full=(
+                        is_padding_full[i] if is_padding_full is not None else None
+                    ),
                 )
             )
 

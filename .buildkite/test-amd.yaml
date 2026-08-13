@@ -3746,6 +3746,7 @@ steps:
   - pytest -v -s v1/determinism/test_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
   - pytest -v -s v1/determinism/test_prefix_cache_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
   - pytest -v -s v1/determinism/test_ep_all2all_batch_invariant.py -m 'distributed(num_gpus=4)'
+  - pytest -v -s v1/determinism/test_ep_microbatching_batch_invariant.py -m 'distributed(num_gpus=4)'
   - pytest -v -s v1/determinism/test_tp_all_reduce_batch_invariant.py -m 'distributed(num_gpus=4)'
   - pytest -v -s v1/determinism/test_tp_reduce_scatter_batch_invariant.py -m 'distributed(num_gpus=4)'
 
