@@ -145,23 +145,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor expert_ids, Tensor topk_weights, int top_k, "
       "bool mul_routed_weight, int split_k) -> ()");
   ops.impl("awq_gemv_moe_hip", torch::kCUDA, &awq_gemv_moe_hip);
-#else
-  // Expert-specialization mxfp8 blockscaled grouped quantization (SM100+).
-  ops.def(
-      "mxfp8_experts_quant("
-      " Tensor input, Tensor problem_sizes, Tensor expert_offsets,"
-      " Tensor blockscale_offsets, Tensor! quant_output, Tensor! scale_factor)"
-      " -> ()");
-  // conditionally compiled so impl registration is in source file
-
-  // Expert-specialization mxfp8 blockscaled grouped GEMM (SM100+).
-  ops.def(
-      "cutlass_mxfp8_grouped_mm("
-      " Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor! out,"
-      " Tensor problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets)"
-      " -> ()");
-  // conditionally compiled so impl registration is in source file
-
 #endif
 }
 
