@@ -359,3 +359,52 @@ def test_sp_collectives_fall_back_without_custom_kernel(monkeypatch):
     torch.testing.assert_close(sp_ops.sp_reduce_scatter(hidden_states), hidden_states)
     all_gather.assert_called_once_with(hidden_states, 0)
     reduce_scatter.assert_called_once_with(hidden_states, 0)
+
+
+def test_sp_padding_mask_accepts_a_longer_mask(monkeypatch):
+    """`ForwardContext.is_padding_full` is the unsliced `max_num_tokens` buffer.
+
+    Sharding it as-is would divide the buffer rather than the batch, so the
+    function slices to the token count first.
+    """
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: 0)
+
+    hidden_states = torch.empty(5, 2)
+    full = torch.zeros(64, dtype=torch.bool)
+    full[5:] = True  # the buffer's stale tail, well past this step's batch
+
+    actual = sp_ops.sp_padding_mask(full, hidden_states)
+    # 5 tokens -> padded to 8 -> rank 0 gets rows 0,1. Both are real tokens.
+    torch.testing.assert_close(actual, torch.tensor([False, False]))
+
+
+def test_sp_padding_mask_compiles_with_a_dynamic_batch(monkeypatch):
+    """A concrete mask length must not specialize the symbolic batch dim.
+
+    The mask is deliberately a fixed-length buffer: one of the same symbolic
+    length as `hidden_states` would specialize trivially and pass either way.
+    The result is compared by value, because the failure worth guarding against
+    is Dynamo returning a shard sized for the traced batch at every other size.
+    """
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(sp_ops, "get_tensor_model_parallel_rank", lambda: 1)
+
+    max_num_tokens = 128
+    full = torch.zeros(max_num_tokens, dtype=torch.bool)
+
+    def fn(is_padding, hidden_states):
+        return sp_ops.sp_padding_mask(is_padding, hidden_states)
+
+    compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+
+    for num_tokens in (16, 32, 64):
+        full.fill_(False)
+        full[num_tokens - 3 : num_tokens] = True
+        hidden_states = torch.empty(num_tokens, 2)
+        torch._dynamo.mark_dynamic(hidden_states, 0)
+
+        got = compiled(full, hidden_states)
+        want = sp_ops.sp_padding_mask(full, hidden_states)
+        assert got.shape[0] == num_tokens // 4, (num_tokens, got.shape)
+        torch.testing.assert_close(got, want)

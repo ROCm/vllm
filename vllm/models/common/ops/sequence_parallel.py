@@ -54,15 +54,30 @@ def sp_padding_mask(
     is_padding: torch.Tensor | None,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
+    """This rank's slice of the padding mask, sharded exactly as `sp_shard`
+    shards the tokens.
+
+    `is_padding` must describe at least the rows of `hidden_states`; it may be
+    longer, so that `ForwardContext.is_padding_full` can be passed directly. It
+    is sliced to the token count rather than checked against it, because
+    comparing a concrete length with a symbolic `hidden_states.shape[0]`
+    specializes the dynamic batch dimension and `@support_torch_compile` makes
+    that a hard error.
+
+    The rows `sp_shard` invents to reach a multiple of the TP size are padded
+    with `True`, not `False`: they carry no token, so every consumer that
+    bounds a reduction by this mask must exclude them.
+    """
+    tp_size = get_tensor_model_parallel_world_size()
+    tp_rank = get_tensor_model_parallel_rank()
+
     num_tokens = hidden_states.shape[0]
     if is_padding is None:
         is_padding = hidden_states.new_zeros(num_tokens, dtype=torch.bool)
-    assert is_padding.shape[0] == num_tokens
+    is_padding = is_padding[:num_tokens]
 
-    tp_size = get_tensor_model_parallel_world_size()
     sp_pad = (-num_tokens) % tp_size
     if sp_pad > 0:
         is_padding = torch.nn.functional.pad(is_padding, (0, sp_pad), value=True)
     chunk = is_padding.shape[0] // tp_size
-    tp_rank = get_tensor_model_parallel_rank()
     return is_padding[tp_rank * chunk : (tp_rank + 1) * chunk]
