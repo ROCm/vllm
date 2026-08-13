@@ -463,18 +463,17 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
 
+        # Backstop for the VllmConfig guard, which keys off model_config.use_mla
+        # and so misses an MLA model that does not declare itself one. Only
+        # effective in-process; the authoritative disable is in VllmConfig.
         if (
             cache_config is not None
             and cache_config.enable_prefix_caching
             and envs.VLLM_BATCH_INVARIANT
-            and (
-                self.attn_backend.get_name() == "TRITON_MLA"
-                or self.attn_backend.get_name() == "FLASHINFER"
-            )
         ):
             logger.warning_once(
-                "Disabling prefix caching for TRITON_MLA / FLASHINFER "
-                "with batch invariance, as it is not yet supported.",
+                "Disabling prefix caching for MLA with batch invariance; "
+                "see VllmConfig.__post_init__ for why.",
             )
             cache_config.enable_prefix_caching = False
 
@@ -1605,6 +1604,7 @@ def build_mla_chunked_context_metadata(
     dcp_world_size: int,
     dcp_local_block_size: int,
     dcp_virtual_block_size: int,
+    max_concurrent_prefills: int,
 ) -> "MLACommonPrefillMetadata.ChunkedContextMetadata | None":
     """Build chunked-context metadata for an MLA prefill.
 
@@ -1624,6 +1624,10 @@ def build_mla_chunked_context_metadata(
         dcp_world_size: Decode-context-parallel world size (1 if disabled).
         dcp_local_block_size: Per-rank interleave block size for DCP.
         dcp_virtual_block_size: ``dcp_local_block_size * dcp_world_size``.
+        max_concurrent_prefills: Most prefills that can share the workspace in
+            one step. Under batch invariance the chunk size is derived from
+            this instead of the live prefill count, so a request's context is
+            always split at the same offsets.
 
     Returns:
         The chunked-context metadata, or None when no prefill has any context.
@@ -1638,7 +1642,15 @@ def build_mla_chunked_context_metadata(
     # Currently we allocate an equal amount of workspace for each prefill with
     # context; we could probably use a more advanced algorithm here and allocate
     # more workspace to prefills with longer context lengths.
-    max_context_chunk = chunked_prefill_workspace_size // num_prefills_with_context
+    # Batch invariance: dividing by the live prefill count moves a request's
+    # chunk boundaries (and so the merge_attn_states reduction) with the rest
+    # of the batch, so size the chunk for a full step instead. Short contexts
+    # just produce empty trailing chunks, which mask_empty_context neutralizes.
+    max_context_chunk = chunked_prefill_workspace_size // (
+        max_concurrent_prefills
+        if envs.VLLM_BATCH_INVARIANT
+        else num_prefills_with_context
+    )
     if align_chunk_to_block:
         # The `gather_and_maybe_dequant_cache` kernel cannot handle chunk
         # starts that are not aligned to block_size, so round down.
@@ -2098,6 +2110,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 dcp_world_size=self.dcp_world_size,
                 dcp_local_block_size=self.dcp_local_block_size,
                 dcp_virtual_block_size=self.dcp_virtual_block_size,
+                max_concurrent_prefills=self.vllm_config.scheduler_config.max_num_seqs,
             )
 
             prefill_metadata = MLACommonPrefillMetadata(

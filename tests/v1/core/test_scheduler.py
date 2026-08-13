@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 from concurrent.futures import Future
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -45,6 +45,21 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def without_batch_invariance(test_fn):
+    """Pin a test to the ordinary (non-batch-invariant) chunking contract.
+
+    A prefill chunk normally shrinks to whatever token budget the rest of the
+    batch left over. Under `VLLM_BATCH_INVARIANT` the scheduler instead caps
+    chunks at a constant and defers a request whose chunk does not fit, so
+    tests that assert the shrinking contract only hold with the flag off; this
+    pins them so the file also passes when the suite is run with
+    `VLLM_BATCH_INVARIANT=1`. `Scheduler.__init__` reads the flag once, so
+    patching around `create_scheduler` is enough. The batch-invariant contract
+    has its own tests below.
+    """
+    return patch("vllm.envs.VLLM_BATCH_INVARIANT", False)(test_fn)
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -268,6 +283,7 @@ def test_cached_request_data_resumed_all_token_ids_mrv1_only():
     assert cached.all_token_ids == {}
 
 
+@without_batch_invariance
 def test_schedule_partial_requests():
     """Test scheduling behavior with partial requests.
 
@@ -586,6 +602,7 @@ def test_no_mm_input_chunking():
 
 
 @pytest.mark.parametrize("enable_prefix_caching", [True, False])
+@without_batch_invariance
 def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     """Test scheduling behavior with concurrent partial requests.
 
@@ -659,6 +676,117 @@ def test_schedule_concurrent_partial_requests(enable_prefix_caching: bool):
     assert output2.num_scheduled_tokens[requests[0].request_id] == 1
     assert output2.num_scheduled_tokens[requests[1].request_id] == 1
     assert output2.num_scheduled_tokens[requests[2].request_id] == 800 - 224 - 224
+
+
+@patch("vllm.envs.VLLM_BATCH_INVARIANT", True)
+def test_batch_invariant_prefill_chunk_depends_only_on_the_request():
+    """Under batch invariance a prefill chunk's length is a function of the
+    request alone.
+
+    MLA splits a chunked prefill's attention at exactly the scheduler's chunk
+    boundary, so a boundary that moves with the rest of the batch moves the
+    logprobs with it. Chunks are therefore capped at a constant and a request
+    whose chunk does not fit the remaining budget is deferred, not shrunk.
+    """
+    scheduler = create_scheduler(max_num_batched_tokens=128, max_num_seqs=16)
+    chunk = scheduler.batch_invariant_prefill_chunk
+    # One decode slot per sequence is reserved so a capped chunk always fits.
+    assert chunk == 128 - 16
+
+    (long_req,) = create_requests(num_requests=1, num_tokens=300, req_ids=["long"])
+    scheduler.add_request(long_req)
+
+    # Alone in the batch, with 128 tokens of budget free, the chunk is still
+    # the cap.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["long"] == chunk
+    _model_output(scheduler, output, [[]])
+
+    # A short request joins; the in-progress chunk keeps its length.
+    (short_req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["short"])
+    scheduler.add_request(short_req)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["long"] == chunk
+    assert output.num_scheduled_tokens["short"] == 8
+    _model_output(scheduler, output, [[], [0]])
+
+    # Only the tail is left, which is shorter than the cap.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["long"] == 300 - 2 * chunk
+
+
+@patch("vllm.envs.VLLM_BATCH_INVARIANT", True)
+def test_batch_invariant_prefill_defers_instead_of_shrinking():
+    """A prefill whose capped chunk does not fit waits for a step where it
+    does, and then still takes exactly the cap."""
+    scheduler = create_scheduler(max_num_batched_tokens=128, max_num_seqs=16)
+    chunk = scheduler.batch_invariant_prefill_chunk
+
+    (short_req,) = create_requests(num_requests=1, num_tokens=100, req_ids=["short"])
+    (long_req,) = create_requests(num_requests=1, num_tokens=300, req_ids=["long"])
+    scheduler.add_request(short_req)
+    scheduler.add_request(long_req)
+
+    # 28 tokens of budget are left after the short prefill, which would be a
+    # legal (batch-variant) chunk. The request waits instead.
+    output = scheduler.schedule()
+    assert "long" not in output.num_scheduled_tokens
+    assert [req.request_id for req in scheduler.waiting] == ["long"]
+    _model_output(scheduler, output, [[0]])
+
+    # The short request is a decode now, so the cap fits: not 127, the cap.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["short"] == 1
+    assert output.num_scheduled_tokens["long"] == chunk
+
+
+@patch("vllm.envs.VLLM_BATCH_INVARIANT", True)
+def test_batch_invariant_respects_disabled_chunked_prefill():
+    """With chunked prefill off a prompt is scheduled whole or not at all, so
+    the cap must not introduce a split of its own."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=1024, max_num_seqs=16, enable_chunked_prefill=False
+    )
+    assert scheduler.batch_invariant_prefill_chunk == 0
+
+    # A prompt longer than the cap would have been (1024 - 16) but still within
+    # the token budget: the only window where the cap could have split it.
+    (req,) = create_requests(num_requests=1, num_tokens=1010, req_ids=["r"])
+    scheduler.add_request(req)
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["r"] == 1010
+
+
+@patch("vllm.envs.VLLM_BATCH_INVARIANT", True)
+def test_batch_invariant_chunk_cap_leaves_room_for_spec_decode():
+    """The cap is never smaller than one decode slot.
+
+    The reserve is `max_num_seqs * (1 + num_speculative_tokens)`, which can be
+    the whole budget; the cap then floors at a decode slot rather than at a
+    single token, which would truncate a speculative decode's draft tokens away.
+    """
+    num_spec = 3
+    scheduler = create_scheduler(
+        num_speculative_tokens=num_spec,
+        max_num_batched_tokens=64,
+        max_num_seqs=16,
+    )
+    assert scheduler.batch_invariant_prefill_chunk == 1 + num_spec
+
+    (req,) = create_requests(num_requests=1, num_tokens=8, req_ids=["r"], max_tokens=8)
+    scheduler.add_request(req)
+    # Two capped prefill chunks, the second of which completes the prompt.
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["r"] == 1 + num_spec
+    _model_output(scheduler, output, [[]])
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["r"] == 1 + num_spec
+    _model_output(scheduler, output, [[42]])
+    scheduler.update_draft_token_ids(DraftTokenIds(["r"], [[1, 2, 3]]))
+
+    output = scheduler.schedule()
+    assert output.num_scheduled_tokens["r"] == 1 + num_spec
+    assert output.scheduled_spec_decode_tokens["r"] == [1, 2, 3]
 
 
 def test_stop_via_update_from_output():
@@ -986,6 +1114,7 @@ def test_schedule_concurrent_batches(
 
 
 @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
+@without_batch_invariance
 def test_schedule_order(enable_chunked_prefill: bool):
     scheduler = create_scheduler(
         max_num_batched_tokens=1024,
@@ -1445,6 +1574,7 @@ def test_spec_decoding_stats_empty_output():
     assert scheduler_stats is None or scheduler_stats.spec_decoding_stats is None
 
 
+@without_batch_invariance
 def test_no_spec_tokens_scheduled_for_prefill_chunks():
     """Test that draft tokens are ignored for prefill chunk requests.
 
@@ -1627,6 +1757,7 @@ def test_spec_decode_padding_skipped_for_diffusion():
     assert r2.request_id not in out.scheduled_spec_decode_tokens
 
 
+@without_batch_invariance
 def test_spec_decode_padding_skipped_with_prefill_in_batch():
     """Padding is skipped when the batch contains a prefill chunk: the batch is
     already mixed/non-uniform, so padding a new decode request buys nothing.
@@ -4555,6 +4686,7 @@ def test_remote_kv_promotion_keeps_fcfs_with_grammar_prefix():
     ]
 
 
+@without_batch_invariance
 def test_fcfs_mixed_skipped_waiting_types_keep_order():
     scheduler = create_scheduler(max_num_batched_tokens=20)
     scheduler._update_waiting_for_remote_kv = Mock()
@@ -4567,6 +4699,7 @@ def test_fcfs_mixed_skipped_waiting_types_keep_order():
         mk_req("remote"),
         mk_req("stream"),
     )
+    # req_regular takes the whole token budget, so req_tail stays waiting.
     req_regular, req_tail = mk_req("regular", 20), mk_req("tail")
     req_grammar.status = RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
     req_grammar.structured_output_request = Mock(grammar=None)

@@ -396,7 +396,11 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             # called "return_attn_probs" instead of return_softmax_lse
             kwargs["return_attn_probs"] = return_softmax_lse
             assert out is None and output_scale is None
-        if envs.VLLM_BATCH_INVARIANT:
+        if envs.VLLM_BATCH_INVARIANT and self._is_vllm_fa:
+            # num_splits pins the split-KV reduction, which only the decode path
+            # uses; the upstream flash_attn ROCm builds on does not accept the
+            # argument at all. Its varlen prefill walks KV sequentially within a
+            # query block, so the reduction order is already fixed.
             kwargs["num_splits"] = 1
 
         attn_out = FA4_MLA_PREFILL_KERNEL(
