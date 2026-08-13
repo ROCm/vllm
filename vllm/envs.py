@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     VLLM_ALLOW_UNFUSED_AWQ_GEMM: bool = True
     VLLM_AWQ_USE_TN_GEMM: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
+    VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1098,6 +1099,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Currently disabled by default due to .T contiguity overhead.
     # TODO: Optimize to avoid the transpose copy overhead.
     "VLLM_AWQ_USE_TN_GEMM": lambda: bool(int(os.getenv("VLLM_AWQ_USE_TN_GEMM", "0"))),
+    # If set, monkey-patch triton.runtime.autotuner.Autotuner.run to skip
+    # benchmarking and select the first valid config (walking past invalid
+    # ones). Used to eliminate autotuning variability when measuring kernel
+    # performance and applied before running any kernel.
+    "VLLM_TRITON_FORCE_FIRST_CONFIG": lambda: (
+        os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower()
+        in ("1", "true")
+    ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()
