@@ -53,6 +53,11 @@ CHECK_ROWS = list(range(1, 32))
 # operand range until the fp32 accumulator inside the reduction has to round,
 # without which reordering it is unobservable and the sweep asserts nothing.
 # fp16 cannot go past 12 -- four operands at 2**14 overflow the dtype's range.
+#
+# Detection power is not monotone in world size, and not in the same direction
+# for both dtypes (measured over 8 seed bases: fp16 1.78x stronger at ws=8,
+# bf16 0.56x), so neither world size is redundant. Raising bf16's spread to 24
+# strengthens the ws=8 arm if it ever needs it; bf16 has no overflow ceiling.
 CASES = [
     (torch.bfloat16, 20),
     (torch.float16, 12),

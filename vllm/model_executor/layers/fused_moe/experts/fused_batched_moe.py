@@ -448,6 +448,12 @@ def invoke_moe_batched_triton_kernel(
     BLOCK_M = config["BLOCK_SIZE_M"]
     BLOCK_N = config["BLOCK_SIZE_N"]
     BLOCK_K = config["BLOCK_SIZE_K"]
+    if block_shape is not None:
+        # `moe_mmk` loads one scale per K tile, at `k_start // group_k`, and
+        # applies it to the whole tile -- so a K tile wider than the
+        # quantization group silently uses the first group's scale for every
+        # group it spans. `invoke_fused_moe_triton_kernel` clamps identically.
+        BLOCK_K = min(BLOCK_K, min(block_shape[0], block_shape[1]))
 
     grid = (
         expert_num_tokens.size(0),
@@ -466,6 +472,19 @@ def invoke_moe_batched_triton_kernel(
     assert B_scale is None or B_scale.ndim == 1 or B_scale.ndim == 3, (
         f"{0 if B_scale is None else B_scale.shape}"
     )
+    if use_fp8_w8a8 or use_int8_w8a16:
+        assert B_scale is not None
+        # A block-quantized weight scale has one entry per (N, K) group. The
+        # kernel indexes it without checking, so a mismatch here is silent
+        # wrong arithmetic rather than a fault -- the same class of defect as
+        # the stride bug below.
+        assert block_shape is None or (
+            triton.cdiv(B.size(-2), block_shape[0]) == B_scale.size(-2)
+            and triton.cdiv(B.size(-1), block_shape[1]) == B_scale.size(-1)
+        ), f"{B.shape} and {block_shape} do not agree with {B_scale.shape}"
+    else:
+        assert A_scale is None, f"unquantized launch with an A scale {A_scale.shape}"
+        assert B_scale is None, f"unquantized launch with a B scale {B_scale.shape}"
 
     if B_scale is not None:
         stride_bse = B_scale.stride(0)
@@ -500,6 +519,11 @@ def invoke_moe_batched_triton_kernel(
         and (BLOCK_N & (BLOCK_N - 1)) == 0
         and (BLOCK_K & (BLOCK_K - 1)) == 0
     )
+    if use_td and K % BLOCK_K != 0:
+        # Mirrors `invoke_fused_moe_triton_kernel`: a TD gather feeding
+        # `tl.dot` at non-block-aligned K miscompiles. Not reproduced on
+        # gfx950, but the fallback only costs the TD path.
+        use_td = False
     if use_td:
         set_triton_allocator(A.device)
 
@@ -853,6 +877,12 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
         )
 
         supported: list[tuple[QuantKey | None, QuantKey | None]] = [(None, None)]
+        # Keep (kFp8StaticTensorSym, kFp8DynamicTokenSym) even though no
+        # in-tree quant method emits it: it is the form
+        # (kFp8StaticTensorSym, kFp8DynamicTensorSym) executes in under
+        # VLLM_BATCH_INVARIANT, where the activation is promoted to per-token
+        # and the weight scale stays per-tensor. See
+        # `maybe_promote_act_quant_for_batch_invariance`.
         if device_supports_fp8:
             supported += [
                 (kFp8Static128BlockSym, kFp8Dynamic128Sym),
@@ -878,6 +908,26 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
+        return True
+
+    @staticmethod
+    def _supports_batch_invariance() -> bool:
+        """Unquantized and all five fp8 pairs `_supports_quant_scheme` lists.
+
+        This runs `batched_triton_kernel` on an `E x max_num_tokens x K`
+        layout, so nothing established for `fused_moe_kernel` carries over.
+        Here there is no split-K, no `tl.atomic_*` and no `@triton.autotune`;
+        each CTA owns a disjoint `[BLOCK_M, BLOCK_N]` tile and runs the whole K
+        loop into one fp32 accumulator; the grid is keyed on `max_num_tokens`, a
+        deployment constant, so token r always lands in tile `r // BLOCK_M`. The
+        batch reaches the kernel only through `mask_m` and two early exits.
+
+        The fp8 pairs qualify only because
+        `maybe_promote_act_quant_for_batch_invariance` makes the activation
+        scale per-token; a batch-wide amax moves rows. The blockwise scheme is
+        scoped to BLOCK_K=32, which the mode pins, since it applies scales
+        inside the K loop.
+        """
         return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:

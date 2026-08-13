@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+    maybe_promote_act_quant_for_batch_invariance,
 )
 from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
@@ -69,6 +70,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # Whether quantized MOE runs natively, or through
         # higher-precision + activation QDQ.
         self.quantization_emulation = False
+        quant_config = maybe_promote_act_quant_for_batch_invariance(quant_config)
         super().__init__(moe_config, quant_config)
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
@@ -134,6 +136,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 (kFp8StaticTensorSym, kFp8StaticTensorSym),
                 (kFp8StaticTensorSym, kFp8DynamicTensorSym),
             ]
+        # Dynamic per-tensor activation schemes stay supported under
+        # VLLM_BATCH_INVARIANT: __init__ promotes them to per-token, which is
+        # a function of the token rather than of the batch. See
+        # maybe_promote_act_quant_for_batch_invariance.
         return (weight_key, activation_key) in supported
 
     @staticmethod

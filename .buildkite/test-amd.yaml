@@ -2501,6 +2501,8 @@ steps:
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
   - pytest -v -s v1/determinism/test_padding_bounded_quant.py
   - pytest -v -s v1/determinism/test_moe_row_permutation_batch_invariant.py
+  - pytest -v -s v1/determinism/test_batched_moe_batch_invariant.py
+  - pytest -v -s v1/determinism/test_moe_act_quant_batch_invariant.py
 
 - label: Acceptance Length Test (Large Models) # TBD
   timeout_in_minutes: 180
@@ -3695,6 +3697,8 @@ steps:
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
   - pytest -v -s v1/determinism/test_padding_bounded_quant.py
   - pytest -v -s v1/determinism/test_moe_row_permutation_batch_invariant.py
+  - pytest -v -s v1/determinism/test_batched_moe_batch_invariant.py
+  - pytest -v -s v1/determinism/test_moe_act_quant_batch_invariant.py
   # MX is gfx950 only; these self-skip elsewhere.
   - pytest -v -s v1/determinism/test_mx_linear_batch_invariant.py
   - pytest -v -s v1/determinism/test_mxfp8_batch_invariant.py

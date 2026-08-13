@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import Union
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig, SchedulerConfig
 from vllm.config.kernel import MoEBackend
 from vllm.distributed import get_dp_group, get_pcp_group, get_tensor_model_parallel_rank
@@ -309,6 +310,22 @@ class FusedMoEQuantConfig:
             and self.a2_scale is None
         )
 
+    def with_per_token_act_quant(self) -> "FusedMoEQuantConfig":
+        """Return a copy of this config with per-token activation scales.
+
+        Only meaningful for dynamic per-tensor activations: the per-tensor
+        scale is an amax over every row in the launch, so it is a function of
+        the batch, while a per-token scale is a function of the token alone.
+        Quantization granularity -- and therefore the numerics -- changes;
+        callers must say so.
+        """
+        assert self.is_dynamic_per_tensor_act, "not a dynamic per-tensor scheme"
+        return replace(
+            self,
+            _a1=replace(self._a1, shape=GroupShape.PER_TOKEN),
+            _a2=replace(self._a2, shape=GroupShape.PER_TOKEN),
+        )
+
     @property
     def block_shape(self) -> list[int] | None:
         if (
@@ -598,6 +615,69 @@ class FusedMoEQuantConfig:
         assert quant_config.per_out_ch_quant == per_out_ch_quant
         assert quant_config.block_shape == block_shape
         return quant_config
+
+
+def maybe_promote_act_quant_for_batch_invariance(
+    quant_config: FusedMoEQuantConfig,
+) -> FusedMoEQuantConfig:
+    """Promote dynamic per-tensor activations to per-token under the mode.
+
+    A dynamic per-tensor activation scale is an amax over every row the kernel
+    was handed: the whole local batch without expert parallelism, and whatever
+    the all2all delivered with it under EP. A token's quantized activation --
+    and therefore its output -- then depends on what else was batched with it.
+    Both GEMMs are affected: the a1 scale comes from the prepare step, the a2
+    scale from the amax over ``intermediate_cache2``, which spans
+    ``num_tokens * top_k`` rows. There is no fixed-order repair for this, the
+    way there is for a reduction: the scale is not a function of the token.
+
+    Setting per-token activations is not only an activation change: the Triton
+    launchers pass ``per_channel_quant=quant_config.per_act_token_quant``, so
+    the weight scale is read down the per-channel path too. A per-tensor weight
+    scale must therefore be broadcast rather than indexed -- see
+    ``_as_per_channel_weight_scale``.
+
+    A calibrated scale is a constant and cannot follow the batch, so static
+    schemes are left alone, as are the MX and NVFP4 emulation paths, which
+    quantize elsewhere and ignore this flag.
+    """
+    if not envs.VLLM_BATCH_INVARIANT or not (
+        quant_config.use_fp8_w8a8 or quant_config.use_int8_w8a8
+    ):
+        return quant_config
+
+    if not quant_config.is_per_tensor:
+        return quant_config
+
+    if (quant_config.a1_scale is None) != (quant_config.a2_scale is None):
+        # One GEMM is calibrated and the other is not. The kernel takes a
+        # single activation-granularity flag for both, so the uncalibrated
+        # side cannot be promoted on its own, and its dynamic per-tensor amax
+        # would follow the batch. Refuse here, where the scheme is visible,
+        # rather than mid-forward.
+        raise ValueError(
+            "VLLM_BATCH_INVARIANT is set but this MoE layer has an activation "
+            "scale for only one of its two GEMMs "
+            f"(a1_scale={'set' if quant_config.a1_scale is not None else 'None'}, "
+            f"a2_scale={'set' if quant_config.a2_scale is not None else 'None'}), "
+            "so the uncalibrated GEMM would use a dynamic per-tensor scale, "
+            "which is an amax over the whole batch and cannot be batch "
+            "invariant."
+        )
+
+    if not quant_config.is_dynamic_per_tensor_act:
+        return quant_config
+
+    logger.warning_once(
+        "VLLM_BATCH_INVARIANT: promoting %s MoE activation quantization from "
+        "dynamic per-tensor to dynamic per-token. A per-tensor scale is an "
+        "amax over the whole batch, so it is not batch invariant; a per-token "
+        "scale is a function of the token alone. This changes the numerics "
+        "relative to a run with the mode off (per-token is the finer "
+        "granularity, so it is at least as accurate).",
+        quant_config.quant_dtype,
+    )
+    return quant_config.with_per_token_act_quant()
 
 
 def fp8_w8a8_moe_quant_config(

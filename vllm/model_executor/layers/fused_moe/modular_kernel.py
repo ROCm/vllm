@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
     RoutingMethodType,
+    maybe_promote_act_quant_for_batch_invariance,
 )
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
@@ -496,7 +497,16 @@ class FusedMoEExperts(ABC):
             )
 
         self.moe_config = moe_config
-        self.quant_config = quant_config
+        # Promote here rather than in each subclass. A dynamic per-tensor
+        # activation scale is an amax over whatever rows the kernel is handed,
+        # so under batch invariance it is promoted to per-token. The
+        # prepare/finalize half is promoted in `maybe_make_prepare_finalize`,
+        # but that rebinds a local and the oracles pass the original config on
+        # to the experts, so a subclass that did not promote for itself would
+        # see a different scheme from its own dispatch. Doing it in the base
+        # means no subclass has to remember. Idempotent: once promoted the
+        # scheme is no longer dynamic per-tensor, so a second call is a no-op.
+        self.quant_config = maybe_promote_act_quant_for_batch_invariance(quant_config)
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
 

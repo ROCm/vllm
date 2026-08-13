@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+    maybe_promote_act_quant_for_batch_invariance,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEPrepareAndFinalize,
@@ -137,6 +138,13 @@ def maybe_make_prepare_finalize(
     #   * maybe_make_prepare_finalize() is called from the oracle. We
     #     always return a PrepareAndFinalize object and the quant method
     #     holds the ModularKernel.
+    # Promote before anything reads the scheme: `use_fp8_dispatch` below is
+    # derived from it here, while the experts promote in their __init__, which
+    # runs after this. Promoting only there leaves the all2all dispatching bf16
+    # while the experts expect per-token scales.
+    if quant_config is not None:
+        quant_config = maybe_promote_act_quant_for_batch_invariance(quant_config)
+
     if not moe.moe_parallel_config.use_all2all_kernels:
         if not allow_new_interface:
             return None

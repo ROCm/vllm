@@ -14,7 +14,25 @@ independent whatever the implementation does, so an EP=2 test passes against a
 batch-variant combine. Four ranks is the smallest size that measures anything,
 which is why this module asks for four GPUs.
 
+The arms:
+
+- **deepep_high_throughput**: the default DeepEP dispatch/combine, on
+  `TritonExperts`.
+- **deepep_low_latency**: forces `FusedMoEActivationFormat.BatchedExperts`
   (`FusedMoEParallelConfig.use_batched_activation_format`), whose only experts
+  class on ROCm is `BatchedTritonExperts`, so that one class decides whether
+  this backend is reachable at all -- the oracle refuses the deployment unless
+  it declares support. It declares the unquantized path only, which is what
+  OLMoE is. It is also the only arm whose experts class is not `TritonExperts`,
+  and the (prepare_finalize, experts) pair is asserted so a silent fallback
+  cannot pass it.
+- **mori_high_throughput**: `--max-num-batched-tokens` is pinned low for this
+  arm on purpose: MoRI
+  allocates a symmetric receive buffer of `ep_size * max_num_batched_tokens`
+  rows, so leaving the default makes this test memory-hungry for no extra
+  coverage. The rows the all2all did not deliver are marked invalid by
+  `MoriPrepareAndFinalize.prepare`, so what the experts see still tracks the
+  batch.
 
 - **mori_low_latency**: not a second test. Both single-node MoRI variants were
   observed selecting `EpDispatchCombineKernelType.IntraNode`
@@ -100,6 +118,14 @@ MORI_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_MORI_LOAD_CONCURRENCY", "96"))
 # The LoRA arm is eager, so it serves fewer requests per second and needs more
 # in flight to reach the same exposure.
 LORA_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LORA_LOAD_CONCURRENCY", "48"))
+# The fp8 arms need more for the opposite reason to MoRI: each step is cheaper,
+# so the server drains the queue between the needle's steps and its prefill
+# again ends up alone. Both are raised, not just the one seen to fail.
+FP8_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_FP8_LOAD_CONCURRENCY", "96"))
+# The bf16 low-latency arm is cheap per step for the same reason, and it is the
+# second server in the process, so its caches are warm and the needle returns
+# sooner still.
+LL_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LL_LOAD_CONCURRENCY", "96"))
 LOAD_RAMP_SECONDS = float(os.getenv("VLLM_EP_LOAD_RAMP_SECONDS", "12"))
 # The load must drag the needle rank's padded token count at least this far
 # above what it ran alone, otherwise the needle saw identical shapes twice.
@@ -230,11 +256,48 @@ def _patch_modular_kernel(module):
 
     def wrapper(self, prepare_finalize, fused_experts, *args, **kwargs):
         original_init(self, prepare_finalize, fused_experts, *args, **kwargs)
+        # The quantization scheme is read off the experts *after* their
+        # __init__, which is where `maybe_promote_act_quant_for_batch_invariance`
+        # runs. So this records what will execute, not what the checkpoint
+        # asked for -- the two differ under the mode and the fp8 arms assert
+        # on the difference.
+        quant = {}
+        try:
+            quant = dict(
+                quant_dtype=str(fused_experts.quant_dtype),
+                per_act_token_quant=bool(fused_experts.per_act_token_quant),
+                block_shape=fused_experts.block_shape,
+            )
+        except Exception as e:  # pragma: no cover
+            quant = {"quant_err": repr(e)}
         _emit(
             event="mk",
             pf=type(prepare_finalize).__name__,
             experts=type(fused_experts).__name__,
+            **quant,
         )
+
+    cls.__init__ = wrapper
+
+
+def _patch_deepep_ll(module):
+    """Record whether DeepEP LL dispatched fp8 or bf16.
+
+    `use_fp8_dispatch` decides whether the low-latency kernels quantize inside
+    `_do_quant` and carry scales through the buffers, or move bf16 and leave
+    the experts to quantize. It is derived from the quant config in
+    `maybe_make_prepare_finalize`, not from the checkpoint's dtype, so an fp8
+    model can perfectly well dispatch bf16 -- and an arm that means to cover
+    the fp8 dispatch has to check rather than assume.
+    """
+    cls = getattr(module, "DeepEPLLPrepareAndFinalize", None)
+    if cls is None:
+        return
+    original_init = cls.__init__
+
+    def wrapper(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        _emit(event="deepep_ll", use_fp8_dispatch=bool(self.use_fp8_dispatch))
 
     cls.__init__ = wrapper
 
@@ -277,6 +340,9 @@ _TARGETS = {
     "vllm.v1.worker.dp_utils": _patch_dp_utils,
     "vllm.distributed.device_communicators.all2all": _patch_all2all,
     "vllm.model_executor.layers.fused_moe.modular_kernel": _patch_modular_kernel,
+    "vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_ll": (
+        _patch_deepep_ll
+    ),
     "vllm.lora.punica_wrapper.punica_gpu": _patch_punica,
 }
 
@@ -474,6 +540,48 @@ def deepep_ht_server(tmp_path, enable_batch_invariant_mode):
 
 
 @pytest.fixture
+def deepep_ll_server(tmp_path, enable_batch_invariant_mode):
+    """A DP=4 + EP server on the DeepEP low-latency all2all.
+
+    Function-scoped for the same reason as `deepep_ht_server`.
+
+    This is the only arm whose experts class is `BatchedTritonExperts` rather
+    than `TritonExperts`: DeepEP LL forces the batched activation format, and
+    the assertion below is what keeps that from silently falling back.
+    """
+    yield from _ep_server(tmp_path, "deepep_low_latency")
+
+
+@pytest.fixture
+def deepep_ll_fp8_server(tmp_path, enable_batch_invariant_mode):
+    """DeepEP LL serving OLMoE under online per-tensor fp8.
+
+    `--quantization fp8` gives `_Fp8OnlineMoEBase` a per-tensor weight key with
+    `kFp8DynamicTensorSym` activations, which under the mode
+    `maybe_promote_act_quant_for_batch_invariance` turns into per-token. That
+    is the one row in `BatchedTritonExperts._supports_quant_scheme` no
+    checkpoint produces, and it is reachable only this way.
+    """
+    yield from _ep_server(tmp_path, "deepep_low_latency", ["--quantization", "fp8"])
+
+
+@pytest.fixture
+def deepep_ll_fp8_block_server(tmp_path, enable_batch_invariant_mode):
+    """DeepEP LL serving OLMoE under online block fp8.
+
+    Not a duplicate of the arm above: this is the only way to reach DeepEP
+    LL's *fp8 dispatch*. `use_fp8_dispatch` is
+    `quant_dtype == fp8 and block_shape == DEEPEP_QUANT_BLOCK_SHAPE`
+    ([128, 128]), so the per-tensor arm dispatches bf16 and leaves the experts
+    to quantize, while this one quantizes inside `_do_quant` and carries the
+    scales through the low-latency buffers.
+    """
+    yield from _ep_server(
+        tmp_path, "deepep_low_latency", ["--quantization", "fp8_per_block"]
+    )
+
+
+@pytest.fixture
 def mori_ht_server(tmp_path, enable_batch_invariant_mode):
     """A DP=4 + EP server on MoRI.
 
@@ -591,6 +699,8 @@ def _assert_needle_does_not_see_the_batch(
     load_concurrency: int = LOAD_CONCURRENCY,
     model: str = MODEL,
     require_idle_lora_rank: bool = False,
+    expect_fp8_dispatch: bool | None = None,
+    expect_quant: dict | None = None,
 ) -> None:
     """The needle's logprobs must not move when the rest of the server does."""
     url = server.url_for("v1/completions")
@@ -634,6 +744,36 @@ def _assert_needle_does_not_see_the_batch(
         f"{{('{prepare_finalize_cls}', '{experts_cls}')}}."
     )
 
+    if expect_quant is not None:
+        # What the experts will actually run, read after their __init__ and so
+        # after any batch-invariance promotion. Asserted rather than assumed:
+        # the whole reason an fp8 arm exists is that it runs a different
+        # scheme from the bf16 arms, and a checkpoint that silently loaded
+        # unquantized would otherwise pass by re-measuring those.
+        observed = {
+            tuple(sorted((k, repr(r.get(k))) for k in expect_quant))
+            for r in records
+            if r.get("event") == "mk"
+        }
+        want = {tuple(sorted((k, repr(v)) for k, v in expect_quant.items()))}
+        assert observed == want, (
+            f"the experts were built with {observed}, not {want}. Under the "
+            "mode the scheme here is the *promoted* one, not the "
+            "checkpoint's."
+        )
+
+    if expect_fp8_dispatch is not None:
+        dispatch = {
+            r["use_fp8_dispatch"] for r in records if r.get("event") == "deepep_ll"
+        }
+        assert dispatch == {expect_fp8_dispatch}, (
+            f"DeepEP LL reported use_fp8_dispatch={dispatch}, expected "
+            f"{{{expect_fp8_dispatch}}}. It is derived from the quant config "
+            "(fp8 dtype *and* a [128, 128] block shape), so a per-tensor fp8 "
+            "checkpoint legitimately dispatches bf16 -- but which one ran "
+            "decides which code this arm covered."
+        )
+
     # Vacuity: if the load never changed the needle rank's shapes then it ran
     # the same forward twice and the comparison below is empty.
     alone_pads = _needle_rank_pads(records, alone)
@@ -663,6 +803,13 @@ def _assert_needle_does_not_see_the_batch(
         for i, (a, b) in enumerate(zip(alone["logprobs"], loaded["logprobs"]))
         if a != b
     ]
+    # Printed on success too: the docstrings above quote these numbers, and a
+    # passing run is the only place the exposure actually achieved is visible.
+    print(
+        f"\n{prepare_finalize_cls}/{experts_cls}: {len(moved)}/"
+        f"{len(alone['logprobs'])} logprobs moved, needle-rank padding "
+        f"{max(alone_pads)} -> {max(loaded_pads)}"
+    )
     assert not moved, (
         f"the needle's logprobs changed at positions {moved} because unrelated "
         f"traffic was in flight: its own rank's padded token count went from "
@@ -680,6 +827,107 @@ def test_deepep_high_throughput_combine_does_not_see_the_batch(deepep_ht_server)
         manager_cls="DeepEPHTAll2AllManager",
         prepare_finalize_cls="DeepEPHTPrepareAndFinalize",
         experts_cls="TritonExperts",
+    )
+
+
+def test_deepep_low_latency_combine_does_not_see_the_batch(deepep_ll_server):
+    """The needle keeps its logprobs on the batched-format experts path.
+
+    This is the end-to-end half of the `BatchedTritonExperts` certification.
+    The kernel-level evidence is in `_supports_batch_invariance`; what only a
+    server can show is that the pieces around it -- DeepEP LL's atomic slot
+    assignment, its weighted combine, and the token count each expert is handed
+    varying with the cluster's load -- do not reintroduce the dependence.
+
+    `experts_cls` is asserted because the whole point of this arm is the
+    batched class: a fallback to `TritonExperts` would pass while measuring the
+    backend that `test_deepep_high_throughput_combine_does_not_see_the_batch`
+    already covers.
+    """
+    server, log_prefix = deepep_ll_server
+    _assert_needle_does_not_see_the_batch(
+        server,
+        log_prefix,
+        manager_cls="DeepEPLLAll2AllManager",
+        prepare_finalize_cls="DeepEPLLPrepareAndFinalize",
+        experts_cls="BatchedTritonExperts",
+        load_concurrency=LL_LOAD_CONCURRENCY,
+    )
+
+
+def test_deepep_low_latency_fp8_promotion_engages_end_to_end(deepep_ll_fp8_server):
+    """The fp8 batched-experts path, end to end, with the promotion asserted.
+
+    One-sided guard: there is no admissible mode-off control, so passing is not
+    evidence the mode achieved anything, while failing would be evidence of a
+    batch dependence. The two-sided arms in this file are the bf16 ones; the
+    name says `engages` rather than `does_not_see_the_batch` for that reason.
+
+    The checkpoint asks for dynamic per-tensor activations; `expect_quant`
+    asserts the *promoted* per-token form actually reached the experts, since a
+    surviving per-tensor scale is exactly the dependence this arm would
+    otherwise report as absent. `use_fp8_dispatch` is False here and correctly
+    so -- it requires a [128, 128] block shape; the block arm below covers it.
+    """
+    server, log_prefix = deepep_ll_fp8_server
+    _assert_needle_does_not_see_the_batch(
+        server,
+        log_prefix,
+        manager_cls="DeepEPLLAll2AllManager",
+        prepare_finalize_cls="DeepEPLLPrepareAndFinalize",
+        experts_cls="BatchedTritonExperts",
+        expect_fp8_dispatch=False,
+        expect_quant={
+            "quant_dtype": "torch.float8_e4m3fn",
+            "per_act_token_quant": True,
+            "block_shape": None,
+        },
+        load_concurrency=FP8_LOAD_CONCURRENCY,
+    )
+
+
+def test_deepep_low_latency_fp8_block_dispatch_engages_end_to_end(
+    deepep_ll_fp8_block_server,
+):
+    """The same, on the path where DeepEP LL itself quantizes.
+
+    With a [128, 128] block shape the low-latency kernels dispatch fp8: the
+    scales are produced in `_do_quant` and carried through the buffers, so the
+    experts receive quantized activations they did not quantize. That is code
+    no other arm in this suite runs, and it is the half of the fp8 admission
+    that the whole-class sweep -- which goes through the no-comms
+    `BatchedPrepareAndFinalize` -- could not reach.
+
+    No promotion here: a block-quantized activation scale is per (token,
+    k-tile) already, so `maybe_promote_act_quant_for_batch_invariance` leaves
+    it alone. `per_act_token_quant` is therefore False and the block shape is
+    what carries the granularity.
+
+    **This arm's mode-off control runs, and says the metric is blind**: with
+    the mode off the same comparison barely moves, so a passing verdict here is
+    not evidence that the mode is doing anything. Whether that is because block
+    quantization coarsens the arithmetic below the logprob quantum or because
+    the path genuinely has no batch dependence left is not established.
+
+    Kept rather than skipped, because what it does establish is mechanical and
+    is asserted above: DeepEP LL really did dispatch fp8, the batched experts
+    really did consume it, and the pair did not fall back. The invariance
+    verdict is the part that is uncontrolled.
+    """
+    server, log_prefix = deepep_ll_fp8_block_server
+    _assert_needle_does_not_see_the_batch(
+        server,
+        log_prefix,
+        manager_cls="DeepEPLLAll2AllManager",
+        prepare_finalize_cls="DeepEPLLPrepareAndFinalize",
+        experts_cls="BatchedTritonExperts",
+        expect_fp8_dispatch=True,
+        expect_quant={
+            "quant_dtype": "torch.float8_e4m3fn",
+            "per_act_token_quant": False,
+            "block_shape": [128, 128],
+        },
+        load_concurrency=FP8_LOAD_CONCURRENCY,
     )
 
 

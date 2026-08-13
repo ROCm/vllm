@@ -173,6 +173,22 @@ def _patch_moe_config(module):
 
     module.FusedMoEParallelConfig.make = staticmethod(make)
 
+    promote = module.maybe_promote_act_quant_for_batch_invariance
+
+    def wrapped(quant_config):
+        out = promote(quant_config)
+        if _once("act_quant"):
+            _emit(
+                "act_quant",
+                quant_dtype=str(getattr(quant_config, "quant_dtype", None)),
+                was_dynamic_per_tensor=bool(
+                    getattr(quant_config, "is_dynamic_per_tensor_act", False)
+                ),
+                promoted=out is not quant_config,
+            )
+        return out
+
+    module.maybe_promote_act_quant_for_batch_invariance = wrapped
 
 
 def _patch_all2all(module):
