@@ -306,57 +306,38 @@ class DiffusionMetrics:
     num_committed_tokens: int
 
 
-async def fetch_diffusion_metrics(
-    base_url: str, session: aiohttp.ClientSession
-) -> DiffusionMetrics | None:
-    """Fetch diffusion decoding metrics from the server's Prometheus endpoint.
+def parse_diffusion_metrics(metrics: PrometheusMetrics) -> DiffusionMetrics | None:
+    """Extract diffusion decoding metrics from parsed Prometheus data.
 
     Returns None if the model is not a diffusion model or metrics are not
     available.
     """
-    metrics_url = f"{base_url}/metrics"
-    try:
-        async with session.get(metrics_url) as response:
-            if response.status != 200:
-                return None
-            text = await response.text()
+    num_denoising_steps = 0
+    num_canvas_positions = 0
+    num_committed_tokens = 0
+    found_diffusion = False
 
-            num_denoising_steps = 0
-            num_canvas_positions = 0
-            num_committed_tokens = 0
-            found_diffusion = False
+    for name, samples in metrics.items():
+        if not name.startswith("vllm:diffusion") or not name.endswith("_total"):
+            continue
+        found_diffusion = True
+        for _, value_str in samples:
+            with contextlib.suppress(ValueError):
+                if "num_denoising_steps" in name:
+                    num_denoising_steps += int(float(value_str))
+                elif "num_canvas_positions" in name:
+                    num_canvas_positions += int(float(value_str))
+                elif "num_committed_tokens" in name:
+                    num_committed_tokens += int(float(value_str))
 
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                if line.startswith("vllm:diffusion"):
-                    # Extract metric name (before labels) to avoid matching
-                    # substrings inside label values.
-                    parts = line.split(None, 1)
-                    metric_name = parts[0].split("{")[0]
-                    if not metric_name.endswith("_total"):
-                        continue
-                    found_diffusion = True
-                    with contextlib.suppress(ValueError):
-                        if "num_denoising_steps" in metric_name:
-                            num_denoising_steps += int(float(parts[-1]))
-                        elif "num_canvas_positions" in metric_name:
-                            num_canvas_positions += int(float(parts[-1]))
-                        elif "num_committed_tokens" in metric_name:
-                            num_committed_tokens += int(float(parts[-1]))
-
-            if not found_diffusion:
-                return None
-
-            return DiffusionMetrics(
-                num_denoising_steps=num_denoising_steps,
-                num_canvas_positions=num_canvas_positions,
-                num_committed_tokens=num_committed_tokens,
-            )
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    if not found_diffusion:
         return None
+
+    return DiffusionMetrics(
+        num_denoising_steps=num_denoising_steps,
+        num_canvas_positions=num_canvas_positions,
+        num_committed_tokens=num_committed_tokens,
+    )
 
 
 class TaskType(Enum):
@@ -1002,7 +983,9 @@ async def benchmark(
         parse_spec_decode_metrics(prom_before) if prom_before else None
     )
     cpu_metrics_before = parse_cpu_metrics(prom_before) if prom_before else None
-    diffusion_metrics_before = await fetch_diffusion_metrics(base_url, session)
+    diffusion_metrics_before = (
+        parse_diffusion_metrics(prom_before) if prom_before else None
+    )
 
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
@@ -1136,7 +1119,9 @@ async def benchmark(
                 "per_position_acceptance_rates": per_pos_rates,
             }
 
-    diffusion_metrics_after = await fetch_diffusion_metrics(base_url, session)
+    diffusion_metrics_after = (
+        parse_diffusion_metrics(prom_after) if prom_after else None
+    )
     diffusion_stats: dict[str, Any] | None = None
     if diffusion_metrics_before is not None and diffusion_metrics_after is not None:
         delta_steps = (
