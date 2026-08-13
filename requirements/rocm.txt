@@ -27,3 +27,7 @@ tilelang==0.1.10
 apache-tvm-ffi==0.1.10 
 # Required for faster safetensors model loading
 fastsafetensors >= 0.3.3
+
+# AITER
+--find-links https://rocm.frameworks-nightlies.amd.com/whl-multi-arch/amd_aiter/
+amd_aiter==0.1.20+rocm7.2.3.3135022

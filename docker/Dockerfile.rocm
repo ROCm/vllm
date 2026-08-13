@@ -2,6 +2,8 @@
 ARG REMOTE_VLLM="0"
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
 ARG VLLM_BRANCH="main"
+ARG AITER_WHL_URL="https://rocm.frameworks-nightlies.amd.com/whl-multi-arch/amd_aiter/"
+ARG AITER_VERSION=
 ARG COMMON_WORKDIR=/app
 ARG BASE_IMAGE=rocm/vllm-dev:base
 ARG CI_BASE_IMAGE=rocm/vllm-dev:ci_base
@@ -857,6 +859,18 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     && uv pip install --system -r requirements/rocm.txt \
     && pip uninstall -y vllm \
     && uv pip install --system *.whl
+
+# Overwrite AITER if requested
+ARG AITER_VERSION=
+RUN if [ -n "$AITER_VERSION" ]; then \
+      echo "Overriding aiter -> ${AITER_VERSION}" && \
+      pip uninstall -y amd_aiter && \
+      pip install --no-cache-dir \
+        --find-links ${AITER_WHL_URL} \
+        "amd_aiter==${AITER_VERSION}" ; \
+    else \
+      echo "AITER_VERSION unset; keeping $(pip3.12 show amd_aiter | awk '/^Version:/{print $2}')" ; \
+    fi
 
 # Install NIXL ROCm wheel
 RUN --mount=type=bind,from=build_nixl,src=/app/install,target=/nixl_install \
