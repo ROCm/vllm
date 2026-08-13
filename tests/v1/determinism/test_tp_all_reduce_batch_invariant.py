@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import ray
 import torch
-from utils import order_sensitive_elements
+from utils import order_sensitive_elements, skip_if_not_cuda_alike
 
 from tests.utils import (
     init_test_distributed_environment,
@@ -27,18 +27,12 @@ from tests.utils import (
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import get_tp_group, set_custom_all_reduce
-from vllm.platforms import current_platform
 
 # multi_gpu_test would also wrap the test in create_new_process_for_each_test,
 # whose re-import breaks the ray workers below, so take its marks alone: the
 # registered `distributed` selector keeps `-m distributed` picking this test up,
 # and its skipif enforces the 4 GPUs the module docstring explains are needed.
-pytestmark = [
-    pytest.mark.skipif(
-        not current_platform.is_cuda_alike(), reason="requires a CUDA-alike device"
-    ),
-    *multi_gpu_marks(num_gpus=4),
-]
+pytestmark = [skip_if_not_cuda_alike, *multi_gpu_marks(num_gpus=4)]
 
 # Token counts spanning the small-message thresholds where the collectives
 # switch protocol, chunking, or algorithm. At world size 4 the custom all-reduce

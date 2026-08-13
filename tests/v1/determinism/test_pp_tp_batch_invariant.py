@@ -149,7 +149,7 @@ def _make_llm(**overrides) -> LLM:
     return LLM(**kwargs)
 
 
-def test_tp_all_reduce_path_under_pipeline_parallelism(record_property):
+def test_tp_all_reduce_path_under_pipeline_parallelism():
     """Record which all-reduce implementation the composed run actually uses.
 
     Batch invariance dispatches to the custom all-reduce below its size limit
@@ -228,7 +228,6 @@ def test_tp_all_reduce_path_under_pipeline_parallelism(record_property):
             "the library collective instead of the custom kernel.",
             stacklevel=2,
         )
-    record_property("ca_comm_live", sorted(live))
 
 
 def test_pp_tp_generation_is_batch_invariant():

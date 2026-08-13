@@ -197,7 +197,7 @@ def test_expert_gemm_is_row_permutation_invariant(
 )
 @torch.inference_mode()
 def test_expert_gemm_tolerates_native_sort_nondeterminism(
-    default_vllm_config, m: int, scheme: str, record_property
+    default_vllm_config, m: int, scheme: str
 ):
     """The same reordering happens without any all2all at all.
 
@@ -238,7 +238,6 @@ def test_expert_gemm_tolerates_native_sort_nondeterminism(
     # Warn rather than skip: the 16 stability assertions above did run, and the
     # only thing not exercised is invariance under a reordering that did not
     # occur.
-    record_property("row_reorderings_observed", reordered)
     if reordered == 0:
         warnings.warn(
             "moe_align_block_size produced a stable order in all 16 trials, so "

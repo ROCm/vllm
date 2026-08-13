@@ -19,11 +19,12 @@ data-parallel machinery existed. Here it is measured at DP=4 x EP=4.
 
 Two dependencies are screened, and the second is the novel one:
 
-1. **The needle's own cache state.** The same prompt is run cold, and at hits of
-   400, 800, 1600 and 2384 tokens. Under the mode the scheduler caps a prefill
-   chunk at `batch_invariant_prefill_chunk` so the chunk *length* is a function
-   of the request alone -- but the chunk *origin* is not, because chunks start
-   at the hit length. At the settings below the cap is 1984, so cold prefills as
+1. **The needle's own cache state.** The same prompt is run cold, and at hits
+   of 400, 1600 and 2384 tokens (a full-prompt hit block-aligns to 2384). Under
+   the mode the scheduler caps a prefill chunk at
+   `batch_invariant_prefill_chunk` so the chunk *length* is a function of the
+   request alone -- but the chunk *origin* is not, because chunks start at the
+   hit length. At the settings below the cap is 1984, so cold prefills as
    [1984, 416] and a 400-token hit prefills as [1984, 16]: the same number of
    chunks, with the boundary moved from 1984 to 2384. That is precisely the
    degree of freedom the cap cannot close, and it is what made MLA unsafe.

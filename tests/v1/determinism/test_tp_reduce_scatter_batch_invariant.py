@@ -19,7 +19,7 @@ import pytest
 import ray
 import torch
 import torch.distributed as dist
-from utils import order_sensitive_elements
+from utils import order_sensitive_elements, skip_if_not_cuda_alike
 
 from tests.utils import (
     init_test_distributed_environment,
@@ -27,14 +27,8 @@ from tests.utils import (
     multi_process_parallel,
 )
 from vllm.distributed.parallel_state import get_tp_group, set_custom_all_reduce
-from vllm.platforms import current_platform
 
-pytestmark = [
-    pytest.mark.skipif(
-        not current_platform.is_cuda_alike(), reason="requires a CUDA-alike device"
-    ),
-    *multi_gpu_marks(num_gpus=4),
-]
+pytestmark = [skip_if_not_cuda_alike, *multi_gpu_marks(num_gpus=4)]
 
 # Divisible by 8 so the same counts work at both world sizes, and spread across
 # the small-message thresholds where the collective changes protocol. They also
