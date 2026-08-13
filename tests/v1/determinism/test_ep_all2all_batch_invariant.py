@@ -144,13 +144,12 @@ LORA_NAME = "synthetic-moe"
 LORA_RANK = 16
 # The alone window must contain at least this many ranks that ran the MoE LoRA
 # on the gathered batch while their own metadata said they had none of it --
-# the state the dropped-delta bug needed. All three non-needle ranks were
-# measured in it; asking for two leaves headroom without ever accepting a
-# verdict that rests on a single idle rank.
+# the state the dropped-delta bug needed. Two, rather than all three non-needle
+# ranks, leaves headroom without accepting a verdict that rests on a single one.
 MIN_IDLE_LORA_RANKS = 2
 # ...and the loaded window must contain none, or nearly none: it is the arm
 # where every rank has its own LoRA tokens and therefore the arm that got the
-# right answer pre-fix. Measured 0 of ~1080 calls on all four ranks.
+# right answer pre-fix.
 MAX_LOADED_IDLE_FRACTION = 0.5
 
 NEEDLE_PROMPT = (
