@@ -6,11 +6,13 @@ import torch.nn.functional as F
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     get_fp8_min_max,
     group_broadcast,
+    padding_bounded_amax,
     prep_scale_for_group_broadcast,
 )
 from vllm.platforms import current_platform
@@ -70,6 +72,28 @@ class QuantFP8(CustomOp):
 
         self.use_aiter = rocm_aiter_ops.is_linear_fp8_enabled()
 
+        # Sequence-parallel MoE shards the token dimension across TP ranks while
+        # `ForwardContext.is_padding` stays full-batch, so the mask no longer
+        # describes these rows.  Decided from config, not from a shape
+        # comparison, which would specialize the dynamic batch dimension under
+        # torch.compile.  The second disjunct is the models' own
+        # `_use_sequence_parallel`, which reshards without consulting
+        # `use_sequence_parallel_moe`; either one alone is too narrow.
+        config = get_current_vllm_config_or_none()
+        if config is None:
+            self.sequence_parallel_moe = False
+        else:
+            parallel_config = config.parallel_config
+            self.sequence_parallel_moe = parallel_config.use_sequence_parallel_moe or (
+                parallel_config.pipeline_parallel_size == 1
+                and parallel_config.enable_expert_parallel
+                and parallel_config.tensor_parallel_size > 1
+                and (
+                    config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+                    or parallel_config.data_parallel_size > 1
+                )
+            )
+
         self.is_group_quant = group_shape.is_per_group()
         if self.is_group_quant:
             self.group_size = group_shape.col
@@ -80,6 +104,30 @@ class QuantFP8(CustomOp):
                     "Only per-token or per-tensor scales are supported for dynamic "
                     "non-group quantization."
                 )
+
+    def _bounded_per_tensor_scale(self, x: torch.Tensor) -> torch.Tensor | None:
+        """A dynamic per-tensor scale taken over the real rows only.
+
+        Per-tensor is the one granularity whose amax crosses rows the token does
+        not own, and under cudagraphs the trailing padding rows hold the previous
+        replay's contents. Returns None for static, per-token and per-group
+        scales, which are bounded by construction, leaving the caller unchanged.
+        """
+        if self.static or not self.group_shape.is_per_tensor():
+            return None
+        if self.sequence_parallel_moe:
+            # These rows are one shard of the batch the mask describes, so
+            # bounding with it would be silently wrong. Support belongs where
+            # the sharding happens.
+            return None
+        # Reads the unsliced mask buffer; see `ForwardContext.is_padding_full`.
+        amax = padding_bounded_amax(x)
+        if amax is None:
+            return None
+        # Widen for the divide: `amax / _FP8_MAX` in fp32 lowers to a reciprocal
+        # multiply and does not match the kernel's correctly-rounded quotient.
+        # No `_FP8_MIN_SCALING_FACTOR` floor -- the kernel applies none either.
+        return (amax.double() / _FP8_MAX).float().clamp(min=1e-12).reshape(1)
 
     def forward_cuda(
         self,
@@ -121,9 +169,13 @@ class QuantFP8(CustomOp):
             and scale_ub.numel() == 1
         )
 
+        # A [1] scale takes the static per-tensor kernel, whose arithmetic is
+        # the dynamic one's minus the amax.
+        bounded_scale = self._bounded_per_tensor_scale(x) if scale is None else None
+
         return ops.scaled_fp8_quant(
             x,
-            scale,
+            scale if bounded_scale is None else bounded_scale,
             num_token_padding=self.num_token_padding,
             scale_ub=scale_ub,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
@@ -150,6 +202,9 @@ class QuantFP8(CustomOp):
         if use_aiter_per_group_quant:
             return rocm_aiter_ops.group_fp8_quant(x, self.group_size)
         if use_aiter_per_tensor_quant:
+            if scale is None:
+                # AITER's per-tensor amax is unbounded like the HIP kernel's.
+                scale = self._bounded_per_tensor_scale(x)
             return rocm_aiter_ops.per_tensor_quant(x, _FP8_DTYPE, scale)
         if use_aiter_per_token_quant:
             return rocm_aiter_ops.per_token_quant(x, _FP8_DTYPE, scale)
@@ -200,10 +255,12 @@ class QuantFP8(CustomOp):
                 x_max = x_max.unsqueeze(-1).to(torch.float32)
                 if scale_ub is not None:
                     x_max = x_max.clamp(max=scale_ub)
+                scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
             else:
-                x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
-
-            scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
+                scale = self._bounded_per_tensor_scale(x)
+                if scale is None:
+                    x_max = x.abs().max().unsqueeze(-1).to(torch.float32)
+                    scale = (x_max / _FP8_MAX).clamp(min=_FP8_MIN_SCALING_FACTOR)
         else:
             scale = prep_scale_for_group_broadcast(scale, x, self.group_shape)
 

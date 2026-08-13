@@ -24,6 +24,41 @@ INT4_DTYPE = scalar_types.uint4b8
 INT8_DTYPE = scalar_types.uint8b128
 
 
+def padding_bounded_amax(x: torch.Tensor) -> torch.Tensor | None:
+    """`x.abs().max()` taken over the rows that carry a real token.
+
+    A dynamic *per-tensor* scale is the one quantization granularity whose
+    reduction crosses rows the token does not own: one cudagraph padding row
+    holding a previous replay's values is enough to set the scale for the whole
+    tensor and drive every real row's quantized value toward zero.
+
+    Returns None when there is nothing to bound with -- no forward context, no
+    padding mask, or fewer than two dimensions -- leaving the caller unchanged.
+    `x` is flattened to 2-D, so its leading dimensions must index tokens; a
+    caller whose rows are token-expert slots needs a mask over those slots.
+    """
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if x.ndim < 2 or not is_forward_context_available():
+        return None
+    is_padding = get_forward_context().is_padding_full
+    if is_padding is None:
+        return None
+    x_2d = x.reshape(-1, x.shape[-1])
+    row_amax = x_2d.abs().amax(dim=-1).to(torch.float32)
+
+    # Slice rather than length-check: under torch.compile a concrete length
+    # compared against a symbolic `x.shape[0]` specializes the dynamic batch
+    # dimension.  `rest` -- the rows past the mask, empty unless the caller's
+    # rows outnumber the batch's -- is left unbounded, since a mask entry
+    # belonging to another row is worse than no mask at all.  The mask a caller
+    # gets must therefore be one its own rows index.
+    mask = is_padding[: row_amax.shape[0]]
+    covered = torch.where(mask, row_amax.new_zeros(()), row_amax[: mask.shape[0]])
+    rest = row_amax[mask.shape[0] :]
+    return torch.cat([covered, rest]).max()
+
+
 def get_fp8_min_max() -> tuple[float, float]:
     """Get the min and max values for FP8 quantization."""
     # Using the default value (240.0) from pytorch will cause accuracy

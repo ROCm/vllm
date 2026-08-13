@@ -765,6 +765,12 @@ class GPUModelRunner(
         self.positions = torch.zeros(
             self.max_num_tokens, dtype=torch.int64, device=self.device
         )
+        # Marks trailing cudagraph-padding rows.  Consumers (the fused topk
+        # routers, the per-tensor activation amaxes) saw `None` here until now:
+        # only the `v1/worker/gpu/` runner populated this mask.
+        self.is_padding = torch.zeros(
+            self.max_num_tokens, dtype=torch.bool, device=self.device
+        )
         self.query_start_loc = self._make_buffer(
             self.max_num_reqs + 1, dtype=torch.int32
         )
@@ -1052,6 +1058,27 @@ class GPUModelRunner(
             device=self.device,
             with_numpy=numpy,
         )
+
+    def _make_is_padding(
+        self, num_tokens_unpadded: int, num_tokens_padded: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the cudagraph-padding mask, sliced and unsliced.
+
+        Rows ``[num_tokens_unpadded, num_tokens_padded)`` exist only to reach a
+        captured graph size: they carry no request and hold whatever the
+        previous replay left in the graph pool.  The fills are unconditional
+        because the buffer is captured into the graph, so a step that skipped
+        them would replay the capturing step's values.
+
+        Returns:
+            The mask sliced to `num_tokens_padded`, and the whole buffer.  A
+            consumer reached through the forward context needs the unsliced one:
+            Dynamo bakes in the length, so a length that tracks the cudagraph
+            size is a wrong constant on every other size.
+        """
+        self.is_padding[:num_tokens_unpadded].fill_(False)
+        self.is_padding[num_tokens_unpadded:num_tokens_padded].fill_(True)
+        return self.is_padding[:num_tokens_padded], self.is_padding
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
@@ -4429,6 +4456,9 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        is_padding, is_padding_full = self._make_is_padding(
+            num_tokens_unpadded, num_tokens_padded
+        )
         with (
             set_forward_context(
                 attn_metadata,
@@ -4440,6 +4470,8 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                is_padding=is_padding,
+                is_padding_full=is_padding_full,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
@@ -6132,6 +6164,11 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            # A dummy run carries no real tokens, so every row is padding.
+            # Capture happens through this path, and a graph captured with the
+            # mask all-False would bake in the unbounded behaviour for every
+            # later replay.
+            is_padding, is_padding_full = self._make_is_padding(0, num_tokens_padded)
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -6143,6 +6180,8 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    is_padding=is_padding,
+                    is_padding_full=is_padding_full,
                 ),
             ):
                 outputs = self.model(
