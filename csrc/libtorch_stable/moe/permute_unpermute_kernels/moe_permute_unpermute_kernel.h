@@ -2,9 +2,8 @@
 // reference from tensorrt_llm moe kernel implementation archive in
 // https://github.com/BBuf/tensorrt-llm-moe/tree/master
 
-#include <c10/core/ScalarType.h>
-#include <torch/all.h>
-#include "dispatch.h"
+#include <torch/csrc/stable/tensor.h>
+#include "libtorch_stable/moe/permute_unpermute_kernels/dispatch.h"
 
 #ifdef USE_ROCM
   #include <hip/hip_runtime.h>
@@ -120,13 +119,13 @@ rocm_moe_convert<__hip_fp8_e5m2, float>(float val) {
 #endif  // USE_ROCM
 
 template <typename T>
-inline T* get_ptr(torch::Tensor& t) {
-  return reinterpret_cast<T*>(t.data_ptr());
+inline T* get_ptr(torch::stable::Tensor& t) {
+  return reinterpret_cast<T*>(t.mutable_data_ptr());
 }
 
 template <typename T>
-inline const T* get_ptr(const torch::Tensor& t) {
-  return reinterpret_cast<const T*>(t.data_ptr());
+inline const T* get_ptr(const torch::stable::Tensor& t) {
+  return reinterpret_cast<const T*>(t.const_data_ptr());
 }
 
 class CubKeyValueSorter {
