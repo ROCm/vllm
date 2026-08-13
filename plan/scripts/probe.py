@@ -180,9 +180,16 @@ def run_decode(
 def main():
     print(f"flashinfer {flashinfer.__version__}")
     print(f"gpu {torch.cuda.get_device_properties(0).gcnArchName}")
-    from flashinfer.aiter_utils import HAS_AITER
+    # 0.5.3+amd.1 exposed HAS_AITER; later builds replaced it with
+    # is_aiter_supported(), the helper the README always documented.
+    try:
+        from flashinfer.aiter_utils import HAS_AITER
 
-    print(f"HAS_AITER={HAS_AITER}")
+        print(f"HAS_AITER={HAS_AITER}")
+    except ImportError:
+        from flashinfer.aiter_utils import is_aiter_supported
+
+        print(f"is_aiter_supported={is_aiter_supported(torch.device('cuda'))}")
     dec_sig = inspect.signature(flashinfer.BatchDecodeWithPagedKVCacheWrapper.__init__)
     print(f"decode __init__ params: {list(dec_sig.parameters)}")
 

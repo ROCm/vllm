@@ -4,7 +4,43 @@
 **Hardware:** AMD Instinct MI300X, `gfx942:sramecc+:xnack-`
 **Found:** 2026-07-31, while integrating amd-flashinfer as a vLLM attention backend
 **Severity:** High — wrong numerical output, no error raised, on the **default** code path
-**Status:** Open, not reported upstream yet
+**Status:** findings #1 and #2 **FIXED** upstream; #3 open; two new regressions
+opened. See "Retest" below before acting on anything in this document.
+
+---
+
+## Retest against a newer build (2026-08-12)
+
+Everything below describes `0.5.3+amd.1`, the published wheel. It was re-run
+against a source build of `amd-integration` at commit `afc7a613`
+(`0.5.3+amd.2.dev55`), on MI300X / ROCm 7.2.3 / torch 2.12.0.
+
+| paged prefill | `+amd.1` | `+amd.2.dev55` |
+|---|---|---|
+| `fa2` fp16 / bf16 | wrong (3.5) | **correct (1.6e-2)** ✅ |
+| `aiter` fp16 | correct | **wrong (3.5)** ⚠️ new |
+| `aiter` bf16 | correct | **fails to compile** ⚠️ new |
+| `auto` resolves to | `fa2` | `aiter` |
+| decode, all routes | correct | correct |
+
+- **Finding #1 (fa2 prefill wrong) is FIXED.**
+- **Finding #2 (`auto` never reaches AITER) is FIXED** — `auto` now routes to
+  AITER, confirmed bitwise.
+- **Finding #3 (`-DUSE_ROCM`) is still unfixed**; the retest required applying
+  `scripts/patch_use_rocm.py` locally before anything would JIT on torch 2.12.
+- **Two new regressions on the AITER prefill path.** bf16 fails to compile —
+  the generated `batch_prefill_aiter_config.inc` uses `__hip_bfloat16`, which
+  does not exist in ROCm 7.2.3 (`hip_bfloat16`, no leading underscores, does).
+  fp16 compiles but returns max-abs ≈ 3.5 vs SDPA. Because `auto` now routes
+  to AITER, the default path is still broken — the failure moved rather than
+  closed.
+- API change: `aiter_utils.HAS_AITER` was replaced by `is_aiter_supported()`.
+
+Caveat: the retest ran on a locally patched build (`-DUSE_ROCM`). The bf16
+compile error is clearly independent of that patch; the fp16 numerical result
+would ideally be reproduced without it, on torch ≤ 2.10.
+
+---
 
 ## Four findings in this document
 
