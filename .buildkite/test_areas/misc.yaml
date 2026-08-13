@@ -396,6 +396,7 @@ steps:
     - pip install pytest-timeout pytest-forked
     - pytest -v -s v1/determinism/test_batch_invariance.py
     - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
+    - pytest -v -s v1/determinism/test_padding_bounded_quant.py
     - VLLM_TEST_MODEL=deepseek-ai/DeepSeek-V2-Lite-Chat pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k TRITON_MLA
     - VLLM_TEST_MODEL=Qwen/Qwen3-30B-A3B-Thinking-2507-FP8 pytest -v -s v1/determinism/test_batch_invariance.py::test_v1_generation_is_deterministic_across_batch_sizes_with_needle -k FLASH_ATTN
 
@@ -419,6 +420,67 @@ steps:
     - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
     - pytest -v -s v1/determinism/test_cutlass_batch_invariance.py
     - pytest -v -s v1/determinism/test_online_batch_invariance.py
+
+# The multi-GPU batch-invariance steps below are split by device count because
+# batch invariance breaks differently in each parallelism, so a failure names
+# the axis. Keep the per-module pytest invocations separate as well: the
+# determinism conftest asserts that VRAM has settled between modules, so a leak
+# in one module fails the next module's teardown and blames the wrong file.
+
+- label: Batch Invariance (2 GPUs)
+  key: batch-invariance-2-gpus
+  timeout_in_minutes: 60
+  optional: true
+  device: h100
+  num_devices: 2
+  source_file_dependencies:
+    - vllm/v1/attention
+    - vllm/model_executor/layers
+    - vllm/distributed
+    - tests/v1/determinism/
+  commands:
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - pip install pytest-timeout pytest-forked
+    - pytest -v -s v1/determinism/test_pp_batch_invariant.py -m 'distributed(num_gpus=2)'
+    - pytest -v -s v1/determinism/test_dp_batch_invariant.py -m 'distributed(num_gpus=2)'
+
+- label: Batch Invariance (4 GPUs)
+  key: batch-invariance-4-gpus
+  timeout_in_minutes: 90
+  optional: true
+  device: h100
+  num_devices: 4
+  source_file_dependencies:
+    - vllm/v1/attention
+    - vllm/model_executor/layers
+    - vllm/distributed
+    - tests/v1/determinism/
+  commands:
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - pip install pytest-timeout pytest-forked
+    - pytest -v -s v1/determinism/test_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
+    - pytest -v -s v1/determinism/test_prefix_cache_ep_batch_invariant.py -m 'distributed(num_gpus=4)'
+    - pytest -v -s v1/determinism/test_ep_all2all_batch_invariant.py -m 'distributed(num_gpus=4)'
+    - pytest -v -s v1/determinism/test_tp_all_reduce_batch_invariant.py -m 'distributed(num_gpus=4)'
+    - pytest -v -s v1/determinism/test_tp_reduce_scatter_batch_invariant.py -m 'distributed(num_gpus=4)'
+
+- label: Batch Invariance (8 GPUs)
+  key: batch-invariance-8-gpus
+  timeout_in_minutes: 60
+  optional: true
+  device: h100
+  num_devices: 8
+  source_file_dependencies:
+    - vllm/v1/attention
+    - vllm/model_executor/layers
+    - vllm/distributed
+    - tests/v1/determinism/
+  commands:
+    - export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    - pip install pytest-timeout pytest-forked
+    - pytest -v -s v1/determinism/test_pp_tp_batch_invariant.py -m 'distributed(num_gpus=8)'
+    - pytest -v -s v1/determinism/test_tp_all_reduce_batch_invariant.py -m 'distributed(num_gpus=8)'
+    - pytest -v -s v1/determinism/test_tp_reduce_scatter_batch_invariant.py -m 'distributed(num_gpus=8)'
 
 - label: Acceptance Length Test (Large Models) # optional
   device: h200_35gb

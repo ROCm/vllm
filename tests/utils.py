@@ -1850,6 +1850,24 @@ def _format_subprocess_exit(returncode: int) -> str:
 _SPAWN_CHILD_ENV = "VLLM_TEST_SPAWN_CHILD"
 
 
+def _rootdir_for_import(module_name: str) -> str | None:
+    """The `sys.path` entry pytest prepended in order to import `module_name`.
+
+    A child interpreter that re-imports a test module by name has to insert the
+    same directory, and no other: the first one above the file that is not a
+    package. Inserting the file's own directory instead would put a sibling of
+    its `__init__.py` ahead of an installed distribution of the same name
+    (`tests/models/transformers/`).
+    """
+    module = sys.modules[module_name]
+    if module.__file__ is None:
+        return None
+    rootdir = Path(module.__file__).resolve().parent
+    while (rootdir / "__init__.py").exists():
+        rootdir = rootdir.parent
+    return str(rootdir)
+
+
 def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]:
     """Decorator to spawn a new process for each test function.
 
@@ -1884,6 +1902,7 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
             payload = cloudpickle.dumps(
                 {
                     "module": f.__module__,
+                    "module_dir": _rootdir_for_import(f.__module__),
                     "qualname": f.__qualname__,
                     "args": args,
                     "kwargs": kwargs,
@@ -1898,6 +1917,8 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
                 "except ImportError:\n"
                 "    class Skipped(BaseException): pass\n"
                 "data = cloudpickle.loads(sys.stdin.buffer.read())\n"
+                "if data['module_dir'] is not None:\n"
+                "    sys.path.insert(0, data['module_dir'])\n"
                 "mod = importlib.import_module(data['module'])\n"
                 "target = mod\n"
                 "for name in data['qualname'].split('.'):\n"
