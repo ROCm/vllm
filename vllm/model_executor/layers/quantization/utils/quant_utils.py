@@ -49,10 +49,10 @@ def padding_bounded_amax(x: torch.Tensor) -> torch.Tensor | None:
 
     # Slice rather than length-check: under torch.compile a concrete length
     # compared against a symbolic `x.shape[0]` specializes the dynamic batch
-    # dimension.  `rest` is the rows past the mask, left unbounded, since a mask
-    # entry belonging to another row is worse than no mask at all.  Rows that
-    # are not a prefix of the batch -- a microbatch, a DP-gathered input -- are
-    # therefore not bounded here.
+    # dimension.  `rest` -- the rows past the mask, empty unless the caller's
+    # rows outnumber the batch's -- is left unbounded, since a mask entry
+    # belonging to another row is worse than no mask at all.  The mask a caller
+    # gets must therefore be one its own rows index.
     mask = is_padding[: row_amax.shape[0]]
     covered = torch.where(mask, row_amax.new_zeros(()), row_amax[: mask.shape[0]])
     rest = row_amax[mask.shape[0] :]

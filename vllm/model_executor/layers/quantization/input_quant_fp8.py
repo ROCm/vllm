@@ -76,17 +76,23 @@ class QuantFP8(CustomOp):
         # `ForwardContext.is_padding` stays full-batch, so the mask no longer
         # describes these rows.  Decided from config, not from a shape
         # comparison, which would specialize the dynamic batch dimension under
-        # torch.compile.  The model-side predicate also admits mega-MoE at
-        # dp_size 1, which `use_sequence_parallel_moe` does not.
+        # torch.compile.  The second disjunct is the models' own
+        # `_use_sequence_parallel`, which reshards without consulting
+        # `use_sequence_parallel_moe`; either one alone is too narrow.
         config = get_current_vllm_config_or_none()
-        self.sequence_parallel_moe = config is not None and (
-            config.parallel_config.use_sequence_parallel_moe
-            or (
-                config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-                and config.parallel_config.enable_expert_parallel
-                and config.parallel_config.tensor_parallel_size > 1
+        if config is None:
+            self.sequence_parallel_moe = False
+        else:
+            parallel_config = config.parallel_config
+            self.sequence_parallel_moe = parallel_config.use_sequence_parallel_moe or (
+                parallel_config.pipeline_parallel_size == 1
+                and parallel_config.enable_expert_parallel
+                and parallel_config.tensor_parallel_size > 1
+                and (
+                    config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+                    or parallel_config.data_parallel_size > 1
+                )
             )
-        )
 
         self.is_group_quant = group_shape.is_per_group()
         if self.is_group_quant:

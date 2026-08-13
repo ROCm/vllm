@@ -131,8 +131,10 @@ def test_moe_a2_scale_ignores_unrouted_slots(vllm_config):
 def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch):
     """Sequence-parallel MoE shards the tokens; the mask stays full-batch.
 
-    Slicing it would apply the leading window to whatever shard the rank holds,
-    so the bound must be off here -- not merely different.
+    Slicing it would apply the leading window to whatever shard the rank holds
+    -- and since padding is trailing, the shard holding it would get an
+    all-False mask and the bound would become a silent no-op. So it must be
+    off here, not merely different.
     """
     device = current_platform.device_type
     monkeypatch.setattr(
