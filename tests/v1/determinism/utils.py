@@ -181,8 +181,9 @@ def shutdown_llm(llm) -> None:
 
     The VRAM comes back with the child a second or two after the caller drops
     its last reference to ``llm``, which is what the inter-module settle in
-    ``conftest.py`` absorbs. In-process engines
-    (``VLLM_ENABLE_V1_MULTIPROCESSING=0``) are not covered.
+    ``conftest.py`` absorbs. Under ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` the
+    engine still shuts down, but its VRAM is not recoverable in-process; run
+    those tests in a spawned interpreter.
     """
     llm.llm_engine.engine_core.shutdown()
 

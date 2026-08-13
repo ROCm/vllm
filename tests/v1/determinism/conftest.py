@@ -23,14 +23,15 @@ def settle_gpu_memory_between_modules():
     memory, so a heavy module makes the next one fail at startup rather than
     merely run slower.
 
-    Module scope, not function scope: the amdsmi query costs ~2s. It asserts
-    rather than warns -- the 10% threshold clears the allocator and Triton
-    residue a kernel module leaves in-process, so tripping it means a whole
-    engine is still resident and the run should say so at the module that
-    caused it. No-op off ROCm.
+    Module scope, not function scope: the settle waits for two seconds of
+    stable readings, and blocks for its full timeout before failing. It
+    asserts rather than warns -- the default threshold clears the allocator
+    and Triton residue a kernel module leaves in-process, so tripping it means
+    a whole engine is still resident and the run should say so at the module
+    that caused it. No-op off ROCm.
     """
     yield
 
     from tests.utils import wait_for_rocm_memory_to_settle
 
-    wait_for_rocm_memory_to_settle(threshold_ratio=0.1)
+    wait_for_rocm_memory_to_settle()
