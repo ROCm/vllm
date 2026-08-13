@@ -304,6 +304,16 @@ class AutoAWQConfig(QuantizationConfig):
             if current_platform.is_cpu():
                 return AutoAWQMarlinLinearMethod(self)
 
+            # Same on ROCm: there is no Marlin kernel, but the same method
+            # reaches choose_mp_linear_kernel, which picks the HIP w4a16
+            # kernels (Hybrid/HipW4A16LinearKernel) and their awq_gemv_hip
+            # decode path. Before upstream consolidated the AWQ configs, the
+            # fork got here via AWQConfig overriding itself to awq_marlin;
+            # routing straight to this method preserves that. Falling through
+            # to AutoAWQLinearMethod instead costs ~30% decode.
+            if current_platform.is_rocm():
+                return AutoAWQMarlinLinearMethod(self)
+
             # Check if Marlin is supported and not using batch invariant mode
             # (Marlin kernels are not batch invariant)
             use_marlin = (
