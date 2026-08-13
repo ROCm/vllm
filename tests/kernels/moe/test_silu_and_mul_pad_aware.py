@@ -122,11 +122,11 @@ def test_swiglu_limit_out_of_range_expert_id(bad):
     n = 64
     inp = torch.randn(n, 2 * HIDDEN, dtype=torch.bfloat16, device=device)
     ids = torch.randint(0, LOCAL_EXPERTS, (n,), dtype=torch.int64, device=device)
-    ids[0] = bad
+    ids[n // 2] = bad
     emap = _expert_map(device)
 
     out = torch.zeros(n, HIDDEN, dtype=torch.bfloat16, device=device)
     swiglu_limit_func(out, inp, 7.0, topk_ids=ids, expert_map=emap)
     torch.accelerator.synchronize()
 
-    assert torch.count_nonzero(out[0]) == 0, "out-of-range slot was computed"
+    assert torch.count_nonzero(out[n // 2]) == 0, "out-of-range slot was computed"

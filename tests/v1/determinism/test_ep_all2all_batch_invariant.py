@@ -109,12 +109,11 @@ DP = 4
 NEEDLE_RANK = 2
 NEEDLE_MAX_TOKENS = 32
 LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LOAD_CONCURRENCY", "24"))
-# The MoRI arm needs more. What the guard below wants is for the needle's
-# prefill step to have company, and that arm runs the whole padded receive
-# buffer through Triton every step -- it served roughly a third as many
-# requests as the others in the same wall clock. At the shared default the
-# needle's prefill got a step to itself in both conditions and the guard
-# (correctly) refused the verdict; at this exposure it does not.
+# The default is tuned for the bf16 high-throughput arm. What the guard below
+# wants is for the needle's prefill step to have company; MoRI runs the whole
+# padded receive buffer through Triton every step and serves far fewer requests
+# in the same wall clock, so at the shared default the needle's prefill gets a
+# step to itself and the guard correctly refuses a verdict.
 MORI_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_MORI_LOAD_CONCURRENCY", "96"))
 # The LoRA arm is eager, so it serves fewer requests per second and needs more
 # in flight to reach the same exposure.

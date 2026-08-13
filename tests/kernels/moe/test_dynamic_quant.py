@@ -63,4 +63,7 @@ def test_unroutable_row_cannot_set_the_scale(bad):
     unrouted = scale_for(-1)
     # Sync explicitly: an out-of-bounds address faults asynchronously.
     torch.accelerator.synchronize()
+    # Positive control: the row must be able to move the scale when it is
+    # routed, or an agreement with `-1` says nothing about exclusion.
+    assert not torch.equal(unrouted, scale_for(0))
     assert torch.equal(unrouted, scale_for(bad))
