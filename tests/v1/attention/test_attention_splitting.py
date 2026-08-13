@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
+import vllm.envs as envs
 from tests.v1.attention.test_attention_backends import BATCH_SPECS
 from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
 from vllm.v1.attention.backends.utils import (
@@ -329,8 +333,6 @@ def test_prefill_split_across_ubatches(
     seq_lens, query_lens, split_point, expected_first_reqs, expected_second_reqs
 ):
     """Test splitting a prefill across ubatches"""
-    import numpy as np
-
     device = torch.device("cpu")
     batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
     common = create_common_attn_metadata(batch_spec, block_size=16, device=device)
@@ -483,8 +485,6 @@ def test_build_attention_metadata_zeros_stale_is_prefilling():
 )
 def test_request_aligned_split_points(query_lens, num_tokens_padded, expected):
     """Split points must coincide with request boundaries."""
-    import numpy as np
-
     num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
     num_ubatches = len(expected) + 1
     points = request_aligned_split_points(
@@ -515,8 +515,6 @@ def test_request_aligned_split_points_declines(query_lens, num_ubatches):
     `can_align_ubatch_split` is the pre-collective form of the same question and
     has to agree, since the DP ranks decide before the split point is computed.
     """
-    import numpy as np
-
     num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
     assert (
         request_aligned_split_points(
@@ -546,8 +544,6 @@ def test_aligned_ubatch_slices_never_split_a_request(seq_lens, query_lens):
     slices must leave every request whole, which shows up as an unchanged
     seq_lens and a query_start_loc starting at zero.
     """
-    import numpy as np
-
     device = torch.device("cpu")
     batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
     common = create_common_attn_metadata(batch_spec, block_size=16, device=device)
@@ -585,8 +581,6 @@ def test_aligned_ubatch_slices_never_split_a_request(seq_lens, query_lens):
 
 def test_unaligned_split_is_unchanged_by_default():
     """Alignment is opt-in; the default path keeps cutting wherever it likes."""
-    import numpy as np
-
     query_lens = [150, 150, 150]
     num_scheduled_tokens = np.array(query_lens, dtype=np.int32)
 
@@ -657,13 +651,7 @@ def test_alignment_gate(
     monkeypatch, batch_invariant, use_ubatching, dp_size, backend, expected
 ):
     """All four predicates are load-bearing, so each is pinned separately."""
-    from types import SimpleNamespace
-
-    import vllm.envs as envs
-    from vllm.v1.worker import ubatch_utils
-
     monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", batch_invariant)
-    monkeypatch.setattr(ubatch_utils.envs, "VLLM_BATCH_INVARIANT", batch_invariant)
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             use_ubatching=use_ubatching,

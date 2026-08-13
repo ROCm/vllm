@@ -68,6 +68,7 @@ from utils import (
 )
 
 from tests.utils import RemoteOpenAIServer, large_gpu_mark, multi_gpu_marks
+from vllm.utils.import_utils import has_deep_ep
 
 pytestmark = [
     skip_if_not_cuda_alike,
@@ -283,17 +284,21 @@ _EXPECTED_MANAGER = {
 def dbo_server(request, tmp_path, enable_batch_invariant_mode):
     """A DP=4 + EP server with DBO enabled, once per all2all backend.
 
-    The low-latency arm requires a DeepEP carrying the low-latency ordering
-    fix; see the module docstring. Without it the server does not start and
-    this arm times out rather than failing fast, which is the cost of covering
-    a configuration whose blocker lived in another repository.
+    Skipped without the `deep_ep` package: the engine never comes up and the
+    server sits out its whole `max_wait_seconds`, so an unequipped machine
+    burns half an hour per arm to produce an error where a skip is honest. A
+    DeepEP that lacks the low-latency ordering fix (see the module docstring)
+    times out the same way, and cannot be detected by import.
 
     Function scoped and explicitly dependent on the autouse
     `enable_batch_invariant_mode` fixture: a module-scoped server is built
     before that fixture runs, so it would launch with VLLM_BATCH_INVARIANT
-    unset while this process believed it set. The `modes` assertion catches
-    that, and has.
+    unset while this process believed it set; the `modes` assertion catches
+    that.
     """
+    if not has_deep_ep():
+        pytest.skip("requires the deep_ep package")
+
     log_prefix = str(tmp_path / "ubatch")
 
     args = [

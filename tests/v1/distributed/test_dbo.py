@@ -33,10 +33,9 @@ DP_SIZE = 2
 NUM_QUESTIONS = 256  # Fast eval for CI; but must be large enough to hit dbo thresholds
 NUM_SHOTS = 5  # Few-shot examples
 # The eval fires all questions concurrently, so batch composition -- and with
-# it the numerics -- differs between runs. Measured across 144 post-warmup
-# evals: mean 0.65, stdev 0.013, min 0.633. Before lowering this floor again,
-# check whether the failing runs scored near zero: that is a crashed request,
-# not numerics.
+# it the numerics -- differs between runs; measured mean 0.65, stdev 0.013.
+# Before lowering this floor, check whether the failing runs scored near zero:
+# that is a crashed request, not numerics.
 MIN_ACCURACY = 0.62
 # A cold server answers its first burst badly (2.7-3.5% unparsable against 0.4%
 # once warm). Fail on that separately: a server that could not be parsed did
