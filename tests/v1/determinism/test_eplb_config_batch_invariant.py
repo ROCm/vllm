@@ -18,13 +18,12 @@ dependence, and batch invariance does not forbid it; it forbids a token's
 output depending on its *batch-mates*. The replica hash is the only part of
 EPLB that does that, and it is the only part refused here.
 
-The measurement behind the refusal, which has no test of its own: DeepSeek-V2-
-Lite, DP=4 x EP=4, `num_redundant_experts=8`, expert placement held still with
-zero committed rearrangements -- 64 of 64 needle logprobs moved when 32
-companions shared its rank, and 0 of 64 when 24 companions ran on the other
-three ranks instead. Only companions that change the needle's own row index
-move it, which is the signature of the hash rather than of the collective. The
-same sweep at `num_redundant_experts=0` moved 0 of 64 in every condition.
+The refusal rests on measurement rather than audit, and that measurement has no
+test of its own: with expert placement held still (DeepSeek-V2-Lite, DP=4 x
+EP=4, `num_redundant_experts=8`), a needle's logprobs move only when a companion
+changes the needle's own row index, which is the replica hash's signature and
+not the collective's. The same sweep at `num_redundant_experts=0` is clean in
+every condition.
 
 This module is deliberately cheap: it constructs the config objects directly,
 costs milliseconds, and needs neither a model nor a device, so it runs in a
