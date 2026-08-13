@@ -128,8 +128,8 @@ class Scheduler(SchedulerInterface):
         # batch left over moves the request's chunk boundaries with the batch,
         # and MLA prefill splits its attention at exactly those boundaries
         # (context chunks merged with the causal new-token chunk), so the
-        # logprobs move too. Cap chunks at a size that always fits once the
-        # other slots are decoding and defer instead of truncating.
+        # logprobs move too. Cap chunks at a size that always fits once every
+        # slot is decoding, and defer instead of truncating.
         # Without chunked prefill a prompt is scheduled whole or not at all, so
         # there is no boundary to pin and the cap would only introduce one.
         self.batch_invariant_prefill_chunk = 0
