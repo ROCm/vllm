@@ -76,6 +76,9 @@ jobs:
           # after each job), so installing into the system Python is safe.
           # The container's Debian base ships the PEP 668 EXTERNALLY-MANAGED
           # marker which uv enforces by default.
+          # TEMPORARY PIN: transformers 5.15.0+ breaks Gemma-4 models with
+          # AmbiguousGlobalPerLayerAttributeError. Pin to 5.14.1 (last working
+          # version) until vLLM adds compatibility fixes.
           uv pip install --system --break-system-packages --link-mode=copy \
             -c constraints.txt \
             "$(echo dist/vllm-*.whl)[device-gfx1151]" \
@@ -86,7 +89,7 @@ jobs:
             "pytest-timeout" \
             "sentencepiece" \
             "tblib" \
-            "transformers" \
+            "transformers==5.14.1" \
             --index-url ${{ env.PYTORCH_INDEX_URL }} \
             --extra-index-url https://pypi.org/simple/ \
             --index-strategy unsafe-best-match \
