@@ -13,6 +13,7 @@ of them can pass by being vacuous.
 
 import pytest
 import torch
+from utils import skip_if_not_cuda_alike
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
@@ -20,6 +21,8 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
+
+pytestmark = [skip_if_not_cuda_alike]
 
 # A value no activation produces, so a scale that moved when it appeared can
 # only have read a row nothing wrote. Not NaN and not Inf: the amax kernels use
@@ -35,9 +38,6 @@ def vllm_config():
         yield cfg
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
-)
 def test_linear_per_tensor_scale_ignores_cudagraph_padding(vllm_config):
     device = current_platform.device_type
     quant = QuantFP8(static=False, group_shape=GroupShape.PER_TENSOR)
@@ -66,9 +66,6 @@ def test_linear_per_tensor_scale_ignores_cudagraph_padding(vllm_config):
     assert float(unbounded) > 1e6 * float(bounded)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
-)
 def test_linear_per_tensor_scale_unchanged_when_nothing_is_padding(vllm_config):
     """An all-False mask must be a bitwise no-op, not merely a close one."""
     device = current_platform.device_type
@@ -88,9 +85,6 @@ def test_linear_per_tensor_scale_unchanged_when_nothing_is_padding(vllm_config):
     assert torch.equal(q_masked.view(torch.uint8), q_plain.view(torch.uint8))
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
-)
 def test_moe_a2_scale_ignores_unrouted_slots(vllm_config):
     """The contiguous a2 buffer is one slot per token-expert pair.
 
@@ -125,9 +119,6 @@ def test_moe_a2_scale_ignores_unrouted_slots(vllm_config):
     assert torch.equal(fallback, unbounded)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
-)
 def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch):
     """Sequence-parallel MoE shards the tokens; the mask stays full-batch.
 
@@ -163,9 +154,6 @@ def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch)
     assert float(scale) > 1e26
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
-)
 def test_moe_a1_scale_ignores_cudagraph_padding(vllm_config):
     """The MoE's *first* activation quantize is one row per token.
 
@@ -199,9 +187,6 @@ def test_moe_a1_scale_ignores_cudagraph_padding(vllm_config):
     assert torch.equal(opted_out, unbounded)
 
 
-@pytest.mark.skipif(
-    not current_platform.is_cuda_alike(), reason="needs a CUDA-alike device"
-)
 def test_mask_shorter_than_the_batch_leaves_the_rest_unbounded(vllm_config):
     """A mask that runs out must not be stretched over the rows it never saw.
 
