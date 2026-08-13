@@ -1572,6 +1572,46 @@ class VllmConfig:
                     "count, or unset VLLM_BATCH_INVARIANT."
                 )
 
+            if self.parallel_config.enable_eplb:
+                redundant = self.parallel_config.eplb_config.num_redundant_experts
+                if redundant > 0:
+                    # The router picks between a logical expert's replicas by
+                    # hashing the token's row index in the current forward
+                    # (`_eplb_map_and_record_i32_kernel`). The replicas hold
+                    # the same weights, so the choice is mathematically
+                    # irrelevant and numerically is not: it moves the token to
+                    # a different rank's GEMM and a different position in the
+                    # combine.
+                    raise ValueError(
+                        "EPLB with redundant experts is not supported with "
+                        "VLLM_BATCH_INVARIANT "
+                        f"(eplb_config.num_redundant_experts={redundant}). A "
+                        "logical expert with more than one physical replica is "
+                        "routed by hashing the token's index within the batch, "
+                        "so which replica -- and therefore which rank -- serves "
+                        "a token depends on what else is batched with it. Set "
+                        "num_redundant_experts to 0, which is batch invariant, "
+                        "or unset VLLM_BATCH_INVARIANT."
+                    )
+                # Rearrangement is a *temporal* dependence, not a batch one:
+                # `eplb_step()` runs after the forward pass, so a request's
+                # output depends on the traffic that preceded it rather than on
+                # its batch-mates. Warn rather than refuse, and state it as a
+                # possibility: a server whose load stays balanced never commits
+                # a rearrangement, and
+                # `eplb_state._note_rearrangement_committed` reports the ones
+                # that are.
+                logger.warning_once(
+                    "EPLB is enabled with VLLM_BATCH_INVARIANT. Output remains "
+                    "invariant to batch composition, but may stop being "
+                    "reproducible across runs: EPLB moves experts between "
+                    "ranks based on the load it has observed, so once it does "
+                    "so a request's output depends on the traffic that "
+                    "preceded it. Disable EPLB if you need run-to-run "
+                    "reproducibility; the rearrangement that costs it is "
+                    "logged when it happens."
+                )
+
             # These passes rewrite the collective the communicator would have
             # run -- sequence parallelism and AsyncTP into reduce-scatter +
             # all-gather, the fusions into a fused all-reduce+RMSNorm kernel --

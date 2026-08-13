@@ -1100,6 +1100,13 @@ class VllmBackend:
             local_cache_dir, disable_cache, self.prefix
         )
 
+        # Under batch invariance, report kernels whose config was settled by an
+        # on-device race -- including races run by whatever process built this
+        # cache entry, since reloading it skips Inductor entirely.
+        from vllm.model_executor.layers.batch_invariant import note_compile_cache_dir
+
+        note_compile_cache_dir(None if disable_cache else local_cache_dir)
+
         # Reuses existing cache key
 
         logger.debug(

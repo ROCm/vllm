@@ -2499,6 +2499,7 @@ steps:
   - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
   - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
+  - pytest -v -s v1/determinism/test_eplb_config_batch_invariant.py
   - pytest -v -s v1/determinism/test_padding_bounded_quant.py
   - pytest -v -s v1/determinism/test_moe_row_permutation_batch_invariant.py
   - pytest -v -s v1/determinism/test_batched_moe_batch_invariant.py
@@ -3695,6 +3696,7 @@ steps:
   - pytest -v -s v1/determinism/test_rms_norm_batch_invariant.py
   - pytest -v -s v1/determinism/test_matmul_batch_invariant.py
   - pytest -v -s v1/determinism/test_online_batch_invariance.py
+  - pytest -v -s v1/determinism/test_eplb_config_batch_invariant.py
   - pytest -v -s v1/determinism/test_padding_bounded_quant.py
   - pytest -v -s v1/determinism/test_moe_row_permutation_batch_invariant.py
   - pytest -v -s v1/determinism/test_batched_moe_batch_invariant.py

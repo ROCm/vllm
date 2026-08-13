@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import math
 import os
 from collections.abc import Callable
@@ -8,11 +9,14 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.mem_utils import get_max_shared_memory_bytes
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import is_torch_equal_or_newer
+
+logger = init_logger(__name__)
 
 
 def _matmul_launch_metadata(
@@ -1456,11 +1460,171 @@ def override_envs_for_invariance():
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
 
+_autotuned_kernels: list[str] = []
+_autotune_watch_installed = False
+
+
+_compile_cache_dir: str | None = None
+_AUTOTUNED_MARKER = "autotuned_kernels.json"
+_autotune_reported = False
+
+
+def autotuned_kernels() -> list[str]:
+    """Kernels whose config this process settled by timing, in order."""
+    return list(_autotuned_kernels)
+
+
+def _warn_autotuned(kernels: list[str], from_cache: bool) -> None:
+    # Not warning_once: its dedupe key is the interpolated message, and the
+    # kernel list grows as codegen proceeds, so every newly raced kernel would
+    # re-emit the whole paragraph with a larger count.
+    global _autotune_reported
+    if _autotune_reported:
+        return
+    _autotune_reported = True
+    logger.warning(
+        "Inductor chose the config for at least one kernel by timing candidates "
+        "on a device%s. Every worker process holds its own race and caches its "
+        "own winner, so processes need not agree: replicas can answer the same "
+        "request differently, ranks of one model can compute a replicated op "
+        "differently, and a single process can change its answer across a cache "
+        "clear. Each process stays internally batch invariant either way. See "
+        "batch_invariant._watch_for_autotune_races for which Inductor benchmarks "
+        "to pin. Kernels: %s",
+        " when this cache entry was built" if from_cache else "",
+        ", ".join(kernels),
+    )
+
+
+def note_compile_cache_dir(cache_dir: str | None) -> None:
+    """Attach the autotune report to a compile cache entry.
+
+    Called by the compile backend once the cache directory for this rank is
+    known and before anything is compiled into it. Two jobs: say so if a
+    previous process already recorded races for this entry, and give the watch
+    somewhere to record its own.
+
+    Without this the report is only ever emitted on the compile that makes the
+    decision, never on the restarts that inherit it -- and inheriting it is the
+    normal case, because vLLM reloads its serialized artifacts without running
+    Inductor codegen at all.
+    """
+    global _compile_cache_dir
+    if not envs.VLLM_BATCH_INVARIANT:
+        return
+    _compile_cache_dir = cache_dir
+    if cache_dir is None:
+        return
+    marker = os.path.join(cache_dir, _AUTOTUNED_MARKER)
+    try:
+        if os.path.exists(marker):
+            with open(marker) as f:
+                kernels = json.load(f)
+            if kernels:
+                _warn_autotuned(kernels, from_cache=True)
+    except (OSError, ValueError):
+        logger.debug("Could not read %s", marker)
+
+
+def _record_autotuned_to_cache() -> None:
+    if _compile_cache_dir is None:
+        return
+    marker = os.path.join(_compile_cache_dir, _AUTOTUNED_MARKER)
+    try:
+        os.makedirs(_compile_cache_dir, exist_ok=True)
+        with open(marker, "w") as f:
+            json.dump(sorted(set(_autotuned_kernels)), f, indent=2)
+    except OSError:
+        logger.debug("Could not record autotuned kernels to %s", marker)
+
+
+def _watch_for_autotune_races() -> None:
+    """Report kernels whose config was chosen by an on-device race.
+
+    Inductor settles some kernels by timing their candidate configs at first
+    call, in the process that will then serve with the winner, and freezes that
+    winner for the life of the process.
+
+    A tile size ought to be numerically inert for a pointwise kernel and is not:
+    with `enable_fp_fusion` the backend may contract `a*b + c*d` into an FMA or
+    not, and which it picks follows the vectorisation width the tile size
+    implies. Two processes that raced to different winners are therefore running
+    different arithmetic. Disabling fp fusion removes the disagreement, but it is
+    a global that slows every Triton kernel and leaves every other raced knob
+    untouched.
+
+    That is not a batch dependence and the mode's contract survives it: every
+    token in a process meets the same kernel whatever it was batched with. What
+    it costs is agreement *between* processes -- data-parallel replicas, ranks
+    computing a replicated op, and one process either side of a cache clear.
+    That is reproducibility rather than batch invariance, the same class as
+    EPLB's rearrangement, so it is reported rather than refused.
+
+    The hook is `check_autotune_cache` rather than the race itself, because the
+    race usually does not run here -- the cache collapses the candidate list to
+    the winner whenever one is on disk, and it is keyed per rank. Watching the
+    cache check reports the kernel either way. vLLM's own compile cache reloads
+    serialized artifacts without running Inductor at all, so the finding is also
+    written into the cache entry and re-emitted from there -- see
+    `note_compile_cache_dir`.
+    """
+    global _autotune_watch_installed
+    if _autotune_watch_installed:
+        return
+    try:
+        from torch._inductor.runtime import triton_heuristics
+
+        original = triton_heuristics.check_autotune_cache
+    except (AttributeError, ImportError):
+        # Inductor's internals are not a stable interface. Losing the report is
+        # not worth failing startup over, but say so, because a silent absence
+        # reads exactly like "nothing was raced".
+        logger.debug(
+            "Could not watch Inductor's autotuner; this process cannot report "
+            "whether any kernel config was chosen by an on-device race."
+        )
+        return
+
+    def check_autotune_cache(configs, filename, inductor_meta):
+        result = original(configs, filename, inductor_meta)
+        try:
+            if len(configs) <= 1:
+                # Nothing to choose between, so nothing to be non-deterministic
+                # about.
+                return result
+            name = (inductor_meta or {}).get("kernel_name", "<unnamed>")
+            info = result[2] if len(result) > 2 else None
+            state = (info or {}).get("autotune_cache_state", "unknown")
+            first_sighting = name not in _autotuned_kernels
+            _autotuned_kernels.append(name)
+            logger.debug(
+                "Kernel %s has %d candidate configs; chosen by on-device timing "
+                "(autotune cache %s).",
+                name,
+                len(configs),
+                state,
+            )
+
+            # Recorded into the cache entry so a later process that reloads these
+            # artifacts, and so never reaches this code, still learns of it.
+            if first_sighting:
+                _record_autotuned_to_cache()
+            _warn_autotuned(sorted(set(_autotuned_kernels)), from_cache=False)
+        except Exception:
+            # Reporting is not worth failing a compile over.
+            logger.debug("Autotune watch failed for this kernel", exc_info=True)
+        return result
+
+    triton_heuristics.check_autotune_cache = check_autotune_cache
+    _autotune_watch_installed = True
+
+
 def init_batch_invariance():
     # this will hit all the csrc overrides as well
     if envs.VLLM_BATCH_INVARIANT:
         override_envs_for_invariance()
         enable_batch_invariant_mode()
+        _watch_for_autotune_races()
 
         # Disable TF32 for batch invariance - it causes non-deterministic rounding
         torch.backends.cuda.matmul.fp32_precision = "ieee"

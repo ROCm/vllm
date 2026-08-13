@@ -34,6 +34,7 @@ from dataclasses import dataclass
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.config.utils import compute_hash_cached
 from vllm.distributed.parallel_state import (
@@ -59,6 +60,38 @@ from .rebalance_execute import (
 )
 
 logger = init_logger(__name__)
+
+_committed_rearrangements = 0
+
+
+def _note_rearrangement_committed() -> None:
+    """Report the moment EPLB actually costs a deployment its reproducibility.
+
+    Enabling EPLB under batch invariance is not by itself a loss. Rearrangement
+    is a temporal dependence rather than a batch one -- `eplb_step()` runs after
+    the forward pass -- and a server whose load stays balanced never commits
+    one, so warning on configuration would fire on every EPLB deployment.
+
+    The initial placement is deterministic and the startup
+    `rearrange(is_profile=True)` is never committed, so zero commits really does
+    mean two runs placed experts identically.
+    """
+    global _committed_rearrangements
+    if not envs.VLLM_BATCH_INVARIANT:
+        return
+    _committed_rearrangements += 1
+    logger.warning_once(
+        "EPLB has committed an expert rearrangement while "
+        "VLLM_BATCH_INVARIANT is set. Output stays invariant to batch "
+        "composition, but a request's answer now also depends on the traffic "
+        "that preceded it, so this run no longer reproduces earlier ones. "
+        "Disable EPLB if you need that. Later rearrangements are logged at "
+        "debug rather than repeating this."
+    )
+    logger.debug(
+        "[EPLB] committed rearrangement #%d under batch invariance",
+        _committed_rearrangements,
+    )
 
 
 @dataclass
@@ -900,6 +933,7 @@ class EplbState:
                             eplb_model_state,
                             new_physical_to_logical_map=new_physical_to_logical_map,
                         )
+                        _note_rearrangement_committed()
 
                 if is_main_rank:
                     assert start_event is not None
