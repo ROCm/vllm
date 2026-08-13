@@ -299,6 +299,17 @@ class FusedMoEQuantConfig:
         return self._a1.shape == GroupShape.PER_TENSOR
 
     @property
+    def is_dynamic_per_tensor_act(self) -> bool:
+        """Activations are quantized per tensor with a scale computed at run
+        time, i.e. an amax over whatever rows the kernel was handed."""
+        return (
+            self.is_quantized
+            and self.is_per_tensor
+            and self.a1_scale is None
+            and self.a2_scale is None
+        )
+
+    @property
     def block_shape(self) -> list[int] | None:
         if (
             self._a1.shape is not None
@@ -1356,9 +1367,13 @@ class FusedMoEConfig:
             )
 
         if self.use_mori_kernels:
-            assert self.rocm_aiter_fmoe_enabled, (
-                "Mori needs to be used with aiter fused_moe for now."
-            )
+            # MoRI used to assert `rocm_aiter_fmoe_enabled` here. It is a
+            # dispatch/combine library and AITER is an expert GEMM, so that
+            # assertion was a performance contract, not a data-format one.
+            # `ExpertTokensMetadata.expert_num_tokens` from MoRI's `prepare` is
+            # a single device-side total rather than per-expert counts, and
+            # only `AiterExperts` reads it; every other experts class ignores
+            # it and produces correct output, so the coupling is dropped.
             assert not self.aiter_fmoe_shared_expert_enabled, (
                 "Mori does not support fusion shared expert now. "
                 "Turn it off by setting VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS=0"

@@ -30,6 +30,8 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
     moe_kernel_quantize_input,
+    silu_and_mul_is_pad_aware,
+    silu_and_mul_pad_aware,
     swiglu_limit_func,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -169,11 +171,32 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         activation: MoEActivation,
         output: torch.Tensor,
         input: torch.Tensor,
+        *,
+        topk_ids: torch.Tensor | None = None,
+        expert_map: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         gemm1_clamp_limit = self.quant_config.gemm1_clamp_limit
         if activation == MoEActivation.SILU and gemm1_clamp_limit is not None:
             swiglu_limit_func(output, input, float(gemm1_clamp_limit))
+            return
+
+        # Plain SiLU can skip the token-expert slots the w2 GEMM will not read.
+        # That is a small win for any expert-parallel batch, where most slots
+        # are non-local, and a large one for a dispatch that hands over a
+        # fixed-size receive buffer: MoRI's is 8192 rows whatever the batch.
+        # The kernel is bit-identical to torch.ops._C.silu_and_mul on the slots
+        # it does compute.
+        #
+        # topk_ids is deliberately not forwarded to super().activation(): for
+        # SWIGLUOAI_UNINTERLEAVE it would newly select the pad-aware clamp
+        # kernel, whose fp32 silu does not match the CUDA kernel bit for bit.
+        if (
+            activation == MoEActivation.SILU
+            and topk_ids is not None
+            and silu_and_mul_is_pad_aware(input)
+        ):
+            silu_and_mul_pad_aware(output, input, topk_ids, expert_map)
             return
 
         # SWIGLUOAI_UNINTERLEAVE routes to the silu_and_mul_with_clamp kernel and
@@ -268,6 +291,25 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quantization_emulation=self.quantization_emulation,
             )
 
+        # A quantized scheme needs either quantized activations or a scale to
+        # make them with, and neither is guaranteed. The prepare step decides
+        # whether to quantize on dispatch from its own view of the config --
+        # MoRI leaves use_fp8_dispatch False for a dynamic per-tensor scheme --
+        # while this kernel only quantizes for itself when
+        # expects_unquantized_inputs, which today requires LoRA. With both
+        # absent the null scale reaches Triton and fails inside the kernel,
+        # several frames from the cause.
+        assert not (
+            self.quant_dtype is not None
+            and not self.expects_unquantized_inputs
+            and hidden_states.dtype != self.quant_dtype
+            and a1q_scale is None
+        ), (
+            f"activations arrived as {hidden_states.dtype} with no scale for a "
+            f"{self.quant_dtype} scheme: the prepare step did not quantize them "
+            "and this kernel was not asked to"
+        )
+
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
@@ -337,6 +379,16 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         num_tokens_post_padded_lora = None
         token_lora_mapping = None
         lora_context = self._lora_context
+
+        # Skipping the token-expert slots no expert GEMM reads is only sound
+        # while nothing else writes them. The LoRA deltas go into
+        # intermediate_cache1/3 under their own expert assignment and read
+        # intermediate_cache2 back as the w2 shrink input, so withhold the
+        # pad-aware activation and reduction whenever LoRA is live. Read from
+        # the local above rather than from self, and here rather than at
+        # construction: `_lora_context` is installed after post_init_setup.
+        pad_aware_topk_ids = topk_ids if lora_context is None else None
+
         if lora_unquantized_hidden_states is not None:
             lora_x = lora_unquantized_hidden_states
         elif (
@@ -460,7 +512,11 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             )
         else:
             self.activation(
-                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+                activation,
+                intermediate_cache2,
+                intermediate_cache1.view(-1, N),
+                topk_ids=pad_aware_topk_ids,
+                expert_map=expert_map,
             )
 
             qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
@@ -470,6 +526,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 self.per_act_token_quant,
                 self.block_shape,
                 quantization_emulation=self.quantization_emulation,
+                # The rows MM2 will read.  A dynamic per-tensor scale is one
+                # amax over the whole buffer, so without these it also reduces
+                # over the unrouted and non-local slots the activation above
+                # just declined to write.
+                topk_ids=pad_aware_topk_ids,
+                expert_map=expert_map,
             )
 
         # LoRA w2: applied to intermediate_cache3 before moe_sum, using the
@@ -549,10 +611,29 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 )
 
         # separate function is required for MoE + LoRA
-        self.moe_sum(intermediate_cache3, output)
+        self.moe_sum(
+            intermediate_cache3,
+            output,
+            topk_ids=pad_aware_topk_ids,
+            expert_map=expert_map,
+        )
 
-    def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
-        ops.moe_sum(input, output)
+    def moe_sum(
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        topk_ids: torch.Tensor | None = None,
+        expert_map: torch.Tensor | None = None,
+    ) -> None:
+        # With topk_ids the kernel skips slots whose expert is negative or
+        # non-local. Those slots hold exactly +0.0 -- `write_zeros_to_output`
+        # put it there -- and the fp32 accumulator starts at +0.0 and so can
+        # never be -0.0, which makes dropping a +0.0 addend a bitwise no-op.
+        # The reduction order is unchanged either way: `moe_sum_vec_kernel`
+        # walks k ascending in one thread per output element, and its
+        # instantiation keys off dtype, topk and alignment, never off the
+        # number of tokens.
+        ops.moe_sum(input, output, topk_ids, expert_map)
 
 
 class TritonWNA16Experts(TritonExperts):

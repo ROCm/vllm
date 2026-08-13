@@ -5,6 +5,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe import batched_activation, dynamic_quant
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -467,15 +468,15 @@ def invoke_moe_batched_triton_kernel(
     )
 
     if B_scale is not None:
-        if B_scale.ndim == 1:
-            stride_bse = 1
-            stride_bsk = 0
-            stride_bsn = 0
-        else:
-            stride_bse = B_scale.stride(0)
-            stride_bsk = B_scale.stride(2)
-            stride_bsn = B_scale.stride(1)
-
+        stride_bse = B_scale.stride(0)
+        # `moe_mmk` indexes the weight scale as
+        # `b_scale[expert * stride_bse + offs_bn * stride_bsn]`, unmasked, with
+        # `offs_bn` spanning N. A per-tensor scale is 1-D `[E]`, viewed as
+        # `[E, 1, 1]` above, whose contiguous strides are all 1 -- so that read
+        # runs up to N elements past an E-element tensor. A size-1 dimension is
+        # a broadcast and its stride must be 0.
+        stride_bsn = B_scale.stride(1) if B_scale.size(1) > 1 else 0
+        stride_bsk = B_scale.stride(2) if B_scale.size(2) > 1 else 0
     else:
         stride_bse = 0
         stride_bsk = 0
@@ -715,6 +716,33 @@ def batched_moe_kernel_quantize_input(
     per_act_token_quant: bool,
     block_shape: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # One implementation for eager and for capture.  Placed above the capture
+    # check on purpose: routing it inside the branch would preserve the
+    # divergence it exists to remove.
+    #
+    # The capture branch below ignores `expert_num_tokens` and takes one amax
+    # over the whole [E, max_num_tokens, N] buffer.  Rows past an expert's
+    # delivered count were written by no producer this step, and under
+    # cudagraphs the buffer is a persistent graph-pool allocation, so they hold
+    # the previous replay's contents.  The eager branch bounds the reduction
+    # correctly but only by paying an `.item()` host sync per expert, which is
+    # why it cannot be captured -- so the two branches computed different
+    # scales from the same inputs, and only one of them was right.
+    if (
+        qtype is not None
+        and A_scale is None
+        and not per_act_token_quant
+        and block_shape is None
+        and A.ndim == 3
+    ):
+        return dynamic_quant.dynamic_quantize(
+            A,
+            qtype,
+            granularity=dynamic_quant.PER_EXPERT,
+            mask_mode=dynamic_quant.MASK_DELIVERED,
+            expert_num_tokens=expert_num_tokens,
+        )
+
     if _is_capturing_or_compiling():
         # Note: this does a bunch of extra work because expert_num_tokens is
         # ignored but it does support torch.compile + cudagraphs.
@@ -969,10 +997,6 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             workspace2, (E, max_num_tokens, activation_out_dim)
         )
 
-        # TODO(bnell): should this be done for any quantized type?
-        if self.quant_config.use_fp8_w8a8:
-            intermediate_cache1.fill_(0)
-
         a1q_scale = normalize_batched_scales_shape(a1q_scale, E)
 
         # MM1
@@ -993,14 +1017,32 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             block_shape=self.block_shape,
         )
 
-        intermediate_cache2.fill_(0)
-
-        # TODO (bnell): use triton utility from batched deep gemm.
-        self.activation(
-            activation,
-            intermediate_cache2.view(-1, activation_out_dim),
-            intermediate_cache1.view(-1, N),
-        )
+        # Neither cache is zero-filled.  `intermediate_cache1.fill_(0)` used to
+        # run above under fp8, and it was not defensive: it was what kept the
+        # padded rows finite for an a2 amax that spanned the whole buffer.
+        # That reduction is now bounded by `expert_num_tokens`, so the
+        # elementwise work below can skip the rows MM1 never wrote.
+        #
+        # These two changes are not separable.  A pad-aware activation leaves
+        # the rows it skips holding whatever the shared workspace held, so
+        # making the producer pad-aware while the consumer still reduces over
+        # every row recreates the exact defect the bound removes.  On the
+        # fallback branch the unmasked activation still reads the rows MM1
+        # skipped; its results land in rows no consumer reads.
+        if (
+            activation == MoEActivation.SILU
+            and batched_activation.silu_mul_batched_is_exact(intermediate_cache2.dtype)
+            and intermediate_cache1.dtype == intermediate_cache2.dtype
+        ):
+            batched_activation.silu_mul_batched(
+                intermediate_cache2, intermediate_cache1, expert_num_tokens
+            )
+        else:
+            self.activation(
+                activation,
+                intermediate_cache2.view(-1, activation_out_dim),
+                intermediate_cache1.view(-1, N),
+            )
 
         qintermediate_cache2, a2q_scale = batched_moe_kernel_quantize_input(
             intermediate_cache2,

@@ -13,6 +13,7 @@ is applied on activations via `moe_kernel_quantize_input`.
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -91,6 +92,22 @@ class OCP_MXQuantizationEmulationTritonExperts(TritonExperts):
             OCP_MX_Scheme.w_mxfp6_e3m2_a_fp8,
         ]:
             self._quant_dtype = current_platform.fp8_dtype()
+
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and self._quant_dtype == current_platform.fp8_dtype()
+            and (quant_config.a1_scale is None or quant_config.a2_scale is None)
+        ):
+            # These schemes are calibrated per-tensor static. Without the scale
+            # the activation quantization takes a dynamic amax over every token
+            # in the launch, so a row's output depends on the rest of its batch
+            # by construction and no kernel can recover it.
+            raise ValueError(
+                f"VLLM_BATCH_INVARIANT is set but {self.ocp_mx_scheme} has no "
+                "calibrated activation scale, so fp8 activation quantization "
+                "would use a dynamic per-tensor scale, which cannot be batch "
+                "invariant."
+            )
 
     @property
     def quant_dtype(self) -> torch.dtype | str | None:

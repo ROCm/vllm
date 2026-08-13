@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import dynamic_quant
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
@@ -31,6 +32,10 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     ref_nvfp4_quant_dequant,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_fp8_min_max,
+    padding_bounded_amax,
+)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     per_tensor_dequantize,
 )
@@ -43,6 +48,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_MOE_FP8_MAX = get_fp8_min_max()[1]
+
 
 @triton.jit
 def _count_expert_num_tokens(
@@ -51,6 +58,7 @@ def _count_expert_num_tokens(
     num_experts,
     topk_numel,
     expert_map,
+    expert_map_len,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -65,7 +73,13 @@ def _count_expert_num_tokens(
         expert_ids = tl.load(topk_ids_ptrs, mask=mask, other=-1)
         if HAS_EXPERT_MAP:
             expert_map_ptrs = expert_map + expert_ids
-            expert_map_mask = expert_ids >= 0
+            # Bound both ends, against the map's own length.  NOT against
+            # `num_experts`: this kernel is called with num_LOCAL_experts
+            # (see `count_expert_num_tokens` below, and the `curr_expert <
+            # num_experts` store guard), while `expert_ids` are GLOBAL ids --
+            # bounding by the local count would discard every id a rank > 0
+            # owns and silently return all zeros.
+            expert_map_mask = (expert_ids >= 0) & (expert_ids < expert_map_len)
             expert_ids = tl.load(expert_map_ptrs, mask=expert_map_mask, other=-1)
 
         has_curr_expert = tl.where(expert_ids == curr_expert, 1, 0)
@@ -109,6 +123,7 @@ def count_expert_num_tokens(
         num_local_experts,
         topk_ids.numel(),
         expert_map,
+        expert_map.numel() if expert_map is not None else 0,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
@@ -140,12 +155,47 @@ def _fp8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+    bound_cudagraph_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform fp8 quantization on the inputs.  If a block_shape
     is provided, the output will be blocked.
     """
     if block_shape is None:
+        if A_scale is None and not per_act_token and bound_cudagraph_padding:
+            # Token rows: the rows this reduction must not span are the
+            # cudagraph padding rows, which hold the previous replay's
+            # activations.  See `padding_bounded_amax`.
+            amax = padding_bounded_amax(A)
+            if amax is not None:
+                # Widen for the divide, then narrow, and no
+                # `_FP8_MIN_SCALING_FACTOR` floor: this is the same arithmetic
+                # `QuantFP8._bounded_per_tensor_scale` performs, and the
+                # shipped per-tensor kernel applies no floor either.
+                A_scale = (
+                    (amax.double() / _MOE_FP8_MAX).float().clamp(min=1e-12).reshape(1)
+                )
+        if (
+            A_scale is None
+            and not per_act_token
+            and topk_ids is not None
+            and topk_ids.numel() == A.shape[0]
+            and A.ndim == 2
+        ):
+            # Dynamic per-tensor: one amax over every row, including the
+            # token-expert slots no expert GEMM will read.  Bound it, and do
+            # the bound and the quantize in one pass rather than an amax in
+            # torch followed by a second read in the shipped kernel.
+            return dynamic_quant.dynamic_quantize(
+                A,
+                current_platform.fp8_dtype(),
+                granularity=dynamic_quant.PER_TENSOR,
+                mask_mode=dynamic_quant.MASK_ROUTED,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+            )
         # TODO(luka): use QuantFP8 custom op
         #  https://github.com/vllm-project/vllm/issues/20711
         A, A_scale = ops.scaled_fp8_quant(
@@ -166,6 +216,9 @@ def _int8_quantize(
     A_scale: torch.Tensor | None,
     per_act_token: bool,
     block_shape: list[int] | None = None,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+    bound_cudagraph_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Perform int8 quantization on the inputs.  If a block_shape
@@ -176,11 +229,30 @@ def _int8_quantize(
     # activations apply per-token quantization. Otherwise, assume
     # activation tensor-wise fp8/int8 quantization, dynamic or static
     if block_shape is None:
+        if A_scale is None and not per_act_token and bound_cudagraph_padding:
+            amax = padding_bounded_amax(A)
+            if amax is not None:
+                # Same expression as the unbounded branch below, same floor.
+                A_scale = torch.clamp(amax / 127.0, min=1e-10)
         if per_act_token:
             A, A_scale = per_token_quant_int8(A)
         elif A_scale is not None:
             # Static per-tensor: use the optimized CUDA kernel
             A, A_scale, _ = ops.scaled_int8_quant(A, scale=A_scale)
+        elif topk_ids is not None and topk_ids.numel() == A.shape[0] and A.ndim == 2:
+            # Dynamic per-tensor, bounded: `A.abs().max()` below spans every
+            # row, including the token-expert slots no expert GEMM wrote.  On
+            # the legacy `fused_experts_impl` entry those are not even zeroed,
+            # because it passes `ignore_invalid_experts=True` so invalid blocks
+            # never reach `write_zeros_to_output`.
+            return dynamic_quant.dynamic_quantize(
+                A,
+                torch.int8,
+                granularity=dynamic_quant.PER_TENSOR,
+                mask_mode=dynamic_quant.MASK_ROUTED,
+                topk_ids=topk_ids,
+                expert_map=expert_map,
+            )
         elif A_scale is None:
             # Dynamic per-tensor: compute scale then quantize via kernel
             A_scale = torch.clamp(A.abs().max() / 127.0, min=1e-10)
@@ -283,7 +355,23 @@ def moe_kernel_quantize_input(
     ocp_mx_scheme: str | None = None,
     quantization_emulation: bool = False,
     mx_alignment: int = 0,
+    topk_ids: torch.Tensor | None = None,
+    expert_map: torch.Tensor | None = None,
+    bound_cudagraph_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``topk_ids``/``expert_map`` bound the dynamic per-tensor fp8 reduction.
+
+    That is the only granularity here whose amax spans rows the token does not
+    own -- an unrouted or non-local token-expert slot that MM1 never wrote.
+    Every other branch is per-token, per-group or static and is already bounded,
+    so they ignore these.
+
+    ``bound_cudagraph_padding`` says the leading dimension of ``A`` indexes
+    tokens, so the *other* rows this reduction must not span -- the cudagraph
+    padding rows -- can be excluded too.  It is False by default because the a2
+    input's rows are token-expert slots, which the padding mask does not
+    describe; only the a1 call sites set it.
+    """
     # Handle OCP MX scheme that requires QDQ (quantize-dequantize) for emulation
     if ocp_mx_scheme is not None:
         if ocp_mx_scheme in {"w_mxfp4", "w_mxfp4_a_mxfp4"}:
@@ -303,14 +391,30 @@ def moe_kernel_quantize_input(
         if quantization_emulation:
             return _fp8_quantize_dequantize(A, A_scale)
         else:
-            return _fp8_quantize(A, A_scale, per_act_token_quant, block_shape)
+            return _fp8_quantize(
+                A,
+                A_scale,
+                per_act_token_quant,
+                block_shape,
+                topk_ids,
+                expert_map,
+                bound_cudagraph_padding,
+            )
     elif quant_dtype == torch.int8:
         if quantization_emulation:
             raise NotImplementedError(
                 "moe_kernel_quantize_input does not support quant_dtype=torch.int8"
                 " MOE quantization emulation. Please open an issue."
             )
-        return _int8_quantize(A, A_scale, per_act_token_quant, block_shape)
+        return _int8_quantize(
+            A,
+            A_scale,
+            per_act_token_quant,
+            block_shape,
+            topk_ids,
+            expert_map,
+            bound_cudagraph_padding,
+        )
     elif quant_dtype == "nvfp4":
         if not quantization_emulation:
             return _nvfp4_quantize(A, A_scale, is_sf_swizzled_layout=is_scale_swizzled)
@@ -490,6 +594,7 @@ def _swiglu_limit_pad_aware_kernel(
     input_row_stride,
     num_tokens,
     swiglu_limit,
+    num_experts,
     HAS_LIMIT: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -507,7 +612,7 @@ def _swiglu_limit_pad_aware_kernel(
         if HAS_EXPERT_MAP:
             local_expert_id = tl.load(
                 expert_map_ptr + expert_id,
-                mask=expert_id >= 0,
+                mask=(expert_id >= 0) & (expert_id < num_experts),
                 other=-1,
             )
             should_compute = should_compute & (local_expert_id != -1)
@@ -549,7 +654,10 @@ def _swiglu_limit_pad_aware(
         return
 
     BLOCK_SIZE = 1024
-    grid = (min(num_tokens, 256), triton.cdiv(hidden_size, BLOCK_SIZE))
+    # Persistent over rows, so the workgroup count per column tile is the cap;
+    # 2048 fills a large GPU and `min` leaves the small-batch grid unchanged.
+    # Matches the `silu_and_mul_pad_aware` twin below.
+    grid = (min(num_tokens, 2048), triton.cdiv(hidden_size, BLOCK_SIZE))
     _swiglu_limit_pad_aware_kernel[grid](
         input,
         output,
@@ -559,7 +667,112 @@ def _swiglu_limit_pad_aware(
         gate_up_size,
         num_tokens,
         swiglu_limit,
+        expert_map.numel() if expert_map is not None else 0,
         HAS_LIMIT=swiglu_limit > 0,
+        HAS_EXPERT_MAP=expert_map is not None,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _silu_and_mul_pad_aware_kernel(
+    input_ptr,  # [num_rows, 2 * hidden_size]
+    output_ptr,  # [num_rows, hidden_size]
+    topk_ids_ptr,  # [num_rows], flattened [num_tokens, topk]
+    expert_map_ptr,  # global -> local expert id, or -1 if non-local
+    hidden_size,
+    input_row_stride,
+    num_rows,
+    num_experts,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    row_stride = tl.num_programs(0)
+    column_tile = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = column_tile < hidden_size
+
+    for row in tl.range(pid, num_rows, row_stride):
+        expert_id = tl.load(topk_ids_ptr + row)
+        should_compute = expert_id >= 0
+        if HAS_EXPERT_MAP:
+            local_expert_id = tl.load(
+                expert_map_ptr + expert_id,
+                mask=(expert_id >= 0) & (expert_id < num_experts),
+                other=-1,
+            )
+            should_compute = should_compute & (local_expert_id >= 0)
+
+        if should_compute:
+            gate_offsets = row.to(tl.int64) * input_row_stride + column_tile
+            gate = tl.load(input_ptr + gate_offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            up = tl.load(input_ptr + gate_offsets + hidden_size, mask=mask, other=0.0)
+            up = up.to(tl.float32)
+            # Two details make this bit-for-bit with torch.ops._C.silu_and_mul.
+            # `packed_silu_kernel` returns the storage dtype, so silu is rounded
+            # before the multiply and only then widened again; and the CUDA
+            # kernel multiplies by `up + beta` with beta = 0.0, which turns a
+            # -0.0 up into +0.0. Both are load-bearing.
+            silu = gate / (1.0 + tl.exp(-gate))
+            silu = silu.to(output_ptr.dtype.element_ty).to(tl.float32)
+            up = tl.where(up == 0.0, 0.0, up)
+            tl.store(
+                output_ptr + row.to(tl.int64) * hidden_size + column_tile,
+                (silu * up).to(output_ptr.dtype.element_ty),
+                mask=mask,
+            )
+
+
+def silu_and_mul_is_pad_aware(input: torch.Tensor) -> bool:
+    """Whether `silu_and_mul_pad_aware` reproduces the CUDA kernel exactly.
+
+    bfloat16 only, and that is not conservatism. Triton's `exp` is not HIP's
+    `expf` and no spelling of the Triton side closes the gap; bf16 rounds the
+    difference away -- checked exhaustively over all 2^32 (gate, up) pairs --
+    while fp16 and fp32 keep enough mantissa to expose it. So the fast path is
+    restricted to the dtype where equality is proven rather than likely.
+    """
+    return input.dtype == torch.bfloat16
+
+
+def silu_and_mul_pad_aware(
+    output: torch.Tensor,
+    input: torch.Tensor,  # first half is gate, second half is up
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None = None,
+) -> None:
+    """`torch.ops._C.silu_and_mul` that skips rows no expert GEMM will read.
+
+    Rows are token-expert slots: `input` is `[num_tokens * topk, 2 * hidden]`
+    and `topk_ids` is the matching `[num_tokens, topk]`. A slot is skipped when
+    its expert id is negative (an unrouted or padded row) or maps outside this
+    rank. `fused_moe_kernel` never reads those slots -- a block whose expert is
+    non-local returns after `write_zeros_to_output`, and a slot with a negative
+    id is not in `sorted_token_ids` at all -- so the output there is dead.
+
+    Callers must check `silu_and_mul_is_pad_aware` first; the computed slots are
+    bit-identical to the CUDA kernel only for the dtype it admits.
+    """
+    assert silu_and_mul_is_pad_aware(input)
+    num_rows, gate_up_size = input.shape
+    hidden_size = gate_up_size // 2
+    if num_rows == 0:
+        return
+
+    BLOCK_SIZE = 1024
+    grid = (min(num_rows, 2048), triton.cdiv(hidden_size, BLOCK_SIZE))
+    _silu_and_mul_pad_aware_kernel[grid](
+        input,
+        output,
+        topk_ids,
+        expert_map,
+        hidden_size,
+        gate_up_size,
+        num_rows,
+        expert_map.numel() if expert_map is not None else 0,
         HAS_EXPERT_MAP=expert_map is not None,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=4,

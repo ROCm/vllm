@@ -17,8 +17,10 @@ from tests.kernels.utils import torch_experts
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
+    batched_moe_kernel_quantize_input,
     invoke_moe_batched_triton_kernel,
 )
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.torch_utils import set_random_seed
@@ -535,3 +537,89 @@ def test_batched_triton_backend_mapping():
         == UnquantizedMoeBackend.BATCHED_TRITON
     )
     assert map_unquantized_backend("triton") == UnquantizedMoeBackend.TRITON
+
+
+# A value no activation can produce, so a scale that moved when it appeared can
+# only have read a row nothing wrote.  Not NaN and not Inf: the amax kernels use
+# `fmaxf`, which is NaN-blind, and Inf would conflate "the reduction crossed
+# this row" with "the arithmetic overflowed".
+_SENTINEL = 1e30
+
+
+def _batched_a2_scale(a, counts, poison_dead_rows):
+    a = a.clone()
+    if poison_dead_rows:
+        for e in range(a.shape[0]):
+            a[e, int(counts[e]) :] = _SENTINEL
+    _, scale = batched_moe_kernel_quantize_input(
+        a, None, a.shape[1], a.shape[0], a.shape[2], counts,
+        current_platform.fp8_dtype(), False, None,
+    )  # fmt: skip
+    return scale.reshape(-1)
+
+
+@pytest.mark.parametrize("e,t,k", [(8, 128, 256), (16, 64, 512)])
+def test_batched_a2_quantize_ignores_undelivered_rows(e, t, k):
+    """The a2 scale must not depend on rows past `expert_num_tokens`.
+
+    Those rows are written by no producer in the step.  Under cudagraphs the
+    buffer is a persistent graph-pool allocation, so they hold the previous
+    replay's contents, and a per-tensor amax that spans them takes its value
+    from another step's data.
+    """
+    device = current_platform.device_type
+    set_random_seed(7)
+    a = (torch.randn((e, t, k), device=device) * 2).to(torch.bfloat16)
+    counts = torch.full((e,), t // 4, dtype=torch.int32, device=device)
+    counts[0] = 0  # an expert that was delivered nothing
+    counts[1] = 1  # and one that was delivered a single row
+
+    clean = _batched_a2_scale(a, counts, poison_dead_rows=False)
+    poisoned = _batched_a2_scale(a, counts, poison_dead_rows=True)
+    torch.testing.assert_close(poisoned, clean, atol=0, rtol=0)
+
+    # Positive control, so this cannot pass by being vacuous: the *unbounded*
+    # reduction -- one amax over the flattened buffer, which is what the
+    # capture path used to do -- must be visibly moved by the same sentinel.
+    poisoned_a = a.clone()
+    for i in range(e):
+        poisoned_a[i, int(counts[i]) :] = _SENTINEL
+    unbounded = moe_kernel_quantize_input(
+        poisoned_a.view(-1, k), None, current_platform.fp8_dtype(), False, None
+    )[1]
+    assert float(unbounded) > 1e26, float(unbounded)
+    assert float(unbounded) > 1e6 * float(clean.max())
+
+    fp8_max = torch.finfo(current_platform.fp8_dtype()).max
+    for i in range(e):
+        n = int(counts[i])
+        want = float(a[i, :n].abs().amax()) / fp8_max if n else 0.0
+        assert abs(float(clean[i]) - want) <= 1e-6 * max(want, 1e-6)
+
+
+def test_batched_a2_quantize_eager_matches_capture():
+    """One scale for one input, whether or not a graph is being recorded.
+
+    These were two implementations before: the capture path ignored
+    `expert_num_tokens` and reduced over the whole buffer, while the eager path
+    bounded it per expert via a host sync.
+    """
+    device = current_platform.device_type
+    e, t, k = 8, 128, 256
+    set_random_seed(9)
+    a = (torch.randn((e, t, k), device=device) * 2).to(torch.bfloat16)
+    for i in range(e):
+        a[i, t // 4 :] = _SENTINEL
+    counts = torch.full((e,), t // 4, dtype=torch.int32, device=device)
+
+    eager = _batched_a2_scale(a, counts, poison_dead_rows=False)
+    assert float(eager.max()) < 1e26, "the bound did not hold in either arm"
+
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _batched_a2_scale(a, counts, poison_dead_rows=False)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    torch.testing.assert_close(captured, eager, atol=0, rtol=0)

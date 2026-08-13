@@ -17,6 +17,7 @@ from utils import skip_if_not_cuda_alike
 
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
+from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
@@ -84,6 +85,40 @@ def test_linear_per_tensor_scale_unchanged_when_nothing_is_padding(vllm_config):
     assert torch.equal(q_masked.view(torch.uint8), q_plain.view(torch.uint8))
 
 
+def test_moe_a2_scale_ignores_unrouted_slots(vllm_config):
+    """The contiguous a2 buffer is one slot per token-expert pair.
+
+    MM1 writes only the routed, local ones and MM2 reads only those; the rest
+    hold whatever the workspace held.
+    """
+    device = current_platform.device_type
+    n_slots, hidden, n_live = 24, 64, 18
+    torch.manual_seed(13)
+    a = torch.randn(n_slots, hidden, device=device, dtype=torch.bfloat16)
+    a[n_live:] = SENTINEL
+
+    topk_ids = torch.zeros(n_slots, dtype=torch.int32, device=device)
+    topk_ids[n_live:] = -1  # unrouted
+
+    assert int((topk_ids >= 0).sum()) == n_live
+
+    fp8 = current_platform.fp8_dtype()
+    _, bounded = moe_kernel_quantize_input(a, None, fp8, False, None, topk_ids=topk_ids)
+    _, unbounded = moe_kernel_quantize_input(a, None, fp8, False, None)
+
+    want = float(a[:n_live].abs().amax()) / torch.finfo(fp8).max
+    assert float(bounded) == pytest.approx(want, rel=1e-6)
+    assert float(unbounded) > 1e26
+
+    # Ids that do not describe these rows must be ignored, not guessed at.
+    _, short = moe_kernel_quantize_input(
+        a, None, fp8, False, None, topk_ids=topk_ids[:5]
+    )
+    assert torch.equal(short, unbounded)
+    _, fallback = moe_kernel_quantize_input(a, None, fp8, False, None)
+    assert torch.equal(fallback, unbounded)
+
+
 def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch):
     """Sequence-parallel MoE shards the tokens; the mask stays full-batch.
 
@@ -117,6 +152,39 @@ def test_bound_is_disabled_under_sequence_parallel_moe(vllm_config, monkeypatch)
     # Disabled: identical to the unmasked path, bit for bit.
     assert torch.equal(scale, unbounded)
     assert float(scale) > 1e26
+
+
+def test_moe_a1_scale_ignores_cudagraph_padding(vllm_config):
+    """The MoE's *first* activation quantize is one row per token.
+
+    `topk_ids` bounds the a2 buffer, whose rows are token-expert slots. It says
+    nothing about a1, whose rows are tokens -- and the rows a1 must not span are
+    the cudagraph padding ones.
+    """
+    device = current_platform.device_type
+    n_real, n_pad, hidden = 12, 4, 64
+    torch.manual_seed(23)
+    a = torch.randn(n_real + n_pad, hidden, device=device, dtype=torch.bfloat16)
+    a[n_real:] = SENTINEL
+
+    is_padding = torch.zeros(n_real + n_pad, dtype=torch.bool, device=device)
+    is_padding[n_real:] = True
+
+    fp8 = current_platform.fp8_dtype()
+    with set_forward_context(
+        None, vllm_config, num_tokens=n_real + n_pad, is_padding_full=is_padding
+    ):
+        _, bounded = moe_kernel_quantize_input(
+            a, None, fp8, False, None, bound_cudagraph_padding=True
+        )
+        # Opting out must be a true no-op, so the a2 call sites are unaffected.
+        _, opted_out = moe_kernel_quantize_input(a, None, fp8, False, None)
+    _, unbounded = moe_kernel_quantize_input(a, None, fp8, False, None)
+
+    want = float(a[:n_real].abs().amax()) / torch.finfo(fp8).max
+    assert float(bounded) == pytest.approx(want, rel=1e-6)
+    assert float(unbounded) > 1e26
+    assert torch.equal(opted_out, unbounded)
 
 
 def test_mask_shorter_than_the_batch_leaves_the_rest_unbounded(vllm_config):

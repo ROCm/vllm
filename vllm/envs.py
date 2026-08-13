@@ -262,6 +262,7 @@ if TYPE_CHECKING:
     VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True
     VLLM_DEEPEP_V2_PREFER_OVERLAP: bool = False
     VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION: bool = False
+    VLLM_MORI_VERIFY_RECV_BOUND: bool = False
     VLLM_DBO_COMM_SMS: int = 20
     VLLM_PATTERN_MATCH_DEBUG: str | None = None
     VLLM_DEBUG_DUMP_PATH: str | None = None
@@ -1867,6 +1868,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DeepEP v2: trade precision for transfer size in combine
     "VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION": lambda: bool(
         int(os.getenv("VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION", "0"))
+    ),
+    # MoRI: check on every dispatch that the rows actually delivered fit inside
+    # the host-derived bound `MoriPrepareAndFinalize.prepare` trims its receive
+    # buffer to, and log the slack. Costs a device sync per layer, so it is for
+    # validation runs -- in particular multi-node ones, where exceeding the
+    # bound is the one failure mode that yields wrong output rather than an
+    # error: the experts never write the rows past it and combine reads them.
+    "VLLM_MORI_VERIFY_RECV_BOUND": lambda: bool(
+        int(os.getenv("VLLM_MORI_VERIFY_RECV_BOUND", "0"))
     ),
     # The number of SMs/CUs to allocate for communication kernels when
     # running DBO; the rest will be allocated to compute.
