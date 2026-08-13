@@ -100,6 +100,13 @@ class LoRAKernelMeta:
         )
 
     def _reset(self):
+        # `prepare_tensors` writes token_lora_mapping only for the rows of the
+        # current batch, and not at all when the batch has no LoRA token. The
+        # EP MoE dispatch all-gathers a `[:num_padded_tokens]` slice of it, so
+        # without this fill the gathered mapping carries whatever was last in
+        # the buffer -- uninitialised memory on the first steps -- and a padded
+        # or idle-rank row can be handed a live LoRA id.
+        self.token_lora_mapping.fill_(-1)
         self.active_lora_ids.fill_(-1)
         self.num_tokens_per_lora.fill_(0)
         self.lora_token_start_loc.fill_(0)

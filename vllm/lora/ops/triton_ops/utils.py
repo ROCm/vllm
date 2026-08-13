@@ -218,6 +218,14 @@ def get_lora_op_configs(
     # default config
     default = {}
     if op_type == "shrink":
+        # split_k is the load-bearing override for batch invariance: with
+        # split_k > 1 the shrink kernel writes back with tl.atomic_add
+        # (see do_shrink_kernel), so the K reduction order depends on the
+        # batch size and on run-to-run CTA scheduling. Pinning it to 1
+        # switches the write-back to a plain tl.store.
+        #
+        # block_k stays batch-keyed: mm_k walks K sequentially into one fp32
+        # accumulator, so the tile width does not change the reduction order.
         split_k = 64 if batch < 128 else 8
         if is_batch_invariant:
             split_k = 1

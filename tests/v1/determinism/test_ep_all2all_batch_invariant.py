@@ -22,6 +22,30 @@ which is why this module asks for four GPUs.
   on the backend literal), so the low-latency literal exercises the same
   kernel.
 
+The third arm covers MoE **LoRA** on top of EP, which is a different failure
+than a variant combine and is the regression this file's LoRA test exists for.
+`PunicaWrapperGPU`'s LoRA metadata -- `no_lora_flag`, `active_lora_ids`,
+`num_active_loras` -- describes the batch *this rank scheduled*, but under EP
+the MoE LoRA runs on the all-gathered batch. A rank whose own requests carried
+no adapter early-returned on `no_lora_flag` while it still owned experts
+serving everyone else's tokens, and the LoRA delta for those tokens was
+silently dropped. Which tokens lost it depended on what the rest of the cluster
+was running, so a lightly loaded server produced the *wrong* answer and a busy
+one the right one. Pre-fix the needle's generated *text* changes, not just its
+logprobs, which is how this arm distinguishes a dropped delta from the
+reduction-order drift the rest of this file is about.
+
+Only `allgather_reducescatter` is testable here, and that is not a choice:
+`FusedMoEWithLoRA._ep_check` asserts that backend outright, so LoRA + DeepEP
+and LoRA + MoRI cannot be brought up at all.
+
+The LoRA arm runs `--enforce-eager`, also not a preference. Its vacuity guard
+has to show that a rank with no LoRA tokens of its own was serving experts for
+tokens that had them, which means reading `add_lora_fused_moe`'s view of the
+metadata from Python -- and under cudagraphs that call stops executing on
+replay, so the needle's steps go unrecorded. The bug reproduces either way;
+only eager can prove the guard saw it.
+
 Why a server rather than the offline `LLM` API: all2all kernels need
 `dp_size > 1` (`FusedMoEParallelConfig.use_all2all_kernels`), and `LLM()`
 rejects `data_parallel_size > 1` as unsupported for single-process usage. The
@@ -35,8 +59,10 @@ decode shape is captured those stop executing from Python on replay, so their
 call counts go quiet during exactly the steps being measured.
 """
 
+import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 from utils import (
@@ -71,10 +97,25 @@ LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LOAD_CONCURRENCY", "24"))
 # in the same wall clock, so at the shared default the needle's prefill gets a
 # step to itself and the guard correctly refuses a verdict.
 MORI_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_MORI_LOAD_CONCURRENCY", "96"))
+# The LoRA arm is eager, so it serves fewer requests per second and needs more
+# in flight to reach the same exposure.
+LORA_LOAD_CONCURRENCY = int(os.getenv("VLLM_EP_LORA_LOAD_CONCURRENCY", "48"))
 LOAD_RAMP_SECONDS = float(os.getenv("VLLM_EP_LOAD_RAMP_SECONDS", "12"))
 # The load must drag the needle rank's padded token count at least this far
 # above what it ran alone, otherwise the needle saw identical shapes twice.
 MIN_LOADED_PAD = 16
+
+LORA_NAME = "synthetic-moe"
+LORA_RANK = 16
+# The alone window must contain at least this many ranks that ran the MoE LoRA
+# on the gathered batch while their own metadata said they had none of it --
+# the state the dropped-delta bug needed. Two, rather than all three non-needle
+# ranks, leaves headroom without accepting a verdict that rests on a single one.
+MIN_IDLE_LORA_RANKS = 2
+# ...and the loaded window must contain none, or nearly none: it is the arm
+# where every rank has its own LoRA tokens and therefore the arm that got the
+# right answer pre-fix.
+MAX_LOADED_IDLE_FRACTION = 0.5
 
 NEEDLE_PROMPT = (
     "Explain, step by step, how a four-stroke internal combustion engine "
@@ -198,10 +239,45 @@ def _patch_modular_kernel(module):
     cls.__init__ = wrapper
 
 
+def _patch_punica(module):
+    """Record what each rank believed about its own LoRA work, per MoE call.
+
+    This is the mechanism guard for the LoRA arm. `x` is the all-gathered
+    activation -- every rank's tokens -- while `token_mapping_meta` was built
+    from the batch this rank scheduled, so `no_lora=True` is a rank that is
+    about to run (pre-fix: skip) the MoE LoRA for other ranks' tokens. If no
+    such rank existed while the needle ran, the arm never reached the state the
+    fix is about and its verdict means nothing.
+
+    Both reads are of CPU-side tensors that the metadata already maintains, so
+    this costs no device sync and does not perturb the schedule.
+    """
+    cls = getattr(module, "PunicaWrapperGPU", None)
+    if cls is None:
+        return
+    original = cls.add_lora_fused_moe
+
+    def wrapper(self, y, x, *args, **kwargs):
+        try:
+            meta = self.token_mapping_meta
+            _emit(
+                event="lora_moe",
+                rows=int(x.size(0)),
+                no_lora=bool(meta.no_lora_flag_cpu[0].item()),
+                n_active=int(meta.num_active_loras_cpu[0].item()),
+            )
+        except Exception as e:  # pragma: no cover
+            _emit(event="lora_moe_err", err=repr(e))
+        return original(self, y, x, *args, **kwargs)
+
+    cls.add_lora_fused_moe = wrapper
+
+
 _TARGETS = {
     "vllm.v1.worker.dp_utils": _patch_dp_utils,
     "vllm.distributed.device_communicators.all2all": _patch_all2all,
     "vllm.model_executor.layers.fused_moe.modular_kernel": _patch_modular_kernel,
+    "vllm.lora.punica_wrapper.punica_gpu": _patch_punica,
 }
 
 '''
@@ -227,10 +303,10 @@ def _load(url: str, concurrency: int, model: str = MODEL) -> BackgroundLoad:
     )
 
 
-def _needle(url) -> dict:
+def _needle(url, model: str = MODEL) -> dict:
     started = time.time()
     response = dp_completion(
-        url, MODEL, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, NEEDLE_RANK, logprobs=1
+        url, model, NEEDLE_PROMPT, NEEDLE_MAX_TOKENS, NEEDLE_RANK, logprobs=1
     )
     choice = response["choices"][0]
     return {
@@ -250,6 +326,92 @@ def _needle_rank_pads(records: list[dict], needle: dict) -> list[int]:
         and r.get("padded") is not None
         and needle["started"] <= r["t"] <= needle["finished"]
     ]
+
+
+def _lora_calls_by_rank(records: list[dict], needle: dict) -> dict[int, dict]:
+    """Per-DP-rank MoE-LoRA activity during one needle request.
+
+    `no_lora` counts the calls where this rank's own scheduled batch carried no
+    adapter -- the state that used to skip the kernel for the gathered batch.
+    """
+    pid_rank = {
+        r["pid"]: r["dp_rank"]
+        for r in records
+        if r.get("event") == "dp" and r.get("dp_rank") is not None
+    }
+    tally: dict[int, dict] = {}
+    for r in records:
+        if r.get("event") != "lora_moe":
+            continue
+        if not needle["started"] <= r["t"] <= needle["finished"]:
+            continue
+        rank = pid_rank.get(r["pid"])
+        if rank is None:
+            continue
+        entry = tally.setdefault(rank, {"calls": 0, "no_lora": 0, "rows": set()})
+        entry["calls"] += 1
+        entry["no_lora"] += int(r["no_lora"])
+        entry["rows"].add(r["rows"])
+    return tally
+
+
+def _write_synthetic_moe_adapter(directory: Path) -> Path:
+    """A random rank-16 LoRA on every expert projection of `MODEL`.
+
+    Synthetic on purpose. The property under test is that a token's LoRA delta
+    is applied identically whatever else the cluster is doing -- bitwise
+    invariance, not output quality -- and these weights are noise, so the
+    generations they produce mean nothing and are never inspected.
+
+    `lora_B` is *not* zero initialised as PEFT leaves it: a zero B makes the
+    delta identically zero, the base model answers, and the test would pass
+    without the MoE LoRA kernels ever having mattered.
+    """
+    import torch
+    from safetensors.torch import save_file
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(MODEL)
+    hidden, inter = config.hidden_size, config.intermediate_size
+    torch.manual_seed(1234)
+
+    tensors: dict[str, torch.Tensor] = {}
+
+    def add(name: str, fan_in: int, fan_out: int) -> None:
+        tensors[f"{name}.lora_A.weight"] = (
+            torch.randn(LORA_RANK, fan_in, dtype=torch.float32) * fan_in**-0.5
+        ).to(torch.bfloat16)
+        tensors[f"{name}.lora_B.weight"] = (
+            torch.randn(fan_out, LORA_RANK, dtype=torch.float32) * 0.02
+        ).to(torch.bfloat16)
+
+    for layer in range(config.num_hidden_layers):
+        for expert in range(config.num_experts):
+            prefix = f"base_model.model.model.layers.{layer}.mlp.experts.{expert}"
+            add(f"{prefix}.gate_proj", hidden, inter)
+            add(f"{prefix}.up_proj", hidden, inter)
+            add(f"{prefix}.down_proj", inter, hidden)
+
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, str(directory / "adapter_model.safetensors"))
+    (directory / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "peft_type": "LORA",
+                "task_type": "CAUSAL_LM",
+                "base_model_name_or_path": MODEL,
+                "r": LORA_RANK,
+                "lora_alpha": 2 * LORA_RANK,
+                "lora_dropout": 0.0,
+                "bias": "none",
+                "fan_in_fan_out": False,
+                "inference_mode": True,
+                "target_modules": ["gate_proj", "up_proj", "down_proj"],
+                "modules_to_save": None,
+            }
+        )
+    )
+    return directory
 
 
 def _ep_server(tmp_path, all2all_backend: str, extra_args: list[str] | None = None):
@@ -328,6 +490,97 @@ def mori_ht_server(tmp_path, enable_batch_invariant_mode):
     )
 
 
+@pytest.fixture
+def lora_ep_server(tmp_path, enable_batch_invariant_mode):
+    """A DP=4 + EP server serving a synthetic MoE LoRA over AllGather+ReduceScatter.
+
+    Function-scoped for the same reason as `deepep_ht_server`.
+
+    The backend is not a choice: `FusedMoEWithLoRA._ep_check` asserts
+    `allgather_reducescatter`, so this is the only all2all LoRA can run on.
+    `--enforce-eager` is what makes the mechanism guard readable; see the
+    module docstring.
+    """
+    adapter = _write_synthetic_moe_adapter(tmp_path / "moe_lora")
+    yield from _ep_server(
+        tmp_path,
+        "allgather_reducescatter",
+        [
+            "--enable-lora",
+            "--lora-modules",
+            f"{LORA_NAME}={adapter}",
+            "--max-lora-rank",
+            str(LORA_RANK),
+            "--max-num-batched-tokens",
+            "2048",
+            "--enforce-eager",
+        ],
+    )
+
+
+def _assert_a_rank_served_lora_it_did_not_schedule(
+    records: list[dict], alone: dict, loaded: dict
+) -> None:
+    """The LoRA arm's vacuity guard: it must reach the state the bug needed.
+
+    Load alone is not enough here. The dropped delta needed a rank holding *no
+    LoRA tokens of its own* while it owned experts for a gathered batch that
+    had them -- so the alone window has to contain such a rank, and the loaded
+    window has to not, or the two conditions differ in exposure but not in the
+    thing that broke and the comparison proves nothing.
+    """
+    alone_lora = _lora_calls_by_rank(records, alone)
+    loaded_lora = _lora_calls_by_rank(records, loaded)
+
+    assert set(alone_lora) == set(range(DP)), (
+        f"MoE-LoRA calls were recorded on ranks {sorted(alone_lora)}, not all "
+        f"{DP}. Either the adapter never reached the forward path or the "
+        "instrumentation did not load -- note it goes quiet under cudagraphs, "
+        "which is why this arm is eager."
+    )
+
+    needle_rows = alone_lora[NEEDLE_RANK]["rows"]
+    same_rows = {rank for rank, d in alone_lora.items() if d["rows"] == needle_rows}
+    assert same_rows == set(range(DP)), (
+        "the ranks did not run the MoE LoRA over the same activation sizes "
+        f"as rank {NEEDLE_RANK} "
+        f"({ {r: sorted(d['rows']) for r, d in alone_lora.items()} }), so they "
+        "were not all working on one all-gathered batch and an idle rank would "
+        "not have been holding anybody else's tokens."
+    )
+
+    idle = sorted(
+        rank
+        for rank, d in alone_lora.items()
+        if rank != NEEDLE_RANK and d["calls"] and d["no_lora"] == d["calls"]
+    )
+    assert len(idle) >= MIN_IDLE_LORA_RANKS, (
+        f"only ranks {idle} ran every MoE-LoRA call with no LoRA token of "
+        f"their own while the needle ran alone "
+        f"({ {r: (d['no_lora'], d['calls']) for r, d in alone_lora.items()} } "
+        "as no_lora/calls). That is the state the dropped-delta bug needed, so "
+        "without it this arm never tested the fix."
+    )
+    assert alone_lora[NEEDLE_RANK]["no_lora"] < alone_lora[NEEDLE_RANK]["calls"], (
+        f"rank {NEEDLE_RANK} scheduled no LoRA token either, so the needle "
+        f"request did not use the '{LORA_NAME}' adapter at all."
+    )
+
+    busiest = max(
+        (d["no_lora"] / d["calls"], rank)
+        for rank, d in loaded_lora.items()
+        if d["calls"]
+    )
+    assert busiest[0] <= MAX_LOADED_IDLE_FRACTION, (
+        f"rank {busiest[1]} still had no LoRA work of its own for "
+        f"{busiest[0]:.0%} of its MoE-LoRA calls under load "
+        f"({ {r: (d['no_lora'], d['calls']) for r, d in loaded_lora.items()} } "
+        "as no_lora/calls). Both windows are then in the same state and the "
+        "comparison cannot see a delta that is dropped in one of them. Raise "
+        "VLLM_EP_LORA_LOAD_CONCURRENCY."
+    )
+
+
 def _assert_needle_does_not_see_the_batch(
     server,
     log_prefix: str,
@@ -336,17 +589,19 @@ def _assert_needle_does_not_see_the_batch(
     prepare_finalize_cls: str,
     experts_cls: str,
     load_concurrency: int = LOAD_CONCURRENCY,
+    model: str = MODEL,
+    require_idle_lora_rank: bool = False,
 ) -> None:
     """The needle's logprobs must not move when the rest of the server does."""
     url = server.url_for("v1/completions")
 
     # Discarded: keeps first-request state out of the comparison.
-    _needle(url)
+    _needle(url, model)
 
-    with _load(url, 0):
-        alone = _needle(url)
-    with _load(url, load_concurrency) as load:
-        loaded = _needle(url)
+    with _load(url, 0, model):
+        alone = _needle(url, model)
+    with _load(url, load_concurrency, model) as load:
+        loaded = _needle(url, model)
     load.assert_ran_cleanly()
 
     records = read_records(log_prefix)
@@ -396,6 +651,9 @@ def _assert_needle_does_not_see_the_batch(
         "Raise VLLM_EP_LOAD_CONCURRENCY (or VLLM_EP_MORI_LOAD_CONCURRENCY)."
     )
 
+    if require_idle_lora_rank:
+        _assert_a_rank_served_lora_it_did_not_schedule(records, alone, loaded)
+
     assert loaded["tokens"] == alone["tokens"], (
         f"the needle sampled different tokens once the server was busy: "
         f"{alone['tokens']} vs {loaded['tokens']}"
@@ -434,4 +692,31 @@ def test_mori_high_throughput_combine_does_not_see_the_batch(mori_ht_server):
         prepare_finalize_cls="MoriPrepareAndFinalize",
         experts_cls="TritonExperts",
         load_concurrency=MORI_LOAD_CONCURRENCY,
+    )
+
+
+def test_moe_lora_delta_does_not_see_the_batch(lora_ep_server):
+    """A LoRA'd token keeps its delta whatever the other EP ranks are serving.
+
+    Regression test for the rank-local LoRA metadata being used to decide
+    whether to run the MoE LoRA on the all-gathered batch: an idle rank skipped
+    it and dropped the delta for every gathered token routed to the experts it
+    owned. Pre-fix this arm moved 32 of 32 logprobs and changed the generated
+    text; post-fix 0 of 32.
+
+    The adapter is synthetic (random weights over every expert projection), so
+    what it generates is meaningless -- the claim is bitwise invariance of the
+    delta, not quality. `_assert_a_rank_served_lora_it_did_not_schedule` is
+    what keeps that claim from being vacuous.
+    """
+    server, log_prefix = lora_ep_server
+    _assert_needle_does_not_see_the_batch(
+        server,
+        log_prefix,
+        manager_cls="AgRsAll2AllManager",
+        prepare_finalize_cls="MoEPrepareAndFinalizeNaiveDPEPModular",
+        experts_cls="TritonExperts",
+        load_concurrency=LORA_LOAD_CONCURRENCY,
+        model=LORA_NAME,
+        require_idle_lora_rank=True,
     )

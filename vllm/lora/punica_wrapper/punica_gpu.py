@@ -72,6 +72,35 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             captured_lora_counts=captured_lora_counts,
         )
 
+        # Built here rather than on demand: the first EP MoE call may well be
+        # inside a cudagraph capture, and an allocation made there belongs to
+        # the graph's pool.
+        self._all_lora_ids = torch.arange(
+            -1, self.max_loras, dtype=torch.int32, device=self.device
+        )
+
+    @property
+    def all_lora_ids(self) -> torch.Tensor:
+        """Every LoRA slot, for a batch this rank did not schedule.
+
+        `token_mapping_meta.active_lora_ids` lists the slots *this rank's own
+        requests* use. Under expert parallelism the MoE LoRA runs on the
+        all-gathered activation, so that is the wrong set: a slot used only by
+        another rank's tokens would be skipped and its delta silently dropped,
+        which makes a token's output depend on what the rest of the cluster
+        happens to be running. So enumerate every slot and let `adapter_enabled`
+        and the per-slot token counts -- which come from the *dispatched*
+        mapping -- do the filtering.
+
+        This assumes slot `k` names the same adapter on every DP rank. Nothing
+        enforces that today: `lora_index_to_id` is per-process LRU state.
+
+        Shaped like `active_lora_ids` (max_loras + 1, with the "-1" no-LoRA
+        entry first) so the align and Triton kernels see the layout they
+        already handle.
+        """
+        return self._all_lora_ids
+
     def update_metadata(
         self,
         mapping: LoRAMapping,
@@ -358,6 +387,10 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         )
         if token_lora_mapping is None:
             token_lora_mapping = token_lora_mapping_meta
+        else:
+            # An explicit mapping means `topk_ids` describes the all-gathered
+            # batch, not this rank's. See `all_lora_ids`.
+            lora_ids = self.all_lora_ids
         # Under EP the caller passes local_num_experts but topk_ids carries
         # GLOBAL expert indices. The CUDA kernel uses num_experts to size
         # its bucketing table; with EP we must size by global_num_experts
@@ -452,13 +485,20 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             x.size(0), self.lora_config.specialize_active_lora
         )
 
-        assert no_lora_flag.numel() == 1
-        if no_lora_flag.item():
-            # None of the inputs require LoRA.
-            return
-
         if token_lora_mapping is None:
+            assert no_lora_flag.numel() == 1
+            if no_lora_flag.item():
+                # None of the inputs require LoRA.
+                return
             token_lora_mapping = token_lora_mapping_meta
+        else:
+            # An explicit mapping means `x` is the all-gathered batch. Both
+            # `no_lora_flag` and `lora_ids` were computed from this rank's own
+            # requests, so neither describes it: an idle rank would skip the
+            # LoRA entirely for the gathered tokens routed to the experts it
+            # owns. Run every slot and let the dispatched mapping decide.
+            lora_ids = self.all_lora_ids
+            num_active_loras = self.token_mapping_meta.default_num_active_loras_cpu
         fused_moe_lora(
             y,
             x,

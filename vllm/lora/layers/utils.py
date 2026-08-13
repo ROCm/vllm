@@ -114,6 +114,13 @@ def try_get_optimal_moe_lora_config(
     # base MoE weight's block-wise quantization, so block_shape is omitted
     # from the config lookup — the non-quantized branch in get_default_config
     # ignores it anyway.
+    #
+    # M is the token count, so this lookup is batch-keyed, but it needs no
+    # batch-invariance guard of its own: both branches it can reach are
+    # already pinned. get_moe_configs() returns None under
+    # VLLM_BATCH_INVARIANT so the M-bucketed tuned table is never consulted,
+    # and get_default_config() short-circuits to a fixed M-independent
+    # config.
     raw_config = try_get_optimal_moe_config(w1_shape, w2_shape, top_k, dtype, M)
     config: dict[str, int | None] = dict(raw_config)
     if op_type in [
