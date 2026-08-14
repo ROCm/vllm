@@ -860,52 +860,23 @@ def main():
 
     def apply_hip_preprocessing(qweight, qzeros, scales, group_size, N):
         """Apply the same preprocessing as
-        AWQLinearMethod.process_weights_after_loading.
+        AutoAWQLinearMethod.process_weights_after_loading.
 
-        Uses the shared compute_awq_padding_for_rocm function from awq.py to ensure
-        padding logic stays in sync.
+        Delegates to the shared maybe_pad_awq_weights helper so the padding
+        logic stays in sync with the serving path.
         """
-        from vllm.model_executor.layers.quantization.awq import (
-            compute_awq_padding_for_rocm,
+        from vllm.model_executor.layers.quantization.awq_gemv_config import (
+            maybe_pad_awq_weights,
         )
         from vllm.platforms import current_platform
 
         if not current_platform.is_rocm():
             return qweight, qzeros, scales, qweight.shape[0]
 
-        K = qweight.shape[0]
-        num_groups = qzeros.shape[0]
-
-        if group_size != 128:
-            return qweight, qzeros, scales, K
-
-        should_pad, padded_groups = compute_awq_padding_for_rocm(
-            num_groups, N, group_size
+        qweight, qzeros, scales = maybe_pad_awq_weights(
+            qweight, qzeros, scales, group_size
         )
-
-        if not should_pad or padded_groups <= num_groups:
-            return qweight, qzeros, scales, K
-
-        pad_groups = padded_groups - num_groups
-        padded_K = K + pad_groups * group_size
-
-        # Pad tensors
-        qweight_padded = torch.zeros(
-            (padded_K, qweight.shape[1]), dtype=qweight.dtype, device=qweight.device
-        )
-        qweight_padded[:K] = qweight
-
-        qzeros_padded = torch.zeros(
-            (padded_groups, qzeros.shape[1]), dtype=qzeros.dtype, device=qzeros.device
-        )
-        qzeros_padded[:num_groups] = qzeros
-
-        scales_padded = torch.zeros(
-            (padded_groups, scales.shape[1]), dtype=scales.dtype, device=scales.device
-        )
-        scales_padded[:num_groups] = scales
-
-        return qweight_padded, qzeros_padded, scales_padded, padded_K
+        return qweight, qzeros, scales, qweight.shape[0]
 
     def bench(fn, warmup=50, rep=200):
         """Benchmark using triton.testing.do_bench with median return mode."""
