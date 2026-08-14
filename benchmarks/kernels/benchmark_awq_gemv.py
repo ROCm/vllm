@@ -69,7 +69,7 @@ def extract_awq_shapes(
     Returns:
         List of unique (K, N) tuples, sorted by (N, K)
     """
-    from vllm.model_executor.layers.quantization.awq import AWQConfig
+    from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
     from vllm.transformers_utils.config import get_config
 
     config = get_config(model=model, trust_remote_code=trust_remote_code)
@@ -79,7 +79,7 @@ def extract_awq_shapes(
     # vLLM auto-detects it from safetensors metadata at runtime.
     raw_quant_config = getattr(config, "quantization_config", {})
     if isinstance(raw_quant_config, dict):
-        awq_config = AWQConfig.from_config(raw_quant_config)
+        awq_config = AutoAWQConfig.from_config(raw_quant_config)
         awq_config.maybe_update_config(model)
         modules_to_not_convert = awq_config.modules_to_not_convert
     else:
