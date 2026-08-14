@@ -47,8 +47,10 @@ steps:
   - csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu
   - vllm/models/deepseek_v4/common/ops/
   - tests/kernels/test_fused_deepseek_v4_qnorm_rope_kv_insert.py
+  - tests/kernels/test_top_k_per_row.py # it runs on Blackwell too - some kernels have arch-specific optimizations
   commands:
     - pytest -v -s kernels/test_fused_deepseek_v4_*.py
+    - pytest -v -s kernels/test_top_k_per_row.py
 
 - label: Deepseek V4 Kernel Test (B200)
   key: deepseek-v4-kernel-test-b200
@@ -74,6 +76,20 @@ steps:
   commands:
     - pytest -v -s kernels/attention --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
   parallelism: 2
+  mirror:
+    amd:
+      device: mi325_1
+      timeout_in_minutes: 55
+      depends_on:
+      - image-build-amd
+      source_file_dependencies:
+      - csrc/attention/
+      - vllm/v1/attention
+      - vllm/model_executor/layers/attention
+      - tests/kernels/attention
+      - vllm/_aiter_ops.py
+      - vllm/envs.py
+      - vllm/platforms/rocm.py
 
 - label: Kernels Attention DiffKV Test (H100)
   key: kernels-attention-diffkv-test-h100
