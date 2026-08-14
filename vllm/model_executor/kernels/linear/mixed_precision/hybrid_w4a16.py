@@ -12,6 +12,7 @@ Both the HIP skinny kernel and the triton kernel read from this single
 weight copy. The triton kernel transposes tiles in-register.
 """
 
+import os
 from contextlib import nullcontext
 
 import torch
@@ -41,6 +42,14 @@ SUPPORTED_GROUP_SIZES = [32, 64, 128]
 # longer a K*M bound: the skinny kernel reads whatever does not fit in LDS from
 # global memory itself.
 MAX_SKINNY_BATCH_SIZE = 5
+
+
+def _handasm_w4a16_enabled() -> bool:
+    """Hand-tuned AMDGCN override for the skinny W4A16 GEMM (gfx1151).
+
+    On by default; set VLLM_W4A16_HANDASM=0 to fall back to the Triton kernel.
+    """
+    return os.environ.get("VLLM_W4A16_HANDASM", "1") == "1" and on_gfx1151()
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +464,37 @@ def triton_w4a16_skinny_fmt_gemm(
             M, N, K, group_size, a.dtype
         )
         grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+        # Opt-in hand-tuned AMDGCN override (VLLM_W4A16_HANDASM=1): dispatch to a
+        # prebuilt .hsaco assembled from a hand-editable .amdgcn when the selected
+        # tile/config exactly matches what that ISA was built for. The loader
+        # asserts every pinned constexpr/ABI field; otherwise we fall through to
+        # the Triton kernel below. See asm_w4a16.py / asm/.
+        if _handasm_w4a16_enabled():
+            from .asm_w4a16 import config_matches, launch_skinny_w4a16
+
+            if config_matches(
+                a.dtype,
+                has_zp,
+                group_size,
+                block_m,
+                block_n,
+                block_k,
+                num_warps,
+            ):
+                launch_skinny_w4a16(
+                    a,
+                    b_q,
+                    scales,
+                    c,
+                    M,
+                    N,
+                    K,
+                    K8,
+                    stride_bn,
+                    num_groups,
+                    group_size,
+                )
+                return c
         # The kernel picks the packed (fp16/gfx1x) vs scalar unpack itself.
         _triton_w4a16_skinny_fmt_kernel[grid](
             a,
