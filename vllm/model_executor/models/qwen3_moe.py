@@ -807,7 +807,6 @@ class Qwen3MoeForCausalLM(
         )
 
         # Set MoE hyperparameters
-        self.expert_weights = []
 
         self.moe_layers = []
         example_layer = None
