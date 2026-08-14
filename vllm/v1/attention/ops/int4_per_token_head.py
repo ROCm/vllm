@@ -727,10 +727,18 @@ def _launch_packed_attn(
     total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
     TILE_SIZE_PREFILL = _get_tile_size(
-        head_size, sliding_window_val, q.element_size(), is_prefill=True
+        head_size,
+        sliding_window_val,
+        q.element_size(),
+        is_prefill=True,
+        block_size=block_size,
     )
     TILE_SIZE_DECODE = _get_tile_size(
-        head_size, sliding_window_val, q.element_size(), is_prefill=False
+        head_size,
+        sliding_window_val,
+        q.element_size(),
+        is_prefill=False,
+        block_size=block_size,
     )
 
     use_3d = not (
