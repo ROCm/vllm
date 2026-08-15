@@ -245,7 +245,9 @@ def test_opcheck():
 @torch.inference_mode()
 def test_declines_unsupported():
     """The gate must decline every case the kernel asserts on."""
-    from vllm.third_party.flash_linear_attention.ops.chunk_rocm import is_hip_gdn_supported
+    from vllm.third_party.flash_linear_attention.ops.chunk_rocm import (
+        is_hip_gdn_supported,
+    )
 
     q, _, v, _, _, _, cu_seqlens = _make_inputs([64], num_k_heads=8, gqa_ratio=2)
 
