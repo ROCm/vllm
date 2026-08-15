@@ -224,6 +224,7 @@ _ON_GFX1250 = "gfx1250" in _GCN_ARCH
 _ON_CDNA = any(arch in _GCN_ARCH for arch in ["gfx9", "gfx1250"])
 # RDNA = gfx11/gfx12 minus the CDNA-classified gfx1250.
 _ON_RDNA = _ON_GFX1X and not _ON_CDNA
+_ON_RDNA4 = any(arch in _GCN_ARCH for arch in ["gfx1200", "gfx1201"])
 
 
 def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
@@ -331,6 +332,10 @@ def on_gfx12x() -> bool:
 
 def on_gfx1250() -> bool:
     return _ON_GFX1250
+
+
+def on_rdna4() -> bool:
+    return _ON_RDNA4
 
 
 def on_mi3xx() -> bool:
@@ -492,6 +497,10 @@ def _get_backend_priorities(
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
     if is_aiter_found_and_supported():
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
+    elif rocm_aiter_ops.is_rdna_aiter_enabled():
+        # RDNA4 (gfx12) only: aiter ships Triton-only kernels there, so it is
+        # gated apart from the gfx9/CK umbrella above and takes priority.
+        backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     allow_rocm_attn = not use_kv_connector
@@ -976,7 +985,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        return on_cdna() or on_gfx12x()
+        return on_cdna() or on_rdna4()
 
     @classmethod
     def is_fp8_fnuz(cls) -> bool:
@@ -1132,6 +1141,7 @@ class RocmPlatform(Platform):
             cc.cudagraph_mode != CUDAGraphMode.NONE
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
+            and not on_rdna4()
         ):
             rms_norm = ["aiter"] + default
         else:
