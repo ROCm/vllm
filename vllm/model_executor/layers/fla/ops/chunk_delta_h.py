@@ -22,7 +22,14 @@ from .utils import (
 )
 
 NUM_WARPS = [2, 4, 8, 16]
-_CDH_STAGES = [2] if is_navi else [2, 3, 4]
+if is_navi:
+    # Navi: pinned to a single stage count; see _cdh_early_prune below.
+    _CDH_STAGES = [2]
+elif torch.version.hip:
+    # Triton's AMD backend fails to lower this kernel with num_stages=4.
+    _CDH_STAGES = [2, 3]
+else:
+    _CDH_STAGES = [2, 3, 4]
 
 
 def _cdh_early_prune(configs, named_args, **kwargs):
