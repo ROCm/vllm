@@ -434,6 +434,7 @@ def flash_attn_triton_available() -> bool:
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
+    use_kv_connector: bool = False,
 ) -> list[AttentionBackendEnum]:
     from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
 
@@ -457,14 +458,19 @@ def _get_backend_priorities(
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
     if is_aiter_found_and_supported():
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
+    # Keep ROCM_ATTN disabled for KV connectors until connector transfer
+    # semantics are validated for its asymmetric native K/V cache views.
+    allow_rocm_attn = not use_kv_connector
     if on_gfx1x():
         # On RDNA (gfx11/gfx12), TRITON_ATTN is faster than ROCM_ATTN
         # because ROCM_ATTN's custom paged attention kernel falls back
         # to Triton internally with extra overhead.
         backends.append(AttentionBackendEnum.TRITON_ATTN)
-        backends.append(AttentionBackendEnum.ROCM_ATTN)
+        if allow_rocm_attn:
+            backends.append(AttentionBackendEnum.ROCM_ATTN)
     else:
-        backends.append(AttentionBackendEnum.ROCM_ATTN)
+        if allow_rocm_attn:
+            backends.append(AttentionBackendEnum.ROCM_ATTN)
         backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
 
@@ -539,7 +545,22 @@ class RocmPlatform(Platform):
         backend_priorities = _get_backend_priorities(
             attn_selector_config.use_mla,
             attn_selector_config.use_sparse,
+            attn_selector_config.use_kv_connector,
         )
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        is_encoder_decoder = (
+            getattr(getattr(vllm_config, "model_config", None), "attn_type", None)
+            == "encoder_decoder"
+        )
+        # ROCM_ATTN still uses a legacy attention layout (KV is the outer
+        # dimension) that is incompatible with the encoder backend layouts. The
+        # encoder and decoder need the layouts to match. This is currently
+        # enforced implicitly.
+        # TODO: Make this explicit in the selector in a future PR.
+        if is_encoder_decoder and AttentionBackendEnum.ROCM_ATTN in backend_priorities:
+            backend_priorities.remove(AttentionBackendEnum.ROCM_ATTN)
         for priority, backend in enumerate(backend_priorities):
             try:
                 backend_class = backend.get_class()
