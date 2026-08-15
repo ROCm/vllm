@@ -149,26 +149,10 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.attn_type != AttentionType.ENCODER_DECODER:
-            return kv_cache.unbind(1)
-
-        # NOTE: Encoder-decoder layers can share the same raw KV allocation with
-        # ROCM_ATTN decoder layers, whose physical layout is K/V first. Keep
-        # this cross-attention path on that physical layout so block IDs do not
-        # alias different bytes across the shared allocation.
-        num_blocks, _, block_size, num_kv_heads, head_size = kv_cache.shape
-        block_stride = block_size * num_kv_heads * head_size
-        kv_cache = kv_cache.as_strided(
-            (2, num_blocks, block_size, num_kv_heads, head_size),
-            (
-                num_blocks * block_stride,
-                block_stride,
-                num_kv_heads * head_size,
-                head_size,
-                1,
-            ),
-        )
-        return kv_cache.unbind(0)
+        # Blocks-first ``(num_blocks, 2, ...)``. The model runner normalizes any
+        # shared decoder/cross-attention allocation to this layout, so no
+        # per-backend restriding is needed here.
+        return kv_cache.unbind(1)
 
     def forward(
         self,
@@ -243,18 +227,49 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
-        with create_attention_profiler_scope(
-            backend_name="ROCM_AITER_UNIFIED",
-            batch_size=seqused_k.shape[0],
-            max_query_len=max_seqlen_q,
-            max_seq_len=max_seqlen_k,
-            num_heads=self.num_heads,
-            head_size=self.head_size,
-            num_kv_heads=self.num_kv_heads,
-            dtype=query.dtype,
-            is_causal=True,
-        ):
-            self.unified_attention(
+        if attn_metadata.causal:
+            with create_attention_profiler_scope(
+                backend_name="ROCM_AITER_UNIFIED",
+                batch_size=seqused_k.shape[0],
+                max_query_len=max_seqlen_q,
+                max_seq_len=max_seqlen_k,
+                num_heads=self.num_heads,
+                head_size=self.head_size,
+                num_kv_heads=self.num_kv_heads,
+                dtype=query.dtype,
+                is_causal=True,
+            ):
+                self.unified_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
+                    k_descale=layer._k_scale,
+                    v_descale=layer._v_scale,
+                    sinks=self.sinks,
+                    output_scale=output_scale,
+                )
+        else:
+            # The aiter kernel is causal-only. Non-causal cross-attention
+            # (ENCODER_DECODER, e.g. Whisper) falls back to the vLLM Triton
+            # unified kernel, which shares this layout and honors the flag.
+            from vllm.v1.attention.ops.triton_unified_attention import (
+                unified_attention as triton_unified_attention,
+            )
+
+            descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
+            triton_unified_attention(
                 q=query[:num_actual_tokens],
                 k=key_cache,
                 v=value_cache,
@@ -264,14 +279,14 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 seqused_k=seqused_k,
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=softmax_scale,
-                causal=True,
+                causal=attn_metadata.causal,
                 alibi_slopes=self.alibi_slopes,
                 window_size=self.sliding_window,
                 block_table=block_table,
                 softcap=self.logits_soft_cap,
                 q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
-                k_descale=layer._k_scale,
-                v_descale=layer._v_scale,
+                k_descale=layer._k_scale.expand(descale_shape),
+                v_descale=layer._v_scale.expand(descale_shape),
                 sinks=self.sinks,
                 output_scale=output_scale,
             )
