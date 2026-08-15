@@ -22,6 +22,9 @@ ALLOWED_FILES = {
     "vllm/distributed/weight_transfer/ipc_engine.py",
     "tests/distributed/test_packed_tensor.py",
     "tools/pre_commit/check_torch_cuda.py",
+    # Needs torch.cuda.Event(external=True) to time individual kernels from
+    # inside a captured graph; torch.Event has no `external` parameter.
+    "tests/kernels/quantization/bench_rocm_skinny_gemm.py",
 }
 
 
