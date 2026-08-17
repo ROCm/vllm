@@ -479,7 +479,7 @@ class AiterExperts(mk.FusedMoEExpertsModular):
                 return True
             
             if on_gfx1250():
-                return activation_key is None # TODO (JMATHIAS): This is a quick workaround patch to allow AiterExpers for Kimi k3
+                return activation_key is None or activation_key == kMxfp4Dynamic
             
             return False
         return True
