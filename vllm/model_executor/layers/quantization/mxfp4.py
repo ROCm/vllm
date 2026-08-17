@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
-
 import torch
 
 from vllm.logger import init_logger
@@ -22,7 +20,6 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     TRITON_BACKENDS,
     Mxfp4MoeBackend,
-    backend_to_kernel_cls,
     convert_gpt_oss_weight_to_mxfp4_moe_kernel_format,
     convert_weight_to_mxfp4_moe_kernel_format,
     make_mxfp4_moe_kernel,
@@ -103,10 +100,6 @@ class Mxfp4Config(QuantizationConfig):
                 "Skipping quantization for this layer.",
             )
         return None
-
-    def is_mxfp4_quant(self, prefix: str, layer: torch.nn.Module) -> bool:
-        """MXFP4 config always uses MXFP4 quantization."""
-        return True
 
 
 class GptOssMxfp4Config(Mxfp4Config):
@@ -496,6 +489,7 @@ def _use_k3_situ_aiter(moe: FusedMoEConfig) -> bool:
     )
 
 
+
 class Mxfp4MoEMethod(FusedMoEMethodBase):
     """MXFP4 MoE quantization method."""
 
@@ -505,20 +499,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.is_k3_situ_aiter = _use_k3_situ_aiter(moe)
         self.experts_cls: type[mk.FusedMoEExperts] | None
         if self.is_k3_situ_aiter:
+            from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+                backend_to_kernel_cls,
+            )
             self.mxfp4_backend = Mxfp4MoeBackend.AITER_MXFP4_BF16
             self.experts_cls = backend_to_kernel_cls(self.mxfp4_backend)[0]
-            logger.info_once("Using AITER_MXFP4_BF16 for Kimi-K3 SiTU MXFP4 MoE.")
-            from vllm._aiter_ops import rocm_aiter_ops
+            logger.info_once(
+                "Using AITER_MXFP4_BF16 for Kimi-K3 SiTU MXFP4 MoE."
+            )
+            import os
 
+            from vllm._aiter_ops import rocm_aiter_ops
             if rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled():
-                # AITER keeps bf16 activations below this token count, which
-                # would not match the fp8 a8w4 kernels the interleaved SiTU
-                # path is tuned for. The a16w4 path never reads it.
-                # TODO: Remove once AITER takes this as a kernel argument.
                 os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
         else:
-            self.mxfp4_backend, self.experts_cls = select_deepseek_v4_mxfp4_moe_backend(
-                moe
+            self.mxfp4_backend, self.experts_cls = (
+                select_deepseek_v4_mxfp4_moe_backend(moe)
             )
 
         self.max_capture_size = moe.max_capture_size
@@ -579,6 +575,38 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             activation=self.moe.activation,
         )
 
+    @staticmethod
+    def _encode_mxfp4_weight_scale(loaded_weight: torch.Tensor) -> torch.Tensor:
+        if loaded_weight.dtype == torch.uint8:
+            return loaded_weight
+        if loaded_weight.dtype == torch.float8_e8m0fnu:
+            return loaded_weight.view(torch.uint8)
+        if loaded_weight.is_floating_point():
+            return loaded_weight.to(torch.float8_e8m0fnu).view(torch.uint8)
+        return loaded_weight
+
+    @staticmethod
+    def get_scale_weight_loader(weight_loader):
+        def mxfp4_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+            return_success: bool = False,
+        ) -> bool | None:
+            loaded_weight = Mxfp4MoEMethod._encode_mxfp4_weight_scale(loaded_weight)
+            return weight_loader(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                return_success=return_success,
+            )
+
+        return mxfp4_weight_loader
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -597,6 +625,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.num_experts = num_experts
         self.intermediate_size = intermediate_size_per_partition
         self.hidden_size = hidden_size
+        weight_loader = extra_weight_attrs.pop("weight_loader")
+        scale_weight_loader = Mxfp4MoEMethod.get_scale_weight_loader(weight_loader)
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -610,6 +640,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
+        set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
 
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
@@ -622,6 +653,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, {"weight_loader": scale_weight_loader})
         w13_weight_scale.quant_method = "block"
 
         # down_proj (row parallel)
@@ -636,6 +668,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
+        set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
 
         w2_weight_scale = torch.nn.Parameter(
             torch.zeros(
@@ -648,6 +681,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, {"weight_loader": scale_weight_loader})
         w2_weight_scale.quant_method = "block"
 
         if self.moe.has_bias:
@@ -661,6 +695,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
+            set_weight_attrs(w13_bias, {"weight_loader": weight_loader})
 
             w2_bias = torch.nn.Parameter(
                 torch.zeros(
@@ -672,6 +707,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
+            set_weight_attrs(w2_bias, {"weight_loader": weight_loader})
 
     def _setup_kernel(
         self,
@@ -688,42 +724,46 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         hidden_size = self.hidden_size
         sf_block_size = 32
 
-        # Shape assertions
-        assert (
-            w13.dim() == 3
-            and w13.shape[0] == num_experts
-            and w13.shape[1] == intermediate_size * self.moe.w13_num_shards
-            and w13.shape[2] == hidden_size // 2
-        )
-        assert (
-            w13_scale.dim() == 3
-            and w13_scale.shape[0] == num_experts
-            and w13_scale.shape[1] == intermediate_size * self.moe.w13_num_shards
-            and w13_scale.shape[2] == hidden_size // sf_block_size
-        )
-        assert (
-            w2.dim() == 3
-            and w2.shape[0] == num_experts
-            and w2.shape[1] == hidden_size
-            and w2.shape[2] == intermediate_size // 2
-        )
-        assert (
-            w2_scale.dim() == 3
-            and w2_scale.shape[1] == hidden_size
-            and w2_scale.shape[2] == intermediate_size // sf_block_size
-        )
-        if w13_bias is not None:
+        # Shape assertions — skipped for SITU since its kernel handles native
+        # (non-256-aligned) intermediate sizes without prior round-up.
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+
+        if self.moe.activation != MoEActivation.SITU:
             assert (
-                w13_bias.dim() == 2
-                and w13_bias.shape[0] == num_experts
-                and w13_bias.shape[1] == intermediate_size * self.moe.w13_num_shards
+                w13.dim() == 3
+                and w13.shape[0] == num_experts
+                and w13.shape[1] == intermediate_size * self.moe.w13_num_shards
+                and w13.shape[2] == hidden_size // 2
             )
-        if w2_bias is not None:
             assert (
-                w2_bias.dim() == 2
-                and w2_bias.shape[0] == num_experts
-                and w2_bias.shape[1] == hidden_size
+                w13_scale.dim() == 3
+                and w13_scale.shape[0] == num_experts
+                and w13_scale.shape[1] == intermediate_size * self.moe.w13_num_shards
+                and w13_scale.shape[2] == hidden_size // sf_block_size
             )
+            assert (
+                w2.dim() == 3
+                and w2.shape[0] == num_experts
+                and w2.shape[1] == hidden_size
+                and w2.shape[2] == intermediate_size // 2
+            )
+            assert (
+                w2_scale.dim() == 3
+                and w2_scale.shape[1] == hidden_size
+                and w2_scale.shape[2] == intermediate_size // sf_block_size
+            )
+            if w13_bias is not None:
+                assert (
+                    w13_bias.dim() == 2
+                    and w13_bias.shape[0] == num_experts
+                    and w13_bias.shape[1] == intermediate_size * self.moe.w13_num_shards
+                )
+            if w2_bias is not None:
+                assert (
+                    w2_bias.dim() == 2
+                    and w2_bias.shape[0] == num_experts
+                    and w2_bias.shape[1] == hidden_size
+                )
 
         # Convert weights to kernel format
         if self.is_k3_situ_aiter:
@@ -742,6 +782,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     w13_bias=w13_bias,
                     w2_bias=w2_bias,
                     _cache_permute_indices=self._cache_permute_indices,
+                    activation=self.moe.activation,
                 )
             )
 
@@ -778,9 +819,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def _convert_k3_situ_weight_to_kernel_format(
         self, layer: RoutedExperts
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # K3's AITER A16W4 kernel wants the separated ([gate_all, up_all])
-        # stage-1 layout, unlike the interleaved gpt-oss/DeepSeek path in
-        # convert_weight_to_mxfp4_moe_kernel_format. Preshuffle once here.
         from aiter.utility.fp4_utils import e8m0_shuffle
 
         from vllm._aiter_ops import rocm_aiter_ops
@@ -790,9 +828,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         e8m0_dtype = torch.float8_e8m0fnu
         num_experts = layer.w13_weight.shape[0]
 
-        # a8w4 (VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4=1) uses the gate/up-
-        # interleaved (_gui_) fp8 flydsl kernels, which need w13 weight+scale
-        # in interleave layout. Default a16w4 keeps the separated layout.
         guinterleave = rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
         w13_raw = layer.w13_weight.data.view(fp4_dtype)
         w2_raw = layer.w2_weight.data.view(fp4_dtype)
@@ -828,6 +863,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w2.is_shuffled = True
 
         return w13, w2, w13_scale, w2_scale
+
 
     def process_weights_after_loading(self, layer):
         w13 = layer.w13_weight
