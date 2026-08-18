@@ -385,8 +385,8 @@ def test_hybrid_w4a16_process_weights_symmetric_with_prefill_dequant():
     from types import SimpleNamespace
 
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (  # noqa: E501
-        HybridW4A16LinearKernel,
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (  # noqa: E501
+        RDNAHybridW4A16LinearKernel,
     )
 
     _ensure_single_process_model_parallel()
@@ -415,7 +415,7 @@ def test_hybrid_w4a16_process_weights_symmetric_with_prefill_dequant():
         ),
     )
 
-    kernel = HybridW4A16LinearKernel(
+    kernel = RDNAHybridW4A16LinearKernel(
         MPLinearLayerConfig(
             full_weight_shape=(K, N),
             partition_weight_shape=(K, N),

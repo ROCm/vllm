@@ -7,7 +7,7 @@ The hybrid kernel stores weights in ExLlama shuffle format [N, K//8] int32.
 Tests validate:
   - Triton GEMM (triton_w4a16_skinny_fmt_gemm) for prefill path
   - HIP wvSplitK_int4_g for decode path
-  - Full hybrid dispatch (torch.ops.vllm.hybrid_w4a16_apply) routing
+  - Full hybrid dispatch (torch.ops.vllm.rdna_hybrid_w4a16_apply) routing
 
 Run `pytest tests/kernels/quantization/test_hybrid_w4a16_triton.py`.
 """
@@ -30,7 +30,7 @@ pytest.importorskip("triton")
 device = "cuda"
 
 hybrid_w4a16_module = importlib.import_module(
-    "vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16"
+    "vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16"
 )
 triton_w4a16_skinny_fmt_gemm = hybrid_w4a16_module.triton_w4a16_skinny_fmt_gemm
 
@@ -151,7 +151,7 @@ def _pack_scale_zp(
     """Build the asymmetric PackedSb carrier [N, K//G] fp32 that
     triton_w4a16_skinny_fmt_gemm consumes (low 16 bits = scale; high 16 bits =
     fp16 bias_eff = -(8 + (zp-8))*scale, or bf16 integer zp). Mirrors
-    HybridW4A16LinearKernel.process_weights_after_loading.
+    RDNAHybridW4A16LinearKernel.process_weights_after_loading.
     """
     scale_u16 = scales_nkg.contiguous().view(torch.uint16).to(torch.int32) & 0xFFFF
     if dtype == torch.float16:
@@ -318,7 +318,7 @@ def test_hybrid_w4a16_dispatch(dtype, M, K, N, G, random_seed: int):
     )
 
     cu_count = num_compute_units()
-    out = torch.ops.vllm.hybrid_w4a16_apply(
+    out = torch.ops.vllm.rdna_hybrid_w4a16_apply(
         a, b_packed_i8, scales, b_packed_i32, None, None, cu_count, G
     )
 

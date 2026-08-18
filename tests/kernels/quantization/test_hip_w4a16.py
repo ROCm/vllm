@@ -596,7 +596,7 @@ def test_wvsplitk_int4_g_packed_zero_points(
     plausible-looking output, so this compares actual values.
     """
     import vllm._custom_ops as ops
-    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
         pack_skinny_int4,
     )
     from vllm.utils.platform_utils import num_compute_units
@@ -636,7 +636,7 @@ def test_wvsplitk_int4_g_rejects_unpacked_zero_points() -> None:
     silently accepting that shape now would read garbage nibbles.
     """
     import vllm._custom_ops as ops
-    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
         pack_skinny_int4,
     )
     from vllm.utils.platform_utils import num_compute_units
@@ -673,7 +673,7 @@ def test_wvsplitk_int4_g_padded_group_stride(k: int, group_size: int) -> None:
     is exercised regardless.
     """
     import vllm._custom_ops as ops
-    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
         pack_skinny_int4,
     )
     from vllm.utils.platform_utils import num_compute_units

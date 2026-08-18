@@ -23,7 +23,7 @@ import time
 import torch
 
 import vllm._custom_ops as ops
-from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
     _group_stride_pad,
     _pad_group_rows,
     pack_skinny_int4,
