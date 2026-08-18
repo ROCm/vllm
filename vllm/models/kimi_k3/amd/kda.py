@@ -533,6 +533,16 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 from vllm.platforms.rocm import on_gfx1250
 
                 if on_gfx1250():
+                    recurrent_state[prefill_state_indices] = gather_initial_states(
+                        recurrent_state,
+                        prefill_state_indices,
+                        prefill_has_initial_state,
+                    )
+                    prefill_slot_indices = (
+                        prefill_state_indices.unsqueeze(1)
+                        .expand(-1, q_ns.shape[1])
+                        .contiguous()
+                    )
                     core_attn_out_non_spec, _ = fused_recurrent_kda(
                         q=q_ns,
                         k=k_ns,
@@ -544,7 +554,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         lower_bound=self.gate_lower_bound,
                         initial_state=recurrent_state,
                         cu_seqlens=prefill_query_start_loc,
-                        ssm_state_indices=prefill_state_indices,
+                        ssm_state_indices=prefill_slot_indices,
                     )
                 else:
                     initial_state = gather_initial_states(
