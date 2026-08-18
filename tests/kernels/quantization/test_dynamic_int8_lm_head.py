@@ -133,3 +133,53 @@ def test_dynamic_int8_lm_head_embedding(m, k, dtype, seed, default_vllm_config):
 
     ref = torch.nn.functional.embedding(indices, w_orig.cuda())
     torch.testing.assert_close(emb, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("lm_head_first", [False, True])
+@pytest.mark.parametrize("dtype", DTYPES)
+@torch.inference_mode()
+def test_dynamic_int8_lm_head_tie_weights(lm_head_first, dtype, default_vllm_config):
+    """Weight-tied models must tie without NotImplementedError.
+
+    ParallelLMHead.tie_weights() delegates to quant_method.tie_weights(), so a
+    method that does not override it raises NotImplementedError from the base
+    class at model-construction time (e.g. Gemma 4, tie_word_embeddings=True).
+
+    The tied pair must also end up sharing a single INT8 copy of the vocab
+    table, regardless of the order the loader walks the two modules in.
+    """
+    torch.manual_seed(0)
+    m, k = 256, 128
+    m_embed, embed = _make_layer(m, k, dtype)
+    m_head, lm_head = _make_layer(m, k, dtype)
+
+    xavier = math.sqrt(2 / k)
+    embed.weight.data.copy_(
+        (torch.rand(m, k, dtype=dtype, device="cpu") * 2 - 1) * xavier
+    )
+    embed.cuda()
+    lm_head.cuda()
+    embed.quant_method = m_embed
+
+    w_orig = embed.weight.data.clone()
+    assert m_head.tie_weights(lm_head, embed) is lm_head
+    assert lm_head.weight is embed.weight
+
+    order = (
+        ((m_head, lm_head), (m_embed, embed))
+        if lm_head_first
+        else ((m_embed, embed), (m_head, lm_head))
+    )
+    for method, layer in order:
+        method.process_weights_after_loading(layer)
+
+    # Both sides quantized, sharing one INT8 buffer and one scale tensor.
+    assert lm_head.weight.dtype == torch.int8
+    assert lm_head.weight.data_ptr() == embed.weight.data_ptr()
+    assert lm_head.weight_scale.data_ptr() == embed.weight_scale.data_ptr()
+    assert m_head._w_orig.data_ptr() == m_embed._w_orig.data_ptr()
+
+    # Quantizing twice would corrupt the shared table; check it still
+    # dequantizes back to the original weights.
+    dequant = embed.weight.data.to(dtype) * embed.weight_scale.unsqueeze(1)
+    torch.testing.assert_close(dequant, w_orig.cuda(), atol=xavier / 127, rtol=0.05)
