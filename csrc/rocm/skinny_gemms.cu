@@ -79,15 +79,6 @@ bool is_gfx11() {
   return result;
 }
 
-bool on_gfx1151() {
-  static const bool result = [] {
-    const auto* dprops = at::cuda::getCurrentDeviceProperties();
-    const std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx1151") != std::string::npos;
-  }();
-  return result;
-}
-
 #if defined(NDEBUG)
   #undef NDEBUG
   #include <assert.h>
@@ -1420,13 +1411,12 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 //   YTILE  = output rows per thread tile
 //   UNRL   = K-loop unroll factor
 //   N      = batch size (passed through from the switch in wvSplitK)
-// gfx1151 goes through WVSPLIT_TILE_CFG like every other gfx11xx board.
-// Upstream's #40784 added a separate on_gfx1151() chain here, but it selects
-// only AC=8 configs, so routing gfx1151 into it silently dropped the nine
-// AC=16/AC=32 branches WVSPLIT_TILE_CFG carries for K in {2048, 4096, 8192}
-// and K%2048==0 -- measured at -1.0 to -1.4% decode on Qwen3-30B-A3B (K=2048),
-// Qwen3.x-35B and Qwen3-Omni-30B. Dense models were unaffected because
-// Gemma-3-4B's K=2560 hits K%1024==512, a rule both chains share.
+// All gfx11xx boards, gfx1151 included, route through WVSPLIT_TILE_CFG.
+// Giving gfx1151 a chain of its own would restrict it to AC=8 configs and drop
+// the nine AC=16/AC=32 branches WVSPLIT_TILE_CFG carries for K in {2048, 4096,
+// 8192} and K%2048==0, which costs 1.0-1.4% decode on Qwen3-30B-A3B (K=2048),
+// Qwen3.x-35B and Qwen3-Omni-30B. Dense models are unaffected: Gemma-3-4B's
+// K=2560 hits K%1024==512, a rule both paths share.
 #define WVSPLIT_TILE(_sYT, __N)                                 \
   {                                                             \
     if (on_gfx1x()) { /* gfx11xx/GFX12, wave32 */               \
