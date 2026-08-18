@@ -530,32 +530,50 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     prefill_state_indices = non_spec_state_indices_tensor
                     prefill_has_initial_state = has_initial_state
 
-                initial_state = gather_initial_states(
-                    recurrent_state,
-                    prefill_state_indices,
-                    prefill_has_initial_state,
-                )
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
-                    q=q_ns,
-                    k=k_ns,
-                    v=v_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    g_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=prefill_query_start_loc,
-                    chunk_indices=m.chunk_indices,
-                    chunk_offsets=m.chunk_offsets,
-                )
-                # Init cache
-                recurrent_state[prefill_state_indices] = last_recurrent_state
+                from vllm.platforms.rocm import on_gfx1250
+
+                if on_gfx1250():
+                    core_attn_out_non_spec, _ = fused_recurrent_kda(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        dt_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=recurrent_state,
+                        cu_seqlens=prefill_query_start_loc,
+                        ssm_state_indices=prefill_state_indices,
+                    )
+                else:
+                    initial_state = gather_initial_states(
+                        recurrent_state,
+                        prefill_state_indices,
+                        prefill_has_initial_state,
+                    )
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = chunk_kda_with_fused_gate(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=prefill_query_start_loc,
+                        chunk_indices=m.chunk_indices,
+                        chunk_offsets=m.chunk_offsets,
+                    )
+                    recurrent_state[prefill_state_indices] = (
+                        last_recurrent_state
+                    )
 
                 if split_non_spec:
                     # Restore decode-first token order for the merge below.
