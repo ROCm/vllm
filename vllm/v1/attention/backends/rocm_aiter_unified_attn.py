@@ -231,7 +231,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
 
         if attn_metadata.causal:
             with create_attention_profiler_scope(
-                backend_name="ROCM_AITER_UNIFIED",
+                backend_name="ROCM_AITER_UNIFIED_ATTN",
                 batch_size=seqused_k.shape[0],
                 max_query_len=max_seqlen_q,
                 max_seq_len=max_seqlen_k,
@@ -272,7 +272,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
             with create_attention_profiler_scope(
-                backend_name="ROCM_AITER_UNIFIED_TRITON_FB",
+                backend_name="ROCM_AITER_UNIFIED_ATTN",
                 batch_size=seqused_k.shape[0],
                 max_query_len=max_seqlen_q,
                 max_seq_len=max_seqlen_k,
