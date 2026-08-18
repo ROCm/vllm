@@ -834,6 +834,13 @@ class RocmPlatform(Platform):
         # worker processes. Keeping this query context-free preserves `fork`
         # where it is otherwise valid (e.g. out-of-tree models registered in
         # the parent process).
+        #
+        # gfx11 opts out: skipping the HIP context here costs 5-18% of prefill
+        # throughput on Strix Halo, and both paths return the same 32 GiB, so
+        # the amdsmi query buys nothing locally. Provisional, pending the
+        # CPU-side root cause.
+        if on_gfx11():
+            return torch.cuda.get_device_properties(device_id).total_memory
         try:
             physical_device_id = cls.device_id_to_physical_device_id(device_id)
             return _query_total_memory_from_amdsmi(physical_device_id)
