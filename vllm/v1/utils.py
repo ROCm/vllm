@@ -788,19 +788,23 @@ def create_attention_profiler_scope(
     dtype_str = str(dtype).replace("torch.", "")
     causal_str = "causal" if is_causal else "non_causal"
 
-    scope_name = (
-        f"attn_{causal_str} "
-        f"B={batch_size} Q={max_query_len} S={max_seq_len} "
-        f"H={num_heads} D={head_size} KV_H={num_kv_heads} "
-        f"DT={dtype_str} BE={backend_name}"
-    )
     # Only surface the V operand token stride when it is *not* the natural
     # contiguous value (num_kv_heads * head_size). The real ViT layout feeds a
     # non-contiguous V sliced from the fused QKV projection (token stride
     # mult*H*D), which is what we want visible in the profile; natural strides
     # are omitted to keep the label short.
-    if v_token_stride is not None and v_token_stride != num_kv_heads * head_size:
-        scope_name += f" Vstride={v_token_stride}"
+    # Build in one f-string to avoid string ops that dynamo can't trace.
+    vstride_suffix = (
+        f" Vstride={v_token_stride}"
+        if v_token_stride is not None and v_token_stride != num_kv_heads * head_size
+        else ""
+    )
+    scope_name = (
+        f"attn_{causal_str} "
+        f"B={batch_size} Q={max_query_len} S={max_seq_len} "
+        f"H={num_heads} D={head_size} KV_H={num_kv_heads} "
+        f"DT={dtype_str} BE={backend_name}{vstride_suffix}"
+    )
 
     return record_function_or_nullcontext(scope_name)
 
