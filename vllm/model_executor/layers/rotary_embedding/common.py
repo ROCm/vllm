@@ -143,6 +143,7 @@ class ApplyRotaryEmb(CustomOp):
                 ).apply_rotary
 
     @staticmethod
+    @torch.compile(dynamic=True)  # Fuse RoPE ops into a single kernel
     def forward_static(
         x: torch.Tensor,
         cos: torch.Tensor,
