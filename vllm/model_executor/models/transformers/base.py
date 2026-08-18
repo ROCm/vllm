@@ -501,9 +501,6 @@ class Base(
         """
         text_config = self.text_config
 
-        num_heads = self.model_config.get_num_attention_heads(self.parallel_config)
-        head_size = self.model_config.get_head_size()
-        num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         logits_soft_cap = getattr(text_config, "attn_logit_softcapping", None)
 
         # In encoder models, the attention layers will have `is_causal=False`
@@ -524,6 +521,19 @@ class Base(
 
         attention_instances = {}
         for i in range(start, end):
+            # `[i]` is the whole-model config unless the checkpoint is
+            # heterogeneous, in which case it is this layer's own geometry.
+            arch_config = self.model_config.model_arch_config[i]
+            num_heads = self.model_config.get_num_attention_heads(
+                self.parallel_config, arch_config
+            )
+            head_size = arch_config.head_size
+            # Default to Llama scale, maybe updated in vllm_flash_attention_forward
+            scale = head_size**-0.5
+            num_kv_heads = self.model_config.get_num_kv_heads(
+                self.parallel_config, arch_config
+            )
+
             # Handle interleaved sliding window attention
             per_layer_sliding_window = None
             if (
@@ -540,9 +550,7 @@ class Base(
             attention_instances[i] = attn_cls(
                 num_heads=num_heads,
                 head_size=head_size,
-                # NOTE: We use Llama scale as default, if it's set by
-                # Transformers, it's updated in vllm_flash_attention_forward
-                scale=head_size**-0.5,
+                scale=scale,
                 num_kv_heads=num_kv_heads,
                 cache_config=self.cache_config,
                 quant_config=self.quant_config,

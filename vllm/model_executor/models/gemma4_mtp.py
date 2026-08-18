@@ -276,11 +276,12 @@ class Gemma4MTPDecoderLayer(nn.Module):
         layer_config = gemma4_layer_config(config, layer_idx)
         head_dim = layer_config.head_dim
         num_kv_heads = layer_config.num_key_value_heads
+        num_heads = layer_config.num_attention_heads
 
         self.self_attn = Gemma4MTPAttention(
             config=config,
             hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
+            num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
