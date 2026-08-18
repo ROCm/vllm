@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 //! Shared parser core for JSON tool calls wrapped by text markers.
 
 pub use granite4::Granite4ToolParser;
@@ -28,24 +31,24 @@ use super::utils::{
 };
 use super::{Result, ToolCallDelta, ToolParserOutput};
 
-type JsonToolInput<'i> = Partial<&'i str>;
+pub(crate) type JsonToolInput<'i> = Partial<&'i str>;
 
 #[derive(Debug, Clone, Copy)]
-struct JsonToolCallConfig {
-    parser_name: &'static str,
-    start_marker: &'static str,
-    end_marker: &'static str,
-    marker_whitespace: JsonToolCallWhitespace,
-    delimiter: Option<&'static str>,
-    name_key: &'static str,
+pub(crate) struct JsonToolCallConfig {
+    pub parser_name: &'static str,
+    pub start_marker: &'static str,
+    pub end_marker: &'static str,
+    pub marker_whitespace: JsonToolCallWhitespace,
+    pub delimiter: Option<&'static str>,
+    pub name_key: &'static str,
     /// Candidate JSON keys naming the arguments payload, tried in order.
     /// Most parsers use a single key like `["arguments"]`, but some accept
     /// multiple (e.g. InternLM2 accepts `parameters` or `arguments`).
-    arguments_key: &'static [&'static str],
+    pub arguments_key: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy)]
-enum JsonToolCallWhitespace {
+pub(crate) enum JsonToolCallWhitespace {
     Optional,
     Exact(&'static str),
 }
@@ -58,7 +61,7 @@ enum JsonToolCallMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum JsonToolCallEvent {
+pub(crate) enum JsonToolCallEvent {
     Text { len: usize },
     ToolCallStart,
     ToolCallHeader { function_name: String },
@@ -106,7 +109,7 @@ impl JsonToolCallParser {
     fn finish(&mut self) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
         match &self.mode {
-            JsonToolCallMode::Text => output.normal_text.push_str(&self.buffer),
+            JsonToolCallMode::Text => output.push_text(&self.buffer),
             JsonToolCallMode::Header | JsonToolCallMode::Arguments { .. } => {
                 return Err(parsing_failed!(
                     "incomplete {} tool call",
@@ -126,7 +129,7 @@ impl JsonToolCallParser {
     ) -> Result<()> {
         match event {
             JsonToolCallEvent::Text { len: consumed_len } => {
-                output.normal_text.push_str(&self.buffer[..consumed_len]);
+                output.push_text(&self.buffer[..consumed_len]);
             }
             JsonToolCallEvent::ToolCallStart => self.mode = JsonToolCallMode::Header,
             JsonToolCallEvent::ToolCallHeader { function_name } => {
@@ -136,7 +139,7 @@ impl JsonToolCallParser {
                 self.mode = JsonToolCallMode::Arguments {
                     json_scan: JsonObjectScanState::default(),
                 };
-                output.calls.push(ToolCallDelta {
+                output.push_call(ToolCallDelta {
                     tool_index,
                     name: Some(function_name),
                     arguments: String::new(),
@@ -149,7 +152,7 @@ impl JsonToolCallParser {
                         self.config.parser_name
                     ));
                 };
-                output.calls.push(ToolCallDelta {
+                output.push_call(ToolCallDelta {
                     tool_index,
                     name: None,
                     arguments: self.buffer[..consumed_len].to_string(),
@@ -217,7 +220,7 @@ fn tool_call_start_event(
 
 /// Parse a marker-wrapped JSON tool-call header before the raw arguments
 /// payload.
-fn tool_call_header_event(
+pub(crate) fn tool_call_header_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
@@ -314,7 +317,7 @@ fn tool_call_close_event(
     input: &mut JsonToolInput<'_>,
     config: JsonToolCallConfig,
 ) -> ModalResult<JsonToolCallEvent> {
-    let _ = literal("}").parse_next(input)?;
+    seq!(_: ws0, _: literal("}")).parse_next(input)?;
 
     match config.delimiter {
         Some(delimiter) => alt((
@@ -400,7 +403,35 @@ mod tests {
             parser.parse_into(chunk, &mut output).unwrap();
         }
         output.append(parser.finish().unwrap());
-        output.coalesce_calls()
+        output.coalesce()
+    }
+
+    #[test]
+    fn json_tool_call_tolerates_whitespace_before_outer_brace() {
+        // Pretty-printed JSON puts whitespace between the arguments object's `}`
+        // and the outer object's `}`; it must still parse (json.loads parity).
+        let mut whole = JsonToolCallParser::new(DELIMITED_CONFIG);
+        let whole_output = collect_chunks(
+            &mut whole,
+            &[r#"<tool_calls>{"function":"f","parameters":{"x":1} }</tool_calls>"#],
+        );
+        assert_eq!(whole_output.calls().len(), 1);
+        assert_eq!(whole_output.calls()[0].name.as_deref(), Some("f"));
+        assert_eq!(whole_output.calls()[0].arguments, r#"{"x":1}"#);
+
+        // Same input, but the whitespace before the outer `}` is split across a
+        // chunk boundary (exercises `ws0` returning Incomplete on `Partial`).
+        let mut chunked = JsonToolCallParser::new(DELIMITED_CONFIG);
+        let chunked_output = collect_chunks(
+            &mut chunked,
+            &[
+                r#"<tool_calls>{"function":"f","parameters":{"x":1}"#,
+                " ",
+                "}</tool_calls>",
+            ],
+        );
+        assert_eq!(chunked_output.calls().len(), 1);
+        assert_eq!(chunked_output.calls()[0].arguments, r#"{"x":1}"#);
     }
 
     #[test]
@@ -415,22 +446,25 @@ mod tests {
 
         expect![[r#"
             ToolParserOutput {
-                normal_text: "",
-                calls: [
-                    ToolCallDelta {
-                        tool_index: 0,
-                        name: Some(
-                            "get_weather",
-                        ),
-                        arguments: "{\"location\":\"Shanghai\"}",
-                    },
-                    ToolCallDelta {
-                        tool_index: 1,
-                        name: Some(
-                            "add",
-                        ),
-                        arguments: "{\"x\":1,\"y\":2}",
-                    },
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"location\":\"Shanghai\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "add",
+                            ),
+                            arguments: "{\"x\":1,\"y\":2}",
+                        },
+                    ),
                 ],
             }
         "#]]
@@ -451,22 +485,25 @@ mod tests {
 
         expect![[r#"
             ToolParserOutput {
-                normal_text: "",
-                calls: [
-                    ToolCallDelta {
-                        tool_index: 0,
-                        name: Some(
-                            "get_weather",
-                        ),
-                        arguments: "{\"location\":\"Shanghai\"}",
-                    },
-                    ToolCallDelta {
-                        tool_index: 1,
-                        name: Some(
-                            "add",
-                        ),
-                        arguments: "{\"x\":1,\"y\":2}",
-                    },
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"location\":\"Shanghai\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "add",
+                            ),
+                            arguments: "{\"x\":1,\"y\":2}",
+                        },
+                    ),
                 ],
             }
         "#]]
@@ -486,15 +523,19 @@ mod tests {
 
         expect![[r#"
             ToolParserOutput {
-                normal_text: " trailing text",
-                calls: [
-                    ToolCallDelta {
-                        tool_index: 0,
-                        name: Some(
-                            "get_weather",
-                        ),
-                        arguments: "{\"location\":\"Shanghai\"}",
-                    },
+                events: [
+                    Text(
+                        " trailing text",
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"location\":\"Shanghai\"}",
+                        },
+                    ),
                 ],
             }
         "#]]

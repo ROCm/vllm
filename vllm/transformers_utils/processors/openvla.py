@@ -7,9 +7,13 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BatchFeature, TensorType
+from transformers import (
+    BatchFeature,
+    ImageProcessingMixin,
+    ProcessorMixin,
+    TensorType,
+)
 from transformers.image_utils import ImageInput
-from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import TextInput
 
 IMAGENET_MEAN = np.array([0.484375, 0.455078125, 0.40625], dtype=np.float32)
@@ -68,7 +72,7 @@ def preprocess_openvla_image(image: Any, image_size: int) -> torch.Tensor:
     return torch.from_numpy(pixel_values)
 
 
-class OpenVLAImageProcessor:
+class OpenVLAImageProcessor(ImageProcessingMixin):
     def __init__(self, *, image_size: int) -> None:
         self.image_size = image_size
 

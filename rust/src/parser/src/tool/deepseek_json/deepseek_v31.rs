@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use super::{DeepSeekJsonFormat, DeepSeekJsonToolParser};
-use crate::tool::{Result, StructuralTagModel, Tool, ToolParser, ToolParserOutput};
+use crate::tool::{Result, StructuralTagBuilder, Tool, ToolParser, ToolParserOutput};
 
 /// Tool parser for DeepSeek V3.1 raw JSON tool calls.
 ///
@@ -28,8 +31,8 @@ impl ToolParser for DeepSeekV31ToolParser {
         Ok(Box::new(Self::new(tools)))
     }
 
-    fn structural_tag_model(&self) -> Option<StructuralTagModel> {
-        Some(StructuralTagModel::DeepSeekV31)
+    fn structural_tag_builder(&self) -> Option<&dyn StructuralTagBuilder> {
+        Some(xgrammar_structural_tag::Model::DeepSeekV31.builder())
     }
 
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
@@ -70,8 +73,8 @@ mod tests {
         let mut parser = DeepSeekV31ToolParser::new(&test_tools());
         let output = parser.parse_complete("Hello, world!").unwrap();
 
-        assert_eq!(output.normal_text, "Hello, world!");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
     }
 
     #[test]
@@ -85,11 +88,11 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(output.normal_text, "Let me check.");
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].tool_index, 0);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
-        assert_eq!(output.calls[0].arguments, arguments);
+        assert_eq!(output.normal_text(), "Let me check.");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].tool_index, 0);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[0].arguments, arguments);
     }
 
     #[test]
@@ -100,7 +103,7 @@ mod tests {
             .parse_complete(&tool_section(&[v31_tool_call("get_weather", arguments)]))
             .unwrap();
 
-        assert_eq!(output.calls[0].arguments, arguments);
+        assert_eq!(output.calls()[0].arguments, arguments);
     }
 
     #[test]
@@ -123,7 +126,7 @@ mod tests {
         for chunk in chunks {
             let next = parser.parse_chunk(chunk).unwrap();
             observed_arguments.extend(
-                next.calls
+                next.calls()
                     .iter()
                     .filter(|call| call.name.is_none())
                     .map(|call| call.arguments.clone()),
@@ -134,7 +137,7 @@ mod tests {
 
         assert_eq!(observed_arguments, ["{\"location\":", "\"Beijing\"", "}"]);
         assert_eq!(
-            output.coalesce_calls().calls[0].arguments,
+            output.coalesce().calls()[0].arguments,
             r#"{"location":"Beijing"}"#
         );
     }
@@ -150,9 +153,9 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.normal_text, "hello ");
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].arguments, r#"{"location":"Tokyo"}"#);
+        assert_eq!(output.normal_text(), "hello ");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].arguments, r#"{"location":"Tokyo"}"#);
     }
 
     #[test]
@@ -163,8 +166,8 @@ mod tests {
 
         let output = parser.parse_complete(&input).unwrap();
 
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].arguments, arguments);
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].arguments, arguments);
     }
 
     #[test]
@@ -180,22 +183,25 @@ mod tests {
 
         expect![[r#"
             ToolParserOutput {
-                normal_text: "",
-                calls: [
-                    ToolCallDelta {
-                        tool_index: 0,
-                        name: Some(
-                            "get_weather",
-                        ),
-                        arguments: "{\"location\":\"Shanghai\"}",
-                    },
-                    ToolCallDelta {
-                        tool_index: 1,
-                        name: Some(
-                            "add",
-                        ),
-                        arguments: "{\"x\":1,\"y\":2}",
-                    },
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"location\":\"Shanghai\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "add",
+                            ),
+                            arguments: "{\"x\":1,\"y\":2}",
+                        },
+                    ),
                 ],
             }
         "#]]
@@ -212,9 +218,9 @@ mod tests {
 
         let output = collect_stream(&mut parser, &[&input]);
 
-        assert!(output.normal_text.is_empty());
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].arguments, r#"{"location":"Tokyo"}"#);
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].arguments, r#"{"location":"Tokyo"}"#);
     }
 
     #[test]
@@ -239,6 +245,7 @@ mod tests {
 
         let error = parser.parse_chunk(&input).unwrap_err();
 
-        expect!["tool parser parsing failed: "].assert_eq(&error.to_report_string());
+        expect![[r#"tool parser parsing failed: near "<｜tool▁sep｜>{}": "#]]
+            .assert_eq(&error.to_report_string());
     }
 }

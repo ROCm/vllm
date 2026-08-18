@@ -1405,36 +1405,25 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     }                                                                        \
   }
 
-#define WVSPLIT_TILE(_sYT, __N)                                      \
-  {                                                                  \
-    bool fit_lds = (Kbp_in * N_in <= max_lds_len);                   \
-    if (is_gfx11()) {                                                \
-      if (_sYT <= 1)                                                 \
-        WVSPLITK_CFG(32, 16, 1, 4, __N)                              \
-      else if (K_in < 1024)                                          \
-        WVSPLITK_CFG(32, 16, 2, 4, __N)                              \
-      else if ((K_in % 1024 == 512) && (_sYT >= 40 || K_in >= 4096)) \
-        WVSPLITK_CFG(32, 16, 4, 1, __N)                              \
-      else if (K_in <= 2048 && (__N >= 2 || _sYT <= 26))             \
-        WVSPLITK_CFG(32, 16, 1, 4, __N)                              \
-      else if (__N >= 2 && !fit_lds)                                 \
-        WVSPLITK_CFG(32, 16, 1, 4, __N)                              \
-      else if (__N == 1)                                             \
-        WVSPLITK_CFG(32, 16, 1, 2, __N)                              \
-      else                                                           \
-        WVSPLITK_CFG(32, 16, 1, 1, __N)                              \
-    } else {                                                         \
-      if (_sYT <= 1)                                                 \
-        WVSPLITK_CFG(64, 16, 1, 4, __N)                              \
-      else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2))          \
-        WVSPLITK_CFG(64, 16, 2, 2, __N)                              \
-      else if (_sYT <= 4 * 3)                                        \
-        WVSPLITK_CFG(64, 16, 3, 2, __N)                              \
-      else if (__N == 4)                                             \
-        WVSPLITK_CFG(64, 16, 4, 1, __N)                              \
-      else                                                           \
-        WVSPLITK_CFG(64, 16, 4, 2, __N)                              \
-    }                                                                \
+// WVSPLITK_CFG arguments are: (THRDS, WVPRGRP, YTILE, UNRL, N).
+//   THRDS  = wavefront width (32 on GFX11/GFX12, 64 on GFX9)
+//   WVPRGRP= waves per group (always 16)
+//   YTILE  = output rows per thread tile
+//   UNRL   = K-loop unroll factor
+//   N      = batch size (passed through from the switch in wvSplitK)
+// All gfx11xx boards, gfx1151 included, route through WVSPLIT_TILE_CFG.
+// Giving gfx1151 a chain of its own would restrict it to AC=8 configs and drop
+// the nine AC=16/AC=32 branches WVSPLIT_TILE_CFG carries for K in {2048, 4096,
+// 8192} and K%2048==0, which costs 1.0-1.4% decode on Qwen3-30B-A3B (K=2048),
+// Qwen3.x-35B and Qwen3-Omni-30B. Dense models are unaffected: Gemma-3-4B's
+// K=2560 hits K%1024==512, a rule both paths share.
+#define WVSPLIT_TILE(_sYT, __N)                                 \
+  {                                                             \
+    if (on_gfx1x()) { /* gfx11xx/GFX12, wave32 */               \
+      WVSPLIT_TILE_CFG(/*THRDS=*/32, /*WVPRGRP=*/16, _sYT, __N) \
+    } else { /* GFX9, wave64 */                                 \
+      WVSPLIT_TILE_CFG(/*THRDS=*/64, /*WVPRGRP=*/16, _sYT, __N) \
+    }                                                           \
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK", [&] {
@@ -1451,37 +1440,21 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     // then cut the active waves to balance their distribution...
     int sYT = (M_in + CuCount * 4 - 1) / (CuCount * 4);
 
-    const bool use_wave32 = on_gfx1x();
     switch (N_in) {
       case 1:
-        if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 1)
-        else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 1)
+        WVSPLIT_TILE(sYT, 1)
         break;
       case 2:
-        if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 2)
-        else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 2)
+        WVSPLIT_TILE(sYT, 2)
         break;
       case 3:
-        if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 3)
-        else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 3)
+        WVSPLIT_TILE(sYT, 3)
         break;
       case 4:
-        if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 4)
-        else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 4)
+        WVSPLIT_TILE(sYT, 4)
         break;
       case 5:
-        if (use_wave32)
-          WVSPLIT_TILE_CFG(32, 16, sYT, 5)
-        else
-          WVSPLIT_TILE_CFG(64, 16, sYT, 5)
+        WVSPLIT_TILE(sYT, 5)
         break;
       default:
         throw std::runtime_error(

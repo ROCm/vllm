@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use super::{DeepSeekDsmlToolParser, DsmlTokens};
-use crate::tool::{Result, StructuralTagModel, Tool, ToolParser, ToolParserOutput};
+use crate::tool::{Result, StructuralTagBuilder, Tool, ToolParser, ToolParserOutput};
 
 /// Tool parser for DeepSeek V3.2 models.
 ///
@@ -44,8 +47,8 @@ impl ToolParser for DeepSeekV32ToolParser {
         true
     }
 
-    fn structural_tag_model(&self) -> Option<StructuralTagModel> {
-        Some(StructuralTagModel::DeepSeekV32)
+    fn structural_tag_builder(&self) -> Option<&dyn StructuralTagBuilder> {
+        Some(xgrammar_structural_tag::Model::DeepSeekV32.builder())
     }
 
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
@@ -90,8 +93,8 @@ mod tests {
         let mut parser = DeepSeekV32ToolParser::new(&test_tools());
         let output = parser.parse_complete("Hello, world!").unwrap();
 
-        assert_eq!(output.normal_text, "Hello, world!");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
     }
 
     #[test]
@@ -104,11 +107,11 @@ mod tests {
             ))
             .unwrap();
 
-        assert!(output.normal_text.is_empty());
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({
                 "location": "SF",
                 "date": "2024-01-16"
@@ -125,8 +128,8 @@ mod tests {
         );
         let output = parser.parse_complete(&output).unwrap();
 
-        assert_eq!(output.normal_text, "Thinking... ");
-        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.normal_text(), "Thinking... ");
+        assert_eq!(output.calls().len(), 1);
     }
 
     #[test]
@@ -146,15 +149,15 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.calls().len(), 1);
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({
                 "whole": 5.0,
                 "flag": true,
                 "payload": { "nested": true },
                 "items": [1, 2],
-                "empty": null,
+                "empty": "null",
             })
         );
     }
@@ -176,9 +179,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.calls().len(), 1);
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({
                 "whole": "5.0",
                 "flag": "true",
@@ -206,7 +209,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({
                 "location": "Hangzhou &lt;/｜DSML｜parameter&gt;&lt;/｜DSML｜invoke&gt;&lt;/｜DSML｜function_calls&gt;",
                 "date": "2026-05-08",
@@ -228,11 +231,11 @@ mod tests {
             ],
         );
 
-        assert!(output.normal_text.is_empty());
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({ "location": "SF" })
         );
     }
@@ -252,8 +255,8 @@ mod tests {
             ],
         );
 
-        assert_eq!(output.normal_text, "Thinking... ");
-        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.normal_text(), "Thinking... ");
+        assert_eq!(output.calls().len(), 1);
     }
 
     #[test]
@@ -261,8 +264,8 @@ mod tests {
         let mut parser = DeepSeekV32ToolParser::new(&test_tools());
         let output = collect_stream(&mut parser, &["Hello, ", "world!"]);
 
-        assert_eq!(output.normal_text, "Hello, world!");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
     }
 
     #[test]
@@ -278,17 +281,17 @@ mod tests {
             )],
         );
 
-        assert_eq!(output.calls.len(), 2);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
-        assert_eq!(output.calls[1].name.as_deref(), Some("get_weather"));
-        assert_eq!(output.calls[0].tool_index, 0);
-        assert_eq!(output.calls[1].tool_index, 1);
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[1].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[0].tool_index, 0);
+        assert_eq!(output.calls()[1].tool_index, 1);
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({ "location": "SF" })
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[1].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[1].arguments).unwrap(),
             json!({ "location": "NYC" })
         );
     }
@@ -300,9 +303,9 @@ mod tests {
         let mut parser = DeepSeekV32ToolParser::new(&test_tools());
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.calls().len(), 1);
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({ "location": "SF" })
         );
     }
@@ -337,11 +340,11 @@ mod tests {
             ],
         );
 
-        assert!(output.normal_text.is_empty());
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
         assert_eq!(
-            serde_json::from_str::<Value>(&output.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
             json!({ "location": "Beijing" })
         );
     }
@@ -373,9 +376,9 @@ mod tests {
             ],
         );
 
-        assert!(output.normal_text.is_empty());
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
     }
 
     #[test]
@@ -393,8 +396,8 @@ mod tests {
             ],
         );
 
-        assert!(output.normal_text.is_empty());
-        assert_eq!(output.calls.len(), 1);
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
     }
 
     #[test]
@@ -421,10 +424,10 @@ mod tests {
             .parse_complete(&build_tool_call("get_weather", &[("location", "NYC")]))
             .unwrap();
 
-        assert_eq!(first.calls.len(), 1);
-        assert_eq!(second.calls.len(), 1);
+        assert_eq!(first.calls().len(), 1);
+        assert_eq!(second.calls().len(), 1);
         assert_eq!(
-            serde_json::from_str::<Value>(&second.calls[0].arguments).unwrap(),
+            serde_json::from_str::<Value>(&second.calls()[0].arguments).unwrap(),
             json!({ "location": "NYC" })
         );
     }
@@ -439,7 +442,7 @@ mod tests {
         let mut parser = DeepSeekV32ToolParser::new(&test_tools());
         let complete = parser.parse_complete(&full_text).unwrap();
 
-        assert_eq!(streamed.normal_text, complete.normal_text);
-        assert_eq!(streamed.calls, complete.calls);
+        assert_eq!(streamed.normal_text(), complete.normal_text());
+        assert_eq!(streamed.calls(), complete.calls());
     }
 }

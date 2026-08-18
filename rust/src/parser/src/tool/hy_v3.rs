@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 use winnow::ascii::multispace0 as ws0;
 use winnow::combinator::{alt, delimited, eof, repeat, seq, terminated};
 use winnow::prelude::*;
@@ -7,7 +10,7 @@ use winnow::token::{literal, rest, take_until};
 use super::parameters::ToolSchemas;
 use super::utils::{MarkerScanState, parse_buffered_event, safe_text_len, take_until_marker};
 use super::{Result, ToolCallDelta, ToolParser, ToolParserOutput};
-use crate::tool::{StructuralTagModel, Tool};
+use crate::tool::{StructuralTagBuilder, Tool};
 
 const TOOL_CALLS_START: &str = "<tool_calls>";
 const TOOL_CALLS_END: &str = "</tool_calls>";
@@ -79,7 +82,7 @@ impl HyV3ToolParser {
     fn apply_event(&mut self, event: HyV3Event, output: &mut ToolParserOutput) -> Result<()> {
         match event {
             HyV3Event::Text { len: consumed_len } => {
-                output.normal_text.push_str(&self.buffer[..consumed_len]);
+                output.push_text(&self.buffer[..consumed_len]);
             }
             HyV3Event::ToolBlockStart => {
                 self.mode = HyV3Mode::ToolBlock {
@@ -91,7 +94,7 @@ impl HyV3ToolParser {
                 let arguments = serde_json::to_string(&arguments)
                     .map_err(|error| parsing_failed!("failed to serialize arguments: {}", error))?;
 
-                output.calls.push(ToolCallDelta {
+                output.push_call(ToolCallDelta {
                     tool_index: self.emitted_tool_count,
                     name: Some(name),
                     arguments,
@@ -113,8 +116,8 @@ impl ToolParser for HyV3ToolParser {
         Ok(Box::new(Self::new(tools)))
     }
 
-    fn structural_tag_model(&self) -> Option<StructuralTagModel> {
-        Some(StructuralTagModel::HyV3)
+    fn structural_tag_builder(&self) -> Option<&dyn StructuralTagBuilder> {
+        Some(xgrammar_structural_tag::Model::HyV3.builder())
     }
 
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
@@ -133,7 +136,7 @@ impl ToolParser for HyV3ToolParser {
     fn finish(&mut self) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
         match self.mode {
-            HyV3Mode::Text => output.normal_text.push_str(&self.buffer),
+            HyV3Mode::Text => output.push_text(&self.buffer),
             HyV3Mode::ToolBlock { .. } => return Err(parsing_failed!("incomplete HY3 tool call")),
             HyV3Mode::Done => {}
         }
@@ -266,7 +269,7 @@ mod tests {
     }
 
     fn parsed_arguments(output: &ToolParserOutput, index: usize) -> Value {
-        serde_json::from_str(&output.calls[index].arguments).unwrap()
+        serde_json::from_str(&output.calls()[index].arguments).unwrap()
     }
 
     #[test]
@@ -281,8 +284,8 @@ mod tests {
         let mut parser = HyV3ToolParser::new(&test_tools());
         let output = parser.parse_complete("This is a plain response.").unwrap();
 
-        assert_eq!(output.normal_text, "This is a plain response.");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "This is a plain response.");
+        assert!(output.calls().is_empty());
     }
 
     #[test]
@@ -294,9 +297,9 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.normal_text, "");
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(output.normal_text(), "");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
         assert_eq!(parsed_arguments(&output, 0), json!({}));
     }
 
@@ -309,7 +312,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
         assert_eq!(parsed_arguments(&output, 0), json!({}));
     }
 
@@ -354,8 +357,8 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(output.normal_text, "Checking.");
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(output.normal_text(), "Checking.");
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
     }
 
     #[test]
@@ -376,22 +379,25 @@ mod tests {
 
         expect![[r#"
             ToolParserOutput {
-                normal_text: "",
-                calls: [
-                    ToolCallDelta {
-                        tool_index: 0,
-                        name: Some(
-                            "get_weather",
-                        ),
-                        arguments: "{\"city\":\"Beijing\",\"date\":\"2026-03-30\"}",
-                    },
-                    ToolCallDelta {
-                        tool_index: 1,
-                        name: Some(
-                            "get_weather",
-                        ),
-                        arguments: "{\"city\":\"Hangzhou\",\"date\":\"2026-03-30\"}",
-                    },
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"city\":\"Beijing\",\"date\":\"2026-03-30\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"city\":\"Hangzhou\",\"date\":\"2026-03-30\"}",
+                        },
+                    ),
                 ],
             }
         "#]]
@@ -434,8 +440,8 @@ mod tests {
         output.append(parser.parse_chunk("response.").unwrap());
         output.append(parser.finish().unwrap());
 
-        assert_eq!(output.normal_text, "This is a plain response.");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "This is a plain response.");
+        assert!(output.calls().is_empty());
     }
 
     #[test]
@@ -452,8 +458,8 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
         assert_eq!(parsed_arguments(&output, 0), json!({}));
     }
 
@@ -475,8 +481,8 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.calls.len(), 1);
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
         assert_eq!(
             parsed_arguments(&output, 0),
             json!({ "city": "Beijing", "date": "2026-03-30" })
@@ -498,8 +504,8 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.normal_text, "Checking.");
-        assert_eq!(output.calls[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(output.normal_text(), "Checking.");
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
     }
 
     #[test]
@@ -519,7 +525,7 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.calls.len(), 2);
+        assert_eq!(output.calls().len(), 2);
         assert_eq!(parsed_arguments(&output, 0)["city"], json!("Beijing"));
         assert_eq!(parsed_arguments(&output, 1)["city"], json!("Hangzhou"));
     }
@@ -535,8 +541,8 @@ mod tests {
 
         let output = collect_stream(&mut parser, &chunks);
 
-        assert_eq!(output.normal_text, "hello ");
-        assert_eq!(output.calls.len(), 1);
+        assert_eq!(output.normal_text(), "hello ");
+        assert_eq!(output.calls().len(), 1);
         assert_eq!(parsed_arguments(&output, 0), json!({ "city": "Beijing" }));
     }
 
@@ -552,8 +558,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(output.normal_text, "");
-        assert!(output.calls.is_empty());
+        assert_eq!(output.normal_text(), "");
+        assert!(output.calls().is_empty());
     }
 
     #[test]

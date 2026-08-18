@@ -25,6 +25,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.hip_w4a16 import (
 from vllm.model_executor.kernels.linear.mixed_precision.hip_w8a16 import (
     HipW8A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.humming import (
+    HummingLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
     HybridW4A16LinearKernel,
 )
@@ -40,6 +43,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
 )
 from vllm.model_executor.kernels.linear.mixed_precision.rdna3_w4a16 import (
     RDNA3W4A16LinearKernel,
+)
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
+    RDNAHybridW4A16LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
@@ -64,9 +70,11 @@ __all__ = [
     "HipW4A16LinearKernel",
     "HybridW4A16LinearKernel",
     "HipW8A16LinearKernel",
+    "HummingLinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
     "RDNA3W4A16LinearKernel",
+    "RDNAHybridW4A16LinearKernel",
     "TritonW4A16LinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",

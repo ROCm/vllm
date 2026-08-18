@@ -26,18 +26,18 @@ import time
 
 import torch
 
-from vllm.model_executor.layers.fla.ops.chunk import chunk_gated_delta_rule
-from vllm.model_executor.layers.fla.ops.chunk_delta_h import (
+from vllm.third_party.flash_linear_attention.ops.chunk import chunk_gated_delta_rule
+from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
-from vllm.model_executor.layers.fla.ops.chunk_o import chunk_fwd_o
-from vllm.model_executor.layers.fla.ops.cumsum import chunk_local_cumsum
-from vllm.model_executor.layers.fla.ops.index import (
+from vllm.third_party.flash_linear_attention.ops.chunk_o import chunk_fwd_o
+from vllm.third_party.flash_linear_attention.ops.cumsum import chunk_local_cumsum
+from vllm.third_party.flash_linear_attention.ops.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
-from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
-from vllm.model_executor.layers.fla.ops.wy_fast_doubly_fused import (
+from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+from vllm.third_party.flash_linear_attention.ops.wy_fast_doubly_fused import (
     fused_kkt_solve_tril_recompute_w_u_fwd,
 )
 
@@ -97,7 +97,7 @@ class Inputs:
     def via_op(self, hip_enabled: bool):
         """Call the public op with the HIP kernel forced on or off."""
         import vllm.envs as envs
-        import vllm.model_executor.layers.fla.ops.chunk_rocm as cr
+        import vllm.third_party.flash_linear_attention.ops.chunk_rocm as cr
 
         saved = envs.VLLM_GDN_HIP
         envs.VLLM_GDN_HIP = hip_enabled
@@ -329,7 +329,7 @@ def breakdown(inp: Inputs) -> None:
 def hip(inp: Inputs, **kw):
     """The whole op in one HIP kernel."""
     del kw
-    from vllm.model_executor.layers.fla.ops.chunk_rocm import chunk_gdn_hip_fwd
+    from vllm.third_party.flash_linear_attention.ops.chunk_rocm import chunk_gdn_hip_fwd
 
     return chunk_gdn_hip_fwd(
         q=inp.q,
