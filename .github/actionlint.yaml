@@ -6,3 +6,5 @@ self-hosted-runner:
     - linux-strix-halo-gpu-rocm-noneng
     - linux-strix-halo-gpu-rocm-oem
     - vllm-runners
+    # Not yet in actionlint's known-label set.
+    - macos-26
