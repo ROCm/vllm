@@ -996,7 +996,7 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         e8m0_dtype = torch.float8_e8m0fnu
 
         if is_gfx1250:
-            from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+            from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight, interleave_gate_up_rows
 
             w13_raw = w13_weight.data.view(fp4_dtype)
             w2_raw = w2_weight.data.view(fp4_dtype)
@@ -1025,7 +1025,6 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w2.is_shuffled = True
 
             if w13_bias is not None:
-                from aiter.ops.shuffle import interleave_gate_up_rows
                 w13_bias = interleave_gate_up_rows(w13_bias)
 
             return (w13, w2, w13_scale, w2_scale, w13_bias, w2_bias)
@@ -1046,10 +1045,8 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
         # View as native FP4 dtype
-        fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-        if fp4_dtype is not None:
-            w13_weight.data = w13_weight.data.view(fp4_dtype)
-            w2_weight.data = w2_weight.data.view(fp4_dtype)
+        w13_weight.data = w13_weight.data.view(fp4_dtype)
+        w2_weight.data = w2_weight.data.view(fp4_dtype)
 
         # Shuffle weights for AITER CK kernel
         shuffled_w13, shuffled_w2 = rocm_aiter_ops.shuffle_weights(
@@ -1508,7 +1505,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
 
-        from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+        from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight, interleave_gate_up_rows
 
         fp4_dtype = torch.float4_e2m1fn_x2
         e8m0_dtype = torch.float8_e8m0fnu
@@ -1546,8 +1543,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         if w13_bias is not None:
             w13_bias = w13_bias.data.to(torch.float32)
             if guinterleave:
-                from aiter.ops.shuffle import interleave_gate_up_rows
                 w13_bias = interleave_gate_up_rows(w13_bias)
+
         if w2_bias is not None:
             w2_bias = w2_bias.data.to(torch.float32)
 
