@@ -26,13 +26,20 @@ import dataclasses
 import functools
 import gc
 import threading
-import weakref
-from collections.abc import Callable
-from typing import Any, ClassVar, TypeVar
+from collections.abc import Callable, Iterable
+from typing import Any, TypeVar
 
 import torch
 
 import vllm.envs as envs
+from vllm.compilation.cuda_graph import (
+    OwnedCUDAGraph,
+    begin_cudagraph_owner_teardown,
+    create_cudagraph,
+    cudagraph_owner_activity,
+    current_cudagraph_device,
+    register_cudagraph_owner,
+)
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -122,6 +129,15 @@ def eager_break_during_capture(fn: F) -> F:
 # ---------------------------------------------------------------------------
 
 
+@dataclasses.dataclass(frozen=True)
+class _GraphSegment:
+    graph: torch.cuda.CUDAGraph
+    device: torch.device
+
+    def __call__(self) -> None:
+        self.graph.replay()
+
+
 class BreakableCUDAGraphCapture:
     """Stream-capture context that supports eager breaks via :meth:`add_eager`.
 
@@ -147,21 +163,31 @@ class BreakableCUDAGraphCapture:
     def is_active(cls) -> bool:
         return cls.current() is not None
 
-    def __init__(self, pool: Any | None = None) -> None:
+    def __init__(self, pool: Any | None = None, owner: Any | None = None) -> None:
         self.pool = pool
+        self._owner = owner
+        self._cudagraph_manual_owner = owner is None
         self.segments: list[Callable[[], Any]] = []
         self._num_graphs: int = 0
         self._num_eager_breaks: int = 0
         self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._current_device: torch.device | None = None
         self._capturing: bool = False
+        self._closed: bool = False
 
     # --- context manager protocol ----------------------------------------
 
     def __enter__(self) -> BreakableCUDAGraphCapture:
         if getattr(BreakableCUDAGraphCapture._tls, "active", None) is not None:
             raise RuntimeError("Nested BreakableCUDAGraphCapture is not supported.")
+        if self._closed:
+            raise RuntimeError("Breakable CUDA graph capture is closed")
         BreakableCUDAGraphCapture._tls.active = self
-        self._begin_segment()
+        try:
+            self._begin_segment()
+        except Exception:
+            BreakableCUDAGraphCapture._tls.active = None
+            raise
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -174,22 +200,38 @@ class BreakableCUDAGraphCapture:
 
     def _begin_segment(self) -> None:
         assert not self._capturing
-        g = torch.cuda.CUDAGraph()
+        if self._closed:
+            raise RuntimeError("Breakable CUDA graph capture is closed")
+        device = current_cudagraph_device()
+
+        def install_graph(graph: torch.cuda.CUDAGraph) -> None:
+            self._current_device = device
+            self._current_graph = graph
+
+        g = create_cudagraph(
+            self._owner if self._owner is not None else self,
+            device,
+            install_graph,
+        )
+        # Be conservative before entering the native capture call. If
+        # capture_begin() raises after activating capture, teardown must retain
+        # this graph rather than treating it as safe to reset.
+        self._capturing = True
         if self.pool is not None:
             g.capture_begin(pool=self.pool)
         else:
             g.capture_begin()
-        self._current_graph = g
-        self._capturing = True
 
     def _end_segment(self) -> None:
         if not self._capturing:
             return
         assert self._current_graph is not None
+        assert self._current_device is not None
         self._current_graph.capture_end()
-        self.segments.append(self._current_graph.replay)
+        self.segments.append(_GraphSegment(self._current_graph, self._current_device))
         self._num_graphs += 1
         self._current_graph = None
+        self._current_device = None
         self._capturing = False
 
     def add_eager(self, fn: Callable[[], Any]) -> Any:
@@ -200,6 +242,8 @@ class BreakableCUDAGraphCapture:
         Replay does not return values; callers should propagate any
         downstream dependencies via static output buffers.
         """
+        if self._closed:
+            raise RuntimeError("Breakable CUDA graph capture is closed")
         self._end_segment()
         result = fn()
         self.segments.append(fn)
@@ -210,8 +254,31 @@ class BreakableCUDAGraphCapture:
     # --- replay ----------------------------------------------------------
 
     def replay(self) -> None:
+        if self._closed:
+            raise RuntimeError("Breakable CUDA graph capture is closed")
         for r in self.segments:
             r()
+
+    def begin_cudagraph_teardown(self) -> None:
+        self._closed = True
+        if self._capturing:
+            raise RuntimeError("cannot cleanly tear down an active CUDA graph capture")
+
+    def iter_cudagraphs(self) -> Iterable[OwnedCUDAGraph]:
+        for segment in self.segments:
+            if isinstance(segment, _GraphSegment):
+                yield OwnedCUDAGraph(segment.graph, segment.device)
+        if self._current_graph is not None and self._current_device is not None:
+            yield OwnedCUDAGraph(self._current_graph, self._current_device)
+
+    def clear_cudagraph_state(self) -> None:
+        self.segments.clear()
+        self._owner = None
+        self._current_graph = None
+        self._current_device = None
+        self._capturing = False
+        self._num_graphs = 0
+        self._num_eager_breaks = 0
 
     # --- introspection ---------------------------------------------------
 
@@ -256,15 +323,6 @@ class BreakableCUDAGraphWrapper:
           on subsequent invocations with the same descriptor.
     """
 
-    _all_instances: ClassVar[weakref.WeakSet[BreakableCUDAGraphWrapper]] = (
-        weakref.WeakSet()
-    )
-
-    @classmethod
-    def clear_all_graphs(cls) -> None:
-        for instance in list(cls._all_instances):
-            instance.clear_graphs()
-
     def __init__(
         self,
         runnable: Callable[..., Any],
@@ -283,7 +341,8 @@ class BreakableCUDAGraphWrapper:
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
 
         self.entries: dict[BatchDescriptor, _BreakableEntry] = {}
-        BreakableCUDAGraphWrapper._all_instances.add(self)
+        self._cudagraph_teardown_started = False
+        self._cudagraph_activity_enabled = register_cudagraph_owner(self, vllm_config)
 
         logger.info_once("Breakable CUDA graph enabled")
 
@@ -303,10 +362,28 @@ class BreakableCUDAGraphWrapper:
         return self
 
     def clear_graphs(self) -> None:
+        self.clear_cudagraph_state()
+
+    def begin_cudagraph_teardown(self) -> None:
+        begin_cudagraph_owner_teardown(self)
+        for entry in self.entries.values():
+            if entry.capture is not None:
+                entry.capture.begin_cudagraph_teardown()
+
+    def iter_cudagraphs(self) -> Iterable[OwnedCUDAGraph]:
+        for entry in self.entries.values():
+            if entry.capture is not None:
+                yield from entry.capture.iter_cudagraphs()
+
+    def clear_cudagraph_state(self) -> None:
+        for entry in self.entries.values():
+            if entry.capture is not None:
+                entry.capture.clear_cudagraph_state()
         self.entries.clear()
 
     # --- dispatch --------------------------------------------------------
 
+    @cudagraph_owner_activity
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if not is_forward_context_available():
             return self.runnable(*args, **kwargs)
@@ -378,7 +455,8 @@ class BreakableCUDAGraphWrapper:
         # pre-capture prefetches are complete and don't leak into the graph.
         get_offloader().sync_prev_onload()
 
-        capture = BreakableCUDAGraphCapture(pool=self.graph_pool)
+        capture = BreakableCUDAGraphCapture(pool=self.graph_pool, owner=self)
+        entry.capture = capture
         with capture:
             output = self.runnable(*args, **kwargs)
             # Join the offloader's copy stream while we still hold the last
@@ -391,7 +469,6 @@ class BreakableCUDAGraphWrapper:
             # the next batch descriptor's capture.
             output = weak_ref_tensors(output)
 
-        entry.capture = capture
         entry.output = weak_ref_tensors(output)
 
         logger.debug(

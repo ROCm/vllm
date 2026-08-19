@@ -2,14 +2,24 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
 import vllm.envs as envs
-from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.compilation.cuda_graph import (
+    CUDAGraphWrapper,
+    OwnedCUDAGraph,
+    begin_cudagraph_owner_teardown,
+    create_cudagraph,
+    cudagraph_capture_attempt,
+    cudagraph_owner_activity,
+    register_cudagraph_owner,
+)
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed import get_ep_group
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -111,12 +121,14 @@ class SMControlContextManager:
 
 
 class UBatchWrapper:
+    _THREAD_QUIESCE_TIMEOUT_S = envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+
     def __init__(
         self,
         runnable: Callable,
         vllm_config: VllmConfig,
         runtime_mode: CUDAGraphMode,
-        device: torch.cuda.device,
+        device: torch.device,
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
@@ -129,16 +141,22 @@ class UBatchWrapper:
 
         self.cudagraphs: dict[int, CUDAGraphMetaData] = {}
 
-        self.cudagraph_wrapper = None
-        if runtime_mode is not CUDAGraphMode.NONE:
-            self.cudagraph_wrapper = CUDAGraphWrapper(
-                runnable, vllm_config, runtime_mode=runtime_mode
-            )
-
         self.sm_control = self._create_sm_control_context(vllm_config)
         self.device = device
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
         self._runnable_str = str(runnable) if self.is_debugging_mode else None
+        self._outstanding_ubatch_threads: list[threading.Thread] = []
+        self._ubatch_threads_lock = threading.Lock()
+        self.cudagraph_wrapper = None
+        self._cudagraph_teardown_started = False
+        self._cudagraph_activity_enabled = register_cudagraph_owner(self, vllm_config)
+
+        # Register the outer owner before constructing its nested wrapper so
+        # registry quiescence cannot close the child beneath an admitted call.
+        if runtime_mode is not CUDAGraphMode.NONE:
+            self.cudagraph_wrapper = CUDAGraphWrapper(
+                runnable, vllm_config, runtime_mode=runtime_mode
+            )
 
     @property
     def graph_pool(self):
@@ -147,9 +165,124 @@ class UBatchWrapper:
         return None
 
     def clear_graphs(self) -> None:
-        self.cudagraphs.clear()
+        self.clear_cudagraph_state()
+
+    def begin_cudagraph_teardown(self) -> None:
+        begin_cudagraph_owner_teardown(self)
+        outstanding = tuple(getattr(self, "_outstanding_ubatch_threads", ()))
+
+        alive = self._join_ubatch_threads(
+            outstanding,
+            timeout_s=self._THREAD_QUIESCE_TIMEOUT_S,
+        )
+        self._raise_for_active_threads(alive, "CUDA graph teardown")
         if self.cudagraph_wrapper is not None:
-            self.cudagraph_wrapper.clear_graphs()
+            self.cudagraph_wrapper.begin_cudagraph_teardown()
+
+    def iter_cudagraphs(self) -> Iterable[OwnedCUDAGraph]:
+        device = torch.device(self.device)
+        for metadata in self.cudagraphs.values():
+            yield OwnedCUDAGraph(metadata.cudagraph, device)
+        if self.cudagraph_wrapper is not None:
+            yield from self.cudagraph_wrapper.iter_cudagraphs()
+
+    def clear_cudagraph_state(self) -> None:
+        self.cudagraphs.clear()
+        getattr(self, "_outstanding_ubatch_threads", []).clear()
+        if self.cudagraph_wrapper is not None:
+            self.cudagraph_wrapper.clear_cudagraph_state()
+
+    def _record_outstanding_threads(
+        self, threads: Iterable[threading.Thread]
+    ) -> list[threading.Thread]:
+        lock = getattr(self, "_ubatch_threads_lock", None)
+        if lock is None:
+            lock = self._ubatch_threads_lock = threading.Lock()
+        with lock:
+            outstanding = getattr(self, "_outstanding_ubatch_threads", [])
+            candidates = [*outstanding, *threads]
+            seen: set[int] = set()
+            alive: list[threading.Thread] = []
+            for thread in candidates:
+                if id(thread) in seen:
+                    continue
+                seen.add(id(thread))
+                if thread.is_alive():
+                    alive.append(thread)
+            self._outstanding_ubatch_threads = alive
+            return alive
+
+    def _join_ubatch_threads(
+        self,
+        threads: Iterable[threading.Thread],
+        *,
+        timeout_s: float | None = None,
+    ) -> list[threading.Thread]:
+        threads = tuple(threads)
+        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        for thread in threads:
+            timeout = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            thread.join(timeout=timeout)
+        return self._record_outstanding_threads(threads)
+
+    @staticmethod
+    def _raise_for_active_threads(
+        threads: list[threading.Thread], operation: str
+    ) -> None:
+        if threads:
+            raise RuntimeError(
+                f"{len(threads)} ubatch thread(s) remained active during {operation}"
+            )
+
+    def _barrier_timeout(self) -> float | None:
+        return self._THREAD_QUIESCE_TIMEOUT_S if current_platform.is_rocm() else None
+
+    @contextmanager
+    def _manage_ubatch_threads(
+        self,
+        threads: Iterable[threading.Thread],
+        ubatch_metadata: Iterable[UbatchMetadata],
+    ) -> Iterator[list[threading.Thread]]:
+        """Start ubatch threads and guarantee that none are stranded.
+
+        The only special startup case is a later thread failing to start while
+        an earlier sibling is waiting at the barrier. Aborting the barrier
+        releases that sibling; waking the CPU events handles failures after all
+        threads have reached the barrier.
+        """
+        started: list[threading.Thread] = []
+        startup_complete = False
+        failed = True
+        try:
+            for thread in threads:
+                thread.start()
+                started.append(thread)
+            startup_complete = True
+            yield started
+            failed = False
+        finally:
+            if not startup_complete:
+                self.ready_barrier.abort()
+            if failed:
+                for metadata in ubatch_metadata:
+                    metadata.context.cpu_wait_event.set()
+
+            alive = self._join_ubatch_threads(
+                started,
+                timeout_s=self._barrier_timeout(),
+            )
+            if getattr(self.ready_barrier, "broken", False) and not alive:
+                self.ready_barrier.reset()
+            if alive:
+                if failed:
+                    logger.error(
+                        "%d ubatch thread(s) remained active during cleanup",
+                        len(alive),
+                    )
+                else:
+                    self._raise_for_active_threads(alive, "cleanup")
 
     @staticmethod
     def _create_sm_control_context(vllm_config: VllmConfig):
@@ -196,12 +329,13 @@ class UBatchWrapper:
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.
-        if hasattr(self.runnable, key):
-            return getattr(self.runnable, key)
-        if self.is_debugging_mode:
+        runnable = self.__dict__.get("runnable")
+        if runnable is not None and hasattr(runnable, key):
+            return getattr(runnable, key)
+        if self.__dict__.get("is_debugging_mode", False):
             raise AttributeError(
                 f"Attribute {key} not exists in the runnable of "
-                f"cudagraph wrapper: {self._runnable_str}"
+                f"cudagraph wrapper: {self.__dict__.get('_runnable_str')}"
             )
         raise AttributeError
 
@@ -209,7 +343,9 @@ class UBatchWrapper:
         # in case we need to access the original runnable.
         return self.runnable
 
-    def _capture_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
+    def _capture_ubatches(
+        self, ubatch_metadata, model
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         Capture a cudagraph for a microbatched run.
 
@@ -257,52 +393,67 @@ class UBatchWrapper:
         # Ubatches will manually manage the forward context, so we override
         # it to None here so we can have it restored correctly later
         with override_forward_context(None):
-            ubatch_threads = []
-            for metadata in ubatch_metadata:
-                thread = threading.Thread(
+            threads = (
+                threading.Thread(
                     target=_capture_ubatch_thread,
                     args=(
                         results,
                         metadata,
                     ),
                 )
-                ubatch_threads.append(thread)
-                thread.start()
-            self.ready_barrier.wait()  # Wait for all ubatch threads to be ready
-
-            # Capture the cudagraph
-            cudagraph_metadata = CUDAGraphMetaData(
-                cudagraph=torch.cuda.CUDAGraph(),
-                ubatch_metadata=ubatch_metadata,
+                for metadata in ubatch_metadata
             )
-            if self.graph_pool is not None:
-                set_graph_pool_id(self.graph_pool)
-            else:
-                set_graph_pool_id(current_platform.graph_pool_handle())
+            with self._manage_ubatch_threads(
+                threads, ubatch_metadata
+            ) as ubatch_threads:
+                self.ready_barrier.wait(timeout=self._barrier_timeout())
 
-            # Sync offloader's copy stream before capture.
-            # Ensure any pre-capture prefetches from offloader are complete.
-            get_offloader().sync_prev_onload()
+                # Capture the cudagraph. Store it before any capture setup so
+                # partial failures remain visible to owner teardown.
+                def install_graph(graph: torch.cuda.CUDAGraph) -> None:
+                    self.cudagraphs[num_tokens] = CUDAGraphMetaData(
+                        cudagraph=graph,
+                        ubatch_metadata=ubatch_metadata,
+                    )
 
-            with torch.cuda.graph(
-                cudagraph_metadata.cudagraph,
-                stream=compute_stream,
-                pool=self.graph_pool,
-            ):
-                ubatch_metadata[0].context.cpu_wait_event.set()
-                for thread in ubatch_threads:
-                    thread.join()
-                sorted_results = [value for position, value in sorted(results)]
-                result = _cat_ubatch_outputs(sorted_results)
-                cudagraph_metadata.outputs = result
-                # Join offloader's copy stream after forward to avoid unjoined
-                # stream error. The last layer's start_prefetch forks copy_stream,
-                # but wait_prefetch only happens in the next forward pass.
-                get_offloader().join_after_forward()
-            self.cudagraphs[num_tokens] = cudagraph_metadata
+                create_cudagraph(
+                    self,
+                    self.device,
+                    install_graph,
+                )
+                cudagraph_metadata = self.cudagraphs[num_tokens]
+                if self.graph_pool is not None:
+                    set_graph_pool_id(self.graph_pool)
+                else:
+                    set_graph_pool_id(current_platform.graph_pool_handle())
+
+                # Sync offloader's copy stream before capture.
+                # Ensure any pre-capture prefetches from offloader are complete.
+                get_offloader().sync_prev_onload()
+
+                with (
+                    cudagraph_capture_attempt(self),
+                    torch.cuda.graph(
+                        cudagraph_metadata.cudagraph,
+                        stream=compute_stream,
+                        pool=self.graph_pool,
+                    ),
+                ):
+                    ubatch_metadata[0].context.cpu_wait_event.set()
+                    self._join_ubatch_threads(ubatch_threads)
+                    sorted_results = [value for position, value in sorted(results)]
+                    result = _cat_ubatch_outputs(sorted_results)
+                    cudagraph_metadata.outputs = result
+                    # Join offloader's copy stream after forward to avoid
+                    # unjoined stream error. The last layer's start_prefetch
+                    # forks copy_stream, but wait_prefetch only happens in
+                    # the next forward pass.
+                    get_offloader().join_after_forward()
         return cudagraph_metadata.outputs
 
-    def _run_ubatches(self, ubatch_metadata, model) -> torch.Tensor:
+    def _run_ubatches(
+        self, ubatch_metadata, model
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         @torch.inference_mode()
         def _ubatch_thread(results, model, ubatch_metadata):
             with ubatch_metadata.context:
@@ -320,9 +471,8 @@ class UBatchWrapper:
         # override it to None here so we can have it restored correctly
         # after both threads have finished
         with override_forward_context(None):
-            ubatch_threads = []
-            for metadata in ubatch_metadata:
-                thread = threading.Thread(
+            threads = (
+                threading.Thread(
                     target=_ubatch_thread,
                     args=(
                         results,
@@ -330,12 +480,14 @@ class UBatchWrapper:
                         metadata,
                     ),
                 )
-                ubatch_threads.append(thread)
-                thread.start()
-            self.ready_barrier.wait()  # Wait for all ubatch threads to be ready
-            ubatch_metadata[0].context.cpu_wait_event.set()
-            for thread in ubatch_threads:
-                thread.join()
+                for metadata in ubatch_metadata
+            )
+            with self._manage_ubatch_threads(
+                threads, ubatch_metadata
+            ) as ubatch_threads:
+                self.ready_barrier.wait(timeout=self._barrier_timeout())
+                ubatch_metadata[0].context.cpu_wait_event.set()
+                self._join_ubatch_threads(ubatch_threads)
         sorted_results = [value for position, value in sorted(results)]
         result = _cat_ubatch_outputs(sorted_results)
         return result
@@ -438,6 +590,7 @@ class UBatchWrapper:
             sliced_intermediate_tensors,
         )
 
+    @cudagraph_owner_activity
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
         batch_descriptor = forward_context.batch_descriptor

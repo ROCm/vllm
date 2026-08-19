@@ -590,7 +590,12 @@ def wait_for_completion_or_failure(
 
 # Note(rob): shutdown function cannot be a bound method,
 # else the gc cannot collect the object.
-def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
+def shutdown(
+    procs: list[BaseProcess],
+    timeout: float | None = None,
+    *,
+    raise_on_failure: bool = False,
+) -> None:
     """Shutdown processes with timeout.
 
     Args:
@@ -643,6 +648,19 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
             pid,
         )
         kill_process_tree(pid)
+
+    if raise_on_failure:
+        failures: list[str] = []
+        forced_names = {name for _, name in remaining_procs}
+        for proc in procs:
+            if proc.name in forced_names:
+                failures.append(f"{proc.name} required SIGKILL")
+            elif proc.exitcode not in (None, 0):
+                failures.append(f"{proc.name} exited with code {proc.exitcode}")
+        if failures:
+            raise RuntimeError(
+                "process shutdown did not complete cleanly: " + "; ".join(failures)
+            )
 
     logger.debug_once("[shutdown] Process manager: complete")
 

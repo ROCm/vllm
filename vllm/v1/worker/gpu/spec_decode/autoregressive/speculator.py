@@ -44,6 +44,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.use_fused_multi_step_decode = False
 
+    def shutdown(self) -> None:
+        prefill_manager = self.prefill_cudagraph_manager
+        decode_manager = self.decode_cudagraph_manager
+        self.prefill_cudagraph_manager = None
+        self.decode_cudagraph_manager = None
+
+        if prefill_manager is not None:
+            prefill_manager.clear_cudagraph_state()
+        if decode_manager is not None:
+            decode_manager.clear_cudagraph_state()
+
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
         if not self.supports_mm_inputs:

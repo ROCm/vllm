@@ -2,11 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUDA graph manager for vision encoder budget-batch execution."""
 
+import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from vllm.compilation.cuda_graph import (
+    OwnedCUDAGraph,
+    begin_cudagraph_owner_teardown,
+    create_cudagraph,
+    cudagraph_capture_attempt,
+    cudagraph_owner_activity,
+    register_cudagraph_owner,
+)
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -54,12 +64,18 @@ class BudgetGraphMetadata:
 class EncoderCudaGraphManager:
     """Budget-based CUDA graph capture/replay for vision encoders."""
 
+    # Profiling creates an explicitly owner-scoped temporary manager without
+    # registry registration; normal runner construction overrides this state.
+    _cudagraph_manual_owner = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         device: torch.device,
         dtype: torch.dtype,
         model: SupportsEncoderCudaGraph,
+        *,
+        register_owner: bool = True,
     ):
         """Initialize CUDA graph manager with provided token budgets
         and max batch size."""
@@ -158,6 +174,9 @@ class EncoderCudaGraphManager:
         self.graph_hits = 0
         self.graph_misses = 0
         self.log_stats_interval = 100
+        self._cudagraph_teardown_started = False
+        self._cudagraph_active_calls = 0
+        self._cudagraph_activity_condition = threading.Condition()
 
         max_budget = self.token_budgets[-1]
         if not self.config.paths:
@@ -186,6 +205,17 @@ class EncoderCudaGraphManager:
             self.max_frames_per_batch,
             self.use_dp,
         )
+        if register_owner:
+            self._cudagraph_activity_enabled = register_cudagraph_owner(
+                self, vllm_config
+            )
+        else:
+            # Temporary profiling managers are manually supplied to
+            # reset_for_reuse rather than registry-owned, but capture still
+            # needs the owner activity gate so reset cannot race the interval
+            # between graph installation and native capture entry.
+            self._cudagraph_activity_enabled = True
+            self._cudagraph_manual_owner = True
 
     @staticmethod
     def _generate_budgets(min_budget: int, max_budget: int) -> list[int]:
@@ -210,12 +240,26 @@ class EncoderCudaGraphManager:
 
     def clear(self) -> None:
         """Release captured encoder CUDA graphs and the manager-local pool."""
+        self.clear_cudagraph_state()
+
+    def begin_cudagraph_teardown(self) -> None:
+        begin_cudagraph_owner_teardown(self)
+
+    def iter_cudagraphs(self) -> Iterable[OwnedCUDAGraph]:
+        for graph_set in self.budget_graphs.values():
+            for metadata in graph_set.values():
+                yield OwnedCUDAGraph(metadata.graph, self.device)
+
+    def clear_cudagraph_state(self) -> None:
         for graph_set in self.budget_graphs.values():
             graph_set.clear()
         self.graph_pool = None
 
+    @cudagraph_owner_activity
     def capture(self, graph_pool: Any):
         """Capture CUDA graphs for every configured path and token budget."""
+        if getattr(self, "_cudagraph_teardown_started", False):
+            raise RuntimeError("CUDA graph owner is closed")
         self.graph_pool = graph_pool
 
         for path, budgets in self.path_token_budgets.items():
@@ -269,19 +313,26 @@ class EncoderCudaGraphManager:
             output = self.model.encoder_cudagraph_forward({**values}, path=path)
             output_buffer = torch.empty_like(output)
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), torch.cuda.graph(graph, pool=self.graph_pool):
+        def install_graph(graph: torch.cuda.CUDAGraph) -> None:
+            graph_set[token_budget] = BudgetGraphMetadata(
+                token_budget=token_budget,
+                max_batch_size=self.max_batch_size,
+                max_frames_per_batch=self.max_frames_per_batch,
+                graph=graph,
+                input_buffers=values,
+                output_buffer=output_buffer,
+            )
+
+        # Installation precedes native capture so a failed capture retains the
+        # graph and its buffers for the teardown coordinator to quarantine.
+        graph = create_cudagraph(self, self.device, install_graph)
+        with (
+            cudagraph_capture_attempt(self),
+            torch.inference_mode(),
+            torch.cuda.graph(graph, pool=self.graph_pool),
+        ):
             output = self.model.encoder_cudagraph_forward({**values}, path=path)
             output_buffer.copy_(output)
-
-        graph_set[token_budget] = BudgetGraphMetadata(
-            token_budget=token_budget,
-            max_batch_size=self.max_batch_size,
-            max_frames_per_batch=self.max_frames_per_batch,
-            graph=graph,
-            input_buffers=values,
-            output_buffer=output_buffer,
-        )
 
     def _find_smallest_fitting_budget_given_tokens(
         self, total_tokens: int, budgets: list[int] | None = None
@@ -325,6 +376,7 @@ class EncoderCudaGraphManager:
         dst.zero_()
         dst[: src.shape[0]].copy_(src)
 
+    @cudagraph_owner_activity
     def _run_budget_graph(
         self,
         mm_kwargs: dict[str, Any],
@@ -340,6 +392,8 @@ class EncoderCudaGraphManager:
         Returns:
             Encoder outputs, or None if graph not captured.
         """
+        if getattr(self, "_cudagraph_teardown_started", False):
+            raise RuntimeError("CUDA graph owner is closed")
         graph_set = self._get_graph_set(path)
         num_items = len(self._get_item_specs(mm_kwargs))
 

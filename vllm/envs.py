@@ -253,6 +253,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION_MIN_SIZE_KB: int | None = None
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
+    VLLM_SHUTDOWN_MARKER_FD: str | None = None
+    VLLM_SHUTDOWN_MARKER_PATH: str | None = None
+    VLLM_SHUTDOWN_RUN_ID: str | None = None
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -1814,6 +1817,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
     ),
+    # Optional low-level lifecycle instrumentation. These values do not affect
+    # compilation and are read directly by vllm.utils.shutdown_markers.
+    "VLLM_SHUTDOWN_MARKER_FD": lambda: os.getenv("VLLM_SHUTDOWN_MARKER_FD"),
+    "VLLM_SHUTDOWN_MARKER_PATH": lambda: os.getenv("VLLM_SHUTDOWN_MARKER_PATH"),
+    "VLLM_SHUTDOWN_RUN_ID": lambda: os.getenv("VLLM_SHUTDOWN_RUN_ID"),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
     # Used to set the process name prefix for vLLM processes.
@@ -2260,6 +2268,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+        "VLLM_SHUTDOWN_MARKER_FD",
+        "VLLM_SHUTDOWN_MARKER_PATH",
+        "VLLM_SHUTDOWN_RUN_ID",
         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
         "VLLM_IMAGE_FETCH_TIMEOUT",
         "VLLM_VIDEO_FETCH_TIMEOUT",

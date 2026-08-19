@@ -100,6 +100,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
+    def shutdown(self) -> None:
+        manager = self.query_cudagraph_manager
+        self.query_cudagraph_manager = None
+        if manager is not None:
+            manager.clear_cudagraph_state()
+
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.

@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive import speculator as spec_mod
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
     MultiModuleMTPSpeculator,
 )
@@ -67,6 +68,41 @@ class _TextOnlyDraftModel(torch.nn.Module):
         is_multimodal=None,
     ):
         raise AssertionError("embed_input_ids should not be called during loading")
+
+
+@pytest.mark.parametrize(
+    ("speculator_cls", "manager_attributes"),
+    [
+        pytest.param(
+            _TestSpeculator,
+            ("prefill_cudagraph_manager", "decode_cudagraph_manager"),
+            id="autoregressive",
+        ),
+        pytest.param(
+            DFlashSpeculator,
+            ("query_cudagraph_manager",),
+            id="dflash",
+        ),
+        pytest.param(
+            MultiModuleMTPSpeculator,
+            ("cudagraph_manager",),
+            id="multi-module-mtp",
+        ),
+    ],
+)
+def test_shutdown_clears_and_drops_cudagraph_managers(
+    speculator_cls, manager_attributes
+):
+    speculator = object.__new__(speculator_cls)
+    managers = [Mock() for _ in manager_attributes]
+    for attribute, manager in zip(manager_attributes, managers):
+        setattr(speculator, attribute, manager)
+
+    speculator.shutdown()
+
+    for attribute, manager in zip(manager_attributes, managers):
+        manager.clear_cudagraph_state.assert_called_once_with()
+        assert getattr(speculator, attribute) is None
 
 
 def _mock_base_model_load(monkeypatch):
@@ -197,9 +233,11 @@ def test_load_model_disables_mm_support_for_text_only_drafter(monkeypatch):
 
     assert not speculator.supports_mm_inputs
     assert warning_messages == [
-        "Draft model _TextOnlyDraftModel does not support external multimodal "
-        "embeddings. Embeddings from the target model will not be passed to the "
-        "drafter; using text-only draft inputs instead."
+        (
+            "Draft model _TextOnlyDraftModel does not support external multimodal "
+            "embeddings. Embeddings from the target model will not be passed to the "
+            "drafter; using text-only draft inputs instead."
+        )
     ]
 
 

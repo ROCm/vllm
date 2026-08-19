@@ -69,6 +69,12 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
 
         self.cudagraph_manager: SpeculatorCudaGraphManager | None = None
 
+    def shutdown(self) -> None:
+        manager = self.cudagraph_manager
+        self.cudagraph_manager = None
+        if manager is not None:
+            manager.clear_cudagraph_state()
+
     def load_draft_model(
         self,
         target_model: nn.Module,

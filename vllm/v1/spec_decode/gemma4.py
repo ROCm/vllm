@@ -7,12 +7,22 @@ The Gemma4 assistant model runs all decoder layers per draft step
 with the target model via cross-model KV sharing.
 """
 
+import threading
 from collections import defaultdict
+from collections.abc import Iterable
 from copy import copy
 
 import torch
 import torch.nn as nn
 
+from vllm.compilation.cuda_graph import (
+    OwnedCUDAGraph,
+    begin_cudagraph_owner_teardown,
+    create_cudagraph,
+    cudagraph_capture_attempt,
+    cudagraph_owner_activity,
+    register_cudagraph_owner,
+)
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
@@ -58,6 +68,26 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         self._centroids_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._centroids_inputs: dict[int, torch.Tensor] = {}
         self._centroids_outputs: dict[int, torch.Tensor] = {}
+        self._cudagraph_teardown_started = False
+        self._cudagraph_active_calls = 0
+        self._cudagraph_activity_condition = threading.Condition()
+        self._cudagraph_activity_enabled = register_cudagraph_owner(self, vllm_config)
+
+    def begin_cudagraph_teardown(self) -> None:
+        begin_cudagraph_owner_teardown(self)
+
+    def iter_cudagraphs(self) -> Iterable[OwnedCUDAGraph]:
+        for graph in self._centroids_graphs.values():
+            yield OwnedCUDAGraph(graph, self.device)
+
+    def clear_cudagraph_state(self) -> None:
+        self._centroids_sizes.clear()
+        self._centroids_graphs.clear()
+        self._centroids_inputs.clear()
+        self._centroids_outputs.clear()
+
+    def shutdown(self) -> None:
+        self.clear_cudagraph_state()
 
     def set_per_group_block_table(self, gid: int, block_table: torch.Tensor) -> None:
         self._per_group_block_tables[gid] = block_table
@@ -102,7 +132,10 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata
         return per_group_attn_metadata, per_layer_attn_metadata
 
+    @cudagraph_owner_activity
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._cudagraph_teardown_started:
+            raise RuntimeError("CUDA graph owner is closed")
         if self._centroids_sizes:
             T = hidden_states.shape[0]
             for size in self._centroids_sizes:
@@ -113,8 +146,24 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             return self.model.get_top_tokens(hidden_states)
         return super()._greedy_sample(hidden_states)
 
+    def _create_centroids_cudagraph(
+        self,
+        size: int,
+        static_input: torch.Tensor,
+    ) -> torch.cuda.CUDAGraph:
+        def install_graph(graph: torch.cuda.CUDAGraph) -> None:
+            self._centroids_graphs[size] = graph
+            self._centroids_inputs[size] = static_input
+
+        # Install before native capture so a failed capture retains the graph
+        # and its input buffer for safe terminal quarantine.
+        return create_cudagraph(self, self.device, install_graph)
+
+    @cudagraph_owner_activity
     def _setup_centroids_cuda_graphs(self) -> None:
         """Capture CUDA graphs for centroids get_top_tokens at key sizes."""
+        if self._cudagraph_teardown_started:
+            raise RuntimeError("CUDA graph owner is closed")
         masked_emb = self.model.masked_embedding
         lm_head_weight = self.model._get_full_lm_head_weight()
 
@@ -129,14 +178,12 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                 masked_emb.get_top_tokens(static_input, lm_head_weight)
             torch.accelerator.synchronize()
 
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
+            g = self._create_centroids_cudagraph(size, static_input)
+            with cudagraph_capture_attempt(self), torch.cuda.graph(g):
                 static_output = masked_emb.get_top_tokens(
                     static_input,
                     lm_head_weight,
                 )
-            self._centroids_graphs[size] = g
-            self._centroids_inputs[size] = static_input
             self._centroids_outputs[size] = static_output
 
         self._centroids_sizes = sorted(self._centroids_graphs)

@@ -30,6 +30,10 @@ logger = init_logger(__name__)
 
 
 class BaseSpeculator(ABC):
+    def shutdown(self) -> None:
+        """Release speculator-owned resources during runner shutdown."""
+        return None
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass

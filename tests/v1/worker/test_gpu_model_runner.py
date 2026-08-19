@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -10,9 +11,17 @@ import pytest
 import torch
 
 import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
+import vllm.v1.worker.workspace as workspace_module
+from vllm.compilation.cuda_graph import (
+    CUDAGraphTeardownError,
+    CUDAGraphTeardownFailure,
+    CUDAGraphTeardownStats,
+    CUDAGraphWrapper,
+)
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -62,6 +71,92 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import select_common_block_size
+
+
+def test_registry_isolated_when_vllm_config_is_reused(
+    monkeypatch: pytest.MonkeyPatch, default_vllm_config: VllmConfig
+) -> None:
+    class StopRunnerInitialization(Exception):
+        pass
+
+    def stop_runner_initialization(_vllm_config: VllmConfig) -> None:
+        raise StopRunnerInitialization
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "JitWarmupRegistry",
+        stop_runner_initialization,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "is_rocm",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "get_global_graph_pool",
+        object,
+    )
+
+    def partially_construct_runner() -> GPUModelRunner:
+        runner = object.__new__(GPUModelRunner)
+        with pytest.raises(StopRunnerInitialization):
+            runner.__init__(default_vllm_config, torch.device("cpu"))
+        return runner
+
+    original_compilation_config = default_vllm_config.compilation_config
+    vars(original_compilation_config)["_cudagraph_owner_registry_token"] = (
+        "caller-owned-token"
+    )
+    preexisting_layer = object()
+    original_compilation_config.static_forward_context["preexisting"] = (
+        preexisting_layer
+    )
+    runner_a = partially_construct_runner()
+    runner_b = partially_construct_runner()
+
+    late_owner_a = CUDAGraphWrapper(
+        lambda: None,
+        runner_a.vllm_config,
+        CUDAGraphMode.FULL,
+    )
+    late_owner_b = CUDAGraphWrapper(
+        lambda: None,
+        runner_b.vllm_config,
+        CUDAGraphMode.FULL,
+    )
+    later_owner_a = CUDAGraphWrapper(
+        lambda: None,
+        runner_a.vllm_config,
+        CUDAGraphMode.FULL,
+    )
+
+    assert default_vllm_config.compilation_config is original_compilation_config
+    assert runner_a.vllm_config is not default_vllm_config
+    assert runner_b.vllm_config is not default_vllm_config
+    assert runner_a.vllm_config is not runner_b.vllm_config
+    assert runner_a.compilation_config is not original_compilation_config
+    assert runner_b.compilation_config is not original_compilation_config
+    assert runner_a.compilation_config is not runner_b.compilation_config
+    assert (
+        runner_a.compilation_config.static_forward_context
+        is not runner_b.compilation_config.static_forward_context
+    )
+    assert "preexisting" not in runner_a.compilation_config.static_forward_context
+    assert "preexisting" not in runner_b.compilation_config.static_forward_context
+    assert original_compilation_config.static_forward_context["preexisting"] is (
+        preexisting_layer
+    )
+    assert (
+        vars(original_compilation_config)["_cudagraph_owner_registry_token"]
+        == "caller-owned-token"
+    )
+    assert runner_a.cudagraph_owner_registry.owners() == (
+        late_owner_a,
+        later_owner_a,
+    )
+    assert runner_b.cudagraph_owner_registry.owners() == (late_owner_b,)
+
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
@@ -1842,3 +1937,419 @@ class TestInitFp8KvScalesHybridModels:
         assert (t1 == 0).all()
         assert (t2 == 0).all()
         assert all((t == 0).all() for t in list_entry)
+
+
+class _ShutdownEventContext(dict):
+    def __init__(self, events: list[str]):
+        super().__init__()
+        self.events = events
+
+    def clear(self) -> None:
+        self.events.append("static_context")
+        super().clear()
+
+
+def _make_legacy_teardown_stats(
+    error: Exception | None = None,
+    *,
+    fallback_required: bool = False,
+) -> CUDAGraphTeardownStats:
+    failures = (
+        (CUDAGraphTeardownFailure("reset", "TestOwner", error, "reset failed"),)
+        if error is not None
+        else ()
+    )
+    return CUDAGraphTeardownStats(
+        graph_count=int(error is not None),
+        owner_graph_counts={"TestOwner": int(error is not None)},
+        enumeration_duration_s=0,
+        reset_duration_s=0,
+        clear_duration_s=0,
+        total_duration_s=0,
+        failures=failures,
+        _retained_owner_ids=(frozenset({1}) if fallback_required else frozenset()),
+    )
+
+
+def _make_legacy_shutdown_runner(
+    events: list[str], stats: CUDAGraphTeardownStats
+) -> tuple[GPUModelRunner, Mock, Mock]:
+    runner = object.__new__(GPUModelRunner)
+    registry = Mock()
+    registry.teardown.side_effect = lambda **_: events.append("teardown") or stats
+    drafter = Mock()
+    drafter.shutdown.side_effect = lambda: events.append("drafter")
+    runner.cudagraph_owner_registry = registry
+    runner.drafter = drafter
+    runner.encoder_cudagraph_manager = object()
+    runner._cleanup_profiling_kv_cache = Mock(
+        side_effect=lambda **_kwargs: events.append("kv_cleanup")
+    )
+    runner.compilation_config = SimpleNamespace(
+        static_forward_context=_ShutdownEventContext(events)
+    )
+    runner.model = object()
+    return runner, registry, drafter
+
+
+def _patch_legacy_shutdown_dependencies(
+    monkeypatch, events: list[str], *, rocm: bool
+) -> None:
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform, "is_rocm", lambda: rocm
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform, "is_xpu", lambda: False
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator,
+        "synchronize",
+        lambda: events.append("synchronize"),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.gc, "collect", lambda: events.append("gc_collect")
+    )
+    monkeypatch.setattr(
+        workspace_module,
+        "reset_workspace_manager",
+        lambda: events.append("workspace"),
+    )
+
+
+def test_legacy_rocm_shutdown_tears_down_graphs_before_model_state(monkeypatch):
+    events: list[str] = []
+    runner, registry, drafter = _make_legacy_shutdown_runner(
+        events, _make_legacy_teardown_stats()
+    )
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=True)
+
+    runner.shutdown()
+
+    assert events == [
+        "synchronize",
+        "teardown",
+        "drafter",
+        "kv_cleanup",
+        "static_context",
+        "workspace",
+        "gc_collect",
+        "empty_cache",
+        "synchronize",
+    ]
+    registry.teardown.assert_called_once_with(post_reset_sync=True)
+    drafter.shutdown.assert_called_once_with()
+    assert runner.drafter is None
+    assert runner.encoder_cudagraph_manager is None
+    assert runner.model is None
+
+
+def test_legacy_rocm_shutdown_cleans_model_before_reporting_graph_failure(
+    monkeypatch,
+):
+    events: list[str] = []
+    runner, _, _ = _make_legacy_shutdown_runner(
+        events, _make_legacy_teardown_stats(RuntimeError("reset failed"))
+    )
+
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=True)
+
+    with pytest.raises(CUDAGraphTeardownError, match="reset failed"):
+        runner.shutdown()
+
+    assert events == [
+        "synchronize",
+        "teardown",
+        "drafter",
+        "kv_cleanup",
+        "static_context",
+        "workspace",
+        "gc_collect",
+        "empty_cache",
+        "synchronize",
+    ]
+    assert not getattr(runner, "_cudagraph_teardown_incomplete", False)
+    assert runner.model is None
+
+
+def test_legacy_rocm_shutdown_does_not_mask_model_cleanup_failure(monkeypatch):
+    events: list[str] = []
+    runner, _, drafter = _make_legacy_shutdown_runner(
+        events, _make_legacy_teardown_stats(RuntimeError("reset failed"))
+    )
+    log_error = Mock()
+
+    def fail_drafter_shutdown() -> None:
+        events.append("drafter")
+        raise RuntimeError("drafter cleanup failed")
+
+    drafter.shutdown.side_effect = fail_drafter_shutdown
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=True)
+    monkeypatch.setattr(gpu_model_runner_module.logger, "error", log_error)
+
+    with pytest.raises(RuntimeError, match="drafter cleanup failed"):
+        runner.shutdown()
+
+    assert events == ["synchronize", "teardown", "drafter"]
+    assert "reset failed" in str(log_error.call_args_list)
+
+
+def test_legacy_rocm_sync_failure_retains_device_state(monkeypatch):
+    events: list[str] = []
+    runner, registry, drafter = _make_legacy_shutdown_runner(
+        events, _make_legacy_teardown_stats()
+    )
+    model = runner.model
+    log_exception = Mock()
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=True)
+    monkeypatch.setattr(gpu_model_runner_module.logger, "exception", log_exception)
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator,
+        "synchronize",
+        lambda: (_ for _ in ()).throw(RuntimeError("sync failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        runner.shutdown()
+
+    registry.teardown.assert_not_called()
+    assert runner._cudagraph_teardown_incomplete
+    assert runner._terminal_fallback_cycle is runner
+    assert events == []
+    assert runner.drafter is drafter
+    assert runner.model is model
+    log_exception.assert_called_once()
+    assert "synchronization failed" in log_exception.call_args.args[0]
+
+
+def test_legacy_rocm_shutdown_preserves_gemma_and_static_fallback_state(monkeypatch):
+    events: list[str] = []
+    runner, registry, gemma_drafter = _make_legacy_shutdown_runner(
+        events,
+        _make_legacy_teardown_stats(
+            RuntimeError("reset failed"),
+            fallback_required=True,
+        ),
+    )
+    gemma_drafter.centroid_inputs = {1: object()}
+    model = runner.model
+    encoder_manager = runner.encoder_cudagraph_manager
+    static_buffer = object()
+    runner.compilation_config.static_forward_context["static"] = static_buffer
+    static_forward_context = runner.compilation_config.static_forward_context
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=True)
+
+    with pytest.raises(CUDAGraphTeardownError, match="reset failed"):
+        runner.shutdown()
+
+    assert runner._cudagraph_teardown_incomplete
+    registry.retain_fallback_dependency.assert_called_once_with(runner)
+    gemma_drafter.shutdown.assert_not_called()
+    runner._cleanup_profiling_kv_cache.assert_not_called()
+    assert events == ["synchronize", "teardown"]
+    assert runner.drafter is gemma_drafter
+    assert runner.drafter.centroid_inputs
+    assert runner.model is model
+    assert runner.encoder_cudagraph_manager is encoder_manager
+    assert runner.compilation_config.static_forward_context is static_forward_context
+    assert runner.compilation_config.static_forward_context["static"] is static_buffer
+
+
+def test_legacy_rocm_shutdown_retains_after_coordinator_exception(monkeypatch):
+    events: list[str] = []
+    runner, registry, gemma_drafter = _make_legacy_shutdown_runner(
+        events, _make_legacy_teardown_stats()
+    )
+    model = runner.model
+    static_forward_context = runner.compilation_config.static_forward_context
+    log_exception = Mock()
+    registry.teardown.side_effect = RuntimeError("coordinator failed")
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=True)
+    monkeypatch.setattr(gpu_model_runner_module.logger, "exception", log_exception)
+
+    with pytest.raises(RuntimeError, match="coordinator failed"):
+        runner.shutdown()
+
+    assert runner._cudagraph_teardown_incomplete
+    registry.retain_fallback_dependency.assert_called_once_with(runner)
+    gemma_drafter.shutdown.assert_not_called()
+    runner._cleanup_profiling_kv_cache.assert_not_called()
+    assert events == ["synchronize"]
+    assert runner.drafter is gemma_drafter
+    assert runner.model is model
+    assert runner.compilation_config.static_forward_context is static_forward_context
+    log_exception.assert_called_once()
+    assert "failed unexpectedly" in log_exception.call_args.args[0]
+
+
+def test_legacy_non_rocm_shutdown_preserves_implicit_graph_cleanup(monkeypatch):
+    events: list[str] = []
+    runner, registry, drafter = _make_legacy_shutdown_runner(
+        events, _make_legacy_teardown_stats()
+    )
+    encoder_manager = runner.encoder_cudagraph_manager
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=False)
+
+    runner.shutdown()
+
+    registry.teardown.assert_not_called()
+    drafter.shutdown.assert_not_called()
+    assert events == ["kv_cleanup", "static_context", "workspace"]
+    assert runner.encoder_cudagraph_manager is encoder_manager
+    assert runner.model is None
+
+
+def test_legacy_non_rocm_shutdown_sync_failure_is_fail_fast(monkeypatch):
+    events: list[str] = []
+    runner, registry, drafter = _make_legacy_shutdown_runner(
+        events, _make_legacy_teardown_stats()
+    )
+    model = runner.model
+    runner._cleanup_profiling_kv_cache.side_effect = RuntimeError("sync failed")
+    _patch_legacy_shutdown_dependencies(monkeypatch, events, rocm=False)
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        runner.shutdown()
+
+    registry.teardown.assert_not_called()
+    drafter.shutdown.assert_not_called()
+    assert events == []
+    assert runner.model is model
+
+
+@pytest.mark.parametrize(
+    ("fallback_required", "reset_raises"),
+    [
+        (False, False),
+        (True, False),
+        (True, True),
+    ],
+    ids=(
+        "safe-failure",
+        "fallback-stats",
+        "coordinator-exception",
+    ),
+)
+def test_profile_cudagraph_memory_handles_reset_failure_safely(
+    monkeypatch,
+    fallback_required: bool,
+    reset_raises: bool,
+):
+    events: list[str] = []
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
+    runner.device = torch.device("cpu")
+    runner.lora_config = None
+    runner._cudagraph_teardown_incomplete = False
+    runner._init_minimal_kv_cache_for_profiling = Mock()
+    runner._freeze_gc = Mock(return_value=nullcontext())
+    runner.maybe_remove_all_loras = Mock(
+        side_effect=lambda _: events.append("lora_cleanup")
+    )
+    runner._cleanup_profiling_kv_cache = Mock(
+        side_effect=lambda: events.append("kv_cleanup")
+    )
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=Mock(return_value=[]),
+        cudagraph_keys={},
+        keys_initialized=True,
+    )
+
+    encoder_manager = SimpleNamespace(
+        get_num_graphs_to_capture=Mock(return_value=1),
+        token_budgets=[1],
+        capture=Mock(side_effect=lambda **_: events.append("encoder_capture")),
+    )
+    runner._create_encoder_cudagraph_manager = Mock(return_value=encoder_manager)
+    reset_error = RuntimeError("profiling reset failed")
+    teardown_stats = _make_legacy_teardown_stats(
+        reset_error,
+        fallback_required=fallback_required,
+    )
+    original_pool = object()
+    profiling_pool = object()
+    encoder_profiling_pool = object()
+    pool_wrapper = SimpleNamespace(graph_pool=original_pool)
+    runner.cudagraph_owner_registry = Mock()
+    runner.cudagraph_owner_registry.owners_of_type.return_value = (pool_wrapper,)
+    log_exception = Mock()
+
+    def reset_for_reuse(*_, **__):
+        events.append("graph_reset")
+        if reset_raises:
+            raise reset_error
+        return teardown_stats
+
+    runner.cudagraph_owner_registry.reset_for_reuse.side_effect = reset_for_reuse
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "graph_capture",
+        lambda **_: nullcontext(),
+    )
+    graph_pool_handles = iter((profiling_pool, encoder_profiling_pool))
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "graph_pool_handle",
+        lambda: next(graph_pool_handles),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform, "is_rocm", lambda: False
+    )
+    monkeypatch.setattr(gpu_model_runner_module.logger, "exception", log_exception)
+    monkeypatch.setattr(
+        gpu_model_runner_module.compilation_counter,
+        "num_cudagraph_captured",
+        73,
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator, "synchronize", lambda: None
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator, "empty_cache", lambda: None
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.torch.accelerator,
+        "get_memory_info",
+        lambda: (1 << 30, 2 << 30),
+    )
+
+    expected_error = RuntimeError if reset_raises else CUDAGraphTeardownError
+    expected_message = "profiling reset failed"
+    with pytest.raises(expected_error, match=expected_message):
+        runner.profile_cudagraph_memory()
+
+    expected_events = ["encoder_capture", "graph_reset"]
+    if fallback_required:
+        assert runner._cudagraph_teardown_incomplete
+        assert pool_wrapper.graph_pool is profiling_pool
+        assert runner.cudagraph_dispatcher.keys_initialized is True
+        runner.cudagraph_owner_registry.retain_fallback_dependency.assert_called_once_with(
+            runner
+        )
+    else:
+        expected_events.extend(("lora_cleanup", "kv_cleanup"))
+        assert not runner._cudagraph_teardown_incomplete
+        assert pool_wrapper.graph_pool is original_pool
+        assert runner.cudagraph_dispatcher.keys_initialized is False
+        runner.cudagraph_owner_registry.retain_fallback_dependency.assert_not_called()
+    assert events == expected_events
+    assert gpu_model_runner_module.compilation_counter.num_cudagraph_captured == 73
+    if reset_raises:
+        log_exception.assert_called_once()
+        assert "profiling reset failed unexpectedly" in log_exception.call_args.args[0]
+    else:
+        log_exception.assert_not_called()
+    runner.cudagraph_owner_registry.reset_for_reuse.assert_called_once_with(
+        [pool_wrapper, encoder_manager],
+        post_reset_sync=True,
+    )

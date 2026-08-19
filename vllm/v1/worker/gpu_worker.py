@@ -17,6 +17,9 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+from vllm.compilation.cuda_graph import (
+    retain_cudagraph_dependency_for_terminal_exit,
+)
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
 from vllm.device_allocator import get_mem_allocator_instance
@@ -67,6 +70,7 @@ from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.shutdown_markers import emit_shutdown_marker
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -181,6 +185,7 @@ class Worker(WorkerBase):
         # so we have all the information needed for proper trace naming.
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
+        self._cudagraph_teardown_incomplete = False
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
@@ -436,6 +441,12 @@ class Worker(WorkerBase):
             )
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+
+        # The runner gives its CUDA graph registry a private CompilationConfig
+        # token. Use that same private config for later compilation contexts and
+        # timing updates instead of the caller's shared config.
+        self.vllm_config = self.model_runner.vllm_config
+        self.compilation_config = self.vllm_config.compilation_config
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -1364,31 +1375,99 @@ class Worker(WorkerBase):
 
     def shutdown(self) -> None:
         gc.unfreeze()
+        if current_platform.is_rocm():
+            self._shutdown_rocm()
+            return
 
-        # has_kv_transfer_group can be None during interpreter shutdown.
+        # Preserve the historical CUDA/XPU/CPU shutdown contract: ordered and
+        # fail-fast, with no new reference-clearing policy.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
         if ensure_ec_transfer_shutdown is not None:
             ensure_ec_transfer_shutdown()
         if self.profiler is not None:
             self.profiler.shutdown()
-
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
-
-        # Release GPU resources held by the model runner so that memory
-        # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
 
-        # Release kept-alive cumem pools while the pluggable allocator wrappers
-        # and callbacks are still alive, so MemPool teardown is not deferred to
-        # interpreter finalization (pytorch/pytorch#145168).
         if current_platform.is_cuda_alike():
-            from vllm.device_allocator.cumem import CuMemAllocator
+            self._release_cumem_pools()
 
-            if CuMemAllocator.instance is not None:
-                CuMemAllocator.instance.release_pools()
+    @staticmethod
+    def _release_cumem_pools() -> None:
+        # Release kept-alive pools while their allocator callbacks are alive,
+        # instead of deferring MemPool teardown to interpreter finalization.
+        from vllm.device_allocator.cumem import CuMemAllocator
+
+        if CuMemAllocator.instance is not None:
+            CuMemAllocator.instance.release_pools()
+
+    def _shutdown_rocm(self) -> None:
+        emit_shutdown_marker("worker_shutdown_begin")
+
+        quiescers: list[tuple[str, Callable[[], None]]] = []
+        if ensure_kv_transfer_shutdown is not None:
+            quiescers.append(("KV transfer shutdown", ensure_kv_transfer_shutdown))
+        if ensure_ec_transfer_shutdown is not None:
+            quiescers.append(("EC transfer shutdown", ensure_ec_transfer_shutdown))
+        if self.profiler is not None:
+            quiescers.append(("profiler shutdown", self.profiler.shutdown))
+        if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
+            quiescers.append(
+                ("weight transfer shutdown", weight_transfer_engine.shutdown)
+            )
+
+        errors: list[Exception] = []
+        for name, shutdown_component in quiescers:
+            try:
+                shutdown_component()
+            except Exception as exc:
+                # These components are independent, and each can own device
+                # work. Ask all of them to stop before deciding whether graph
+                # teardown is safe.
+                logger.exception("[shutdown] GPU worker: %s failed", name)
+                errors.append(exc)
+        if errors:
+            # These components can own background GPU work and model buffers.
+            # Preserve the complete worker instead of resetting underneath a
+            # callback that did not quiesce.
+            self._cudagraph_teardown_incomplete = True
+            retain_cudagraph_dependency_for_terminal_exit(self)
+            emit_shutdown_marker("worker_shutdown_end", failure_count=len(errors))
+            raise errors[0]
+
+        self.profiler = None
+        self.weight_transfer_engine = None
+
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            try:
+                model_runner.shutdown()
+            except Exception as exc:
+                logger.exception("[shutdown] GPU worker: model runner shutdown failed")
+                errors.append(exc)
+        self._cudagraph_teardown_incomplete = bool(errors) or bool(
+            getattr(model_runner, "_cudagraph_teardown_incomplete", False)
+        )
+        if self._cudagraph_teardown_incomplete:
+            retain_cudagraph_dependency_for_terminal_exit(self)
+        else:
+            self.model_runner = None  # type: ignore[assignment]
+            if current_platform.is_cuda_alike():
+                try:
+                    self._release_cumem_pools()
+                except Exception as exc:
+                    logger.exception("[shutdown] GPU worker: CuMem pool release failed")
+                    errors.append(exc)
+
+        emit_shutdown_marker(
+            "worker_shutdown_end",
+            failure_count=len(errors),
+        )
+        if errors:
+            raise errors[0]
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

@@ -50,8 +50,6 @@ class UBatchContext:
 
     def __enter__(self):
         global _CURRENT_CONTEXTS, _THREAD_ID_TO_CONTEXT
-        _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.id
-        _CURRENT_CONTEXTS[self.id] = self
         # _NUM_UBATCHES is set in make_ubatch_contexts
         self.ready_barrier.wait()
 
@@ -60,6 +58,12 @@ class UBatchContext:
         self._restore_context()
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
+
+        # Register only after initialization succeeds. Python does not call
+        # __exit__ when __enter__ raises, so doing this last avoids stale state
+        # without requiring exception scaffolding.
+        _THREAD_ID_TO_CONTEXT[threading.get_ident()] = self.id
+        _CURRENT_CONTEXTS[self.id] = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):

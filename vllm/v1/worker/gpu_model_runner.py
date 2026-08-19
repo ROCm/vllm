@@ -8,9 +8,9 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
-from dataclasses import replace
+from dataclasses import fields, replace
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -26,7 +26,14 @@ from vllm.compilation.breakable_cudagraph import (
     is_breakable_cudagraph_enabled,
 )
 from vllm.compilation.counter import compilation_counter
-from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
+from vllm.compilation.cuda_graph import (
+    CUDAGraphOwner,
+    CUDAGraphOwnerRegistry,
+    CUDAGraphStat,
+    CUDAGraphTeardownStats,
+    CUDAGraphWrapper,
+    retain_cudagraph_dependency_for_terminal_exit,
+)
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationMode,
@@ -255,6 +262,33 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _log_cudagraph_teardown_stats(
+    stats: CUDAGraphTeardownStats, *, context: str
+) -> None:
+    logger.info(
+        "%s: graphs=%d, owners=%s, enumeration=%.3f ms, reset=%.3f ms, "
+        "clear=%.3f ms, total=%.3f ms, failures=%d",
+        context,
+        stats.graph_count,
+        stats.owner_graph_counts,
+        stats.enumeration_duration_s * 1000,
+        stats.reset_duration_s * 1000,
+        stats.clear_duration_s * 1000,
+        stats.total_duration_s * 1000,
+        len(stats.failures),
+    )
+    for index, failure in enumerate(stats.failures, start=1):
+        logger.error(
+            "%s failure %d/%d: phase=%s, owner=%s\n%s",
+            context,
+            index,
+            len(stats.failures),
+            failure.phase,
+            failure.owner,
+            failure.traceback_text.rstrip(),
+        )
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -506,6 +540,30 @@ class GPUModelRunner(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        # The registry token lives on CompilationConfig. A VllmConfig can be
+        # reused by multiple in-process runners, so keep that mutable routing
+        # state private while sharing the substantive nested configuration.
+        source_compilation_config = vllm_config.compilation_config
+        vllm_config = copy(vllm_config)
+        vllm_config.compilation_config = replace(source_compilation_config)
+        # Model construction helpers may populate init=False runtime containers
+        # before runner construction, so preserve them for a pristine caller
+        # config while giving each runner independent containers. A config that
+        # already carries a registry token came from another runner (or across a
+        # process boundary); its loaded-model runtime state must not be reused.
+        if not hasattr(source_compilation_config, "_cudagraph_owner_registry_token"):
+            for config_field in fields(source_compilation_config):
+                if not config_field.init:
+                    setattr(
+                        vllm_config.compilation_config,
+                        config_field.name,
+                        copy(getattr(source_compilation_config, config_field.name)),
+                    )
+        self.cudagraph_owner_registry = CUDAGraphOwnerRegistry(
+            vllm_config,
+            strong_ownership=current_platform.is_rocm(),
+        )
+        self._cudagraph_teardown_incomplete = False
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -6690,29 +6748,88 @@ class GPUModelRunner(
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
-        from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
-        from vllm.v1.worker.workspace import reset_workspace_manager
+        is_rocm = current_platform.is_rocm()
+        teardown_stats = self._shutdown_rocm_cudagraphs() if is_rocm else None
 
-        # Calls torch.accelerator.synchronize()
-        self._cleanup_profiling_kv_cache()
-        if current_platform.is_rocm():
-            # Drop captured graphs before distributed teardown. On ROCm, delayed
-            # graph destruction can surface HSA faults in the next engine startup.
-            CUDAGraphWrapper.clear_all_graphs()
-            BreakableCUDAGraphWrapper.clear_all_graphs()
-            self.encoder_cudagraph_manager = None
-        self.compilation_config.static_forward_context.clear()
-        self.model = None  # type: ignore[assignment]
-        _ROPE_DICT.clear()
-
-        reset_workspace_manager()
-        if current_platform.is_rocm() or current_platform.is_xpu():
+        self._release_model_state(after_cudagraph_teardown=is_rocm)
+        if is_rocm or current_platform.is_xpu():
             gc.collect()
             torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
 
-    def _cleanup_profiling_kv_cache(self) -> None:
-        torch.accelerator.synchronize()
+        # Safe graph-reset failures are reported after dependent state follows
+        # its normal cleanup path. Cleanup failures propagate directly; the
+        # graph-reset failure has already been logged with its traceback.
+        if teardown_stats is not None:
+            teardown_stats.raise_if_failed()
+
+    def _shutdown_rocm_cudagraphs(self) -> CUDAGraphTeardownStats:
+        """Reset graphs while all of their dependent runner state is alive."""
+        self._cudagraph_teardown_incomplete = True
+        try:
+            torch.accelerator.synchronize()
+        except Exception:
+            logger.exception(
+                "ROCm synchronization failed before CUDA graph teardown; "
+                "attempting to retain graph-dependent runner state"
+            )
+            retain_cudagraph_dependency_for_terminal_exit(self)
+            raise
+
+        try:
+            teardown_stats = self.cudagraph_owner_registry.teardown(
+                post_reset_sync=True
+            )
+        except Exception:
+            logger.exception(
+                "ROCm CUDA graph teardown failed unexpectedly; attempting "
+                "to retain graph-dependent runner state"
+            )
+            self.cudagraph_owner_registry.retain_fallback_dependency(self)
+            raise
+
+        _log_cudagraph_teardown_stats(
+            teardown_stats, context="ROCm CUDA graph teardown"
+        )
+        if teardown_stats.fallback_required:
+            self.cudagraph_owner_registry.retain_fallback_dependency(self)
+            logger.error(
+                "ROCm CUDA graph teardown was incomplete; retaining "
+                "graph-dependent runner state"
+            )
+            teardown_stats.raise_if_failed()
+            raise RuntimeError("ROCm CUDA graph teardown was incomplete")
+
+        self._cudagraph_teardown_incomplete = False
+        return teardown_stats
+
+    def _release_model_state(self, *, after_cudagraph_teardown: bool) -> None:
+        from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
+        from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if after_cudagraph_teardown:
+            drafter = getattr(self, "drafter", None)
+            drafter_shutdown = getattr(drafter, "shutdown", None)
+            if callable(drafter_shutdown):
+                drafter_shutdown()
+            if hasattr(self, "drafter"):
+                self.drafter = None  # type: ignore[assignment]
+            self.encoder_cudagraph_manager = None
+
+        # ROCm has already synchronized before and after graph reset. Other
+        # platforms retain the existing synchronization in KV-cache cleanup.
+        if after_cudagraph_teardown:
+            self._cleanup_profiling_kv_cache(synchronize=False)
+        else:
+            self._cleanup_profiling_kv_cache()
+        self.compilation_config.static_forward_context.clear()
+        self.model = None  # type: ignore[assignment]
+        _ROPE_DICT.clear()
+        reset_workspace_manager()
+
+    def _cleanup_profiling_kv_cache(self, *, synchronize: bool = True) -> None:
+        if synchronize:
+            torch.accelerator.synchronize()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
@@ -6725,7 +6842,6 @@ class GPUModelRunner(
         if hasattr(self, "kv_cache_config"):
             delattr(self, "kv_cache_config")
         self.cache_config.num_gpu_blocks = None
-
         for layer in self.compilation_config.static_forward_context.values():
             if hasattr(layer, "kv_cache"):
                 kv_cache = layer.kv_cache
@@ -6739,14 +6855,14 @@ class GPUModelRunner(
                     layer.impl._k_scale_cache = None
                 if hasattr(layer.impl, "_v_scale_cache"):
                     layer.impl._v_scale_cache = None
-
         gc.collect()
         torch.accelerator.empty_cache()
-
         logger.debug("Cleaned up profiling KV cache and CUDA graphs")
 
     @torch.inference_mode()
-    def _create_encoder_cudagraph_manager(self) -> "EncoderCudaGraphManager | None":
+    def _create_encoder_cudagraph_manager(
+        self, *, register_owner: bool = True
+    ) -> "EncoderCudaGraphManager | None":
         if not (
             self.compilation_config.cudagraph_mm_encoder and self.supports_mm_inputs
         ):
@@ -6772,6 +6888,7 @@ class GPUModelRunner(
             device=self.device,
             dtype=self.dtype,
             model=cast(SupportsEncoderCudaGraph, raw_model),
+            register_owner=register_owner,
         )
 
     @torch.inference_mode()
@@ -6780,6 +6897,79 @@ class GPUModelRunner(
             self.encoder_cudagraph_manager = self._create_encoder_cudagraph_manager()
             if self.encoder_cudagraph_manager is not None:
                 logger.info("Initialized EncoderCudaGraphManager for vision encoder")
+
+    @staticmethod
+    def _restore_cudagraph_capture_count(captured_count: int) -> None:
+        compilation_counter.num_cudagraph_captured = captured_count
+
+    def _reset_profiled_cudagraphs(
+        self,
+        profiling_owners: list[CUDAGraphOwner],
+    ) -> CUDAGraphTeardownStats:
+        try:
+            return self.cudagraph_owner_registry.reset_for_reuse(
+                profiling_owners,
+                post_reset_sync=True,
+            )
+        except Exception:
+            # reset_for_reuse closes the registry and retains the selected
+            # owners after an unexpected coordinator failure. Retain the
+            # runner-owned buffers that those graphs may still reference.
+            self._cudagraph_teardown_incomplete = True
+            logger.exception(
+                "CUDA graph memory profiling reset failed unexpectedly; "
+                "attempting to retain graph-dependent runner state"
+            )
+            self.cudagraph_owner_registry.retain_fallback_dependency(self)
+            raise
+
+    def _cleanup_cudagraph_memory_profile(
+        self,
+        pool_wrappers: tuple[CUDAGraphWrapper | BreakableCUDAGraphWrapper, ...],
+        original_pools: dict[int, Any],
+        encoder_cudagraph_manager: "EncoderCudaGraphManager | None",
+    ) -> None:
+        profiling_owners = list(
+            self.cudagraph_owner_registry.owners_of_type(
+                (
+                    CUDAGraphWrapper,
+                    BreakableCUDAGraphWrapper,
+                    UBatchWrapper,
+                )
+            )
+        )
+        if encoder_cudagraph_manager is not None:
+            profiling_owners.append(encoder_cudagraph_manager)
+
+        teardown_stats = self._reset_profiled_cudagraphs(profiling_owners)
+        _log_cudagraph_teardown_stats(
+            teardown_stats,
+            context="CUDA graph memory profiling cleanup",
+        )
+        if teardown_stats.fallback_required:
+            self._cudagraph_teardown_incomplete = True
+            self.cudagraph_owner_registry.retain_fallback_dependency(self)
+            logger.error(
+                "CUDA graph memory profiling reset was incomplete; retaining "
+                "graph-dependent runner state"
+            )
+            teardown_stats.raise_if_failed()
+            raise RuntimeError("CUDA graph memory profiling reset was incomplete")
+
+        self._cudagraph_teardown_incomplete = False
+        for instance in pool_wrappers:
+            instance_id = id(instance)
+            if instance_id in original_pools:
+                instance.graph_pool = original_pools[instance_id]
+        for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
+            key_set.clear()
+        self.cudagraph_dispatcher.keys_initialized = False
+        self.maybe_remove_all_loras(self.lora_config)
+        self._cleanup_profiling_kv_cache()
+
+        # A reset/clear failure that did not retain native state is safe to
+        # report after the profiling buffers above have been released.
+        teardown_stats.raise_if_failed()
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
@@ -6791,7 +6981,9 @@ class GPUModelRunner(
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
         # Use a temporary manager for memory profiling. The persistent manager
         # is initialized later so it does not keep profiling-only graph state.
-        encoder_cudagraph_manager = self._create_encoder_cudagraph_manager()
+        encoder_cudagraph_manager = self._create_encoder_cudagraph_manager(
+            register_owner=False
+        )
 
         decoder_graphs = sum(len(descs) for _, descs in capture_descs)
         encoder_graphs = (
@@ -6824,10 +7016,13 @@ class GPUModelRunner(
         profiling_pool = current_platform.graph_pool_handle()
         encoder_profiling_pool = current_platform.graph_pool_handle()
         original_pools: dict[int, Any] = {}
-        all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-            BreakableCUDAGraphWrapper._all_instances
+        pool_wrappers = cast(
+            tuple[CUDAGraphWrapper | BreakableCUDAGraphWrapper, ...],
+            self.cudagraph_owner_registry.owners_of_type(
+                (CUDAGraphWrapper, BreakableCUDAGraphWrapper)
+            ),
         )
-        for instance in all_wrappers:
+        for instance in pool_wrappers:
             original_pools[id(instance)] = instance.graph_pool
             instance.graph_pool = profiling_pool
 
@@ -6852,9 +7047,22 @@ class GPUModelRunner(
             else None
         )
 
-        # Cleanup-only guard: CUDA graph capture errors should still propagate
-        # because encoder graph capture is opt-in.
-        try:
+        # ExitStack keeps the capture body straight-line while guaranteeing all
+        # three independent cleanup actions. Callbacks run in reverse order:
+        # disable capture, reset profiling graphs, then restore the counter.
+        with ExitStack() as cleanup_stack:
+            cleanup_stack.callback(
+                self._restore_cudagraph_capture_count,
+                saved_num_cudagraph_captured,
+            )
+            cleanup_stack.callback(
+                self._cleanup_cudagraph_memory_profile,
+                pool_wrappers,
+                original_pools,
+                encoder_cudagraph_manager,
+            )
+            cleanup_stack.callback(set_cudagraph_capturing_enabled, False)
+
             set_cudagraph_capturing_enabled(True)
             with (
                 self._freeze_gc(),
@@ -6915,24 +7123,6 @@ class GPUModelRunner(
                         encoder_memory_estimate / (1 << 20),
                         encoder_graphs,
                     )
-        finally:
-            set_cudagraph_capturing_enabled(False)
-            CUDAGraphWrapper.clear_all_graphs()
-            BreakableCUDAGraphWrapper.clear_all_graphs()
-            if encoder_cudagraph_manager is not None:
-                encoder_cudagraph_manager.clear()
-            all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
-                BreakableCUDAGraphWrapper._all_instances
-            )
-            for instance in all_wrappers:
-                if id(instance) in original_pools:
-                    instance.graph_pool = original_pools[id(instance)]
-            for key_set in self.cudagraph_dispatcher.cudagraph_keys.values():
-                key_set.clear()
-            self.cudagraph_dispatcher.keys_initialized = False
-            self.maybe_remove_all_loras(self.lora_config)
-            self._cleanup_profiling_kv_cache()
-            compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are
         # never replayed concurrently, so the pool overlays their memory.

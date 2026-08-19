@@ -5,6 +5,7 @@ import asyncio
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -45,6 +46,62 @@ def test_supports_async_scheduling_multiproc_executor():
     assert MultiprocExecutor.supports_async_scheduling() is True
 
 
+def test_uniproc_propagates_incomplete_graph_state_when_shutdown_raises() -> None:
+    actual_worker = SimpleNamespace(_cudagraph_teardown_incomplete=True)
+
+    class WorkerWrapper:
+        worker = actual_worker
+        _cudagraph_teardown_incomplete = False
+
+        def shutdown(self):
+            raise RuntimeError("graph reset failed")
+
+    executor = object.__new__(UniProcExecutor)
+    worker_wrapper = WorkerWrapper()
+    executor.driver_worker = worker_wrapper  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="graph reset failed"):
+        executor.shutdown()
+
+    assert executor._cudagraph_teardown_incomplete
+    assert executor.driver_worker is worker_wrapper
+
+
+def test_uniproc_releases_worker_after_complete_shutdown() -> None:
+    class WorkerWrapper:
+        worker = SimpleNamespace(_cudagraph_teardown_incomplete=False)
+        _cudagraph_teardown_incomplete = False
+
+        def shutdown(self):
+            return
+
+    executor = object.__new__(UniProcExecutor)
+    executor.driver_worker = WorkerWrapper()  # type: ignore[assignment]
+
+    executor.shutdown()
+
+    assert not executor._cudagraph_teardown_incomplete
+    assert executor.driver_worker is None
+
+
+def test_uniproc_reports_incomplete_graph_state_without_worker_error() -> None:
+    class WorkerWrapper:
+        worker = SimpleNamespace(_cudagraph_teardown_incomplete=True)
+        _cudagraph_teardown_incomplete = False
+
+        def shutdown(self):
+            return
+
+    executor = object.__new__(UniProcExecutor)
+    executor.driver_worker = WorkerWrapper()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="CUDA graph teardown was incomplete"):
+        executor.shutdown()
+
+    assert executor._cudagraph_teardown_incomplete
+    assert executor.driver_worker is not None
+
+
 class _FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -73,7 +130,7 @@ class _FakeProcess:
     ("timeout", "exits_at", "expected_terminate"),
     [
         pytest.param(6, 5, False, id="worker-exits-before-timeout"),
-        pytest.param(6, 7, True, id="worker-exceeds-timeout"),
+        pytest.param(6, 7, True, id="worker-exits-after-sigterm"),
     ],
 )
 def test_multiproc_executor_worker_termination_timeout(
@@ -87,6 +144,24 @@ def test_multiproc_executor_worker_termination_timeout(
     proc = _FakeProcess(clock, exits_at=exits_at)
     executor._ensure_worker_termination([proc])
     assert proc.terminate_called is expected_terminate
+
+
+def test_multiproc_executor_rocm_default_allows_runtime_finalization(monkeypatch):
+    monkeypatch.delenv("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(
+        multiproc_executor_module.current_platform,
+        "is_rocm",
+        lambda: True,
+    )
+    clock = _FakeClock()
+    monkeypatch.setattr(multiproc_executor_module.time, "time", clock.time)
+    monkeypatch.setattr(multiproc_executor_module.time, "sleep", clock.sleep)
+    executor = MultiprocExecutor.__new__(MultiprocExecutor)
+    proc = _FakeProcess(clock, exits_at=7)
+
+    executor._ensure_worker_termination([proc])
+
+    assert not proc.terminate_called
 
 
 class CustomMultiprocExecutor(MultiprocExecutor):

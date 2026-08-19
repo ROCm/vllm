@@ -6,6 +6,7 @@ import queue
 import signal
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
@@ -21,6 +22,7 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
+from vllm.compilation.cuda_graph import terminal_cudagraph_teardown
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.config.pooler import POOLER_CONFIG_LOG_FIELDS
 from vllm.distributed import (
@@ -43,6 +45,10 @@ from vllm.utils.gc_utils import (
 )
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
+from vllm.utils.shutdown_markers import (
+    emit_shutdown_marker,
+    set_shutdown_marker_context,
+)
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -101,6 +107,122 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _run_shutdown_step(
+    name: str,
+    cleanup: Callable[[], Any],
+) -> Exception | None:
+    """Run one independent terminal cleanup step and detach its traceback."""
+    try:
+        cleanup()
+    except Exception as exc:
+        traceback_text = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        logger.error("[shutdown] EngineCore: %s failed\n%s", name, traceback_text)
+        traceback.clear_frames(exc.__traceback__)
+        # Cleanup often runs while SystemExit or a fatal engine error is active.
+        # The exception context would otherwise retain that active frame and its
+        # EngineCore root through the final collection. The full chain is logged
+        # above before it is detached.
+        exc.__context__ = None
+        exc.__cause__ = None
+        return exc.with_traceback(None)
+    return None
+
+
+def _set_terminal_signal_handlers(handler: Any) -> None:
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, handler)
+
+
+def _shutdown_core_resources(core: "EngineCoreProc") -> None:
+    with terminal_cudagraph_teardown():
+        core.shutdown()
+
+
+def _prepare_engine_core_process_exit(
+    engine_core: "EngineCoreProc | None",
+    signal_callback: SignalCallback | None,
+) -> tuple[bool, Exception | None]:
+    """Stop signal delivery and native resources before root detachment."""
+    # Coalesce repeated process-group/client shutdown signals through resource
+    # teardown. Restoring SIG_DFL earlier would let a second TERM interrupt
+    # graph quiescence and reset.
+    _set_terminal_signal_handlers(signal.SIG_IGN)
+
+    callback_error = None
+    if signal_callback is not None:
+        callback_error = _run_shutdown_step(
+            "signal callback shutdown", signal_callback.stop
+        )
+
+    core_error = None
+    terminal_fallback_required = False
+    if engine_core is not None:
+        core_error = _run_shutdown_step(
+            "local resource teardown",
+            partial(_shutdown_core_resources, engine_core),
+        )
+        terminal_fallback_required = bool(
+            getattr(engine_core, "_cudagraph_teardown_incomplete", False)
+            or getattr(engine_core, "_frontend_teardown_incomplete", False)
+        )
+
+    # Native graph and worker cleanup is complete. Restore normal terminal
+    # signal semantics before the caller detaches roots and collects.
+    _set_terminal_signal_handlers(signal.SIG_DFL)
+    return terminal_fallback_required, callback_error or core_error
+
+
+def _collect_detached_engine_core_heap() -> None:
+    gc_start = time.monotonic()
+    emit_shutdown_marker("gc_collect_begin")
+    try:
+        collected = gc.collect()
+    except Exception as exc:
+        emit_shutdown_marker(
+            "gc_collect_end",
+            duration_ns=int((time.monotonic() - gc_start) * 1e9),
+            error=type(exc).__name__,
+        )
+        raise
+
+    elapsed = time.monotonic() - gc_start
+    emit_shutdown_marker(
+        "gc_collect_end",
+        collected=collected,
+        duration_ns=int(elapsed * 1e9),
+    )
+    logger.info(
+        "[shutdown] EngineCore: final GC collected=%d elapsed=%.3fs",
+        collected,
+        elapsed,
+    )
+
+
+def _freeze_rocm_process_heap() -> None:
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        # Explicit cleanup and final collection have completed. Freeze only
+        # the surviving exit-only heap to avoid another cyclic-GC scan.
+        gc.freeze()
+
+
+def _finalize_engine_core_process_heap(
+    *,
+    freeze_heap: bool,
+    prior_error: Exception | None,
+) -> Exception | None:
+    errors = [prior_error]
+    errors.append(_run_shutdown_step("GC unfreeze", gc.unfreeze))
+    emit_shutdown_marker("engine_root_detached")
+    errors.append(_run_shutdown_step("final GC", _collect_detached_engine_core_heap))
+    if freeze_heap:
+        errors.append(_run_shutdown_step("final GC freeze", _freeze_rocm_process_heap))
+    return next((error for error in errors if error is not None), None)
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -112,6 +234,10 @@ class EngineCore:
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_started = False
+        self._cudagraph_teardown_incomplete = False
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -747,23 +873,80 @@ class EngineCore:
             # More efficient to abort all as a single batch.
             self.abort_requests(request_ids)
 
-    def shutdown(self):
-        logger.debug_once("[shutdown] EngineCore: tearing down local resources")
-        self.structured_output_manager.clear_backend()
-        if self.model_executor:
-            self.model_executor.shutdown()
-        if self.scheduler:
-            self.scheduler.shutdown()
+    def _shutdown_structured_output(self) -> None:
+        manager = getattr(self, "structured_output_manager", None)
+        self.structured_output_manager = None  # type: ignore[assignment]
+        if manager is not None:
+            manager.clear_backend()
 
-        # Undo the gc.freeze() from __init__ so that the objects allocated
-        # during engine startup (model weights, KV caches, etc.) become
-        # visible to the garbage collector again. Without this, deleting
-        # the engine in-process (e.g. unit tests) leaks GPU memory.
-        gc.unfreeze()
-        # Tear down distributed state initialized in this EngineCore process
-        # before it exits and release cached memory.
-        cleanup_dist_env_and_memory()
-        logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
+    def _shutdown_scheduler(self) -> None:
+        scheduler = getattr(self, "scheduler", None)
+        self.scheduler = None  # type: ignore[assignment]
+        if scheduler is not None:
+            scheduler.shutdown()
+
+    def _shutdown_local_resources(self) -> Exception | None:
+        # These resources are independent once request processing has stopped;
+        # a failure in one must not prevent the later resources from closing.
+        steps: list[tuple[str, Callable[[], Any]]] = [
+            ("structured output cleanup", self._shutdown_structured_output),
+            ("model executor shutdown", self._shutdown_model_executor),
+            ("scheduler shutdown", self._shutdown_scheduler),
+            # Undo the freeze performed during initialization before releasing
+            # process-wide distributed state and cached device memory.
+            ("GC unfreeze", gc.unfreeze),
+        ]
+        errors: list[Exception | None] = []
+        for name, cleanup in steps:
+            errors.append(_run_shutdown_step(name, cleanup))
+
+        # Destroying the process group can invalidate native dependencies
+        # retained by the terminal CUDA-graph fallback. Leave distributed
+        # state intact for process exit when graph reset was incomplete.
+        if not self._cudagraph_teardown_incomplete:
+            errors.append(
+                _run_shutdown_step("distributed cleanup", cleanup_dist_env_and_memory)
+            )
+        return next((error for error in errors if error is not None), None)
+
+    def shutdown(self) -> None:
+        with self._shutdown_lock:
+            if self._shutdown_started:
+                return
+            self._shutdown_started = True
+
+            logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+            error = self._shutdown_local_resources()
+            logger.debug_once("[shutdown] EngineCore: local resource teardown complete")
+
+            if error is not None:
+                raise error from None
+
+    def _shutdown_model_executor(self) -> None:
+        """Shut down only the executor, retaining incomplete graph state."""
+        model_executor = getattr(self, "model_executor", None)
+        if model_executor is None:
+            return
+
+        try:
+            model_executor.shutdown()
+        finally:
+            self._cudagraph_teardown_incomplete = bool(
+                getattr(
+                    model_executor,
+                    "_cudagraph_teardown_incomplete",
+                    False,
+                )
+            )
+            if self._cudagraph_teardown_incomplete:
+                self.model_executor = cast(Executor, model_executor)
+            else:
+                self.model_executor = None  # type: ignore[assignment]
+
+        if self._cudagraph_teardown_incomplete:
+            raise RuntimeError(
+                "CUDA graph teardown was incomplete; distributed cleanup was withheld"
+            )
 
     def profile(self, is_start: bool = True, profile_prefix: str | None = None):
         self.model_executor.profile(is_start, profile_prefix)
@@ -1008,6 +1191,9 @@ class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
+    _ENGINE_CORE_STOP = b"ENGINE_CORE_STOP"
+    _IO_POLL_TIMEOUT_MS = 100
+    _IO_THREAD_JOIN_TIMEOUT_S = 5.0
     addresses: EngineZmqAddresses
 
     @instrument(span_name="EngineCoreProc init")
@@ -1025,6 +1211,14 @@ class EngineCoreProc(EngineCore):
     ):
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        self._io_shutdown_event = threading.Event()
+        self._io_shutdown_lock = threading.Lock()
+        self._io_shutdown_complete = False
+        self._frontend_teardown_incomplete = False
+        self.input_thread: threading.Thread | None = None
+        self.output_thread: threading.Thread | None = None
+        self.shutdown_state = EngineShutdownState.RUNNING
+        self.tensor_ipc_receiver: TensorIpcReceiver | None = None
         executor_fail_callback = lambda: self.input_queue.put_nowait(
             (EngineCoreRequestType.EXECUTOR_FAILED, b"")
         )
@@ -1032,10 +1226,8 @@ class EngineCoreProc(EngineCore):
         self.engine_index = engine_index
         identity = self.engine_index.to_bytes(length=2, byteorder="little")
         self.engines_running = False
-        self.shutdown_state = EngineShutdownState.RUNNING
 
         # Receiver for tensor IPC
-        self.tensor_ipc_receiver: TensorIpcReceiver | None = None
         if tensor_queue is not None:
             self.tensor_ipc_receiver = TensorIpcReceiver(tensor_queue)
             logger.info("Using tensor IPC queue for multimodal tensor sharing")
@@ -1094,7 +1286,7 @@ class EngineCoreProc(EngineCore):
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
             ready_event = threading.Event()
-            input_thread = threading.Thread(
+            self.input_thread = threading.Thread(
                 target=self.process_input_sockets,
                 args=(
                     addresses.inputs,
@@ -1104,7 +1296,7 @@ class EngineCoreProc(EngineCore):
                 ),
                 daemon=True,
             )
-            input_thread.start()
+            self.input_thread.start()
 
             self.output_thread = threading.Thread(
                 target=self.process_output_sockets,
@@ -1120,10 +1312,76 @@ class EngineCoreProc(EngineCore):
             # Don't complete handshake until DP coordinator ready message is
             # received.
             while not ready_event.wait(timeout=10):
-                if not input_thread.is_alive():
+                input_thread = self.input_thread
+                if input_thread is None or not input_thread.is_alive():
                     raise RuntimeError("Input socket thread died during startup")
-                assert addresses.coordinator_input is not None
-                logger.info("Waiting for READY message from DP Coordinator...")
+                if addresses.coordinator_input is None:
+                    logger.info("Waiting for input socket thread startup...")
+                else:
+                    logger.info("Waiting for READY message from DP Coordinator...")
+
+    def _shutdown_io_threads(self) -> None:
+        with self._io_shutdown_lock:
+            if self._io_shutdown_complete:
+                return
+
+            self._io_shutdown_event.set()
+            alive_threads: list[str] = []
+            deadline = time.monotonic() + self._IO_THREAD_JOIN_TIMEOUT_S
+
+            output_thread = getattr(self, "output_thread", None)
+            if output_thread is not None and output_thread.is_alive():
+                # Wake output promptly, before the input thread consumes the
+                # shared join deadline.
+                self.output_queue.put_nowait(self._ENGINE_CORE_STOP)
+
+            input_thread = getattr(self, "input_thread", None)
+            if (
+                input_thread is not None
+                and input_thread is not threading.current_thread()
+            ):
+                if input_thread.is_alive():
+                    input_thread.join(max(0.0, deadline - time.monotonic()))
+                if input_thread.is_alive():
+                    alive_threads.append(input_thread.name)
+                else:
+                    self.input_thread = None  # type: ignore[assignment]
+
+            if (
+                output_thread is not None
+                and output_thread is not threading.current_thread()
+            ):
+                if output_thread.is_alive():
+                    output_thread.join(max(0.0, deadline - time.monotonic()))
+                if output_thread.is_alive():
+                    alive_threads.append(output_thread.name)
+                else:
+                    self.output_thread = None  # type: ignore[assignment]
+
+            if alive_threads:
+                names = ", ".join(alive_threads)
+                raise RuntimeError(f"EngineCore I/O threads failed to stop: {names}")
+            self._io_shutdown_complete = True
+
+    def _shutdown_executor_after_io_failure(self) -> None:
+        # A live input thread may still use scheduler and structured-output
+        # state, but it cannot execute the model once the busy loop has exited.
+        with self._shutdown_lock:
+            self._shutdown_model_executor()
+
+    def shutdown(self) -> None:
+        io_error = _run_shutdown_step("I/O thread shutdown", self._shutdown_io_threads)
+        if io_error is None:
+            self._frontend_teardown_incomplete = False
+            super().shutdown()
+            return
+
+        self._frontend_teardown_incomplete = True
+        _run_shutdown_step(
+            "model executor shutdown during I/O fallback",
+            self._shutdown_executor_after_io_failure,
+        )
+        raise io_error from None
 
     @contextmanager
     def _perform_handshakes(
@@ -1276,9 +1534,30 @@ class EngineCoreProc(EngineCore):
 
         engine_core: EngineCoreProc | None = None
         signal_callback: SignalCallback | None = None
+        wakeup_engine: Callable[[], None] | None = None
+        clean_shutdown = False
+        preserve_active_error = False
+
+        def signal_handler(signum: int, _frame: Any) -> None:
+            signal_name = signal.Signals(signum).name
+            emit_shutdown_marker("signal_received", signal=signal_name)
+            logger.info(
+                "[shutdown] EngineCore: trigger received signal=%s",
+                signal_name,
+            )
+            if engine_core is not None:
+                engine_core.shutdown_state = EngineShutdownState.REQUESTED
+            if signal_callback is not None:
+                signal_callback.trigger()
+
         try:
             vllm_config: VllmConfig = kwargs["vllm_config"]
             parallel_config: ParallelConfig = vllm_config.parallel_config
+            set_shutdown_marker_context(
+                dp_rank=dp_rank,
+                dp_local_rank=local_dp_rank,
+                process_role="engine_core",
+            )
             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
             if data_parallel:
                 parallel_config.data_parallel_rank_local = local_dp_rank
@@ -1314,47 +1593,74 @@ class EngineCoreProc(EngineCore):
                 parallel_config.reconfigure_for_independent_dp_rank()
                 engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
 
-            assert engine_core is not None
-
             def wakeup_engine():
                 # Wakes up idle engine via input_queue when shutdown is requested
                 # Not safe in a signal handler - we may interrupt the main thread
                 # while it is holding the non-reentrant input_queue.mutex
-                engine_core.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
+                if engine_core is not None:
+                    engine_core.input_queue.put_nowait(
+                        (EngineCoreRequestType.WAKEUP, None)
+                    )
 
             signal_callback = SignalCallback(wakeup_engine)
-
-            def signal_handler(signum, frame):
-                signal_name = signal.Signals(signum).name
-                logger.info(
-                    "[shutdown] EngineCore: trigger received signal=%s",
-                    signal_name,
-                )
-                engine_core.shutdown_state = EngineShutdownState.REQUESTED
-                signal_callback.trigger()
-
             signal.signal(signal.SIGTERM, signal_handler)
             signal.signal(signal.SIGINT, signal_handler)
 
             engine_core.run_busy_loop()
 
-        except SystemExit:
+        except SystemExit as exc:
             logger.info_once("[shutdown] EngineCore: exiting busy loop")
+            preserve_active_error = exc.code not in (None, 0)
+            has_work = engine_core.has_work() if engine_core is not None else True
+            clean_shutdown = (
+                exc.code in (None, 0)
+                and engine_core is not None
+                and getattr(engine_core, "shutdown_state", None)
+                == EngineShutdownState.SHUTTING_DOWN
+                and not has_work
+            )
+            emit_shutdown_marker(
+                "work_quiesced",
+                clean=clean_shutdown,
+                has_work=has_work,
+            )
+            # Completed busy-loop frames retain ``self`` through this active
+            # exception until it is re-raised after the finally block.
+            traceback.clear_frames(exc.__traceback__)
             raise
         except Exception as e:
+            preserve_active_error = True
             if engine_core is None:
-                logger.exception("EngineCore failed to start.")
+                message = "EngineCore failed to start."
             else:
-                logger.exception("EngineCore encountered a fatal error.")
+                message = "EngineCore encountered a fatal error."
                 engine_core._send_engine_dead()
-            raise e
+            # Drop completed busy-loop/constructor frames before the final GC;
+            # they otherwise retain a partially initialized EngineCore graph.
+            traceback_text = "".join(
+                traceback.format_exception(type(e), e, e.__traceback__)
+            )
+            if e.__traceback__ is not None:
+                traceback.clear_frames(e.__traceback__)
+            logger.error("%s\n%s", message, traceback_text)
+            raise e.with_traceback(None) from None
         finally:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            if signal_callback is not None:
-                signal_callback.stop()
-            if engine_core is not None:
-                engine_core.shutdown()
+            terminal_fallback_required, cleanup_error = (
+                _prepare_engine_core_process_exit(engine_core, signal_callback)
+            )
+
+            # Sever the local references and the signal-handler closure cells
+            # before entering the final collection helper.
+            engine_core = None
+            signal_callback = None
+            wakeup_engine = None
+            cleanup_error = _finalize_engine_core_process_heap(
+                freeze_heap=clean_shutdown or terminal_fallback_required,
+                prior_error=cleanup_error,
+            )
+
+            if cleanup_error is not None and not preserve_active_error:
+                raise cleanup_error from None
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
@@ -1606,8 +1912,15 @@ class EngineCoreProc(EngineCore):
         self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)
 
         # Wait until msg sent by the daemon before shutdown.
-        self.output_thread.join(timeout=5.0)
-        if self.output_thread.is_alive():
+        output_thread = getattr(self, "output_thread", None)
+        if output_thread is None:
+            logger.fatal(
+                "vLLM shutdown signal from EngineCore could not be sent "
+                "because the output thread is unavailable."
+            )
+            return
+        output_thread.join(timeout=5.0)
+        if output_thread.is_alive():
             logger.fatal(
                 "vLLM shutdown signal from EngineCore failed "
                 "to send. Please report this issue."
@@ -1673,7 +1986,12 @@ class EngineCoreProc(EngineCore):
             input_sockets = [
                 stack.enter_context(
                     make_zmq_socket(
-                        ctx, input_address, zmq.DEALER, identity=identity, bind=False
+                        ctx,
+                        input_address,
+                        zmq.DEALER,
+                        identity=identity,
+                        bind=False,
+                        linger=0,
                     )
                 )
                 for input_address in input_addresses
@@ -1688,6 +2006,7 @@ class EngineCoreProc(EngineCore):
                         zmq.XSUB,
                         identity=identity,
                         bind=False,
+                        linger=0,
                     )
                 )
                 # Send subscription message to coordinator.
@@ -1706,13 +2025,23 @@ class EngineCoreProc(EngineCore):
 
             if coord_socket is not None:
                 # Wait for ready message from coordinator.
-                assert coord_socket.recv() == b"READY"
+                while not self._io_shutdown_event.is_set():
+                    if coord_socket.poll(self._IO_POLL_TIMEOUT_MS):
+                        if coord_socket.recv() != b"READY":
+                            raise RuntimeError(
+                                "Unexpected DP coordinator startup message"
+                            )
+                        break
+                if self._io_shutdown_event.is_set():
+                    return
                 poller.register(coord_socket, zmq.POLLIN)
 
             ready_event.set()
             del ready_event
-            while True:
-                for input_socket, _ in poller.poll():
+            while not self._io_shutdown_event.is_set():
+                for input_socket, _ in poller.poll(self._IO_POLL_TIMEOUT_MS):
+                    if self._io_shutdown_event.is_set():
+                        break
                     # (RequestType, RequestData)
                     type_frame, *data_frames = input_socket.recv_multipart(copy=False)
                     # NOTE(yongji): ignore READY message sent by DP coordinator
@@ -1794,6 +2123,8 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
+                if output == EngineCoreProc._ENGINE_CORE_STOP:
+                    break
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
@@ -2033,10 +2364,23 @@ class DPEngineCoreProc(EngineCoreProc):
         dp_group, dp_store = parallel_config.stateless_init_dp_group(return_store=True)
         self.dp_group, self.dp_store = dp_group, dp_store
 
-    def shutdown(self):
-        super().shutdown()
-        if dp_group := getattr(self, "dp_group", None):
+    def _shutdown_dp_group(self) -> None:
+        dp_group = getattr(self, "dp_group", None)
+        if dp_group is not None:
+            del self.dp_group
+            # The stateless coordinator group is Gloo-only, so it is not a
+            # native device dependency of retained CUDA graphs.
             stateless_destroy_torch_distributed_process_group(dp_group)
+
+    def shutdown(self) -> None:
+        engine_error = _run_shutdown_step(
+            "local resource teardown",
+            super().shutdown,
+        )
+        dp_error = _run_shutdown_step("DP group shutdown", self._shutdown_dp_group)
+        error = engine_error or dp_error
+        if error is not None:
+            raise error from None
 
     def _pause_complete(self) -> bool:
         """Two-phase DP-aware pause.
@@ -2335,7 +2679,8 @@ class DPEngineCoreProc(EngineCoreProc):
         )
         outputs.engine_index = self.engine_index
 
-        if hasattr(self, "output_thread") and self.output_thread.is_alive():
+        output_thread = getattr(self, "output_thread", None)
+        if output_thread is not None and output_thread.is_alive():
             self.output_queue.put_nowait((0, outputs))
         else:
             encoder = MsgpackEncoder()

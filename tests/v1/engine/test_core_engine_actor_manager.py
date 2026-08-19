@@ -16,9 +16,10 @@ import zmq
 
 from vllm.utils.network_utils import make_zmq_socket, split_zmq_path
 from vllm.v1.engine.core import EngineCoreActorMixin
-from vllm.v1.engine.core_client import BackgroundResources
+from vllm.v1.engine.core_client import BackgroundResources, MPClient
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
+    CoreEngineProcManager,
     EngineZmqAddresses,
     get_engine_zmq_addresses,
     launch_core_engines,
@@ -110,6 +111,41 @@ def test_background_resources_passes_worker_shutdown_timeout(
     resources = BackgroundResources(ctx=None, engine_manager=engine_manager)
     resources()
     engine_manager.shutdown.assert_called_once_with(timeout=timeout)
+
+
+def test_mp_client_releases_frontend_after_unclean_engine_shutdown() -> None:
+    calls: list[object] = []
+
+    class Finalizer:
+        def detach(self):
+            calls.append("detach")
+            return object()
+
+    class EngineManager(CoreEngineProcManager):
+        def shutdown(self, *, timeout, raise_on_failure):
+            calls.append(("manager", timeout, raise_on_failure))
+            raise RuntimeError("worker cleanup failed")
+
+    manager = object.__new__(EngineManager)
+
+    class Resources:
+        engine_manager = manager
+
+        def __call__(self):
+            calls.append("resources")
+
+    client = object.__new__(MPClient)
+    client._finalizer = Finalizer()  # type: ignore[assignment]
+    client.resources = Resources()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="worker cleanup failed"):
+        client.shutdown(timeout=0)
+
+    assert calls == [
+        "detach",
+        ("manager", 0, True),
+        "resources",
+    ]
 
 
 def _make_vllm_config() -> SimpleNamespace:

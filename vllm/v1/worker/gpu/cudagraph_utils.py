@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from itertools import product
 from typing import Any, NamedTuple, Protocol
@@ -15,6 +16,14 @@ from vllm.compilation.breakable_cudagraph import (
     is_breakable_cudagraph_enabled,
 )
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation.cuda_graph import (
+    OwnedCUDAGraph,
+    begin_cudagraph_owner_teardown,
+    create_cudagraph,
+    cudagraph_capture_attempt,
+    cudagraph_owner_activity,
+    register_cudagraph_owner,
+)
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
@@ -141,8 +150,31 @@ class CudaGraphManager:
             and self.cudagraph_mode.has_piecewise_cudagraphs()
         )
         self.breakable_cg_runner: BreakableCUDAGraphWrapper | None = None
+        self._cudagraph_teardown_started = False
+        self._cudagraph_active_calls = 0
+        self._cudagraph_activity_condition = threading.Condition()
 
         self._init_candidates()
+        self._cudagraph_activity_enabled = register_cudagraph_owner(self, vllm_config)
+
+    def begin_cudagraph_teardown(self) -> None:
+        begin_cudagraph_owner_teardown(self)
+        if (runner := getattr(self, "breakable_cg_runner", None)) is not None:
+            runner.begin_cudagraph_teardown()
+
+    def iter_cudagraphs(self) -> Iterable[OwnedCUDAGraph]:
+        for graph in getattr(self, "graphs", {}).values():
+            yield OwnedCUDAGraph(graph, self.device)
+        if (runner := getattr(self, "breakable_cg_runner", None)) is not None:
+            yield from runner.iter_cudagraphs()
+
+    def clear_cudagraph_state(self) -> None:
+        if hasattr(self, "graphs"):
+            self.graphs.clear()
+        self._graphs_captured = False
+        if (runner := getattr(self, "breakable_cg_runner", None)) is not None:
+            runner.clear_cudagraph_state()
+            self.breakable_cg_runner = None
 
     def _build_lora_dispatch_map(self) -> tuple[dict[int, int], int]:
         """Precompute actual num_active_loras -> effective captured case.
@@ -304,6 +336,7 @@ class CudaGraphManager:
         return len(self._capture_descs) > 0
 
     @torch.inference_mode()
+    @cudagraph_owner_activity
     def capture(
         self,
         create_forward_fn: CreateForwardFn,
@@ -318,6 +351,8 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
+        if getattr(self, "_cudagraph_teardown_started", False):
+            raise RuntimeError("CUDA graph owner is closed")
         with graph_capture(device=self.device):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
@@ -354,7 +389,18 @@ class CudaGraphManager:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
-                        graph = torch.cuda.CUDAGraph()
+
+                        def install_graph(
+                            graph: torch.cuda.CUDAGraph,
+                            desc: BatchExecutionDescriptor = desc,
+                        ) -> None:
+                            self.graphs[desc] = graph
+
+                        graph = create_cudagraph(
+                            self,
+                            self.device,
+                            install_graph,
+                        )
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
@@ -362,14 +408,16 @@ class CudaGraphManager:
                             set_graph_pool_id(self.pool)
                         else:
                             set_graph_pool_id(current_platform.graph_pool_handle())
-                        with torch.cuda.graph(graph, self.pool):
+                        with (
+                            cudagraph_capture_attempt(self),
+                            torch.cuda.graph(graph, self.pool),
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
                             # forks copy_stream, but wait_prefetch only happens in
                             # the next forward pass.
                             get_offloader().join_after_forward()
-                        self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True
 
@@ -409,8 +457,11 @@ class CudaGraphManager:
             num_active_loras=effective_loras,
         )
 
+    @cudagraph_owner_activity
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""
+        if getattr(self, "_cudagraph_teardown_started", False):
+            raise RuntimeError("CUDA graph owner is closed")
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
         )
@@ -424,13 +475,19 @@ class CudaGraphManager:
         get_offloader().sync_prev_onload()
         self.graphs[desc].replay()
 
+    @cudagraph_owner_activity
     def init_breakable_cg_runner(self, model: nn.Module) -> None:
+        if getattr(self, "_cudagraph_teardown_started", False):
+            raise RuntimeError("CUDA graph owner is closed")
         if self.breakable_cg_runner is None:
             self.breakable_cg_runner = BreakableCUDAGraphWrapper(
                 model, self.vllm_config
             )
 
+    @cudagraph_owner_activity
     def run_pw_graph(self, model: nn.Module, model_inputs: dict[str, Any]) -> Any:
+        if getattr(self, "_cudagraph_teardown_started", False):
+            raise RuntimeError("CUDA graph owner is closed")
         if not self.use_breakable_cg:
             # Default: Use torch-compiled piecewise cudagraph.
             return model(**model_inputs)
@@ -463,6 +520,14 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
 
+    def clear_cudagraph_state(self) -> None:
+        super().clear_cudagraph_state()
+        self.hidden_states = None
+        if hasattr(self, "aux_hidden_states"):
+            self.aux_hidden_states.clear()
+        self.intermediate_tensors = None
+
+    @cudagraph_owner_activity
     def capture(
         self,
         model: nn.Module,
@@ -587,6 +652,7 @@ class ModelCudaGraphManager(CudaGraphManager):
 
         super().capture(create_forward_fn, progress_bar_desc)
 
+    @cudagraph_owner_activity
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:

@@ -51,6 +51,7 @@ class AsyncOutputFuture(Future):
 class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
+        self._cudagraph_teardown_incomplete = False
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
         distributed_init_method, rank, local_rank = self._distributed_args()
         kwargs = dict(
@@ -149,9 +150,31 @@ class UniProcExecutor(Executor):
         # it's running.
         return
 
+    def _finish_worker_shutdown(self, worker_wrapper: WorkerWrapperBase) -> None:
+        """Release the wrapper unless its worker asked to retain graph state."""
+        actual_worker = getattr(worker_wrapper, "worker", None)
+        self._cudagraph_teardown_incomplete = bool(
+            getattr(actual_worker, "_cudagraph_teardown_incomplete", False)
+        )
+        if not self._cudagraph_teardown_incomplete:
+            self.driver_worker = None  # type: ignore[assignment]
+
     def shutdown(self) -> None:
-        if worker := self.driver_worker:
-            worker.shutdown()
+        worker_wrapper = getattr(self, "driver_worker", None)
+        if worker_wrapper is None:
+            return
+
+        # Snapshot the worker's teardown result even when shutdown raises. This
+        # decides whether it is safe to drop the last executor-owned reference.
+        try:
+            worker_wrapper.shutdown()
+        finally:
+            self._finish_worker_shutdown(worker_wrapper)
+
+        if self._cudagraph_teardown_incomplete:
+            raise RuntimeError(
+                "CUDA graph teardown was incomplete; preserving worker state"
+            )
 
     @classmethod
     def supports_async_scheduling(cls) -> bool:

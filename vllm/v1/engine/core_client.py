@@ -682,18 +682,38 @@ class MPClient(EngineCoreClient):
             if not success:
                 self._finalizer()
 
+    def _shutdown_engine_manager(self, timeout: float | None) -> None:
+        """Stop child engines and always close the frontend's own resources."""
+        engine_manager = self.resources.engine_manager
+        assert engine_manager is not None
+
+        # Child failure is reported to the caller, but it must not leave ZMQ
+        # sockets and background tasks owned by this frontend alive.
+        try:
+            if isinstance(engine_manager, CoreEngineProcManager):
+                engine_manager.shutdown(timeout=timeout, raise_on_failure=True)
+            else:
+                # Ray actors retain their existing shutdown contract;
+                # deterministic worker teardown is a separate follow-up.
+                engine_manager.shutdown(timeout=timeout)
+        finally:
+            self.resources()
+
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown engine manager under timeout and clean up resources."""
-        if self._finalizer.detach() is not None:
-            timeout_str = "default" if timeout is None else f"{timeout}s"
-            logger.info("[shutdown] MPClient: start timeout=%s", timeout_str)
-            if self.resources.engine_manager is not None:
-                logger.info_once("[shutdown] MPClient: stopping engine manager")
-                self.resources.engine_manager.shutdown(timeout=timeout)
-                logger.info_once("[shutdown] MPClient: engine manager stopped")
+        if self._finalizer.detach() is None:
+            return
+
+        timeout_str = "default" if timeout is None else f"{timeout}s"
+        logger.info("[shutdown] MPClient: start timeout=%s", timeout_str)
+        if self.resources.engine_manager is not None:
+            logger.info_once("[shutdown] MPClient: stopping engine manager")
+            self._shutdown_engine_manager(timeout)
+            logger.info_once("[shutdown] MPClient: engine manager stopped")
+        else:
             logger.info_once("[shutdown] MPClient: cleaning up background resources")
             self.resources()
-            logger.info_once("[shutdown] MPClient: complete")
+        logger.info_once("[shutdown] MPClient: complete")
 
     def _format_exception(self, e: Exception) -> Exception:
         """If errored, use EngineDeadError so root cause is clear."""

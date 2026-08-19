@@ -39,6 +39,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Request draining and process cleanup are separate phases. This 15-second
+# parent bound consists of the validated eight-second ROCm worker-exit window,
+# four seconds for child SIGTERM escalation, and three seconds for final
+# EngineCore root collection or parent intervention. It is a defensive bound,
+# not a latency target, and remains available when request draining is disabled.
+_ENGINE_CORE_RESOURCE_CLEANUP_GRACE_SECONDS = 15
+
 STARTUP_POLL_PERIOD_MS = 10000
 
 
@@ -170,7 +177,12 @@ class CoreEngineProcManager:
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self._finalizer = weakref.finalize(
+            self,
+            shutdown,
+            self.processes,
+            _ENGINE_CORE_RESOURCE_CLEANUP_GRACE_SECONDS,
+        )
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
@@ -213,11 +225,25 @@ class CoreEngineProcManager:
             if self.finished_procs():
                 self.shutdown()
 
-    def shutdown(self, timeout: float | None = None) -> None:
-        """Shutdown engine core processes with configurable timeout."""
+    def shutdown(
+        self,
+        timeout: float | None = None,
+        *,
+        raise_on_failure: bool = False,
+    ) -> None:
+        """Stop EngineCore processes after drain plus resource-cleanup grace.
+
+        ``timeout`` is the request-drain budget exposed by the engine config;
+        it is deliberately separate from the fixed child cleanup allowance.
+        """
         self.manager_stopped.set()
         if self._finalizer.detach() is not None:
-            shutdown(self.processes, timeout=timeout)
+            drain_timeout = 0.0 if timeout is None else max(0.0, timeout)
+            shutdown(
+                self.processes,
+                timeout=(drain_timeout + _ENGINE_CORE_RESOURCE_CLEANUP_GRACE_SECONDS),
+                raise_on_failure=raise_on_failure,
+            )
 
     def monitor_engine_liveness(self) -> None:
         """Monitor engine core process liveness."""
@@ -253,10 +279,13 @@ class CoreEngineProcManager:
 class SignalCallback:
     """Safely trigger a callback from signal handler context via a dedicated thread."""
 
+    _JOIN_TIMEOUT_S = 5.0
+
     def __init__(self, callback: Callable[[], None]):
-        self._callback = callback
+        self._callback: Callable[[], None] | None = callback
         self._event = threading.Event()
         self._stopped = False
+        self._stop_lock = threading.Lock()
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -266,15 +295,26 @@ class SignalCallback:
 
     def _run(self):
         self._event.wait()
-        if not self._stopped:
-            self._callback()
+        callback = self._callback
+        if not self._stopped and callback is not None:
+            callback()
 
     def trigger(self):
         self._event.set()
 
     def stop(self):
-        self._stopped = True
-        self._event.set()
+        with self._stop_lock:
+            self._stopped = True
+            self._event.set()
+
+        if self._thread is not threading.current_thread():
+            self._thread.join(self._JOIN_TIMEOUT_S)
+
+        with self._stop_lock:
+            self._callback = None
+
+        if self._thread.is_alive():
+            raise RuntimeError("Signal callback thread failed to stop")
 
 
 def set_assigned_physical_gpu_ids_for_dp_rank(

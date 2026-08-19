@@ -20,7 +20,8 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
+from dataclasses import fields, replace
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -29,6 +30,11 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
+from vllm.compilation.cuda_graph import (
+    CUDAGraphOwnerRegistry,
+    CUDAGraphTeardownStats,
+    retain_cudagraph_dependency_for_terminal_exit,
+)
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
@@ -58,6 +64,7 @@ from vllm.multimodal.encoder_budget import (
     MultiModalBudget,
     get_dummy_encoder_profile_inputs,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
@@ -156,8 +163,56 @@ from vllm.v1.worker.workspace import use_workspace_lane
 logger = init_logger(__name__)
 
 
+def _log_cudagraph_teardown_stats(stats: CUDAGraphTeardownStats) -> None:
+    logger.info(
+        "ROCm CUDA graph teardown: graphs=%d, owners=%s, "
+        "enumeration=%.3f ms, reset=%.3f ms, clear=%.3f ms, "
+        "total=%.3f ms, failures=%d",
+        stats.graph_count,
+        stats.owner_graph_counts,
+        stats.enumeration_duration_s * 1000,
+        stats.reset_duration_s * 1000,
+        stats.clear_duration_s * 1000,
+        stats.total_duration_s * 1000,
+        len(stats.failures),
+    )
+    for index, failure in enumerate(stats.failures, start=1):
+        logger.error(
+            "ROCm CUDA graph teardown failure %d/%d: phase=%s, owner=%s\n%s",
+            index,
+            len(stats.failures),
+            failure.phase,
+            failure.owner,
+            failure.traceback_text.rstrip(),
+        )
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # The registry token lives on CompilationConfig. A VllmConfig can be
+        # reused by multiple in-process runners, so keep that mutable routing
+        # state private while sharing the substantive nested configuration.
+        source_compilation_config = vllm_config.compilation_config
+        vllm_config = copy(vllm_config)
+        vllm_config.compilation_config = replace(source_compilation_config)
+        # Model construction helpers may populate init=False runtime containers
+        # before runner construction, so preserve them for a pristine caller
+        # config while giving each runner independent containers. A config that
+        # already carries a registry token came from another runner (or across a
+        # process boundary); its loaded-model runtime state must not be reused.
+        if not hasattr(source_compilation_config, "_cudagraph_owner_registry_token"):
+            for config_field in fields(source_compilation_config):
+                if not config_field.init:
+                    setattr(
+                        vllm_config.compilation_config,
+                        config_field.name,
+                        copy(getattr(source_compilation_config, config_field.name)),
+                    )
+        self.cudagraph_owner_registry = CUDAGraphOwnerRegistry(
+            vllm_config,
+            strong_ownership=current_platform.is_rocm(),
+        )
+        self._cudagraph_teardown_incomplete = False
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -1920,7 +1975,67 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
-        torch.accelerator.synchronize()
+        is_rocm = current_platform.is_rocm()
+        teardown_stats = None
+        if is_rocm:
+            teardown_stats = self._shutdown_rocm_cudagraphs()
+        else:
+            # Keep the established non-ROCm fail-fast behavior.
+            torch.accelerator.synchronize()
+        self._release_model_state(shutdown_speculator=is_rocm)
+
+        # Safe graph-reset failures are reported after dependent state follows
+        # its normal cleanup path. Cleanup failures propagate directly; the
+        # graph-reset failure has already been logged with its traceback.
+        if teardown_stats is not None:
+            teardown_stats.raise_if_failed()
+
+    def _shutdown_rocm_cudagraphs(self) -> CUDAGraphTeardownStats:
+        """Reset graphs while all of their dependent runner state is alive."""
+        self._cudagraph_teardown_incomplete = True
+        try:
+            torch.accelerator.synchronize()
+        except Exception:
+            logger.exception(
+                "ROCm synchronization failed before CUDA graph teardown; "
+                "attempting to retain graph-dependent runner state"
+            )
+            retain_cudagraph_dependency_for_terminal_exit(self)
+            raise
+
+        try:
+            teardown_stats = self.cudagraph_owner_registry.teardown(
+                post_reset_sync=True
+            )
+        except Exception:
+            # The registry closes itself and retains graph owners when its
+            # coordinator fails. Retain the runner-owned buffers as well.
+            logger.exception(
+                "ROCm CUDA graph teardown failed unexpectedly; attempting "
+                "to retain graph-dependent runner state"
+            )
+            self.cudagraph_owner_registry.retain_fallback_dependency(self)
+            raise
+
+        _log_cudagraph_teardown_stats(teardown_stats)
+        if teardown_stats.fallback_required:
+            self.cudagraph_owner_registry.retain_fallback_dependency(self)
+            logger.error(
+                "ROCm CUDA graph teardown was incomplete; retaining "
+                "graph-dependent runner state"
+            )
+            teardown_stats.raise_if_failed()
+            raise RuntimeError("ROCm CUDA graph teardown was incomplete")
+
+        self._cudagraph_teardown_incomplete = False
+        return teardown_stats
+
+    def _release_model_state(self, *, shutdown_speculator: bool) -> None:
+        if shutdown_speculator:
+            speculator = getattr(self, "speculator", None)
+            if speculator is not None:
+                speculator.shutdown()
+
         self.cudagraph_manager = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()

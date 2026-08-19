@@ -429,6 +429,10 @@ def _make_manager_for_gpu(
     mgr.graph_hits = 0
     mgr.graph_misses = 0
     mgr.log_stats_interval = 100
+    # This fixture bypasses __init__, so declare the manager as an explicit
+    # manual owner just like the temporary profiling manager.
+    mgr._cudagraph_manual_owner = True
+    mgr._cudagraph_activity_enabled = True
     mgr.model = model
     mgr.config = model.get_encoder_cudagraph_config()
     mgr.device = device

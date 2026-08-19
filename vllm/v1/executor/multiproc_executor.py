@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
 import multiprocessing
 import os
 import pickle
@@ -26,6 +27,7 @@ import cloudpickle
 import torch
 
 import vllm.envs as envs
+from vllm.compilation.cuda_graph import terminal_cudagraph_teardown
 from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
@@ -55,6 +57,7 @@ from vllm.utils.network_utils import (
     get_open_port,
 )
 from vllm.utils.ompmultiprocessing import OMPProcessManager
+from vllm.utils.shutdown_markers import set_shutdown_marker_context
 from vllm.utils.system_utils import (
     _maybe_force_spawn,
     decorate_logs,
@@ -73,6 +76,60 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOu
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
+
+# Repeated TP=2 MI300 shutdown runs showed that HIP process finalization can
+# finish after the generic worker timeout. Three additional seconds covered
+# those clean exits while retaining time for parent escalation. This allowance
+# is only used for ROCm's default; VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS remains
+# authoritative when the user sets it.
+_ROCM_RUNTIME_FINALIZATION_ALLOWANCE_SECONDS = 3
+_WORKER_SIGTERM_GRACE_SECONDS = 4
+_WORKER_SIGKILL_GRACE_SECONDS = 4
+_ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_SECONDS = 5
+
+
+def _worker_shutdown_timeout_seconds() -> int:
+    timeout = envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+    if current_platform.is_rocm() and not envs.is_set(
+        "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS"
+    ):
+        timeout += _ROCM_RUNTIME_FINALIZATION_ALLOWANCE_SECONDS
+    return timeout
+
+
+class _ShutdownErrors:
+    """Run independent terminal cleanup steps and retain the first failure."""
+
+    def __init__(self, component: str) -> None:
+        self.component = component
+        self.first: Exception | None = None
+
+    def run(self, name: str, cleanup: Callable[[], Any]) -> bool:
+        try:
+            cleanup()
+        except Exception as exc:
+            # Terminal cleanup must continue for independent resources. Log
+            # every failed step, but report the first failure to the parent.
+            traceback_text = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+            logger.error(
+                "[shutdown] %s: %s failed\n%s",
+                self.component,
+                name,
+                traceback_text,
+            )
+            if self.first is None:
+                traceback.clear_frames(exc.__traceback__)
+                exc.__context__ = None
+                exc.__cause__ = None
+                self.first = exc.with_traceback(None)
+            return False
+        return True
+
+    def raise_first(self) -> None:
+        if self.first is not None:
+            raise self.first from None
 
 
 class FutureWrapper(Future):
@@ -261,7 +318,10 @@ class MultiprocExecutor(Executor):
                     if uw.death_writer is not None:
                         uw.death_writer.close()
                         uw.death_writer = None
-                self._ensure_worker_termination([uw.proc for uw in unready_workers])
+                self._ensure_worker_termination(
+                    [uw.proc for uw in unready_workers],
+                    raise_on_failure=False,
+                )
 
         self.output_rank = self._get_output_rank()
 
@@ -448,7 +508,11 @@ class MultiprocExecutor(Executor):
         return future if non_block else future.result()
 
     @staticmethod
-    def _ensure_worker_termination(worker_procs: list[BaseProcess]):
+    def _ensure_worker_termination(
+        worker_procs: list[BaseProcess],
+        *,
+        raise_on_failure: bool = True,
+    ) -> None:
         """Ensure that all worker processes are terminated. Assumes workers have
         received termination requests. Waits for processing, then sends
         termination and kill signals if needed."""
@@ -465,7 +529,22 @@ class MultiprocExecutor(Executor):
                 time.sleep(0.1)
             return False
 
-        active_procs = lambda: [proc for proc in worker_procs if proc.is_alive()]
+        def active_procs() -> list[BaseProcess]:
+            return [proc for proc in worker_procs if proc.is_alive()]
+
+        def failed_procs() -> list[BaseProcess]:
+            return [
+                proc
+                for proc in worker_procs
+                if getattr(proc, "exitcode", None) not in (None, 0)
+            ]
+
+        def exit_details() -> str:
+            return ", ".join(
+                f"{getattr(proc, 'name', 'worker')}={getattr(proc, 'exitcode', None)}"
+                for proc in worker_procs
+            )
+
         initial_count = len(active_procs())
 
         # Give processes time to clean themselves up properly first
@@ -474,8 +553,13 @@ class MultiprocExecutor(Executor):
             initial_count,
         )
         if wait_for_termination(
-            active_procs(), timeout=envs.VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS
+            active_procs(), timeout=_worker_shutdown_timeout_seconds()
         ):
+            failed = failed_procs()
+            if failed and raise_on_failure:
+                raise RuntimeError(
+                    "worker cleanup exited with nonzero status: " + exit_details()
+                )
             logger.info_once("[shutdown] Executor: all workers exited gracefully")
             return
 
@@ -488,7 +572,8 @@ class MultiprocExecutor(Executor):
         )
         for p in remaining:
             p.terminate()
-        if not wait_for_termination(active_procs(), 4):
+        killed = False
+        if not wait_for_termination(active_procs(), _WORKER_SIGTERM_GRACE_SECONDS):
             # Send SIGKILL if still running
             remaining = active_procs()
             logger.warning(
@@ -498,41 +583,61 @@ class MultiprocExecutor(Executor):
             )
             for p in remaining:
                 p.kill()
+            killed = bool(remaining)
+            wait_for_termination(active_procs(), _WORKER_SIGKILL_GRACE_SECONDS)
 
-    def shutdown(self):
-        """Properly shut down the executor and its workers"""
-        if not getattr(self, "shutting_down", False):
-            worker_count = len(getattr(self, "workers", None) or [])
-            logger.debug(
-                "[shutdown] Executor: start worker_count=%d",
-                worker_count,
+        failed = failed_procs()
+        if raise_on_failure and (killed or failed or active_procs()):
+            raise RuntimeError(
+                "worker cleanup required forced termination or exited "
+                f"nonzero: {exit_details()}"
             )
+
+    def _shutdown_workers(self, errors: _ShutdownErrors) -> None:
+        workers = getattr(self, "workers", None)
+        if not workers:
+            return
+
+        for worker in workers:
+            death_writer = worker.death_writer
+            worker.death_writer = None
+            if death_writer is not None:
+                errors.run("worker death pipe close", death_writer.close)
+
+        errors.run(
+            "worker termination",
+            partial(self._ensure_worker_termination, [w.proc for w in workers]),
+        )
+
+        for worker in workers:
+            response_mq = worker.worker_response_mq
+            worker.worker_response_mq = None
+            if response_mq is not None:
+                errors.run("worker response queue shutdown", response_mq.shutdown)
+
+    def _shutdown_executor_queues(self, errors: _ShutdownErrors) -> None:
+        rpc_broadcast_mq = getattr(self, "rpc_broadcast_mq", None)
+        self.rpc_broadcast_mq = None
+        if rpc_broadcast_mq is not None:
+            errors.run("broadcast queue shutdown", rpc_broadcast_mq.shutdown)
+
+        response_mqs = getattr(self, "response_mqs", None) or []
+        self.response_mqs = []
+        for response_mq in response_mqs:
+            errors.run("response queue shutdown", response_mq.shutdown)
+
+    def shutdown(self) -> None:
+        """Shut down worker processes, then release their transport queues."""
+        errors = _ShutdownErrors("Executor")
+        if not getattr(self, "shutting_down", False):
+            workers = getattr(self, "workers", None) or []
+            logger.debug("[shutdown] Executor: start worker_count=%d", len(workers))
             self.shutting_down = True
+            self._shutdown_workers(errors)
 
-            # Make sure all the worker processes are terminated first.
-            if workers := getattr(self, "workers", None):
-                for w in workers:
-                    # Close death_writer to signal child processes to exit
-                    if w.death_writer is not None:
-                        w.death_writer.close()
-                        w.death_writer = None
-                self._ensure_worker_termination([w.proc for w in workers])
-
-                for w in workers:
-                    # Shutdown response queues
-                    if w.worker_response_mq is not None:
-                        w.worker_response_mq.shutdown()
-                        w.worker_response_mq = None
-
-        if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
-            rpc_broadcast_mq.shutdown()
-            self.rpc_broadcast_mq = None
-        if response_mqs := getattr(self, "response_mqs", None):
-            for mq in response_mqs:
-                mq.shutdown()
-            self.response_mqs = []
-
+        self._shutdown_executor_queues(errors)
         logger.debug_once("[shutdown] Executor: complete")
+        errors.raise_first()
 
     def check_health(self) -> None:
         self.collective_rpc("check_health", timeout=10)
@@ -601,6 +706,7 @@ class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
     READY_STR = "READY"
+    ASYNC_OUTPUT_SHUTDOWN = object()
     rpc_broadcast_mq: MessageQueue | None
     worker_response_mq: MessageQueue | None
 
@@ -648,6 +754,12 @@ class WorkerProc:
         is_driver_worker: bool,
     ):
         self.rank = rank
+        set_shutdown_marker_context(
+            rank=rank,
+            local_rank=local_rank,
+            dp_rank=vllm_config.parallel_config.data_parallel_rank,
+            process_role="worker",
+        )
         wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
         # TODO: move `init_worker` to executor level as a collective rpc call
         all_kwargs: list[dict] = [
@@ -813,16 +925,86 @@ class WorkerProc:
 
         return cast(list[WorkerProcHandle], ready_proc_handles)
 
-    def shutdown(self):
-        if self.rpc_broadcast_mq is not None:
-            self.rpc_broadcast_mq.shutdown()
-        if self.worker_response_mq is not None:
-            self.worker_response_mq.shutdown()
-        self.worker.shutdown()
-        self.rpc_broadcast_mq = None
-        self.worker_response_mq = None
-        destroy_model_parallel()
-        destroy_distributed_environment()
+    def _quiesce_async_output(self) -> None:
+        if not self.use_async_scheduling:
+            return
+
+        self.async_output_queue.put_nowait(WorkerProc.ASYNC_OUTPUT_SHUTDOWN)
+        self.async_output_copy_thread.join(
+            timeout=_ASYNC_OUTPUT_THREAD_JOIN_TIMEOUT_SECONDS
+        )
+        if self.async_output_copy_thread.is_alive():
+            raise RuntimeError(
+                "async output thread did not stop before worker shutdown"
+            )
+
+    def _shutdown_worker(self) -> None:
+        with terminal_cudagraph_teardown():
+            self.worker.shutdown()
+
+    def _shutdown_message_queues(self, errors: _ShutdownErrors) -> None:
+        for queue_name in ("rpc_broadcast_mq", "worker_response_mq"):
+            message_queue = getattr(self, queue_name, None)
+            setattr(self, queue_name, None)
+            if message_queue is not None:
+                errors.run(f"{queue_name} shutdown", message_queue.shutdown)
+
+    @staticmethod
+    def _shutdown_distributed_state(errors: _ShutdownErrors) -> None:
+        errors.run("model-parallel shutdown", destroy_model_parallel)
+        errors.run("distributed-environment shutdown", destroy_distributed_environment)
+
+    def _finish_rocm_process_shutdown(
+        self,
+        *,
+        async_output_quiesced: bool,
+        errors: _ShutdownErrors,
+    ) -> None:
+        if not current_platform.is_rocm():
+            return
+
+        # WorkerProc is a dedicated terminal child. Keep the existing exit-only
+        # freeze fallback after explicit cleanup so interpreter-final cyclic GC
+        # does not revisit graph owners. Incomplete teardown remains rooted.
+        self._terminal_fallback_cycle = self
+        if async_output_quiesced:
+            errors.run("terminal garbage collection", gc.collect)
+        errors.run("terminal GC freeze", gc.freeze)
+
+    def shutdown(self) -> None:
+        """Quiesce graph users before releasing worker and process resources."""
+        actual_worker = getattr(self.worker, "worker", None)
+        errors = _ShutdownErrors("WorkerProc")
+
+        async_output_quiesced = errors.run(
+            "async output thread shutdown",
+            self._quiesce_async_output,
+        )
+        if async_output_quiesced:
+            errors.run("worker shutdown", self._shutdown_worker)
+        elif actual_worker is not None:
+            actual_worker._cudagraph_teardown_incomplete = True
+
+        self._shutdown_message_queues(errors)
+
+        graph_teardown_incomplete = not async_output_quiesced or bool(
+            getattr(actual_worker, "_cudagraph_teardown_incomplete", False)
+        )
+        if graph_teardown_incomplete:
+            self._terminal_fallback_cycle = self
+        else:
+            self._shutdown_distributed_state(errors)
+
+        self._finish_rocm_process_shutdown(
+            async_output_quiesced=async_output_quiesced,
+            errors=errors,
+        )
+        errors.raise_first()
+
+        if graph_teardown_incomplete:
+            raise RuntimeError(
+                "CUDA graph teardown was incomplete; preserving worker state"
+            )
 
     def monitor_death_pipe(self, death_pipe, shutdown_requested: threading.Event):
         if death_pipe is None:
@@ -1024,6 +1206,8 @@ class WorkerProc:
 
         while True:
             output = self.async_output_queue.get()
+            if output is WorkerProc.ASYNC_OUTPUT_SHUTDOWN:
+                return
             self.enqueue_output(output)
 
     def worker_busy_loop(self):
