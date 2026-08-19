@@ -130,6 +130,27 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     )
 
 
+@register_speculator("dflare")
+def update_dflare(config_dict: dict, pre_trained_config: dict) -> None:
+    """Convert a DFlare speculators checkpoint to vLLM draft metadata."""
+    pre_trained_config["architectures"] = ["DFlareDraftModel"]
+    pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
+    if config_dict.get("target_hidden_size") is not None:
+        pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+
+    aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+    pre_trained_config["dflare_config"] = {
+        "mask_token_id": config_dict["mask_token_id"],
+        "target_layer_ids": [i - 1 for i in aux_layer_ids],
+        "causal": not config_dict.get("sliding_window_non_causal", True),
+    }
+    # Reuse DFlash's scheduling and KV-cache machinery; the DFlare model reads
+    # dflare_config for fusion, while the shared speculator reads this alias.
+    pre_trained_config["dflash_config"] = dict(pre_trained_config["dflare_config"])
+    pre_trained_config["dflash_config"]["use_aux_hidden_state"] = False
+
+
 @register_speculator("dspark")
 def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     """

@@ -30,6 +30,7 @@ from vllm.model_executor.models import (
     supports_multimodal_embeddings,
 )
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
+from vllm.model_executor.models.gemma4_dflare import DFlareGemma4ForCausalLM
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
@@ -114,7 +115,12 @@ class SpecDecodeBaseProposer:
             1 if not self.parallel_drafting else self.num_speculative_tokens
         )
         self.net_num_new_slots_per_request = self.extra_slots_per_request - (
-            1 if (self.pass_hidden_states_to_model and self.method != "dflash") else 0
+            1
+            if (
+                self.pass_hidden_states_to_model
+                and self.method not in ("dflash", "dflare")
+            )
+            else 0
         )
         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
 
@@ -531,7 +537,7 @@ class SpecDecodeBaseProposer:
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
 
-        if self.method in ("eagle3", "dflash"):
+        if self.method in ("eagle3", "dflash", "dflare"):
             model = self.model
             if isinstance(model, BreakableCUDAGraphWrapper):
                 model = model.unwrap()
@@ -543,6 +549,7 @@ class SpecDecodeBaseProposer:
                     DFlashQwen3ForCausalLM,
                     Eagle3Qwen3ForCausalLM,
                     DFlashLagunaForCausalLM,
+                    DFlareGemma4ForCausalLM,
                 ),
             )
             target_hidden_states = self.model.combine_hidden_states(
@@ -1020,7 +1027,7 @@ class SpecDecodeBaseProposer:
             return bool(
                 {"DeepSeekMTPModel", "KimiK3MTPModel"}.intersection(architectures)
             )
-        return self.method not in ("mtp", "draft_model", "dflash")
+        return self.method not in ("mtp", "draft_model", "dflash", "dflare")
 
     def prepare_next_token_ids_cpu(
         self,

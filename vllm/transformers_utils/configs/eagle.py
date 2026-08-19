@@ -72,10 +72,26 @@ class EAGLEConfig(PretrainedConfig):
                 else f"DFlash{arch}"
                 for arch in self.model.architectures
             ]
+        elif method == "dflare":
+            assert self.model is not None, (
+                "model should not be None when method is dflare"
+            )
+            dflare_config = getattr(self.model, "dflare_config", None)
+            if dflare_config is not None and not hasattr(
+                self.model, "dflash_config"
+            ):
+                self.model.dflash_config = dict(dflare_config)
+                self.model.dflash_config["use_aux_hidden_state"] = False
+            kwargs["architectures"] = [
+                arch
+                if arch.startswith("DFlare") or arch.endswith("DFlare")
+                else f"DFlare{arch}"
+                for arch in self.model.architectures
+            ]
         else:
             raise ValueError(
                 f"Invalid method {method}. Supported methods are "
-                "eagle, eagle3, and dflash."
+                "eagle, eagle3, dflash, and dflare."
             )
 
         super().__init__(**kwargs)

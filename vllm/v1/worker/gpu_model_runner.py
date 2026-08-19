@@ -688,6 +688,9 @@ class GPUModelRunner(
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dflare():
+                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
             elif self.speculative_config.use_eagle():
@@ -4704,7 +4707,12 @@ class GPUModelRunner(
         assert self.speculative_config is not None
         # DFlash queries one extra token (the bonus token) beyond num_spec_tokens
         num_drafter_query_tokens = self.num_spec_tokens + (
-            1 if self.speculative_config.use_dflash() else 0
+            1
+            if (
+                self.speculative_config.use_dflash()
+                or self.speculative_config.use_dflare()
+            )
+            else 0
         )
         return (
             common_attn_metadata.max_seq_len + num_drafter_query_tokens
