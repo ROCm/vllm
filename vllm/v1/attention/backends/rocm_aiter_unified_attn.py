@@ -231,7 +231,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
 
         if attn_metadata.causal:
             with create_attention_profiler_scope(
-                backend_name="ROCM_AITER_UNIFIED",
+                backend_name="ROCM_AITER_UNIFIED_ATTN",
                 batch_size=seqused_k.shape[0],
                 max_query_len=max_seqlen_q,
                 max_seq_len=max_seqlen_k,
@@ -271,27 +271,38 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
             )
 
             descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
-            triton_unified_attention(
-                q=query[:num_actual_tokens],
-                k=key_cache,
-                v=value_cache,
-                out=output[:num_actual_tokens],
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=max_seqlen_q,
-                seqused_k=seqused_k,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=attn_metadata.causal,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                block_table=block_table,
-                softcap=self.logits_soft_cap,
-                q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-                sinks=self.sinks,
-                output_scale=output_scale,
-            )
+            with create_attention_profiler_scope(
+                backend_name="ROCM_AITER_UNIFIED_ATTN",
+                batch_size=seqused_k.shape[0],
+                max_query_len=max_seqlen_q,
+                max_seq_len=max_seqlen_k,
+                num_heads=self.num_heads,
+                head_size=self.head_size,
+                num_kv_heads=self.num_kv_heads,
+                dtype=query.dtype,
+                is_causal=False,
+            ):
+                triton_unified_attention(
+                    q=query[:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[:num_actual_tokens],
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    seqused_k=seqused_k,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=softmax_scale,
+                    causal=attn_metadata.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=layer._q_scale if query.dtype == self.fp8_dtype else None,
+                    k_descale=layer._k_scale.expand(descale_shape),
+                    v_descale=layer._v_scale.expand(descale_shape),
+                    sinks=self.sinks,
+                    output_scale=output_scale,
+                )
 
         return output
 
