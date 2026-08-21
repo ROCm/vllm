@@ -33,7 +33,7 @@ if not on_gfx11():
 
 pytest.importorskip("triton")
 
-from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
     pack_int4_exllama_shuffle,
 )
 from vllm.model_executor.layers.fused_moe import moe_hip_w4a16  # noqa: E402

@@ -38,7 +38,7 @@ def test_rocm_compressed_tensors_w4a16_e2e(
     with vllm_runner(
         model_path, dtype="float16", gpu_memory_utilization=0.35
     ) as vllm_model:
-        # Note: we cannot assert HybridW4A16LinearKernel is selected here
+        # Note: we cannot assert RDNAHybridW4A16LinearKernel is selected here
         # because V1 engine runs the model in a subprocess and apply_model
         # requires serializable callables (msgpack can't serialize functions).
         # If the W4A16 kernel is broken, generate_greedy will throw.

@@ -54,9 +54,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.hip_w8a16 import (
 from vllm.model_executor.kernels.linear.mixed_precision.humming import (
     HummingLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
-    HybridW4A16LinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.machete import (
     MacheteLinearKernel,
 )
@@ -439,7 +436,6 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         HummingLinearKernel,
     ],
     PlatformEnum.ROCM: [
-        HybridW4A16LinearKernel,
         HipW8A16LinearKernel,
         RDNA3W4A16LinearKernel,
         RDNAHybridW4A16LinearKernel,
@@ -1194,7 +1190,6 @@ __all__ = [
     "RDNAHybridW4A16LinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
-    "HybridW4A16LinearKernel",
     "TritonW4A16LinearKernel",
     "XPUW4A8IntLinearKernel",
     "XPUwNa16LinearKernel",

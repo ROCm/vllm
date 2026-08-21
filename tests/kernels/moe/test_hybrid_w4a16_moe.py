@@ -20,7 +20,7 @@ import torch
 from tests.kernels.moe.utils import make_dummy_moe_config
 from tests.kernels.utils import torch_experts
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
     pack_int4_exllama_shuffle,
 )
 from vllm.model_executor.layers.fused_moe import fused_topk

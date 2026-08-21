@@ -37,6 +37,41 @@ MAX_SKINNY_BATCH_SIZE = hybrid_module.MAX_SKINNY_BATCH_SIZE
 # ---------------------------------------------------------------------------
 
 
+def _pack_zp_rows_for_kernel(zp_nkg: torch.Tensor) -> torch.Tensor:
+    """Pack raw uint4 zero points along N: [N, G] int32 -> [N//8, G] int32.
+
+    Mirrors the layout the HIP skinny kernel reads (and that
+    ``process_weights_after_loading`` produces): row n's nibble lives in
+    word[n//8] at bits 4*(n%8).
+    """
+    assert zp_nkg.dtype == torch.int32
+    N, G = zp_nkg.shape
+    assert N % 8 == 0
+    shifts = (torch.arange(8, device=zp_nkg.device, dtype=torch.int32) * 4)[:, None]
+    return torch.sum(
+        (zp_nkg.view(N // 8, 8, G) & 0xF) << shifts, dim=1, dtype=torch.int32
+    ).contiguous()
+
+
+def _build_packed_scale_zp(
+    scales_nkg: torch.Tensor, zp_nkg: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    """Build the Triton scale/zp carrier exactly as the layer does.
+
+    fp16 packs scale | bias_eff, bf16 packs scale | zp_int; see the kernel
+    docstring for how each is consumed.
+    """
+    scale_u16 = scales_nkg.view(torch.uint16).to(torch.int32) & 0xFFFF
+    if dtype == torch.float16:
+        w_s_f32 = scales_nkg.to(torch.float32)
+        scaled_zp_f32 = (zp_nkg.to(torch.float32) - 8.0) * w_s_f32
+        bias_eff = (-(8.0 * w_s_f32 + scaled_zp_f32)).to(dtype)
+        hi_u16 = bias_eff.contiguous().view(torch.uint16).to(torch.int32) & 0xFFFF
+    else:
+        hi_u16 = zp_nkg.to(torch.int32) & 0xFFFF
+    return ((hi_u16 << 16) | scale_u16).view(torch.float32).contiguous()
+
+
 def _rdna_hybrid_w4a16_reference(
     x_mk: torch.Tensor,
     w_int4_nk: torch.Tensor,
@@ -50,7 +85,7 @@ def _rdna_hybrid_w4a16_reference(
     x_mk: [M, K] fp16/bf16
     w_int4_nk: [N, K] int32 with raw uint4 values in [0, 15]
     scales_nkg: [N, K//G] fp16/bf16
-    zp_nkg: [N, K//G] fp16/bf16 raw zero points (already in act dtype),
+    zp_nkg: [N, K//G] int32 raw zero points in [0, 15],
             or None for symmetric (uint4b8, dequant subtracts 8)
     """
     G = group_size
@@ -110,13 +145,18 @@ def test_rdna_hybrid_w4a16_apply_matches_reference(dtype, group_size, has_zp, M)
         0.05 * torch.rand((N, K // group_size), device=device, dtype=torch.float32)
     ).to(dtype)
 
-    # Optional raw zero points [N, K//G] in act dtype.
+    # Optional raw zero points [N, K//G] as int32 nibbles. The kernels consume
+    # them packed 8x along N (skinny) and folded into the carrier (Triton).
     if has_zp:
         zp_nkg = torch.randint(
             0, 16, (N, K // group_size), device=device, dtype=torch.int32
-        ).to(dtype)
+        )
+        w_zp = _pack_zp_rows_for_kernel(zp_nkg)
+        packed_scale_zp = _build_packed_scale_zp(scales_nkg, zp_nkg, dtype)
     else:
         zp_nkg = None
+        w_zp = None
+        packed_scale_zp = None
 
     from vllm.utils.platform_utils import num_compute_units
 
@@ -124,10 +164,12 @@ def test_rdna_hybrid_w4a16_apply_matches_reference(dtype, group_size, has_zp, M)
         x_mk,
         w_q,
         scales_nkg,
-        zp_nkg,
+        w_q_i32,
+        w_zp,
         None,  # bias
         num_compute_units(),
         group_size,
+        packed_scale_zp,
     )
 
     ref = _rdna_hybrid_w4a16_reference(
@@ -163,6 +205,7 @@ def test_rdna_hybrid_w4a16_apply_with_bias(dtype, M):
         x_mk,
         w_q,
         scales_nkg,
+        w_q_i32,
         None,
         bias,
         num_compute_units(),
@@ -378,11 +421,18 @@ def test_rdna_hybrid_w4a16_process_weights_asymmetric_repack(group_size, dist_in
     )
     kernel.process_weights_after_loading(layer)
 
-    # Zero-points: unpacked to [N, K//G], cast to act dtype, raw values [0..15].
-    assert layer.weight_zero_point.dtype == torch.float16
-    assert tuple(layer.weight_zero_point.shape) == (N, K // G)
-    expected_zp = zeros_int4_gn.t().to(torch.float16)  # [N, K//G]
-    torch.testing.assert_close(layer.weight_zero_point, expected_zp)
+    # Zero-points stay in their PACKED 4-bit form -- [N//8, K//G] int32, row n's
+    # nibble at word[n//8] bits 4*(n%8) -- which is what the HIP skinny kernel
+    # reads. Expanding them to the activation dtype would cost 4x the DRAM
+    # traffic on a memory-bound kernel (and the C++ rejects that dtype).
+    assert layer.weight_zero_point.dtype == torch.int32
+    assert tuple(layer.weight_zero_point.shape) == (N // 8, K // G)
+    torch.testing.assert_close(layer.weight_zero_point, zeros_ckpt_n8kg)
+
+    # The Triton prefill path reads the scale/zp carrier instead of two loads;
+    # asymmetric layers must have it built at load time.
+    assert hasattr(layer, "_hybrid_w_packed_scale_zp")
+    assert tuple(layer._hybrid_w_packed_scale_zp.shape) == (N, K // G)
 
     # Quantized weights match symmetric path's layout regardless of zp.
     w_q_i32 = layer.weight_packed.view(torch.int32)
@@ -517,7 +567,7 @@ def test_rdna_hybrid_w4a16_dispatch(dtype, M, K, N, G):
 
     cu_count = num_compute_units()
     out = torch.ops.vllm.rdna_hybrid_w4a16_apply(
-        a, b_packed_i8, scales, None, None, cu_count, G
+        a, b_packed_i8, scales, b_packed_i32, None, None, cu_count, G
     )
 
     ref = _hip_skinny_reference(a, w_int4_nk, scales, group_size=G, zp_bias=8)

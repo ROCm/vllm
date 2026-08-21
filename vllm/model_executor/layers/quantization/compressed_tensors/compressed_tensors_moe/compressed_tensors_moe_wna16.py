@@ -578,9 +578,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         the HIP skinny kernel uses HAS_ZERO_POINTS=false with hardcoded
         bias=8, and the Triton kernel uses ZP_BIAS=8.
         """
-        from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
-            pack_int4_exllama_shuffle,
+        from vllm.model_executor.kernels.linear.mixed_precision import (
+            rdna_hybrid_w4a16,
         )
+
+        pack_int4_exllama_shuffle = rdna_hybrid_w4a16.pack_int4_exllama_shuffle
         from vllm.model_executor.layers.fused_moe.all2all_utils import (
             maybe_make_prepare_finalize,
         )

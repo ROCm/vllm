@@ -456,7 +456,7 @@ def prepare_hybrid_weights(
     Scales/zp follow the activation *dtype* so the kernel exercises the
     same fp16 vs bf16 code path it takes in production.
     """
-    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
         _group_stride_pad,
         _pad_group_rows,
         pack_skinny_int4,
@@ -499,7 +499,7 @@ def _compute_packed_scale_zp(
     dtype: torch.dtype,
 ) -> torch.Tensor | None:
     """Pack the per-group packed scale/zp carrier into one fp32, matching the load-time
-    carrier built in ``HybridW4A16LinearKernel.process_weights_after_loading``.
+    carrier built in ``RDNAHybridW4A16LinearKernel.process_weights_after_loading``.
 
     Built ONLY for asymmetric layers (``w_zp`` given); returns None for symmetric
     (the kernel uses the constant -8 offset there, no carrier). Low 16 bits =
@@ -591,8 +591,8 @@ def measure_tflops(
     (hot), matching a real prefill where activations are freshly produced and
     weights stream from HBM.
     """
-    from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
-        _hybrid_w4a16_apply_impl,
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (
+        _rdna_hybrid_w4a16_apply_impl,
     )
     from vllm.triton_utils import triton
     from vllm.utils.platform_utils import num_compute_units
@@ -634,7 +634,7 @@ def measure_tflops(
     def run():
         w = bufs[idx[0] % n_buf]
         idx[0] += 1
-        return _hybrid_w4a16_apply_impl(
+        return _rdna_hybrid_w4a16_apply_impl(
             a,
             w["w_q_skinny"],
             w["w_s_skinny"],
