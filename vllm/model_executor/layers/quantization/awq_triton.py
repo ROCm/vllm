@@ -1111,9 +1111,6 @@ def _awq_gemm_triton(
         if current_platform.is_rocm():
             try:
                 from vllm._custom_ops import awq_gemv_hip
-                from vllm.model_executor.layers.quantization.awq_gemv_config import (
-                    get_awq_gemv_split_k,
-                )
 
                 # Check if weights are padded (qweight.K > activation.K)
                 padded_K = qweight.shape[0]
@@ -1127,8 +1124,8 @@ def _awq_gemm_triton(
                     act_padded[:K] = act
                     act = act_padded
 
-                # Look up optimal split-k from config
-                split_k = get_awq_gemv_split_k(K, N, group_size)
+                # 0 lets the kernel pick split-k with its own heuristic.
+                split_k = 0
 
                 ctx = (
                     nullcontext()

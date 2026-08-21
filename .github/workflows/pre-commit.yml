@@ -32,3 +32,12 @@ jobs:
     - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
       with:
         extra_args: --all-files --hook-stage manual
+      env:
+        # update-dockerfile-graph only regenerates
+        # docs/assets/contributing/dockerfile-stages-dependency.png, an upstream
+        # docs asset this fork does not use. It also needs a Docker daemon and
+        # exits 0 silently on runners without one, so it never reliably guarded
+        # that asset -- it just failed on whichever runner happened to have
+        # Docker. Skipped here rather than dropping the hook from
+        # .pre-commit-config.yaml, which upstream edits often.
+        SKIP: update-dockerfile-graph
