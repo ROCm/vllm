@@ -291,6 +291,9 @@ def get_block_size(dtype: torch.dtype, head_dim: int | None = None) -> int:
     # vectorized the loads (see get_block_n / get_num_warps: BN=16, NW=2).
     if _is_rdna() and head_dim == 72 and dtype in (torch.bfloat16, torch.float16):
         return 64
+    # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
+    if _is_rdna() and head_dim == 80 and dtype in (torch.bfloat16, torch.float16):
+        return 64
     if dtype == torch.float32:
         return 32
     elif current_platform.is_cuda_alike() and current_platform.has_device_capability(
@@ -313,6 +316,9 @@ def get_block_n(dtype: torch.dtype, head_dim: int | None = None) -> int:
     tile wins (BN=32/NW=4/WE=6 was sized for the old spilling codegen)."""
     if _is_rdna() and head_dim == 72 and dtype in (torch.bfloat16, torch.float16):
         return 16
+    # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
+    if _is_rdna() and head_dim == 80 and dtype in (torch.bfloat16, torch.float16):
+        return 16
     return get_block_size(dtype, head_dim)
 
 
@@ -328,6 +334,9 @@ def get_num_warps(head_dim: int) -> int:
             # + NW=2 (no waves_per_eu override) is fastest at B=1,S=3520,H=16,
             # D=72 bf16 (~2.36 ms vs ~2.85 ms at the old NW=4/WE=6 tile).
             return 2
+        # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
+        if head_dim == 80:
+            return 2
         return 8
     else:
         return 4 if head_dim <= 64 else 8
@@ -340,6 +349,9 @@ def get_waves_per_eu(head_dim: int) -> int | None:
         # 0 spills the default occupancy beats the old waves_per_eu=6 (which was
         # tuned for the spilling BM=32/NW=2 codegen).
         return None
+    # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
+    if _is_rdna() and head_dim == 80:
+        return 6
     return None
 
 
