@@ -299,6 +299,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         prompt_text: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
@@ -336,6 +337,7 @@ class AsyncLLM(EngineClient):
                 trace_headers,
                 priority,
                 data_parallel_rank,
+                session_id,
             )
 
         # Convert Input --> Request.
@@ -367,6 +369,7 @@ class AsyncLLM(EngineClient):
                     trace_headers=trace_headers,
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,
+                    session_id=session_id,
                 )
             else:
                 # Raw prompts require tokenization and possibly multimodal
@@ -382,6 +385,7 @@ class AsyncLLM(EngineClient):
                     trace_headers=trace_headers,
                     priority=priority,
                     data_parallel_rank=data_parallel_rank,
+                    session_id=session_id,
                 )
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
@@ -450,6 +454,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
     ) -> RequestOutputCollector:
         self._validate_streaming_input_sampling_params(sampling_params)
 
@@ -461,6 +466,7 @@ class AsyncLLM(EngineClient):
             trace_headers=trace_headers,
             priority=priority,
             data_parallel_rank=data_parallel_rank,
+            session_id=session_id,
         )
 
         if not sampling_params.skip_clone:
@@ -561,6 +567,7 @@ class AsyncLLM(EngineClient):
         trace_headers: Mapping[str, str] | None = None,
         priority: int = 0,
         data_parallel_rank: int | None = None,
+        session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
@@ -590,6 +597,7 @@ class AsyncLLM(EngineClient):
                 trace_headers=trace_headers,
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
+                session_id=session_id,
                 prompt_text=prompt_text,
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
