@@ -11,7 +11,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.hip_w4a16 import (  # no
 from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (  # noqa: E501
     MPLinearLayerConfig,
 )
-from vllm.model_executor.layers.quantization import awq_gemv_config
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedvLLMParameter,
@@ -132,44 +131,29 @@ def test_hip_w4a16_can_implement_rejects_invalid_configs(overrides, monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("group_size", "input_shape", "expected_shape"),
+    ("group_size", "input_shape"),
     [
-        (32, (2048, 32 * 15), (2048, 32 * 15)),  # 15 groups, split_k=0 (auto), no pad
-        (32, (2048, 32 * 16), (2048, 32 * 16)),  # 16 groups, split_k=0 (auto), no pad
-        (32, (2048, 32 * 20), (2048, 32 * 20)),  # 20 groups, split_k=0 (auto), no pad
-        (32, (8192, 32 * 22), (8192, 32 * 22)),  # 22 groups, split_k=0 (auto), no pad
-        (32, (2048, 32 * 80), (2048, 32 * 80)),  # 80 groups, split_k=0 (auto), no pad
-        (128, (8, 128 * 1), (8, 128 * 1)),  # minimum shape
-        (128, (2048, 128 * 1), (2048, 128 * 1)),  # too much overhead
-        (128, (2048, 128 * 15), (2048, 128 * 16)),  # pads to sk=16
-        (128, (2048, 128 * 17), (2048, 128 * 17)),  # no viable padding
-        (128, (8192, 128 * 22), (8192, 128 * 24)),  # pads to sk=8
-        (128, (12288, 128 * 20), (12288, 128 * 20)),  # already divisible
-        (128, (16384, 128 * 15), (16384, 128 * 16)),  # pads to sk=8
-        (128, (24576, 128 * 15), (24576, 128 * 16)),  # pads to sk=4
-        (128, (24576, 128 * 22), (24576, 128 * 24)),  # pads to sk=4
+        (32, (2048, 32 * 15)),  # group count not a power of two
+        (32, (8192, 32 * 22)),
+        (128, (8, 128 * 1)),  # minimum shape
+        (128, (2048, 128 * 15)),
+        (128, (8192, 128 * 22)),
+        (128, (12288, 128 * 20)),
+        (128, (24576, 128 * 15)),
     ],
 )
 @pytest.mark.parametrize("act_dtype", [torch.float16])  # TODO: +torch.bfloat16
-def test_hip_w4a16_process_shapes(
-    group_size, input_shape, expected_shape, act_dtype, monkeypatch
-):
+def test_hip_w4a16_process_shapes(group_size, input_shape, act_dtype, monkeypatch):
+    """K is never padded: split_k=0 leaves the factor choice to the kernel."""
     monkeypatch.setattr(
         ops, "hip_w4a16_linear_kernel_apply_weights", lambda *a, **kw: None
-    )
-    # Force heuristic path by simulating "no config" regardless of device.
-    monkeypatch.delenv("AWQ_GEMV_SPLIT_K", raising=False)
-    monkeypatch.setattr(
-        awq_gemv_config,
-        "get_awq_gemv_config",
-        lambda: None,
     )
     device = "cpu"
 
     _ensure_single_process_model_parallel()
     pack_factor = 8
     input_n, input_k = input_shape
-    expected_n, expected_k = expected_shape
+    expected_n, expected_k = input_n, input_k
 
     config = MPLinearLayerConfig(
         full_weight_shape=(input_k, input_n),
@@ -236,141 +220,16 @@ def test_hip_w4a16_process_shapes(
     )
     kernel.process_weights_after_loading(layer)
 
-    # Just check that the shape was padded to the expected size.  The
-    # tests that actually hit the GPU should be sensitive to errors in
-    # transforming the values, so we don't bother checking them here.
+    # Just check the resulting shapes.  The tests that actually hit the GPU
+    # should be sensitive to errors in transforming the values, so we don't
+    # bother checking them here.
+    assert kernel._split_k == 0
     assert layer.weight_packed.shape == (expected_k, expected_n // pack_factor)
     assert layer.weight_scale.shape == (expected_k // group_size, expected_n)
     assert layer.weight_zero_point.shape == (
         expected_k // group_size,
         expected_n // pack_factor,
     )
-
-
-@pytest.mark.parametrize(
-    ("group_size", "input_k", "config_dict", "expected_packed_k"),
-    [
-        (32, 224, {(224, 2048): 4}, 256),
-        (128, 896, {(896, 2048): 7}, 1024),
-    ],
-)
-def test_hip_w4a16_env_split_k_override(
-    group_size, input_k, config_dict, expected_packed_k, monkeypatch
-):
-    monkeypatch.setattr(
-        ops, "hip_w4a16_linear_kernel_apply_weights", lambda *a, **kw: None
-    )
-    # Ensure env override wins even if a config is present.
-    monkeypatch.setattr(
-        awq_gemv_config,
-        "get_awq_gemv_config",
-        lambda: config_dict,
-    )
-    monkeypatch.setenv("AWQ_GEMV_SPLIT_K", "8")
-
-    # Env var must override the group_size!=128 bypass too.
-    assert awq_gemv_config.get_awq_gemv_split_k(input_k, 2048, group_size) == 8
-
-    device = "cpu"
-
-    _ensure_single_process_model_parallel()
-    pack_factor = 8
-    input_n = 2048
-
-    config = MPLinearLayerConfig(
-        full_weight_shape=(input_k, input_n),
-        partition_weight_shape=(input_k, input_n),
-        weight_type=scalar_types.uint4,
-        act_type=torch.float16,
-        group_size=group_size,
-        zero_points=True,
-        has_g_idx=False,
-        out_type=None,
-    )
-    ok, err = HipW4A16LinearKernel.can_implement(config)
-    assert ok, err
-
-    w_q_packed = torch.ones(
-        (input_n, input_k // pack_factor),
-        dtype=torch.int32,
-        device=device,
-    )
-    w_zp_packed = torch.ones(
-        (input_n // pack_factor, input_k // group_size),
-        dtype=torch.int32,
-        device=device,
-    )
-    w_s_data = torch.ones(
-        input_n, input_k // group_size, dtype=torch.float16, device=device
-    )
-
-    layer = torch.nn.Module()
-    weight_loader = lambda *_args, **_kwargs: None
-
-    w_q = PackedvLLMParameter(
-        input_dim=1,
-        output_dim=0,
-        packed_dim=1,
-        packed_factor=pack_factor,
-        weight_loader=weight_loader,
-        data=w_q_packed,
-    )
-    w_s = GroupQuantScaleParameter(
-        output_dim=0,
-        input_dim=1,
-        weight_loader=weight_loader,
-        data=w_s_data,
-    )
-    w_zp = PackedvLLMParameter(
-        input_dim=1,
-        output_dim=0,
-        packed_dim=0,
-        packed_factor=pack_factor,
-        weight_loader=weight_loader,
-        data=w_zp_packed,
-    )
-
-    layer.register_parameter("weight_packed", w_q)
-    layer.register_parameter("weight_scale", w_s)
-    layer.register_parameter("weight_zero_point", w_zp)
-
-    kernel = HipW4A16LinearKernel(
-        config,
-        w_q_param_name="weight_packed",
-        w_s_param_name="weight_scale",
-        w_zp_param_name="weight_zero_point",
-    )
-    kernel.process_weights_after_loading(layer)
-
-    # split_k=8 forces padding when num_groups isn't divisible by 8.
-    assert kernel._split_k == 8
-    assert layer.weight_packed.shape == (expected_packed_k, input_n // pack_factor)
-
-
-@pytest.mark.parametrize(
-    ("group_size", "K", "N"),
-    [
-        (32, 2560, 2560),
-        (32, 4096, 4096),
-        (32, 4096, 11008),
-        (64, 4096, 4096),
-    ],
-)
-def test_compute_awq_gemv_padding_non128_group_size(group_size, K, N, monkeypatch):
-    """group_size != 128 should always return split_k=0, no padding."""
-    monkeypatch.delenv("AWQ_GEMV_SPLIT_K", raising=False)
-    monkeypatch.setattr(
-        awq_gemv_config,
-        "get_awq_gemv_config",
-        lambda: None,
-    )
-    num_groups = K // group_size
-    should_pad, padded_groups, split_k = awq_gemv_config.compute_awq_gemv_padding(
-        num_groups, K, N
-    )
-    assert not should_pad
-    assert split_k == 0
-    assert padded_groups == num_groups
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
