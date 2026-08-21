@@ -781,7 +781,7 @@ def main():
         "--sparse-mla-mha-variants",
         nargs="+",
         default=None,
-        choices=["dense_mha", "mqa"],
+        choices=["dense_mha", "masked_mha", "mqa"],
         help="Sparse MLA variants to run in mha_vs_mqa mode. Defaults to both.",
     )
 
@@ -944,6 +944,9 @@ def main():
         )
         args.sparse_mla_mha_variants = yaml_config.get(
             "sparse_mla_mha_variants", args.sparse_mla_mha_variants
+        )
+        args.sparse_mla_masked_mha_max_seq_len = yaml_config.get(
+            "sparse_mla_masked_mha_max_seq_len", None
         )
 
         # Parameter sweep configuration
@@ -1363,6 +1366,7 @@ def main():
             console.print(f"Prefill backend: {prefill_backend}")
         available_variants = [
             ("dense_mha", False, "dense"),
+            ("masked_mha", False, "masked"),
             ("mqa", True, "auto"),
         ]
         requested_variants = getattr(args, "sparse_mla_mha_variants", None)
@@ -1383,6 +1387,9 @@ def main():
             ]
         else:
             variants = available_variants
+        masked_mha_max_seq_len = getattr(
+            args, "sparse_mla_masked_mha_max_seq_len", None
+        )
         formatter = ResultsFormatter(console)
         total = 0
         for spec in args.batch_specs:
@@ -1392,6 +1399,10 @@ def main():
                     variant_label == "dense_mha"
                     and dense_mha_max_seq_len is not None
                     and q_len > dense_mha_max_seq_len
+                ) or (
+                    variant_label == "masked_mha"
+                    and masked_mha_max_seq_len is not None
+                    and q_len > masked_mha_max_seq_len
                 ):
                     continue
                 total += len(backends)
@@ -1405,6 +1416,10 @@ def main():
                             variant_label == "dense_mha"
                             and dense_mha_max_seq_len is not None
                             and q_len > dense_mha_max_seq_len
+                        ) or (
+                            variant_label == "masked_mha"
+                            and masked_mha_max_seq_len is not None
+                            and q_len > masked_mha_max_seq_len
                         ):
                             continue
                         config = BenchmarkConfig(
@@ -1434,6 +1449,7 @@ def main():
                             sparse_mla_dense_mha_max_seq_len=dense_mha_max_seq_len,
                             sparse_mla_topk_pattern=sparse_mla_topk_pattern,
                             prefill_backend=prefill_backend,
+                            sparse_mla_masked_mha_max_seq_len=masked_mha_max_seq_len,
                         )
 
                         # run_mla_benchmark needs the real backend name
