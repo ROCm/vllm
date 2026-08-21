@@ -102,18 +102,9 @@ class HipW4A16LinearKernel(MPLinearKernel):
         K = c.partition_weight_shape[0]
         N = c.partition_weight_shape[1]
         num_groups = 1 if c.group_size == -1 else K // c.group_size
-        from vllm.model_executor.layers.quantization.awq_gemv_config import (
-            compute_awq_gemv_padding,
-        )
-
-        should_pad, padded_groups, split_k = compute_awq_gemv_padding(
-            num_groups=num_groups,
-            K=K,
-            N=N,
-        )
-        self._split_k = split_k
-        padded_k = padded_groups * c.group_size if should_pad else K
-        pad_groups = padded_groups - num_groups if should_pad else 0
+        # 0 lets awq_gemv_hip pick split-k with its own heuristic, and without
+        # a target factor to divide into there is nothing to pad K for.
+        self._split_k = 0
         pack_factor = 32 // c.weight_type.size_bits
 
         if not c.zero_points:
@@ -152,14 +143,6 @@ class HipW4A16LinearKernel(MPLinearKernel):
             w_unpacked = unpack_quantized_values_into_int32(
                 x.data, self.config.weight_type, packed_dim=0
             ).contiguous()
-            if should_pad:
-                w_unpacked_padded = torch.zeros(
-                    (padded_k, N),
-                    dtype=w_unpacked.dtype,
-                    device=w_unpacked.device,
-                )
-                w_unpacked_padded[:K] = w_unpacked
-                w_unpacked = w_unpacked_padded
             return awq_pack(w_unpacked, c.weight_type.size_bits, w_unpacked.shape[0], N)
 
         def transform_w_zp(x):
@@ -172,30 +155,13 @@ class HipW4A16LinearKernel(MPLinearKernel):
                 .t()
                 .contiguous()
             )
-            if pad_groups:
-                w_unpacked_padded = torch.zeros(
-                    (padded_groups, N),
-                    dtype=w_unpacked.dtype,
-                    device=w_unpacked.device,
-                )
-                w_unpacked_padded[:num_groups] = w_unpacked
-                w_unpacked = w_unpacked_padded
             return awq_pack(w_unpacked, c.weight_type.size_bits, w_unpacked.shape[0], N)
 
         def transform_w_s(x):
             assert isinstance(x, BasevLLMParameter)
             # Normalize to (G, N) with input_dim=0 regardless of source.
             permute_param_layout_(x, input_dim=0, output_dim=1)
-            data = x.data
-            if pad_groups:
-                w_s_padded = torch.zeros(
-                    (padded_groups, N),
-                    dtype=data.dtype,
-                    device=data.device,
-                )
-                w_s_padded[:num_groups].copy_(data)
-                return w_s_padded
-            return data.contiguous()
+            return x.data.contiguous()
 
         self._transform_param(layer, self.w_q_name, transform_w_q)
         if self.config.zero_points:

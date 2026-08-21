@@ -24,9 +24,6 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 from vllm.model_executor.layers.fused_moe.utils import (
     _resize_cache,
 )
-from vllm.model_executor.layers.quantization.awq_gemv_config import (
-    get_awq_gemv_split_k,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
@@ -47,22 +44,9 @@ class HipW4A16Experts(mk.FusedMoEExpertsModular):
     ):
         super().__init__(moe_config, quant_config)
 
-        block_shape = self.quant_config.block_shape
-        group_size = block_shape[1] if block_shape else 128
-
-        w1_scale = self.quant_config.w1_scale
-        assert w1_scale is not None, "w1_scale is required for HipW4A16Experts"
-        num_groups_w1 = w1_scale.size(1)
-        K1 = num_groups_w1 * group_size
-        N1 = w1_scale.size(2)
-        self._split_k_w1 = get_awq_gemv_split_k(K1, N1, group_size)
-
-        w2_scale = self.quant_config.w2_scale
-        assert w2_scale is not None, "w2_scale is required for HipW4A16Experts"
-        num_groups_w2 = w2_scale.size(1)
-        K2 = num_groups_w2 * group_size
-        N2 = w2_scale.size(2)
-        self._split_k_w2 = get_awq_gemv_split_k(K2, N2, group_size)
+        # 0 lets awq_gemv_moe_hip pick split-k with its own heuristic.
+        self._split_k_w1 = 0
+        self._split_k_w2 = 0
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
