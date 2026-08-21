@@ -859,23 +859,11 @@ def main():
         return all_pass
 
     def apply_hip_preprocessing(qweight, qzeros, scales, group_size, N):
-        """Apply the same preprocessing as
-        AutoAWQLinearMethod.process_weights_after_loading.
+        """Match AutoAWQLinearMethod.process_weights_after_loading.
 
-        Delegates to the shared maybe_pad_awq_weights helper so the padding
-        logic stays in sync with the serving path.
+        Weights are passed through as-is: the split-k tables that used to
+        drive K-padding are gone, and awq_gemv_hip picks split-k itself.
         """
-        from vllm.model_executor.layers.quantization.awq_gemv_config import (
-            maybe_pad_awq_weights,
-        )
-        from vllm.platforms import current_platform
-
-        if not current_platform.is_rocm():
-            return qweight, qzeros, scales, qweight.shape[0]
-
-        qweight, qzeros, scales = maybe_pad_awq_weights(
-            qweight, qzeros, scales, group_size
-        )
         return qweight, qzeros, scales, qweight.shape[0]
 
     def bench(fn, warmup=50, rep=200):
