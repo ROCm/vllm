@@ -26,8 +26,8 @@ if not on_gfx115x():
     )
 
 import vllm.envs as envs  # noqa: E402
-import vllm.model_executor.layers.fla.ops.chunk_rocm as chunk_rocm  # noqa: E402
-from vllm.model_executor.layers.fla.ops import (  # noqa: E402
+import vllm.third_party.flash_linear_attention.ops.chunk_rocm as chunk_rocm  # noqa: E402
+from vllm.third_party.flash_linear_attention.ops import (  # noqa: E402
     chunk_gated_delta_rule,
 )
 
@@ -55,7 +55,7 @@ def _accelerated_paths_disabled():
     assert not chunk_rocm._available()
     saved_fused = None
     try:
-        import vllm.model_executor.layers.fla.ops.chunk_fused as chunk_fused
+        import vllm.third_party.flash_linear_attention.ops.chunk_fused as chunk_fused
 
         saved_fused = chunk_fused._ENABLED
         chunk_fused._ENABLED = False
@@ -182,7 +182,7 @@ def test_initial_state_dtypes(state_dtype):
 @torch.inference_mode()
 def test_core_attn_out_aliasing():
     """``out`` is a view into a caller-owned buffer; it must not overrun it."""
-    from vllm.model_executor.layers.fla.ops.chunk_rocm import chunk_gdn_hip_fwd
+    from vllm.third_party.flash_linear_attention.ops.chunk_rocm import chunk_gdn_hip_fwd
 
     q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
         [300], num_k_heads=8, gqa_ratio=2
@@ -245,7 +245,9 @@ def test_opcheck():
 @torch.inference_mode()
 def test_declines_unsupported():
     """The gate must decline every case the kernel asserts on."""
-    from vllm.model_executor.layers.fla.ops.chunk_rocm import is_hip_gdn_supported
+    from vllm.third_party.flash_linear_attention.ops.chunk_rocm import (
+        is_hip_gdn_supported,
+    )
 
     q, _, v, _, _, _, cu_seqlens = _make_inputs([64], num_k_heads=8, gqa_ratio=2)
 

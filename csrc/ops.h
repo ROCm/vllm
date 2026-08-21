@@ -43,6 +43,8 @@ void gelu_fast(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_quick(torch::Tensor& out, torch::Tensor& input);
 
+void relu_squared(torch::Tensor& out, torch::Tensor& input);
+
 #ifdef USE_ROCM
 torch::Tensor awq_gemv_hip(torch::Tensor activation, torch::Tensor qweight,
                            torch::Tensor scales, torch::Tensor qzeros,

@@ -38,12 +38,12 @@ def gdn_inputs() -> dict:
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="GDN kernels require CUDA/ROCm")
 def test_triple_fused_wy_matches_unfused(gdn_inputs):
     """Triple-fused chain (skips A intermediate) matches unfused."""
-    from vllm.model_executor.layers.fla.ops.chunk_scaled_dot_kkt import (
+    from vllm.third_party.flash_linear_attention.ops.chunk_scaled_dot_kkt import (
         chunk_scaled_dot_kkt_fwd,
     )
-    from vllm.model_executor.layers.fla.ops.solve_tril import solve_tril
-    from vllm.model_executor.layers.fla.ops.wy_fast import recompute_w_u_fwd
-    from vllm.model_executor.layers.fla.ops.wy_fast_doubly_fused import (
+    from vllm.third_party.flash_linear_attention.ops.solve_tril import solve_tril
+    from vllm.third_party.flash_linear_attention.ops.wy_fast import recompute_w_u_fwd
+    from vllm.third_party.flash_linear_attention.ops.wy_fast_doubly_fused import (
         fused_kkt_solve_tril_recompute_w_u_fwd,
     )
 
