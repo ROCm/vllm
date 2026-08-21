@@ -938,20 +938,9 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        qweight = layer.qweight.data
-        qzeros = layer.qzeros.data
-        scales = layer.scales.data
-        if current_platform.is_rocm():
-            from vllm.model_executor.layers.quantization.awq_gemv_config import (
-                maybe_pad_awq_weights,
-            )
-
-            qweight, qzeros, scales = maybe_pad_awq_weights(
-                qweight, qzeros, scales, self.quant_config.group_size
-            )
-        layer.qweight = torch.nn.Parameter(qweight, requires_grad=False)
-        layer.qzeros = torch.nn.Parameter(qzeros, requires_grad=False)
-        layer.scales = torch.nn.Parameter(scales, requires_grad=False)
+        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
     def apply(
         self,
@@ -967,9 +956,10 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         if current_platform.is_rocm():
-            # ops.awq_gemm already picks fused vs dequant+matmul itself (at a
-            # tuned threshold, and honouring the K-padding applied above), so
-            # the heuristic below must not pre-empt it.
+            # ops.awq_gemm picks fused vs dequant+matmul itself, at a threshold
+            # tuned for ROCm (64 rather than 256) and via the Triton dequant
+            # path, since _C.awq_dequantize is not built here. Letting the
+            # heuristic below pre-empt it would override both.
             out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
         else:
             # num_tokens >= threshold
