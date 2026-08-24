@@ -239,6 +239,22 @@ def backend_to_kernel_cls(
             AiterExperts,
         )
 
+        # gfx1250: DeepSeek-R1 a4w4 needs aiter's gluon moe_gemm_a4w4, which the
+        # native AiterExperts path (rocm_aiter_ops.fused_moe) does not provide.
+        # Opt in with VLLM_ROCM_USE_A4W4_TRITON_EXPERTS=1; AiterExperts stays the
+        # default/fallback.
+        import os
+
+        if os.getenv("VLLM_ROCM_USE_A4W4_TRITON_EXPERTS", "0").lower() in (
+            "1",
+            "true",
+        ):
+            from vllm.model_executor.layers.fused_moe.experts.aiter_triton_a4w4_moe import (  # noqa: E501
+                AiterTritonA4W4Experts,
+            )
+
+            return [AiterTritonA4W4Experts, AiterExperts]
+
         return [AiterExperts]
 
     elif backend == Mxfp4MoeBackend.XPU:
@@ -996,6 +1012,27 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         e8m0_dtype = torch.float8_e8m0fnu
 
         if is_gfx1250:
+            import os
+
+            if os.getenv("VLLM_ROCM_USE_A4W4_TRITON_EXPERTS", "0").lower() in (
+                "1",
+                "true",
+            ):
+                # AiterTritonA4W4Experts (gluon moe_gemm_a4w4) consumes PLAIN
+                # column-major mxfp4 weights with UNSWIZZLED scales and shuffles
+                # nothing; the native moe_shuffle_* layout below would corrupt
+                # it. Return the raw fp4 view untouched.
+                w13_weight.data = w13_weight.data.view(fp4_dtype)
+                w2_weight.data = w2_weight.data.view(fp4_dtype)
+                return (
+                    w13_weight,
+                    w2_weight,
+                    w13_weight_scale,
+                    w2_weight_scale,
+                    w13_bias,
+                    w2_bias,
+                )
+
             from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight, interleave_gate_up_rows
 
             w13_raw = w13_weight.data.view(fp4_dtype)
