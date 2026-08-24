@@ -44,7 +44,9 @@ MK_SHAPES = [
     (1024, 512),
     (8192, 2560),
 ]
-N_BATCH = [1, 4]
+# 5 is the largest N the wvSplitK_int8 kernel implements; 6 is the first that
+# must fall back to F.linear rather than reach the kernel and throw.
+N_BATCH = [1, 4, 5, 6]
 SEEDS = [0]
 
 
