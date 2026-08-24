@@ -9,7 +9,7 @@ on:
     inputs:
       pytorch_index:
         description: 'PyTorch index URL for ROCm nightly wheels'
-        default: 'https://rocm.nightlies.amd.com/whl-multi-arch'
+        default: 'https://nightly.repo.amd.com/rocm/whl-next'
         required: false
       rocm_arch:
         description: 'ROCm architecture (e.g., gfx1103;gfx1150;gfx1151)'
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
+  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
   PYTORCH_ROCM_ARCH: ${{ github.event.inputs.rocm_arch || 'gfx1103;gfx1150;gfx1151' }}
   CI_IMAGE: ghcr.io/rocm/vllm/gfx11-ci:latest
 
@@ -56,17 +56,29 @@ jobs:
         run: |
           # Resolve torch on the ROCm nightly index, then derive matching
           # torchvision/torchaudio pins. The nightly publishes multiple
-          # base versions side-by-side (2.9, 2.10, 2.11, 2.12); pin to
-          # 2.12 to match requirements/build/rocm.txt. torch and
+          # base versions side-by-side (2.9, 2.10, 2.11, 2.12, 2.13); pin to
+          # 2.13 to match requirements/build/rocm.txt. torch and
           # torchvision must share the same +rocm build-date suffix or they
           # ABI-mismatch at import ("operator torchvision::nms does not
           # exist"). torchaudio is a special case: it was retired from the
           # PyTorch release process at 2.11 (I/O moved to TorchCodec, see
-          # pytorch/audio#3902), so there is no 2.12 build and never will
+          # pytorch/audio#3902), so there is no 2.12+ build and never will
           # be. It is pinned at its terminal 2.11.0 release (same +rocm
           # suffix), which declares no torch version dependency and floats
           # across torch minors.
-          echo 'torch==2.12.*' > constraints.in
+          #
+          # 2026-08-24: nightlies moved from rocm.nightlies.amd.com to this
+          # repo.amd.com index (see ROCm/TheRock migration notice). The old
+          # index carried two ROCm version lines side by side (a frozen
+          # +rocm7.15.0aYYYYMMDD line alongside the live +rocm10.1.0aYYYYMMDD
+          # one), which fooled uv's "pick the highest version" resolution
+          # into preferring the stale line forever (PEP 440 compares
+          # local-version segments as opaque strings once a segment contains
+          # a letter, so "rocm7" sorts above "rocm10" -- see AIInfo
+          # context/rocm-nightly-install.md). The new index only ever carries
+          # a single ROCm product line, so a plain `uv pip compile` resolve
+          # is safe again.
+          echo 'torch==2.13.*' > constraints.in
           # --no-deps: torch pins exact rocm[libraries]/triton versions
           # in its metadata (e.g. rocm[libraries]==7.14.0a..., triton==
           # 3.7.0+rocm...); we don't want those locked in constraints.
@@ -79,7 +91,7 @@ jobs:
           # +rocm local version uv just picked for torch.
           TORCH_LOCAL=$(grep '^torch==' constraints.txt | sed 's/.*+//')
           TORCH_PATCH_SUFFIX=$(grep '^torch==' constraints.txt | sed 's/^torch==[0-9]\+\.[0-9]\+\.\([0-9]\+[^+]*\)+.*/\1/')
-          echo "torchvision==0.27.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
+          echo "torchvision==0.28.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
           # torchaudio is frozen at 2.11.0 (no 2.12+ exists); hardcode the
           # base version and only inherit the +rocm build-date suffix.
           echo "torchaudio==2.11.0+${TORCH_LOCAL}" >> constraints.txt
@@ -175,7 +187,7 @@ jobs:
       test_name: correctness
       runs_on: linux-strix-halo-gpu-rocm-oem
       ci_image: ghcr.io/rocm/vllm/gfx11-ci:latest
-      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
+      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
       timeout: 300
       pytest_args: >-
         tests/kernels/moe/test_exllama_moe.py
@@ -202,7 +214,7 @@ jobs:
       test_name: performance
       runs_on: linux-strix-halo-gpu-rocm-noneng
       ci_image: ghcr.io/rocm/vllm/gfx11-ci:latest
-      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
+      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
       timeout: 300
       pytest_args: >-
         tests/kernels/quantization/test_hybrid_w4a16_perf.py
