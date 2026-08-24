@@ -9,7 +9,7 @@ on:
     inputs:
       pytorch_index:
         description: 'PyTorch index URL for ROCm nightly wheels'
-        default: 'https://rocm.nightlies.amd.com/whl-multi-arch'
+        default: 'https://nightly.repo.amd.com/rocm/whl-next'
         required: false
       rocm_arch:
         description: 'ROCm architecture (e.g., gfx1103;gfx1150;gfx1151)'
@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
+  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
   PYTORCH_ROCM_ARCH: ${{ github.event.inputs.rocm_arch || 'gfx1103;gfx1150;gfx1151' }}
   CI_IMAGE: ghcr.io/rocm/vllm/gfx11-ci:latest
 
@@ -67,30 +67,28 @@ jobs:
           # suffix), which declares no torch version dependency and floats
           # across torch minors.
           #
-          # CAUTION: do not resolve this with a bare `uv pip compile
-          # torch==2.13.*` (as this step used to). The nightly index carries
-          # two ROCm version lines side by side: the old `+rocm7.15.0aYYYYMMDD`
-          # line (frozen ~20260728) and the current `+rocm10.1.0aYYYYMMDD`
-          # line (daily builds). PEP 440 compares local-version segments as
-          # opaque strings once a segment contains a letter, so "rocm7" sorts
-          # ABOVE "rocm10" (the digit '7' > '1' at the first differing
-          # position) -- uv's "pick the highest version" resolution is fooled
-          # into preferring the frozen 7.15 line forever, silently building
-          # against weeks-old ROCm (see AIInfo context/rocm-nightly-install.md,
-          # "version-maximization footgun"). Resolve the newest build on the
-          # live `+rocm10.` line directly instead of trusting uv's max.
-          TORCH_DATE=$(curl -fsSL "${{ env.PYTORCH_INDEX_URL }}/torch/" \
-            | grep -oE 'torch-2\.13\.[0-9]+\+rocm10\.[0-9]+\.[0-9]+a[0-9]{8}-cp312-cp312-linux_x86_64\.whl' \
-            | grep -oE '[0-9]{8}' | sort -u | tail -1)
-          TORCH_VER=$(curl -fsSL "${{ env.PYTORCH_INDEX_URL }}/torch/" \
-            | grep -oE "torch-2\.13\.[0-9]+\+rocm10\.[0-9]+\.[0-9]+a${TORCH_DATE}" | head -1 | sed 's/^torch-//')
-          if [ -z "$TORCH_VER" ]; then
-            echo "::error::No torch 2.13.x build found on the live +rocm10. line at ${{ env.PYTORCH_INDEX_URL }}/torch/"
-            exit 1
-          fi
-          echo "torch==${TORCH_VER}" > constraints.txt
+          # 2026-08-24: nightlies moved from rocm.nightlies.amd.com to this
+          # repo.amd.com index (see ROCm/TheRock migration notice). The old
+          # index carried two ROCm version lines side by side (a frozen
+          # +rocm7.15.0aYYYYMMDD line alongside the live +rocm10.1.0aYYYYMMDD
+          # one), which fooled uv's "pick the highest version" resolution
+          # into preferring the stale line forever (PEP 440 compares
+          # local-version segments as opaque strings once a segment contains
+          # a letter, so "rocm7" sorts above "rocm10" -- see AIInfo
+          # context/rocm-nightly-install.md). The new index only ever carries
+          # a single ROCm product line, so a plain `uv pip compile` resolve
+          # is safe again.
+          echo 'torch==2.13.*' > constraints.in
+          # --no-deps: torch pins exact rocm[libraries]/triton versions
+          # in its metadata (e.g. rocm[libraries]==7.14.0a..., triton==
+          # 3.7.0+rocm...); we don't want those locked in constraints.
+          uv pip compile constraints.in \
+            --index-url ${{ env.PYTORCH_INDEX_URL }} \
+            --prerelease allow \
+            --no-header --no-annotate --no-deps \
+            -o constraints.txt
           # Synthesize torchvision/torchaudio entries with the same
-          # +rocm local version just resolved for torch.
+          # +rocm local version uv just picked for torch.
           TORCH_LOCAL=$(grep '^torch==' constraints.txt | sed 's/.*+//')
           TORCH_PATCH_SUFFIX=$(grep '^torch==' constraints.txt | sed 's/^torch==[0-9]\+\.[0-9]\+\.\([0-9]\+[^+]*\)+.*/\1/')
           echo "torchvision==0.28.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
@@ -189,7 +187,7 @@ jobs:
       test_name: correctness
       runs_on: linux-strix-halo-gpu-rocm-oem
       ci_image: ghcr.io/rocm/vllm/gfx11-ci:latest
-      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
+      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
       timeout: 300
       pytest_args: >-
         tests/kernels/moe/test_exllama_moe.py
@@ -216,7 +214,7 @@ jobs:
       test_name: performance
       runs_on: linux-strix-halo-gpu-rocm-noneng
       ci_image: ghcr.io/rocm/vllm/gfx11-ci:latest
-      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/whl-multi-arch' }}
+      pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
       timeout: 300
       pytest_args: >-
         tests/kernels/quantization/test_hybrid_w4a16_perf.py
