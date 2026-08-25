@@ -179,7 +179,6 @@ class DynamicInt8LMHeadMethod(QuantizeMethodBase):
     def __init__(self) -> None:
         # Set by tie_weights() on the lm_head of a weight-tied model.
         self._tied_source: torch.nn.Module | None = None
-        self._processed = False
 
     def create_weights(
         self,
@@ -208,10 +207,12 @@ class DynamicInt8LMHeadMethod(QuantizeMethodBase):
 
         # Idempotent: a tied lm_head quantizes its source on demand below, so
         # the loader may reach an already-quantized layer. Re-running would
-        # quantize INT8 data a second time and destroy the weights.
-        if self._processed:
+        # quantize INT8 data a second time and destroy the weights. The flag
+        # lives on the layer rather than the method because the reload path
+        # clears it (model_loader/reload/layerwise.py) so a refit re-quantizes.
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
-        self._processed = True
+        layer._already_called_process_weights_after_loading = True
 
         # Weight-tied model: the source embedding shares this exact tensor, so
         # quantize it once and adopt the result instead of building a second

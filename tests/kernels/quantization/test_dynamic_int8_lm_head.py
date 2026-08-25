@@ -137,16 +137,15 @@ def test_dynamic_int8_lm_head_embedding(m, k, dtype, seed, default_vllm_config):
 
 @pytest.mark.parametrize("lm_head_first", [False, True])
 @pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.skipif(not _has_int8_kernel(), reason="no int8 per-channel kernel")
 @torch.inference_mode()
 def test_dynamic_int8_lm_head_tie_weights(lm_head_first, dtype, default_vllm_config):
-    """Weight-tied models must tie without NotImplementedError.
+    """A tied lm_head and embedding must share one INT8 copy of the vocab table.
 
-    ParallelLMHead.tie_weights() delegates to quant_method.tie_weights(), so a
-    method that does not override it raises NotImplementedError from the base
-    class at model-construction time (e.g. Gemma 4, tie_word_embeddings=True).
-
-    The tied pair must also end up sharing a single INT8 copy of the vocab
-    table, regardless of the order the loader walks the two modules in.
+    Both layers get their own DynamicInt8LMHeadMethod and the loader calls
+    process_weights_after_loading once per layer, so quantizing them
+    independently would build a second INT8 vocab table. The tie must also be
+    order-independent: the loader may reach either module first.
     """
     torch.manual_seed(0)
     m, k = 256, 128
@@ -183,3 +182,41 @@ def test_dynamic_int8_lm_head_tie_weights(lm_head_first, dtype, default_vllm_con
     # dequantizes back to the original weights.
     dequant = embed.weight.data.to(dtype) * embed.weight_scale.unsqueeze(1)
     torch.testing.assert_close(dequant, w_orig.cuda(), atol=xavier / 127, rtol=0.05)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.skipif(not _has_int8_kernel(), reason="no int8 per-channel kernel")
+@torch.inference_mode()
+def test_dynamic_int8_lm_head_requantizes_after_reload(dtype, default_vllm_config):
+    """Clearing the per-layer guard must let the weight quantize again.
+
+    model_loader/reload/layerwise.py deletes
+    ``_already_called_process_weights_after_loading`` and re-runs
+    ``process_weights_after_loading`` so a refit re-quantizes. A guard kept on
+    the quant method instead of the layer would be invisible to that path,
+    leaving an FP16 weight in front of the INT8 kernel.
+    """
+    torch.manual_seed(0)
+    m, k = 256, 128
+    method, layer = _make_layer(m, k, dtype)
+
+    xavier = math.sqrt(2 / k)
+    layer.weight.data.copy_(
+        (torch.rand(m, k, dtype=dtype, device="cpu") * 2 - 1) * xavier
+    )
+    w_orig = layer.weight.data.clone()
+    layer.cuda()
+
+    method.process_weights_after_loading(layer)
+    assert layer.weight.dtype == torch.int8
+    assert layer._already_called_process_weights_after_loading is True
+
+    # Reload restores the FP16 parameter recorded at construction, clears the
+    # guard, and processes again.
+    layer.register_parameter(
+        "weight", torch.nn.Parameter(w_orig.cuda(), requires_grad=False)
+    )
+    delattr(layer, "_already_called_process_weights_after_loading")
+    method.process_weights_after_loading(layer)
+
+    assert layer.weight.dtype == torch.int8, "reload must re-quantize the weight"
