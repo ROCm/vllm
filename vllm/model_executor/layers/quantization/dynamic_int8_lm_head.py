@@ -176,6 +176,10 @@ class DynamicInt8LMHeadMethod(QuantizeMethodBase):
 
     _w_orig: torch.Tensor
 
+    def __init__(self) -> None:
+        # Set by tie_weights() on the lm_head of a weight-tied model.
+        self._tied_source: torch.nn.Module | None = None
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -200,6 +204,30 @@ class DynamicInt8LMHeadMethod(QuantizeMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from vllm.config import get_current_vllm_config
+
+        # Idempotent: a tied lm_head quantizes its source on demand below, so
+        # the loader may reach an already-quantized layer. Re-running would
+        # quantize INT8 data a second time and destroy the weights. The flag
+        # lives on the layer rather than the method because the reload path
+        # clears it (model_loader/reload/layerwise.py) so a refit re-quantizes.
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        layer._already_called_process_weights_after_loading = True
+
+        # Weight-tied model: the source embedding shares this exact tensor, so
+        # quantize it once and adopt the result instead of building a second
+        # INT8 copy of the vocab table. Quantizing the source on demand keeps
+        # this independent of the order named_modules() visits the two layers.
+        source = self._tied_source
+        if source is not None:
+            src_method = source.quant_method
+            src_method.process_weights_after_loading(source)
+            self._w_orig = src_method._w_orig
+            self._group_size = src_method._group_size
+            self._sim_mode = src_method._sim_mode
+            layer.weight = source.weight
+            layer.register_parameter("weight_scale", source.weight_scale)
+            return
 
         weight = layer.weight.data  # [M, K] in FP16/BF16
         act_dtype = weight.dtype
@@ -338,3 +366,17 @@ class DynamicInt8LMHeadMethod(QuantizeMethodBase):
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, self._w_orig)
+
+    def tie_weights(self, layer: torch.nn.Module, embed_tokens: torch.nn.Module):
+        """Tie the lm_head weight to the token embedding.
+
+        Runs at construction time, before weights are loaded, so both sides
+        still hold the unquantized parameter from ``create_weights``.  The
+        two layers are separate modules, so ``process_weights_after_loading``
+        is invoked once per layer; ``_tied_source`` lets the second call reuse
+        the first one's INT8 result instead of quantizing the shared table
+        twice (which would cost an extra full INT8 copy of the vocab matrix).
+        """
+        layer.weight = embed_tokens.weight
+        self._tied_source = embed_tokens
+        return layer
