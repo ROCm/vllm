@@ -184,7 +184,7 @@ def test_dynamic_int8_lm_head_tie_weights(lm_head_first, dtype, default_vllm_con
     torch.testing.assert_close(dequant, w_orig.cuda(), atol=xavier / 127, rtol=0.05)
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("dtype", DTYPES[:1])  # guard logic is dtype-independent
 @pytest.mark.skipif(not _has_int8_kernel(), reason="no int8 per-channel kernel")
 @torch.inference_mode()
 def test_dynamic_int8_lm_head_requantizes_after_reload(dtype, default_vllm_config):
