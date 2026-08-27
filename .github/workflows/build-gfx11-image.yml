@@ -1,4 +1,4 @@
-name: Build gfx11 vLLM image
+name: Docker build gfx11 vLLM image
 
 # Builds the runnable vLLM image for RDNA3/3.5 (docker/Dockerfile.gfx11).
 # Distinct from build-gfx11-ci-image.yml, which publishes the thin *builder*
@@ -40,10 +40,6 @@ on:
         description: '1 = build the pinned ref, 0 = build this branch checkout'
         default: '1'
         required: false
-      build_target:
-        description: 'Dockerfile stage to stop at (rocm-base probes cheaply)'
-        default: 'runtime'
-        required: false
       push_image:
         description: 'Publish to GHCR (untick for a build-only dry run)'
         type: boolean
@@ -80,7 +76,6 @@ jobs:
       IN_MAX_JOBS: ${{ inputs.max_jobs || '2' }}
       IN_REMOTE_VLLM: ${{ inputs.remote_vllm || '1' }}
       IN_VLLM_REF: ${{ inputs.vllm_ref || '' }}
-      IN_BUILD_TARGET: ${{ inputs.build_target || 'runtime' }}
       IN_PUSH_IMAGE: ${{ inputs.push_image || false }}
 
     steps:
@@ -150,7 +145,6 @@ jobs:
           echo "max_jobs:   $IN_MAX_JOBS"
           echo "arch:       $IN_ROCM_ARCH (device: $IN_DEVICE_ARCH)"
           echo "source:     ${{ steps.src.outputs.ref }} (remote_vllm=$IN_REMOTE_VLLM)"
-          echo "target:     $IN_BUILD_TARGET"
           echo "push_image: $IN_PUSH_IMAGE"
           nproc; free -g; df -h / /mnt
 
@@ -159,7 +153,7 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.gfx11
-          target: ${{ env.IN_BUILD_TARGET }}
+          target: runtime
           push: ${{ env.IN_PUSH_IMAGE }}
           # MAX_JOBS is memory-bound, not core-bound: the runner has 4 vCPU but
           # only 15 GB of RAM. The ceiling is set by swap, not by this number --
