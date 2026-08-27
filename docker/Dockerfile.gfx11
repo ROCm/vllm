@@ -206,5 +206,4 @@ LABEL org.opencontainers.image.source="https://github.com/ROCm/vllm"
 LABEL org.opencontainers.image.description="vLLM for AMD RDNA3/3.5 (gfx11xx), built from ROCm wheels"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-EXPOSE 8080
 WORKDIR /workspace
