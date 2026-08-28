@@ -113,14 +113,21 @@ def unique_filepath(fn: Callable[[int], Path]) -> Path:
 
 
 def _sync_visible_devices_env_vars():
-    """Sync HIP/CUDA visibility env vars before spawning (ROCm only)."""
+    """Reconcile env vars inherited by child processes (ROCm only).
+
+    Syncs HIP/CUDA visibility and clears ROCPROFILER_REGISTER_LIBRARY.
+    """
 
     if not current_platform.is_rocm():
         return
 
-    from vllm.platforms.rocm import _sync_hip_cuda_env_vars
+    from vllm.platforms.rocm import (
+        _clear_rocprofiler_register_library,
+        _sync_hip_cuda_env_vars,
+    )
 
     _sync_hip_cuda_env_vars()
+    _clear_rocprofiler_register_library()
 
 
 def _maybe_force_spawn():

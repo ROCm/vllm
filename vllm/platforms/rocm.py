@@ -113,6 +113,22 @@ def _rocm_device_count_stateless(cuda_visible_devices: str | None = None) -> int
     return r
 
 
+def _clear_rocprofiler_register_library():
+    """Unset ROCPROFILER_REGISTER_LIBRARY so child processes do not inherit it.
+
+    librocprofiler-sdk records its own path in this variable when HIP
+    initializes, and librocprofiler-register reads it to decide which library
+    to load. A process that starts with the variable already set produces
+    torch profiler traces containing no GPU records at all.
+
+    The variable is set by a C-level setenv() that os.environ never sees, so
+    os.unsetenv() is what clears it for both forked and spawned children; the
+    pop() only keeps os.environ consistent if it was also exported by the user.
+    """
+    os.unsetenv("ROCPROFILER_REGISTER_LIBRARY")
+    os.environ.pop("ROCPROFILER_REGISTER_LIBRARY", None)
+
+
 def _sync_hip_cuda_env_vars():
     """Ensure HIP_VISIBLE_DEVICES and CUDA_VISIBLE_DEVICES are consistent.
     Treats empty string as unset. Raises on genuine conflicts."""
