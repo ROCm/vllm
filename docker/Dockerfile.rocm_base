@@ -335,8 +335,8 @@ ARG USE_SCCACHE
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
 RUN git clone --recursive ${AITER_REPO}
-RUN git checkout ${AITER_BRANCH}
 RUN cd aiter \
+    && git checkout ${AITER_BRANCH}
     && git submodule update --init --recursive \
     && pip install -r requirements.txt
 RUN pip install pyyaml && cd aiter \
