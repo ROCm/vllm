@@ -439,6 +439,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum.XPU: [
         XPUFp8BlockScaledMMKernel,
         TritonFp8BlockScaledMMKernel,
+        BlockWiseTorchFP8ScaledMMLinearKernel,
     ],
 }
 
