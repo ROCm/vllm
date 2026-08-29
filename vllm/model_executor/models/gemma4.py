@@ -573,7 +573,6 @@ class Gemma4DecoderLayer(nn.Module):
         head_dim = layer_config.head_dim
         num_kv_heads = layer_config.num_key_value_heads
 
-
         self.self_attn = Gemma4Attention(
             config=config,
             hidden_size=self.hidden_size,
