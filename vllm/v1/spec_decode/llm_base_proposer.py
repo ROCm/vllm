@@ -1403,6 +1403,10 @@ class SpecDecodeBaseProposer:
                 self.model.config.image_token_index = (
                     target_model.config.media_placeholder_token_id
                 )
+            elif self.get_model_name(target_model) == "NemotronH_Nano_VL_V2":
+                self.model.config.image_token_index = (
+                    target_model.config.img_context_token_id
+                )
             else:
                 # Some multimodal targets (e.g. MiniCPM-V) do not expose an
                 # `image_token_index` on their config -- they merge multimodal

@@ -387,7 +387,9 @@ class EmbedBenchmarkMetrics:
     completed: int
     failed: int
     total_input: int
+    total_input_sequences: int
     request_throughput: float
+    input_sequence_throughput: float
     total_token_throughput: float
     mean_e2el_ms: float
     std_e2el_ms: float
@@ -550,6 +552,7 @@ def calculate_metrics_for_embeddings(
         The calculated benchmark metrics.
     """
     total_input = 0
+    total_input_sequences = 0
     completed = 0
     failed = 0
     e2els: list[float] = []
@@ -558,6 +561,7 @@ def calculate_metrics_for_embeddings(
             e2els.append(outputs[i].latency)
             completed += 1
             total_input += outputs[i].prompt_len
+            total_input_sequences += outputs[i].num_input_sequences
         else:
             failed += 1
 
@@ -571,7 +575,9 @@ def calculate_metrics_for_embeddings(
         completed=completed,
         failed=failed,
         total_input=total_input,
+        total_input_sequences=total_input_sequences,
         request_throughput=completed / dur_s,
+        input_sequence_throughput=total_input_sequences / dur_s,
         total_token_throughput=total_input / dur_s,
         mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
@@ -1223,6 +1229,12 @@ async def benchmark(
             "Request throughput (req/s):", metrics.request_throughput
         )
     )
+    if isinstance(metrics, EmbedBenchmarkMetrics):
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Input throughput (inputs/s):", metrics.input_sequence_throughput
+            )
+        )
     if goodput_config_dict and isinstance(metrics, BenchmarkMetrics):
         print(
             "{:<40} {:<10.2f}".format(
@@ -1326,7 +1338,9 @@ async def benchmark(
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
+            "total_input_sequences": metrics.total_input_sequences,
             "request_throughput": metrics.request_throughput,
+            "input_sequence_throughput": metrics.input_sequence_throughput,
             "total_token_throughput": metrics.total_token_throughput,
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
