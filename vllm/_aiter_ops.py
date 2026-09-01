@@ -3134,7 +3134,10 @@ class rocm_aiter_ops:
             get_gemm_config,
         )
         # Fake M value for now
-        return get_gemm_config("GEMM-A8W8_BLOCKSCALE_PRESHUFFLED", 128, N, K)
+        _, is_tuned = get_gemm_config(
+            "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED", 1, n, k
+        )
+        return is_tuned
 
     @staticmethod
     def is_triton_gemm_afp4wfp4_presh_ws_tuned(n: int, k: int) -> bool:
