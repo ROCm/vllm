@@ -13,6 +13,9 @@ from vllm.model_executor.parameter import BasevLLMParameter
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
+# Largest N the wvSplitK_int8 kernel implements; see the switch in
+# csrc/rocm/skinny_gemms_w8a8.cu, which throws on anything above this.
+MAX_SUPPORTED_N = 5
 
 
 def _w8a16_apply_impl(
@@ -37,7 +40,7 @@ def _w8a16_apply_impl(
     N = x_2d.shape[0]
     K = x_2d.shape[1]
 
-    if K * N <= LDS_CAPACITY_ELEMENTS:
+    if N <= MAX_SUPPORTED_N and K * N <= LDS_CAPACITY_ELEMENTS:
         return ops.wvSplitK_int8(w_q, x_2d, w_s, cu_count, bias, group_size)
 
     return torch.nn.functional.linear(x_2d, w_dequant, bias)
