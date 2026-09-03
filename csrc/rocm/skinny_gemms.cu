@@ -664,6 +664,10 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         uint32_t k = k1 + k2 * THRDS * A_CHUNK;
         uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K) break;
+        // Reads a whole A_CHUNK, so A_CHUNK must divide K: a lane straddling
+        // K would otherwise pull in the next row (or unwritten LDS for the
+        // last n). B is clamped instead, which only lines up when the chunk
+        // is whole. The dispatcher derives A_CHUNK from K to guarantee this.
         for (int n = 0; n < N; n++) {
           bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
         }
@@ -1501,88 +1505,57 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 // ds_load traffic per dot scaled by N (2N vs 4N ds_loads per body for the
 // same 32 dots). That costs more than the idle tail saves, and the tail is
 // itself bandwidth-limited so it never cost the full 5%.
-#define WVSPLIT_TILE_CFG(_THRDS, _WVPRGRP, _sYT, __N)                        \
-  {                                                                          \
-    bool fit_lds = (Kbp_in * N_in <= max_lds_len);                           \
-    if (is_gfx11()) {                                                        \
-      if (_sYT <= 1)                                                         \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                            \
-      else if (K_in < 1024)                                                  \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 2, 4, __N)                            \
-      else if ((K_in % 1024 == 512) && (_sYT >= 40 || K_in >= 4096))         \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 1, __N)                            \
-      else if ((K_in == 2048) && (__N == 1))                                 \
-        /* Tuned for gfx1151 (Qwen3.5 decode shapes M ∈ {256, 1024,        \
-           248320}, K=2048, N=1): beats the (AC=8, W=16, UN=4) baseline of   \
-           the K_in<=2048 branch below by 1.31-1.37x on small/mid M and 3.9% \
-           on the lm_head-sized M.  Compiles to 145 VGPRs / occupancy 9 (vs  \
-           46 / 8 for the default); zero spills.  VGPR-bound but DRAM-       \
-           saturated past 92% of LPDDR5X peak after subtracting the per-     \
-           launch dispatch floor.  Verify per shape with                     \
-           benchmarks/kernels/sweep_bf16_kernel.py. */                       \
-        WVSPLITK_CFG_AC(32, 4, 1, 8, __N, 16)                                \
-      /* gfx1151 AC=32 fast paths.  Each cell beats AC=16 by >=2% with       \
-         z>1.96 in a 10-rep do_bench A/B (stderr 0.1-1.0us per cell, mean    \
-         delta 1.5-3 us per cell).  Other K%2048==0 cells stay on the AC=16  \
-         fallbacks below where AC=32 was a tie or lost (notably 4096x4096    \
-         N=4 was -2.7%, do not extrapolate to untested cells).  Re-verify    \
-         per shape with benchmarks/kernels/sweep_bf16_kernel.py (extend the  \
-         ACHUNKS list to include 32 and rebuild with                         \
-         VLLM_SKINNY_GEMM_SWEEP_BF16=1). */                                  \
-      else if ((K_in == 2048) && (__N == 2 || __N == 3))                     \
-        /* M=2560 K=2048 N=2: 1.057x (z=21.5); N=3: 1.049x (z=12.8) */       \
-        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
-      else if ((K_in == 4096) && (__N == 1))                                 \
-        /* M=2560 K=4096 N=1: 1.041x (z=3.7); UR=4 not 2 for N=1 */          \
-        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 4, __N, 32)                     \
-      else if ((K_in == 4096) && (__N == 2) && (M_in < 4096))                \
-        /* M<4096 K=4096 N=2: 1.057x (z=13.1), W=16 wins at this M */        \
-        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
-      else if ((K_in == 4096) && (__N == 2) && (M_in >= 4096))               \
-        /* M>=4096 K=4096 N=2: 1.028x (z=6.2), W=32 wins at larger M */      \
-        WVSPLITK_CFG_AC(_THRDS, 4, 1, 2, __N, 32)                            \
-      else if ((K_in == 4096) && (__N == 3))                                 \
-        /* M=2560 K=4096 N=3: 1.031x (z=4.9) */                              \
-        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                     \
-      else if ((K_in == 8192) && (__N == 2))                                 \
-        /* M=2560 K=8192 N=2: 1.040x (z=9.3), W=32 wins at this K */         \
-        WVSPLITK_CFG_AC(_THRDS, 4, 1, 2, __N, 32)                            \
-      else if ((K_in % 2048 == 0) && (__N == 2))                             \
-        /* gfx1151 K%2048==0, N=2 only: YT=2 + W=32 + AC=16 + UR=4.          \
-           sweep_bf16_kernel.py 4-axis sweep showed this is the best         \
-           N=2 config across K in {2048, 4096, 8192} and 4096x4096,          \
-           1.06x (K=8192) to 1.60x (K=2048) over the prior AC=8 default. */  \
-        WVSPLITK_CFG_AC(_THRDS, 4, 2, 4, __N, 16)                            \
-      else if ((K_in % 2048 == 0) && (__N != 2))                             \
-        /* gfx1151 K%2048==0, N in {1, 3, 4} (K=2048 N=1 handled above):     \
-           YT=1 + W=16 + AC=16 + UR=4.  N=3/4 want YT=1 not YT=2 (LDS/VGPR   \
-           pressure from W=32 hurts them); same config also wins for N=1.    \
-           sweep showed 1.11x-1.19x (N=1), 1.23x-1.98x (N=3),                \
-           1.59x-2.73x (N=4) over the prior AC=8 defaults. */                \
-        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 4, __N, 16)                     \
-      else if (K_in <= 2048)                                                 \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                            \
-      else if (__N >= 2 && !fit_lds) {                                       \
-        if (K_in % 1024 == 0 && Kbp_in < max_lds_len / 2)                    \
-          WVSPLITK_CFG(_THRDS, _WVPRGRP, 2, 4, __N)                          \
-        else                                                                 \
-          WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                          \
-      } else if (__N == 1)                                                   \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 2, __N)                            \
-      else                                                                   \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 1, __N)                            \
-    } else {                                                                 \
-      if (_sYT <= 1)                                                         \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                            \
-      else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2))                  \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 2, 2, __N)                            \
-      else if (_sYT <= 4 * 3)                                                \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 3, 2, __N)                            \
-      else if (__N == 4)                                                     \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 1, __N)                            \
-      else                                                                   \
-        WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 2, __N)                            \
-    }                                                                        \
+#define WVSPLIT_TILE_CFG(_THRDS, _WVPRGRP, _sYT, __N)                          \
+  {                                                                            \
+    bool fit_lds = (Kbp_in * N_in <= max_lds_len);                             \
+    if (is_gfx11()) {                                                          \
+      /* Three cases, derived from a paired interleaved A/B of the unified     \
+         config against the per-shape tuning it replaced (2 reps each, one     \
+         exclusive window, .so swapped per process; rep-to-rep median 0.63%).  \
+                                                                            \  \
+         Short K keeps YTILE=2 because a round is then only a slot or two, so  \
+         the per-round reduction and m-loop bookkeeping are a large share of   \
+         it and YTILE amortises them. A_CHUNK=16 also keeps THRDS*A_CHUNK <= K \
+         so no lane idles. Worth -1.0% on 2048x512.                            \
+                                                                            \  \
+         K%1024==512 below 8192 keeps its old YTILE=4/A_CHUNK=8 tuning. It is  \
+         the only family the unified config regressed: K=2560 lost 1.9-2.2%    \
+         and K=3584 lost up to 1.4%, systematically across all N. Above 8192   \
+         the same family wins instead (K=9728 -2.1%, K=18944 -3.0%) because    \
+         the K sweep is long enough to amortise the extra rounds, so the       \
+         threshold rather than the family is what selects.                     \
+                                                                            \  \
+         Everything else takes the unified YTILE=1/UNRL=2/A_CHUNK=32: wins on  \
+         K=2048 (-1.1 to -2.9%) and K=14336 (-1.2%), neutral on K=4096         \
+         (+0.2 to +0.8%, inside the noise floor), and it collapses what were   \
+         eight distinct tuples into one. All three cases hold PD*YTILE*        \
+         A_CHUNK/8 = 4 loads in flight per wave. */                            \
+      /* A_CHUNK must divide K -- see the note at the bigA read in             \
+         wvSplitK_hf_sml_. The op only guarantees K % 8 == 0, so the width     \
+         is derived from K rather than assumed. K%1024==512 implies 32 | K     \
+         and A_CHUNK=8 is always safe, so only the 16 and 32 cases need a      \
+         divisibility test. The fallback tuple is already instantiated, so     \
+         this costs no extra template. */                                      \
+      if (K_in < (_THRDS) * 32 && K_in % 16 == 0)                              \
+        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 2, 2, __N, 16)                       \
+      else if ((K_in % 1024 == 512) && (K_in < 8192) && (_sYT >= 40))          \
+        WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 1, __N)                              \
+      else if (K_in % 32 == 0)                                                 \
+        WVSPLITK_CFG_AC(_THRDS, _WVPRGRP, 1, 2, __N, 32)                       \
+      else                                                                     \
+        WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                              \
+    } else {                                                                   \
+      if (_sYT <= 1)                                                           \
+        WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                              \
+      else if ((__N == 1) || (!fit_lds) || (_sYT <= 4 * 2))                    \
+        WVSPLITK_CFG(_THRDS, _WVPRGRP, 2, 2, __N)                              \
+      else if (_sYT <= 4 * 3)                                                  \
+        WVSPLITK_CFG(_THRDS, _WVPRGRP, 3, 2, __N)                              \
+      else if (__N == 4)                                                       \
+        WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 1, __N)                              \
+      else                                                                     \
+        WVSPLITK_CFG(_THRDS, _WVPRGRP, 4, 2, __N)                              \
+    }                                                                          \
   }
 
 // WVSPLITK_CFG arguments are: (THRDS, WVPRGRP, YTILE, UNRL, N).
@@ -1600,7 +1573,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 #define WVSPLIT_TILE(_sYT, __N)                                 \
   {                                                             \
     if (on_gfx1x()) { /* gfx11xx/GFX12, wave32 */               \
-      WVSPLIT_TILE_CFG(/*THRDS=*/32, /*WVPRGRP=*/4, _sYT, __N) \
+      WVSPLIT_TILE_CFG(/*THRDS=*/32, /*WVPRGRP=*/4, _sYT, __N)  \
     } else { /* GFX9, wave64 */                                 \
       WVSPLIT_TILE_CFG(/*THRDS=*/64, /*WVPRGRP=*/16, _sYT, __N) \
     }                                                           \
