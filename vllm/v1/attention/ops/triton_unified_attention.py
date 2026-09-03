@@ -30,6 +30,15 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx1151
+
+    _ON_NAVI = current_platform.is_navi()
+    _ON_GFX1151 = on_gfx1151()
+else:
+    _ON_NAVI = False
+    _ON_GFX1151 = False
+
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
@@ -810,8 +819,8 @@ def _get_tile_size(
     # AMD Triton requires TILE_SIZE to be a power of 2
     # Note: this may disable the fast path (TILE_SIZE == BLOCK_SIZE)
     # for non-power-of-2 block sizes
-    if current_platform.is_navi():
-        if current_platform.is_gfx1151() and is_prefill and head_size >= 80:
+    if _ON_NAVI:
+        if _ON_GFX1151 and is_prefill and head_size >= 80:
             tile_size = 32
         else:
             tile_size = triton.next_power_of_2(block_size)
@@ -1141,14 +1150,14 @@ def unified_attention(
             max_num_stages = 4
             if head_size > 128:
                 max_num_stages = 2
-            if current_platform.is_navi() and head_size > 256:
+            if _ON_NAVI and head_size > 256:
                 max_num_stages = 1
             # Navi (gfx11) decode at head_size>=80 with TILE_SIZE rounded up
             # to the next power-of-2 of block_size (often 1024–2048) and
             # 3-stage K/V software pipelining overflows the 64KB LDS budget.
             # Force a single stage when the head is wide enough for K/V tiles
             # to dominate; the smaller-head case keeps the default 3 stages.
-            if current_platform.is_navi() and head_size >= 80:
+            if _ON_NAVI and head_size >= 80:
                 max_num_stages = 1
             num_stages = min(3, max_num_stages)
             waves_per_eu = 2
@@ -1161,7 +1170,7 @@ def unified_attention(
         # Long context prefill optimization
         if max_seqlen_q >= 256:
             # Strix Halo (gfx1151) tuning from systematic experiments
-            if current_platform.is_gfx1151():
+            if _ON_GFX1151:
                 num_stages = 3
                 if head_size >= 80:
                     BLOCK_M = 64
@@ -1179,7 +1188,7 @@ def unified_attention(
 
             # Navi memory optimization: Cap BLOCK_M to fit Q tile in 64KB LDS
             q_tile_bytes = BLOCK_M * head_size * element_size
-            if current_platform.is_navi() and q_tile_bytes > 65536:
+            if _ON_NAVI and q_tile_bytes > 65536:
                 max_block_m = 65536 // (head_size * element_size)
                 # Reserve headroom for K/V tiles
                 BLOCK_M = min(BLOCK_M, max_block_m - max_block_m % 16)
@@ -1189,7 +1198,7 @@ def unified_attention(
             # head_size>=80 + num_stages=3 overflows for head_size=128
             # (Qwen3.5-style) since each pipeline stage holds independent
             # K and V tiles.
-            if current_platform.is_navi():
+            if _ON_NAVI:
                 num_stages = _cap_num_stages_for_navi_lds(
                     num_stages, BLOCK_M, TILE_SIZE_PREFILL, head_size, element_size
                 )
@@ -1229,7 +1238,7 @@ def unified_attention(
     grid: tuple[Any, ...]
     config = {}
 
-    use_swapped_grid = not use_3d and current_platform.is_gfx1151()
+    use_swapped_grid = not use_3d and _ON_GFX1151
 
     if not use_3d:
         if use_swapped_grid:
@@ -1240,7 +1249,7 @@ def unified_attention(
     else:
         tile_size = TILE_SIZE_DECODE
 
-        if current_platform.is_gfx1151():
+        if _ON_GFX1151:
             is_large_mha = num_kv_heads >= 32 and head_size >= 128
             is_small_head_or_mqa = head_size <= 64 or num_kv_heads == 1
 
@@ -1264,7 +1273,7 @@ def unified_attention(
             waves_per_eu = 6 if is_large_mha else (2 if is_small_head_or_mqa else 4)
 
         # Navi memory: Apply the same cap the 2D path uses
-        if current_platform.is_navi():
+        if _ON_NAVI:
             num_stages = _cap_num_stages_for_navi_lds(
                 num_stages, BLOCK_M, TILE_SIZE_DECODE, head_size, q.element_size()
             )
