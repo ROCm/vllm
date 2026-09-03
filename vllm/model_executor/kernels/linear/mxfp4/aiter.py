@@ -96,12 +96,26 @@ if is_aiter_found_and_supported():
             else:
                 x_q = x
                 x_s = x_scales
+            # gfx1250: aiter's Triton gemm_afp4wfp4 corrupts rows when M > 512 and M % 16 != 0
+            # Pad the quantized activation to a multiple of 16 rows and slice the result
+            from vllm.platforms.rocm import on_gfx1250
+
+            M_real = x_q.shape[0]
+            if on_gfx1250() and M_real > 512 and M_real % 16 != 0:
+                pad = (-M_real) % 16
+                x_q = torch.cat(
+                    [x_q, torch.zeros((pad, *x_q.shape[1:]), dtype=x_q.dtype, device=x_q.device)]
+                )
+                # e8m0 code 127 == scale 1.0
+                x_s = torch.cat(
+                    [x_s, torch.full((pad, *x_s.shape[1:]), 127, dtype=x_s.dtype, device=x_s.device)]
+                )
             y = torch.empty(
                 x_q.shape[0], weight.shape[0], device=x_q.device, dtype=out_dtype
             )
 
             gemm_afp4wfp4(x_q, weight, x_s, weight_scale.T, out_dtype, y)
-            return y
+            return y[:M_real]
 
     def gemm_with_dynamic_quant_fake(
         x: torch.Tensor,

@@ -396,7 +396,8 @@ def use_rocm_custom_paged_attention(
 ) -> bool:
     # custom paged attn always supported on V0. On V1, requires sliding window
     # disabled due to observed numerical discrepancy.
-    if on_cdna():
+    # gfx1250: MFMA16 ll4mi kernel compiles but faults at runtime (HSA_STATUS_ERROR_EXCEPTION)
+    if on_cdna() and not on_gfx1250():
         return (
             (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
@@ -490,6 +491,11 @@ def _get_backend_priorities(
     elif rocm_aiter_ops.is_rdna_aiter_enabled():
         backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     backends.append(AttentionBackendEnum.TRITON_ATTN)
+    if on_gfx1250():
+        # gfx1250: ROCM_ATTN dispatches the faulting CDNA paged-attention kernel and the
+        # aiter backends NaNs for fp8 q / overflow LDS; TRITON_ATTN is the verified path (fp8 KV)
+        backends.remove(AttentionBackendEnum.TRITON_ATTN)
+        backends.insert(0, AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
 
     return backends
@@ -1113,8 +1119,10 @@ class RocmPlatform(Platform):
 
         #  Aiter rms norm perform best when CUDA Graph capture is enabled.
         # TODO(luka/TJ) remove env vars completely
+        # gfx1250: native RMSNorm lets inductor fuse embedding+RMSNorm into a kernel
+        # that hits the Triton buffer-ops miscompile
         if (
-            cc.cudagraph_mode != CUDAGraphMode.NONE
+            (cc.cudagraph_mode != CUDAGraphMode.NONE or on_gfx1250())
             and envs.VLLM_ROCM_USE_AITER
             and envs.VLLM_ROCM_USE_AITER_RMSNORM
             and not on_rdna4()

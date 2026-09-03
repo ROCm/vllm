@@ -153,7 +153,9 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         from aiter.ops.triton.unified_attention import unified_attention
 
         self.unified_attention = unified_attention
-        self.supports_quant_query_input = True
+        # gfx1250: aiter unified attention returns NaN for fp8 queries 
+        # keep q in bf16 until fixed
+        self.supports_quant_query_input = not on_gfx1250()
 
         # Layout flag: must mirror get_kv_cache_shape, which is attn_type
         # agnostic because the allocation is shared across layers.
