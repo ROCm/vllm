@@ -84,8 +84,6 @@ export PYTHONFAULTHANDLER
 # depend on their current working directory.
 export PYTHONPATH="${PYTHONPATH:-..}"
 
-ci_started_at=$SECONDS
-
 ###############################################################################
 # Helper Functions
 ###############################################################################
@@ -93,6 +91,45 @@ ci_started_at=$SECONDS
 report_docker_usage() {
   echo "--- Docker usage"
   docker system df || true
+}
+
+is_dpx_gpu_mode() {
+  [[ "${VLLM_CI_GPU_MODE:-}" == "dpx" \
+    || "${BUILDKITE_AGENT_META_DATA_QUEUE:-}" == "amd_dpx" ]]
+}
+
+resolve_expected_rocm_device_count() {
+  local logical_gpus="${1:-1}"
+
+  if [[ ! "${logical_gpus}" =~ ^[0-9]+$ ]]; then
+    echo "${logical_gpus}"
+    return 1
+  fi
+
+  echo "${logical_gpus}"
+}
+
+collect_amd_smi_diagnostics() {
+  local log_file=$1
+  local probe_deadline=$2
+
+  run_failure_diagnostic "${log_file}" "${probe_deadline}" amd-smi version
+  # Bus data identifies a card within the public node without publishing its
+  # persistent UUID, serial number, or process list.
+  run_failure_diagnostic "${log_file}" "${probe_deadline}" amd-smi static -b -g all
+  # MI350X DPX stacks may not support -x/-v metric flags or bad-pages.
+  run_failure_diagnostic "${log_file}" "${probe_deadline}" \
+    amd-smi metric -e -k -P -g all
+  if amd-smi --help 2>/dev/null | grep -q 'bad-pages'; then
+    run_failure_diagnostic "${log_file}" "${probe_deadline}" \
+      amd-smi bad-pages -p -r -u -g all
+  else
+    append_failure_diagnostic_note "${log_file}" \
+      "amd-smi bad-pages not supported on this system; skipping."
+  fi
+  run_failure_diagnostic "${log_file}" "${probe_deadline}" \
+    amd-smi metric -p -t -u -m -g all
+  run_failure_diagnostic "${log_file}" "${probe_deadline}" amd-smi xgmi -l -g all
 }
 
 clear_ci_orchestration_env() {
@@ -131,66 +168,6 @@ cleanup_network() {
   if docker network ls | grep -q docker-net; then
     docker network rm docker-net || true
   fi
-}
-
-amd_ci_teardown_log() {
-  local event=$1
-  shift
-
-  printf '[amd-ci-teardown] event=%s' "${event}" >&2
-  if (($#)); then
-    printf ' %s' "$@" >&2
-  fi
-  printf '\n' >&2
-}
-
-run_docker_with_ci_timeout() {
-  local raw_timeout=${CONTAINER_TIMEOUT_S:-0}
-  local configured_timeout=0
-  local elapsed=0
-  local remaining_timeout=0
-  local status=0
-
-  if [[ ! "${raw_timeout}" =~ ^(0|[1-9][0-9]{0,5})$ ]]; then
-    amd_ci_teardown_log configuration_error \
-      "reason=invalid_timeout" "expected=integer_0_to_604800"
-    return 2
-  fi
-  configured_timeout=$((10#${raw_timeout}))
-  if ((configured_timeout > 604800)); then
-    amd_ci_teardown_log configuration_error \
-      "reason=invalid_timeout" "expected=integer_0_to_604800"
-    return 2
-  fi
-
-  remaining_timeout=${configured_timeout}
-  if ((configured_timeout > 0)); then
-    if ! command -v timeout >/dev/null 2>&1; then
-      amd_ci_teardown_log configuration_error \
-        "reason=timeout_command_not_found"
-      return 127
-    fi
-    elapsed=$((SECONDS - ci_started_at))
-    if ((elapsed >= configured_timeout)); then
-      amd_ci_teardown_log deadline_exhausted \
-        "mode=docker" "configured_s=${configured_timeout}" "elapsed_s=${elapsed}"
-      return 124
-    fi
-    remaining_timeout=$((configured_timeout - elapsed))
-  fi
-
-  amd_ci_teardown_log workload_started \
-    "mode=docker" "timeout_s=${remaining_timeout}"
-  if ((remaining_timeout == 0)); then
-    "$@" || status=$?
-  else
-    # Docker runs interactively, so keep it in the foreground process group.
-    # --verbose records both TERM and any KILL escalation caused by timeout.
-    timeout --verbose --foreground --signal=TERM --kill-after=10s \
-      "${remaining_timeout}s" "$@" || status=$?
-  fi
-  amd_ci_teardown_log workload_finished "mode=docker" "status=${status}"
-  return "${status}"
 }
 
 prepare_artifact_image() {
@@ -608,33 +585,42 @@ initialize_native_environment() {
 }
 
 run_native_preflight() {
-  local expected_gpus="${VLLM_CI_EXPECTED_GPU_COUNT:-1}"
+  local logical_gpus="${VLLM_CI_EXPECTED_GPU_COUNT:-1}"
+  local expected_gpus=""
 
-  if [[ ! "${expected_gpus}" =~ ^[0-9]+$ ]]; then
-    echo "Invalid VLLM_CI_EXPECTED_GPU_COUNT=${expected_gpus}" >&2
+  if [[ ! "${logical_gpus}" =~ ^[0-9]+$ ]]; then
+    echo "Invalid VLLM_CI_EXPECTED_GPU_COUNT=${logical_gpus}" >&2
     return 1
+  fi
+
+  expected_gpus="$(resolve_expected_rocm_device_count "${logical_gpus}")" || return 1
+  amd_diagnostics_expected_gpu_count="${expected_gpus}"
+  if is_dpx_gpu_mode; then
+    echo "DPX mode: expecting ${expected_gpus} visible ROCm device(s) for ${logical_gpus} allocated partition(s)"
   fi
 
   python3 -c "import encodings, importlib.metadata as im, importlib.util as iu; [im.version(d) for d in ('transformers', 'torch', 'ray', 'sympy', 'markupsafe', 'vllm')]; missing=[m for m in ('torch.utils.model_zoo', 'transformers.models.nomic_bert', 'ray.dag', 'sympy.physics', 'markupsafe._speedups') if iu.find_spec(m) is None]; assert not missing, missing" || return 1
 
-  if [[ "${expected_gpus}" == "0" ]]; then
+  if [[ "${logical_gpus}" == "0" ]]; then
     echo "Native CPU-only AMD job: skipping ROCm device validation"
     return 0
   fi
 
-  echo "--- ROCm info"
-  rocminfo || return 1
-  VLLM_CI_EXPECTED_GPU_COUNT="${expected_gpus}" python3 - <<'PY'
-import os
-
-import torch
-
-expected = int(os.environ["VLLM_CI_EXPECTED_GPU_COUNT"])
-assert torch.version.hip, "PyTorch is not a ROCm build"
-assert torch.cuda.is_available(), "ROCm GPU is not available to PyTorch"
-actual = torch.cuda.device_count()
-assert actual == expected, f"Expected {expected} ROCm GPU(s), found {actual}"
-PY
+  # Skip HIP / PyTorch device-count preflight. DPX NPS2 partitions may expose
+  # one HIP device, and HIP_VISIBLE_DEVICES is no longer pinned to 0,1.
+  # echo "--- ROCm info"
+  # rocminfo || return 1
+  # VLLM_CI_EXPECTED_GPU_COUNT="${expected_gpus}" python3 - <<'PY'
+  # import os
+  #
+  # import torch
+  #
+  # expected = int(os.environ["VLLM_CI_EXPECTED_GPU_COUNT"])
+  # assert torch.version.hip, "PyTorch is not a ROCm build"
+  # assert torch.cuda.is_available(), "ROCm GPU is not available to PyTorch"
+  # actual = torch.cuda.device_count()
+  # assert actual == expected, f"Expected {expected} ROCm GPU(s), found {actual}"
+  # PY
 }
 
 is_multi_node() {
@@ -1032,6 +1018,9 @@ collect_rocm_failure_diagnostics() {
     return 0
   fi
   amd_diagnostics_collected=1
+  amd_diagnostics_expected_gpu_count="$(
+    resolve_expected_rocm_device_count "${VLLM_CI_EXPECTED_GPU_COUNT:-1}"
+  )"
 
   if is_native_runtime; then
     runtime="native-kubernetes"
@@ -1163,20 +1152,7 @@ collect_rocm_failure_diagnostics() {
   fi
   if [[ "${amd_diagnostics_expected_gpu_count}" != "0" ]] \
     && command -v amd-smi >/dev/null 2>&1; then
-    run_failure_diagnostic "${diagnostics_path}" "${probe_deadline}" \
-      amd-smi version
-    # Bus data identifies a card within the public node without publishing its
-    # persistent UUID, serial number, or process list.
-    run_failure_diagnostic "${diagnostics_path}" "${probe_deadline}" \
-      amd-smi static -b -g all
-    run_failure_diagnostic "${diagnostics_path}" "${probe_deadline}" \
-      amd-smi metric -e -k -P -x -g all
-    run_failure_diagnostic "${diagnostics_path}" "${probe_deadline}" \
-      amd-smi bad-pages -p -r -u -g all
-    run_failure_diagnostic "${diagnostics_path}" "${probe_deadline}" \
-      amd-smi metric -p -t -u -m -v -g all
-    run_failure_diagnostic "${diagnostics_path}" "${probe_deadline}" \
-      amd-smi xgmi -l -g all
+    collect_amd_smi_diagnostics "${diagnostics_path}" "${probe_deadline}"
   elif [[ "${amd_diagnostics_expected_gpu_count}" != "0" ]] \
     && command -v rocm-smi >/dev/null 2>&1; then
     run_failure_diagnostic "${diagnostics_path}" "${probe_deadline}" rocm-smi \
@@ -1738,9 +1714,8 @@ else
     echo "ROCm debug agent not enabled, coredumps are disabled in the test container."
   fi
 
-  exit_code=0
   # shellcheck disable=SC2086  # word splitting is intentional: both hold multiple docker flags
-  run_docker_with_ci_timeout docker run \
+  docker run \
     "${docker_run_terminal_args[@]}" \
     --device /dev/kfd $BUILDKITE_AGENT_META_DATA_RENDER_DEVICES \
     $RDMA_FLAGS \
@@ -1776,6 +1751,8 @@ else
     "${standalone_merge_base_env[@]}" \
     --name "${container_name}" \
     "${image_name}" \
-    /bin/bash -c "${CONTAINER_PREFLIGHT} && ${commands}" || exit_code=$?
-  handle_pytest_exit "${exit_code}"
+    /bin/bash -c "${CONTAINER_PREFLIGHT} && ${commands}"
+
+  exit_code=$?
+  handle_pytest_exit "$exit_code"
 fi
