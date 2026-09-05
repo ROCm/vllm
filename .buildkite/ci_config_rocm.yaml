@@ -27,6 +27,8 @@ run_all_patterns:
   - "tools/build_rust.py"
   - "tools/install_torchcodec_rocm.sh"
   - "tests/vllm_test_utils/"
+  - "tests/kernels/moe/conftest.py"
+  - "tests/compile/passes/conftest.py"
   - "vllm/envs.py"
   - "vllm/__init__.py"
   - "csrc/"

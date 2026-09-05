@@ -1399,3 +1399,5 @@ zipp==3.23.0
 # nvidia-cusparselt-cu13
 # nvidia-nccl-cu13
 # nvidia-nvshmem-cu13
+
+# force-rebuild: workspace-manager-fix
