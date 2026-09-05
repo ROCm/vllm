@@ -1903,3 +1903,20 @@ def fake_vllm_ir(monkeypatch):
     yield
 
     del test_lib
+
+
+# ---------------------------------------------------------------------------
+# WorkspaceManager isolation — DPX / high-concurrency (max-in-flight >= 32)
+# reset_workspace_manager() clears the module-level _manager global so that
+# consecutive tests start from a clean state. Without this, a previous test's
+# teardown may leave _manager=None (AssertionError on next workspace access).
+# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _reset_workspace_manager_after_test():
+    """Reset WorkspaceManager global after every test for isolation."""
+    yield
+    try:
+        from vllm.v1.worker.workspace import reset_workspace_manager
+        reset_workspace_manager()
+    except Exception:
+        pass
