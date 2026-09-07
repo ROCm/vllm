@@ -1249,29 +1249,6 @@ def unified_attention(
     else:
         tile_size = TILE_SIZE_DECODE
 
-        if _ON_GFX1151:
-            is_large_mha = num_kv_heads >= 32 and head_size >= 128
-            is_small_head_or_mqa = head_size <= 64 or num_kv_heads == 1
-
-            BLOCK_M = 64 if is_large_mha else 16
-            BLOCK_M = max(BLOCK_M, triton.next_power_of_2(num_queries_per_kv))
-            BLOCK_Q = BLOCK_M // num_queries_per_kv
-            total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-
-            # num_par_softmax_segments is decided by the caller (so the
-            # segment buffers it allocated are exactly the size the launch
-            # grid will use). See TritonAttentionMetadataBuilder in
-            # vllm/v1/attention/backends/triton_attn.py for the gfx1151
-            # per-shape tuning.
-            assert num_par_softmax_segments is not None, (
-                "gfx1151 3D decode requires num_par_softmax_segments to be "
-                "supplied by the caller"
-            )
-
-            num_warps = 4
-            num_stages = 4 if is_large_mha else (1 if num_kv_heads == 1 else 3)
-            waves_per_eu = 6 if is_large_mha else (2 if is_small_head_or_mqa else 4)
-
         # Navi memory: Apply the same cap the 2D path uses
         if _ON_NAVI:
             num_stages = _cap_num_stages_for_navi_lds(
