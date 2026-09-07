@@ -131,6 +131,13 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.headdim = model_config.get_head_size()
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
 
+        # gfx1151: a single KV head or a small head leaves the default
+        # segment count under-occupied on the 3D decode path.  The buffers
+        # below are sized from this value, so the launch grid matches by
+        # construction.
+        if _ON_GFX1151 and (self.headdim <= 64 or self.num_heads_kv == 1):
+            self.num_par_softmax_segments = 32
+
         # Check if CUDA Graphs are enabled for decode
         self.decode_cudagraph_enabled = (
             self.vllm_config.compilation_config.cudagraph_mode

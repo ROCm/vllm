@@ -1249,6 +1249,14 @@ def unified_attention(
     else:
         tile_size = TILE_SIZE_DECODE
 
+        if _ON_GFX1151:
+            if num_kv_heads == 1:
+                num_warps, num_stages, waves_per_eu = 4, 1, 2
+            elif head_size <= 64:
+                num_warps, num_stages, waves_per_eu = 4, 3, 2
+            elif num_kv_heads <= 4 and head_size <= 128:
+                num_warps, num_stages, waves_per_eu = 4, 3, 4
+
         # Navi memory: Apply the same cap the 2D path uses
         if _ON_NAVI:
             num_stages = _cap_num_stages_for_navi_lds(
