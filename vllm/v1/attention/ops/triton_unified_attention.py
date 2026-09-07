@@ -1238,7 +1238,9 @@ def unified_attention(
     grid: tuple[Any, ...]
     config = {}
 
-    use_swapped_grid = not use_3d and _ON_GFX1151
+    # head_size 64 regresses with the swapped order, so the swap follows the
+    # same head_size boundary the rest of the gfx1151 tuning uses.
+    use_swapped_grid = not use_3d and _ON_GFX1151 and head_size >= 80
 
     if not use_3d:
         if use_swapped_grid:
