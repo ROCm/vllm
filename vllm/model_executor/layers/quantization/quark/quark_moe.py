@@ -1455,6 +1455,15 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
             global_num_experts=layer.global_num_experts,
             expert_map=layer.expert_map,
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            # Monolithic kernels route internally and need the grouped top-k /
+            # noaux_tc parameters from the layer (as Mxfp4MoEMethod and
+            # Fp8MoEMethod pass them). Without these, DeepSeek-style routing
+            # (Kimi-K2.6, DSR1) selects experts without the correction bias
+            # and drops routed_scaling_factor.
+            num_expert_group=layer.num_expert_group,
+            topk_group=layer.topk_group,
+            e_score_correction_bias=layer.e_score_correction_bias,
+            routed_scaling_factor=layer.routed_scaling_factor,
         )
 
 

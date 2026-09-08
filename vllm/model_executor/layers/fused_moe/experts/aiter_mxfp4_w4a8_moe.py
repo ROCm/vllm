@@ -778,11 +778,19 @@ def aiter_triton_kernel_w4a4_moe_forward(
     aiter_routing = _routing_mod.routing
 
     gating_output = patch_gating_output(gating_output, global_num_experts)
+    # Route in fp32. The DeepSeek/Kimi gate emits bf16 logits when the AITER
+    # MoE path is enabled, and aiter's fused routing returns the gate weights
+    # (after renorm and routed_scaling_factor) in the logits dtype.
+    gating_output = gating_output.to(torch.float32)
 
     if score_mode is not None:
         use_grouped_topk = (
             num_expert_group is not None and num_expert_group > 1
         )
+        # aiter's fused routing asserts an fp32 bias; DeepseekV2MoE casts
+        # e_score_correction_bias to the router dtype (bf16) with AITER MoE on.
+        if e_score_correction_bias is not None:
+            e_score_correction_bias = e_score_correction_bias.to(torch.float32)
         routing_data, gather_idx, scatter_idx = aiter_routing(
             gating_output,
             topk,
@@ -815,17 +823,19 @@ def aiter_triton_kernel_w4a4_moe_forward(
 
     gammas = routing_data.gate_scal if routing_data else None
 
-    swiglu_limit = (
-        quant_config.gemm1_clamp_limit
-        if quant_config.gemm1_clamp_limit is not None
-        else 7.0
-    )
     # SWIGLUOAI needs the alpha/residual swiglu fused into the GEMM1 epilogue,
     # which reads gate/up interleaved along N (see the oracle's weight prep).
     fused_swiglu = activation in (
         MoEActivation.SWIGLUOAI,
         MoEActivation.SWIGLUOAI_UNINTERLEAVE,
     )
+    # The 7.0 clamp is the GPT-OSS SwiGLU-OAI default. Plain SiLU (DeepSeek,
+    # Kimi) has no clamp: fused_clamp_act_mul skips it for limit <= 0. With
+    # the clamp on, SiLU pre-activations above 7 were silently clipped.
+    if quant_config.gemm1_clamp_limit is not None:
+        swiglu_limit = quant_config.gemm1_clamp_limit
+    else:
+        swiglu_limit = 7.0 if fused_swiglu else 0.0
     swiglu_kwargs: dict[str, object] = {}
     if fused_swiglu:
         assert quant_config.gemm1_beta in (None, 1.0), (
