@@ -238,7 +238,13 @@ def rocm_unquantized_gemm_impl(
     ) <= 128 * 1024 * 12  # deterministic
     fits_wvsplitkrc &= CuNeeded <= cu_count
 
-    skinny_operands_compatible = weight.is_contiguous() and (
+    # The skinny kernels need K contiguous, not the whole tensor: the host
+    # captures Kap/Kbp = stride(0) and the kernel indexes B_[row * Kbp] and
+    # s[k_ + Kap * n] rather than assuming K, and the LDS-fit check is sized
+    # with Kbp. Requiring is_contiguous() here would disqualify every weight
+    # that pad_weights_avoid_cache_cliff_on_gfx11 has padded -- that pad only
+    # changes stride(0) -- and drop those layers onto the slower fallback GEMM.
+    skinny_operands_compatible = weight.stride(-1) == 1 and (
         bias is None or bias.is_contiguous()
     )
 
