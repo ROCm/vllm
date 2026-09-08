@@ -40,7 +40,8 @@
 //     [GDN_CHUNK][GDN_HEAD_DIM] buffer holds V beta, becomes Y, then becomes
 //     v_new in place.
 //
-// q, k, v and the output are bf16; g, beta and the state are f32. Sequences are
+// q, k, v and the output are bf16 or fp16 (all four alike, chosen by the
+// IS_FP16 template parameter); g, beta and the state are f32. Sequences are
 // packed varlen behind cu_seqlens. A value head reads key head head / (H / Hg).
 // g is the raw per-token log decay: the cumsum is taken here, over this
 // kernel's own chunk.
@@ -143,6 +144,39 @@ __device__ __forceinline__ uint16_t gdn_f32_to_bf16(float f) {
   return static_cast<uint16_t>(rounded >> 16);
 }
 
+// fp16 goes through the hardware conversions rather than the hand-rolled shift
+// and round above: bf16 is a truncation of f32 so it is a couple of integer
+// ops, while fp16 needs a different exponent bias and subnormal handling that
+// v_cvt_f32_f16 / v_cvt_f16_f32 already do in one instruction each.
+__device__ __forceinline__ float gdn_fp16_to_f32(uint16_t x) {
+  return static_cast<float>(std::bit_cast<_Float16>(x));
+}
+
+__device__ __forceinline__ uint16_t gdn_f32_to_fp16(float f) {
+  return std::bit_cast<uint16_t>(static_cast<_Float16>(f));
+}
+
+// The element type is a compile-time parameter so the conversion resolves at
+// compile time: this sits in the innermost load loop, and a runtime branch
+// there would cost more than the duplicated code costs.
+template <bool IS_FP16>
+__device__ __forceinline__ float gdn_load(uint16_t x) {
+  if constexpr (IS_FP16) {
+    return gdn_fp16_to_f32(x);
+  } else {
+    return gdn_bf16_to_f32(x);
+  }
+}
+
+template <bool IS_FP16>
+__device__ __forceinline__ uint16_t gdn_store(float f) {
+  if constexpr (IS_FP16) {
+    return gdn_f32_to_fp16(f);
+  } else {
+    return gdn_f32_to_bf16(f);
+  }
+}
+
 // A block of GDN_BLOCK_SIZE threads is 32 waves, so two blocks per WGP come to
 // 16 waves per SIMD.  Requesting that caps the register allocation at
 // file_size/16, and the family is not uniform in file size: gfx1151 has 1536
@@ -187,6 +221,7 @@ __device__ __forceinline__ uint16_t gdn_f32_to_bf16(float f) {
 #define GDN_CHUNKED_ARGS \
   q, k, v, g, beta, state_in, dst, state_out, cu_seqlens, H, Hg, v_per_k, scale
 
+template <bool IS_FP16>
 __device__ __forceinline__ void gdn_chunked_body(GDN_CHUNKED_PARAMS) {
   constexpr int CHUNK = GDN_CHUNK;
   constexpr int HEAD_DIM = GDN_HEAD_DIM;
@@ -289,9 +324,9 @@ __device__ __forceinline__ void gdn_chunked_body(GDN_CHUNKED_PARAMS) {
       const int64_t v_idx =
           tok * H * HEAD_DIM + static_cast<int64_t>(head) * HEAD_DIM + s;
 
-      s_k[t][s] = valid ? gdn_bf16_to_f32(k[qk_idx]) : 0.0f;
-      s_q[t][s] = valid ? gdn_bf16_to_f32(q[qk_idx]) * scale : 0.0f;
-      s_y[t][s] = valid ? gdn_bf16_to_f32(v[v_idx]) : 0.0f;
+      s_k[t][s] = valid ? gdn_load<IS_FP16>(k[qk_idx]) : 0.0f;
+      s_q[t][s] = valid ? gdn_load<IS_FP16>(q[qk_idx]) * scale : 0.0f;
+      s_y[t][s] = valid ? gdn_load<IS_FP16>(v[v_idx]) : 0.0f;
     }
     __syncthreads();
 
@@ -448,10 +483,10 @@ __device__ __forceinline__ void gdn_chunked_body(GDN_CHUNKED_PARAMS) {
         const int64_t dst_off =
             static_cast<int64_t>(bos + tok0 + i) * H * HEAD_DIM +
             static_cast<int64_t>(head) * HEAD_DIM + col0;
-        // col0 is even, so the bf16 pair is 4-byte aligned
+        // col0 is even, so the 16-bit pair is 4-byte aligned
         const uint32_t packed =
-            static_cast<uint32_t>(gdn_f32_to_bf16(out0)) |
-            (static_cast<uint32_t>(gdn_f32_to_bf16(out1)) << 16);
+            static_cast<uint32_t>(gdn_store<IS_FP16>(out0)) |
+            (static_cast<uint32_t>(gdn_store<IS_FP16>(out1)) << 16);
         *reinterpret_cast<uint32_t*>(&dst[dst_off]) = packed;
       }
     }
@@ -486,15 +521,17 @@ __device__ __forceinline__ void gdn_chunked_body(GDN_CHUNKED_PARAMS) {
   }
 }
 
+template <bool IS_FP16>
 __global__ void __launch_bounds__(GDN_BLOCK_SIZE, GDN_MIN_WAVES_PER_SIMD)
     gdn_chunked_kernel_wgp(GDN_CHUNKED_PARAMS) {
-  gdn_chunked_body(GDN_CHUNKED_ARGS);
+  gdn_chunked_body<IS_FP16>(GDN_CHUNKED_ARGS);
 }
 
+template <bool IS_FP16>
 __global__ void GDN_CU_MODE __launch_bounds__(GDN_BLOCK_SIZE,
                                               GDN_MIN_WAVES_PER_SIMD)
     gdn_chunked_kernel_cu(GDN_CHUNKED_PARAMS) {
-  gdn_chunked_body(GDN_CHUNKED_ARGS);
+  gdn_chunked_body<IS_FP16>(GDN_CHUNKED_ARGS);
 }
 
 }  // namespace
@@ -504,10 +541,15 @@ void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                  std::optional<torch::Tensor> initial_state,
                  torch::Tensor& cu_seqlens, torch::Tensor& out,
                  torch::Tensor& final_state, double scale) {
-  TORCH_CHECK(q.scalar_type() == at::kBFloat16, "q must be bf16");
-  TORCH_CHECK(k.scalar_type() == at::kBFloat16, "k must be bf16");
-  TORCH_CHECK(v.scalar_type() == at::kBFloat16, "v must be bf16");
-  TORCH_CHECK(out.scalar_type() == at::kBFloat16, "out must be bf16");
+  // bf16 and fp16 are both 16 bits wide and the kernel works in fp32
+  // throughout, so the element type only picks the conversion at the load and
+  // the store.  All four tensors must agree: the kernel reads one type.
+  const auto dtype = q.scalar_type();
+  TORCH_CHECK(dtype == at::kBFloat16 || dtype == at::kHalf,
+              "q must be bf16 or fp16, got ", dtype);
+  TORCH_CHECK(k.scalar_type() == dtype, "k must match q's dtype");
+  TORCH_CHECK(v.scalar_type() == dtype, "v must match q's dtype");
+  TORCH_CHECK(out.scalar_type() == dtype, "out must match q's dtype");
   TORCH_CHECK(g.scalar_type() == at::kFloat, "g must be fp32");
   TORCH_CHECK(beta.scalar_type() == at::kFloat, "beta must be fp32");
   TORCH_CHECK(final_state.scalar_type() == at::kFloat, "state must be fp32");
@@ -545,8 +587,13 @@ void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
   // CU mode leaves the second CU of each WGP idle and costs about a quarter of
   // the op; above it every CU is busy either way and CU mode is worth ~10%.
   const int nsm = props->multiProcessorCount;
+  const bool cu_mode = H * n_seqs > nsm;
+  const bool is_fp16 = dtype == at::kHalf;
   const auto kernel =
-      (H * n_seqs > nsm) ? gdn_chunked_kernel_cu : gdn_chunked_kernel_wgp;
+      is_fp16 ? (cu_mode ? gdn_chunked_kernel_cu</*IS_FP16=*/true>
+                         : gdn_chunked_kernel_wgp</*IS_FP16=*/true>)
+              : (cu_mode ? gdn_chunked_kernel_cu</*IS_FP16=*/false>
+                         : gdn_chunked_kernel_wgp</*IS_FP16=*/false>);
 
   kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const uint16_t*>(q.data_ptr()),
