@@ -31,15 +31,17 @@ from vllm.third_party.flash_linear_attention.ops.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
 from vllm.third_party.flash_linear_attention.ops.chunk_o import chunk_fwd_o
+from vllm.third_party.flash_linear_attention.ops.chunk_scaled_dot_kkt import (
+    chunk_scaled_dot_kkt_fwd,
+)
 from vllm.third_party.flash_linear_attention.ops.cumsum import chunk_local_cumsum
 from vllm.third_party.flash_linear_attention.ops.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
+from vllm.third_party.flash_linear_attention.ops.solve_tril import solve_tril
 from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
-from vllm.third_party.flash_linear_attention.ops.wy_fast_doubly_fused import (
-    fused_kkt_solve_tril_recompute_w_u_fwd,
-)
+from vllm.third_party.flash_linear_attention.ops.wy_fast import recompute_w_u_fwd
 
 # Qwen3.5/3.6 35B-A3B delta-net: 32 value heads, 16 key heads, head dim 128.
 DEFAULT_HV = 32
@@ -247,14 +249,33 @@ def breakdown(inp: Inputs) -> None:
         cu_seqlens=inp.cu_seqlens,
         chunk_indices=inp.chunk_indices,
     )
-    w, u = fused_kkt_solve_tril_recompute_w_u_fwd(
-        k=inp.k,
-        v=inp.v,
-        beta=inp.beta,
-        g_cumsum=g_cs,
-        cu_seqlens=inp.cu_seqlens,
-        chunk_indices=inp.chunk_indices,
-    )
+
+    def _wy_chain():
+        A = chunk_scaled_dot_kkt_fwd(
+            k=inp.k,
+            beta=inp.beta,
+            g=g_cs,
+            cu_seqlens=inp.cu_seqlens,
+            chunk_indices=inp.chunk_indices,
+            output_dtype=torch.float32,
+        )
+        A = solve_tril(
+            A=A,
+            cu_seqlens=inp.cu_seqlens,
+            chunk_indices=inp.chunk_indices,
+            output_dtype=inp.k.dtype,
+        )
+        return recompute_w_u_fwd(
+            k=inp.k,
+            v=inp.v,
+            beta=inp.beta,
+            A=A,
+            g_cumsum=g_cs,
+            cu_seqlens=inp.cu_seqlens,
+            chunk_indices=inp.chunk_indices,
+        )
+
+    w, u = _wy_chain()
     h, v_new, _ = chunk_gated_delta_rule_fwd_h(
         k=inp.k,
         w=w,
@@ -274,14 +295,7 @@ def breakdown(inp: Inputs) -> None:
             cu_seqlens=inp.cu_seqlens,
             chunk_indices=inp.chunk_indices,
         ),
-        "kkt+solve+wu": lambda: fused_kkt_solve_tril_recompute_w_u_fwd(
-            k=inp.k,
-            v=inp.v,
-            beta=inp.beta,
-            g_cumsum=g_cs,
-            cu_seqlens=inp.cu_seqlens,
-            chunk_indices=inp.chunk_indices,
-        ),
+        "kkt+solve+wu": _wy_chain,
         "chunk_delta_h": lambda: chunk_gated_delta_rule_fwd_h(
             k=inp.k,
             w=w,
