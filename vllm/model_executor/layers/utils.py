@@ -232,11 +232,21 @@ def rocm_unquantized_gemm_impl(
     GrpsShrB = min(N_p2 // 16, 4)
     # Given the above, how many CUs would we need?
     CuNeeded = rndup_cus * GrpsShrB
-    # candidate for atomic reduce count splitk?
+    # Deterministic reduction stores one float workspace value per K shard.
     fits_wvsplitkrc = (
         N_p2 * m * ((k + 512 - 1) // 512)
     ) <= 128 * 1024 * 12  # deterministic
     fits_wvsplitkrc &= CuNeeded <= cu_count
+
+    # The skinny kernels need K contiguous, not the whole tensor: the host
+    # captures Kap/Kbp = stride(0) and the kernel indexes B_[row * Kbp] and
+    # s[k_ + Kap * n] rather than assuming K, and the LDS-fit check is sized
+    # with Kbp. Requiring is_contiguous() here would disqualify every weight
+    # that pad_weights_avoid_cache_cliff_on_gfx11 has padded -- that pad only
+    # changes stride(0) -- and drop those layers onto the slower fallback GEMM.
+    skinny_operands_compatible = weight.stride(-1) == 1 and (
+        bias is None or bias.is_contiguous()
+    )
 
     use_skinny_reduce_counting = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
@@ -249,14 +259,14 @@ def rocm_unquantized_gemm_impl(
             and k > 512
             and m % 16 == 0
             and fits_wvsplitkrc
-            and weight.is_contiguous()
+            and skinny_operands_compatible
         )
     )
 
     if use_skinny_reduce_counting:
-        x_view = x.reshape(-1, x.size(-1))
+        x_view = x.reshape(-1, x.size(-1)).contiguous()
         with record_function_or_nullcontext(f"wvSplitKrc {n}x{m}x{k}"):
-            out = ops.wvSplitKrc(weight, x_view, cu_count, bias)
+            out = ops.wvSplitKrc(x_view, weight, cu_count, bias)
         return out.reshape(*x.shape[:-1], weight.shape[0])
 
     # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
@@ -308,10 +318,13 @@ def rocm_unquantized_gemm_impl(
         # TODO GFX1250: Include once skinny GEMM is supported on gfx1250
         and x.dtype in [torch.float16, torch.bfloat16]
         and k % 8 == 0
+        and skinny_operands_compatible
     )
 
     if use_skinny:
-        x_view = x.reshape(-1, x.size(-1))
+        # The skinny kernels assume contiguous K elements. A shape-preserving
+        # reshape can retain a transposed activation's non-contiguous strides.
+        x_view = x.reshape(-1, x.size(-1)).contiguous()
         if m > 8 and 0 < n <= 5:
             cu_count = num_compute_units()
             with record_function_or_nullcontext(f"wvSplitK {n}x{m}x{k}"):
