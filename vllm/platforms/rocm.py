@@ -20,6 +20,7 @@ from .interface import DeviceCapability, Platform, PlatformEnum, in_wsl
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.cache import CacheDType
     from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -461,8 +462,10 @@ def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
     use_kv_connector: bool = False,
+    kv_cache_dtype: "CacheDType | None" = None,
 ) -> list[AttentionBackendEnum]:
     from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
+    from vllm.utils.torch_utils import is_quantized_kv_cache
 
     if use_sparse:
         return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
@@ -479,7 +482,9 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
             ]
 
-    backends = []
+    triton_first = on_gfx1250() and is_quantized_kv_cache(kv_cache_dtype or "auto")
+
+    backends = [AttentionBackendEnum.TRITON_ATTN] if triton_first else []
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:
@@ -490,12 +495,8 @@ def _get_backend_priorities(
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
     elif rocm_aiter_ops.is_rdna_aiter_enabled():
         backends.insert(0, AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
-    backends.append(AttentionBackendEnum.TRITON_ATTN)
-    if on_gfx1250():
-        # gfx1250: ROCM_ATTN dispatches the faulting CDNA paged-attention kernel and the
-        # aiter backends NaNs for fp8 q / overflow LDS; TRITON_ATTN is the verified path (fp8 KV)
-        backends.remove(AttentionBackendEnum.TRITON_ATTN)
-        backends.insert(0, AttentionBackendEnum.TRITON_ATTN)
+    if not triton_first:
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
     backends.append(AttentionBackendEnum.TURBOQUANT)
 
     return backends
@@ -589,6 +590,7 @@ class RocmPlatform(Platform):
             attn_selector_config.use_mla,
             attn_selector_config.use_sparse,
             attn_selector_config.use_kv_connector,
+            attn_selector_config.kv_cache_dtype,
         )
         from vllm.config import get_current_vllm_config_or_none
 
