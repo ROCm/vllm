@@ -835,6 +835,9 @@ def rocm_aiter_sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
     compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -856,7 +859,16 @@ def rocm_aiter_sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
     compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
+    if candidate_blocks is not None:
+        raise NotImplementedError(
+            "The ROCm AITER sparse attention indexer does not implement "
+            "candidate-block selection (DeepSeek-V4.1)."
+        )
+
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
