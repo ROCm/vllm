@@ -76,18 +76,9 @@ fn request_output_with_stop_reason(
     EngineCoreOutput {
         request_id: request_id.to_string(),
         new_token_ids,
-        new_logprobs: None,
-        new_prompt_logprobs_tensors: None,
-        pooling_output: None,
         finish_reason,
         stop_reason,
-        events: None,
-        kv_transfer_params: None,
-        ec_transfer_params: None,
-        trace_headers: None,
-        prefill_stats: None,
-        routed_experts: None,
-        num_nans_in_logits: 0,
+        ..Default::default()
     }
 }
 
@@ -104,16 +95,9 @@ fn request_output_with_logprobs(
         new_token_ids,
         new_logprobs: new_logprobs.map(MaybeWireLogprobs::Direct),
         new_prompt_logprobs_tensors: new_prompt_logprobs_tensors.map(MaybeWireLogprobs::Direct),
-        pooling_output: None,
         finish_reason,
         stop_reason,
-        events: None,
-        kv_transfer_params: None,
-        ec_transfer_params: None,
-        trace_headers: None,
-        prefill_stats: None,
-        routed_experts: None,
-        num_nans_in_logits: 0,
+        ..Default::default()
     }
 }
 
@@ -132,16 +116,11 @@ fn request_output_with_logprobs_and_kv(
         new_token_ids,
         new_logprobs: new_logprobs.map(MaybeWireLogprobs::Direct),
         new_prompt_logprobs_tensors: new_prompt_logprobs_tensors.map(MaybeWireLogprobs::Direct),
-        pooling_output: None,
         finish_reason,
         stop_reason,
-        events: None,
         kv_transfer_params,
         ec_transfer_params,
-        trace_headers: None,
-        prefill_stats: None,
-        routed_experts: None,
-        num_nans_in_logits: 0,
+        ..Default::default()
     }
 }
 
@@ -1767,7 +1746,7 @@ async fn version_returns_engine_vllm_version() {
         json,
         json!({
             "version": "test-vllm-version",
-            "rust_frontend_version": env!("CARGO_PKG_VERSION"),
+            "rust_frontend_version": vllm_build_info::VERSION,
         })
     );
 }

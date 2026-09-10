@@ -2497,20 +2497,32 @@ class rocm_aiter_ops:
 
     @staticmethod
     def rms_norm(
-        x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
     ) -> torch.Tensor:
-        return torch.ops.vllm.rocm_aiter_rms_norm(x, weight, variance_epsilon)
+        """RMSNorm via AITER kernel."""
+        import aiter
+
+        return aiter.rms_norm(x, weight, epsilon)
 
     @staticmethod
     def rms_norm2d_with_add(
         x: torch.Tensor,
         residual: torch.Tensor,
         weight: torch.Tensor,
-        variance_epsilon: float,
+        epsilon: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.vllm.rocm_aiter_rmsnorm2d_fwd_with_add(
-            x, residual, weight, variance_epsilon
-        )
+        """Fused residual-add + RMSNorm via AITER kernel.
+
+        Returns (normalized_output, residual_sum).
+        """
+        import aiter
+
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
+        aiter.rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, epsilon, 0)
+        return out, residual_out
 
     @staticmethod
     def w8a8_gemm(
