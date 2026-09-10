@@ -6,7 +6,11 @@ import torch
 import torch.nn.functional as F
 
 from vllm.platforms import current_platform
-from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+from vllm.triton_utils import triton
+from vllm.v1.attention.ops.triton_prefill_attention import (
+    _split_head_dim,
+    context_attention_fwd,
+)
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -79,7 +83,7 @@ def ref_masked_attention(
 @pytest.mark.parametrize("max_seq_len", [1024])
 @pytest.mark.parametrize("H_Q", [32])
 @pytest.mark.parametrize("H_KV", [32, 8])
-@pytest.mark.parametrize("D", [128])
+@pytest.mark.parametrize("D", [64, 72, 80, 128])
 @pytest.mark.parametrize("is_causal", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_context_attention(
@@ -157,7 +161,7 @@ def test_context_attention(
 @pytest.mark.parametrize("max_seq_len", [1024])
 @pytest.mark.parametrize("H_Q", [32])
 @pytest.mark.parametrize("H_KV", [32, 8])
-@pytest.mark.parametrize("D", [128])
+@pytest.mark.parametrize("D", [64, 72, 80, 128])
 @pytest.mark.parametrize("sliding_window", [(32, 32), (32, 0), (0, 32)])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_context_attention_sliding_window(
@@ -230,3 +234,22 @@ def test_context_attention_sliding_window(
 
     # Compare outputs
     torch.testing.assert_close(o, o_ref, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("Lk", [16, 32, 40, 64, 72, 80, 96, 128, 192, 256])
+def test_split_head_dim(Lk: int):
+    """The split covers the head dim without widening the dot beyond it."""
+    main, tail = _split_head_dim(Lk)
+    npo2 = triton.next_power_of_2(Lk)
+
+    assert main & (main - 1) == 0
+    assert tail & (tail - 1) == 0
+    assert Lk <= main + tail <= npo2
+    # A tail pass exists only where the single block would have padded.
+    assert (tail == 0) is (npo2 == Lk)
+
+
+def test_split_head_dim_vit_shapes():
+    """The ViT head dims this was written for both fit a 64 + 16 split."""
+    assert _split_head_dim(72) == (64, 16)
+    assert _split_head_dim(80) == (64, 16)
