@@ -32,6 +32,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import RCP_LN2
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import _ON_GFX115X
+else:
+    _ON_GFX115X = False
+
 
 @triton.jit
 def _fwd_kernel(
@@ -301,6 +306,29 @@ def _split_head_dim(Lk: int) -> tuple[int, int]:
     return main, tail
 
 
+def _gfx115x_encoder_launch(
+    head_dim: int, dtype: torch.dtype
+) -> tuple[int, int] | None:
+    """KV tile and warp count for this kernel on gfx115x.
+
+    The generic config gives the kernel a square tile, so on gfx115x the KV
+    tile inherits ``BLOCK_M`` = 128. That is far wider than this kernel wants:
+    a narrow KV tile is 1.9x to 3.4x faster across every encoder shape
+    measured on gfx1151. The best pairing flips at a head dim of 80, above
+    which the wider tile and 8 warps win.
+
+    Args:
+        head_dim: Attention head dimension.
+        dtype: Query dtype; only the 16-bit paths were tuned.
+
+    Returns:
+        ``(BLOCK_N, num_warps)``, or None to keep the generic config.
+    """
+    if not _ON_GFX115X or dtype not in (torch.bfloat16, torch.float16):
+        return None
+    return (16, 4) if head_dim <= 80 else (32, 8)
+
+
 def get_block_size(dtype: torch.dtype) -> int:
     if dtype == torch.float32:
         return 32
@@ -333,9 +361,13 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    BLOCK = get_block_size(q.dtype)
-
     Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
+
+    block_m = block_n = get_block_size(q.dtype)
+    num_warps = 4 if Lk <= 64 else 8
+    tuned_launch = _gfx115x_encoder_launch(Lk, q.dtype)
+    if tuned_launch is not None:
+        block_n, num_warps = tuned_launch
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
     # rescale with 1/ln(2) for triton exp2
@@ -346,8 +378,7 @@ def context_attention_fwd(
     if sinks is not None:
         assert sinks.shape[0] == head, "Sinks must be num_query_heads size"
 
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
-    num_warps = 4 if Lk <= 64 else 8
+    grid = (batch, head, triton.cdiv(max_input_len, block_m))
 
     sliding_window_q = sliding_window_q if sliding_window_q is not None else 0
     sliding_window_k = sliding_window_k if sliding_window_k is not None else 0
@@ -381,10 +412,10 @@ def context_attention_fwd(
         o.stride(0),
         o.stride(1),
         kv_group_num=kv_group_num,
-        BLOCK_M=BLOCK,
+        BLOCK_M=block_m,
         BLOCK_DMODEL=block_dmodel,
         BLOCK_DMODEL_TAIL=block_dmodel_tail,
-        BLOCK_N=BLOCK,
+        BLOCK_N=block_n,
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW_Q=sliding_window_q,
         SLIDING_WINDOW_K=sliding_window_k,
