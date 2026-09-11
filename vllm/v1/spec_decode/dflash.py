@@ -297,7 +297,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         context_states = self._dflash_hidden_states
         context_positions = self._context_positions_buffer[:num_context]
         context_slots = self._context_slot_mapping_buffer[:num_context]
-        if self._dflash_has_rejected_context:
+        if self.method == "dflare" and self._dflash_has_rejected_context:
             context_states, context_positions, context_slots = compact_dflash_context(
                 context_states,
                 context_positions,

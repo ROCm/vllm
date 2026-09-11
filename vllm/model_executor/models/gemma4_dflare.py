@@ -645,18 +645,32 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         model_weights = []
         head_weights = []
+        includes_draft_id_mapping = False
         for name, weight in weights:
-            if name == "d2t" or name.endswith(".d2t"):
+            if (
+                name in ("d2t", "draft_id_to_target_id")
+                or name.endswith(".d2t")
+                or name.endswith(".draft_id_to_target_id")
+            ):
                 if self.draft_id_to_target_id is None:
                     raise ValueError(
                         "Checkpoint contains a reduced-vocabulary d2t mapping "
                         "but draft_vocab_size equals the target vocabulary"
                     )
                 head_weights.append(("draft_id_to_target_id", weight))
+                includes_draft_id_mapping = True
             elif "lm_head" in name:
                 head_weights.append((name, weight))
             else:
                 model_weights.append((name, weight))
+        if (
+            self.draft_id_to_target_id is not None
+            and not includes_draft_id_mapping
+        ):
+            raise ValueError(
+                "Reduced-vocabulary DFlare checkpoint is missing its "
+                "draft-to-target token mapping"
+            )
         self.model.load_weights(model_weights)
         if head_weights:
             AutoWeightsLoader(self).load_weights(head_weights)

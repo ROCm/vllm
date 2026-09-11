@@ -1,9 +1,12 @@
 import math
+from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
 from vllm.model_executor.models.gemma4_dflare import (
+    DFlareGemma4ForCausalLM,
     DFlareGemma4Model,
     _apply_angelslim_rope,
 )
@@ -177,3 +180,18 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
 
     torch.testing.assert_close(fused[0], loop[0])
     torch.testing.assert_close(fused[1], loop[1])
+
+
+def test_reduced_vocab_requires_draft_id_mapping():
+    model = SimpleNamespace(
+        draft_id_to_target_id=nn.Parameter(
+            torch.zeros(4, dtype=torch.long),
+            requires_grad=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match="missing.*draft-to-target"):
+        DFlareGemma4ForCausalLM.load_weights(
+            model,
+            [("lm_head.weight", torch.zeros(4, 4))],
+        )

@@ -454,7 +454,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # FULL replay uses the attention metadata and per-layer slot mappings
         # captured by DFlashCudaGraphManager. Rebuilding separate objects here
         # has no consumer and adds eager CPU/H2D work to every decode cycle.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if (
+            self.speculative_config.method == "dflare"
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+        ):
             draft_attn_metadata = None
             draft_slot_mappings_by_layer = None
         else:
