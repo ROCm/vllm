@@ -427,11 +427,21 @@ torch::Tensor wvSplitK_int8(const at::Tensor& in_a, const at::Tensor& in_b,
     }                                                            \
   }
 
-#define WVSPLITK_INT8(_YTILE, _UNRL, _N)        \
-  if (on_gfx<11>())                             \
-    WVSPLITK_INT8_LAUNCH(32, _YTILE, _UNRL, _N) \
-  else                                          \
-    WVSPLITK_INT8_LAUNCH(64, _YTILE, _UNRL, _N)
+#define WVSPLITK_INT8(_YTILE, _UNRL, _N)                                \
+  {                                                                     \
+    constexpr bool any11 = std::ranges::any_of(kRocmArchs, is_gfx<11>); \
+    constexpr bool all11 = std::ranges::all_of(kRocmArchs, is_gfx<11>); \
+    if constexpr (any11) {                                              \
+      if (all11 || on_gfx<11>()) {                                      \
+        WVSPLITK_INT8_LAUNCH(32, _YTILE, _UNRL, _N)                     \
+      }                                                                 \
+    }                                                                   \
+    if constexpr (!all11) {                                             \
+      if (!any11 || !on_gfx<11>()) {                                    \
+        WVSPLITK_INT8_LAUNCH(64, _YTILE, _UNRL, _N)                     \
+      }                                                                 \
+    }                                                                   \
+  }
 
 #define WVSPLIT_INT8_TILE(_sYT, __N) \
   {                                  \

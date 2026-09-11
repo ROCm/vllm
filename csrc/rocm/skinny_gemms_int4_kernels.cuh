@@ -1210,11 +1210,22 @@ static int mindiv_int4(int N, int div1, int div2) {
           __wvPrGrp, CuCount, b_row_stride_bytes_i32, group_stride_i32);       \
   }
 
-#define WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, _GS, _HAS_ZP)                \
-  if (on_gfx_int4<11, 12>())                                                   \
-    WVSPLITK_INT4G_LAUNCH_CHUNKED(32, _YTILE, 16, 16, _UNRL, _N, _GS, _HAS_ZP) \
-  else                                                                         \
-    WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
+#define WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, _GS, _HAS_ZP)             \
+  {                                                                         \
+    constexpr bool any32 = std::ranges::any_of(kRocmArchs, is_gfx<11, 12>); \
+    constexpr bool all32 = std::ranges::all_of(kRocmArchs, is_gfx<11, 12>); \
+    if constexpr (any32) {                                                  \
+      if (all32 || on_gfx_int4<11, 12>()) {                                 \
+        WVSPLITK_INT4G_LAUNCH_CHUNKED(32, _YTILE, 16, 16, _UNRL, _N, _GS,   \
+                                      _HAS_ZP)                              \
+      }                                                                     \
+    }                                                                       \
+    if constexpr (!all32) {                                                 \
+      if (!any32 || !on_gfx_int4<11, 12>()) {                               \
+        WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)          \
+      }                                                                     \
+    }                                                                       \
+  }
 
 #define WVSPLIT_INT4G_GS_CHUNKED(_YTILE, _UNRL, _N, _HAS_ZP) \
   if (group_size == 32)                                      \
@@ -1224,11 +1235,21 @@ static int mindiv_int4(int N, int div1, int div2) {
   else                                                       \
     WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 128, _HAS_ZP)
 
-#define WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
-  if (on_gfx_int4<11, 12>())                                   \
-    WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
-  else                                                         \
-    WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
+#define WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)                     \
+  {                                                                         \
+    constexpr bool any32 = std::ranges::any_of(kRocmArchs, is_gfx<11, 12>); \
+    constexpr bool all32 = std::ranges::all_of(kRocmArchs, is_gfx<11, 12>); \
+    if constexpr (any32) {                                                  \
+      if (all32 || on_gfx_int4<11, 12>()) {                                 \
+        WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP)          \
+      }                                                                     \
+    }                                                                       \
+    if constexpr (!all32) {                                                 \
+      if (!any32 || !on_gfx_int4<11, 12>()) {                               \
+        WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)          \
+      }                                                                     \
+    }                                                                       \
+  }
 
 #define WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP) \
   if (group_size == 32)                              \
@@ -1593,11 +1614,21 @@ __global__ void moe_wvSplitK_int4_hf_(
     }                                                                         \
   }
 
-#define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
-  if (on_gfx_int4<11, 12>())                                       \
-    MOE_WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
-  else                                                             \
-    MOE_WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
+#define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)                 \
+  {                                                                         \
+    constexpr bool any32 = std::ranges::any_of(kRocmArchs, is_gfx<11, 12>); \
+    constexpr bool all32 = std::ranges::all_of(kRocmArchs, is_gfx<11, 12>); \
+    if constexpr (any32) {                                                  \
+      if (all32 || on_gfx_int4<11, 12>()) {                                 \
+        MOE_WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP)      \
+      }                                                                     \
+    }                                                                       \
+    if constexpr (!all32) {                                                 \
+      if (!any32 || !on_gfx_int4<11, 12>()) {                               \
+        MOE_WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)      \
+      }                                                                     \
+    }                                                                       \
+  }
 
 #define MOE_WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP) \
   if (group_size == 32)                                  \
@@ -1609,17 +1640,26 @@ __global__ void moe_wvSplitK_int4_hf_(
 // because the (Y4 U2 AC32) win came from gfx1151's ATT trace.  GFX9
 // wave64 path is left at the defaults (W=16, AC=16) -- the 4-axis
 // sweep wasn't run there, so it keeps the original launch macro.
-#define MOE_WVSPLIT_INT4G_GS_W_AC(_YTILE, _W, _AC, _UNRL, _N, _HAS_ZP)    \
-  if (on_gfx_int4<11, 12>()) {                                            \
-    if (group_size == 32)                                                 \
-      MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 32,  \
-                                     _HAS_ZP)                             \
-    else                                                                  \
-      MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 128, \
-                                     _HAS_ZP)                             \
-  } else {                                                                \
-    /* GFX9 fallback: original heuristic (W=AC=16). */                    \
-    MOE_WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP)                      \
+#define MOE_WVSPLIT_INT4G_GS_W_AC(_YTILE, _W, _AC, _UNRL, _N, _HAS_ZP)        \
+  {                                                                           \
+    constexpr bool any32 = std::ranges::any_of(kRocmArchs, is_gfx<11, 12>);   \
+    constexpr bool all32 = std::ranges::all_of(kRocmArchs, is_gfx<11, 12>);   \
+    if constexpr (any32) {                                                    \
+      if (all32 || on_gfx_int4<11, 12>()) {                                   \
+        if (group_size == 32)                                                 \
+          MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 32,  \
+                                         _HAS_ZP)                             \
+        else                                                                  \
+          MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 128, \
+                                         _HAS_ZP)                             \
+      }                                                                       \
+    }                                                                         \
+    if constexpr (!all32) {                                                   \
+      if (!any32 || !on_gfx_int4<11, 12>()) {                                 \
+        /* GFX9 fallback: original heuristic (W=AC=16). */                    \
+        MOE_WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP)                      \
+      }                                                                       \
+    }                                                                         \
   }
 
 #define MOE_WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                    \
