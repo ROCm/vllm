@@ -5323,6 +5323,7 @@ class GPUModelRunner(
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
+            or spec_config.use_dflare()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(

@@ -187,11 +187,50 @@ def test_reduced_vocab_requires_draft_id_mapping():
         draft_id_to_target_id=nn.Parameter(
             torch.zeros(4, dtype=torch.long),
             requires_grad=False,
-        )
+        ),
+        config=SimpleNamespace(draft_vocab_size=4),
+        target_vocab_size=8,
     )
 
     with pytest.raises(ValueError, match="missing.*draft-to-target"):
         DFlareGemma4ForCausalLM.load_weights(
             model,
             [("lm_head.weight", torch.zeros(4, 4))],
+        )
+
+
+def test_reduced_vocab_rejects_duplicate_target_ids():
+    model = SimpleNamespace(
+        draft_id_to_target_id=nn.Parameter(
+            torch.zeros(4, dtype=torch.long),
+            requires_grad=False,
+        ),
+        config=SimpleNamespace(draft_vocab_size=4),
+        target_vocab_size=8,
+    )
+
+    with pytest.raises(ValueError, match="unique"):
+        DFlareGemma4ForCausalLM.load_weights(
+            model,
+            [
+                ("d2t", torch.tensor([0, -1, 0, 0])),
+                ("lm_head.weight", torch.zeros(4, 4)),
+            ],
+        )
+
+
+def test_reduced_vocab_requires_lm_head():
+    model = SimpleNamespace(
+        draft_id_to_target_id=nn.Parameter(
+            torch.zeros(4, dtype=torch.long),
+            requires_grad=False,
+        ),
+        config=SimpleNamespace(draft_vocab_size=4),
+        target_vocab_size=8,
+    )
+
+    with pytest.raises(ValueError, match="missing lm_head"):
+        DFlareGemma4ForCausalLM.load_weights(
+            model,
+            [("d2t", torch.tensor([0, 0, 0, 0]))],
         )

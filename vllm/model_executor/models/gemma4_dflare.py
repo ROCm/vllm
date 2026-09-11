@@ -600,6 +600,7 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
             vllm_config,
         )
         target_vocab_size = vllm_config.model_config.get_vocab_size()
+        self.target_vocab_size = target_vocab_size
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
@@ -646,6 +647,7 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
         model_weights = []
         head_weights = []
         includes_draft_id_mapping = False
+        includes_lm_head = False
         for name, weight in weights:
             if (
                 name in ("d2t", "draft_id_to_target_id")
@@ -657,10 +659,28 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
                         "Checkpoint contains a reduced-vocabulary d2t mapping "
                         "but draft_vocab_size equals the target vocabulary"
                     )
+                mapping = weight.detach().view(-1).to(dtype=torch.long, device="cpu")
+                if mapping.numel() != self.config.draft_vocab_size:
+                    raise ValueError(
+                        "DFlare draft-to-target mapping size does not match "
+                        f"draft_vocab_size: {mapping.numel()} != "
+                        f"{self.config.draft_vocab_size}"
+                    )
+                target_ids = torch.arange(mapping.numel()) + mapping
+                if (
+                    target_ids.min().item() < 0
+                    or target_ids.max().item() >= self.target_vocab_size
+                    or torch.unique(target_ids).numel() != mapping.numel()
+                ):
+                    raise ValueError(
+                        "DFlare draft-to-target mapping must contain unique "
+                        "target-vocabulary IDs"
+                    )
                 head_weights.append(("draft_id_to_target_id", weight))
                 includes_draft_id_mapping = True
             elif "lm_head" in name:
                 head_weights.append((name, weight))
+                includes_lm_head = True
             else:
                 model_weights.append((name, weight))
         if (
@@ -670,6 +690,10 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
             raise ValueError(
                 "Reduced-vocabulary DFlare checkpoint is missing its "
                 "draft-to-target token mapping"
+            )
+        if self.draft_id_to_target_id is not None and not includes_lm_head:
+            raise ValueError(
+                "Reduced-vocabulary DFlare checkpoint is missing lm_head weights"
             )
         self.model.load_weights(model_weights)
         if head_weights:
