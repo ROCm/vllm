@@ -13,6 +13,7 @@
 #include "dispatch_utils.h"
 #include "quantization/w8a8/fp8/common.cuh"
 #include "core/batch_invariant.hpp"
+#include "rocm_arch_dispatch.h"
 
 // TODO(rasmith): The kernels in this file are susceptible to integer overflow
 // issues, do not take strides, and are unable to handle PyTorch tensors that
@@ -51,31 +52,10 @@ int get_lds_size() {
   return result;
 }
 
-bool on_gfx1x() {
-  static const bool result = [] {
-    const auto* dprops = at::cuda::getCurrentDeviceProperties();
-    const std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx11") != std::string::npos ||
-           device_arch.find("gfx12") != std::string::npos;
-  }();
-  return result;
-}
-
-bool on_gfx12() {
-  static const bool result = [] {
-    const auto* dprops = at::cuda::getCurrentDeviceProperties();
-    const std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx12") != std::string::npos;
-  }();
-  return result;
-}
-
-bool is_gfx11() {
-  static const bool result = [] {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx11") != std::string::npos;
-  }();
+template <unsigned... VERSIONS>
+static bool on_gfx() {
+  static const bool result =
+      is_gfx<VERSIONS...>(at::cuda::getCurrentDeviceProperties()->gcnArchName);
   return result;
 }
 
@@ -1324,7 +1304,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 #define WVSPLIT_TILE_CFG(_THRDS, _WVPRGRP, _sYT, __N)                        \
   {                                                                          \
     bool fit_lds = (Kbp_in * N_in <= max_lds_len);                           \
-    if (is_gfx11()) {                                                        \
+    if (on_gfx<11>()) {                                                      \
       if (_sYT <= 1)                                                         \
         WVSPLITK_CFG(_THRDS, _WVPRGRP, 1, 4, __N)                            \
       else if (K_in < 1024)                                                  \
@@ -1419,7 +1399,7 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 // K=2560 hits K%1024==512, a rule both paths share.
 #define WVSPLIT_TILE(_sYT, __N)                                 \
   {                                                             \
-    if (on_gfx1x()) { /* gfx11xx/GFX12, wave32 */               \
+    if (on_gfx<11, 12>()) { /* gfx11xx/GFX12, wave32 */         \
       WVSPLIT_TILE_CFG(/*THRDS=*/32, /*WVPRGRP=*/16, _sYT, __N) \
     } else { /* GFX9, wave64 */                                 \
       WVSPLIT_TILE_CFG(/*THRDS=*/64, /*WVPRGRP=*/16, _sYT, __N) \
@@ -1553,7 +1533,7 @@ torch::Tensor wvSplitK_fused_silu_mul(const at::Tensor& in_a,
                 : nullptr;
         fptype* c = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-        const bool use_wave32 = on_gfx1x();
+        const bool use_wave32 = on_gfx<11, 12>();
 
         // Mirror the unfused wvSplitK launch site exactly, then flip the
         // FUSED_SILU_MUL template parameter to true.  Argument order is the
@@ -1661,7 +1641,7 @@ torch::Tensor wvSplitK_fused_silu_gate_mul(
                 : nullptr;
         fptype* c = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-        const bool use_wave32 = on_gfx1x();
+        const bool use_wave32 = on_gfx<11, 12>();
 
         // Same tile config as wvSplitK_fused_silu_mul; only the trailing
         // FUSED_GATE_MUL=true template flag and the GATE pointer differ.
@@ -1817,7 +1797,7 @@ torch::Tensor wvSplitK_sweep(const at::Tensor& in_a, const at::Tensor& in_b,
             : nullptr;
     fptype* c = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-    if (is_gfx11()) {
+    if (on_gfx<11>()) {
       WVSPLITK_SWEEP_YTILE(32)
     } else {
       WVSPLITK_SWEEP_YTILE(64)
@@ -2831,7 +2811,7 @@ void wvSplitKQ(const at::Tensor& in_b, const at::Tensor& in_a,
   }
 
 #define WVSPLITKQ(_WvPrGrp, _YTILEs, _YTILEm, _UNRLs, _UNRLm, _N)      \
-  if (on_gfx12())                                                      \
+  if (on_gfx<12>())                                                    \
     WVSPLITKQ_IMPL(32, _WvPrGrp, _YTILEs, _YTILEm, _UNRLs, _UNRLm, _N) \
   else                                                                 \
     WVSPLITKQ_IMPL(64, _WvPrGrp, _YTILEs, _YTILEm, _UNRLs, _UNRLm, _N)

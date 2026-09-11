@@ -122,6 +122,19 @@ function (vllm_finalize_hipify_target)
 endfunction()
 
 #
+# Build the VLLM_ROCM_ARCH_LIST compile definition for a set of GPU
+# architectures.  The value is the quoted, comma-separated element list of a
+# C++ initializer.
+#
+function (rocm_arch_list_definition OUT_DEF)
+  set(_ARCH_INIT "")
+  foreach (_ARCH IN LISTS ARGN)
+    string(APPEND _ARCH_INIT "\"${_ARCH}\",")
+  endforeach()
+  set(${OUT_DEF} "VLLM_ROCM_ARCH_LIST=${_ARCH_INIT}" PARENT_SCOPE)
+endfunction()
+
+#
 # Get additional GPU compiler flags from torch.
 #
 function (get_torch_gpu_compiler_flags OUT_GPU_FLAGS GPU_LANG)

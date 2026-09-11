@@ -11,6 +11,7 @@
 
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
+#include "rocm_arch_dispatch.h"
 
 #if defined(__HIPCC__) && \
     (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
@@ -32,12 +33,10 @@ int get_lds_size_int8() {
   return result;
 }
 
-bool is_gfx11_int8() {
-  static const bool result = [] {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx11") != std::string::npos;
-  }();
+template <unsigned... VERSIONS>
+static bool on_gfx() {
+  static const bool result =
+      is_gfx<VERSIONS...>(at::cuda::getCurrentDeviceProperties()->gcnArchName);
   return result;
 }
 
@@ -429,7 +428,7 @@ torch::Tensor wvSplitK_int8(const at::Tensor& in_a, const at::Tensor& in_b,
   }
 
 #define WVSPLITK_INT8(_YTILE, _UNRL, _N)        \
-  if (is_gfx11_int8())                          \
+  if (on_gfx<11>())                             \
     WVSPLITK_INT8_LAUNCH(32, _YTILE, _UNRL, _N) \
   else                                          \
     WVSPLITK_INT8_LAUNCH(64, _YTILE, _UNRL, _N)
@@ -529,7 +528,7 @@ torch::Tensor wvSplitK_int8_sweep(const at::Tensor& in_a,
   const fptype* biasptr = nullptr;
   fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-  const int THRDS = is_gfx11_int8() ? 32 : 64;
+  const int THRDS = on_gfx<11>() ? 32 : 64;
 
   #define SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N)          \
     {                                                                         \
