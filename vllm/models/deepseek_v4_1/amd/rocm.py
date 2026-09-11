@@ -13,6 +13,10 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4.amd.rocm import (
+    block_scaled_mm_kernel,
+    weight_already_preshuffled,
+)
 from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4_1.sparse_mla import (
@@ -85,7 +89,8 @@ def apply_pre_quantized_block_scaled_mm(
         if params.weight_scale_inv is None
         else params.weight_scale_inv
     )
-    kernel = linear.quant_method.fp8_linear
+    kernel = block_scaled_mm_kernel(linear)
+    assert kernel is not None, f"no block-scaled kernel on {type(linear).__name__}"
     out = kernel.apply_block_scaled_mm(
         A=x_fp8, B=params.weight, As=x_scale, Bs=weight_scale
     )
@@ -525,12 +530,14 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 return None
             if ws.dtype == torch.float8_e8m0fnu:
                 ws = _upcast_e8m0_to_fp32(ws).contiguous()
-            # Shuffle the weight in place (single weight, no unshuffled copy).
-            replace_parameter(
-                linear,
-                "weight",
-                rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
-            )
+            # Shuffle in place (single weight, no unshuffled copy), unless the
+            # kernel already did it.
+            if not weight_already_preshuffled(linear):
+                replace_parameter(
+                    linear,
+                    "weight",
+                    rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
+                )
             return ws
 
         self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
@@ -595,7 +602,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         if self.indexer is not None:
             linears.append(self.indexer.wq_b)
         for linear in linears:
-            kernel = getattr(getattr(linear, "quant_method", None), "fp8_linear", None)
+            kernel = block_scaled_mm_kernel(linear)
             if not isinstance(kernel, Fp8BlockScaledMMLinearKernel):
                 return False
         return True

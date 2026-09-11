@@ -3,7 +3,7 @@
 
 import functools
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -38,6 +38,11 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
+if TYPE_CHECKING:
+    from vllm.model_executor.kernels.linear.scaled_mm import (
+        Fp8BlockScaledMMLinearKernel,
+    )
+
 logger = init_logger(__name__)
 
 
@@ -61,19 +66,32 @@ def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     return indptr
 
 
+def block_scaled_mm_kernel(
+    linear: torch.nn.Module,
+) -> "Fp8BlockScaledMMLinearKernel | None":
+    """The block-scaled kernel serving ``linear``, or None.
+
+    Quark and compressed-tensors keep it on ``layer.scheme``, the other fp8
+    methods on ``layer.quant_method``.
+    """
+    for holder in (
+        getattr(linear, "quant_method", None),
+        getattr(linear, "scheme", None),
+    ):
+        kernel = getattr(holder, "fp8_linear", None)
+        if kernel is not None:
+            return kernel
+    return None
+
+
 def weight_already_preshuffled(linear: torch.nn.Module) -> bool:
     """True when the linear's kernel already B-preshuffled ``weight``.
 
-    The hand-shuffles below (fused_wqa_wkv, wo_b, gate_up_proj) must be skipped
-    for those, since shuffle_weight is a permutation rather than an involution.
+    The model's own hand-shuffles (fused_wqa_wkv, wo_b, gate_up_proj) must be
+    skipped for those: shuffle_weight is a permutation, not an involution.
     """
-    return any(
-        getattr(getattr(method, "fp8_linear", None), "preshuffles_weight", False)
-        for method in (
-            getattr(linear, "quant_method", None),
-            getattr(linear, "scheme", None),
-        )
-    )
+    kernel = block_scaled_mm_kernel(linear)
+    return bool(getattr(kernel, "preshuffles_weight", False))
 
 
 def apply_pre_quantized_block_scaled_mm(
@@ -99,7 +117,8 @@ def apply_pre_quantized_block_scaled_mm(
         if params.weight_scale_inv is None
         else params.weight_scale_inv
     )
-    kernel = linear.quant_method.fp8_linear
+    kernel = block_scaled_mm_kernel(linear)
+    assert kernel is not None, f"no block-scaled kernel on {type(linear).__name__}"
     out = kernel.apply_block_scaled_mm(
         A=x_fp8, B=params.weight, As=x_scale, Bs=weight_scale
     )
@@ -736,7 +755,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             linears.append(self.indexer.wq_b)
         layouts: set[bool] = set()
         for linear in linears:
-            kernel = getattr(getattr(linear, "quant_method", None), "fp8_linear", None)
+            kernel = block_scaled_mm_kernel(linear)
             if not isinstance(kernel, Fp8BlockScaledMMLinearKernel):
                 return None
             layouts.add(bool(getattr(kernel, "wants_transposed_act_scale", False)))
