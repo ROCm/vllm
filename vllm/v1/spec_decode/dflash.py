@@ -13,6 +13,7 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import (
+    compact_dflash_context,
     copy_and_expand_dflash_inputs_kernel,
     next_power_of_2,
 )
@@ -156,6 +157,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         grid = (batch_size, num_blocks)
 
         has_num_rejected = num_rejected_tokens_gpu is not None
+        self._dflash_has_rejected_context = has_num_rejected
         copy_and_expand_dflash_inputs_kernel[grid](
             # Inputs
             next_token_ids_ptr=next_token_ids,
@@ -292,10 +294,19 @@ class DFlashProposer(SpecDecodeBaseProposer):
         num_context = self._dflash_num_context
 
         # Pre-insert context KVs directly into cache
+        context_states = self._dflash_hidden_states
+        context_positions = self._context_positions_buffer[:num_context]
+        context_slots = self._context_slot_mapping_buffer[:num_context]
+        if self._dflash_has_rejected_context:
+            context_states, context_positions, context_slots = compact_dflash_context(
+                context_states,
+                context_positions,
+                context_slots,
+            )
         self.model.precompute_and_store_context_kv(
-            self._dflash_hidden_states,  # Shape is already [num_context, hidden_size]
-            self._context_positions_buffer[:num_context],
-            self._context_slot_mapping_buffer[:num_context],
+            context_states,
+            context_positions,
+            context_slots,
         )
         return (
             dict(

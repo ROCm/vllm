@@ -1383,6 +1383,23 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.use_dflare() and self.draft_model_config is not None:
+            trained_block_size = getattr(
+                self.draft_model_config.hf_config,
+                "block_size",
+                None,
+            )
+            if (
+                trained_block_size is not None
+                and self.num_speculative_tokens + 1 > trained_block_size
+            ):
+                raise ValueError(
+                    "DFlare num_speculative_tokens exceeds the trained block "
+                    f"horizon: K={self.num_speculative_tokens}, "
+                    f"block_size={trained_block_size}. Expected K <= "
+                    "block_size - 1."
+                )
+
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(

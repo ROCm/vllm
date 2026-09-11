@@ -2385,6 +2385,7 @@ class VllmConfig:
                 "eagle3",
                 "mtp",
                 "dflash",
+                "dflare",
                 "dspark",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")

@@ -1,5 +1,11 @@
+import math
+
+import torch
+
+from vllm.model_executor.models.gemma4_dflare import _apply_angelslim_rope
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
+from vllm.v1.spec_decode.utils import compact_dflash_context
 
 
 def _speculators_config():
@@ -53,3 +59,45 @@ def test_dflare_speculators_config_conversion():
 
 def test_dflare_model_is_registered():
     assert "DFlareDraftModel" in ModelRegistry.get_supported_archs()
+
+
+def test_angelslim_legacy_rope_layout():
+    hidden = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    actual = _apply_angelslim_rope(
+        hidden,
+        positions=torch.tensor([1]),
+        theta=100.0,
+        layout="legacy",
+    )
+    expected = torch.tensor(
+        [
+            [
+                math.cos(1.0) - 3.0 * math.sin(1.0),
+                2.0 * math.cos(1.0) - 4.0 * math.sin(1.0),
+                3.0 * math.cos(0.1) + math.sin(0.1),
+                4.0 * math.cos(0.1) + 2.0 * math.sin(0.1),
+            ]
+        ]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_compact_dflash_context_removes_rejected_rows():
+    states = torch.arange(12).view(4, 3)
+    positions = torch.tensor([5, 6, 7, 8])
+    slots = [
+        torch.tensor([10, -1, 12, -1]),
+        torch.tensor([20, -1, 22, -1]),
+    ]
+
+    compact_states, compact_positions, compact_slots = compact_dflash_context(
+        states,
+        positions,
+        slots,
+    )
+
+    torch.testing.assert_close(compact_states, states[[0, 2]])
+    torch.testing.assert_close(compact_positions, positions[[0, 2]])
+    assert compact_slots is not None
+    torch.testing.assert_close(compact_slots[0], torch.tensor([10, 12]))
+    torch.testing.assert_close(compact_slots[1], torch.tensor([20, 22]))
