@@ -113,6 +113,17 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
 
 
+def test_v2_model_runner_supports_dflare():
+    config = VllmConfig()
+    config.speculative_config = SimpleNamespace(
+        method="dflare",
+        parallel_drafting=True,
+        enable_adaptive_verification=False,
+    )
+
+    assert config._get_v2_model_runner_unsupported_features() == []
+
+
 def test_rocm_defaults_deepseek_v4_to_mrv1(monkeypatch):
     """ROCm keeps DeepSeek V4 on MRV1, which is still faster there."""
     from vllm.config.vllm import default_v2_model_runner_architectures

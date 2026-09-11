@@ -1,8 +1,12 @@
 import math
 
 import torch
+from torch import nn
 
-from vllm.model_executor.models.gemma4_dflare import _apply_angelslim_rope
+from vllm.model_executor.models.gemma4_dflare import (
+    DFlareGemma4Model,
+    _apply_angelslim_rope,
+)
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.v1.spec_decode.utils import compact_dflash_context
@@ -101,3 +105,75 @@ def test_compact_dflash_context_removes_rejected_rows():
     assert compact_slots is not None
     torch.testing.assert_close(compact_slots[0], torch.tensor([10, 12]))
     torch.testing.assert_close(compact_slots[1], torch.tensor([20, 22]))
+
+
+class _Projection(nn.Module):
+    def __init__(self, weight: torch.Tensor):
+        super().__init__()
+        self.weight = nn.Parameter(weight)
+        self.bias = None
+
+    def forward(self, hidden_states: torch.Tensor):
+        return hidden_states @ self.weight.T, None
+
+
+class _Layer(nn.Module):
+    def __init__(self, key_weight: torch.Tensor, value_weight: torch.Tensor):
+        super().__init__()
+        self.self_attn = nn.Module()
+        self.self_attn.target_k_proj = _Projection(key_weight)
+        self.self_attn.target_v_proj = _Projection(value_weight)
+
+
+def test_fused_context_kv_matches_layer_loop(monkeypatch):
+    model = object.__new__(DFlareGemma4Model)
+    nn.Module.__init__(model)
+    model.target_layer_ids = [0, 1]
+    model.target_hidden_size = 4
+    model.layer_fusion_weights = nn.Parameter(
+        torch.tensor([[2.0, 0.0], [0.0, 2.0]])
+    )
+    model._hidden_norm_weight = torch.ones(4)
+    model._rms_norm_eps = 1e-6
+
+    torch.manual_seed(0)
+    layers = [
+        _Layer(torch.randn(4, 4), torch.randn(4, 4)),
+        _Layer(torch.randn(4, 4), torch.randn(4, 4)),
+    ]
+    model.layers = nn.ModuleList(layers)
+    model._fused_target_kv_weight = torch.stack(
+        [
+            torch.cat(
+                (
+                    layer.self_attn.target_k_proj.weight,
+                    layer.self_attn.target_v_proj.weight,
+                )
+            )
+            for layer in layers
+        ]
+    )
+    model._fused_target_kv_bias = None
+
+    def rms_norm(out, hidden_states, weight, epsilon):
+        variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
+        out.copy_(
+            (
+                hidden_states.float()
+                * torch.rsqrt(variance + epsilon)
+                * weight.float()
+            ).to(hidden_states.dtype)
+        )
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.gemma4_dflare.ops.rms_norm",
+        rms_norm,
+    )
+    context_states = torch.randn(3, 8)
+    fused = model._project_context_kv(context_states, 3, 2, 2, 2)
+
+    model._fused_target_kv_weight = None
+    loop = model._project_context_kv(context_states, 3, 2, 2, 2)
+
+    torch.testing.assert_close(fused[0], loop[0])
+    torch.testing.assert_close(fused[1], loop[1])
