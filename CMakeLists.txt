@@ -1527,6 +1527,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_options(_rocm_C_skinny PRIVATE
       $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS}>)
     target_compile_definitions(_rocm_C_skinny PRIVATE "-DTORCH_EXTENSION_NAME=_rocm_C")
+    rocm_arch_list_definition(VLLM_SKINNY_ARCH_LIST_DEF ${VLLM_SKINNY_ARCHES})
+    target_compile_definitions(_rocm_C_skinny PRIVATE
+      "${VLLM_SKINNY_ARCH_LIST_DEF}")
     target_link_libraries(_rocm_C_skinny PRIVATE torch)
   else()
     message(STATUS "Only gfx1250, skipping skinny_gemms")
@@ -1605,6 +1608,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   else()
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
   endif()
+
+  rocm_arch_list_definition(VLLM_ROCM_ARCH_LIST_DEF ${VLLM_GPU_ARCHES})
+  target_compile_definitions(_rocm_C PRIVATE "${VLLM_ROCM_ARCH_LIST_DEF}")
 
   # COMPILE_FLAGS only apply to HIP-language files (via generator expression).
   # torch_bindings.cpp is compiled as CXX so needs the defines separately.

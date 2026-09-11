@@ -52,7 +52,7 @@ torch::Tensor wvSplitK_int4g_hf_sweep(
   const fptype* biasptr = nullptr;
   fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-  const int THRDS = is_gfx1x_int4() ? 32 : 64;
+  const int THRDS = on_gfx_int4<11, 12>() ? 32 : 64;
 
   #define SWEEP_GHF_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N, _GS) \
     {                                                                         \

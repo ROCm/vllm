@@ -21,6 +21,7 @@
 
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
+#include "rocm_arch_dispatch.h"
 
 #if defined(__HIPCC__) && \
     (defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__))
@@ -47,13 +48,10 @@ static int get_lds_size_int4() {
   return result;
 }
 
-static bool is_gfx1x_int4() {
-  static const bool result = [] {
-    auto dprops = at::cuda::getCurrentDeviceProperties();
-    std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx11") != std::string::npos ||
-           device_arch.find("gfx12") != std::string::npos;
-  }();
+template <unsigned... Versions>
+static bool on_gfx_int4() {
+  static const bool result =
+      is_gfx<Versions...>(at::cuda::getCurrentDeviceProperties()->gcnArchName);
   return result;
 }
 
@@ -1213,7 +1211,7 @@ static int mindiv_int4(int N, int div1, int div2) {
   }
 
 #define WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, _GS, _HAS_ZP)                \
-  if (is_gfx1x_int4())                                                         \
+  if (on_gfx_int4<11, 12>())                                                   \
     WVSPLITK_INT4G_LAUNCH_CHUNKED(32, _YTILE, 16, 16, _UNRL, _N, _GS, _HAS_ZP) \
   else                                                                         \
     WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
@@ -1227,7 +1225,7 @@ static int mindiv_int4(int N, int div1, int div2) {
     WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 128, _HAS_ZP)
 
 #define WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
-  if (is_gfx1x_int4())                                         \
+  if (on_gfx_int4<11, 12>())                                   \
     WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
   else                                                         \
     WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
@@ -1253,64 +1251,64 @@ static int mindiv_int4(int N, int div1, int div2) {
   else                                                                      \
     WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 128, _HAS_ZP)
 
-#define WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                           \
-  {                                                                      \
-    if (K_in * N_in > max_lds_len) {                                     \
-      /* Chunked branch.  Same wave-packing rule as the fitting branch   \
-         below, for the same reason: it is a property of M, not of       \
-         chunking. */                                                    \
-      if (_sYT < 30)                                                     \
-        WVSPLIT_INT4G_GS_CHUNKED(4, 2, __N, _HAS_ZP)                     \
-      else if (mindiv_int4(M_in, CuCount * 4, 16) < 16)                  \
-        WVSPLIT_INT4G_GS_CHUNKED(2, 2, __N, _HAS_ZP)                     \
-      else                                                               \
-        WVSPLIT_INT4G_GS_CHUNKED(4, 1, __N, _HAS_ZP)                     \
-    } else if (__N >= 3 && _sYT >= 40 && K_in >= 4096 &&                 \
-               mindiv_int4(M_in, CuCount * 4, 16) < 16)                  \
-      /* YTILE=4 is the better tuple in this range, but only when it     \
-         does not cost wave slots.  mindiv_int4 trims WvPrGrp to even    \
-         out the m-rounds, and at YTILE=4 it can trim harder than at     \
-         YTILE=2: M=5376 gives 14 (2 of 16 wave-rows idle) against 15 at \
-         YTILE=2.  The K bound keeps this off shallow rows, where the k1 \
-         loop is too short to amortise the extra m-tiles.  The chunked   \
-         branch above needs no such bound: it only runs when K*N exceeds \
-         LDS, so K is always past it. */                                 \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                               \
-    else if (__N >= 4 && _sYT >= 480)                                    \
-      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                               \
-    else if (__N >= 3 && _sYT >= 40)                                     \
-      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                               \
-    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096))    \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                               \
-    else if (__N >= 3 && _sYT < 40)                                      \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                               \
-    else if (__N >= 2)                                                   \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                               \
-    else if (is_gfx1x_int4() && __N == 1 && K_in == 4096)                \
-      /* Tuned for gfx1151 (Qwen3.5 W4A16 decode: GDN out_proj at        \
-         M=2048, K=4096, N=1).  AC=32 doubles per-thread global load     \
-         granularity; the K=4096 row has enough work to amortize the     \
-         wider load.  W stays at 16 (vs 32 in the bf16 K=2048 branch)    \
-         because int4 dequant inflates VGPR pressure -- AC=32 + W=32     \
-         spills.  Lifts kernel ~70% -> ~84% of LPDDR5X peak post-        \
-         overhead.  K<=2048 already at ~87% by default and untouched.    \
-         Verify per shape with                                           \
-         benchmarks/kernels/sweep_int4g_kernel.py. */                    \
-      WVSPLITK_INT4G_GS_W_AC(1, 4, 16, 32, __N, _HAS_ZP)                 \
-    else if (is_gfx1x_int4() && __N == 1 && K_in % (32 * 32 * 8) == 0)   \
-      /* Deep-K decode rows that divide this tuple's K step exactly      \
-         (THRDS*A_CHUNK*UNRL = 8192), e.g. gemma-4-31B down_proj at      \
-         K=8192 and K=16384, M=5376.  AC=32 issues global_load_b128      \
-         and UNRL=8 makes each row's contiguous run 4 KB.                \
-                                                                      \  \
-         The exact-division guard is load-bearing: a K that leaves a     \
-         large ragged tail has too few k1 iterations to hide it behind   \
-         and prefers the default tuple.  Geometry and row stride have    \
-         to be tuned together; re-verify both with                       \
-         benchmarks/kernels/sweep_int4g_kernel.py. */                    \
-      WVSPLITK_INT4G_GS_W_AC(2, 8, 16, 32, __N, _HAS_ZP)                 \
-    else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */      \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                               \
+#define WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                               \
+  {                                                                          \
+    if (K_in * N_in > max_lds_len) {                                         \
+      /* Chunked branch.  Same wave-packing rule as the fitting branch       \
+         below, for the same reason: it is a property of M, not of           \
+         chunking. */                                                        \
+      if (_sYT < 30)                                                         \
+        WVSPLIT_INT4G_GS_CHUNKED(4, 2, __N, _HAS_ZP)                         \
+      else if (mindiv_int4(M_in, CuCount * 4, 16) < 16)                      \
+        WVSPLIT_INT4G_GS_CHUNKED(2, 2, __N, _HAS_ZP)                         \
+      else                                                                   \
+        WVSPLIT_INT4G_GS_CHUNKED(4, 1, __N, _HAS_ZP)                         \
+    } else if (__N >= 3 && _sYT >= 40 && K_in >= 4096 &&                     \
+               mindiv_int4(M_in, CuCount * 4, 16) < 16)                      \
+      /* YTILE=4 is the better tuple in this range, but only when it         \
+         does not cost wave slots.  mindiv_int4 trims WvPrGrp to even        \
+         out the m-rounds, and at YTILE=4 it can trim harder than at         \
+         YTILE=2: M=5376 gives 14 (2 of 16 wave-rows idle) against 15 at     \
+         YTILE=2.  The K bound keeps this off shallow rows, where the k1     \
+         loop is too short to amortise the extra m-tiles.  The chunked       \
+         branch above needs no such bound: it only runs when K*N exceeds     \
+         LDS, so K is always past it. */                                     \
+      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                   \
+    else if (__N >= 4 && _sYT >= 480)                                        \
+      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                                   \
+    else if (__N >= 3 && _sYT >= 40)                                         \
+      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                                   \
+    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096))        \
+      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                                   \
+    else if (__N >= 3 && _sYT < 40)                                          \
+      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                   \
+    else if (__N >= 2)                                                       \
+      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                   \
+    else if (on_gfx_int4<11, 12>() && __N == 1 && K_in == 4096)              \
+      /* Tuned for gfx1151 (Qwen3.5 W4A16 decode: GDN out_proj at            \
+         M=2048, K=4096, N=1).  AC=32 doubles per-thread global load         \
+         granularity; the K=4096 row has enough work to amortize the         \
+         wider load.  W stays at 16 (vs 32 in the bf16 K=2048 branch)        \
+         because int4 dequant inflates VGPR pressure -- AC=32 + W=32         \
+         spills.  Lifts kernel ~70% -> ~84% of LPDDR5X peak post-            \
+         overhead.  K<=2048 already at ~87% by default and untouched.        \
+         Verify per shape with                                               \
+         benchmarks/kernels/sweep_int4g_kernel.py. */                        \
+      WVSPLITK_INT4G_GS_W_AC(1, 4, 16, 32, __N, _HAS_ZP)                     \
+    else if (on_gfx_int4<11, 12>() && __N == 1 && K_in % (32 * 32 * 8) == 0) \
+      /* Deep-K decode rows that divide this tuple's K step exactly          \
+         (THRDS*A_CHUNK*UNRL = 8192), e.g. gemma-4-31B down_proj at          \
+         K=8192 and K=16384, M=5376.  AC=32 issues global_load_b128          \
+         and UNRL=8 makes each row's contiguous run 4 KB.                    \
+                                                                      \      \
+         The exact-division guard is load-bearing: a K that leaves a         \
+         large ragged tail has too few k1 iterations to hide it behind       \
+         and prefers the default tuple.  Geometry and row stride have        \
+         to be tuned together; re-verify both with                           \
+         benchmarks/kernels/sweep_int4g_kernel.py. */                        \
+      WVSPLITK_INT4G_GS_W_AC(2, 8, 16, 32, __N, _HAS_ZP)                     \
+    else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */          \
+      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                                   \
   }
 
 // Inner dispatch: shared by both symmetric and asymmetric paths
@@ -1596,7 +1594,7 @@ __global__ void moe_wvSplitK_int4_hf_(
   }
 
 #define MOE_WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)        \
-  if (is_gfx1x_int4())                                             \
+  if (on_gfx_int4<11, 12>())                                       \
     MOE_WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS, _HAS_ZP) \
   else                                                             \
     MOE_WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS, _HAS_ZP)
@@ -1612,7 +1610,7 @@ __global__ void moe_wvSplitK_int4_hf_(
 // wave64 path is left at the defaults (W=16, AC=16) -- the 4-axis
 // sweep wasn't run there, so it keeps the original launch macro.
 #define MOE_WVSPLIT_INT4G_GS_W_AC(_YTILE, _W, _AC, _UNRL, _N, _HAS_ZP)    \
-  if (is_gfx1x_int4()) {                                                  \
+  if (on_gfx_int4<11, 12>()) {                                            \
     if (group_size == 32)                                                 \
       MOE_WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 32,  \
                                      _HAS_ZP)                             \
@@ -1666,7 +1664,7 @@ __global__ void moe_wvSplitK_int4_hf_(
                 wave32/CU = 75% of peak.  Better latency hiding for   \
                 memory-bound kernels. */                              \
     {                                                                 \
-      if (is_gfx1x_int4() && K_in == 2048)                            \
+      if (on_gfx_int4<11, 12>() && K_in == 2048)                      \
         /* gfx1151 K=2048 N=1 (Qwen3.5 MoE gate_up at M=1024,         \
          * E=256): 4-axis sweep via                                   \
          * benchmarks/kernels/sweep_int4g_moe_kernel.py finds         \
@@ -1679,7 +1677,7 @@ __global__ void moe_wvSplitK_int4_hf_(
         MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 4, __N, _HAS_ZP)         \
       else if (K_in >= 1024)                                          \
         MOE_WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                      \
-      else if (is_gfx1x_int4() && K_in == 512)                        \
+      else if (on_gfx_int4<11, 12>() && K_in == 512)                  \
         /* gfx1151 K=512 N=1 (Qwen3.5 MoE down-proj).  4-axis sweep   \
          * via benchmarks/kernels/sweep_int4g_moe_kernel.py finds     \
          * (Y=4, U=1, W=32, AC=8) at 28.1 us vs the LOW-VGPR pick     \
@@ -1691,7 +1689,7 @@ __global__ void moe_wvSplitK_int4_hf_(
          * iter loads avoid the (W=32, AC=32) VGPR-spill penalty the  \
          * (W=32, AC=32) default below describes. */                  \
         MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 8, 1, __N, _HAS_ZP)          \
-      else if (is_gfx1x_int4())                                       \
+      else if (on_gfx_int4<11, 12>())                                 \
         MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                      \
       else                                                            \
         MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 2, __N, _HAS_ZP)         \
