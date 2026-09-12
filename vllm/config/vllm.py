@@ -104,16 +104,29 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
 )
 
 
+# Architectures above that ROCm serves with a torch-compiled implementation.
+# Enabling breakable graphs forces CompilationMode.NONE, so for these it would
+# trade torch.compile for capture they already get from FX splitting.
+ROCM_COMPILED_ARCHITECTURES = frozenset(
+    {
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+        "Qwen4ExpMTP",
+    }
+)
+
+
 @lru_cache
 def default_breakable_cudagraph_architectures() -> frozenset[str]:
     """Architectures defaulting to breakable CUDA graphs on this platform."""
     from vllm.platforms import current_platform
 
     if current_platform.is_rocm():
-        # Breakable CUDA graphs currently regress performance on ROCm, so no
-        # architecture opts in by default here. Users can still force it with
-        # VLLM_USE_BREAKABLE_CUDAGRAPH=1.
-        return frozenset()
+        # Everything except the architectures ROCm torch-compiles: breakable
+        # graphs supply piecewise capture those would otherwise lose, and
+        # would only displace torch.compile for the rest. Users can still opt
+        # in or out with VLLM_USE_BREAKABLE_CUDAGRAPH.
+        return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES - ROCM_COMPILED_ARCHITECTURES
     return DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES
 
 

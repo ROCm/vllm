@@ -338,8 +338,8 @@ def test_hisparse_rejects_non_cuda(monkeypatch):
 
 
 def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):
-    """ROCm keeps the DSA models (DeepSeek V3.2/V4, GLM-5.2) on their compiled
-    MRV1 paths and off breakable cudagraphs by default."""
+    """ROCm opts its non-compiled DSA implementations into breakable
+    cudagraphs, and leaves torch-compiled architectures out."""
     from vllm.config.vllm import (
         ROCM_DEFAULT_MRV1_ARCHITECTURES,
         default_breakable_cudagraph_architectures,
@@ -355,9 +355,12 @@ def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):
         assert "GlmMoeDsaForCausalLM" in ROCM_DEFAULT_MRV1_ARCHITECTURES
 
         breakable_architectures = default_breakable_cudagraph_architectures()
-        assert "DeepseekV32ForCausalLM" not in breakable_architectures
-        assert "DeepseekV32MTPModel" not in breakable_architectures
-        assert "GlmMoeDsaForCausalLM" not in breakable_architectures
+        assert "DeepseekV32ForCausalLM" in breakable_architectures
+        assert "DeepseekV32MTPModel" in breakable_architectures
+        assert "GlmMoeDsaForCausalLM" in breakable_architectures
+        # Qwen4Exp is torch-compiled on ROCm, so breakable would only cost it
+        # torch.compile.
+        assert "Qwen4ExpForCausalLM" not in breakable_architectures
 
         # The carve-out takes effect via the runner-selection property
         # (warning_once args must be hashable for its lru_cache).
