@@ -20,8 +20,13 @@ if current_platform.is_cuda():
     from .nvidia.model import DeepseekV32ForCausalLM
     from .nvidia.model import DeepseekV32ForCausalLM as GlmMoeDsaForCausalLM
     from .nvidia.mtp import DeepseekV32MTP
+elif current_platform.is_rocm():
+    # GLM-5.2 (glm_moe_dsa) reuses the DSA module here too.
+    from .amd.model import DeepseekV32ForCausalLM
+    from .amd.model import DeepseekV32ForCausalLM as GlmMoeDsaForCausalLM
+    from .amd.mtp import DeepseekV32MTP
 else:
-    # ROCm, XPU, and CPU keep the generic implementation.
+    # XPU and CPU keep the generic implementation.
     from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP as DeepseekV32MTP
     from vllm.model_executor.models.deepseek_v2 import (
         DeepseekV3ForCausalLM as DeepseekV32ForCausalLM,
