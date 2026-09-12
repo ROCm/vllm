@@ -35,15 +35,22 @@ _TINY_DOT_MAX_K = _TINY_DOT_MAX_WARPS * 32 * _TINY_DOT_ELEMS_PER_LANE
 
 
 @triton.jit
-def _tiny_dot_kernel(x_ptr, w_ptr, out_ptr, K, BLOCK: tl.constexpr):
+def _tiny_dot_kernel(
+    x_ptr, w_ptr, out_ptr, K, BLOCK: tl.constexpr, APPLY_SIGMOID: tl.constexpr
+):
     offsets = tl.arange(0, BLOCK)
     mask = offsets < K
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr, tl.sum(x * w, axis=0))
+    acc = tl.sum(x * w, axis=0)
+    if APPLY_SIGMOID:
+        acc = 1.0 / (1.0 + tl.exp(-acc))
+    tl.store(out_ptr, acc)
 
 
-def _tiny_dot_triton(x_flat: torch.Tensor, w_flat: torch.Tensor) -> torch.Tensor:
+def _tiny_dot_triton(
+    x_flat: torch.Tensor, w_flat: torch.Tensor, apply_sigmoid: bool = False
+) -> torch.Tensor:
     K = x_flat.numel()
     BLOCK = triton.next_power_of_2(K)
     # Grow the workgroup with BLOCK so every lane keeps the same small number
@@ -51,11 +58,43 @@ def _tiny_dot_triton(x_flat: torch.Tensor, w_flat: torch.Tensor) -> torch.Tensor
     num_warps = min(
         _TINY_DOT_MAX_WARPS, max(4, BLOCK // (32 * _TINY_DOT_ELEMS_PER_LANE))
     )
-    out_f32 = torch.empty((), dtype=torch.float32, device=x_flat.device)
+    # Allocating the output in the input dtype lets tl.store do the fp32 ->
+    # bf16/fp16 rounding, which is what (x*w).sum(dtype=x.dtype) does anyway,
+    # and saves a copy per call.
+    out = torch.empty((), dtype=x_flat.dtype, device=x_flat.device)
     _tiny_dot_kernel[(1,)](
-        x_flat, w_flat, out_f32, K=K, BLOCK=BLOCK, num_warps=num_warps
+        x_flat,
+        w_flat,
+        out,
+        K=K,
+        BLOCK=BLOCK,
+        APPLY_SIGMOID=apply_sigmoid,
+        num_warps=num_warps,
     )
-    return out_f32.to(x_flat.dtype)
+    return out
+
+
+def tiny_sigmoid_dot_supported() -> bool:
+    """Whether tiny_sigmoid_dot beats the eager chain on this device."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1151
+
+    return envs.VLLM_ROCM_USE_SKINNY_GEMM and on_gfx1151()
+
+
+def tiny_sigmoid_dot(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """sigmoid((x.flatten() * weight.flatten()).sum()) in a single launch.
+
+    The eager spelling of a gated scalar projection is three launches (mul,
+    sum, sigmoid). Callers must check tiny_sigmoid_dot_supported() first and
+    must not pass a bias.
+    """
+    if weight.numel() > _TINY_DOT_MAX_K:
+        return torch.sigmoid((x.reshape(-1) * weight.reshape(-1)).sum(dtype=x.dtype))
+    return _tiny_dot_triton(
+        x.reshape(-1).contiguous(), weight.reshape(-1).contiguous(), apply_sigmoid=True
+    )
 
 
 def get_token_bin_counts_and_mask(
