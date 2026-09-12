@@ -13,6 +13,7 @@ from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     flashinfer_bf16_mm,
     is_flashinfer_cutedsl_bf16_gemm_supported,
@@ -21,6 +22,79 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+# The reduction runs in one workgroup, which is what lets it be a single
+# launch, and that bounds K by what stays in registers. Past 128 elements per
+# lane the kernel exhausts the 256-VGPR budget and spills, which costs a
+# factor of 5 and hands the win back to the eager chain. A workgroup tops out
+# at 32 warps and a gfx11 warp is 32 lanes, so K tops out at 32 * 32 * 128.
+_TINY_DOT_ELEMS_PER_LANE = 128
+_TINY_DOT_MAX_WARPS = 32
+_TINY_DOT_MAX_K = _TINY_DOT_MAX_WARPS * 32 * _TINY_DOT_ELEMS_PER_LANE
+
+
+@triton.jit
+def _tiny_dot_kernel(
+    x_ptr, w_ptr, out_ptr, K, BLOCK: tl.constexpr, APPLY_SIGMOID: tl.constexpr
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < K
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    acc = tl.sum(x * w, axis=0)
+    if APPLY_SIGMOID:
+        acc = 1.0 / (1.0 + tl.exp(-acc))
+    tl.store(out_ptr, acc)
+
+
+def _tiny_dot_triton(
+    x_flat: torch.Tensor, w_flat: torch.Tensor, apply_sigmoid: bool = False
+) -> torch.Tensor:
+    K = x_flat.numel()
+    BLOCK = triton.next_power_of_2(K)
+    # Grow the workgroup with BLOCK so every lane keeps the same small number
+    # of elements live, rather than letting register pressure grow with K.
+    num_warps = min(
+        _TINY_DOT_MAX_WARPS, max(4, BLOCK // (32 * _TINY_DOT_ELEMS_PER_LANE))
+    )
+    # Allocating the output in the input dtype lets tl.store do the fp32 ->
+    # bf16/fp16 rounding, which is what (x*w).sum(dtype=x.dtype) does anyway,
+    # and saves a copy per call.
+    out = torch.empty((), dtype=x_flat.dtype, device=x_flat.device)
+    _tiny_dot_kernel[(1,)](
+        x_flat,
+        w_flat,
+        out,
+        K=K,
+        BLOCK=BLOCK,
+        APPLY_SIGMOID=apply_sigmoid,
+        num_warps=num_warps,
+    )
+    return out
+
+
+def tiny_sigmoid_dot_supported() -> bool:
+    """Whether tiny_sigmoid_dot beats the eager chain on this device."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1151
+
+    return envs.VLLM_ROCM_USE_SKINNY_GEMM and on_gfx1151()
+
+
+def tiny_sigmoid_dot(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """sigmoid((x.flatten() * weight.flatten()).sum()) in a single launch.
+
+    The eager spelling of a gated scalar projection is three launches (mul,
+    sum, sigmoid). Callers must check tiny_sigmoid_dot_supported() first and
+    must not pass a bias.
+    """
+    if weight.numel() > _TINY_DOT_MAX_K:
+        return torch.sigmoid((x.reshape(-1) * weight.reshape(-1)).sum(dtype=x.dtype))
+    return _tiny_dot_triton(
+        x.reshape(-1).contiguous(), weight.reshape(-1).contiguous(), apply_sigmoid=True
+    )
 
 
 def get_token_bin_counts_and_mask(
@@ -252,7 +326,7 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1151, on_gfx1250
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -307,6 +381,33 @@ def rocm_unquantized_gemm_impl(
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
         return gemm_a16w16(x, weight, bias)
+
+    # A tiny scalar projection such as the Qwen MoE shared_expert_gate,
+    # ReplicatedLinear(hidden_size, 1), reaches hipBLASLt as a 1x1xK GEMM and
+    # still costs a 64x96x32 macro tile plus a SplitK post-pass to produce a
+    # single scalar. A fused elementwise-mul + reduction is far cheaper, and
+    # one such gate runs per MoE layer per decode step.
+    #
+    # Without a bias and with K small enough for a single block, a Triton
+    # kernel does the whole thing in one launch; otherwise the eager chain
+    # below is still well ahead of BLAS. Correctness is covered by
+    # tests/kernels/test_tiny_dot_triton.py.
+    if (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx1151()
+        and m == 1
+        and n == 1
+        and x.dtype in [torch.float16, torch.bfloat16]
+    ):
+        if bias is None and k <= _TINY_DOT_MAX_K:
+            out = _tiny_dot_triton(
+                x.reshape(-1).contiguous(), weight.reshape(-1).contiguous()
+            )
+            return out.reshape(*x.shape[:-1], 1)
+        out = (x.reshape(-1) * weight.reshape(-1)).sum(dtype=x.dtype)
+        if bias is not None:
+            out = out + bias.reshape(-1)[0]
+        return out.reshape(*x.shape[:-1], 1)
 
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
