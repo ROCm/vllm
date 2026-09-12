@@ -252,7 +252,7 @@ def use_aiter_triton_gemm(n, m, k, dtype):
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1151, on_gfx1250
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -307,6 +307,23 @@ def rocm_unquantized_gemm_impl(
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
         return gemm_a16w16(x, weight, bias)
+
+    # A tiny scalar projection such as the Qwen MoE shared_expert_gate,
+    # ReplicatedLinear(hidden_size, 1), reaches hipBLASLt as a 1x1xK GEMM and
+    # still costs a 64x96x32 macro tile plus a SplitK post-pass to produce a
+    # single scalar. A fused elementwise-mul + reduction is far cheaper, and
+    # one such gate runs per MoE layer per decode step.
+    if (
+        envs.VLLM_ROCM_USE_SKINNY_GEMM
+        and on_gfx1151()
+        and m == 1
+        and n == 1
+        and x.dtype in [torch.float16, torch.bfloat16]
+    ):
+        out = (x.reshape(-1) * weight.reshape(-1)).sum(dtype=x.dtype)
+        if bias is not None:
+            out = out + bias.reshape(-1)[0]
+        return out.reshape(*x.shape[:-1], 1)
 
     use_skinny = (
         envs.VLLM_ROCM_USE_SKINNY_GEMM
