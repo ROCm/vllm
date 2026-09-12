@@ -131,17 +131,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         self.headdim = model_config.get_head_size()
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
 
-        # Strix Halo (gfx1151): per-shape tuning for the 3D decode path.
-        # The launcher in unified_attention() asserts this value was supplied
-        # and uses it as-is, so the buffers allocated below match the kernel
-        # launch grid by construction.
-        if _ON_GFX1151:
-            if self.num_heads_kv == 8:
-                self.num_par_softmax_segments = 8
-            elif self.headdim <= 64 or self.num_heads_kv == 1:
-                self.num_par_softmax_segments = 32
-            else:
-                self.num_par_softmax_segments = 16
+        # gfx1151: a single KV head or a small head leaves the default
+        # segment count under-occupied on the 3D decode path.  The buffers
+        # below are sized from this value, so the launch grid matches by
+        # construction.
+        if _ON_GFX1151 and (self.headdim <= 64 or self.num_heads_kv == 1):
+            self.num_par_softmax_segments = 32
 
         # Check if CUDA Graphs are enabled for decode
         self.decode_cudagraph_enabled = (
