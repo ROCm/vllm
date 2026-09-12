@@ -607,7 +607,10 @@ def fused_norm_rope(
         HAS_INDEXER=has_indexer,
         INDEX_ROPE_INTERLEAVE=index_rope_interleave,
         USE_PDL=use_pdl,
-        launch_pdl=use_pdl,
+        # launch_pdl is launcher metadata rather than a kernel argument, and
+        # only the CUDA launcher accepts it; ROCm's Triton rejects unknown
+        # launch kwargs. Pass it only where PDL applies.
+        **({"launch_pdl": True} if use_pdl else {}),
     )
     return q_c_out
 
@@ -979,7 +982,10 @@ def fused_q(
         INDEX_ROPE_INTERLEAVE=index_rope_interleave,
         QUANTIZE_MQA=quantize_mqa,
         USE_PDL=use_pdl,
-        launch_pdl=use_pdl,
+        # launch_pdl is launcher metadata rather than a kernel argument, and
+        # only the CUDA launcher accepts it; ROCm's Triton rejects unknown
+        # launch kwargs. Pass it only where PDL applies.
+        **({"launch_pdl": True} if use_pdl else {}),
         # num_warps=1 is optimal here: each program is a single 128-element
         # rope+quant, so the kernel is program-count/occupancy bound, not
         # per-program compute bound (swept 1/2/4/8 — 1 wins or ties everywhere).
