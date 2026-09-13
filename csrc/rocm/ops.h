@@ -142,6 +142,20 @@ void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                  torch::Tensor& cu_seqlens, torch::Tensor& out,
                  torch::Tensor& final_state, double scale);
 
+// Causal MHA decode attention for RDNA3.5 (defined in
+// rdna35_causal_mha_attn.cu; real body is gfx11-only, stub elsewhere). Mutates
+// out and the three partial buffers in place. Callers gate the shape (Python
+// rdna35_causal_mha_attn.can_run), so an unsupported one raises via TORCH_CHECK
+// rather than leaving out untouched.
+void rdna35_causal_mha_attn(torch::Tensor& out, torch::Tensor& query,
+                            torch::Tensor& key_cache,
+                            torch::Tensor& value_cache,
+                            torch::Tensor& block_table, torch::Tensor& seq_lens,
+                            torch::Tensor& partial_out,
+                            torch::Tensor& partial_max,
+                            torch::Tensor& partial_sum, double scale,
+                            double softcap);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
