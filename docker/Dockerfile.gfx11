@@ -1,0 +1,209 @@
+# syntax=docker/dockerfile:1.7
+#
+# vLLM runtime image for AMD RDNA3/3.5 (gfx11xx, e.g. Strix Halo / gfx1151).
+#
+# Built entirely from Python wheels -- no system-wide ROCm packages. The ROCm
+# toolchain and runtime come from the `rocm[devel,libraries]` wheels, so this
+# image does not inherit from rocm/vllm-dev like docker/Dockerfile.rocm does.
+#
+# Stages:
+#   rocm-base -- system deps + uv + pinned ROCm SDK / PyTorch / Triton wheels
+#   builder   -- compiles the vLLM wheel into /dist
+#   runtime   -- rocm-base + the built wheel (no ~15 GB of HIP objects)
+#
+# Build (pinned vLLM commit, the default -- reproducible, ignores your HEAD):
+#   docker build -f docker/Dockerfile.gfx11 --target runtime -t vllm-gfx11 .
+#
+# Build the working tree instead, to test local changes:
+#   docker build -f docker/Dockerfile.gfx11 --build-arg REMOTE_VLLM=0 \
+#       --target runtime -t vllm-gfx11 .
+#
+# vLLM's HIP kernels are compiled from source: expect ~30-75 min cold and
+# ~40 GB free under /var/lib/docker. ccache and the uv download cache are
+# BuildKit cache mounts, so a rebuild after a version bump is far cheaper.
+
+ARG BASE_IMAGE=python:3.12-bookworm
+
+# REMOTE_VLLM=1: clone VLLM_REPO at the pinned VLLM_REF (tested and verified)
+# REMOTE_VLLM=0: build the local source in the Docker context (ONBUILD COPY ./)
+ARG REMOTE_VLLM=1
+
+# ---------------------------------------------------------------------------
+# Stage 1: rocm-base -- shared ROCm + PyTorch layer
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS rocm-base
+
+ARG PYTORCH_ROCM_ARCH=gfx1151
+ARG DEVICE_ARCH=gfx1151
+ARG PYTORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
+
+# Pinned wheel versions, all from the same ROCm nightly date so the stack is
+# self-consistent. torch and torchvision must share the +rocm build-date suffix
+# or they ABI-mismatch at import.
+ARG ROCM_BUILD=10.1.0a20260806
+ARG TORCH_VERSION=2.12.0
+ARG TORCHVISION_VERSION=0.27.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG TRITON_VERSION=3.8.0+git4cff872c.rocm10.1.0a20260806
+
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+        git curl ca-certificates cmake ninja-build gcc g++ ccache libdrm-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r render && groupadd -rf video
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh && uv --version
+
+# set up the ROCm SDK environment
+ENV ROCM_PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV PATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_devel/bin:$PATH
+ENV PYTHONPATH=/usr/local/lib/python3.12/site-packages/_rocm_sdk_core/share/amd_smi
+
+# The pins are written to /constraints.txt as well as installed, so that the
+# builder's `uv pip install -r requirements/build/rocm.txt` cannot quietly move
+# torch onto a different build (that file carries its own torch== line and a
+# download.pytorch.org extra index).
+#
+# `devel` and `libraries` extras are needed on top of `device-<arch>`: devel
+# provides hipcc to compile vLLM, libraries provides the runtime math libs.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eux; \
+    { \
+      echo "torch==${TORCH_VERSION}+rocm${ROCM_BUILD}"; \
+      echo "torchvision==${TORCHVISION_VERSION}+rocm${ROCM_BUILD}"; \
+      echo "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_BUILD}"; \
+      echo "triton==${TRITON_VERSION}"; \
+      echo "rocm==${ROCM_BUILD}"; \
+    } > /constraints.txt; \
+    cat /constraints.txt; \
+    uv pip install --system --break-system-packages --link-mode=copy \
+        "torch[device-${DEVICE_ARCH}]==${TORCH_VERSION}+rocm${ROCM_BUILD}" \
+        "torchvision[device-${DEVICE_ARCH}]==${TORCHVISION_VERSION}+rocm${ROCM_BUILD}" \
+        "torchaudio==${TORCHAUDIO_VERSION}+rocm${ROCM_BUILD}" \
+        "triton==${TRITON_VERSION}" \
+        "rocm[devel,libraries,device-${DEVICE_ARCH}]==${ROCM_BUILD}" \
+        --index-url "${PYTORCH_INDEX_URL}" \
+        --extra-index-url https://pypi.org/simple/ \
+        --index-strategy unsafe-first-match \
+        --prerelease allow; \
+    rocm-sdk init; \
+    hipcc --version
+
+# ---------------------------------------------------------------------------
+# Stage 2: source -- local build context, or a clone
+# ---------------------------------------------------------------------------
+# .git is deliberately part of the context: setup.py derives the wheel version
+# from `git describe`, so stripping it yields an unversioned wheel.
+FROM rocm-base AS fetch_vllm_0
+ONBUILD COPY ./ /src/vllm/
+
+FROM rocm-base AS fetch_vllm_1
+ARG VLLM_REPO=https://github.com/ROCm/vllm.git
+ARG VLLM_REF=ddd378cfb1e9e9232ae5af18657bc8f99587666c
+ENV VLLM_REPO=${VLLM_REPO}
+ENV VLLM_REF=${VLLM_REF}
+ONBUILD RUN set -eux; \
+    git clone "${VLLM_REPO}" /src/vllm; \
+    cd /src/vllm; \
+    git checkout --detach "${VLLM_REF}" \
+      || { git fetch -v origin "${VLLM_REF}" && git checkout --detach FETCH_HEAD; }; \
+    git log -1 --format='vLLM commit: %H %ad %s'
+
+# ---------------------------------------------------------------------------
+# Stage 3: builder -- compile the vLLM wheel
+# ---------------------------------------------------------------------------
+FROM fetch_vllm_${REMOTE_VLLM} AS builder
+
+ARG PYTORCH_ROCM_ARCH=gfx1151
+ARG PYTORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
+# Empty falls back to $(nproc) at build time; lower it if the compile OOMs.
+ARG MAX_JOBS=
+
+WORKDIR /src/vllm
+
+RUN git config --global --add safe.directory /src/vllm
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --break-system-packages --link-mode=copy \
+        -c /constraints.txt \
+        -r requirements/build/rocm.txt \
+        --index-url "${PYTORCH_INDEX_URL}" \
+        --extra-index-url https://pypi.org/simple/ \
+        --index-strategy unsafe-first-match \
+        --prerelease allow
+
+ENV VLLM_TARGET_DEVICE=rocm \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    CCACHE_DIR=/root/.cache/ccache \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CMAKE_HIP_COMPILER_LAUNCHER=ccache
+
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    set -eux; \
+    export MAX_JOBS="${MAX_JOBS:-$(nproc)}"; \
+    ccache --zero-stats || true; \
+    python setup.py bdist_wheel --dist-dir=/dist; \
+    ccache --show-stats || true; \
+    ls -la /dist
+
+# ---------------------------------------------------------------------------
+# Stage 4: export_wheel -- wheel only, for `--output type=local,dest=...`
+# ---------------------------------------------------------------------------
+FROM scratch AS export_wheel
+COPY --from=builder /dist /
+
+# ---------------------------------------------------------------------------
+# Stage 5: runtime
+# ---------------------------------------------------------------------------
+FROM rocm-base AS runtime
+
+ARG DEVICE_ARCH=gfx1151
+ARG PYTORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
+# transformers 5.15+ raises AmbiguousGlobalPerLayerAttributeError on Gemma-4.
+ARG TRANSFORMERS_VERSION=5.14.1
+
+COPY --from=builder /dist /dist
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    set -eux; \
+    uv pip install --system --break-system-packages --link-mode=copy \
+        -c /constraints.txt \
+        "$(echo /dist/vllm-*.whl)[device-${DEVICE_ARCH}]" \
+        "huggingface_hub" \
+        "transformers==${TRANSFORMERS_VERSION}" \
+        --index-url "${PYTORCH_INDEX_URL}" \
+        --extra-index-url https://pypi.org/simple/ \
+        --index-strategy unsafe-first-match \
+        --prerelease allow
+
+# /hf    -- HuggingFace cache, bind-mount from the host to avoid re-downloads
+# /cache -- Triton/MIOpen kernel caches + HOME, bind-mount so they stay warm
+#           across runs (a cold MIOpen cache costs seconds at every startup).
+# 0777 because the container is typically run as the invoking host UID, which
+# may not exist in /etc/passwd inside the image.
+RUN mkdir -p /hf /cache/triton /cache/miopen /workspace \
+    && chmod -R 777 /hf /cache /workspace
+
+ENV HOME=/cache \
+    HF_HOME=/hf \
+    TRITON_CACHE_DIR=/cache/triton \
+    MIOPEN_USER_DB_PATH=/cache/miopen \
+    MIOPEN_CUSTOM_CACHE_DIR=/cache/miopen \
+    MIOPEN_FIND_DB_PATH=/cache/miopen \
+    PYTHONUNBUFFERED=1
+
+# TRITON_HIP_USE_IN_THREAD_TRANSPOSE=0 is the non-obvious one: Triton 3.8's
+# in-thread transpose drives vLLM's TRITON_ATTN prefill kernel to the 256-VGPR
+# cap on gfx1151, spilling 120 B/thread. At the ViT-encoder shape that is most
+# of a ~5% VLM TTFT regression, so it matters for VLM workloads.
+ENV TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
+    FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+    TORCH_BLAS_PREFER_HIPBLASLT=1 \
+    TRITON_HIP_USE_IN_THREAD_TRANSPOSE=0
+
+LABEL org.opencontainers.image.source="https://github.com/ROCm/vllm"
+LABEL org.opencontainers.image.description="vLLM for AMD RDNA3/3.5 (gfx11xx), built from ROCm wheels"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+WORKDIR /workspace
