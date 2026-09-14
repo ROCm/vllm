@@ -15,10 +15,7 @@ from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
 from .op import exp
-from .utils import FLA_CHUNK_SIZE, is_navi
-
-_KKT_WARPS = [2, 4] if is_navi else [2, 4, 8]
-_KKT_STAGES = [2] if is_navi else [2, 3, 4]
+from .utils import FLA_CHUNK_SIZE
 
 # On RDNA (gfx11xx/gfx12xx) WMMA only
 # accepts 16-bit/int inputs, so a widened (e.g. fp32) tl.dot is lowered to a
@@ -41,8 +38,8 @@ if current_platform.is_rocm():
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64, 128]
-        for num_warps in _KKT_WARPS
-        for num_stages in _KKT_STAGES
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
     ],
     key=["H", "K", "BT", "IS_VARLEN"],
 )

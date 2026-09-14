@@ -50,7 +50,9 @@ def is_hip_gdn_supported(
     """
     if cu_seqlens is None or query.shape[0] != 1:
         return False
-    if query.dtype != torch.bfloat16 or value.dtype != torch.bfloat16:
+    if query.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if value.dtype != query.dtype:
         return False
     if query.shape[-1] != 128 or value.shape[-1] != 128:
         return False
