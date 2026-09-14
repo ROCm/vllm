@@ -12,6 +12,7 @@ from typing import Final
 import torch
 
 from vllm.model_executor.parameter import BasevLLMParameter, permute_param_layout_
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -33,10 +34,11 @@ _current_n_dim: int = 0
 
 @functools.lru_cache(maxsize=1)
 def _is_rdna3() -> bool:
-    if not torch.cuda.is_available():
+    if not current_platform.is_rocm():
         return False
-    name = torch.cuda.get_device_properties(0).gcnArchName
-    return name.startswith("gfx11")
+    from vllm.platforms.rocm import on_gfx11
+
+    return on_gfx11()
 
 
 def _make_config(m: int, n: int, k: int, warps: int, stages: int) -> dict[str, int]:
