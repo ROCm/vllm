@@ -134,7 +134,6 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MOE_AWQ_GEMV_HIP: bool = False
-    VLLM_MOE_GPTQ_EXLLAMA: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
     VLLM_MOE_HIP: str | None = None
     VLLM_GDN_HIP: bool = True
@@ -1251,11 +1250,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Converts weights to skinny layout [E, N, K//8] int32 (ExLlama shuffle).
     "VLLM_MOE_HYBRID_W4A16": lambda: (
         os.getenv("VLLM_MOE_HYBRID_W4A16", "true").lower() in ("true", "1")
-    ),
-    # Use exllama 4-bit kernel for MoE GPTQ instead of Triton.
-    # Requires exllama-native weight format [E, K/8, N] int32.
-    "VLLM_MOE_GPTQ_EXLLAMA": lambda: (
-        os.getenv("VLLM_MOE_GPTQ_EXLLAMA", "true").lower() in ("true", "1")
     ),
     # rdna_moe_gemm gfx11 W4A16 MoE prefill WMMA GEMM. Tri-state: unset =
     # default-on wherever the kernel is built (gfx11), "1" forces on, "0" forces
