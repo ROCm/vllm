@@ -1061,10 +1061,6 @@ class RocmPlatform(Platform):
         return True
 
     @classmethod
-    def is_gfx1151(cls) -> bool:
-        return _ON_GFX1151
-
-    @classmethod
     def get_gcn_arch(cls) -> str:
         """Get the GCN architecture string for the current device."""
         return _GCN_ARCH

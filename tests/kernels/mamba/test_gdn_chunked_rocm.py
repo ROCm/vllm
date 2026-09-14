@@ -70,13 +70,14 @@ def _accelerated_paths_disabled():
             chunk_fused._ENABLED = saved_fused
 
 
-def _make_inputs(seq_lens, num_k_heads, gqa_ratio, state_dtype=torch.float32):
+def _make_inputs(
+    seq_lens, num_k_heads, gqa_ratio, state_dtype=torch.float32, dtype=torch.bfloat16
+):
     num_v_heads = num_k_heads * gqa_ratio
     num_seqs = len(seq_lens)
     cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
     cu_seqlens[1:] = torch.tensor(seq_lens, device="cuda", dtype=torch.int32).cumsum(0)
     total = int(cu_seqlens[-1].item())
-    dtype = torch.bfloat16
 
     # q and k reach the kernel l2-normalised, and the conditioning of (I + A)
     # depends on it.
@@ -161,6 +162,27 @@ def test_matches_triton_chain(gqa_ratio, seq_lens):
     (o, state), (ref_o, ref_state) = _run_both(*inputs)
 
     # Both paths are bf16 end to end, so they agree only to bf16 precision.
+    assert _rel_rms(o, ref_o) < 2e-2
+    assert _rel_rms(state, ref_state) < 2e-2
+
+
+@pytest.mark.parametrize("gqa_ratio", [1, 3])
+@pytest.mark.parametrize("seq_lens", [[512], [32, 33, 64, 1], [137, 1, 941]])
+@torch.inference_mode()
+def test_matches_triton_chain_fp16(gqa_ratio, seq_lens):
+    """fp16 inputs take the same kernel; AWQ checkpoints ship fp16.
+
+    gqa_ratio 3 covers the 48-value-head / 16-key-head shape of
+    Qwen3.6-27B-AWQ-INT4, which is what put fp16 on this path.
+    """
+    inputs = _make_inputs(
+        seq_lens, num_k_heads=8, gqa_ratio=gqa_ratio, dtype=torch.float16
+    )
+    (o, state), (ref_o, ref_state) = _run_both(*inputs)
+
+    assert o.dtype == torch.float16
+    # fp16 carries 10 mantissa bits to bf16's 7, so the two paths agree more
+    # tightly here than the bf16 case above.
     assert _rel_rms(o, ref_o) < 2e-2
     assert _rel_rms(state, ref_state) < 2e-2
 
@@ -252,8 +274,11 @@ def test_declines_unsupported():
     q, _, v, _, _, _, cu_seqlens = _make_inputs([64], num_k_heads=8, gqa_ratio=2)
 
     assert is_hip_gdn_supported(q, v, cu_seqlens)
+    assert is_hip_gdn_supported(q.half(), v.half(), cu_seqlens)
     assert not is_hip_gdn_supported(q, v, None)
-    assert not is_hip_gdn_supported(q.half(), v.half(), cu_seqlens)
+    # The kernel reads one element type, so a mixed pair has to fall back.
+    assert not is_hip_gdn_supported(q.half(), v, cu_seqlens)
+    assert not is_hip_gdn_supported(q.float(), v.float(), cu_seqlens)
     assert not is_hip_gdn_supported(q[..., :64], v[..., :64], cu_seqlens)
     # value heads not a multiple of key heads
     assert not is_hip_gdn_supported(q[:, :, :3], v[:, :, :5], cu_seqlens)
