@@ -191,7 +191,6 @@ jobs:
       timeout: 300
       pytest_args: >-
         tests/kernels/moe/test_hybrid_w4a16_moe.py
-        tests/kernels/quantization/test_awq_gemv_moe.py
         tests/kernels/quantization/test_fused_qk_norm_mrope_kvcache.py
         tests/kernels/quantization/test_hip_w4a16.py
         tests/kernels/quantization/test_hybrid_w4a16_triton.py

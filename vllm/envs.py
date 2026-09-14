@@ -133,7 +133,6 @@ if TYPE_CHECKING:
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
-    VLLM_MOE_AWQ_GEMV_HIP: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
     VLLM_MOE_HIP: str | None = None
     VLLM_GDN_HIP: bool = True
@@ -1241,10 +1240,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
-    ),
-    # Use AWQ GEMV HIP kernel for MoE decode on ROCm (RDNA3/3.5).
-    "VLLM_MOE_AWQ_GEMV_HIP": lambda: (
-        os.getenv("VLLM_MOE_AWQ_GEMV_HIP", "false").lower() in ("true", "1")
     ),
     # Use hybrid W4A16 (HIP skinny + Triton) kernel for MoE on ROCm.
     # Converts weights to skinny layout [E, N, K//8] int32 (ExLlama shuffle).

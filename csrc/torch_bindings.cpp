@@ -26,13 +26,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "awq_gemv_hip(Tensor activation, Tensor qweight, Tensor scales, "
       "Tensor qzeros, int split_k) -> Tensor");
   ops.impl("awq_gemv_hip", torch::kCUDA, &awq_gemv_hip);
-
-  ops.def(
-      "awq_gemv_moe_hip(Tensor activation, Tensor qweight, Tensor scales, "
-      "Tensor qzeros, Tensor output, Tensor sorted_token_ids, "
-      "Tensor expert_ids, Tensor topk_weights, int top_k, "
-      "bool mul_routed_weight, int split_k) -> ()");
-  ops.impl("awq_gemv_moe_hip", torch::kCUDA, &awq_gemv_moe_hip);
 #endif
 }
 
