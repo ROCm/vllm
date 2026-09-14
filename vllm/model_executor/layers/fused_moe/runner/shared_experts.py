@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import sys
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -72,6 +73,17 @@ class SharedExperts(torch.nn.Module):
                 self._input_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
                 self._output_ready_event = [torch.cuda.Event(), torch.cuda.Event()]
 
+        # On gfx11 the overlap is net-positive at every measured prefill size, so
+        # the token cap is lifted there unless it was set explicitly.
+        self._stream_token_threshold = envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        if current_platform.is_rocm() and not envs.is_set(
+            "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD"
+        ):
+            from vllm.platforms.rocm import on_gfx11
+
+            if on_gfx11():
+                self._stream_token_threshold = sys.maxsize
+
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
         self.moe_config = new_moe_config
@@ -110,8 +122,7 @@ class SharedExperts(torch.nn.Module):
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda_alike()
             and self._stream is not None
-            and hidden_states.shape[0]
-            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and hidden_states.shape[0] <= self._stream_token_threshold
         )
 
         if should_run_shared_in_aux_stream:
