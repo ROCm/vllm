@@ -705,133 +705,6 @@ else:
     hip_w4a16_linear_kernel_apply_weights = None
 
 
-def awq_gemv_moe_hip(
-    activation: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-    output: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    top_k: int,
-    mul_routed_weight: bool,
-    split_k: int = 0,
-) -> None:
-    torch.ops._C.awq_gemv_moe_hip(
-        activation,
-        qweight,
-        scales,
-        qzeros,
-        output,
-        sorted_token_ids,
-        expert_ids,
-        topk_weights,
-        top_k,
-        mul_routed_weight,
-        split_k,
-    )
-
-
-def _awq_moe_gemm_hip(
-    input_2d: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-    output: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    top_k: int,
-    mul_routed_weight: bool,
-    expected_k: int,
-    split_k: int = 0,
-) -> None:
-    assert input_2d.dim() == 2
-    M = input_2d.shape[0]
-    K_act = input_2d.shape[1]
-    padded_K = qweight.shape[1]
-
-    if M == 1:
-        if K_act != padded_K:
-            if K_act == expected_k:
-                x_padded = torch.zeros(
-                    (1, padded_K),
-                    dtype=input_2d.dtype,
-                    device=input_2d.device,
-                )
-                x_padded[:, :K_act] = input_2d
-                input_2d = x_padded
-            else:
-                raise ValueError(
-                    "Unexpected activation width for padded AWQ MoE: "
-                    f"{K_act} (expected {expected_k} or {padded_K})"
-                )
-        awq_gemv_moe_hip(
-            input_2d,
-            qweight,
-            scales,
-            qzeros,
-            output,
-            sorted_token_ids,
-            expert_ids,
-            topk_weights,
-            top_k,
-            mul_routed_weight,
-            split_k,
-        )
-    else:
-        num_slots = sorted_token_ids.size(0)
-        num_valid = M * top_k
-        for slot_idx in range(num_slots):
-            token_id = sorted_token_ids[slot_idx].item()
-            if token_id >= num_valid:
-                continue
-            expert_id = expert_ids[slot_idx].item()
-            act_row = token_id // top_k
-            w_fp16 = awq_dequantize(
-                qweight[expert_id],
-                scales[expert_id],
-                qzeros[expert_id],
-                0,
-                0,
-                0,
-                output_k=expected_k,
-            )
-            result = input_2d[act_row : act_row + 1, :expected_k] @ w_fp16
-            if mul_routed_weight:
-                result = result * topk_weights[token_id].item()
-            output[token_id] = result.squeeze(0)
-
-
-def _awq_moe_gemm_hip_fake_impl(
-    input_2d: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-    output: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    top_k: int,
-    mul_routed_weight: bool,
-    expected_k: int,
-    split_k: int = 0,
-) -> None:
-    pass
-
-
-if current_platform.is_rocm() and hasattr(torch.ops._C, "awq_gemv_moe_hip"):
-    direct_register_custom_op(
-        op_name="awq_moe_gemm_hip",
-        op_func=_awq_moe_gemm_hip,
-        fake_impl=_awq_moe_gemm_hip_fake_impl,
-    )
-    awq_moe_gemm_hip = torch.ops.vllm.awq_moe_gemm_hip
-else:
-    awq_moe_gemm_hip = None
-
-
 if hasattr(torch.ops._C, "awq_gemm"):
 
     @register_fake("_C::awq_gemm")
@@ -888,39 +761,6 @@ if hasattr(torch.ops._C, "gptq_gemm"):
     ) -> torch.Tensor:
         return torch.empty(
             (a.size(0), b_q_weight.size(1)), dtype=a.dtype, device=a.device
-        )
-
-
-def fused_moe_exllama_gemm(
-    a: torch.Tensor,
-    b_q_weight: torch.Tensor,
-    b_gptq_qzeros: torch.Tensor,
-    b_gptq_scales: torch.Tensor,
-    c: torch.Tensor,
-    sorted_token_ids: torch.Tensor,
-    expert_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    top_k: int,
-    mul_routed_weight: bool,
-    block_size_m: int = 64,
-) -> None:
-    from vllm.v1.utils import record_function_or_nullcontext
-
-    M, K = a.shape
-    E, N = b_q_weight.size(0), c.size(-1)
-    with record_function_or_nullcontext(f"exllama_moe {M}x{N}x{K} E={E} top_k={top_k}"):
-        torch.ops._C.fused_moe_exllama_gemm(
-            a,
-            b_q_weight,
-            b_gptq_qzeros,
-            b_gptq_scales,
-            c,
-            sorted_token_ids,
-            expert_ids,
-            topk_weights,
-            top_k,
-            mul_routed_weight,
-            block_size_m,
         )
 
 
@@ -4499,6 +4339,109 @@ def cpu_attention_with_kv_cache(
         v_scale,
         kv_cache_dtype,
     )
+
+
+def cpu_mla_decode(
+    query: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    output: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    loc: torch.Tensor | None,
+    attn_logits: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    sm_scale: float,
+    logit_cap: float,
+    is_cross_attn: bool,
+    sliding_window_size: int,
+    encoder_lens: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+) -> None:
+    torch.ops._C.decode_attention_cpu(
+        query,
+        k_buffer,
+        v_buffer,
+        output,
+        key,
+        value,
+        loc,
+        attn_logits,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        sm_scale,
+        logit_cap,
+        is_cross_attn,
+        sliding_window_size,
+        encoder_lens,
+        sinks,
+    )
+
+
+def cpu_mla_extend(
+    q_extend: torch.Tensor,
+    k_extend: torch.Tensor | None,
+    v_extend: torch.Tensor | None,
+    o_extend: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    extend_start_loc: torch.Tensor,
+    max_len_extend: int,
+    sm_scale: float,
+    logit_cap: float,
+    is_cross_attn: bool,
+    sliding_window_size: int,
+    encoder_lens: torch.Tensor | None,
+    sinks: torch.Tensor | None,
+    tree_mask: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C.extend_attention_cpu(
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        extend_seq_lens,
+        extend_start_loc,
+        max_len_extend,
+        sm_scale,
+        logit_cap,
+        is_cross_attn,
+        sliding_window_size,
+        encoder_lens,
+        sinks,
+        tree_mask,
+    )
+
+
+def bmm_cpu(
+    out: torch.Tensor,
+    mat1: torch.Tensor,
+    mat2: torch.Tensor,
+    is_vnni: bool,
+    scale: torch.Tensor | None = None,
+) -> None:
+    torch.ops._C.bmm_cpu(out, mat1, mat2, is_vnni, scale)
+
+
+def amx_mla_concat_and_cache(
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    torch.ops._C.concat_and_cache_mla_cpu(kv_c_normed, k_pe, kv_cache, slot_mapping)
 
 
 def cpu_gemm_wna16(

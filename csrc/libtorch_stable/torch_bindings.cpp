@@ -433,11 +433,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor q_in, Tensor kv, Tensor! k_cache, "
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
       "int q_head_padded, float eps, int cache_block_size) -> Tensor");
-  ops.def(
-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out("
-      "Tensor q_in, Tensor kv, Tensor! q_out, Tensor! k_cache, "
-      "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
-      "int q_head_padded, float eps, int cache_block_size) -> ()");
 
   // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
   // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.
@@ -675,13 +670,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // Post processing for GPTQ.
   ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
 
-  // Fused MoE GPTQ GEMM using exllama 4-bit kernel with expert routing.
-  ops.def(
-      "fused_moe_exllama_gemm(Tensor a, Tensor b_q_weight, "
-      "Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor! c, "
-      "Tensor sorted_token_ids, Tensor expert_ids, Tensor topk_weights, "
-      "int top_k, bool mul_routed_weight, int block_size_m) -> ()");
-
   // Mamba selective scan kernel
   ops.def(
       "selective_scan_fwd(Tensor! u, Tensor! delta,"
@@ -780,8 +768,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("fused_qk_norm_rope", TORCH_BOX(&fused_qk_norm_rope));
   ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
            TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert));
-  ops.impl("fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out",
-           TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_out));
   ops.impl(
       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert",
       TORCH_BOX(&fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert));
@@ -864,7 +850,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // GPTQ kernels
   ops.impl("gptq_gemm", TORCH_BOX(&gptq_gemm));
   ops.impl("gptq_shuffle", TORCH_BOX(&gptq_shuffle));
-  ops.impl("fused_moe_exllama_gemm", TORCH_BOX(&fused_moe_exllama_gemm));
 
   // Mamba kernels
   ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
@@ -915,7 +900,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C, HIP, ops) {
   // GPTQ kernels
   ops.impl("gptq_gemm", TORCH_BOX(&gptq_gemm));
   ops.impl("gptq_shuffle", TORCH_BOX(&gptq_shuffle));
-  ops.impl("fused_moe_exllama_gemm", TORCH_BOX(&fused_moe_exllama_gemm));
 
   ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
 }

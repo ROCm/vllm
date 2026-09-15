@@ -34,11 +34,6 @@ enum class PackingOrder {
   AWQ,
 };
 
-enum class MixtureOfExperts {
-  NO,
-  YES,
-};
-
 // Number of K-elements processed per inner-loop iteration in the GEMV kernel.
 // G (group size) must be a positive multiple of this value.
 static constexpr int PIPELINE_DEPTH = 16;
@@ -69,19 +64,14 @@ static constexpr uint32_t FP16_1024_PAIR = 0x64006400u;
 // AWQ GEMV Kernel with Split-K parallelism
 // Accumulates in fp32 for precision, supports SPLIT_K = 1, 2, 4, 8, 16
 // ============================================================================
-template <int OUTPUT_PER_THREAD, int SPLIT_K, PackingOrder PACKING,
-          MixtureOfExperts MOE>
+template <int OUTPUT_PER_THREAD, int SPLIT_K, PackingOrder PACKING>
 __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
     const __half* __restrict__ activation,  // [K]
     const uint32_t* __restrict__ qweight,   // [K, N/8]
     const __half* __restrict__ scales,      // [K/G, N]
     const uint32_t* __restrict__ qzeros,    // [K/G, N/8]
     __half* __restrict__ output,            // [N]
-    size_t M, size_t K, size_t N, size_t G,
-    const int* __restrict__ sorted_token_ids,
-    const int* __restrict__ expert_ids, const float* __restrict__ topk_weights,
-    int top_k, int num_valid_tokens, bool mul_routed_weight,
-    size_t expert_stride_w, size_t expert_stride_s, size_t expert_stride_z) {
+    size_t M, size_t K, size_t N, size_t G) {
   static_assert(OUTPUT_PER_THREAD == 8,
                 "Split-K only supports OUTPUT_PER_THREAD=8");
   static_assert(SPLIT_K >= 1 && SPLIT_K <= 20,
@@ -170,29 +160,6 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
       reinterpret_cast<size_t>(scales) + col_start * sizeof(__half);
 
   const __half* act_ptr = activation + start_row;
-
-  if constexpr (MOE == MixtureOfExperts::YES) {
-    // resolve token/expert routing from sorted_token_ids
-    int token_id = sorted_token_ids[blockIdx.y];
-    if (token_id >= num_valid_tokens) return;
-    int expert_id = expert_ids[blockIdx.y];
-
-    // offset pointers to the assigned expert
-    qweight += expert_id * expert_stride_w;
-    scales = reinterpret_cast<const __half*>(reinterpret_cast<size_t>(scales) +
-                                             expert_id * expert_stride_s *
-                                                 sizeof(__half));
-    qzeros += expert_id * expert_stride_z;
-    act_ptr = activation + (token_id / top_k) * K + start_row;
-    output += token_id * N;
-
-    // recompute derived pointers
-    w_ptr = qweight + tid * UINT32_PER_LOAD + start_row * weight_row_stride;
-    zeros_ptr_val = reinterpret_cast<size_t>(qzeros) +
-                    tid * UINT32_PER_LOAD * sizeof(uint32_t);
-    scales_ptr_val =
-        reinterpret_cast<size_t>(scales) + col_start * sizeof(__half);
-  }
 
   // Simplified pointer arithmetic with memory clobber to limit cross-iteration
   // optimization The asm barrier prevents the compiler from over-optimizing
@@ -472,22 +439,8 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
   #undef GET_W_PTR_SK
   #undef W_PTR_ADD_ROW_SK
 
-  auto apply_moe_weight = [&]() {
-    if constexpr (MOE == MixtureOfExperts::YES) {
-      if (mul_routed_weight) {
-        int token_id = sorted_token_ids[blockIdx.y];
-        float w = topk_weights[token_id];
-  #pragma unroll
-        for (auto& a : acc) {
-          a *= w;
-        }
-      }
-    }
-  };
-
   // For SPLIT_K=1, no reduction needed - write directly to output and return
   if constexpr (SPLIT_K == 1) {
-    apply_moe_weight();
   #pragma unroll
     for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
       size_t col = col_start + i;
@@ -571,7 +524,6 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
       }
 
       // Write outputs (convert fp32 accumulators to fp16)
-      apply_moe_weight();
   #pragma unroll
       for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
         size_t col = col_start + i;
@@ -596,7 +548,6 @@ __global__ __launch_bounds__(SPLIT_K * 32) void awq_gemv_kernel_splitk(
       }
 
       // Write outputs (convert fp32 accumulators to fp16)
-      apply_moe_weight();
   #pragma unroll
       for (int i = 0; i < OUTPUT_PER_THREAD; i++) {
         size_t col = col_start + i;
@@ -837,7 +788,7 @@ torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
                                            OUTPUT_PER_THREAD * sizeof(float)
                                      : 0;
 
-    awq_gemv_kernel_splitk<8, SPLIT_K, PACKING, MixtureOfExperts::NO>
+    awq_gemv_kernel_splitk<8, SPLIT_K, PACKING>
         <<<num_blocks, THREADS_PER_BLOCK, smem_size, stream>>>(
             reinterpret_cast<const __half*>(act_flat.data_ptr<at::Half>()),
             reinterpret_cast<const uint32_t*>(qweight.data_ptr<int32_t>()),
@@ -845,8 +796,7 @@ torch::Tensor awq_gemv_hip_impl(torch::Tensor activation,  // [M, K] or [K]
             reinterpret_cast<const uint32_t*>(qzeros.data_ptr<int32_t>()),
             reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
             static_cast<size_t>(K), static_cast<size_t>(N),
-            static_cast<size_t>(G), nullptr, nullptr, nullptr, 0, 0, false, 0,
-            0, 0);
+            static_cast<size_t>(G));
   };
 
   dispatch_splitk(effective_splitk, launch);
@@ -864,103 +814,5 @@ torch::Tensor awq_gemv_hip(torch::Tensor activation,  // [M, K] or [K]
   return awq_gemv_hip_impl<PackingOrder::AWQ>(activation, qweight, scales,
                                               qzeros, split_k);
 };
-
-void awq_gemv_moe_hip(
-    torch::Tensor activation,        // [num_tokens, K] fp16
-    torch::Tensor qweight,           // [E, K, N/8] int32 (AWQ packed)
-    torch::Tensor scales,            // [E, K/G, N] fp16
-    torch::Tensor qzeros,            // [E, K/G, N/8] int32 (AWQ packed)
-    torch::Tensor output,            // [num_slots, N] fp16 (pre-allocated)
-    torch::Tensor sorted_token_ids,  // [num_slots] int32
-    torch::Tensor expert_ids,        // [num_slots] int32
-    torch::Tensor topk_weights,      // [num_tokens * topk] float32
-    int64_t top_k, bool mul_routed_weight, int64_t split_k) {
-  TORCH_CHECK(qweight.dim() == 3, "qweight must be 3D [E, K, N/8], got ",
-              qweight.dim(), "D");
-  TORCH_CHECK(scales.dim() == 3, "scales must be 3D [E, K/G, N], got ",
-              scales.dim(), "D");
-  TORCH_CHECK(qzeros.dim() == 3, "qzeros must be 3D [E, K/G, N/8], got ",
-              qzeros.dim(), "D");
-
-  int64_t E = qweight.size(0);
-  (void)E;
-  int64_t K = qweight.size(1);
-  int64_t N = qweight.size(2) * 8;
-  int64_t num_groups = qzeros.size(1);
-
-  TORCH_CHECK(num_groups > 0, "num_groups must be positive");
-  TORCH_CHECK(K % num_groups == 0, "K (", K,
-              ") must be divisible by num_groups (", num_groups, ")");
-  int64_t G = K / num_groups;
-  TORCH_CHECK(G % PIPELINE_DEPTH == 0, "group_size (", G,
-              ") must be a positive multiple of ", PIPELINE_DEPTH);
-  TORCH_CHECK(N % 8 == 0, "N (", N, ") must be divisible by 8");
-
-  int64_t num_slots = sorted_token_ids.size(0);
-
-  TORCH_CHECK(activation.dim() == 2, "activation must be 2D [num_tokens, K]");
-  TORCH_CHECK(activation.size(1) >= K, "activation.size(1) must be >= K");
-  TORCH_CHECK(output.dim() == 2 && output.size(1) == N,
-              "output must be [num_slots, N]");
-  TORCH_CHECK(expert_ids.size(0) == num_slots,
-              "expert_ids length must match sorted_token_ids");
-
-  TORCH_CHECK(activation.is_contiguous(), "activation must be contiguous");
-  TORCH_CHECK(qweight.is_contiguous(), "qweight must be contiguous");
-  TORCH_CHECK(scales.is_contiguous(), "scales must be contiguous");
-  TORCH_CHECK(qzeros.is_contiguous(), "qzeros must be contiguous");
-  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
-  TORCH_CHECK(sorted_token_ids.is_contiguous());
-  TORCH_CHECK(expert_ids.is_contiguous());
-  TORCH_CHECK(topk_weights.is_contiguous());
-
-  TORCH_CHECK(activation.scalar_type() == at::ScalarType::Half);
-  TORCH_CHECK(scales.scalar_type() == at::ScalarType::Half);
-  TORCH_CHECK(qweight.scalar_type() == at::ScalarType::Int);
-  TORCH_CHECK(qzeros.scalar_type() == at::ScalarType::Int);
-  TORCH_CHECK(output.scalar_type() == at::ScalarType::Half);
-  TORCH_CHECK(sorted_token_ids.scalar_type() == at::ScalarType::Int);
-  TORCH_CHECK(expert_ids.scalar_type() == at::ScalarType::Int);
-  TORCH_CHECK(topk_weights.scalar_type() == at::ScalarType::Float);
-
-  size_t expert_stride_w = static_cast<size_t>(K) * (N / 8);
-  size_t expert_stride_s = static_cast<size_t>(num_groups) * N;
-  size_t expert_stride_z = static_cast<size_t>(num_groups) * (N / 8);
-
-  constexpr int OUTPUT_PER_THREAD = 8;
-  constexpr int THREADS_PER_SPLIT = 32;
-
-  auto stream = at::hip::getCurrentHIPStream();
-
-  int64_t total_outputs = (N + OUTPUT_PER_THREAD - 1) / OUTPUT_PER_THREAD;
-  int64_t num_col_blocks =
-      (total_outputs + THREADS_PER_SPLIT - 1) / THREADS_PER_SPLIT;
-
-  int64_t effective_splitk = compute_effective_splitk(split_k, num_groups, N);
-
-  auto launch = [&]<int SPLIT_K>() {
-    constexpr int THREADS_PER_BLOCK = THREADS_PER_SPLIT * SPLIT_K;
-    dim3 grid(num_col_blocks, num_slots);
-    size_t smem_size = (SPLIT_K > 1) ? SPLIT_K * THREADS_PER_SPLIT *
-                                           OUTPUT_PER_THREAD * sizeof(float)
-                                     : 0;
-
-    awq_gemv_kernel_splitk<8, SPLIT_K, PackingOrder::AWQ, MixtureOfExperts::YES>
-        <<<grid, THREADS_PER_BLOCK, smem_size, stream>>>(
-            reinterpret_cast<const __half*>(activation.data_ptr<at::Half>()),
-            reinterpret_cast<const uint32_t*>(qweight.data_ptr<int32_t>()),
-            reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()),
-            reinterpret_cast<const uint32_t*>(qzeros.data_ptr<int32_t>()),
-            reinterpret_cast<__half*>(output.data_ptr<at::Half>()), 1,
-            static_cast<size_t>(K), static_cast<size_t>(N),
-            static_cast<size_t>(G), sorted_token_ids.data_ptr<int32_t>(),
-            expert_ids.data_ptr<int32_t>(), topk_weights.data_ptr<float>(),
-            static_cast<int>(top_k),
-            static_cast<int>(activation.size(0) * top_k), mul_routed_weight,
-            expert_stride_w, expert_stride_s, expert_stride_z);
-  };
-
-  dispatch_splitk(effective_splitk, launch);
-}
 
 #endif  // USE_ROCM

@@ -91,7 +91,6 @@ __all__ = [
 
 if HAS_TRITON:
     # import to register the custom ops
-    from vllm.model_executor.layers.fused_moe.exllama_moe import ExllamaExperts
     from vllm.model_executor.layers.fused_moe.experts.batched_deep_gemm_moe import (
         BatchedDeepGemmExperts,
     )
@@ -141,7 +140,6 @@ if HAS_TRITON:
         "CutlassExpertsFp8",
         "CutlassBatchedExpertsFp8",
         "CutlassExpertsW4A8Fp8",
-        "ExllamaExperts",
         "TritonExperts",
         "TritonWNA16Experts",
         "BatchedTritonExperts",

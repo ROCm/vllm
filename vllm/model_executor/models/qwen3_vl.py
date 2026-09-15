@@ -922,7 +922,7 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
             self.get_hf_config().vision_config.spatial_merge_size,
             video_needs_metadata=True,
             expected_hidden_size=self._get_expected_hidden_size(),
-            embeds_from_ec_connector=self.embeds_from_ec_connector,
+            allow_missing_mm_embeddings=self.allow_missing_mm_embeddings,
         )
 
     def _get_vision_info(
@@ -1297,7 +1297,6 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
         prompt: str,
         mm_data: Mapping[str, object],
         mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
         mm_data = dict(mm_data)
 
@@ -1382,7 +1381,6 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     prompt="<|vision_start|><|video_pad|><|vision_end|>",
                     mm_data=video_mm_data,
                     mm_kwargs=video_mm_kwargs,
-                    tok_kwargs=tok_kwargs,
                 )
 
                 # Discard HF output input_ids — we use get_video_repl below
@@ -1444,7 +1442,6 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
             prompt=prompt,
             mm_data=mm_data,
             mm_kwargs=non_video_mm_kwargs,
-            tok_kwargs=tok_kwargs,
         )
 
         # Replace each placeholder with pre-computed video tokens.
@@ -1768,6 +1765,7 @@ class Qwen3VLForConditionalGeneration(
     }
 
     supports_encoder_tp_data = True
+    supports_tower_connector_lora = True
 
     supported_video_pruning_methods = ("evs", "vidcom2")
 
