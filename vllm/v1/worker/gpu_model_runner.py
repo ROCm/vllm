@@ -194,6 +194,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
+from vllm.v1.spec_decode.dflare import DFlareProposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -685,11 +686,11 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
-            elif (
-                self.speculative_config.use_dflash()
-                or self.speculative_config.use_dflare()
-            ):
+            elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.use_dflare():
+                self.drafter = DFlareProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
