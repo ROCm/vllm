@@ -226,6 +226,35 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           if (k_ >= K) break;
         }
 
+        // The fp16 unpack already subtracts a constant: the low-nibble path
+        // subtracts 1024, and the high-nibble path fuses the multiply by 1/16
+        // with an add of -64. The zero point is uniform over a group and
+        // A_CHUNK never straddles one, so it rides along in those constants
+        // instead of costing a second A_CHUNK-wide pass over the unpacked
+        // values. Both edits are exact in fp16: at 1024 one ulp is 1, so
+        // 1024 + zp is BIAS_LO + zp, and at 64 one ulp is 1/16, so 64 + zp is
+        // BIAS_HI + (zp << 4). The symmetric constants are the same identity
+        // with zp fixed at 8.
+        //
+        // The zero point depends on the weight row and the group but not on
+        // the activation row, so it is hoisted out of the n loop: it is read
+        // once per k2 rather than N times, and the read issues ahead of the
+        // unpack that consumes it instead of stalling it.
+        [[maybe_unused]] uint32_t BIAS_LO[YTILE], BIAS_HI[YTILE];
+        if constexpr (std::is_same_v<scalar_t, half>) {
+  #pragma unroll
+          for (int y = 0; y < YTILE; y++) {
+            BIAS_LO[y] = HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
+            BIAS_HI[y] = HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+            if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+              const uint32_t zp =
+                  zp_nibble(zero_points, m + y, k_ / GROUP_SIZE, num_groups);
+              BIAS_LO[y] += zp * 0x00010001u;
+              BIAS_HI[y] += (zp << 4) * 0x00010001u;
+            }
+          }
+        }
+
   #pragma unroll
         for (uint32_t n = 0; n < N; n++) {
   #pragma unroll
@@ -234,14 +263,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
             if constexpr (std::is_same_v<scalar_t, half>) {
               constexpr uint32_t FP16_MAGIC = 0x64006400u;
-              // When HAS_ZERO_POINTS, store raw nibble values;
-              // the zero-point subtraction below handles the full shift.
-              // When symmetric, bake -8 into the constants.
-              constexpr uint32_t BIAS_LO =
-                  HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
               constexpr uint32_t SCALE16 = 0x2C002C00u;
-              constexpr uint32_t BIAS_HI =
-                  HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
@@ -252,15 +274,15 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                 uint32_t hi1 = (qa & 0x00F000F0u) | FP16_MAGIC;
 
                 *(half2*)&cvtB.f[w * 4 + 0] =
-                    __hsub2(*(half2*)&lo0, *(const half2*)&BIAS_LO);
+                    __hsub2(*(half2*)&lo0, *(const half2*)&BIAS_LO[y]);
                 *(half2*)&cvtB.f[w * 4 + 1] =
                     __hfma2(*(half2*)&hi0, *(const half2*)&SCALE16,
-                            *(const half2*)&BIAS_HI);
+                            *(const half2*)&BIAS_HI[y]);
                 *(half2*)&cvtB.f[w * 4 + 2] =
-                    __hsub2(*(half2*)&lo1, *(const half2*)&BIAS_LO);
+                    __hsub2(*(half2*)&lo1, *(const half2*)&BIAS_LO[y]);
                 *(half2*)&cvtB.f[w * 4 + 3] =
                     __hfma2(*(half2*)&hi1, *(const half2*)&SCALE16,
-                            *(const half2*)&BIAS_HI);
+                            *(const half2*)&BIAS_HI[y]);
               }
             } else {
               // bf16 path: marlin-style magic-number trick.
@@ -282,18 +304,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                 qa >>= 4;
                 *(uint32_t*)&cvtB.f[w * 4 + 3] =
                     (qa & 0x000F000Fu) | BF16_MAGIC;
-              }
-            }
-
-            if constexpr (!std::is_same_v<scalar_t, __hip_bfloat16>) {
-              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                uint32_t group_idx = k_ / GROUP_SIZE;
-                scalar_t zp = __float2s<scalar_t>(static_cast<float>(
-                    zp_nibble(zero_points, m + y, group_idx, num_groups)));
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK; b++) {
-                  cvtB.h[b] = cvtB.h[b] - zp;
-                }
               }
             }
 
@@ -503,6 +513,35 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         uint32_t k_ = k + threadIdx.x * A_CHUNK;
         if (k_ >= K) break;
 
+        // The fp16 unpack already subtracts a constant: the low-nibble path
+        // subtracts 1024, and the high-nibble path fuses the multiply by 1/16
+        // with an add of -64. The zero point is uniform over a group and
+        // A_CHUNK never straddles one, so it rides along in those constants
+        // instead of costing a second A_CHUNK-wide pass over the unpacked
+        // values. Both edits are exact in fp16: at 1024 one ulp is 1, so
+        // 1024 + zp is BIAS_LO + zp, and at 64 one ulp is 1/16, so 64 + zp is
+        // BIAS_HI + (zp << 4). The symmetric constants are the same identity
+        // with zp fixed at 8.
+        //
+        // The zero point depends on the weight row and the group but not on
+        // the activation row, so it is hoisted out of the n loop: it is read
+        // once per k2 rather than N times, and the read issues ahead of the
+        // unpack that consumes it instead of stalling it.
+        [[maybe_unused]] uint32_t BIAS_LO[YTILE], BIAS_HI[YTILE];
+        if constexpr (std::is_same_v<scalar_t, half>) {
+  #pragma unroll
+          for (int y = 0; y < YTILE; y++) {
+            BIAS_LO[y] = HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
+            BIAS_HI[y] = HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
+            if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
+              const uint32_t zp =
+                  zp_nibble(zero_points, m + y, k_ / GROUP_SIZE, num_groups);
+              BIAS_LO[y] += zp * 0x00010001u;
+              BIAS_HI[y] += (zp << 4) * 0x00010001u;
+            }
+          }
+        }
+
   #pragma unroll
         for (uint32_t n = 0; n < N; n++) {
   #pragma unroll
@@ -511,14 +550,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
             if constexpr (std::is_same_v<scalar_t, half>) {
               constexpr uint32_t FP16_MAGIC = 0x64006400u;
-              // When HAS_ZERO_POINTS, store raw nibble values;
-              // the zero-point subtraction below handles the full shift.
-              // When symmetric, bake -8 into the constants.
-              constexpr uint32_t BIAS_LO =
-                  HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
               constexpr uint32_t SCALE16 = 0x2C002C00u;
-              constexpr uint32_t BIAS_HI =
-                  HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
@@ -529,15 +561,15 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                 uint32_t hi1 = (qa & 0x00F000F0u) | FP16_MAGIC;
 
                 *(half2*)&cvtB.f[w * 4 + 0] =
-                    __hsub2(*(half2*)&lo0, *(const half2*)&BIAS_LO);
+                    __hsub2(*(half2*)&lo0, *(const half2*)&BIAS_LO[y]);
                 *(half2*)&cvtB.f[w * 4 + 1] =
                     __hfma2(*(half2*)&hi0, *(const half2*)&SCALE16,
-                            *(const half2*)&BIAS_HI);
+                            *(const half2*)&BIAS_HI[y]);
                 *(half2*)&cvtB.f[w * 4 + 2] =
-                    __hsub2(*(half2*)&lo1, *(const half2*)&BIAS_LO);
+                    __hsub2(*(half2*)&lo1, *(const half2*)&BIAS_LO[y]);
                 *(half2*)&cvtB.f[w * 4 + 3] =
                     __hfma2(*(half2*)&hi1, *(const half2*)&SCALE16,
-                            *(const half2*)&BIAS_HI);
+                            *(const half2*)&BIAS_HI[y]);
               }
             } else {
               // bf16 path: marlin-style magic-number trick.
@@ -559,18 +591,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                 qa >>= 4;
                 *(uint32_t*)&cvtB.f[w * 4 + 3] =
                     (qa & 0x000F000Fu) | BF16_MAGIC;
-              }
-            }
-
-            if constexpr (!std::is_same_v<scalar_t, __hip_bfloat16>) {
-              if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
-                uint32_t group_idx = k_ / GROUP_SIZE;
-                scalar_t zp = __float2s<scalar_t>(static_cast<float>(
-                    zp_nibble(zero_points, m + y, group_idx, num_groups)));
-  #pragma unroll
-                for (uint32_t b = 0; b < A_CHUNK; b++) {
-                  cvtB.h[b] = cvtB.h[b] - zp;
-                }
               }
             }
 
