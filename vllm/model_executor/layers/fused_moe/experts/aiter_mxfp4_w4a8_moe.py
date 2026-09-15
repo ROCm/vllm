@@ -5,6 +5,10 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -26,6 +30,63 @@ __all__ = [
     "aiter_triton_kernel_w4a4_moe_forward",
     "aiter_triton_kernel_w4a8_moe_forward",
 ]
+
+
+# TODO(akaratza): Remove
+# _get_padding_mask and patch_gating_output after
+# https://github.com/ROCm/aiter/pull/4530 is released and consumed by vLLM.
+def _get_padding_mask() -> torch.Tensor | None:
+    """Retrieves a boolean mask with non-padding (0) and padding (1) tokens."""
+    if not is_forward_context_available():
+        return None
+
+    forward_context = get_forward_context()
+
+    # model runner v2.
+    if forward_context.is_padding is not None:
+        return forward_context.is_padding
+
+    # model runner v1.
+    slot_mapping = forward_context.slot_mapping
+
+    if isinstance(slot_mapping, list):
+        slot_mapping_dict = slot_mapping[0]
+    else:
+        slot_mapping_dict = slot_mapping
+
+    if isinstance(slot_mapping_dict, dict):
+        slot_mapping_sample = next(iter(slot_mapping_dict.values()), None)
+    else:
+        slot_mapping_sample = slot_mapping_dict
+
+    if isinstance(slot_mapping_sample, torch.Tensor):
+        return slot_mapping_sample < 0
+    else:
+        return None
+
+
+def patch_gating_output(
+    gating_output: torch.Tensor, global_num_experts: int
+) -> torch.Tensor:
+    """Zero the router logits of padding rows."""
+    if global_num_experts == 128:
+        return gating_output
+
+    is_padding = _get_padding_mask()
+    if is_padding is None:
+        return gating_output
+
+    num_rows = gating_output.shape[0]
+    if is_padding.shape[0] < num_rows:
+        extended = torch.ones(
+            num_rows, dtype=is_padding.dtype, device=is_padding.device
+        )
+        extended[: is_padding.shape[0]] = is_padding
+        is_padding = extended
+    elif is_padding.shape[0] > num_rows:
+        is_padding = is_padding[:num_rows]
+
+    return gating_output.masked_fill(is_padding[:, None], 0.0)
 
 
 def aiter_triton_kernel_w4a8_moe_forward(
@@ -60,6 +121,8 @@ def aiter_triton_kernel_w4a8_moe_forward(
     if on_gfx1250():
         _routing_mod.is_tdm_avail = lambda: False
     aiter_routing = _routing_mod.routing
+
+    gating_output = patch_gating_output(gating_output, global_num_experts)
 
     routing_data, gather_idx, scatter_idx = aiter_routing(
         gating_output, topk, sm_first=not renormalize
@@ -449,6 +512,8 @@ def aiter_triton_kernel_w4a16_moe_forward(
         _routing_mod.is_tdm_avail = lambda: False
     aiter_routing = _routing_mod.routing
 
+    gating_output = patch_gating_output(gating_output, global_num_experts)
+
     if score_mode is not None:
         use_grouped_topk = num_expert_group is not None and num_expert_group > 1
         routing_data, gather_idx, scatter_idx = aiter_routing(
@@ -710,6 +775,8 @@ def aiter_triton_kernel_w4a4_moe_forward(
         _routing_mod.is_tdm_avail = lambda: False
     aiter_routing = _routing_mod.routing
 
+    gating_output = patch_gating_output(gating_output, global_num_experts)
+
     if score_mode is not None:
         use_grouped_topk = (
             num_expert_group is not None and num_expert_group > 1
@@ -736,6 +803,9 @@ def aiter_triton_kernel_w4a4_moe_forward(
 
     if on_gfx1250():
         gather_src = gather_idx.to(torch.long) // topk
+        # A bad routing index here aborts the HSA queue and kills the engine;
+        # clamping degrades the padding rows instead, which are discarded.
+        gather_src = gather_src.clamp_(0, hidden_states.shape[0] - 1)
         hidden_states = hidden_states[gather_src]
         gather_idx = None
 
