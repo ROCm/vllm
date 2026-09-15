@@ -622,29 +622,21 @@ class DFlashQwen3Model(nn.Module):
         all_k_normed = self._normalize_context_k(all_k)
 
         # --- Fused RoPE across all layers ---
-        # DFlare overrides the stock rotary layout to match AngelSlim training.
-        if hasattr(self, "_apply_context_rope_override"):
-            all_k_normed = self._apply_context_rope_override(
-                all_k_normed,
-                context_positions,
-            )
-            all_k_flat = all_k_normed.view(L * num_ctx, kv)
-        else:
-            # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
-            # In-place RoPE: pass K as the "query" arg with key=None.
-            all_k_flat = all_k_normed.view(L * num_ctx, kv)
-            positions_repeated = context_positions.repeat(L)
-            cos_sin_cache = self._rope_cos_sin_cache
-            if cos_sin_cache.dtype != all_k_flat.dtype:
-                cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
-            ops.rotary_embedding(
-                positions_repeated,
-                all_k_flat,
-                None,
-                self._rope_head_size,
-                cos_sin_cache,
-                self._rope_is_neox,
-            )
+        # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
+        # In-place RoPE: pass K as the "query" arg with key=None.
+        all_k_flat = all_k_normed.view(L * num_ctx, kv)
+        positions_repeated = context_positions.repeat(L)
+        cos_sin_cache = self._rope_cos_sin_cache
+        if cos_sin_cache.dtype != all_k_flat.dtype:
+            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+        ops.rotary_embedding(
+            positions_repeated,
+            all_k_flat,
+            None,
+            self._rope_head_size,
+            cos_sin_cache,
+            self._rope_is_neox,
+        )
 
         if context_slot_mapping is None:
             return

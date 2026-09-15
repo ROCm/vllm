@@ -16,7 +16,7 @@ from vllm.model_executor.models.gemma4_dflare import (
 )
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
-from vllm.v1.spec_decode.utils import compact_dflash_context
+from vllm.v1.spec_decode.dflash import _compact_dflare_context
 
 
 def _speculators_config():
@@ -93,7 +93,7 @@ def test_angelslim_legacy_rope_layout():
     torch.testing.assert_close(actual, expected)
 
 
-def test_compact_dflash_context_removes_rejected_rows():
+def test_compact_dflare_context_removes_rejected_rows():
     states = torch.arange(12).view(4, 3)
     positions = torch.tensor([5, 6, 7, 8])
     slots = [
@@ -101,7 +101,7 @@ def test_compact_dflash_context_removes_rejected_rows():
         torch.tensor([20, -1, 22, -1]),
     ]
 
-    compact_states, compact_positions, compact_slots = compact_dflash_context(
+    compact_states, compact_positions, compact_slots = _compact_dflare_context(
         states,
         positions,
         slots,
@@ -180,6 +180,43 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
 
     torch.testing.assert_close(fused[0], loop[0])
     torch.testing.assert_close(fused[1], loop[1])
+
+
+def test_context_cache_path_is_owned_by_gemma_dflare():
+    model = object.__new__(DFlareGemma4Model)
+    nn.Module.__init__(model)
+    model._num_attn_layers = 1
+    model._num_kv_heads = 1
+    model._head_dim = 2
+
+    keys = torch.tensor([[[[1.0, 2.0]], [[3.0, 4.0]]]])
+    values = torch.tensor([[[[5.0, 6.0]], [[7.0, 8.0]]]])
+    model._project_context_kv = lambda *_args: (keys, values)
+    model._normalize_context_k = lambda tensor: tensor
+    model._apply_context_rope_override = lambda tensor, _positions: tensor + 10
+
+    calls = []
+
+    class _AttentionImpl:
+        def do_kv_cache_update(self, attention, key, value, cache, slots):
+            calls.append((attention, key, value, cache, slots))
+
+    attention = SimpleNamespace(impl=_AttentionImpl(), kv_cache=object())
+    model._attn_layers = [attention]
+    slots = torch.tensor([12, 13])
+
+    model.precompute_and_store_context_kv(
+        torch.zeros(2, 4),
+        torch.tensor([3, 4]),
+        slots,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] is attention
+    torch.testing.assert_close(calls[0][1], keys[0] + 10)
+    torch.testing.assert_close(calls[0][2], values[0])
+    assert calls[0][3] is attention.kv_cache
+    torch.testing.assert_close(calls[0][4], slots)
 
 
 def test_reduced_vocab_requires_draft_id_mapping():

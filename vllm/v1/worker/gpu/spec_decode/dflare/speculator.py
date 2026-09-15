@@ -13,3 +13,4 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 class DFlareSpeculator(DFlashSpeculator):
     _speculator_name = "DFlare"
+    _reuse_full_graph_metadata = True

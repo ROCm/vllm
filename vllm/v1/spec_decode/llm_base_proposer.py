@@ -30,7 +30,6 @@ from vllm.model_executor.models import (
     supports_multimodal_embeddings,
 )
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
-from vllm.model_executor.models.gemma4_dflare import DFlareGemma4ForCausalLM
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
@@ -541,17 +540,19 @@ class SpecDecodeBaseProposer:
             model = self.model
             if isinstance(model, BreakableCUDAGraphWrapper):
                 model = model.unwrap()
-            assert isinstance(
-                model,
-                (
-                    Eagle3LlamaForCausalLM,
-                    Eagle3DeepseekV2ForCausalLM,
-                    DFlashQwen3ForCausalLM,
-                    Eagle3Qwen3ForCausalLM,
-                    DFlashLagunaForCausalLM,
-                    DFlareGemma4ForCausalLM,
-                ),
-            )
+            if self.method == "dflare":
+                assert callable(getattr(model, "combine_hidden_states", None))
+            else:
+                assert isinstance(
+                    model,
+                    (
+                        Eagle3LlamaForCausalLM,
+                        Eagle3DeepseekV2ForCausalLM,
+                        DFlashQwen3ForCausalLM,
+                        Eagle3Qwen3ForCausalLM,
+                        DFlashLagunaForCausalLM,
+                    ),
+                )
             target_hidden_states = self.model.combine_hidden_states(
                 target_hidden_states
             )

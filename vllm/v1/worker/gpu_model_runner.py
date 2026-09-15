@@ -4704,11 +4704,7 @@ class GPUModelRunner(
             1
             if (
                 self.speculative_config.use_dflash()
-                or getattr(
-                    self.speculative_config,
-                    "use_dflare",
-                    lambda: False,
-                )()
+                or self.speculative_config.use_dflare()
             )
             else 0
         )
@@ -5317,7 +5313,6 @@ class GPUModelRunner(
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
-            or spec_config.use_dflare()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(

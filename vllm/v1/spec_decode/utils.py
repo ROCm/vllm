@@ -1,7 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Sequence
-
 import torch
 
 from vllm.platforms import current_platform
@@ -11,44 +9,6 @@ from vllm.v1.attention.backends.utils import (
 )
 
 PADDING_SLOT_ID = -1
-
-
-def compact_dflash_context(
-    context_states: torch.Tensor,
-    context_positions: torch.Tensor,
-    context_slot_mapping: torch.Tensor | Sequence[torch.Tensor | None] | None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor | list[torch.Tensor | None] | None,
-]:
-    """Remove rejected rows from packed DFlash context inputs."""
-    if context_slot_mapping is None:
-        return context_states, context_positions, None
-
-    per_layer = isinstance(context_slot_mapping, Sequence)
-    if per_layer:
-        reference_mapping = next(
-            (mapping for mapping in context_slot_mapping if mapping is not None),
-            None,
-        )
-        if reference_mapping is None:
-            return context_states, context_positions, list(context_slot_mapping)
-    else:
-        reference_mapping = context_slot_mapping
-
-    valid_context = reference_mapping != PADDING_SLOT_ID
-    compact_states = context_states[valid_context]
-    compact_positions = context_positions[valid_context]
-    compact_slots: torch.Tensor | list[torch.Tensor | None] | None
-    if per_layer:
-        compact_slots = [
-            mapping[valid_context] if mapping is not None else None
-            for mapping in context_slot_mapping
-        ]
-    else:
-        compact_slots = context_slot_mapping[valid_context]
-    return compact_states, compact_positions, compact_slots
 
 
 def next_power_of_2(n: int) -> int:

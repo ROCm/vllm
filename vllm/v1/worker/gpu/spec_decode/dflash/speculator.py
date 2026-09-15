@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
+    _reuse_full_graph_metadata = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
@@ -454,10 +455,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # FULL replay uses the attention metadata and per-layer slot mappings
         # captured by DFlashCudaGraphManager. Rebuilding separate objects here
         # has no consumer and adds eager CPU/H2D work to every decode cycle.
-        if (
-            self.speculative_config.method == "dflare"
-            and batch_desc.cg_mode == CUDAGraphMode.FULL
-        ):
+        if self._reuse_full_graph_metadata and batch_desc.cg_mode == CUDAGraphMode.FULL:
             draft_attn_metadata = None
             draft_slot_mappings_by_layer = None
         else:

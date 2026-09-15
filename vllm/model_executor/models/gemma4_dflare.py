@@ -418,6 +418,52 @@ class DFlareGemma4Model(DFlashQwen3Model):
             .contiguous()
         )
 
+    def precompute_and_store_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+    ) -> None:
+        """Project Gemma context with AngelSlim's rotary layout and cache it."""
+        if not hasattr(self, "_num_attn_layers"):
+            self._build_fused_kv_buffers()
+
+        num_context = context_states.shape[0]
+        num_layers = self._num_attn_layers
+        num_kv_heads = self._num_kv_heads
+        head_dim = self._head_dim
+
+        all_k, all_v = self._project_context_kv(
+            context_states,
+            num_context,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+        )
+        all_k = self._normalize_context_k(all_k)
+        all_k = self._apply_context_rope_override(all_k, context_positions)
+
+        if context_slot_mapping is None:
+            return
+
+        per_layer = isinstance(context_slot_mapping, (list, tuple))
+        for layer_index in range(num_layers):
+            slot_mapping = (
+                context_slot_mapping[layer_index]
+                if per_layer
+                else context_slot_mapping
+            )
+            if slot_mapping is None:
+                continue
+            attention = self._attn_layers[layer_index]
+            attention.impl.do_kv_cache_update(
+                attention,
+                all_k[layer_index],
+                all_v[layer_index],
+                attention.kv_cache,
+                slot_mapping,
+            )
+
     def _build_fused_kv_buffers(self) -> None:
         layers_attn = [layer.self_attn for layer in self.layers]
         attn0 = layers_attn[0]
