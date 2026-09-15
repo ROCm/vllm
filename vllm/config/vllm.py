@@ -632,7 +632,7 @@ class VllmConfig:
         speculative_config = self.speculative_config
         if speculative_config is None:
             return 0
-        if speculative_config.use_dflash():
+        if speculative_config.use_dflash() or speculative_config.use_dflare():
             # DFlash requires an extra lookahead slot since it uses in-fill-style
             # decoding instead of standard next-token sampling, so it has a query
             # for the last sampled token plus queries for each draft token.
@@ -2471,6 +2471,7 @@ class VllmConfig:
                 "eagle3",
                 "mtp",
                 "dflash",
+                "dflare",
                 "dspark",
                 "extract_hidden_states",
             ):
@@ -2481,7 +2482,7 @@ class VllmConfig:
             # own speculators.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method not in ("dflash", "dflare", "dspark")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 

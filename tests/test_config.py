@@ -18,6 +18,7 @@ import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
     CompilationConfig,
+    DeviceConfig,
     KernelConfig,
     ModelConfig,
     ObservabilityConfig,
@@ -126,6 +127,17 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
         monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", env_value)
 
     assert envs.VLLM_USE_V2_MODEL_RUNNER is expected
+
+
+def test_v2_model_runner_supports_dflare():
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
+    config.speculative_config = SimpleNamespace(
+        method="dflare",
+        parallel_drafting=True,
+        enable_adaptive_verification=False,
+    )
+
+    assert config._get_v2_model_runner_unsupported_features() == []
 
 
 def test_rocm_keeps_compiled_deepseek_defaults(monkeypatch):

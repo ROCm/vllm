@@ -62,9 +62,15 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
+DFlareModelTypes = Literal["dflare"]
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DFlareModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -318,6 +324,7 @@ class SpeculativeConfig:
             "eagle3",
             "extract_hidden_states",
             "dflash",
+            "dflare",
             "dspark",
         )
         factors.append(uses_aux_hidden_states)
@@ -944,7 +951,13 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "dflare",
+                    "dspark",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -961,6 +974,11 @@ class SpeculativeConfig:
                     in self.draft_model_config.architectures
                 ):
                     self.method = "dflash"
+                elif (
+                    "dflare" in self.draft_model_config.model.lower()
+                    or "DFlareDraftModel" in self.draft_model_config.architectures
+                ):
+                    self.method = "dflare"
                 elif (
                     "dspark" in self.draft_model_config.model.lower()
                     or "Qwen3DSparkModel" in self.draft_model_config.architectures
@@ -1006,7 +1024,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "dflare"):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -1068,7 +1086,7 @@ class SpeculativeConfig:
                     ):
                         hf.n_predict = hf.block_size
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dflare", "dspark"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1377,6 +1395,26 @@ class SpeculativeConfig:
                 f"than zero ({self.num_speculative_tokens})."
             )
 
+        if self.use_dflare() and self.draft_tensor_parallel_size != 1:
+            raise ValueError("DFlare currently requires draft_tensor_parallel_size=1")
+
+        if self.use_dflare() and self.draft_model_config is not None:
+            trained_block_size = getattr(
+                self.draft_model_config.hf_config,
+                "block_size",
+                None,
+            )
+            if (
+                trained_block_size is not None
+                and self.num_speculative_tokens + 1 > trained_block_size
+            ):
+                raise ValueError(
+                    "DFlare num_speculative_tokens exceeds the trained block "
+                    f"horizon: K={self.num_speculative_tokens}, "
+                    f"block_size={trained_block_size}. Expected K <= "
+                    "block_size - 1."
+                )
+
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1445,6 +1483,7 @@ class SpeculativeConfig:
         EAGLE3               eagle3        No       0
         P-EAGLE              eagle3        Yes      K - 1
         DFlash               dflash        Yes      K
+        DFlare               dflare        Yes      K
         DSpark               dspark        Yes      K - 1
         MTP                  mtp           No       0
         N-gram               ngram         No       0
@@ -1454,7 +1493,7 @@ class SpeculativeConfig:
         """
         num_draft_tokens = self.num_speculative_tokens
 
-        if self.use_dflash():
+        if self.use_dflash() or self.use_dflare():
             # DFlash uses one bonus query followed by K mask queries.
             return num_draft_tokens
 
@@ -1493,10 +1532,20 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in (
+            "eagle",
+            "eagle3",
+            "mtp",
+            "dflash",
+            "dflare",
+            "dspark",
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_dflare(self) -> bool:
+        return self.method == "dflare"
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
