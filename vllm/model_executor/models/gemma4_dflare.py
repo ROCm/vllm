@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Gemma-4 DFlare draft model for vLLM's parallel speculator path."""
 
 from collections.abc import Iterable
@@ -27,7 +28,6 @@ from vllm.model_executor.models.utils import (
     get_draft_quant_config,
     maybe_prefix,
 )
-from vllm.multimodal.inputs import NestedTensors
 
 
 def _rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -407,12 +407,16 @@ class DFlareGemma4Model(DFlashQwen3Model):
             self._dflare_rope_layout,
             self._rope_cos_sin_cache,
         )
-        return token_major.view(
-            num_context,
-            num_layers,
-            num_heads,
-            head_dim,
-        ).permute(1, 0, 2, 3).contiguous()
+        return (
+            token_major.view(
+                num_context,
+                num_layers,
+                num_heads,
+                head_dim,
+            )
+            .permute(1, 0, 2, 3)
+            .contiguous()
+        )
 
     def _build_fused_kv_buffers(self) -> None:
         layers_attn = [layer.self_attn for layer in self.layers]
@@ -683,10 +687,7 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
                 includes_lm_head = True
             else:
                 model_weights.append((name, weight))
-        if (
-            self.draft_id_to_target_id is not None
-            and not includes_draft_id_mapping
-        ):
+        if self.draft_id_to_target_id is not None and not includes_draft_id_mapping:
             raise ValueError(
                 "Reduced-vocabulary DFlare checkpoint is missing its "
                 "draft-to-target token mapping"
@@ -699,4 +700,3 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
         if head_weights:
             AutoWeightsLoader(self).load_weights(head_weights)
         self.model._build_fused_kv_buffers()
-

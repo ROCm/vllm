@@ -685,10 +685,10 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
-            elif self.speculative_config.use_dflash():
-                self.drafter = DFlashProposer(self.vllm_config, self.device, self)
-                self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.use_dflare():
+            elif (
+                self.speculative_config.use_dflash()
+                or self.speculative_config.use_dflare()
+            ):
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.method == "suffix":

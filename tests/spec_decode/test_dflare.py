@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import math
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -133,9 +137,7 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
     nn.Module.__init__(model)
     model.target_layer_ids = [0, 1]
     model.target_hidden_size = 4
-    model.layer_fusion_weights = nn.Parameter(
-        torch.tensor([[2.0, 0.0], [0.0, 2.0]])
-    )
+    model.layer_fusion_weights = nn.Parameter(torch.tensor([[2.0, 0.0], [0.0, 2.0]]))
     model._hidden_norm_weight = torch.ones(4)
     model._rms_norm_eps = 1e-6
 
@@ -162,9 +164,7 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
         variance = hidden_states.float().pow(2).mean(dim=-1, keepdim=True)
         out.copy_(
             (
-                hidden_states.float()
-                * torch.rsqrt(variance + epsilon)
-                * weight.float()
+                hidden_states.float() * torch.rsqrt(variance + epsilon) * weight.float()
             ).to(hidden_states.dtype)
         )
 
@@ -194,7 +194,7 @@ def test_reduced_vocab_requires_draft_id_mapping():
 
     with pytest.raises(ValueError, match="missing.*draft-to-target"):
         DFlareGemma4ForCausalLM.load_weights(
-            model,
+            cast(DFlareGemma4ForCausalLM, model),
             [("lm_head.weight", torch.zeros(4, 4))],
         )
 
@@ -211,7 +211,7 @@ def test_reduced_vocab_rejects_duplicate_target_ids():
 
     with pytest.raises(ValueError, match="unique"):
         DFlareGemma4ForCausalLM.load_weights(
-            model,
+            cast(DFlareGemma4ForCausalLM, model),
             [
                 ("d2t", torch.tensor([0, -1, 0, 0])),
                 ("lm_head.weight", torch.zeros(4, 4)),
@@ -231,6 +231,6 @@ def test_reduced_vocab_requires_lm_head():
 
     with pytest.raises(ValueError, match="missing lm_head"):
         DFlareGemma4ForCausalLM.load_weights(
-            model,
+            cast(DFlareGemma4ForCausalLM, model),
             [("d2t", torch.tensor([0, 0, 0, 0]))],
         )

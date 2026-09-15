@@ -1384,9 +1384,7 @@ class SpeculativeConfig:
             )
 
         if self.use_dflare() and self.draft_tensor_parallel_size != 1:
-            raise ValueError(
-                "DFlare currently requires draft_tensor_parallel_size=1"
-            )
+            raise ValueError("DFlare currently requires draft_tensor_parallel_size=1")
 
         if self.use_dflare() and self.draft_model_config is not None:
             trained_block_size = getattr(

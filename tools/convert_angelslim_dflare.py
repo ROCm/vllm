@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Convert an AngelSlim DFlare checkpoint to the vLLM draft contract."""
 
 from __future__ import annotations
@@ -110,9 +113,7 @@ def build_vllm_config(
             "causal": False,
             "rope_layout": dflare_config.get("rope_layout", "legacy"),
         },
-        "eagle_aux_hidden_state_layer_ids": [
-            layer_id + 1 for layer_id in layer_ids
-        ],
+        "eagle_aux_hidden_state_layer_ids": [layer_id + 1 for layer_id in layer_ids],
         "torch_dtype": source_config.get("torch_dtype", "bfloat16"),
     }
 
@@ -138,7 +139,7 @@ def main() -> int:
 
     tensors = {}
     with safe_open(source_weights, framework="pt", device="cpu") as source:
-        for key in source.keys():
+        for key in source:
             tensors[key] = source.get_tensor(key)
     save_file(tensors, args.output / "model.safetensors")
 

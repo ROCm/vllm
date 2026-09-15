@@ -77,9 +77,7 @@ class EAGLEConfig(PretrainedConfig):
                 "model should not be None when method is dflare"
             )
             dflare_config = getattr(self.model, "dflare_config", None)
-            if dflare_config is not None and not hasattr(
-                self.model, "dflash_config"
-            ):
+            if dflare_config is not None and not hasattr(self.model, "dflash_config"):
                 self.model.dflash_config = dict(dflare_config)
                 self.model.dflash_config["use_aux_hidden_state"] = False
             kwargs["architectures"] = [

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GPU DFlare speculator.
 
 DFlare uses the same parallel query scheduling, slot preparation, rejection

@@ -16,9 +16,7 @@ PADDING_SLOT_ID = -1
 def compact_dflash_context(
     context_states: torch.Tensor,
     context_positions: torch.Tensor,
-    context_slot_mapping: torch.Tensor
-    | Sequence[torch.Tensor | None]
-    | None,
+    context_slot_mapping: torch.Tensor | Sequence[torch.Tensor | None] | None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -42,6 +40,7 @@ def compact_dflash_context(
     valid_context = reference_mapping != PADDING_SLOT_ID
     compact_states = context_states[valid_context]
     compact_positions = context_positions[valid_context]
+    compact_slots: torch.Tensor | list[torch.Tensor | None] | None
     if per_layer:
         compact_slots = [
             mapping[valid_context] if mapping is not None else None
