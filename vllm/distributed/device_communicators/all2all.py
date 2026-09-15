@@ -934,9 +934,9 @@ class MoriAll2AllManager(All2AllManagerBase):
     ):
         import mori  # type: ignore[import-not-found]
 
-        from vllm.platforms.rocm import on_gfx942, on_gfx950
+        from vllm.platforms.rocm import on_gfx942, on_gfx950, on_gfx1250
 
-        assert on_gfx942() or on_gfx950(), (
+        assert on_gfx942() or on_gfx950() or on_gfx1250(), (
             "mori currently only support arch gfx942 and gfx950"
         )
 
@@ -944,7 +944,7 @@ class MoriAll2AllManager(All2AllManagerBase):
             # single node
             kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
             rdma_block_num = 0
-            warp_num_per_block = 16
+            warp_num_per_block = 32 if on_gfx1250() else 16
             block_num = 80
         else:
             # Multi-node: kernel follows --all2all-backend (mirrors deepep_* split).
@@ -961,11 +961,18 @@ class MoriAll2AllManager(All2AllManagerBase):
                 warp_num_per_block = 8
                 block_num = 64
                 rdma_block_num = 32
+            elif on_gfx1250():
+                warp_num_per_block = 16
+                block_num = 64
+                rdma_block_num = 32
             else:
                 raise NotImplementedError(
-                    "mori currently only support arch gfx942 and gfx950"
+                    "mori currently only support arch gfx942, gfx950 and gfx1250"
                 )
-
+        gpu_per_node = min(
+            4 if on_gfx1250() else 8,
+            num_ep_ranks,
+        )
         return dict(
             rank=rank,
             world_size=num_ep_ranks,
@@ -981,7 +988,7 @@ class MoriAll2AllManager(All2AllManagerBase):
             block_num=block_num,
             kernel_type=kernel_type,
             rdma_block_num=rdma_block_num,
-            gpu_per_node=min(8, num_ep_ranks),
+            gpu_per_node=gpu_per_node,
         )
 
     def _make_handle(self, **kwargs):
@@ -1001,6 +1008,75 @@ class MoriAll2AllManager(All2AllManagerBase):
         )
         return handle
 
+
+class MoriV2All2AllManager(All2AllManagerBase):
+    """MORI v2 EP via CCO communicator. Uses CCO flat VA for intra-vPOD
+    transfers (P2P for same-node, fabric/UALink for cross-node within vPOD).
+    No arch gating — MORI auto-detects gfx942/gfx950/gfx1250.
+    No launch config — MORI v2 owns its own tuning tables.
+    """
+
+    def __init__(self, cpu_group):
+        from mori.cco import Communicator, get_unique_id
+
+        super().__init__(cpu_group)
+        self.handle_cache = Cache()
+
+        # UniqueId supports pickle (__getstate__/__setstate__), so
+        # broadcast_object_list handles serialization transparently.
+        uid = get_unique_id() if self.rank == 0 else None
+
+        import torch.distributed as dist
+        obj_list = [uid]
+        dist.broadcast_object_list(obj_list, src=0, group=cpu_group)
+        uid = obj_list[0]
+
+        self.comm = Communicator.init(
+            nranks=self.world_size,
+            rank=self.rank,
+            unique_id=uid,
+        )
+        logger.info("MoriV2: CCO communicator ready, rank=%d/%d",
+                     self.rank, self.world_size)
+
+    def _make_all2all_kwargs(
+        self,
+        rank: int,
+        num_ep_ranks: int,
+        input_dtype: torch.dtype,
+        quant_dtype: torch.dtype,
+        token_hidden_size: int,
+        scale_dim: int,
+        scale_type_size: int,
+        max_num_tokens_per_dp_rank: int,
+        num_local_experts: int,
+        num_experts_per_token: int,
+    ):
+        return dict(
+            rank=rank,
+            world_size=num_ep_ranks,
+            hidden_dim=token_hidden_size,
+            max_num_inp_token_per_rank=max_num_tokens_per_dp_rank,
+            num_experts_per_rank=num_local_experts,
+            num_experts_per_token=num_experts_per_token,
+            data_type=quant_dtype,
+            scale_dim=scale_dim,
+            scale_type_size=scale_type_size,
+        )
+
+    def _make_handle(self, **kwargs):
+        from mori.ops.dispatch_combine_v2 import (
+            EpDispatchCombineConfig,
+            EpDispatchCombineOp,
+        )
+
+        cfg = EpDispatchCombineConfig(**kwargs)
+        return EpDispatchCombineOp(cfg, self.comm)
+
+    def get_handle(self, kwargs):
+        v2_kwargs = self._make_all2all_kwargs(**kwargs)
+        logger.debug("MoRI v2 all2all args %s", v2_kwargs)
+        return self.handle_cache.get_or_create(v2_kwargs, self._make_handle)
 
 class DeepEPV2All2AllManager(All2AllManagerBase):
     """

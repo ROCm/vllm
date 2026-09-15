@@ -18,6 +18,7 @@ import torch
 import zmq
 
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.utils import get_current_attn_backends
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -91,6 +92,7 @@ try:
         IOEngine,
         IOEngineConfig,
     )
+    from mori.io.fabric_allocator import make_fabric_mem_pool
 
     logger.info("MoRIIO is available")
     MoRIIO_enabled = True
@@ -1180,11 +1182,9 @@ class MoRIIOConnectorWorker:
             transfer_timeout=self.moriio_config.transfer_timeout,
         )
         self.moriio_wrapper.set_moriio_engine(self.moriio_engine)
-        backend = (
-            BackendType.XGMI
-            if self.moriio_config.backend == "xgmi"
-            else BackendType.RDMA
-        )
+        _backend_map = {"xgmi": BackendType.XGMI, "fabric": BackendType.FABRIC}
+        backend = _backend_map.get(
+            self.moriio_config.backend, BackendType.RDMA)
         self.moriio_wrapper.set_backend_type(
             backend,
             qp_per_transfer=self.moriio_config.qp_per_transfer,
@@ -1192,6 +1192,13 @@ class MoRIIOConnectorWorker:
             num_workers=self.moriio_config.num_workers,
         )
         self.moriio_wrapper.notify_port = self.moriio_config.notify_port
+        # Fabric memory pool: KV cache tensors must be allocated under this pool
+        # for the FABRIC backend to export fabric handles over UALink.
+        self.fabric_pool = (
+            make_fabric_mem_pool()
+            if self.moriio_config.backend == "fabric"
+            else None
+        )
         self.local_kv_cache_metadata: list[bytes] = []
         self.local_kv_cache_size: list[int] = []
         self.layer_name_to_local_kv_cache_metadata: dict[str, list[bytes]] = {}
@@ -1276,12 +1283,6 @@ class MoRIIOConnectorWorker:
         self.use_mla = self.model_config.use_mla
         self.built_session = False
         self.built_write_session: defaultdict[str, list] = defaultdict(list)
-        backend = get_attn_backend(
-            self.model_config.get_head_size(),
-            self.model_config.dtype,
-            self.cache_config.cache_dtype,
-            use_mla=self.use_mla,
-        )
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         # READ-mode producer: a decode release-ACK can arrive BEFORE
         # start_load_kv populates transfer_id_to_request_id (the notify races
@@ -1293,10 +1294,6 @@ class MoRIIOConnectorWorker:
         # (on the tick its mapping exists) -- the heterogeneous-TP ack-counting
         # is preserved.
         self._pending_unmapped_acks: list = []
-
-        # TODO: consider the integration of flashinfer or other backends.
-        self.backend_name = backend.get_name()
-        logger.debug("Detected attention backend %s", self.backend_name)
 
     def schedule_write_blocks(
         self,
@@ -1743,6 +1740,10 @@ class MoRIIOConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in moriio."""
+
+        backends = get_current_attn_backends(self.vllm_config)
+        self.backend_name = backends[0].get_name()
+        logger.debug("Detected attention backend %s", self.backend_name)
 
         self.kv_caches = kv_caches  # layer name to kv cache
         self.kv_cache_shapes = {
