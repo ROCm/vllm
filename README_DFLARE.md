@@ -43,6 +43,5 @@ decode steps. These details are required for serving acceptance to match
 teacher-forced evaluation.
 
 Gemma-4 multimodal requests use the target model's auxiliary hidden-state
-contract. The implementation has been validated on 200 RoboVQA image/text
-requests with a reduced 4K draft vocabulary, AWQ draft body, K=15, V2, and CUDA
-graphs.
+contract. The implementation has been validated on image/text requests with a
+reduced draft vocabulary, quantized draft body, V2, and CUDA graphs.
