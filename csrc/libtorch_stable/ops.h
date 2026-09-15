@@ -584,13 +584,6 @@ torch::stable::Tensor gptq_gemm(torch::stable::Tensor a,
 void gptq_shuffle(torch::stable::Tensor q_weight, torch::stable::Tensor q_perm,
                   int64_t bit);
 
-void fused_moe_exllama_gemm(
-    torch::stable::Tensor a, torch::stable::Tensor b_q_weight,
-    torch::stable::Tensor b_gptq_qzeros, torch::stable::Tensor b_gptq_scales,
-    torch::stable::Tensor c, torch::stable::Tensor sorted_token_ids,
-    torch::stable::Tensor expert_ids, torch::stable::Tensor topk_weights,
-    int64_t top_k, bool mul_routed_weight, int64_t block_size_m);
-
 // Cache ops (shared CUDA/ROCm)
 void swap_blocks(torch::stable::Tensor& src, torch::stable::Tensor& dst,
                  int64_t block_size_in_bytes,
