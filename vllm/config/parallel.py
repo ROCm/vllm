@@ -50,6 +50,7 @@ All2AllBackend = Literal[
     "mori_high_throughput",
     "mori_low_latency",
     "moonep",
+    "mori_v2",
     "nixl_ep",
     "allgather_reducescatter",
     "flashinfer_all2allv",  # temporary alias for flashinfer_nvlink_two_sided
@@ -208,6 +209,7 @@ class ParallelConfig:
     - "mori_high_throughput": MoRI EP with InterNodeV1 for multi-node
     - "mori_low_latency": MoRI EP with InterNodeV1LL for multi-node
     - "moonep": MoonEP balanced EP with dynamic redundant experts (NVLink)
+    - "mori_v2": MoRI v2 EP with CCO (intra-vPOD, fabric/UALink on MI455X)
     - "nixl_ep": Use nixl-ep kernels
     - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels
     - "flashinfer_nvlink_two_sided": Use flashinfer two-sided kernels for mnnvl"""
@@ -727,6 +729,7 @@ class ParallelConfig:
                 "flashinfer_nvlink_one_sided",
                 "mori_high_throughput",
                 "mori_low_latency",
+                "mori_v2",
                 "nixl_ep",
             )
             and self.enable_expert_parallel
