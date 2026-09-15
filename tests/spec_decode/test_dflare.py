@@ -16,7 +16,7 @@ from vllm.model_executor.models.gemma4_dflare import (
 )
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
-from vllm.v1.spec_decode.dflash import _compact_dflare_context
+from vllm.v1.spec_decode.dflare import compact_dflare_context
 
 
 def _speculators_config():
@@ -101,7 +101,7 @@ def test_compact_dflare_context_removes_rejected_rows():
         torch.tensor([20, -1, 22, -1]),
     ]
 
-    compact_states, compact_positions, compact_slots = _compact_dflare_context(
+    compact_states, compact_positions, compact_slots = compact_dflare_context(
         states,
         positions,
         slots,
@@ -124,12 +124,42 @@ class _Projection(nn.Module):
         return hidden_states @ self.weight.T, None
 
 
+class _Attention(nn.Module):
+    def __init__(self, key_weight: torch.Tensor, value_weight: torch.Tensor):
+        super().__init__()
+        self.target_k_proj = _Projection(key_weight)
+        self.target_v_proj = _Projection(value_weight)
+
+
 class _Layer(nn.Module):
     def __init__(self, key_weight: torch.Tensor, value_weight: torch.Tensor):
         super().__init__()
-        self.self_attn = nn.Module()
-        self.self_attn.target_k_proj = _Projection(key_weight)
-        self.self_attn.target_v_proj = _Projection(value_weight)
+        self.self_attn = _Attention(key_weight, value_weight)
+
+
+class _ContextCacheModel(DFlareGemma4Model):
+    test_keys: torch.Tensor
+    test_values: torch.Tensor
+
+    def _project_context_kv(
+        self,
+        context_states: torch.Tensor,
+        num_ctx: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.test_keys, self.test_values
+
+    def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
+        return all_k
+
+    def _apply_context_rope_override(
+        self,
+        all_k_normed: torch.Tensor,
+        context_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        return all_k_normed + 10
 
 
 def test_fused_context_kv_matches_layer_loop(monkeypatch):
@@ -183,7 +213,7 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
 
 
 def test_context_cache_path_is_owned_by_gemma_dflare():
-    model = object.__new__(DFlareGemma4Model)
+    model = object.__new__(_ContextCacheModel)
     nn.Module.__init__(model)
     model._num_attn_layers = 1
     model._num_kv_heads = 1
@@ -191,9 +221,8 @@ def test_context_cache_path_is_owned_by_gemma_dflare():
 
     keys = torch.tensor([[[[1.0, 2.0]], [[3.0, 4.0]]]])
     values = torch.tensor([[[[5.0, 6.0]], [[7.0, 8.0]]]])
-    model._project_context_kv = lambda *_args: (keys, values)
-    model._normalize_context_k = lambda tensor: tensor
-    model._apply_context_rope_override = lambda tensor, _positions: tensor + 10
+    model.test_keys = keys
+    model.test_values = values
 
     calls = []
 

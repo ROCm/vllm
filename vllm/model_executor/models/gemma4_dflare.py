@@ -449,9 +449,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
         per_layer = isinstance(context_slot_mapping, (list, tuple))
         for layer_index in range(num_layers):
             slot_mapping = (
-                context_slot_mapping[layer_index]
-                if per_layer
-                else context_slot_mapping
+                context_slot_mapping[layer_index] if per_layer else context_slot_mapping
             )
             if slot_mapping is None:
                 continue

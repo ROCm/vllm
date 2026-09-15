@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -12,51 +11,14 @@ from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.spec_decode.dflare import compact_dflare_context
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import (
-    PADDING_SLOT_ID,
     copy_and_expand_dflash_inputs_kernel,
     next_power_of_2,
 )
 
 logger = init_logger(__name__)
-
-
-def _compact_dflare_context(
-    context_states: torch.Tensor,
-    context_positions: torch.Tensor,
-    context_slot_mapping: torch.Tensor | Sequence[torch.Tensor | None] | None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor | list[torch.Tensor | None] | None,
-]:
-    """Remove rejected rows from packed DFlare context inputs."""
-    if context_slot_mapping is None:
-        return context_states, context_positions, None
-
-    per_layer = isinstance(context_slot_mapping, Sequence)
-    if per_layer:
-        reference_mapping = next(
-            (mapping for mapping in context_slot_mapping if mapping is not None),
-            None,
-        )
-        if reference_mapping is None:
-            return context_states, context_positions, list(context_slot_mapping)
-    else:
-        reference_mapping = context_slot_mapping
-
-    valid_context = reference_mapping != PADDING_SLOT_ID
-    compact_states = context_states[valid_context]
-    compact_positions = context_positions[valid_context]
-    if per_layer:
-        compact_slots = [
-            mapping[valid_context] if mapping is not None else None
-            for mapping in context_slot_mapping
-        ]
-    else:
-        compact_slots = context_slot_mapping[valid_context]
-    return compact_states, compact_positions, compact_slots
 
 
 class DFlashProposer(SpecDecodeBaseProposer):
@@ -337,7 +299,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         context_positions = self._context_positions_buffer[:num_context]
         context_slots = self._context_slot_mapping_buffer[:num_context]
         if self.method == "dflare" and self._dflare_has_rejected_context:
-            context_states, context_positions, context_slots = _compact_dflare_context(
+            context_states, context_positions, context_slots = compact_dflare_context(
                 context_states,
                 context_positions,
                 context_slots,
