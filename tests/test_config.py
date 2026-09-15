@@ -18,6 +18,7 @@ import vllm.envs as envs
 from vllm.compilation.backends import VllmBackend
 from vllm.config import (
     CompilationConfig,
+    DeviceConfig,
     KernelConfig,
     ModelConfig,
     ObservabilityConfig,
@@ -129,7 +130,7 @@ def test_v2_model_runner_env_tri_state(monkeypatch, env_value, expected):
 
 
 def test_v2_model_runner_supports_dflare():
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig("cpu"))
     config.speculative_config = SimpleNamespace(
         method="dflare",
         parallel_drafting=True,

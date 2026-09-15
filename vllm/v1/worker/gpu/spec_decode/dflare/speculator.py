@@ -12,5 +12,9 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
 
 class DFlareSpeculator(DFlashSpeculator):
+    # V2's shared DFlash input kernel marks rejected context rows with
+    # PAD_SLOT_ID before precompute_and_store_context_kv. The cache update
+    # therefore ignores them without the explicit tensor compaction used by
+    # the legacy V1 DFlareProposer.
     _speculator_name = "DFlare"
     _reuse_full_graph_metadata = True

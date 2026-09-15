@@ -9,14 +9,17 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config import VllmConfig
 from vllm.model_executor.models.gemma4_dflare import (
     DFlareGemma4ForCausalLM,
     DFlareGemma4Model,
     _apply_angelslim_rope,
 )
+from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.v1.spec_decode.dflare import compact_dflare_context
+from vllm.v1.worker.gpu.spec_decode import init_speculator
 
 
 def _speculators_config():
@@ -91,6 +94,32 @@ def test_angelslim_legacy_rope_layout():
         ]
     )
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("layout", ["legacy", "neox"])
+def test_angelslim_rope_cache_matches_computed_frequencies(layout):
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 3, 8)
+    positions = torch.tensor([1, 7])
+    theta = 10000.0
+    inv_freq = 1.0 / (theta ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+    frequencies = torch.einsum(
+        "n,d->nd",
+        torch.arange(8, dtype=torch.float32),
+        inv_freq,
+    )
+    cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
+
+    cached = _apply_angelslim_rope(
+        hidden,
+        positions,
+        theta,
+        layout,
+        cache,
+    )
+    computed = _apply_angelslim_rope(hidden, positions, theta, layout)
+
+    torch.testing.assert_close(cached, computed)
 
 
 def test_compact_dflare_context_removes_rejected_rows():
@@ -210,6 +239,49 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
 
     torch.testing.assert_close(fused[0], loop[0])
     torch.testing.assert_close(fused[1], loop[1])
+
+
+def test_dflare_weight_names_are_translated(monkeypatch):
+    captured = {}
+
+    def capture_weights(self, weights):
+        captured["weights"] = list(weights)
+        return {"loaded"}
+
+    monkeypatch.setattr(DFlashQwen3Model, "load_weights", capture_weights)
+    model = object.__new__(DFlareGemma4Model)
+    nn.Module.__init__(model)
+    weights = [
+        ("layers.0.attention.k_proj_target.weight", torch.zeros(1)),
+        ("layers.0.attention.v_proj_target.weight", torch.zeros(1)),
+        ("layers.0.gate_proj.weight", torch.zeros(1)),
+    ]
+
+    result = model.load_weights(weights)
+
+    assert result == {"loaded"}
+    assert [name for name, _ in captured["weights"]] == [
+        "layers.0.self_attn.target_k_proj.weight",
+        "layers.0.self_attn.target_v_proj.weight",
+        "layers.0.mlp.gate_proj.weight",
+    ]
+
+
+def test_dflare_v2_speculator_dispatch(monkeypatch):
+    sentinel = object()
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.dflare.speculator.DFlareSpeculator",
+        lambda config, device: sentinel,
+    )
+    config = cast(
+        VllmConfig,
+        SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dflare"),
+        ),
+    )
+
+    assert init_speculator(config, torch.device("cpu")) is sentinel
 
 
 def test_context_cache_path_is_owned_by_gemma_dflare():

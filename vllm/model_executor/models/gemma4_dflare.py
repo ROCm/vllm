@@ -96,7 +96,6 @@ class DFlareGemma4Attention(DFlashQwen3Attention):
         attention_bias: bool,
         sliding_window: int | None,
         causal: bool,
-        is_neox_style: bool,
         rope_layout: str,
         cache_config: CacheConfig | None,
         quant_config: QuantizationConfig | None,
@@ -197,7 +196,6 @@ class DFlareGemma4DecoderLayer(nn.Module):
             attention_bias=getattr(config, "attention_bias", False),
             sliding_window=sliding_window,
             causal=causal,
-            is_neox_style=getattr(config, "is_neox_style", True),
             rope_layout=(getattr(config, "dflare_config", None) or {}).get(
                 "rope_layout", "legacy"
             ),

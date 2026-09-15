@@ -4705,11 +4705,7 @@ class GPUModelRunner(
             1
             if (
                 self.speculative_config.use_dflash()
-                or getattr(
-                    self.speculative_config,
-                    "use_dflare",
-                    lambda: False,
-                )()
+                or self.speculative_config.use_dflare()
             )
             else 0
         )

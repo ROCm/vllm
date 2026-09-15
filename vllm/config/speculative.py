@@ -1483,6 +1483,7 @@ class SpeculativeConfig:
         EAGLE3               eagle3        No       0
         P-EAGLE              eagle3        Yes      K - 1
         DFlash               dflash        Yes      K
+        DFlare               dflare        Yes      K
         DSpark               dspark        Yes      K - 1
         MTP                  mtp           No       0
         N-gram               ngram         No       0
