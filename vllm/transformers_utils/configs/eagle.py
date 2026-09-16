@@ -5,6 +5,7 @@ import os
 
 from transformers import AutoConfig, DeepseekV2Config, PretrainedConfig
 
+from vllm.transformers_utils.configs.dflare import apply_dflare_scheduling_alias
 from vllm.transformers_utils.utils import without_trust_remote_code
 
 
@@ -72,10 +73,21 @@ class EAGLEConfig(PretrainedConfig):
                 else f"DFlash{arch}"
                 for arch in self.model.architectures
             ]
+        elif method == "dflare":
+            assert self.model is not None, (
+                "model should not be None when method is dflare"
+            )
+            apply_dflare_scheduling_alias(self.model)
+            kwargs["architectures"] = [
+                arch
+                if arch.startswith("DFlare") or arch.endswith("DFlare")
+                else f"DFlare{arch}"
+                for arch in self.model.architectures
+            ]
         else:
             raise ValueError(
                 f"Invalid method {method}. Supported methods are "
-                "eagle, eagle3, and dflash."
+                "eagle, eagle3, dflash, and dflare."
             )
 
         super().__init__(**kwargs)
