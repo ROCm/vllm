@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.transformers_utils.configs.dflare import apply_dflare_scheduling_alias
+
 SUPPORTED_SPECULATORS_TYPES = {}
 
 
@@ -145,10 +147,7 @@ def update_dflare(config_dict: dict, pre_trained_config: dict) -> None:
         "target_layer_ids": [i - 1 for i in aux_layer_ids],
         "causal": not config_dict.get("sliding_window_non_causal", True),
     }
-    # Reuse DFlash's scheduling and KV-cache machinery; the DFlare model reads
-    # dflare_config for fusion, while the shared speculator reads this alias.
-    pre_trained_config["dflash_config"] = dict(pre_trained_config["dflare_config"])
-    pre_trained_config["dflash_config"]["use_aux_hidden_state"] = False
+    apply_dflare_scheduling_alias(pre_trained_config)
 
 
 @register_speculator("dspark")

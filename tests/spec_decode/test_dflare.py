@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib.util
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
@@ -17,6 +19,10 @@ from vllm.model_executor.models.gemma4_dflare import (
 )
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.transformers_utils.configs.dflare import (
+    apply_dflare_scheduling_alias,
+    dflash_config_from_dflare,
+)
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.v1.spec_decode.dflare import compact_dflare_context
 from vllm.v1.worker.gpu.spec_decode import init_speculator
@@ -372,3 +378,204 @@ def test_reduced_vocab_requires_lm_head():
             cast(DFlareGemma4ForCausalLM, model),
             [("d2t", torch.tensor([0, 0, 0, 0]))],
         )
+
+
+def test_dflare_scheduling_alias_is_shared():
+    dflare_config = {
+        "mask_token_id": 7,
+        "target_layer_ids": [0, 1],
+        "causal": False,
+    }
+    aliased = dflash_config_from_dflare(dflare_config)
+    assert aliased["use_aux_hidden_state"] is False
+    assert aliased["mask_token_id"] == 7
+    assert dflare_config.get("use_aux_hidden_state") is None
+
+    config = {"dflare_config": dflare_config}
+    apply_dflare_scheduling_alias(config)
+    assert config["dflash_config"] == aliased
+    config["dflash_config"]["mask_token_id"] = 99
+    apply_dflare_scheduling_alias(config)
+    assert config["dflash_config"]["mask_token_id"] == 99
+
+
+def test_causal_lm_keeps_concatenated_hidden_size(monkeypatch):
+    captured = {}
+
+    class _FakeDraftModel:
+        def __init__(self, *, vllm_config, prefix: str = "", start_layer_id: int = 0):
+            hf_config = vllm_config.speculative_config.draft_model_config.hf_config
+            captured["hidden_size"] = hf_config.hidden_size
+            captured["draft_hidden_size"] = hf_config.draft_hidden_size
+            self.target_layer_ids = [0, 1]
+            self.target_hidden_size = 4
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.gemma4_dflare.DFlareGemma4Model",
+        _FakeDraftModel,
+    )
+    monkeypatch.setattr(
+        DFlareGemma4ForCausalLM,
+        "_make_lm_head",
+        staticmethod(lambda *args, **kwargs: object()),
+    )
+    monkeypatch.setattr(
+        DFlareGemma4ForCausalLM,
+        "_make_logits_processor",
+        staticmethod(lambda *args, **kwargs: object()),
+    )
+    hf_config = SimpleNamespace(
+        hidden_size=12,
+        draft_hidden_size=4,
+        draft_vocab_size=8,
+        target_head_hidden_size=4,
+        logit_scale=1.0,
+    )
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            draft_model_config=SimpleNamespace(hf_config=hf_config)
+        ),
+        model_config=SimpleNamespace(
+            get_num_layers=lambda _parallel: 1,
+            get_vocab_size=lambda: 8,
+        ),
+        parallel_config=object(),
+    )
+
+    DFlareGemma4ForCausalLM(vllm_config=cast(VllmConfig, vllm_config))
+
+    assert captured["hidden_size"] == 12
+    assert captured["draft_hidden_size"] == 4
+    assert hf_config.hidden_size == 12
+
+
+def test_dflare_pipeline_converts_compacts_and_fuses(monkeypatch):
+    path = Path(__file__).parents[2] / "tools" / "convert_angelslim_dflare.py"
+    spec = importlib.util.spec_from_file_location("convert_angelslim_dflare", path)
+    assert spec is not None and spec.loader is not None
+    converter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(converter)
+
+    converted = converter.build_vllm_config(
+        {
+            "model_type": "qwen3",
+            "vocab_size": 16,
+            "hidden_size": 4,
+            "target_hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 2,
+            "block_size": 4,
+            "dflare_config": {
+                "target_layer_ids": [0, 1],
+                "mask_token_id": 7,
+            },
+        }
+    )
+    serving = SpeculatorsConfig.extract_transformers_pre_trained_config(
+        {
+            "speculators_model_type": "dflare",
+            "speculators_config": {
+                "proposal_methods": [{"speculative_tokens": 3}],
+                "verifier": {"name_or_path": "google/gemma-4-E4B-it"},
+            },
+            "transformer_layer_config": {
+                "model_type": converted["model_type"],
+                "architectures": ["Gemma4ForCausalLM"],
+                "vocab_size": converted["vocab_size"],
+                "hidden_size": converted["hidden_size"],
+                "draft_hidden_size": converted["draft_hidden_size"],
+                "target_hidden_size": converted["target_hidden_size"],
+                "num_hidden_layers": converted["num_hidden_layers"],
+                "num_attention_heads": converted["num_attention_heads"],
+                "num_key_value_heads": converted["num_key_value_heads"],
+                "intermediate_size": converted["intermediate_size"],
+                "head_dim": converted["head_dim"],
+                "rms_norm_eps": converted["rms_norm_eps"],
+            },
+            "draft_vocab_size": converted["draft_vocab_size"],
+            "target_hidden_size": converted["target_hidden_size"],
+            "aux_hidden_state_layer_ids": converted["eagle_aux_hidden_state_layer_ids"],
+            "mask_token_id": converted["dflare_config"]["mask_token_id"],
+        }
+    )
+
+    assert converted["model_type"] == "qwen3"
+    assert converted["hidden_size"] == 8
+    assert converted["draft_hidden_size"] == 4
+    assert converted["dflare_config"]["mask_token_id"] == 7
+    assert serving["dflash_config"]["use_aux_hidden_state"] is False
+    assert serving["dflare_config"]["mask_token_id"] == 7
+
+    layer0 = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]])
+    layer1 = torch.tensor([[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    rejected = torch.zeros(2, 8)
+    states = torch.stack(
+        [
+            torch.cat((layer0[0], layer1[0])),
+            rejected[0],
+            torch.cat((layer0[1], layer1[1])),
+            rejected[1],
+        ]
+    )
+    positions = torch.tensor([3, 4, 5, 6])
+    slots = [torch.tensor([10, -1, 12, -1])]
+    compact_states, compact_positions, compact_slots = compact_dflare_context(
+        states,
+        positions,
+        slots,
+    )
+    torch.testing.assert_close(
+        compact_states,
+        torch.stack(
+            [
+                torch.cat((layer0[0], layer1[0])),
+                torch.cat((layer0[1], layer1[1])),
+            ]
+        ),
+    )
+    torch.testing.assert_close(compact_positions, torch.tensor([3, 5]))
+    assert compact_slots is not None
+    torch.testing.assert_close(compact_slots[0], torch.tensor([10, 12]))
+
+    model = object.__new__(DFlareGemma4Model)
+    nn.Module.__init__(model)
+    model.target_layer_ids = converted["dflare_config"]["target_layer_ids"]
+    model.target_hidden_size = converted["target_hidden_size"]
+    model.layer_fusion_weights = nn.Parameter(
+        torch.tensor([[1.0e6, -1.0e6], [-1.0e6, 1.0e6]])
+    )
+    identity = torch.eye(4)
+    doubled = 2.0 * identity
+    model.layers = nn.ModuleList(
+        [
+            _Layer(identity.clone(), doubled.clone()),
+            _Layer(identity.clone(), doubled.clone()),
+        ]
+    )
+    model._fused_target_kv_weight = None
+    model._fused_target_kv_bias = None
+    model._hidden_norm_weight = torch.ones(4)
+    model._rms_norm_eps = 1e-6
+
+    def identity_norm(out, hidden_states, weight, epsilon):
+        out.copy_(hidden_states)
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.gemma4_dflare.ops.rms_norm",
+        identity_norm,
+    )
+    keys, values = model._project_context_kv(compact_states, 2, 2, 2, 2)
+
+    torch.testing.assert_close(
+        keys[0],
+        layer0.view(2, 2, 2),
+    )
+    torch.testing.assert_close(
+        keys[1],
+        layer1.view(2, 2, 2),
+    )
+    torch.testing.assert_close(values[0], 2.0 * keys[0])
+    torch.testing.assert_close(values[1], 2.0 * keys[1])

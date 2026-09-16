@@ -166,6 +166,10 @@ class DFlareGemma4Attention(DFlashQwen3Attention):
         return output
 
 
+def _draft_hidden_size(config) -> int:
+    return int(getattr(config, "draft_hidden_size", config.hidden_size))
+
+
 class DFlareGemma4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -176,22 +180,26 @@ class DFlareGemma4DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        hidden_size: int | None = None,
     ) -> None:
         super().__init__()
-        self.hidden_size = config.hidden_size
+        self.hidden_size = (
+            hidden_size if hidden_size is not None else _draft_hidden_size(config)
+        )
+        target_hidden_size = getattr(
+            config,
+            "target_hidden_size",
+            self.hidden_size,
+        )
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
         self.self_attn = DFlareGemma4Attention(
-            hidden_size=config.hidden_size,
-            target_hidden_size=getattr(
-                config,
-                "target_hidden_size",
-                config.hidden_size,
-            ),
+            hidden_size=self.hidden_size,
+            target_hidden_size=target_hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             head_dim=getattr(config, "head_dim", None)
-            or config.hidden_size // config.num_attention_heads,
+            or self.hidden_size // config.num_attention_heads,
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
             sliding_window=sliding_window,
@@ -212,11 +220,11 @@ class DFlareGemma4DecoderLayer(nn.Module):
             prefix=f"{prefix}.mlp",
         )
         self.input_layernorm = RMSNorm(
-            config.hidden_size,
+            self.hidden_size,
             eps=config.rms_norm_eps,
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
+            self.hidden_size,
             eps=config.rms_norm_eps,
         )
 
@@ -268,10 +276,11 @@ class DFlareGemma4Model(DFlashQwen3Model):
         self.vocab_size = self.config.vocab_size
         self.quant_config = get_draft_quant_config(vllm_config)
         self.use_aux_hidden_state = False
+        self.draft_hidden_size = _draft_hidden_size(self.config)
         current_config = get_current_vllm_config()
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
-            self.config.hidden_size,
+            self.draft_hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
         self.register_buffer(
@@ -281,7 +290,11 @@ class DFlareGemma4Model(DFlashQwen3Model):
                     getattr(
                         self.config,
                         "target_embedding_size",
-                        self.config.hidden_size,
+                        getattr(
+                            self.config,
+                            "target_hidden_size",
+                            self.draft_hidden_size,
+                        ),
                     )
                 )
                 ** 0.5,
@@ -293,7 +306,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
         self.mask_token_id = dflare_config.get("mask_token_id")
         self.mask_embedding = nn.Parameter(
             torch.zeros(
-                self.config.hidden_size,
+                self.draft_hidden_size,
                 dtype=vllm_config.model_config.dtype,
             ),
             requires_grad=False,
@@ -308,6 +321,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
                     cache_config=current_config.cache_config,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                    hidden_size=self.draft_hidden_size,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -316,12 +330,12 @@ class DFlareGemma4Model(DFlashQwen3Model):
             getattr(
                 self.config,
                 "target_hidden_size",
-                self.config.hidden_size,
+                self.draft_hidden_size,
             ),
             eps=self.config.rms_norm_eps,
         )
         self.norm = RMSNorm(
-            self.config.hidden_size,
+            self.draft_hidden_size,
             eps=self.config.rms_norm_eps,
         )
         target_layer_ids = dflare_config.get(
@@ -334,7 +348,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
         self.target_hidden_size = getattr(
             self.config,
             "target_hidden_size",
-            self.config.hidden_size,
+            self.draft_hidden_size,
         )
         self.layer_fusion_weights = nn.Parameter(
             torch.zeros(self.config.num_hidden_layers, len(self.target_layer_ids))
@@ -350,23 +364,23 @@ class DFlareGemma4Model(DFlashQwen3Model):
             )
             self.layer_fusion_weights.data[draft_idx, target_idx] = 2.0
         target_embedding_size = int(
-            getattr(self.config, "target_embedding_size", self.config.hidden_size)
+            getattr(self.config, "target_embedding_size", self.target_hidden_size)
         )
         target_head_hidden_size = int(
             getattr(self.config, "target_head_hidden_size", target_embedding_size)
         )
         self.input_projection = (
-            nn.Linear(target_embedding_size, self.config.hidden_size, bias=False)
-            if target_embedding_size != self.config.hidden_size
+            nn.Linear(target_embedding_size, self.draft_hidden_size, bias=False)
+            if target_embedding_size != self.draft_hidden_size
             else None
         )
         self.output_projection = (
             nn.Linear(
-                self.config.hidden_size,
+                self.draft_hidden_size,
                 target_head_hidden_size,
                 bias=False,
             )
-            if target_head_hidden_size != self.config.hidden_size
+            if target_head_hidden_size != self.draft_hidden_size
             else None
         )
 
@@ -610,25 +624,14 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
-        draft_hidden_size = getattr(
-            self.config,
-            "draft_hidden_size",
-            self.config.hidden_size,
+        draft_hidden_size = _draft_hidden_size(self.config)
+        self.model = DFlareGemma4Model(
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            start_layer_id=vllm_config.model_config.get_num_layers(
+                vllm_config.parallel_config
+            ),
         )
-        original_hidden_size = self.config.hidden_size
-        self.config.hidden_size = draft_hidden_size
-        try:
-            self.model = DFlareGemma4Model(
-                vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "model"),
-                start_layer_id=vllm_config.model_config.get_num_layers(
-                    vllm_config.parallel_config
-                ),
-            )
-        finally:
-            # Keep the concatenated target width visible to the proposer while
-            # the constructed draft layers retain their own hidden size.
-            self.config.hidden_size = original_hidden_size
 
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = vllm_config.model_config.get_vocab_size()

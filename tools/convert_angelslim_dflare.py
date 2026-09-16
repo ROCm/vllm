@@ -14,6 +14,8 @@ from pathlib import Path
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from vllm.transformers_utils.configs.dflare import dflash_config_from_dflare
+
 
 def load_source_config(checkpoint: Path) -> dict:
     config_path = checkpoint / "config.json"
@@ -54,16 +56,33 @@ def build_vllm_config(
     if block_size < 2:
         raise ValueError("block_size must be at least 2")
 
-    mask_token_id = int(
-        dflare_config.get(
-            "mask_token_id",
-            source_config.get("mask_token_id", 4),
-        )
+    raw_mask_token_id = dflare_config.get(
+        "mask_token_id",
+        source_config.get("mask_token_id"),
     )
+    if raw_mask_token_id is None:
+        raise ValueError(
+            "mask_token_id is required in source dflare_config or as a top-level "
+            "config field"
+        )
+    mask_token_id = int(raw_mask_token_id)
+    model_type = source_config.get("model_type")
+    if not model_type:
+        raise ValueError(
+            "model_type is required; AngelSlim DFlare drafts usually set this "
+            "to the draft transformer family (typically qwen3), not the Gemma "
+            "target architecture"
+        )
     slot_ids = list(range(len(layer_ids)))
+    dflare_out = {
+        "mask_token_id": mask_token_id,
+        "target_layer_ids": slot_ids,
+        "causal": False,
+        "rope_layout": dflare_config.get("rope_layout", "legacy"),
+    }
     return {
         "architectures": ["DFlareDraftModel"],
-        "model_type": "qwen3",
+        "model_type": model_type,
         "vocab_size": int(source_config.get("vocab_size", 262144)),
         "draft_vocab_size": int(source_config.get("vocab_size", 262144)),
         "hidden_size": len(layer_ids) * resolved_target_hidden_size,
@@ -100,19 +119,8 @@ def build_vllm_config(
         "block_size": block_size,
         "num_speculative_tokens": block_size - 1,
         "layer_types": ["full_attention"] * num_hidden_layers,
-        "dflare_config": {
-            "mask_token_id": mask_token_id,
-            "target_layer_ids": slot_ids,
-            "causal": False,
-            "rope_layout": dflare_config.get("rope_layout", "legacy"),
-        },
-        "dflash_config": {
-            "mask_token_id": mask_token_id,
-            "target_layer_ids": slot_ids,
-            "use_aux_hidden_state": False,
-            "causal": False,
-            "rope_layout": dflare_config.get("rope_layout", "legacy"),
-        },
+        "dflare_config": dflare_out,
+        "dflash_config": dflash_config_from_dflare(dflare_out),
         "eagle_aux_hidden_state_layer_ids": [layer_id + 1 for layer_id in layer_ids],
         "torch_dtype": source_config.get("torch_dtype", "bfloat16"),
     }
