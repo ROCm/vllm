@@ -283,21 +283,27 @@ class DFlareGemma4Model(DFlashQwen3Model):
             self.draft_hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        target_embedding_size = int(
+            getattr(
+                self.config,
+                "target_embedding_size",
+                getattr(
+                    self.config,
+                    "target_hidden_size",
+                    self.draft_hidden_size,
+                ),
+            )
+        )
         self.register_buffer(
             "embedding_scale",
             torch.tensor(
-                int(
+                float(
                     getattr(
                         self.config,
-                        "target_embedding_size",
-                        getattr(
-                            self.config,
-                            "target_hidden_size",
-                            self.draft_hidden_size,
-                        ),
+                        "embedding_scale",
+                        target_embedding_size**0.5,
                     )
-                )
-                ** 0.5,
+                ),
                 dtype=vllm_config.model_config.dtype,
             ),
             persistent=False,
@@ -363,9 +369,6 @@ class DFlareGemma4Model(DFlashQwen3Model):
                 ),
             )
             self.layer_fusion_weights.data[draft_idx, target_idx] = 2.0
-        target_embedding_size = int(
-            getattr(self.config, "target_embedding_size", self.target_hidden_size)
-        )
         target_head_hidden_size = int(
             getattr(self.config, "target_head_hidden_size", target_embedding_size)
         )
@@ -607,11 +610,12 @@ class DFlareGemma4Model(DFlashQwen3Model):
                 name = name.replace(".attention.", ".self_attn.")
                 name = name.replace(".k_proj_target", ".target_k_proj")
                 name = name.replace(".v_proj_target", ".target_v_proj")
-                for projection in ("gate_proj", "up_proj", "down_proj"):
-                    name = name.replace(
-                        f".{projection}.",
-                        f".mlp.{projection}.",
-                    )
+                if ".mlp." not in name:
+                    for projection in ("gate_proj", "up_proj", "down_proj"):
+                        name = name.replace(
+                            f".{projection}.",
+                            f".mlp.{projection}.",
+                        )
                 yield name, weight
 
         return super().load_weights(translate(weights))
@@ -620,12 +624,14 @@ class DFlareGemma4Model(DFlashQwen3Model):
 class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
     """vLLM draft-model wrapper for AngelSlim DFlare checkpoints."""
 
+    model_cls = DFlareGemma4Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         draft_hidden_size = _draft_hidden_size(self.config)
-        self.model = DFlareGemma4Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=vllm_config.model_config.get_num_layers(

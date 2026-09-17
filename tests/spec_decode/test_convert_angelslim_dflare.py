@@ -56,6 +56,32 @@ def test_converter_preserves_slim_architecture():
     }
 
 
+def test_converter_detects_qwen3_dflare_contract():
+    converter = _load_converter()
+    source = {
+        "architectures": ["QwenDFlareDraftModel"],
+        "model_type": "qwen3",
+        "vocab_size": 151936,
+        "hidden_size": 2560,
+        "intermediate_size": 9728,
+        "num_hidden_layers": 7,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "dflash_config": {
+            "target_layer_ids": [1, 5, 9],
+            "mask_token_id": 151669,
+        },
+    }
+
+    result = converter.build_vllm_config(source)
+
+    assert result["architectures"] == ["DFlareQwen3ForCausalLM"]
+    assert result["embedding_scale"] == 1.0
+    assert result["dflare_config"]["rope_layout"] == "neox"
+    assert result["eagle_aux_hidden_state_layer_ids"] == [2, 6, 10]
+
+
 def test_converter_requires_model_type():
     converter = _load_converter()
     source = {

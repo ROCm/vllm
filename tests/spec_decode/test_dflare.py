@@ -79,6 +79,7 @@ def test_dflare_speculators_config_conversion():
 
 def test_dflare_model_is_registered():
     assert "DFlareDraftModel" in ModelRegistry.get_supported_archs()
+    assert "DFlareQwen3ForCausalLM" in ModelRegistry.get_supported_archs()
 
 
 def test_angelslim_legacy_rope_layout():
@@ -410,10 +411,7 @@ def test_causal_lm_keeps_concatenated_hidden_size(monkeypatch):
             self.target_layer_ids = [0, 1]
             self.target_hidden_size = 4
 
-    monkeypatch.setattr(
-        "vllm.model_executor.models.gemma4_dflare.DFlareGemma4Model",
-        _FakeDraftModel,
-    )
+    monkeypatch.setattr(DFlareGemma4ForCausalLM, "model_cls", _FakeDraftModel)
     monkeypatch.setattr(
         DFlareGemma4ForCausalLM,
         "_make_lm_head",

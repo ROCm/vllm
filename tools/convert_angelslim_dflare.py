@@ -30,7 +30,11 @@ def build_vllm_config(
     target_hidden_size: int | None = None,
     target_layer_ids: list[int] | None = None,
 ) -> dict:
-    dflare_config = source_config.get("dflare_config") or {}
+    source_architectures = source_config.get("architectures") or []
+    is_qwen3 = "QwenDFlareDraftModel" in source_architectures
+    dflare_config = (
+        source_config.get("dflare_config") or source_config.get("dflash_config") or {}
+    )
     layer_ids = (
         list(target_layer_ids)
         if target_layer_ids is not None
@@ -78,10 +82,13 @@ def build_vllm_config(
         "mask_token_id": mask_token_id,
         "target_layer_ids": slot_ids,
         "causal": False,
-        "rope_layout": dflare_config.get("rope_layout", "legacy"),
+        "rope_layout": dflare_config.get(
+            "rope_layout",
+            "neox" if is_qwen3 else "legacy",
+        ),
     }
-    return {
-        "architectures": ["DFlareDraftModel"],
+    converted = {
+        "architectures": ["DFlareQwen3ForCausalLM" if is_qwen3 else "DFlareDraftModel"],
         "model_type": model_type,
         "vocab_size": int(source_config.get("vocab_size", 262144)),
         "draft_vocab_size": int(source_config.get("vocab_size", 262144)),
@@ -112,7 +119,15 @@ def build_vllm_config(
             )
         ),
         "rms_norm_eps": float(source_config.get("rms_norm_eps", 1e-6)),
-        "rope_theta": float(source_config.get("rope_theta", 10000.0)),
+        "rope_theta": float(
+            source_config.get(
+                "rope_theta",
+                (source_config.get("rope_parameters") or {}).get(
+                    "rope_theta",
+                    10000.0,
+                ),
+            )
+        ),
         "max_position_embeddings": int(
             source_config.get("max_position_embeddings", 131072)
         ),
@@ -124,6 +139,9 @@ def build_vllm_config(
         "eagle_aux_hidden_state_layer_ids": [layer_id + 1 for layer_id in layer_ids],
         "torch_dtype": source_config.get("torch_dtype", "bfloat16"),
     }
+    if is_qwen3:
+        converted["embedding_scale"] = 1.0
+    return converted
 
 
 def main() -> int:
@@ -147,7 +165,7 @@ def main() -> int:
 
     tensors = {}
     with safe_open(source_weights, framework="pt", device="cpu") as source:
-        for key in source:
+        for key in source.keys():
             tensors[key] = source.get_tensor(key)
     save_file(tensors, args.output / "model.safetensors")
 
