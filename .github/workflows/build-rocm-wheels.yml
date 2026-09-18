@@ -274,13 +274,28 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Production: only on push to gfx11, after correctness tests pass.
+  # Published to two indexes while consumers migrate off cloudfront to
+  # frameworks-nightlies.
   upload-release-wheel:
+    name: upload-release-wheel (${{ matrix.index }})
     runs-on: ubuntu-latest
     needs: [build-wheel, test-kernels-correctness]
     if: github.event_name == 'push' && github.repository_owner == 'ROCm'
     permissions:
       id-token: write
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - index: cloudfront
+            role: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
+            bucket: aig-embd-gfx11-wheels
+            index_prefix: simple
+          - index: frameworks-nightlies
+            role: arn:aws:iam::661452401056:role/framework-vllm-nightlies
+            bucket: framework-whls-nightlies
+            index_prefix: whl-multi-arch-staging/vllm-gfx11-dev
 
     steps:
       - name: Checkout code
@@ -298,13 +313,14 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@8df5847569e6427dd6c4fb1cf565c83acfa8afa7 # v6.0.0
         with:
-          role-to-assume: arn:aws:iam::317668459450:role/therock-aig-embd-gfx11-wheels-s3-oidc
+          role-to-assume: ${{ matrix.role }}
           aws-region: us-east-1
 
       - name: Upload wheel to PEP 503 index
         run: |
           pip install boto3
           python .github/workflows/scripts/upload_wheel_s3.py \
-            --bucket aig-embd-gfx11-wheels \
+            --bucket ${{ matrix.bucket }} \
+            --index-prefix ${{ matrix.index_prefix }} \
             --package vllm \
             --wheel-dir dist/
