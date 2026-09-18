@@ -122,7 +122,6 @@ if TYPE_CHECKING:
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_USE_TRITON_AWQ_GEMV: bool = True
-    VLLM_ALLOW_UNFUSED_AWQ_GEMM: bool = True
     VLLM_AWQ_USE_TN_GEMM: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
@@ -155,7 +154,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
-    VLLM_USE_TRITON_RESHAPE_AND_CACHE_FLASH: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
@@ -1190,10 +1188,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_TRITON_AWQ_GEMV": lambda: bool(
         int(os.getenv("VLLM_USE_TRITON_AWQ_GEMV", "1"))
     ),
-    # If set, enable the unfused AWQ GEMM path (dequant + torch.matmul).
-    "VLLM_ALLOW_UNFUSED_AWQ_GEMM": lambda: bool(
-        os.getenv("VLLM_ALLOW_UNFUSED_AWQ_GEMM", "1").lower() in ("true", "1")
-    ),
     # If set, use TN GEMM path (transposed dequant + hipBLASLt) for AWQ prefill.
     # Currently disabled by default due to .T contiguity overhead.
     # TODO: Optimize to avoid the transpose copy overhead.
@@ -1376,11 +1370,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use AITER triton unified attention for V1 attention
     "VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION", "False").lower()
-        in ("true", "1")
-    ),
-    # If set, use triton_reshape_and_cache_flash instead of ops.reshape_and_cache_flash
-    "VLLM_USE_TRITON_RESHAPE_AND_CACHE_FLASH": lambda: (
-        os.getenv("VLLM_USE_TRITON_RESHAPE_AND_CACHE_FLASH", "False").lower()
         in ("true", "1")
     ),
     # Whether to use aiter fusion shared experts ops.
