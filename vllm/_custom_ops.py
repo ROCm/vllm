@@ -2473,21 +2473,6 @@ def wvSplitK_w8a8_sweep(
     )
 
 
-def wvSplitK_int8_sweep(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    scale: torch.Tensor,
-    cu_count: int,
-    ytile: int,
-    unrl: int,
-    achunk: int,
-    wvprgrp: int,
-) -> torch.Tensor:
-    return torch.ops._rocm_C.wvSplitK_int8_sweep(
-        a, b, scale, None, cu_count, ytile, unrl, achunk, wvprgrp
-    )
-
-
 def wvSplitK_int4_g(
     a: torch.Tensor,
     b: torch.Tensor,
