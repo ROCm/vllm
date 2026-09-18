@@ -1146,16 +1146,25 @@ def unified_attention(
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
-    # 2. The batch includes at least one prefill request, or
+    # 2. Those buffers cannot hold one row per query token in this batch, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
+    #
+    # The segm buffers are indexed by absolute token index (``query_offset_0``),
+    # so the 3D path needs one row per query token rather than per sequence.
+    # Checking capacity rather than ``max_seqlen_q > 1`` lets a batch that
+    # carries several query tokens per sequence — a speculative-decode verify
+    # step — use the 3D kernel, while a prefill batch, whose token count the
+    # caller does not size for, still falls back to 2D by construction.
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or softmax_segm_output.shape[0] < q.shape[0]
+        or softmax_segm_max.shape[0] < q.shape[0]
+        or softmax_segm_expsum.shape[0] < q.shape[0]
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )

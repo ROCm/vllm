@@ -194,10 +194,23 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 key=lambda x: abs(x - self.seq_threshold_3D),
             )
 
+        # The kernel indexes these by absolute query-token index, so they need
+        # one row per token the 3D path may be handed.  A decode step gives one
+        # token per sequence; a speculative-decode verify step gives
+        # ``num_speculative_tokens + 1``.  Sizing for that keeps the verify step
+        # on the 3D kernel while leaving prefill — whose token count is
+        # unbounded here — to fail the capacity check in unified_attention() and
+        # fall back to 2D.  Without speculative decoding this is unchanged.
+        spec = vllm_config.speculative_config
+        max_query_len_3D = 1
+        if spec is not None and spec.num_speculative_tokens is not None:
+            max_query_len_3D += spec.num_speculative_tokens
+        segm_rows = self.seq_threshold_3D * max_query_len_3D
+
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
-                self.seq_threshold_3D,
+                segm_rows,
                 self.num_heads_q,
                 self.num_par_softmax_segments,
                 headdim_padded,
@@ -206,12 +219,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (segm_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (segm_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
