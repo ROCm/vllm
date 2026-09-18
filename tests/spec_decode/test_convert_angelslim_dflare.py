@@ -82,6 +82,30 @@ def test_converter_detects_qwen3_dflare_contract():
     assert result["eagle_aux_hidden_state_layer_ids"] == [2, 6, 10]
 
 
+def test_converter_normalizes_gemma_training_config_for_runtime():
+    converter = _load_converter()
+    source = {
+        "architectures": ["Gemma4DFlareDraftModel"],
+        "model_type": "gemma4_dflare",
+        "vocab_size": 262144,
+        "hidden_size": 2560,
+        "intermediate_size": 10240,
+        "num_hidden_layers": 7,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "dflare_config": {
+            "target_layer_ids": [1, 6, 11],
+            "mask_token_id": 4,
+        },
+    }
+
+    result = converter.build_vllm_config(source)
+
+    assert result["model_type"] == "qwen3"
+    assert result["architectures"] == ["DFlareDraftModel"]
+
+
 def test_converter_requires_model_type():
     converter = _load_converter()
     source = {

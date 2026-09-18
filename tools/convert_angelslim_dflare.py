@@ -77,6 +77,7 @@ def build_vllm_config(
             "to the draft transformer family (typically qwen3), not the Gemma "
             "target architecture"
         )
+    runtime_model_type = "qwen3" if model_type == "gemma4_dflare" else model_type
     slot_ids = list(range(len(layer_ids)))
     dflare_out = {
         "mask_token_id": mask_token_id,
@@ -89,7 +90,7 @@ def build_vllm_config(
     }
     converted = {
         "architectures": ["DFlareQwen3ForCausalLM" if is_qwen3 else "DFlareDraftModel"],
-        "model_type": model_type,
+        "model_type": runtime_model_type,
         "vocab_size": int(source_config.get("vocab_size", 262144)),
         "draft_vocab_size": int(source_config.get("vocab_size", 262144)),
         "hidden_size": len(layer_ids) * resolved_target_hidden_size,
@@ -165,7 +166,8 @@ def main() -> int:
 
     tensors = {}
     with safe_open(source_weights, framework="pt", device="cpu") as source:
-        for key in source.keys():
+        # Older safetensors safe_open handles expose keys() but are not iterable.
+        for key in source.keys():  # noqa: SIM118
             tensors[key] = source.get_tensor(key)
     save_file(tensors, args.output / "model.safetensors")
 
