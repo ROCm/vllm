@@ -43,6 +43,37 @@ logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
+# Strix Halo (gfx1151): 3D decode launch parameters keyed by
+# (num_kv_heads, head_size), as
+# ``(num_warps, num_stages, waves_per_eu, tile_size)``.  A ``tile_size`` of
+# ``None`` leaves the adaptive ``_get_tile_size`` result alone.  Shapes absent
+# from the table keep the generic assignment above.  Measured with a KV
+# working set several times the MALL, so the numbers reflect DRAM rather than
+# a cache-resident tensor.  The matching split-K degree lives in
+# TritonAttentionMetadataBuilder (it must agree with the scratch buffers).
+_GFX1151_3D_DECODE = {
+    (2, 64): (2, 1, 2, 32),
+    (2, 128): (4, 1, 1, 64),
+    (2, 512): (4, 1, 2, None),
+    (4, 128): (2, 2, 4, None),
+    (4, 256): (4, 1, 4, None),
+    (4, 512): (8, 1, 2, 32),
+    (8, 128): (2, 1, 4, None),
+    (8, 256): (4, 1, 4, None),
+    (10, 128): (2, 1, 1, 32),
+}
+
+# Same, for layers with a sliding window.  The window bounds the KV the
+# kernel traverses, which shifts the optimum hard towards more split-K: every
+# measured windowed shape wants the same launch, and it beats the dense pick
+# by 27-88%.
+_GFX1151_3D_DECODE_SWA = {
+    (2, 256): (4, 1, 2, None),
+    (4, 256): (4, 1, 2, None),
+    (8, 256): (4, 1, 4, None),
+    (16, 256): (4, 1, 2, None),
+}
+
 
 @triton.jit
 def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
@@ -1258,6 +1289,23 @@ def unified_attention(
                 num_warps, num_stages, waves_per_eu = 4, 3, 2
             elif num_kv_heads <= 4 and head_size <= 128:
                 num_warps, num_stages, waves_per_eu = 4, 3, 4
+
+            table = (
+                _GFX1151_3D_DECODE_SWA if sliding_window_val > 0 else _GFX1151_3D_DECODE
+            )
+            tuned = table.get((num_kv_heads, head_size))
+            if tuned is not None:
+                num_warps, num_stages, waves_per_eu, tuned_tile = tuned
+                if tuned_tile is not None:
+                    # reduce_segments derives its segment boundaries from
+                    # TILE_SIZE_DECODE, so both must move together.  The
+                    # tuned tile is measured on the pointer path; USE_TD
+                    # additionally requires TILE_SIZE to divide BLOCK_SIZE,
+                    # so re-apply the clamp made above.
+                    if use_td:
+                        tuned_tile = min(tuned_tile, block_size)
+                    TILE_SIZE_DECODE = tuned_tile
+                    tile_size = TILE_SIZE_DECODE
 
         # Navi memory: Apply the same cap the 2D path uses
         if _ON_NAVI:
