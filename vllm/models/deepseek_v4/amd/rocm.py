@@ -733,7 +733,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             kv_weight=self.kv_norm.weight.data,
             kv_epsilon=self.eps,
             group_size=128,
-            transpose_scale=False,
+            transpose_scale=True,
         )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
