@@ -63,6 +63,25 @@ logger = init_logger(__name__)
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
 
+# Strix Halo (gfx1151): split-K degree for the 3D decode path, keyed by
+# (num_kv_heads, head_size).  Shapes absent keep the generic rule below.
+# Measured against DRAM, not a cache-resident KV tensor.
+_GFX1151_3D_SEGMENTS = {
+    (4, 128): 8,
+    (4, 512): 8,
+    (8, 128): 8,
+    (8, 256): 8,
+    (10, 128): 8,
+}
+
+# Windowed layers traverse only the window, so they want far more split-K.
+_GFX1151_3D_SEGMENTS_SWA = {
+    (2, 256): 64,
+    (4, 256): 64,
+    (8, 256): 32,
+    (16, 256): 8,
+}
+
 
 @dataclass
 class TritonAttentionMetadata:
@@ -135,8 +154,14 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # segment count under-occupied on the 3D decode path.  The buffers
         # below are sized from this value, so the launch grid matches by
         # construction.
-        if _ON_GFX1151 and (self.headdim <= 64 or self.num_heads_kv == 1):
-            self.num_par_softmax_segments = 32
+        if _ON_GFX1151:
+            windowed = getattr(kv_cache_spec, "sliding_window", None)
+            table = _GFX1151_3D_SEGMENTS_SWA if windowed else _GFX1151_3D_SEGMENTS
+            tuned = table.get((self.num_heads_kv, self.headdim))
+            if tuned is not None:
+                self.num_par_softmax_segments = tuned
+            elif self.headdim <= 64 or self.num_heads_kv == 1:
+                self.num_par_softmax_segments = 32
 
         # Check if CUDA Graphs are enabled for decode
         self.decode_cudagraph_enabled = (
@@ -169,10 +194,23 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 key=lambda x: abs(x - self.seq_threshold_3D),
             )
 
+        # The kernel indexes these by absolute query-token index, so they need
+        # one row per token the 3D path may be handed.  A decode step gives one
+        # token per sequence; a speculative-decode verify step gives
+        # ``num_speculative_tokens + 1``.  Sizing for that keeps the verify step
+        # on the 3D kernel while leaving prefill — whose token count is
+        # unbounded here — to fail the capacity check in unified_attention() and
+        # fall back to 2D.  Without speculative decoding this is unchanged.
+        spec = vllm_config.speculative_config
+        max_query_len_3D = 1
+        if spec is not None and spec.num_speculative_tokens is not None:
+            max_query_len_3D += spec.num_speculative_tokens
+        segm_rows = self.seq_threshold_3D * max_query_len_3D
+
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
-                self.seq_threshold_3D,
+                segm_rows,
                 self.num_heads_q,
                 self.num_par_softmax_segments,
                 headdim_padded,
@@ -181,12 +219,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             device=device,
         )
         self.softmax_segm_max = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (segm_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
         self.softmax_segm_expsum = torch.empty(
-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            (segm_rows, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )
