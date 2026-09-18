@@ -4,7 +4,8 @@
 """Upload wheels to S3 and manage staging lifecycle.
 
 Production upload (PEP 503 index):
-    python upload_wheel_s3.py --bucket BUCKET --package vllm --wheel-dir dist/
+    python upload_wheel_s3.py --bucket BUCKET --package vllm --wheel-dir dist/ \
+        --index-prefix whl-multi-arch-staging/vllm-gfx11-dev
 
 Staging upload (per-run, for testing PR builds):
     python upload_wheel_s3.py --bucket BUCKET --package vllm --wheel-dir dist/ \
@@ -13,13 +14,17 @@ Staging upload (per-run, for testing PR builds):
 Staging cleanup (delete staging runs older than N days):
     python upload_wheel_s3.py --bucket BUCKET --cleanup-staging-days 31
 
-Staging layout:
+Layouts:
+    s3://BUCKET/<index-prefix>/<package>/<wheel-filename>.whl
     s3://BUCKET/staging/<run-id>/<wheel-filename>.whl
 
-The staging prefix is separate from the PEP 503 simple/ index so
-staging wheels are never pip-installable from the main index.
-The S3 bucket's CloudFront function auto-generates index pages for
-any prefix, so staging works with --find-links out of the box.
+The staging prefix is separate from the index prefix so staging
+wheels are never pip-installable from the main index.
+
+Uploading does not publish: a prefix with no index.html 403s rather
+than listing, and index pages here are generated bucket-side (a
+CloudFront function on aig-embd-gfx11-wheels, a server-side indexer
+on the AMD frameworks buckets), never by this script.
 """
 
 import argparse
@@ -31,15 +36,24 @@ import boto3
 
 
 def upload_wheels(
-    s3, bucket: str, package: str, wheel_dir: str, staging_run_id: str = None
+    s3,
+    bucket: str,
+    package: str,
+    wheel_dir: str,
+    staging_run_id: str = None,
+    index_prefix: str = "simple",
 ) -> None:
     wheel_names = []
+    # An empty prefix would key the wheel at /<package>/, which S3 accepts
+    # but no index page lists.
+    index_prefix = index_prefix.strip("/")
+    index_root = f"{index_prefix}/" if index_prefix else ""
     for whl in glob.glob(os.path.join(wheel_dir, "*.whl")):
         name = os.path.basename(whl)
         if staging_run_id:
             key = f"staging/{staging_run_id}/{name}"
         else:
-            key = f"simple/{package}/{name}"
+            key = f"{index_root}{package}/{name}"
         print(f"Uploading {key}")
         s3.upload_file(
             whl,
@@ -102,8 +116,13 @@ def main():
         help="Local directory containing .whl files",
     )
     parser.add_argument(
+        "--index-prefix",
+        default="simple",
+        help="Key prefix of the PEP 503 index (default: simple)",
+    )
+    parser.add_argument(
         "--staging-run-id",
-        help="Upload to staging/<run-id>/ instead of simple/<package>/",
+        help="Upload to staging/<run-id>/ instead of <index-prefix>/<package>/",
     )
     parser.add_argument(
         "--cleanup-staging-days",
@@ -129,6 +148,7 @@ def main():
             args.package,
             args.wheel_dir,
             staging_run_id=args.staging_run_id,
+            index_prefix=args.index_prefix,
         )
 
 
