@@ -11,7 +11,7 @@ ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG MORI_BRANCH="f95cd5e0ca7b730f92f9ffdfb358484d6965d9f7" # TheRock compatible v1.1.0
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
-ARG ROCM_RUNTIME_COMMIT="25e14349f2606a6b95c4ccd45eb92a1835646cf2"
+ARG ROCM_RUNTIME_COMMIT="b4888193fecba32653598a80bcb05a45ef2d79c1"
 
 
 # TheRock configuration
@@ -258,9 +258,10 @@ RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 
 
 ###
-### ROCr + CLR build
+### ROCr + CLR + rocprofiler-sdk build
 ###
-# Brings in multi-stream perf improvements; drop after these arrive in an official release
+# These bring in multi-stream perf improvements and support for device-resident AQL queues
+# Drop after these arrive in an official release
 FROM base AS build_rocm_runtime
 ARG ROCM_SYSTEMS_REPO
 ARG ROCM_RUNTIME_COMMIT
@@ -276,7 +277,8 @@ RUN git init -q /src && cd /src \
     && git config remote.origin.promisor true \
     && git config remote.origin.partialclonefilter blob:none \
     && git sparse-checkout init --cone \
-    && git sparse-checkout set projects/rocr-runtime projects/clr projects/hip shared cmake \
+    && git sparse-checkout set projects/rocr-runtime projects/clr projects/hip \
+        projects/hrr projects/rocprofiler-sdk shared cmake \
     && git fetch --filter=blob:none --depth 1 origin ${ROCM_RUNTIME_COMMIT} \
     && git checkout -q FETCH_HEAD
 # libelf is taken from the SDK's own vendored sysdeps rather than apt -- the wheel image has no
@@ -306,6 +308,24 @@ RUN cd /src/projects/clr \
         -DHIP_LLVM_ROOT="$SDK_DEV/lib/llvm" \
     && cmake --build build --parallel 16 \
     && cmake --install build --prefix /clr-install --strip
+# Built last, and from the same commit, so it compiles against the ROCr headers just installed:
+# rocprofiler-sdk enforces the HSA API table version of the runtime it intercepts.
+RUN cd /src/projects/rocprofiler-sdk \
+    && cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_PREFIX_PATH="$SDK_DEV;$SYSDEPS" \
+        -DCMAKE_INSTALL_PREFIX="$SDK_DEV" \
+        -DROCM_PATH="$SDK_DEV" \
+        -DROCPROFILER_BUILD_TESTS=OFF \
+        -DROCPROFILER_BUILD_SAMPLES=OFF \
+        -DROCPROFILER_BUILD_DOCS=OFF \
+        # rocprofv3's ATT quick scan hard-requires rocprof-trace-decoder, which the wheel does
+        # not ship; librocprofiler-sdk.so, the one libkineto loads, is unaffected.
+        -DROCPROFILER_DISABLE_ATT_QUICK_SCAN=ON \
+        -DCMAKE_C_FLAGS="-isystem $SYSDEPS/include" \
+        -DCMAKE_CXX_FLAGS="-isystem $SYSDEPS/include" \
+    && cmake --build build --parallel 16 \
+    && cmake --install build --prefix /rocprof-install --strip
 RUN mkdir -p /staging/lib \
     && cp -P /rocr-install/lib/libhsa-runtime64.so* /staging/lib/ \
     && cp -P /clr-install/lib/libamdhip64.so* /staging/lib/ \
@@ -336,9 +356,11 @@ RUN --mount=type=bind,from=build_mori,src=/app/install/,target=/install \
 
 FROM base AS final
 
-# torch 2.12 implicitly attaches rocprofiler-sdk; its queue interposition hangs at HSA
-# teardown, so disable it. TODO: drop once ROCm's stock rocprofiler carries the fix.
+# Turn off inline queue interposition to avoid various profiler bugs and limitations
 ENV ROCPROFILER_QUEUE_INTERPOSITION=0
+# Defaults to 1, set to 2 for more multi-stream performance (does not support inline
+# interposition when profiling)
+ENV DEBUG_CLR_DEVICE_ORDERING_EDGE=2
 
 COPY --from=build_rocm_runtime /staging/lib/ ${SDK_DEV}/lib/
 # Hard link the patched library onto every stock file name, in both SDK trees, so that the
@@ -355,6 +377,23 @@ RUN set -eux; \
         [ -f "$f" ] && [ ! -L "$f" ] || continue; \
         case "${f##*/}" in libhsa*) ours="$ours_hsa";; *) ours="$ours_hip";; esac; \
         [ "$f" -ef "$ours" ] || ln -f "$ours" "$f"; \
+    done
+
+# rocprofiler-sdk inverts the usual layout -- the SONAME is the real file and the versioned name
+# the symlink -- so an overlay alone leaves the stock ELF reachable under its old version name.
+RUN rm -rf "$SDK_DEV"/lib/librocprofiler-sdk* "$SDK_DEV"/lib/rocprofiler-sdk \
+        "$SDK_DEV"/lib/cmake/rocprofiler-sdk* "$SDK_DEV"/lib/python*/site-packages/rocpd \
+        "$SDK_DEV"/include/rocprofiler-sdk* "$SDK_DEV"/libexec/rocprofiler-sdk \
+        "$SDK_DEV"/share/rocprofiler-sdk* "$SDK_DEV"/bin/rocprofv3* "$SDK_DEV"/bin/rocprof-attach
+
+COPY --from=build_rocm_runtime /rocprof-install/ ${SDK_DEV}/
+
+# $SDK_CORE keeps its own copies, which are on LD_LIBRARY_PATH and in ld.so.conf. The base stage
+# symlinks a few of them into $SDK_DEV; do the rest, or the stock build stays reachable.
+RUN set -eux; \
+    cd "$SDK_CORE"; \
+    for f in lib/librocprofiler-sdk*.so.* lib/rocprofiler-sdk/*.so.* bin/rocprofv3*; do \
+        if [ -e "$SDK_DEV/$f" ]; then ln -sfn "$SDK_DEV/$f" "$f"; fi; \
     done
 
 RUN ldconfig
