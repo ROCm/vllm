@@ -50,15 +50,12 @@ def aiter_triton_kernel_w4a8_moe_forward(
         and quant_config.use_mxfp4_w4a8
         and rocm_aiter_ops.is_enabled()
     )
-    from vllm.platforms.rocm import on_gfx1250
 
     try:
         from aiter.ops.triton.moe.moe_routing import routing as _routing_mod
     except ImportError:
         from aiter.ops.triton.moe_routing import routing as _routing_mod
 
-    if on_gfx1250():
-        _routing_mod.is_tdm_avail = lambda: False
     aiter_routing = _routing_mod.routing
 
     routing_data, gather_idx, scatter_idx = aiter_routing(
@@ -445,8 +442,6 @@ def aiter_triton_kernel_w4a16_moe_forward(
         from aiter.ops.triton.moe.moe_op_gemm_a16w4 import moe_gemm_a16w4
         from aiter.ops.triton.moe_routing import routing as _routing_mod
 
-    if on_gfx1250():
-        _routing_mod.is_tdm_avail = lambda: False
     aiter_routing = _routing_mod.routing
 
     if score_mode is not None:
@@ -706,8 +701,6 @@ def aiter_triton_kernel_w4a4_moe_forward(
 
     from vllm.platforms.rocm import on_gfx1250
 
-    if on_gfx1250():
-        _routing_mod.is_tdm_avail = lambda: False
     aiter_routing = _routing_mod.routing
 
     if score_mode is not None:
@@ -734,11 +727,6 @@ def aiter_triton_kernel_w4a4_moe_forward(
             gating_output, topk, sm_first=not renormalize
         )
 
-    if on_gfx1250():
-        gather_src = gather_idx.to(torch.long) // topk
-        hidden_states = hidden_states[gather_src]
-        gather_idx = None
-
     w1_data = _aiter_raw(w1)
     w2_data = _aiter_raw(w2)
     w1_scale = _aiter_raw(quant_config.w1_scale)
@@ -751,15 +739,22 @@ def aiter_triton_kernel_w4a4_moe_forward(
         if quant_config.gemm1_clamp_limit is not None
         else 7.0
     )
-    # SWIGLUOAI needs the alpha/residual swiglu fused into the GEMM1 epilogue,
-    # which reads gate/up interleaved along N (see the oracle's weight prep).
+
     fused_swiglu = activation in (
         MoEActivation.SWIGLUOAI,
         MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        MoEActivation.SILU,
     )
     swiglu_kwargs: dict[str, object] = {}
     if fused_swiglu:
-        assert quant_config.gemm1_beta in (None, 1.0), (
+        # SILU is plain silu(gate) * up: no residual, whatever gemm1_beta says.
+        add_residual = (
+            activation != MoEActivation.SILU and quant_config.gemm1_beta == 1.0
+        )
+        assert activation == MoEActivation.SILU or quant_config.gemm1_beta in (
+            None,
+            1.0,
+        ), (
             "aiter's fused swiglu hardcodes the residual to (up + 1); "
             f"gemm1_beta={quant_config.gemm1_beta} cannot be expressed"
         )
@@ -770,13 +765,21 @@ def aiter_triton_kernel_w4a4_moe_forward(
                 else 1.0
             ),
             "limit": swiglu_limit,
-            "swiglu_add_residual": quant_config.gemm1_beta == 1.0,
+            "swiglu_add_residual": add_residual,
         }
     swizzle_mx_scale = (
         "GFX1250_SCALE" if on_gfx1250() else None
     )
 
     x_q, x_scale = mxfp4_quant(hidden_states.to(torch.bfloat16))
+
+    n_w1 = w1_data.shape[-1]
+    fused_out_quant = (
+        fused_swiglu
+        and on_gfx1250()
+        and (unpadded_N_w1 is None or unpadded_N_w1 == n_w1)
+        and (n_w1 // 2) % 32 == 0
+    )
 
     # GEMM1: gate+up projection.
     raw_intermediate = moe_gemm_a4w4(
@@ -790,39 +793,44 @@ def aiter_triton_kernel_w4a4_moe_forward(
         gammas=gammas if apply_router_weight_on_input else None,
         swizzle_mx_scale=swizzle_mx_scale,
         apply_swiglu=fused_swiglu,
+        out_mx_quant=fused_out_quant,
         **swiglu_kwargs,
     )
 
-    if fused_swiglu:
-        # The swiglu epilogue already halved N.
-        intermediate = (
-            raw_intermediate
-            if unpadded_N_w1 is None
-            else raw_intermediate[:, : unpadded_N_w1 // 2]
-        )
+    if fused_out_quant:
+        mid_q, mid_scale = raw_intermediate
     else:
-        if unpadded_N_w1 is not None:
-            raw_intermediate = raw_intermediate[:, :unpadded_N_w1]
+        if fused_swiglu:
+            # The swiglu epilogue already halved N.
+            intermediate = (
+                raw_intermediate
+                if unpadded_N_w1 is None
+                else raw_intermediate[:, : unpadded_N_w1 // 2]
+            )
+        else:
+            if unpadded_N_w1 is not None:
+                raw_intermediate = raw_intermediate[:, :unpadded_N_w1]
 
-        # SiLU(gate) * up on the concatenated [gate | up] halves
-        from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+            # SiLU(gate) * up on the concatenated [gate | up] halves
+            from aiter.ops.triton.fusions.fused_clamp_act_mul import (
+                fused_clamp_act_mul,
+            )
 
-        half_n = raw_intermediate.shape[-1] // 2
-        intermediate = torch.empty(
-            raw_intermediate.shape[0], half_n,
-            dtype=raw_intermediate.dtype,
-            device=raw_intermediate.device,
-        )
-        fused_clamp_act_mul(
-            raw_intermediate,
-            out=intermediate,
-            swiglu_limit=swiglu_limit,
-            activation="silu",
-            dtype_quant=None,
-        )
+            half_n = raw_intermediate.shape[-1] // 2
+            intermediate = torch.empty(
+                raw_intermediate.shape[0], half_n,
+                dtype=raw_intermediate.dtype,
+                device=raw_intermediate.device,
+            )
+            fused_clamp_act_mul(
+                raw_intermediate,
+                out=intermediate,
+                swiglu_limit=swiglu_limit,
+                activation="silu",
+                dtype_quant=None,
+            )
 
-    # GEMM2: down projection with scatter-reduce
-    mid_q, mid_scale = mxfp4_quant(intermediate.to(torch.bfloat16))
+        mid_q, mid_scale = mxfp4_quant(intermediate.to(torch.bfloat16))
 
     out = moe_gemm_a4w4(
         mid_q,
