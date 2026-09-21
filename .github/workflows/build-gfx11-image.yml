@@ -1,0 +1,208 @@
+name: Docker build gfx11 vLLM image
+
+# Builds the runnable vLLM image for RDNA3/3.5 (docker/Dockerfile.gfx11).
+# Distinct from build-gfx11-ci-image.yml, which publishes the thin *builder*
+# image this repo's wheel CI runs inside.
+#
+# Manual only -- workflow_dispatch is the sole trigger. Unlike
+# build-rocm-wheels.yml this has no sccache, so every run is a cache-cold
+# compile of vLLM's HIP kernels (hours, not minutes); running it on push or on
+# a schedule would burn a runner for most of a day per commit.
+#
+# A dispatch publishes to GHCR by default; untick `push_image` for a
+# build-only dry run. The env fallback below stays false on purpose, so that
+# adding a non-dispatch trigger later cannot publish by accident.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: 'Runner label'
+        default: 'ubuntu-latest'
+        required: false
+      rocm_arch:
+        description: 'Compile targets, ";"-separated'
+        default: 'gfx1151'
+        required: false
+      device_arch:
+        description: 'Single arch selecting the torch/vllm device wheel extras'
+        default: 'gfx1151'
+        required: false
+      max_jobs:
+        description: 'Compile parallelism (see note in the build step)'
+        default: '2'
+        required: false
+      vllm_ref:
+        description: 'vLLM commit to build. Blank = the pin in Dockerfile.gfx11'
+        default: ''
+        required: false
+      remote_vllm:
+        description: '1 = build the pinned ref, 0 = build this branch checkout'
+        default: '1'
+        required: false
+      push_image:
+        description: 'Publish to GHCR (untick for a build-only dry run)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-gfx11-image-${{ github.ref }}
+  # A run is hours long; let an in-flight build finish rather than losing it.
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository may contain uppercase (e.g. ROCm/vllm); Docker requires
+  # lowercase tags.
+  IMAGE_NAME: rocm/vllm/gfx11
+
+jobs:
+  build-image:
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+    # A cold build compiles every HIP kernel; 6h is the GitHub-hosted ceiling.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+
+    # `inputs` is null on a push event, and an empty build arg would override
+    # the Dockerfile's ARG default with nothing (an empty REMOTE_VLLM breaks
+    # the FROM, an empty MAX_JOBS silently becomes $(nproc)). Resolve every
+    # knob to a concrete value once, here.
+    env:
+      IN_RUNS_ON: ${{ inputs.runs_on || 'ubuntu-latest' }}
+      IN_ROCM_ARCH: ${{ inputs.rocm_arch || 'gfx1151' }}
+      IN_DEVICE_ARCH: ${{ inputs.device_arch || 'gfx1151' }}
+      IN_MAX_JOBS: ${{ inputs.max_jobs || '2' }}
+      IN_REMOTE_VLLM: ${{ inputs.remote_vllm || '1' }}
+      IN_VLLM_REF: ${{ inputs.vllm_ref || '' }}
+      IN_PUSH_IMAGE: ${{ inputs.push_image || false }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Only the Dockerfile is needed for a pinned build, but a
+          # remote_vllm=0 run compiles this checkout, and setup.py derives the
+          # wheel version from `git describe`.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch upstream tags for versioning
+        if: env.IN_REMOTE_VLLM == '0'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git remote add upstream https://github.com/vllm-project/vllm.git || true
+          git fetch upstream --tags || echo "Warning: could not fetch upstream tags"
+          git describe --tags --always || echo "Warning: git describe failed"
+
+      # Measured on run 33021450792: the runner has a 145 GB root filesystem
+      # with 86 GB free before any cleanup, and the whole ROCm base layer costs
+      # only ~19 GB. Disk is not the constraint here, so jlumbroso/free-disk-space
+      # is not used -- its swap-storage option deletes /mnt/swapfile, which left
+      # the build with 15 GB of RAM and zero swap and got the runner OOM-killed
+      # mid-compile twice (runs 33010389974 at MAX_JOBS=2, 33016302061 at 1).
+      # Spend the surplus disk on swap instead.
+      - name: Enlarge swap
+        run: |
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -g
+          df -h /
+
+      - name: Log in to GHCR
+        # Needed to read the buildcache tag, and to write it plus the image
+        # when push_image is on.
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The image is normally built from the pin in Dockerfile.gfx11, not from
+      # this checkout, so github.sha would be the wrong thing to tag it with.
+      - name: Resolve vLLM source ref
+        id: src
+        run: |
+          if [ "$IN_REMOTE_VLLM" = "0" ]; then
+            REF="${{ github.sha }}"
+          else
+            REF="$IN_VLLM_REF"
+            [ -n "$REF" ] || REF=$(grep -m1 '^ARG VLLM_REF=' docker/Dockerfile.gfx11 | cut -d= -f2)
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Report build plan
+        run: |
+          echo "runner:     $IN_RUNS_ON"
+          echo "max_jobs:   $IN_MAX_JOBS"
+          echo "arch:       $IN_ROCM_ARCH (device: $IN_DEVICE_ARCH)"
+          echo "source:     ${{ steps.src.outputs.ref }} (remote_vllm=$IN_REMOTE_VLLM)"
+          echo "push_image: $IN_PUSH_IMAGE"
+          nproc; free -g; df -h / /mnt
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.gfx11
+          target: runtime
+          push: ${{ env.IN_PUSH_IMAGE }}
+          # MAX_JOBS is memory-bound, not core-bound: the runner has 4 vCPU but
+          # only 15 GB of RAM. The ceiling is set by swap, not by this number --
+          # runs 33010389974 (2 jobs) and 33016302061 (1 job) both died mid-
+          # compile with the runner OOM-killed, and the common factor was zero
+          # swap, not the job count. See the "Enlarge swap" step.
+          build-args: |
+            PYTORCH_ROCM_ARCH=${{ env.IN_ROCM_ARCH }}
+            DEVICE_ARCH=${{ env.IN_DEVICE_ARCH }}
+            MAX_JOBS=${{ env.IN_MAX_JOBS }}
+            REMOTE_VLLM=${{ env.IN_REMOTE_VLLM }}
+            ${{ env.IN_REMOTE_VLLM != '0' && format('VLLM_REF={0}', steps.src.outputs.ref) || '' }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.src.outputs.ref }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.src.outputs.ref }}
+          # Registry cache rather than type=gha: the GitHub Actions cache is
+          # capped at 10 GB per repo, which this image's layers blow past on
+          # the first export. Only written when publishing is on, so an
+          # experimental run leaves GHCR untouched.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: >-
+            ${{ env.IN_PUSH_IMAGE == 'true'
+                && format('type=registry,ref={0}/{1}:buildcache,mode=min', env.REGISTRY, env.IMAGE_NAME)
+                || '' }}
+
+      # Two runs died mid-build with the runner losing contact and its logs
+      # never uploading, so record what the build actually consumed while a
+      # step can still report it.
+      - name: Disk and memory after build
+        if: always()
+        run: |
+          df -h / /mnt || true
+          free -g || true
+          docker system df || true
+
+      - name: Summary
+        if: success()
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          {
+            echo "## gfx11 vLLM image"
+            echo ""
+            echo "- runner: \`$IN_RUNS_ON\`, MAX_JOBS=\`$IN_MAX_JOBS\`"
+            echo "- vLLM source: \`${{ steps.src.outputs.ref }}\`"
+            if [ "$IN_PUSH_IMAGE" = "true" ]; then
+              echo "- **Pushed**: \`${IMAGE}:latest\`, \`${IMAGE}:${{ steps.src.outputs.ref }}\`"
+            else
+              echo "- **Not pushed** (push_image was off); image was built and discarded."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
