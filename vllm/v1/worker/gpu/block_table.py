@@ -4,6 +4,7 @@ from collections.abc import Iterable
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import (
@@ -217,10 +218,7 @@ class BlockTables:
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
-            # gfx1250 (Triton 3.8.0): the 1024-wide tile miscompiles and
-            # writes garbage into part of every tile after the first;
-            # 256 is verified exact against a torch reference.
-            TRITON_BLOCK_SIZE=256,  # type: ignore
+            TRITON_BLOCK_SIZE=_SLOT_MAPPING_TRITON_BLOCK_SIZE,  # type: ignore
         )
         return slot_mappings[:, :num_tokens_padded]
 
@@ -235,6 +233,15 @@ class BlockTables:
         # rather than allocating a new tensor.
         return self.slot_mappings[:, :num_tokens]
 
+def _slot_mapping_triton_block_size() -> int:
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1250
+
+        if on_gfx1250():
+            return 256
+    return 1024
+
+_SLOT_MAPPING_TRITON_BLOCK_SIZE = _slot_mapping_triton_block_size()
 
 @triton.jit(do_not_specialize=["num_reqs"])
 def _gather_block_tables_kernel(
