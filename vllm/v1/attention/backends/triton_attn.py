@@ -720,9 +720,10 @@ class TritonAttentionImpl(AttentionImpl):
             q_descale = k_descale = v_descale = None
         # FP8 per-tensor / auto path (original flow).
         else:
-            kv_cache = kv_cache.transpose(1, 2)
+            # Keep kv_cache bound to the tensor as it arrives, so _run_attention
+            # receives the documented logical (B, H, N, 2*hs) order.
             hs = self.head_size
-            key_cache, value_cache = kv_cache.split(hs, dim=-1)
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(hs, dim=-1)
             if (
                 is_quantized_kv_cache(self.kv_cache_dtype)
                 and key_cache.dtype != self.fp8_dtype
@@ -771,11 +772,12 @@ class TritonAttentionImpl(AttentionImpl):
             dtype=query.dtype,
             is_causal=attn_metadata.causal,
         ):
-            unified_attention(
+            self._run_attention(
                 q=query[:num_actual_tokens],
                 k=key_cache,
                 v=value_cache,
                 out=output[:num_actual_tokens],
+                kv_cache=kv_cache,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
                 seqused_k=seqused_k,
@@ -811,6 +813,17 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
         return output
+
+    def _run_attention(self, *, kv_cache: torch.Tensor, **kwargs) -> None:
+        """Dispatch to the attention kernel.
+
+        The seam an alternative kernel overrides. Everything above it — the KV
+        cache views, the descale shapes, the metadata — stays shared, so a
+        subclass cannot drift from this path by copying it. ``kv_cache`` is the
+        undivided tensor, which the Triton kernel does not need but a kernel
+        that walks the paged layout itself does.
+        """
+        unified_attention(**kwargs)
 
     def _pth_key_value_caches(
         self, kv_cache: torch.Tensor

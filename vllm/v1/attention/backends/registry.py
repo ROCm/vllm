@@ -121,6 +121,9 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.rocm_aiter_unified_attn."
         "RocmAiterUnifiedAttentionBackend"
     )
+    RDNA35_HIP_ATTN = (
+        "vllm.v1.attention.backends.rdna35_hip_attn.Rdna35HipAttentionBackend"
+    )
     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
     CPU_MLA = "vllm.v1.attention.backends.mla.cpu_mla.CPUMLABackend"
     AMX_MLA = "vllm.v1.attention.backends.mla.amx_mla.AMXMLABackend"
