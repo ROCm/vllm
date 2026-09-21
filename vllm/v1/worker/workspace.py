@@ -260,7 +260,33 @@ class WorkspaceManager:
             # allocation below. Without this, each resize may leave a
             # dead segment in reserved memory which can cause higher peak
             # memory usage.
-            torch.accelerator.empty_cache()
+            #
+            # This is skipped when running with more than one distributed
+            # rank (e.g. tensor/data parallel workers). Growth here is
+            # decided purely from *this* rank's local call history, with no
+            # cross-rank coordination, so different ranks can reach a given
+            # resize at slightly different wall-clock times (JIT/compile
+            # jitter, scheduling, etc). On ROCm, torch.accelerator.empty_cache()
+            # is not safe to call from only a subset of ranks while their
+            # peers are concurrently inside an unrelated NCCL/RCCL collective
+            # (e.g. the profiling run's logits all_gather): it can block
+            # forever inside the caching allocator's device synchronization,
+            # while the peers that already moved on block forever waiting for
+            # this rank at the later collective. This was reproduced with the
+            # DeepSeek-V4 sparse attention indexer's per-layer workspace
+            # reservation (rocm_aiter_sparse_attn_indexer): a subset of TP
+            # ranks would hang inside this empty_cache() call indefinitely
+            # while the remaining ranks hung waiting for them at
+            # tensor_model_parallel_all_gather() in _gather_logits, with no
+            # crash/traceback -- a permanent, silent cross-rank deadlock.
+            # The memory-usage benefit of releasing the dead segment early
+            # is not worth risking that deadlock, so we only take it in the
+            # single-rank case, where there are no peers to deadlock with.
+            world_size = 1
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+            if world_size <= 1:
+                torch.accelerator.empty_cache()
             self._current_workspaces[workspace_id] = torch.empty(
                 (required_bytes,), dtype=torch.uint8, device=self._device
             )

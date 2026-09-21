@@ -541,6 +541,41 @@ class GroupCoordinator:
         else:
             self.device = torch.device("cpu")
 
+        if current_platform.is_rocm() and self.world_size > 1:
+            # Eagerly create the underlying RCCL communicator for
+            # `self.device_group` instead of leaving it to PyTorch's normal
+            # lazy-init-on-first-collective behavior.
+            #
+            # `self.device_group`'s backend (plain `torch.distributed`,
+            # *not* vLLM's own PyNccl/AITER_CUSTOM communicators used for
+            # e.g. the TP row/col-parallel all-reduces) is otherwise only
+            # ever exercised the first time a caller uses it directly, e.g.
+            # `all_gather_into_tensor` in
+            # `DeviceCommunicatorBase.all_gather()`. For DeepSeek-V4 on
+            # MI355X that first use is `_gather_logits()`'s
+            # `tensor_model_parallel_all_gather()` call inside the
+            # memory-profiling dummy forward pass -- i.e. after 61 layers'
+            # worth of AITER JIT compilation and torch.compile activity
+            # have already run on every rank, and well after this same set
+            # of GPUs already has other, separately-initialized RCCL
+            # communicators active (PyNccl's, and AITER_CUSTOM's IPC-backed
+            # one). Reproduced on an 8x MI355X node: `ncclCommInitRankConfig`
+            # for this lazily-created communicator hangs indefinitely at
+            # that point -- logging "Init START" and never returning, with
+            # every rank stuck the same way -- which then manifests as a
+            # permanent, silent multiproc_executor/shm_broadcast hang with
+            # no crash or traceback (matching the workers' GPUs sitting at
+            # ~100% from RCCL's busy-wait polling).
+            #
+            # Force that same communicator's init to happen right here
+            # instead, immediately after `device_group` is created and
+            # before any model/layer work starts, while every rank is
+            # trivially in lock-step and no other communicator is mid-use.
+            # A 1-element all_reduce is enough to make PyTorch actually call
+            # into `ncclCommInitRankConfig` for this process group.
+            warmup_tensor = torch.zeros(1, device=self.device)
+            torch.distributed.all_reduce(warmup_tensor, group=self.device_group)
+
         self.use_device_communicator = use_device_communicator
         self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
