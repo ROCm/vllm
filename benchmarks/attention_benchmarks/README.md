@@ -21,6 +21,41 @@ python benchmark.py \
     --output-csv results.csv
 ```
 
+## Cache residency
+
+`benchmark_fn` walks one KV cache per layer and divides the result by the layer
+count, so the layer loop doubles as a rotation over disjoint KV regions. Whether
+a measurement reads DRAM or a resident last-level cache therefore depends on
+`num_layers * kv_bytes_per_layer`, not on one layer's cache.
+
+The default of 10 layers is enough for most shapes. It stops being enough when
+the product falls below the cache, which on a Strix Halo means a 32 MiB MALL
+that CUDA-graph replay never flushes. Measured on that board, TRITON_ATTN
+decode, with and without the option:
+
+| working set (10 layers) | cells | median bias | worst |
+| --- | --- | --- | --- |
+| under 32 MiB | 6 | +35% | +64% |
+| over 32 MiB | 18 | +0% | +3% |
+
+The split is clean: every cell that fits the MALL was reporting a time too low
+to be sustainable, and every cell that does not was already fine. Small models
+at short contexts are the ones affected — `32x8x128` at 512 tokens reads 20 MB
+across ten layers and came out 64% fast.
+
+`--min-working-set-mb` raises `--num-layers` until the KV working set reaches
+the given size. It only ever raises, so shapes already past the cache are
+untouched and their timings do not move.
+
+```bash
+# 20 MB across the default 10 layers: inside the MALL.
+python benchmark.py --backends TRITON_ATTN --batch-specs q1s512 \
+    --num-q-heads 32 --num-kv-heads 8 --head-dim 128      # 11 us, cached
+python benchmark.py --backends TRITON_ATTN --batch-specs q1s512 \
+    --num-q-heads 32 --num-kv-heads 8 --head-dim 128 \
+    --min-working-set-mb 96                               # 18 us, DRAM
+```
+
 ## Simplified Batch Specification Grammar
 
 Express workloads concisely using query length and sequence length:
