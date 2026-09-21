@@ -27,7 +27,7 @@ quiet-lock build pip install -e .
 Matriz garantizada (verificada):
 
 | | build | measure |
-|---|---|---|
+| --- | --- | --- |
 | **build** | concurrentes | serializados |
 | **measure** | serializados | serializados |
 
@@ -69,7 +69,7 @@ Mitigaciones:
 ## 2. Entorno verificado
 
 | Recurso | Ruta / valor |
-|---|---|
+| --- | --- |
 | venv | `/scratch/rogarcia/vllm-build/.venv` |
 | Python | `$VENV/bin/python` (**nunca** `python3` del sistema) |
 | torch | 2.13.0+rocm10.1.0a20260822 |
@@ -109,6 +109,7 @@ PYTHONPATH=/scratch/rogarcia/<tu-worktree>:$VENV/lib/python3.12/site-packages/_r
 ```
 
 Verifica SIEMPRE antes de medir:
+
 ```bash
 PYTHONPATH=... $VENV/bin/python -c "import vllm; print(vllm.__file__)"
 ```
@@ -118,7 +119,7 @@ PYTHONPATH=... $VENV/bin/python -c "import vllm; print(vllm.__file__)"
 ## 3. Ramas
 
 | Rama | Rol |
-|---|---|
+| --- | --- |
 | `rogarcia.gfx1151-3d-attn-tuning` | **Baseline y competencia práctica.** Kernel Triton 3D con soporte MTP. |
 | `rogarcia.attn-bench-cache-residency` | **Herramienta de medida.** Rotación de buffers para evitar residencia en MALL. |
 
@@ -133,7 +134,7 @@ debajo de los 32 MiB de MALL, la medida es **optimista** — CUDA-graph replay
 nunca vacía MALL. Medido en esta board con TRITON_ATTN decode:
 
 | working set (10 capas) | celdas | sesgo mediano | peor |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | < 32 MiB | 6 | **+35 %** | **+64 %** |
 | > 32 MiB | 18 | +0 % | +3 % |
 
@@ -194,7 +195,27 @@ Una implementación **no** está terminada hasta que:
    `lgkmcnt`. Un `s_waitcnt` total indiferenciado **no** permite decir
    "memory-bound".
 
-Sin los cinco puntos, el trabajo se reporta como **en progreso**, no como hecho.
+6. **De configuración única** — una sola configuración de compilación gana en
+   **todo** el barrido de contexto. Está prohibido elegir `NSEG`, `KPW`,
+   `BLOCK`, `TILE` o el layout en función de `S`.
+
+   No es una preferencia estética, es implementabilidad: `S` crece en cada paso
+   de decode y con CUDA graphs el grid se captura, así que una configuración
+   indexada por `S` no puede materializarse en tiempo de ejecución. Los
+   parámetros sí pueden depender de propiedades estáticas —
+   `(H_kv, D, M, board)` — porque son fijas al capturar el grafo.
+
+   Una tabla con la mejor configuración por cada `S` no mide un kernel: mide la
+   envolvente inferior de una familia de kernels, y esa envolvente no existe
+   como binario. Si una configuración gana a `S` corto y pierde a `S` largo, el
+   resultado que hay que reportar es el de la configuración única elegida, con
+   su pérdida en el extremo malo explícita.
+
+   Esto **no** alcanza a los parámetros del harness (`ncopy`, `iters`), que
+   existen para fijar el régimen de memoria y el ruido estadístico, no para
+   cambiar el código medido. Varían con `S` por diseño.
+
+Sin los seis puntos, el trabajo se reporta como **en progreso**, no como hecho.
 
 ---
 
