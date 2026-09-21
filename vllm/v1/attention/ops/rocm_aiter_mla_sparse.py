@@ -29,6 +29,14 @@ else:
 
 logger = init_logger(__name__)
 
+# DeepSeek-V4.1 two-level candidate filtering: portable Triton helpers shared
+# with the generic sparse_attn_indexer path (select at the candidate source
+# layer, mask at the consumer layers; both run on the row logits before top-k).
+from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (  # noqa: E402
+    apply_candidate_mask as _apply_candidate_mask,
+    select_candidate_blocks as _select_candidate_blocks,
+)
+
 
 @functools.cache
 def _get_aiter_topk_ops() -> tuple[Callable[..., None], Callable[..., None]] | None:
@@ -863,12 +871,6 @@ def rocm_aiter_sparse_attn_indexer(
     candidate_block_size: int = 0,
     candidate_write: bool = False,
 ) -> torch.Tensor:
-    if candidate_blocks is not None:
-        raise NotImplementedError(
-            "The ROCm AITER sparse attention indexer does not implement "
-            "candidate-block selection (DeepSeek-V4.1)."
-        )
-
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
     attn_metadata = forward_context.attn_metadata
@@ -992,6 +994,32 @@ def rocm_aiter_sparse_attn_indexer(
 
             num_rows = logits.shape[0]
 
+            if candidate_blocks is not None:
+                # Two-level selection (v4.1): the candidate source publishes
+                # its top blocks; later indexers mask their scores to them.
+                # Logits are [M, N] in packed column space bounded per row by
+                # cu_seqlen_ks/ke, matching the generic path.
+                chunk_candidates = candidate_blocks[
+                    chunk.token_start : chunk.token_end
+                ]
+                if candidate_write:
+                    _select_candidate_blocks(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates.shape[1],
+                        candidate_block_size,
+                        chunk_candidates,
+                    )
+                else:
+                    _apply_candidate_mask(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates,
+                        candidate_block_size,
+                    )
+
             aiter_topk_kernel = _get_aiter_top_k_kernel(
                 is_prefill=True,
                 compress_ratio=compress_ratio,
@@ -1056,6 +1084,35 @@ def rocm_aiter_sparse_attn_indexer(
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
+        if candidate_blocks is not None:
+            # Two-level selection (v4.1) on the decode logits
+            # ([B*next_n, max_model_len], request-local compressed positions).
+            # seq_lens is (B,) or (B, next_n); rows share bounds in groups of
+            # next_n when it is per-request.
+            vis = decode_metadata.seq_lens.reshape(-1)
+            row_repeat = next_n if vis.numel() != num_rows else 1
+            vis = vis[:num_rows]
+            decode_candidates = candidate_blocks[:num_rows]
+            if candidate_write:
+                _select_candidate_blocks(
+                    logits,
+                    None,
+                    vis,
+                    decode_candidates.shape[1],
+                    candidate_block_size,
+                    decode_candidates,
+                    row_repeat,
+                )
+            else:
+                _apply_candidate_mask(
+                    logits,
+                    None,
+                    vis,
+                    decode_candidates,
+                    candidate_block_size,
+                    row_repeat,
+                )
+
         # FULL graphs are not keyed by context length, so use a replay-safe
         # upper bound when choosing the captured kernel.
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL:
@@ -1103,6 +1160,10 @@ def rocm_aiter_sparse_attn_indexer(
 
 
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.uint8:
+        # MXFP8 (ModelOpt) layers store e8m0 scales as raw uint8 bytes; the
+        # byte is the fp32 exponent field.
+        return (scale.to(torch.int32) << 23).view(torch.float32).contiguous()
     if scale.dtype == torch.float8_e8m0fnu:
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,
@@ -1238,6 +1299,15 @@ def _get_cached_wo_a_bf16(
     )
 
     wo_a_scale_param = get_fp8_block_weight_scale(wo_a)
+    if (
+        wo_a_scale_param is None
+        and wo_a.weight.dtype == torch.float8_e4m3fn
+        and getattr(wo_a, "weight_scale", None) is not None
+    ):
+        # MXFP8 (ModelOpt) linear, e.g. DeepSeek V4.1: `weight_scale` is
+        # [N, K // 32] uint8 e8m0, one scale per row per 32-wide K group.
+        # Without this branch the fp8 weight was used unscaled.
+        wo_a_scale_param = wo_a.weight_scale
     if wo_a_scale_param is not None:
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32

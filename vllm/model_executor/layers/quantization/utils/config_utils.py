@@ -75,7 +75,7 @@ def is_shared_expert_quant_fse_compatible(
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         is_layer_skipped,
     )
-    from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+    from vllm.models.deepseek_v4_1.quant_config import DeepseekV4FP8Config
 
     if isinstance(quant_config, DeepseekV4FP8Config):
         from vllm.config import get_current_vllm_config

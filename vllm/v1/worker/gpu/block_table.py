@@ -217,7 +217,10 @@ class BlockTables:
             CP_SIZE=self.cp_size,
             CP_INTERLEAVE=self.cp_interleave,
             PAD_ID=PAD_SLOT_ID,
-            TRITON_BLOCK_SIZE=1024,  # type: ignore
+            # gfx1250 (Triton 3.8.0): the 1024-wide tile miscompiles and
+            # writes garbage into part of every tile after the first;
+            # 256 is verified exact against a torch reference.
+            TRITON_BLOCK_SIZE=256,  # type: ignore
         )
         return slot_mappings[:, :num_tokens_padded]
 
