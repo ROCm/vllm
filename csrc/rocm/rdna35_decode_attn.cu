@@ -84,6 +84,9 @@ static_assert(BLOCK == HEAD_DIM, "fused epilogue gives each thread one d");
 #endif
 static_assert(KV_PAD % 8 == 0, "KV_PAD must keep rows 16B aligned");
 static_assert(PAGE_PAD % 8 == 0, "PAGE_PAD must keep pages 16B aligned");
+// Lets the block table be read once per tile instead of once per token: jb is
+// always a multiple of KPW, so jb..jb+KPW-1 cannot straddle two blocks.
+static_assert(BS % KPW == 0, "a KPW tile must not straddle two blocks");
 
 typedef _Float16 h2v __attribute__((ext_vector_type(2)));
 typedef float f4v __attribute__((ext_vector_type(4)));
@@ -92,10 +95,9 @@ __device__ __forceinline__ h2v as_h2(float x) {
   return __builtin_bit_cast(h2v, x);
 }
 
-// byte offset (in fp16 elements) of the K row for (token j, kv head kvh)
-__device__ __forceinline__ size_t kv_off(const int* __restrict__ bt, int j,
-                                         int kvh) {
-  const int blk = bt[j / BS];
+// byte offset (in fp16 elements) of the K row for (token j, kv head kvh),
+// given the physical block already resolved for j.
+__device__ __forceinline__ size_t kv_off(int blk, int j, int kvh) {
   const int slot = j % BS;
 #if LAYOUT == 0  // NHD: (NB, BS, HKV, 2D)
   return (size_t)blk * PAGE_ELEMS +
@@ -158,11 +160,16 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // Measured: deferring V to just before P@V costs 5.5% at S=32768, where
     // keeping eight loads in flight is what sustains the bandwidth.
     f4v kr[KPW], vr[KPW];
+    // One block-table read per tile, forced into a scalar register.  The four
+    // tokens share a block, and the value is wave-uniform, so the alternative
+    // is four vector loads of the same 4 bytes broadcast to 32 lanes -- a third
+    // of the loop's VMEM slots spent re-reading one integer.
+    const int blk = __builtin_amdgcn_readfirstlane(bt[jb / BS]);
 #pragma unroll
     for (int c = 0; c < KPW; ++c) {
       int jj = jb + c;
       jj = (jj < S) ? jj : (S - 1);
-      const size_t off = kv_off(bt, jj, kvh) + dl;
+      const size_t off = kv_off(blk, jj, kvh) + dl;
       kr[c] = *(const f4v*)(kv + off);
       vr[c] = *(const f4v*)(kv + off + HEAD_DIM);
     }
