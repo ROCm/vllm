@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.transformers_utils.configs.dflare import apply_dflare_scheduling_alias
+
 SUPPORTED_SPECULATORS_TYPES = {}
 
 
@@ -128,6 +130,24 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     pre_trained_config["dflash_config"]["causal"] = not config_dict.get(
         "sliding_window_non_causal", True
     )
+
+
+@register_speculator("dflare")
+def update_dflare(config_dict: dict, pre_trained_config: dict) -> None:
+    """Convert a DFlare speculators checkpoint to vLLM draft metadata."""
+    pre_trained_config["architectures"] = ["DFlareDraftModel"]
+    pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
+    if config_dict.get("target_hidden_size") is not None:
+        pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+
+    aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+    pre_trained_config["dflare_config"] = {
+        "mask_token_id": config_dict["mask_token_id"],
+        "target_layer_ids": [i - 1 for i in aux_layer_ids],
+        "causal": not config_dict.get("sliding_window_non_causal", True),
+    }
+    apply_dflare_scheduling_alias(pre_trained_config)
 
 
 @register_speculator("dspark")

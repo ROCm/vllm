@@ -250,6 +250,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.speculative_config.method in (
                 "eagle3",
                 "dflash",
+                "dflare",
                 "dspark",
                 "extract_hidden_states",
             ):

@@ -12,6 +12,7 @@ import logging
 import statistics
 import types
 from contextlib import contextmanager
+from dataclasses import replace
 
 import torch
 from batch_spec import parse_batch_spec, reorder_for_flashinfer
@@ -20,6 +21,7 @@ from common import (
     BenchmarkResult,
     MockLayer,
     get_attention_scale,
+    layers_for_working_set,
     run_do_bench,
     run_ncu_profile,
 )
@@ -335,6 +337,11 @@ def _create_input_tensors(
     return q_list, k_list, v_list
 
 
+def dtype_size(config) -> int:
+    """Bytes per KV element for the configured cache dtype."""
+    return 1 if config.kv_cache_dtype.startswith("fp8") else config.dtype.itemsize
+
+
 def _create_kv_cache(
     config: BenchmarkConfig,
     max_num_blocks: int,
@@ -487,6 +494,18 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     # Calculate total blocks needed: batch_size * max_blocks_per_request
     max_blocks_per_request = (max_kv + config.block_size - 1) // config.block_size
     max_num_blocks = batch_size * max_blocks_per_request
+
+    # One KV cache per layer, so the layer loop is also a rotation over
+    # disjoint KV; grow it when asked, to push the working set out of cache.
+    kv_bytes_per_layer = (
+        2 * sum(kv_lens) * config.num_kv_heads * config.head_dim * dtype_size(config)
+    )
+    config = replace(
+        config,
+        num_layers=layers_for_working_set(
+            config.num_layers, kv_bytes_per_layer, config.min_working_set_mb
+        ),
+    )
 
     # Suppress vLLM logs during setup to reduce spam
     with log_warnings_and_errors_only():
