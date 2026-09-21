@@ -95,6 +95,16 @@ __device__ __forceinline__ h2v as_h2(float x) {
   return __builtin_bit_cast(h2v, x);
 }
 
+// The hardware reciprocal, not a division.  `num / den` makes the compiler
+// emit the full IEEE sequence -- eleven dependent instructions with Newton
+// refinement and edge-case fixup -- for a result that is immediately rounded
+// to fp16.  v_rcp_f32 is good to ~1 ULP in fp32, far beyond what 11 bits of
+// mantissa can hold, and matches the __builtin_amdgcn_exp2f already used for
+// the softmax.
+__device__ __forceinline__ float fast_div(float num, float den) {
+  return num * __builtin_amdgcn_rcpf(den);
+}
+
 // byte offset (in fp16 elements) of the K row for (token j, kv head kvh),
 // given the physical block already resolved for j.
 __device__ __forceinline__ size_t kv_off(int blk, int j, int kvh) {
@@ -287,7 +297,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   #pragma unroll
     for (int w = 0; w < NWAVE; ++w)
       num = fmaf(a[w], lds_acc[w * HEAD_DIM + tid], num);
-    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] = (OutT)(num / den);
+    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
+        (OutT)fast_div(num, den);
   }
 #else
   const size_t base = ((size_t)h * (NSEG * NWAVE) + seg * NWAVE + wave) * MAXM;
@@ -343,8 +354,7 @@ __global__ __launch_bounds__(RED_THREADS) void reduce_segments(
     for (int i = 0; i < 4; ++i) num[i] = fmaf(a, v[i], num[i]);
   }
 
-  // One reciprocal instead of four divides.
-  const float inv = 1.f / den;
+  const float inv = __builtin_amdgcn_rcpf(den);
   OutT* o = out + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d4;
 #pragma unroll
   for (int i = 0; i < 4; ++i) o[i] = (OutT)(num[i] * inv);
