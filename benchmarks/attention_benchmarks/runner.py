@@ -143,7 +143,10 @@ def _create_vllm_config(
         tokenizer="HuggingFaceTB/SmolLM2-135M",
         skip_tokenizer_init=True,
         trust_remote_code=False,
-        dtype="auto",  # Use model's native dtype
+        # Honour the configured dtype. With "auto" this silently became the
+        # stand-in model's native bfloat16 while BenchmarkConfig.dtype claimed
+        # float16, so every result was labelled with a dtype it did not use.
+        dtype=str(config.dtype).removeprefix("torch."),
         seed=0,
         max_model_len=1024,
     )
