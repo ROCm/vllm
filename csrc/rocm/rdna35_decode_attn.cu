@@ -208,15 +208,21 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 #pragma unroll
         for (int m = 0; m < MAXM; ++m) s[c][m] += __shfl_xor(s[c][m], st, WAVE);
 
+    // (jj <= ctx + m) already implies (jj < S): ctx + m <= S - 1 for every m,
+    // so the bound test this mask also carried was dead weight.
+    //
+    // Measured and rejected: skipping the mask entirely on tiles below ctx via
+    // a wave-uniform branch costs 1.6-7.7%.  The branch stops the scheduler
+    // software-pipelining across it, which is worth more than the selects.
 #pragma unroll
     for (int c = 0; c < KPW; ++c) {
       const int jj = jb + c;
 #pragma unroll
       for (int m = 0; m < MAXM; ++m) {
 #if MUTATE == 1
-        const bool valid = (jj < j1) && (jj <= ctx + m + 1);
+        const bool valid = (jj <= ctx + m + 1);
 #else
-        const bool valid = (jj < j1) && (jj <= ctx + m);
+        const bool valid = (jj <= ctx + m);
 #endif
         s[c][m] = valid ? s[c][m] * scale2 : -INFINITY;
       }
