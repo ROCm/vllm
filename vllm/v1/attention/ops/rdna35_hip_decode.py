@@ -62,9 +62,18 @@ class KernelVariant:
     def name(self) -> str:
         return f"rdna35_decode_{self.suffix}"
 
+    @property
+    def partials_per_head(self) -> int:
+        """How many partials the global reduction merges.
+
+        The fused epilogue collapses a workgroup's NWAVE partials in LDS, so
+        only the NSEG cross-workgroup ones survive.
+        """
+        return self.nseg if self.fused else self.nseg * _NWAVE
+
     def scratch_shapes(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Shapes of the (acc, m/l) partials the kernel writes."""
-        segments = self.num_q_heads * self.nseg * _NWAVE * self.max_m
+        segments = self.num_q_heads * self.partials_per_head * self.max_m
         return (segments, self.head_size), (segments,)
 
 

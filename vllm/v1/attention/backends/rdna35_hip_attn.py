@@ -36,6 +36,23 @@ logger = init_logger(__name__)
 # the q heads divide evenly over the kv heads.
 _SUPPORTED_HEAD_SIZES = (256,)
 
+# The board has 20 WGPs and the grid is (NSEG, num_q_heads), so a model with
+# few heads leaves most of it idle: 8 heads is 8 workgroups.  Splitting the KV
+# range across NSEG workgroups refills the machine.  Measured on Hq=8/Hkv=4,
+# S=8192: 45.0% of roofline at NSEG=1 against 81.0% at NSEG=4.
+#
+# NSEG depends only on the head count, which is fixed when the graph is
+# captured, so this stays within the one-configuration rule -- it is S that a
+# configuration may not depend on.
+_TARGET_WORKGROUPS = 32
+
+
+def _segments_for(num_q_heads: int) -> int:
+    """Largest power of two that keeps the grid near _TARGET_WORKGROUPS."""
+    ratio = max(1, _TARGET_WORKGROUPS // max(1, num_q_heads))
+    return 1 << (ratio.bit_length() - 1)
+
+
 # The JIT-compiled module plus the scratch buffers sized for it.  The module is
 # a pybind extension built at runtime, so it has no static type.
 _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
@@ -140,6 +157,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         q = kwargs["q"]
         block_size = kv_cache.shape[2]
         variant = KernelVariant(
+            nseg=_segments_for(self.num_heads),
             head_size=self.head_size,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,

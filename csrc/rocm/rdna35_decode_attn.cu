@@ -59,15 +59,13 @@
 #ifndef ILV
   #define ILV 1
 #endif
-// Merge the per-wave partials inside the workgroup instead of through a second
-// kernel.  Only valid when NSEG==1, where a head's partials never leave one
-// workgroup.  Exposed as a knob so both paths can be measured against each
-// other; NSEG>1 must keep the global reduction.
+// Merge the NWAVE per-wave partials inside the workgroup, in LDS, instead of
+// routing them through global memory.  With NSEG==1 that finishes the job and
+// no second kernel runs.  With NSEG>1 a head's partials do span workgroups so
+// a global reduction is still needed, but over NSEG values instead of
+// NSEG*NWAVE: an eighth of the traffic and an eighth of the work.
 #ifndef FUSED
-  #define FUSED (NSEG == 1)
-#endif
-#if FUSED && NSEG != 1
-  #error "FUSED requires NSEG==1: partials span workgroups otherwise"
+  #define FUSED 1
 #endif
 
 #define WAVE 32
@@ -76,6 +74,8 @@
 #define KV_ROW (2 * HEAD_DIM + KV_PAD)  // K and V packed, then pad
 #define PAGE_ELEMS (BS * NUM_KV_HEADS * KV_ROW + PAGE_PAD)
 #define GQA (NUM_Q_HEADS / NUM_KV_HEADS)
+// Partials the global reduction merges, when it runs at all.
+#define NPART (FUSED ? NSEG : NSEG * NWAVE)
 #define LOG2E 1.44269504088896340736f
 
 static_assert(DPL == 8, "8 fp16 per lane (b128)");
@@ -151,7 +151,18 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   const float scale2 = scale * LOG2E;
   const int ctx = S - MAXM;
 #if ILV
+  #if NSEG == 1
   const int gw = seg * NWAVE + wave;
+  #else
+  // Correctness, not speed: without readfirstlane the compiler cannot see that
+  // jstart is wave-uniform, so it guards the loop with s_and_saveexec and only
+  // restores exec inside the epilogue.  A wave with no tiles then reaches the
+  // LDS stores with exec = 0 and skips them silently, while s_barrier (scalar)
+  // still fires, so its neighbours read uninitialised LDS.  Only NSEG > 1 can
+  // leave a whole wave empty -- and forcing the SGPR costs ~20% at NSEG == 1,
+  // so it stays out of that path.
+  const int gw = __builtin_amdgcn_readfirstlane(seg * NWAVE + wave);
+  #endif
   const int j1 = S;
   const int jstart = gw * KPW;
   const int jstep = NSEG * NWAVE * KPW;
@@ -290,12 +301,21 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   #pragma unroll
     for (int w = 0; w < NWAVE; ++w) gmax = fmaxf(gmax, lds_m[w]);
 
-    // A wave that got no tiles carries mx=-INFINITY and ls=0, so its weight is
-    // exp2(-inf) = 0 and it drops out without special-casing.
+    // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight is
+    // exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
+    // workgroup can be empty though, and then gmax is -inf as well:
+    // (-inf) - (-inf) is NaN, which would poison the partial.
+  #if NSEG > 1
+    const bool empty = (gmax == -INFINITY);
+  #endif
     float a[NWAVE], den = 0.f;
   #pragma unroll
     for (int w = 0; w < NWAVE; ++w) {
+  #if NSEG > 1
+      a[w] = empty ? 0.f : __builtin_amdgcn_exp2f(lds_m[w] - gmax);
+  #else
       a[w] = __builtin_amdgcn_exp2f(lds_m[w] - gmax);
+  #endif
       den = fmaf(a[w], lds_l[w], den);
     }
 
@@ -303,8 +323,19 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   #pragma unroll
     for (int w = 0; w < NWAVE; ++w)
       num = fmaf(a[w], lds_acc[w * HEAD_DIM + tid], num);
+  #if NSEG == 1
     out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
         (OutT)fast_div(num, den);
+  #else
+    // (num, gmax, den) is itself a valid partial softmax state, so hand the
+    // global reduction one per (head, segment) rather than NWAVE of them.
+    const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
+    p_acc[pb * HEAD_DIM + tid] = num;
+    if (tid == 0) {
+      p_m[pb] = gmax;
+      p_l[pb] = den;
+    }
+  #endif
   }
 #else
   const size_t base = ((size_t)h * (NSEG * NWAVE) + seg * NWAVE + wave) * MAXM;
@@ -332,11 +363,10 @@ template <typename OutT>
 __global__ __launch_bounds__(RED_THREADS) void reduce_segments(
     const float* __restrict__ p_acc, const float* __restrict__ p_m,
     const float* __restrict__ p_l, OutT* __restrict__ out) {
-  constexpr int NPART = NSEG * NWAVE;
   const int m = blockIdx.x;
   const int h = blockIdx.y;
   const int d4 = threadIdx.x * 4;
-  const size_t base = (size_t)h * NPART * MAXM + m;
+  const size_t base = (size_t)h * NPART * MAXM + m;  // NPART partials for h
 
   // p_m and p_l are block-uniform, so these are scalar loads; only p_acc is
   // per-lane.  Deliberately not cached in registers: NPART reaches 128 at
@@ -411,7 +441,7 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
   auto* outp = reinterpret_cast<_Float16*>(out.data_ptr());
   hipLaunchKernelGGL(decode_attn<_Float16>, grid, block, 0, stream, qp, kvp,
                      btp, accp, mp, lp, outp, (int)seq_len, (float)scale);
-  #if !FUSED
+  #if NSEG > 1 || !FUSED
   hipLaunchKernelGGL(reduce_segments<_Float16>, rgrid, dim3(RED_THREADS), 0,
                      stream, accp, mp, lp, outp);
   #endif
