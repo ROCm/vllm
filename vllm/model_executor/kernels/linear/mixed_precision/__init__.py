@@ -19,9 +19,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.dynamic_4bit import (
 from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
     ExllamaLinearKernel,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.hip_w4a16 import (
-    HipW4A16LinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.hip_w8a16 import (
     HipW8A16LinearKernel,
 )
@@ -64,7 +61,6 @@ __all__ = [
     "CutlassW4A8LinearKernel",
     "Dynamic4bitLinearKernel",
     "ExllamaLinearKernel",
-    "HipW4A16LinearKernel",
     "HipW8A16LinearKernel",
     "HummingLinearKernel",
     "MacheteLinearKernel",

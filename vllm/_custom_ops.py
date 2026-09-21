@@ -629,50 +629,6 @@ def awq_gemv_hip(
     return torch.ops._C.awq_gemv_hip(activation, qweight, scales, qzeros, split_k)
 
 
-def _hip_w4a16_linear_kernel_apply_weights(
-    input_2d: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-    expected_k: int,
-    split_k: int = 0,
-) -> torch.Tensor:
-    padded_k = qweight.shape[0]
-    if input_2d.dim() == 1:
-        input_2d = input_2d.unsqueeze(0)
-    if input_2d.shape[1] != padded_k:
-        if input_2d.shape[1] == expected_k:
-            x_padded = torch.zeros(
-                (input_2d.shape[0], padded_k),
-                dtype=input_2d.dtype,
-                device=input_2d.device,
-            )
-            x_padded[:, : input_2d.shape[1]] = input_2d
-            input_2d = x_padded
-        else:
-            raise ValueError(
-                "Unexpected activation width for padded AWQ: "
-                f"{input_2d.shape[1]} (expected {expected_k} or {padded_k})"
-            )
-    if input_2d.shape[0] == 1:
-        return awq_gemv_hip(input_2d, qweight, scales, qzeros, split_k).unsqueeze(0)
-    # GEMM fallback path: dequantize + matmul
-    return input_2d @ awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
-
-
-def _hip_w4a16_linear_kernel_apply_weights_fake_impl(
-    input_2d: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-    expected_k: int,
-    split_k: int = 0,
-) -> torch.Tensor:
-    m = 1 if input_2d.dim() == 1 else input_2d.shape[0]
-    n = qweight.shape[1] * 8
-    return torch.empty((m, n), dtype=scales.dtype, device=input_2d.device)
-
-
 def _awq_gemm_fake_impl(
     input: torch.Tensor,
     qweight: torch.Tensor,
@@ -690,19 +646,6 @@ direct_register_custom_op(
     fake_impl=_awq_gemm_fake_impl,
 )
 awq_gemm = torch.ops.vllm.awq_gemm
-
-
-if current_platform.is_rocm() and hasattr(torch.ops._C, "awq_gemv_hip"):
-    direct_register_custom_op(
-        op_name="hip_w4a16_linear_kernel_apply_weights",
-        op_func=_hip_w4a16_linear_kernel_apply_weights,
-        fake_impl=_hip_w4a16_linear_kernel_apply_weights_fake_impl,
-    )
-    hip_w4a16_linear_kernel_apply_weights = (
-        torch.ops.vllm.hip_w4a16_linear_kernel_apply_weights
-    )
-else:
-    hip_w4a16_linear_kernel_apply_weights = None
 
 
 if hasattr(torch.ops._C, "awq_gemm"):
