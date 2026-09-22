@@ -53,6 +53,32 @@ def _segments_for(num_q_heads: int) -> int:
     return 1 << (ratio.bit_length() - 1)
 
 
+# KV head counts where giving two waves a query token each, rather than one
+# wave all of them, wins at both ends of the context range.  This is a measured
+# table, not a rule: sweeping MSPLIT against Hkv in {2,4,8,16} at a constant
+# GQA of 2 and the NSEG above gives, as a change from MSPLIT=1,
+#
+#   Hkv    S=128    S=32768
+#     2    +3.8%      -4.3%
+#     4    +7.5%      +4.5%
+#     8   +11.1%      +8.1%
+#    16    +3.6%      -6.4%
+#
+# so the benefit is not monotonic in head count, bytes per token, or KV stream
+# count -- all three were checked and none orders these four points.  Only 4
+# and 8 win at long context, and extrapolating past what was measured is how
+# the WGP-alignment rule got into the design document three refutations ago.
+# Re-measure before widening this.
+_MSPLIT_KV_HEADS = frozenset({4, 8})
+
+
+def _msplit_for(num_kv_heads: int, max_m: int) -> int:
+    """Waves sharing the query-token dimension; 1 keeps the old decomposition."""
+    if num_kv_heads in _MSPLIT_KV_HEADS and max_m % 2 == 0:
+        return 2
+    return 1
+
+
 # The JIT-compiled module plus the scratch buffers sized for it.  The module is
 # a pybind extension built at runtime, so it has no static type.
 _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
@@ -158,6 +184,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         block_size = kv_cache.shape[2]
         variant = KernelVariant(
             nseg=_segments_for(self.num_heads),
+            msplit=_msplit_for(self.num_kv_heads, q.shape[0]),
             head_size=self.head_size,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
