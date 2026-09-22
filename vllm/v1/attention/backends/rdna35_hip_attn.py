@@ -34,7 +34,7 @@ logger = init_logger(__name__)
 
 # The kernel's wave split assumes 8 fp16 per lane, and its GQA indexing assumes
 # the q heads divide evenly over the kv heads.
-_SUPPORTED_HEAD_SIZES = (256,)
+_SUPPORTED_HEAD_SIZES = (64, 128, 256, 512)
 
 # The board has 20 WGPs and the grid is (NSEG, num_q_heads), so a model with
 # few heads leaves most of it idle: 8 heads is 8 workgroups.  Splitting the KV

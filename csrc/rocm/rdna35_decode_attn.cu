@@ -84,6 +84,21 @@
 // KV budget, which is the head-starved regime -- measured 1.14x at
 // Hq=8/Hkv=4 and 6% worse at Hq=32/Hkv=16, both at S=128.  Default 1, the
 // decomposition every measurement before this change was taken with.
+#define WAVE 32
+#define NWAVE (BLOCK / WAVE)
+#define MPW (MAXM / MSPLIT)      // query tokens carried by one wave
+#define NSLICE (NWAVE / MSPLIT)  // KV slices a workgroup covers
+#define DPL (HEAD_DIM / WAVE)
+#define KV_ROW (2 * HEAD_DIM + KV_PAD)  // K and V packed, then pad
+#define PAGE_ELEMS (BS * NUM_KV_HEADS * KV_ROW + PAGE_PAD)
+#define GQA (NUM_Q_HEADS / NUM_KV_HEADS)
+
+// Defined after NWAVE on purpose.  An identifier the preprocessor has not
+// seen evaluates to 0 inside #if, silently, so when this sat above the WAVE
+// block LDS_FOR() read NWAVE as zero, every branch compared 0 <= 65536, and
+// the rule always picked MSPLIT=1.  It was masked because the loader passes
+// -DMSPLIT explicitly; D=512 is the first shape where the fallback matters.
+//
 // Each partial row costs HEAD_DIM floats of acc plus its m and l scalars; the
 // two scalar arrays are what took MAXM=8 at MSPLIT=1 to 66048 B, over the
 // 64 KiB ceiling, when only lds_acc was counted.
@@ -121,22 +136,19 @@
     #define MSPLIT 8
   #endif
 #endif
-
-#define WAVE 32
-#define NWAVE (BLOCK / WAVE)
-#define MPW (MAXM / MSPLIT)      // query tokens carried by one wave
-#define NSLICE (NWAVE / MSPLIT)  // KV slices a workgroup covers
-#define DPL (HEAD_DIM / WAVE)
-#define KV_ROW (2 * HEAD_DIM + KV_PAD)  // K and V packed, then pad
-#define PAGE_ELEMS (BS * NUM_KV_HEADS * KV_ROW + PAGE_PAD)
-#define GQA (NUM_Q_HEADS / NUM_KV_HEADS)
 // Partials the global reduction merges, when it runs at all.
 #define NPART (FUSED ? NSEG : NSEG * NWAVE)
 #define LOG2E 1.44269504088896340736f
 
-static_assert(DPL == 8, "8 fp16 per lane (b128)");
+// DPL fp16 per lane covers HEAD_DIM across the wave: 2, 4, 8 and 16 elements
+// for D = 64, 128, 256 and 512, which the compiler issues as b32, b64, b128
+// and a pair of b128.  Only 256 loads at the full b128 width the memory system
+// likes; the narrow ends are correct first and fast later.
+static_assert(DPL >= 2 && (DPL & (DPL - 1)) == 0,
+              "HEAD_DIM/32 must be a power of two of at least 2");
 #if FUSED
-static_assert(BLOCK == HEAD_DIM, "fused epilogue gives each thread one d");
+static_assert(HEAD_DIM % BLOCK == 0 || BLOCK % HEAD_DIM == 0,
+              "the fused epilogue strides the output by BLOCK");
 #endif
 static_assert(KV_PAD % 8 == 0, "KV_PAD must keep rows 16B aligned");
 static_assert(PAGE_PAD % 8 == 0, "PAGE_PAD must keep pages 16B aligned");
@@ -154,6 +166,10 @@ static_assert(FUSED,
 
 typedef _Float16 h2v __attribute__((ext_vector_type(2)));
 typedef float f4v __attribute__((ext_vector_type(4)));
+// One lane's slice of a K, V or Q row.  Sized in floats because that is how
+// fdot2 consumes it: each float carries the two fp16 of one dot step.
+#define FPL (DPL / 2)
+typedef float fvec __attribute__((ext_vector_type(FPL)));
 
 __device__ __forceinline__ h2v as_h2(float x) {
   return __builtin_bit_cast(h2v, x);
@@ -216,14 +232,14 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // makes the compiler build a full 64-bit address in VGPRs (v_lshlrev_b64
   // plus add_co pairs) for each of the MAXM loads instead of using the
   // SGPR-base + 32-bit-VGPR-offset form.
-  f4v qr[MPW];
+  fvec qr[MPW];
 #pragma unroll
   for (int t = 0; t < MPW; ++t) {
     const unsigned qoff =
         ((unsigned)(mbase + t * MSPLIT) * NUM_Q_HEADS + (unsigned)h) *
             HEAD_DIM +
         (unsigned)dl;
-    qr[t] = *(const f4v*)(q + qoff);
+    qr[t] = *(const fvec*)(q + qoff);
   }
 
   float acc[MPW][DPL], mx[MPW], ls[MPW];
@@ -267,7 +283,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // hides behind the dot products, the lane reduction and the softmax.
     // Measured: deferring V to just before P@V costs 5.5% at S=32768, where
     // keeping eight loads in flight is what sustains the bandwidth.
-    f4v kr[KPW], vr[KPW];
+    fvec kr[KPW], vr[KPW];
     // One block-table read per tile, forced into a scalar register.  The four
     // tokens share a block, and the value is wave-uniform, so the alternative
     // is four vector loads of the same 4 bytes broadcast to 32 lanes -- a third
@@ -286,8 +302,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   #pragma unroll
     for (int c = 0; c < KPW; ++c) {
       const size_t off = base + (size_t)c * KV_ROW;
-      kr[c] = *(const f4v*)(kv + off);
-      vr[c] = *(const f4v*)(kv + off + HEAD_DIM);
+      kr[c] = *(const fvec*)(kv + off);
+      vr[c] = *(const fvec*)(kv + off + HEAD_DIM);
     }
     // Tokens past S read whatever the page holds beyond the sequence.  The
     // address is in bounds by construction, not by luck: jb is a multiple of
@@ -306,7 +322,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     if (__builtin_expect(jb + KPW > S, 0)) {
   #pragma unroll
       for (int c = 0; c < KPW; ++c)
-        if (jb + c >= S) vr[c] = f4v{0.f, 0.f, 0.f, 0.f};
+        if (jb + c >= S) vr[c] = fvec{};
     }
 #else
   #pragma unroll
@@ -314,8 +330,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       int jj = jb + c;
       jj = (jj < S) ? jj : (S - 1);
       const size_t off = kv_off(blk, (unsigned)jj, kvh) + dl;
-      kr[c] = *(const f4v*)(kv + off);
-      vr[c] = *(const f4v*)(kv + off + HEAD_DIM);
+      kr[c] = *(const fvec*)(kv + off);
+      vr[c] = *(const fvec*)(kv + off + HEAD_DIM);
     }
 #endif
 
@@ -326,7 +342,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       for (int t = 0; t < MPW; ++t) {
         float d = 0.f;
 #pragma unroll
-        for (int e = 0; e < 4; ++e)
+        for (int e = 0; e < FPL; ++e)
           d = __builtin_amdgcn_fdot2(as_h2(qr[t][e]), as_h2(kr[c][e]), d,
                                      false);
         s[c][t] = d;
@@ -465,24 +481,37 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       den = fmaf(a[s], lds_l[w], den);
     }
 
-    float num = 0.f;
-  #pragma unroll
-    for (int s = 0; s < NSLICE; ++s)
-      num =
-          fmaf(a[s], lds_acc[((size_t)wb + s * MSPLIT) * HEAD_DIM + tid], num);
-  #if NSEG == 1
-    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
-        (OutT)fast_div(num, den);
-  #else
+  #if NSEG > 1
     // (num, gmax, den) is itself a valid partial softmax state, so hand the
     // global reduction one per (head, segment) rather than NWAVE of them.
     const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
-    p_acc[pb * HEAD_DIM + tid] = num;
     if (tid == 0) {
       p_m[pb] = gmax;
       p_l[pb] = den;
     }
   #endif
+    // BLOCK need not equal HEAD_DIM once D is free: D=512 has more output
+    // elements than threads and D=64 has fewer.  The equal case is spelled out
+    // because the compiler cannot prove tid < HEAD_DIM and otherwise wraps the
+    // body in an exec mask and a branch on a condition that is always true.
+  #if BLOCK == HEAD_DIM
+    const int d = tid;
+    {
+  #else
+    for (int d = tid; d < HEAD_DIM; d += BLOCK) {
+  #endif
+      float num = 0.f;
+  #pragma unroll
+      for (int s = 0; s < NSLICE; ++s)
+        num =
+            fmaf(a[s], lds_acc[((size_t)wb + s * MSPLIT) * HEAD_DIM + d], num);
+  #if NSEG == 1
+      out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d] =
+          (OutT)fast_div(num, den);
+  #else
+      p_acc[pb * HEAD_DIM + d] = num;
+  #endif
+    }
   }
 
   #if NSEG > 1 && FUSEDRED
@@ -507,17 +536,19 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     for (int s = 0; s < NSEG; ++s)
       gmax = fmaxf(gmax, p_m[rb + (size_t)s * MAXM]);
 
-    float num = 0.f, den = 0.f;
-    for (int s = 0; s < NSEG; ++s) {
-      const size_t b = rb + (size_t)s * MAXM;
-      // An empty segment carries p_m = -INFINITY, so exp2 of -inf is 0 and it
-      // drops out without a branch.
-      const float a = __builtin_amdgcn_exp2f(p_m[b] - gmax);
-      den = fmaf(a, p_l[b], den);
-      num = fmaf(a, p_acc[b * HEAD_DIM + tid], num);
+    for (int d = tid; d < HEAD_DIM; d += BLOCK) {
+      float num = 0.f, den = 0.f;
+      for (int s = 0; s < NSEG; ++s) {
+        const size_t b = rb + (size_t)s * MAXM;
+        // An empty segment carries p_m = -INFINITY, so exp2 of -inf is 0 and
+        // it drops out without a branch.
+        const float a = __builtin_amdgcn_exp2f(p_m[b] - gmax);
+        den = fmaf(a, p_l[b], den);
+        num = fmaf(a, p_acc[b * HEAD_DIM + d], num);
+      }
+      out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d] =
+          (OutT)fast_div(num, den);
     }
-    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
-        (OutT)fast_div(num, den);
   }
   #endif
 #else

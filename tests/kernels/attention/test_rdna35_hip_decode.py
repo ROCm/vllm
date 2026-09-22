@@ -149,7 +149,10 @@ def test_unsupported_head_size_falls_back_to_triton():
 
     impl = Rdna35HipAttentionImpl.__new__(Rdna35HipAttentionImpl)
     impl._rejected = None
-    impl.head_size, impl.num_heads, impl.num_kv_heads = 128, HQ, HKV
+    # 96 is a real shipped head size (Phi-3.5-vision) and is deliberately not
+    # built: 96/32 is 3 fp16 per lane, which is not a power of two and so has
+    # no single load width. It must fall back, not be served wrong.
+    impl.head_size, impl.num_heads, impl.num_kv_heads = 96, HQ, HKV
 
     fits = impl._prepare(
         kv_cache=torch.empty(0),
@@ -163,4 +166,4 @@ def test_unsupported_head_size_falls_back_to_triton():
         seqused_k=torch.zeros(1),
     )
     assert not fits
-    assert "head_size 128" in impl._rejected
+    assert "head_size 96" in impl._rejected
