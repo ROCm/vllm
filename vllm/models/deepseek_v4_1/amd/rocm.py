@@ -469,8 +469,7 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # ROCm sparse kernels take the page size from attention metadata 
-        # and the shared DeepseekV4IndexerBackend (only supports 256)
+        # shared DeepseekV4IndexerBackend only supports 256
         return [256]
 
     @staticmethod
@@ -516,8 +515,6 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         if not rocm_aiter_ops.is_enabled():
             return
         # aiter gemm_a8w8_blockscale_bpreshuffle is disabled on gfx1250
-        # leave block scales as None so _fused_wqa_wkv_gemm and _o_proj
-        # fall back to the standard (MXFP8) linear path
         from vllm.platforms.rocm import on_gfx1250
 
         if on_gfx1250():

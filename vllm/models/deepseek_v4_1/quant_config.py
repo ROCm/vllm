@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
 
 class DeepseekV4FP8Config(_DeepseekV4FP8ConfigBase):
-    # the V4.1 additions below are the deepseek_v41 model types
     """FP8 config for DeepSeek V4 with expert-dtype-aware MoE dispatch.
 
     DeepSeek V4 checkpoints always use FP8 block quantization for
