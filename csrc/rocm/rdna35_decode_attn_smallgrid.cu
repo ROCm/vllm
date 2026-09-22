@@ -93,7 +93,8 @@
 
 static_assert(DPL == 8, "8 fp16 per lane (b128)");
 #if FUSED
-static_assert(BLOCK == HEAD_DIM, "fused epilogue gives each thread one d");
+static_assert(HEAD_DIM % BLOCK == 0 || BLOCK % HEAD_DIM == 0,
+              "fused epilogue strides the output by BLOCK");
 #endif
 static_assert(KV_PAD % 8 == 0, "KV_PAD must keep rows 16B aligned");
 static_assert(PAGE_PAD % 8 == 0, "PAGE_PAD must keep pages 16B aligned");
@@ -332,18 +333,26 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       den = fmaf(a[w], lds_l[w], den);
     }
 
-    float num = 0.f;
-  #pragma unroll
-    for (int w = 0; w < NWAVE; ++w)
-      num = fmaf(a[w], lds_acc[w * HEAD_DIM + tid], num);
-  #if NSEG == 1
-    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
-        (OutT)fast_div(num, den);
-  #else
+  #if NSEG > 1
     // (num, gmax, den) is itself a valid partial softmax state, so hand the
     // global reduction one per (head, segment) rather than NWAVE of them.
     const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
-    p_acc[pb * HEAD_DIM + tid] = num;
+  #endif
+    // BLOCK need not equal HEAD_DIM: a thread finishes every HEAD_DIM/BLOCK-th
+    // output element, which lets the waves-per-workgroup split be tuned.
+    for (int d = tid; d < HEAD_DIM; d += BLOCK) {
+      float num = 0.f;
+  #pragma unroll
+      for (int w = 0; w < NWAVE; ++w)
+        num = fmaf(a[w], lds_acc[w * HEAD_DIM + d], num);
+  #if NSEG == 1
+      out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d] =
+          (OutT)fast_div(num, den);
+  #else
+      p_acc[pb * HEAD_DIM + d] = num;
+  #endif
+    }
+  #if NSEG > 1
     if (tid == 0) {
       p_m[pb] = gmax;
       p_l[pb] = den;

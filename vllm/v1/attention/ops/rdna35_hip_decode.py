@@ -49,6 +49,8 @@ class KernelVariant:
     mutate: int = 0
     # Compile from the experimental fork rather than the production kernel.
     experimental: bool = False
+    # Threads per workgroup; block // 32 waves cooperate on one head-segment.
+    block: int = _BLOCK
     # Merge the per-wave partials in LDS inside the main kernel rather than in
     # a second pass over global memory. Only valid with nseg == 1.
     fused: bool = True
@@ -59,7 +61,7 @@ class KernelVariant:
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
-            f"{'_x' if self.experimental else ''}"
+            f"_b{self.block}{'_x' if self.experimental else ''}"
             f"_f{int(self.fused)}"
         )
 
@@ -78,7 +80,8 @@ class KernelVariant:
         The fused epilogue collapses a workgroup's NWAVE partials in LDS, so
         only the NSEG cross-workgroup ones survive.
         """
-        return self.nseg if self.fused else self.nseg * _NWAVE
+        waves = self.block // _WAVE
+        return self.nseg if self.fused else self.nseg * waves
 
     def scratch_shapes(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Shapes of the (acc, m/l) partials the kernel writes."""
@@ -134,6 +137,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DKPW={variant.kpw}",
         f"-DMUTATE={variant.mutate}",
         f"-DFUSED={int(variant.fused)}",
+        f"-DBLOCK={variant.block}",
     ]
     logger.info("Compiling %s", variant.name)
     module = load_extension(
