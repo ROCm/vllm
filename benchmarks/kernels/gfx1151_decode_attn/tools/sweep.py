@@ -19,6 +19,7 @@ import statistics
 import sys
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 _HERE = Path(__file__).resolve()
 _ROOT = _HERE.parents[4]
@@ -42,6 +43,12 @@ def main() -> None:
     p.add_argument("--block", type=int, default=None, help="override threads/WG")
     p.add_argument("--kpw", type=int, default=None, help="override keys/wave/tile")
     p.add_argument("--msplit", type=int, default=None, help="waves sharing MAXM")
+    p.add_argument(
+        "--no-fusedred",
+        dest="fusedred",
+        action="store_false",
+        help="launch reduce_segments instead of finishing in-kernel",
+    )
     p.add_argument("--triton", action="store_true", help="also measure Triton")
     args = p.parse_args()
 
@@ -58,11 +65,30 @@ def main() -> None:
             ("block", args.block),
             ("kpw", args.kpw),
             ("msplit", args.msplit),
+            ("fusedred", None if args.fusedred else False),
         )
         if v is not None
     }
     if overrides:
         original = backend_mod.Rdna35HipAttentionImpl._prepare
+
+        # An override the backend would not have chosen leaves self._variant
+        # permanently disagreeing with what _prepare computes, so _prepare
+        # rebuilds on every forward.  load() is already cached; make_scratch is
+        # not, and it zeroes the arrival counters -- a device memset, i.e. a
+        # whole extra kernel launch per call.  Unmemoised that charged ~2 us to
+        # every overridden configuration, including ones where the override
+        # changed no generated code at all, which is how it was caught.
+        # Memoised on the module the backend resolves, so its own call is hit
+        # too, not just the one below.
+        scratch: dict[Any, Any] = {}
+
+        def cached_scratch(variant, device):
+            if variant not in scratch:
+                scratch[variant] = make_scratch(variant, device)
+            return scratch[variant]
+
+        backend_mod.make_scratch = cached_scratch
 
         def patched(self, kv_cache, **kw):
             built = original(self, kv_cache, **kw)
@@ -72,7 +98,7 @@ def main() -> None:
                 self._variant = replace(self._variant, **overrides)
                 built = (
                     load(self._variant),
-                    make_scratch(self._variant, kw["q"].device),
+                    cached_scratch(self._variant, kw["q"].device),
                 )
                 self._built = built
             return built

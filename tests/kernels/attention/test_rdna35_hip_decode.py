@@ -89,9 +89,11 @@ def _run(seq_len, layout=1, dtype=torch.float16, mutate=0):
     q, kv, block_table = _paged_inputs(seq_len, layout, dtype)
     variant = _variant(layout, mutate)
     module = rdna35.load(variant)
-    acc, m, ln = rdna35.make_scratch(variant, q.device)
+    acc, m, ln, arrivals = rdna35.make_scratch(variant, q.device)
     out = torch.empty_like(q)
-    module.decode_attn(q, kv, block_table, out, acc, m, ln, seq_len, HEAD_DIM**-0.5)
+    module.decode_attn(
+        q, kv, block_table, out, acc, m, ln, arrivals, seq_len, HEAD_DIM**-0.5
+    )
     torch.accelerator.synchronize()
     return out.float(), _reference(q, kv, seq_len)
 

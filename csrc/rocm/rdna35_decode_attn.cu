@@ -92,6 +92,24 @@
 
 // Default to the decomposition every measurement before this change was taken
 // with, raising it only when the partials would not otherwise fit.
+// Finish the cross-workgroup reduction inside this kernel instead of launching
+// reduce_segments for it.  Each workgroup publishes its partials, fences, and
+// bumps an arrival counter for its head; the one that sees NSEG-1 is the last
+// and does the merge, then resets the counter for the next launch.
+//
+// Nobody waits: the late arriver is already resident when it does the atomic,
+// so there is no spin and no way for an unscheduled workgroup to wedge a
+// replay.  The reset is what makes a CUDA-graph replay deterministic -- each
+// launch increments exactly NSEG times and the last one zeroes it, and kernels
+// on one stream are ordered, so launch N+1 cannot race launch N's reset.
+//
+// Worth more than the launch it saves: L2 is invalidated on kernel launch
+// (measured 87% -> 2% hit rate across dispatches), so the second kernel's
+// read-back of the partials cannot hit L2 by construction, while this one can.
+#ifndef FUSEDRED
+  #define FUSEDRED 0
+#endif
+
 #ifndef MSPLIT
   #if LDS_FOR(1) <= 65536
     #define MSPLIT 1
@@ -178,8 +196,8 @@ template <typename OutT>
 __global__ __launch_bounds__(BLOCK) void decode_attn(
     const _Float16* __restrict__ q, const _Float16* __restrict__ kv,
     const int* __restrict__ bt, float* __restrict__ p_acc,
-    float* __restrict__ p_m, float* __restrict__ p_l, OutT* __restrict__ out,
-    int S, float scale) {
+    float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
+    OutT* __restrict__ out, int S, float scale) {
   const int seg = blockIdx.x;
   const int tid = threadIdx.x;
   const int lane = tid & (WAVE - 1);
@@ -466,6 +484,42 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     }
   #endif
   }
+
+  #if NSEG > 1 && FUSEDRED
+  // Publish before announcing: the fence orders this workgroup's partial
+  // stores ahead of the atomic, so whoever reads them after seeing the count
+  // is guaranteed to see them.
+  __threadfence();
+  __shared__ int lds_last;
+  if (tid == 0) lds_last = (atomicAdd(&p_cnt[h], 1) == NSEG - 1);
+  __syncthreads();
+  if (!lds_last) return;
+
+  // Last arriver for this head. The counter goes back to zero here so the next
+  // launch starts clean without the host touching it.
+  if (tid == 0) p_cnt[h] = 0;
+  __threadfence();
+
+    #pragma unroll
+  for (int m = 0; m < MAXM; ++m) {
+    const size_t rb = (size_t)h * NSEG * MAXM + m;
+    float gmax = -INFINITY;
+    for (int s = 0; s < NSEG; ++s)
+      gmax = fmaxf(gmax, p_m[rb + (size_t)s * MAXM]);
+
+    float num = 0.f, den = 0.f;
+    for (int s = 0; s < NSEG; ++s) {
+      const size_t b = rb + (size_t)s * MAXM;
+      // An empty segment carries p_m = -INFINITY, so exp2 of -inf is 0 and it
+      // drops out without a branch.
+      const float a = __builtin_amdgcn_exp2f(p_m[b] - gmax);
+      den = fmaf(a, p_l[b], den);
+      num = fmaf(a, p_acc[b * HEAD_DIM + tid], num);
+    }
+    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
+        (OutT)fast_div(num, den);
+  }
+  #endif
 #else
   const size_t base = ((size_t)h * (NSEG * NWAVE) + seg * NWAVE + wave) * MAXM;
   #pragma unroll
@@ -538,7 +592,7 @@ __global__ __launch_bounds__(RED_THREADS) void reduce_segments(
 void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
                     torch::Tensor& block_table, torch::Tensor& out,
                     torch::Tensor& acc, torch::Tensor& m, torch::Tensor& l,
-                    int64_t seq_len, double scale) {
+                    torch::Tensor& cnt, int64_t seq_len, double scale) {
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
   TORCH_CHECK(block_table.scalar_type() == torch::kInt32,
@@ -566,11 +620,12 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
   float* accp = acc.data_ptr<float>();
   float* mp = m.data_ptr<float>();
   float* lp = l.data_ptr<float>();
+  int* cntp = cnt.data_ptr<int>();
 
   auto* outp = reinterpret_cast<_Float16*>(out.data_ptr());
   hipLaunchKernelGGL(decode_attn<_Float16>, grid, block, 0, stream, qp, kvp,
-                     btp, accp, mp, lp, outp, (int)seq_len, (float)scale);
-  #if NSEG > 1 || !FUSED
+                     btp, accp, mp, lp, cntp, outp, (int)seq_len, (float)scale);
+  #if (NSEG > 1 && !FUSEDRED) || !FUSED
   hipLaunchKernelGGL(reduce_segments<_Float16>, rgrid, dim3(RED_THREADS), 0,
                      stream, accp, mp, lp, outp);
   #endif

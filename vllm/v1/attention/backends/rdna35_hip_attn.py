@@ -81,7 +81,7 @@ def _msplit_for(num_kv_heads: int, max_m: int) -> int:
 
 # The JIT-compiled module plus the scratch buffers sized for it.  The module is
 # a pybind extension built at runtime, so it has no static type.
-_Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+_Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
 
 
 class Rdna35HipAttentionBackend(TritonAttentionBackend):
@@ -211,7 +211,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             return
         self.kernel_calls += 1
 
-        module, (acc, softmax_max, softmax_sum) = built
+        module, (acc, softmax_max, softmax_sum, arrivals) = built
         # Called directly rather than through a registered custom op: this path
         # is exercised under CUDA-graph capture, not torch.compile, so the op
         # wrapper would only add indirection inside the region being measured.
@@ -223,6 +223,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             acc,
             softmax_max,
             softmax_sum,
+            arrivals,
             # max_seqlen_k, not seqused_k[0]: reading the tensor would be a
             # device-to-host copy, which invalidates a CUDA-graph capture. With
             # the single sequence _prepare insists on, the two are equal.

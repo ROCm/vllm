@@ -50,6 +50,15 @@ def main() -> None:
     p.add_argument("--block", type=int, nargs="+", default=[None])
     p.add_argument("--kpw", type=int, nargs="+", default=[None])
     p.add_argument("--msplit", type=int, nargs="+", default=[None])
+    p.add_argument("--no-fusedred", dest="fusedred", action="store_false")
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="invoke N times and check every result; catches state a kernel "
+        "leaves behind between launches, such as an arrival counter that is "
+        "not reset",
+    )
     p.add_argument(
         "--mutate",
         type=int,
@@ -95,7 +104,7 @@ def main() -> None:
         )
         bt = torch.arange(blocks, device=dev, dtype=torch.int32)
 
-        kwargs = {"mutate": args.mutate}
+        kwargs = {"mutate": args.mutate, "fusedred": args.fusedred}
         if nseg is not None:
             kwargs["nseg"] = nseg
         if block is not None:
@@ -108,15 +117,21 @@ def main() -> None:
             args.head_dim, args.hq, args.hkv, args.m, args.block_size, layout, **kwargs
         )
         module = load(variant)
-        acc, smax, ssum = make_scratch(variant, dev)
+        acc, smax, ssum, arrivals = make_scratch(variant, dev)
         out = torch.empty_like(q)
-        module.decode_attn(q, kv, bt, out, acc, smax, ssum, s, args.head_dim**-0.5)
-        torch.accelerator.synchronize()
-
         ref = reference(q, kv, s, args.hq, args.hkv, args.head_dim, args.m)
-        got = out.float()
-        max_rel = ((got - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
-        ok = max_rel <= RTOL and torch.isfinite(got).all()
+        max_rel = 0.0
+        ok = True
+        for _ in range(args.repeat):
+            out.zero_()
+            module.decode_attn(
+                q, kv, bt, out, acc, smax, ssum, arrivals, s, args.head_dim**-0.5
+            )
+            torch.accelerator.synchronize()
+            got = out.float()
+            rel = ((got - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
+            max_rel = max(max_rel, rel)
+            ok = ok and rel <= RTOL and torch.isfinite(got).all()
         if args.mutate:
             ok = not ok  # the negative control must be detected
         failures += not ok

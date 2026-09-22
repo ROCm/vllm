@@ -20,7 +20,7 @@ TU=$(mktemp /tmp/inst_XXXX.cu)
 cat > "$TU" <<EOF
 #include "$SRC"
 template __global__ void decode_attn<_Float16>(const _Float16*, const _Float16*,
-    const int*, float*, float*, float*, _Float16*, int, float);
+    const int*, float*, float*, float*, int*, _Float16*, int, float);
 template __global__ void reduce_segments<_Float16>(const float*, const float*,
     const float*, _Float16*);
 EOF

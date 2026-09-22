@@ -50,6 +50,10 @@ class KernelVariant:
     # max_m tokens over its own KV slice; max_m gives every wave one token and
     # a slice shared with its neighbours.
     msplit: int = 1
+    # Finish the cross-workgroup reduction inside decode_attn instead of
+    # launching reduce_segments for it.  On by default: worth ~1.2 us flat, and
+    # a no-op at nseg == 1 where no second kernel runs anyway.
+    fusedred: bool = True
 
     def __post_init__(self) -> None:
         # Raise msplit until the partials fit LDS.  Each of the
@@ -79,7 +83,7 @@ class KernelVariant:
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
-            f"_b{self.block}_ms{self.msplit}"
+            f"_b{self.block}_ms{self.msplit}{'' if self.fusedred else '_nofr'}"
             f"_f{int(self.fused)}"
         )
 
@@ -153,6 +157,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DFUSED={int(variant.fused)}",
         f"-DBLOCK={variant.block}",
         f"-DMSPLIT={variant.msplit}",
+        f"-DFUSEDRED={int(variant.fusedred)}",
     ]
     logger.info("Compiling %s", variant.name)
     module = load_extension(
@@ -167,7 +172,7 @@ def load(variant: KernelVariant) -> Any:
 
 def make_scratch(
     variant: KernelVariant, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Allocate the partials once.
 
     They are passed into the op rather than allocated inside it because the op
@@ -179,6 +184,11 @@ def make_scratch(
         torch.empty(acc_shape, **opts),
         torch.empty(ml_shape, **opts),
         torch.empty(ml_shape, **opts),
+        # Arrival counters, one per q head.  Zeroed once: the kernel resets
+        # them as it consumes them, so every later launch starts clean without
+        # the host writing here -- which it could not do under graph capture
+        # anyway.
+        torch.zeros(variant.num_q_heads, dtype=torch.int32, device=device),
     )
 
 
