@@ -81,6 +81,24 @@ The first start is slow - it downloads weights and compiles kernels - so allow a
 
 From here, usage is standard vLLM; see the [upstream quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html).
 
+### Docker
+
+For nightly packages, we recommend using the published wheels. However, a prebuilt image is also published to GHCR:
+
+```bash
+docker run --rm -it \
+    --device=/dev/kfd --device=/dev/dri \
+    --group-add video --group-add render \
+    --security-opt seccomp=unconfined \
+    --shm-size 16g \
+    -p 8000:8000 \
+    -v ~/.cache/huggingface:/hf \
+    ghcr.io/rocm/vllm/gfx11:latest \
+    vllm serve Qwen/Qwen3-0.6B
+```
+
+Mounting host caches into the container preserves downloaded artifacts across runs. The example above mounts only the Hugging Face cache; mount additional caches as your workflow requires.
+
 ### Other installation options
 
 - Stable vLLM on Strix Halo: [AMD documentation](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/inference/vllm.html?fam=ryzen&gpu=max-plus-pro-495&rocm-ver=10.0.0&vllm-ver=0.27&i=pip&w=compute&gfx=gfx1151).
