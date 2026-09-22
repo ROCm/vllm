@@ -24,7 +24,7 @@ RTOL = 1e-3
 
 
 def reference(q, kv, s, hq, hkv, head_dim, m):
-    flat = kv.transpose(1, 2).reshape(s, hkv, 2 * head_dim)
+    flat = kv.transpose(1, 2).flatten(0, 1)[:s]
     k, v = flat[..., :head_dim], flat[..., head_dim:]
     gqa = hq // hkv
     qf = q.float().permute(1, 0, 2)
@@ -48,6 +48,7 @@ def main() -> None:
     p.add_argument("--layouts", type=int, nargs="+", default=[0, 1])
     p.add_argument("--nseg", type=int, nargs="+", default=[None])
     p.add_argument("--block", type=int, nargs="+", default=[None])
+    p.add_argument("--kpw", type=int, nargs="+", default=[None])
     p.add_argument("--experimental", action="store_true")
     p.add_argument(
         "--mutate",
@@ -65,11 +66,15 @@ def main() -> None:
 
     dev = torch.device("cuda")
     failures = 0
-    for s, layout, nseg, block in itertools.product(
-        args.contexts, args.layouts, args.nseg, args.block
+    for s, layout, nseg, block, kpw in itertools.product(
+        args.contexts, args.layouts, args.nseg, args.block, args.kpw
     ):
         torch.manual_seed(0)
-        blocks = s // args.block_size
+        # Round up, so S need not be a multiple of the page: a tile that runs
+        # off the end of the sequence is exactly the case where a kernel may
+        # read uninitialised slots, and an exact-division harness never builds
+        # one.  The trailing slots are filled with NaN below for that reason.
+        blocks = -(-s // args.block_size)
         shape = (
             (blocks, args.block_size, args.hkv, 2 * args.head_dim)
             if layout == 0
@@ -78,6 +83,12 @@ def main() -> None:
         kv = torch.randn(shape, device=dev, dtype=torch.float16) * 0.5
         if layout == 0:
             kv = kv.transpose(1, 2)
+        # Slots past the sequence carry NaN, not plausible data.  A kernel that
+        # addresses them is fine; one that lets them reach the accumulator is
+        # not, and 0 * NaN = NaN makes that failure total rather than subtle.
+        tail = blocks * args.block_size - s
+        if tail:
+            kv[-1, :, args.block_size - tail :, :] = float("nan")
         q = (
             torch.randn(args.m, args.hq, args.head_dim, device=dev, dtype=torch.float16)
             * 0.5
@@ -89,6 +100,8 @@ def main() -> None:
             kwargs["nseg"] = nseg
         if block is not None:
             kwargs["block"] = block
+        if kpw is not None:
+            kwargs["kpw"] = kpw
         variant = KernelVariant(
             args.head_dim, args.hq, args.hkv, args.m, args.block_size, layout, **kwargs
         )
@@ -105,7 +118,7 @@ def main() -> None:
         if args.mutate:
             ok = not ok  # the negative control must be detected
         failures += not ok
-        label = f"S={s} layout={layout} nseg={nseg} block={block}"
+        label = f"S={s} layout={layout} nseg={nseg} block={block} kpw={kpw}"
         print(f"{label:<44} max_rel={max_rel:.3e}  {'PASS' if ok else 'FAIL'}")
 
     sys.exit(1 if failures else 0)

@@ -40,6 +40,7 @@ def main() -> None:
     )
     p.add_argument("--nseg", type=int, default=None, help="override NSEG")
     p.add_argument("--block", type=int, default=None, help="override threads/WG")
+    p.add_argument("--kpw", type=int, default=None, help="override keys/wave/tile")
     p.add_argument(
         "--experimental",
         action="store_true",
@@ -59,6 +60,7 @@ def main() -> None:
         for k, v in (
             ("nseg", args.nseg),
             ("block", args.block),
+            ("kpw", args.kpw),
             ("experimental", args.experimental or None),
         )
         if v is not None
@@ -95,20 +97,28 @@ def main() -> None:
         roof = s * kv_per_token / (PEAK_GIBS * 1024**3) * 1e6
         cells = []
         for backend in backends:
-            times = []
-            for _ in range(args.reps):
-                cfg = BenchmarkConfig(
-                    backend=backend,
-                    batch_spec=f"q{args.m}s{s}",
-                    num_layers=10,
-                    min_working_set_mb=96,
-                    head_dim=args.head_dim,
-                    num_q_heads=args.hq,
-                    num_kv_heads=args.hkv,
-                    block_size=args.block_size,
-                    device="cuda:0",
-                )
-                times.append(run_attention_benchmark(cfg).median_time * 1e6)
+            cfg = BenchmarkConfig(
+                backend=backend,
+                batch_spec=f"q{args.m}s{s}",
+                num_layers=10,
+                min_working_set_mb=96,
+                head_dim=args.head_dim,
+                num_q_heads=args.hq,
+                num_kv_heads=args.hkv,
+                block_size=args.block_size,
+                device="cuda:0",
+            )
+            # Discarded: the kernel is compiled on its first _prepare, which
+            # lands inside do_bench's own calibration.  That does not just add
+            # time to a sample -- do_bench sizes n_repeat from it, so a build
+            # measuring seconds collapses the run to a single timed iteration
+            # and the whole median is wrong.  Seen as a 66.90 us "median" next
+            # to a true 7.58.  Only the first context of a config is at risk,
+            # which is the short one the tuning cares about most.
+            run_attention_benchmark(cfg)
+            times = [
+                run_attention_benchmark(cfg).median_time * 1e6 for _ in range(args.reps)
+            ]
             t = statistics.median(times)
             cells.append(
                 f"{t:>9.2f} [{min(times):.2f}-{max(times):.2f}] {roof / t * 100:>4.1f}%"
