@@ -28,7 +28,7 @@ derivado por cálculo, `[?]` sin verificar.
 **Lo que funciona, por impacto medido:**
 
 | # | Decisión | Valor | Impacto | § |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 | **Reparto por lane** | `acc[M][8]`: una fila K/V = un `b128` por lane | **2.67×** | 0.1 |
 | 2 | **NSEG (split-KV)** | **1** — no partir el eje KV | 1.10× | 0.1 |
 | 3 | **Profundidad de pipeline** | **4** loads en vuelo (no 6) | óptimo del barrido | 0.1 |
@@ -63,7 +63,7 @@ Seis agentes han medido las hipótesis de este documento en la board real.
 Matriz 2×2 medida `[F6]`, 3 réplicas A/B alternadas por celda, spread < 0.7 %:
 
 | | NHD | HND | ganancia HND |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Triton** | 198.65 µs · 68.4 % | 185.73 µs · 73.2 % | **1.070×** |
 | **HIP paged v5** | 161.40 µs · 84.2 % | **150.20 µs · 90.5 %** | **1.075×** |
 | **ganancia kernel** | **1.231×** | **1.237×** | |
@@ -100,7 +100,7 @@ Robustez: con asignador realista (`shuf=1 poolx=4`) la ganancia se mantiene
 28 celdas, `Hq=32, Hkv=16, D=256, M=4`. µs (% del roofline):
 
 | S | Triton NHD | Triton HND | HIP NHD | **HIP HND** |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 128 | 23.80 (35.7 %) | 22.98 (36.9 %) | **14.10 (60.2 %)** | 14.44 (58.8 %) |
 | 1024 | 111.02 (61.2 %) | 103.89 (65.4 %) | 85.21 (79.7 %) | **80.26 (84.6 %)** |
 | 2048 | 199.15 (68.2 %) | 185.71 (73.2 %) | 162.61 (83.6 %) | **153.16 (88.7 %)** |
@@ -146,7 +146,7 @@ lo excluía. Resuelto **manteniendo `DPL=8` fijo y partiendo la wave**:
 su token.
 
 | D | LPR | SUB | |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 256 | 32 | 1 | el reparto de v5, exacto |
 | 128 | 16 | 2 | |
 | 64 | 8 | 4 | validado |
@@ -155,7 +155,7 @@ Los streams nunca se encuentran —cada grupo es su propio segmento de salida—
 que la máscara causal no se complica y siguen siendo **0 barreras y 0 LDS**.
 
 | | Triton | HIP v6 | ganancia |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **D=128** (`Hq=32,Hkv=8,S=2048`) | 54.95 µs · 61.8 % | **40.70 µs · 83.5 %** | **1.35×** |
 | D=256 (no rompe) | — | 168.60 vs 167.35 µs de v5 | — |
 
@@ -169,7 +169,7 @@ ganancia viene toda del kernel**.
 ### Lo que de verdad movió la aguja
 
 | Optimización | Ganancia | Nota |
-|---|---|---|
+| --- | --- | --- |
 | **Rediseño del reparto por lane** | **2.67×** | `acc` de `[M]` a `[M][8]`: una fila de K/V = un `global_load_b128` por lane |
 | `NSEG=1` | 1.10× | **al revés de lo que predecía este documento** |
 | `KV_PAD=64` | 1.07× | depende del layout; no transferible |
@@ -181,7 +181,7 @@ segmento a global, que `reduce_segments` ya sabía fusionar. 129 VGPR, 0 spill.
 ### Hipótesis del documento: veredicto final
 
 | # | Hipótesis (§) | Veredicto |
-|---|---|---|
+| --- | --- | --- |
 | 1 | Stride del KV: 2.55× (§7.1) | **REFUTADA**: el layout actual ya es óptimo. El riesgo real es `stride_head % 2048 == 0` (hasta 3.76×), inalcanzable hoy |
 | 2 | NSEG=5 / split-KV alto (§3) | **REFUTADA en HIP**: `NSEG=1` gana. Curva monótona: 165.6 / 167.0 / 260.7 / 324.3 / **700.1** µs para 1/2/4/8/16 |
 | 3 | Profundidad 4–6 (§7.2) | **CONFIRMADA en 4**: KPW 2/4/6/8 → 176.0 / **167.2** / 201.5 / 174.6 µs. Cuesta **16 VGPR/nivel**, no 4 |
@@ -233,7 +233,7 @@ dos lanes por fila** y otro reparto. Válido para D=256.
 ### 1.1 Los ejes disponibles
 
 | Eje | Tamaño en decode | ¿Reparte trabajo? |
-|---|---|---|
+| --- | --- | --- |
 | secuencias | 1 | no — es el supuesto |
 | queries (M) | 1–5 | apenas — no llena ni un q-block |
 | cabezas KV | 8–16 | sí, pero es techo fijo del modelo |
@@ -263,7 +263,7 @@ Base factual del resto del documento.
 ### 2.1 Jerarquía de memoria `[M]`
 
 | Nivel | Capacidad | Latencia | BW pico |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | L0 / GL1 | ~16 KiB / 256 KiB `[?]` | 38–43 ns (~110–125 cyc) | 275 GiB/s single-CU |
 | **L2** | **2 MiB** | 100–111 ns | **1767 GiB/s** |
 | **MALL** | **32 MiB** | 162–179 ns | 925 GiB/s |
@@ -281,14 +281,14 @@ reducción en el mismo kernel.
 ### 2.2 Registros y ocupación `[M]`
 
 | Dato | Valor |
-|---|---|
+| --- | --- |
 | VGPR por SIMD | **1536** (resto de RDNA3.5: 1024) |
 | Bloque de asignación | 24 (wave32) / 12 (wave64) |
 | **Tope duro de waves/SIMD** | **16** |
 | Máx. VGPR por wave | 256 |
 | SGPR | nunca limita la ocupación en RDNA |
 
-```
+```text
 waves/SIMD = min(16, floor(1536 / (ceil(n/24)·24)))       [D]
 ```
 
@@ -308,7 +308,7 @@ DRAM. **No optimizar ocupación; optimizar bytes.**
 Picos **teóricos** por CU:
 
 | Ruta | FLOPs/cyc/CU |
-|---|---|
+| --- | --- |
 | `V_FMA_F32` | 128 |
 | `V_PK_FMA_F16` / `V_DOT2_F32_F16` | 256 |
 | **VOPD FP16 (`V_DUAL_DOT2ACC_F32_F16`)** | **512** |
@@ -317,7 +317,7 @@ Picos **teóricos** por CU:
 WMMA **no eleva el techo arquitectónico**. Pero el pico **alcanzado** sí difiere:
 
 | Ruta | TFLOPs | % de su pico |
-|---|---|---|
+| --- | --- | --- |
 | **rocWMMA, ≥2 bloques/CU** | **57.1** | **96 %** |
 | VOPD `V_DUAL_DOT2ACC_F32_F16` | 43.8 | 73.8 % |
 | `V_DOT2_F32_F16` single-issue | 28.7 | 96.7 % |
@@ -331,7 +331,7 @@ leen su acumulador como SRC2, lo que exige 6 lecturas VGPR/ciclo contra 4 bancos
 Ciclos:
 
 | Operación | Throughput |
-|---|---|
+| --- | --- |
 | WMMA por CU (2 waves) | **16 cyc** (512 FLOPs/cyc) |
 | WMMA por wave, bancos disjuntos | 32.0 cyc |
 | WMMA por wave, todo en banco 0 (lo que genera HIPCC) | 34.0 cyc |
@@ -361,7 +361,7 @@ Notas: **SWMMAC no existe en gfx1151** (es gfx12) `[M]`. **No hay
 distintos** (`bank = idx % 4`). Registros distintos **no basta**:
 
 | copias de `P` | bancos | pairing |
-|---|---|---|
+| --- | --- | --- |
 | `v20` / `v24` | 0 y 0 | **0 %** |
 | `v20` / `v21` | 0 y 1 | **100 %** |
 
@@ -381,7 +381,7 @@ rescalado del softmax emparejado con un dot2. De ahí el 1.4 % que midió F2.
 **La receta completa:**
 
 | Requisito | Por qué |
-|---|---|
+| --- | --- |
 | `__builtin_amdgcn_fdot2(a,b,acc,false)` | único camino desde HIP; inline asm no empareja |
 | **≥2 copias de `P` en bancos distintos** | la condición real |
 | `asm volatile("" : "+v"(x))` en las copias | sin esto CSE las refunde: 12 % vs 87 % |
@@ -400,7 +400,7 @@ difundido único.
 ### 2.5 LDS `[M]`
 
 | Dato | Valor |
-|---|---|
+| --- | --- |
 | Capacidad | **128 kB por WGP** (2 × 64 kB), máx 64 kB por work-group |
 | Granularidad | 1024 B |
 | Bancos visibles por wave | **32** → **128 B/ciclo por wave** |
@@ -409,7 +409,7 @@ difundido único.
 Throughput y latencia:
 
 | Op | cyc/op | B/cyc | Latencia |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `ds_load_b32` | 1.0 | **128** | 32 cyc |
 | `ds_load_b64` | 2.0 | **128** | 34 cyc |
 | `ds_load_b128` | 6.0 | 85 | 38 cyc |
@@ -432,7 +432,7 @@ de 16 B; limpio ⟺ `q` impar. Padding: `P ≡ 16 − S (mod 32)`.
 ### 2.6 Cola de memoria `[M]`
 
 | Contador | Capacidad |
-|---|---|
+| --- | --- |
 | `VMcnt` (global) | **63** pendientes |
 | `lgkmcnt` (LDS) | ~17 pendientes |
 | Loads VMEM en vuelo **por wave** | **~10** (tope del VMEM return buffer) |
@@ -469,14 +469,14 @@ parciales; una reducción los combina.
 
 ### 3.1 Ocupación de partida (sin split-KV)
 
-```
+```text
 grid = (q_blocks, H_kv)      q_blocks = M // BLOCK_Q + 1
 BLOCK_M = 16                 (fragmento de la unidad matricial)
 BLOCK_Q = BLOCK_M // R       R = Hq / Hkv
 ```
 
 | Caso | R | BLOCK_Q | filas útiles | WG | % de 40 CU | tiles KV |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | **Hq32/Hkv16, M=4, S=2048** | 2 | 8 | **8/16** | **16** | **20 %** | 128 |
 | Llama3-8B, M=1, S=4096 | 4 | 4 | 4/16 | 8 | 10 % | 256 |
 | Llama3-8B, M=4, S=4096 | 4 | 4 | 16/16 | 16 | 20 % | 256 |
@@ -493,7 +493,7 @@ Dos observaciones:
 Caso de estudio, KV = 32 MB:
 
 | NSEG | WG | WG/WGP | WG/CU | waves/SIMD | tiles/seg | overhead |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | 1 | 16 | 0.8 | 0.4 | 0.8 | 128 | 0 % |
 | 2 | 32 | 1.6 | 0.8 | 1.6 | 64 | 1 % |
 | 3 | 48 | 2.4 | 1.2 | 2.4 | 43 | 2 % |
@@ -514,10 +514,42 @@ Criterios, en orden:
 5. **Techo**: overhead de parciales lineal con NSEG; hasta ~3 % es ruido.
 6. **Suelo**: ≥ 8 tiles por segmento.
 
+> ### ⚠ REFUTADO POR MEDIDA (2026-09-21)
+>
+> Los seis criterios de arriba, y con ellos la elección de **NSEG = 5**, se
+> apoyan en cubrir los 40 CU. La medida dice lo contrario: el óptimo son
+> **32 workgroups** (el 80 % de 40), y subir a 40 o más empeora, en las tres
+> formas probadas.
+>
+> | Hq | NSEG | WG | % de 40 CU | S=1024 | S=8192 | S=32768 |
+> | --- | --- | --- | --- | --- | --- | --- |
+> | 32 | **1** | **32** | 80 % | **85.3 %** | **94.7 %** | **96.7 %** |
+> | 32 | 2 | 64 | 160 % | 68.6 % | 82.8 % | 78.8 % |
+> | 16 | **2** | **32** | 80 % | **69.1 %** | **87.1 %** | **92.1 %** |
+> | 16 | 3 | 48 | 120 % | 65.0 % | 80.3 % | 69.1 % |
+> | 8 | **4** | **32** | 80 % | **59.8 %** | **80.6 %** | **87.8 %** |
+> | 8 | 5 | **40** | **100 %** | 52.5 % | 77.3 % | 86.0 % |
+> | 8 | 6 | 48 | 120 % | 51.7 % | 76.0 % | 63.6 % |
+>
+> `Hq=8, NSEG=5` es el caso decisivo: son exactamente los 40 workgroups que
+> piden los criterios, con la alineación perfecta que la tabla de abajo
+> identifica, y pierde en los cuatro contextos contra 32.
+>
+> La premisa falla porque subir NSEG **no añade trabajo**: reparte el mismo en
+> más trozos. Cada workgroup recibe menos, los parciales se multiplican por
+> NSEG y se pierde la reutilización de KV dentro del workgroup. El barrido de
+> recuento de cabezas apunta a lo mismo desde el otro lado: el % de roofline
+> crece con el trabajo *total*, no con la divisibilidad del grid (49.7 % con
+> Hq=20 contra 63.6 % con Hq=60, y Hq=20 es reparto perfecto sobre 20 WGP).
+>
+> El backend usa por tanto `NSEG = 32 / Hq` redondeado a la baja, en
+> `_segments_for()`. Lo que sigue se conserva como registro del razonamiento
+> original.
+
 **NSEG = 5** satisface los seis. Confirmado por tres vías independientes:
 
 | Criterio | NSEG=5 |
-|---|---|
+| --- | --- |
 | Alineación de grid | 80 = 4×20 = 2×40 ✓ |
 | Waves en vuelo | 4.0/SIMD — en el óptimo 2–4 ✓ |
 | Wave quantization | `32 × 5 = 160 = 8 × 20` ✓ |
@@ -527,7 +559,7 @@ Alineación exacta a 20 y 40 solo ocurre en **NSEG ∈ {5, 10, 15}**.
 Utilización con efecto cola (`WG / (P × ceil(WG/P))`):
 
 | NSEG | WG | P=20 (WGP) | P=40 (CU) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 2 | 32 | 80 % | 80 % |
 | 3 | 48 | 80 % | 60 % |
 | 4 | 64 | 80 % | 80 % |
@@ -539,7 +571,7 @@ falta resolver cuál manda.
 
 ### 3.3 Coste de los parciales
 
-```
+```text
 bytes = NSEG × M × H_q × (D × 4 + 8)        # acc fp32 + (m, l)
 ```
 
@@ -550,7 +582,7 @@ en la reducción.
 
 Tiles totales = `S / TILE = 2048/16 = 128`. El reparto usa `ceil`:
 
-```
+```text
 tiles_per_segment = cdiv(S, NSEG × TILE) = cdiv(2048, 80) = 26
 NSEG=5 → [26, 26, 26, 26, 24]      suma = 128
 ```
@@ -561,7 +593,7 @@ Más relevante que el desbalance: con contextos cortos `ceil` reparte de más al
 principio y los últimos segmentos **quedan vacíos**:
 
 | S | NSEG | reparto | activos |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 2048 | 5 | `[26,26,26,26,24]` | 5/5 |
 | 512 | 16 | `[2 × 16]` | 16/16 |
 | **300** | **8** | `[3,3,3,3,3,3,1,0]` | **7/8** |
@@ -569,7 +601,7 @@ principio y los últimos segmentos **quedan vacíos**:
 
 Condición para que los NSEG segmentos tengan trabajo:
 
-```
+```text
 S > (NSEG - 1) × tiles_per_segment × TILE
 ```
 
@@ -581,7 +613,7 @@ estático**, fijado por propiedades del modelo y la board.
 El daño es asimétrico y el suelo es bajo:
 
 | S | NSEG=5 | NSEG=8 | NSEG=16 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 128 | 4/5 | 8/8 | **8/16** |
 | 256 | 4/5 | 8/8 | 16/16 |
 | 512+ | 5/5 | 8/8 | 16/16 |
@@ -599,13 +631,13 @@ hagan early-return.
 
 ### 4.1 Los índices de la contracción
 
-```
+```text
 O[m, h, e] = Σ_s  P[h, m, s] · V[s, h, e]
 P[h, m, s] = softmax_s( Σ_d Q[m,h,d] · K[s,h,d] / √d )
 ```
 
 | Índice | Tamaño | Tipo | Combinador | ¿Usado? |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `m` | M | libre | — | sí (BLOCK_Q) |
 | `r` | R = n_rep | libre | — | sí (filas del tile) |
 | `kv` | H_kv | libre | — | sí (dimensión del grid) |
@@ -650,13 +682,13 @@ localidad sale gratis. Lo que decide el orden es **cuánta KV está viva a la ve
 y eso lo fija el eje **lento**:
 
 | Eje lento | KV residente (NSEG=5, Hkv=16, S=2048) | Nivel |
-|---|---|---|
+| --- | --- | --- |
 | **H_kv** (1 kv head viva) | **0.40 MB** | **L2** |
 | NSEG (16 kv heads vivas) | 6 MB | solo MALL |
 
 Orden propuesto:
 
-```
+```text
 rápido → H_q     (los R WGs del grupo comparten kv head → reuso inmediato)
 medio  → NSEG    (segmentos de la misma kv head)
 lento  → H_kv    (una sola kv head viva → working set en L2)
@@ -668,7 +700,7 @@ como almacén.
 
 Dimensionado desde la caché, como **cota superior** del segmento:
 
-```
+```text
 S_cache = cache_bytes / (D × 2 × elem_size)
 ```
 
@@ -701,7 +733,7 @@ concurrentes (32 MB), no el de una (2 MB).
 pequeño y NSEG por sí solo no llena la board.
 
 | Eje | Factor | Coste |
-|---|---|---|
+| --- | --- | --- |
 | **KV (NSEG)** | libre (5–32) | parciales en HBM (~2–6 %) |
 | H_q | R (2–8) | rompe el tile si `R < ceil(16/M)×2`; relee KV |
 | M | 1–5 | lo fija el draft, no el kernel |
@@ -722,7 +754,7 @@ En `Q@Kᵀ` el único eje con padding es M: `N = TILE = 16` siempre lleno, `K = 
 se encadena (D=256 → 16 fragmentos).
 
 | M | R | M×R | fragmentos | filas | eficiencia |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 4 | 4 | 16 | 1 | 16/16 | **100 %** |
 | 2 | 8 | 16 | 1 | 16/16 | **100 %** |
 | 8 | 2 | 16 | 1 | 16/16 | **100 %** |
@@ -740,7 +772,7 @@ se encadena (D=256 → 16 fragmentos).
 Los dos productos tienen costes asimétricos:
 
 | Producto | Salida | Coste del padding |
-|---|---|---|
+| --- | --- | --- |
 | `Q @ Kᵀ` | `S[16, TILE]` = **1 KB** | solo FLOPs |
 | `P @ V` | `acc[16, D_v]` = **16 KB** | **FLOPs + VGPR, vivos todo el bucle** |
 
@@ -753,7 +785,7 @@ Medido con el pairing arreglado (D_v=256, BLOCK_M=8, wave32, normalizado a MACs
 útiles):
 
 | Ruta | cyc/iter | vs WMMA | VGPR |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | WMMA | 640.9 | 1.00× | 153 |
 | dot2/VOPD | 434.4 | 1.48× | 75 |
 | **dot2/VOPD, 2 copias de `P`** | **407.8** | **1.57×** | **83** |
@@ -775,7 +807,7 @@ Medido desde el otro lado: dot2 sostiene `NSTAGE=8` sin spill, WMMA se para en 4
 
 ### 5.4 Elegir M en spec decoding
 
-```
+```text
 M óptimo = múltiplo de BLOCK_Q = 16 / R
   R=2  →  M ∈ {8, 16}
   R=4  →  M ∈ {4, 8}
@@ -799,7 +831,7 @@ R no divide a 16 se pierden filas **permanentemente**, con independencia de M
 que varía es cómo se reparte:
 
 | Estrategia | acc vivo | VGPR/lane | ¿relee K? |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | WMMA, `D_v` entero, wave32 | 16 KB | **128** | no |
 | WMMA, `D_v` entero, wave64 | 16 KB | 64 | no |
 | WMMA + `D_v`/2, wave32 | 8 KB | 64 | no |
@@ -817,7 +849,7 @@ y temporales.
 ### 6.2 Desambiguación de «D»
 
 | | Qué es | Papel |
-|---|---|---|
+| --- | --- | --- |
 | **D_qk** | eje de **reducción** de `Q@Kᵀ` | la «K» del fragmento; se recorre y acumula |
 | **D_v** | eje **libre** de `P@V` | la «N» del 2º producto — **el ancho de `acc`** |
 | **wave size** | reparto de `acc` entre lanes | no cambia el tamaño de `acc` |
@@ -826,7 +858,7 @@ y temporales.
 
 **Los bytes en vuelo no dependen del tamaño de wave:**
 
-```
+```text
 bytes en vuelo = TILE × D × 2 × stages
 ```
 
@@ -837,7 +869,7 @@ mismos 16 KB. LDS y bytes en vuelo son idénticos.
 Lo que sí cambia:
 
 | D | wave32 VGPR/lane | wave64 VGPR/lane |
-|---|---|---|
+| --- | --- | --- |
 | 64 | 40 | **20** |
 | **256** | **136** | **68** |
 
@@ -866,7 +898,7 @@ silencio** para las lanes 32–63 y produce un número plausible pero falso.
 wave32, `dwordx4` = 16 B/lane = 512 B por instrucción:
 
 | D | B/fila | lanes/fila | filas por instr | instr por TILE=16 |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | **64** | 128 | 8 | 4 | **4** |
 | 128 | 256 | 16 | 2 | 8 |
 | 256 | 512 | 32 | 1 | 16 |
@@ -877,7 +909,7 @@ wave.
 Presupuesto de VGPR/lane (máx. 256, con WMMA):
 
 | D | TILE | acc | S[16,TILE] | total |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 64 | 16 | 32 | 8 | **40** |
 | 64 | 32 | 32 | 16 | 48 |
 | **256** | 16 | **128** | 8 | **136** |
@@ -916,7 +948,7 @@ head un bloque contiguo de **16 KiB**, dispersándolas.
 verificado en código). Cero bloques perdidos, cero pérdida de concurrencia.
 
 | Medida `[M, F5]` | Resultado |
-|---|---|
+| --- | --- |
 | Kernel Triton de producción | **1.090×** (282 → 259 µs) |
 | Batch 16 / 64 | **1.16× / 1.12×** — gana *más* en batch alto |
 | Prefill | 1.09× |
@@ -960,7 +992,7 @@ padeado a paso 4096: 348 → **587** → 349 µs).
 ### ⚠️ Padear mal es peor que no padear
 
 | pad | µs | vs base | `pad % 32` |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0 (base) | 1167 | 1.00× | — |
 | **+8** | **1712** | **1.47× PEOR** | 8 |
 | **+16** | **1709** | **1.46× PEOR** | 16 |
@@ -973,7 +1005,7 @@ Los tres malos son exactamente los **no múltiplos de 32 B**. Un guard que
 
 ### El guard
 
-```
+```text
 si  paso_de_fila % 2048 == 0  y  num_kv_heads >= 16:
         padear +32 B
 ```
@@ -1016,7 +1048,7 @@ HND ya lo exige NIXL y lo asume FlashInfer, así que no es un camino exótico.
 `[M]` `D` = `global_load_b128` en vuelo por wave. % del pico de 238.4 GiB/s:
 
 | waves (w/SIMD) | D1 | D2 | D4 | D8 | D12 |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | 16 (0.2) | 11 % | 22 % | 43 % | 77 % | **92 %** |
 | 32 (0.4) | 22 % | 41 % | 70 % | **91 %** | 95 % |
 | 80 (1.0) | 49 % | 78 % | **94 %** | 95 % | 95 % |
@@ -1042,7 +1074,7 @@ Little para DRAM: 545 ns × 232 GiB/s ≈ **17.4 KiB en vuelo** por CU `[D]`.
 `[M]` BW máximo según el patrón de cada `load_b128`:
 
 | Patrón | BW máx |
-|---|---|
+| --- | --- |
 | 2 filas × 256 B contiguos | **225 GiB/s** |
 | 4 filas × 128 B contiguos | 214 GiB/s |
 | 8 filas × 64 B contiguos | 198 GiB/s |
@@ -1076,7 +1108,7 @@ múltiplos de 256 B**.
 
 `[M]` Estable entre runs, sin leer `HW_ID1`:
 
-```
+```text
 k   = blockIdx.x
 SE  = (k & 1) ? 0 : 1
 SA  = (k / 2) / 5
@@ -1171,7 +1203,7 @@ guía por defecto para nuestra reducción (parciales fp32 + `(m,l)` en workspace
 Nuestro esquema con NSEG fijo es equivalente a **GlobalSplitU**, no a Stream-K:
 
 | | NSEG fijo | Stream-K |
-|---|---|---|
+| --- | --- | --- |
 | Reparto | NSEG segmentos iguales por (head, tile-Q) | chunks iguales sobre grid persistente |
 | Cola de la última ronda | posible (§3.2) | eliminada por construcción |
 | Segmentos vacíos con S corto | sí (§3.4) | no |
@@ -1229,7 +1261,7 @@ entre iteraciones**, dando números falsamente buenos. Rotar buffers.
 
 Dada `(Hq, Hkv, M, D, S)` y el hardware:
 
-**Reparto del trabajo**
+### Reparto del trabajo
 
 1. `R = Hq/Hkv` → `BLOCK_Q = 16/R` → `q_blocks = M//BLOCK_Q + 1`
 2. `WG_base = q_blocks × Hkv` → ¿cubre los 20 WGP / 40 CU? (§3.1)
@@ -1240,27 +1272,27 @@ Dada `(Hq, Hkv, M, D, S)` y el hardware:
    vacíos para el S mínimo esperado (§3.4, §3.5)
 6. Orden de ejes: `H_q` rápido → NSEG → `H_kv` lento (§4.2)
 
-**Unidad matricial**
+### Unidad matricial
 
-7. `M × R ≡ 0 (mod 16)` → WMMA en ambos productos. Si < 16 → WMMA en `Q@Kᵀ` y
+1. `M × R ≡ 0 (mod 16)` → WMMA en ambos productos. Si < 16 → WMMA en `Q@Kᵀ` y
    medir `P@V` (§5.3)
-8. Comprobar filas útiles: `BLOCK_Q × R` pierde resto si R no divide a 16 (§5.4)
+2. Comprobar filas útiles: `BLOCK_Q × R` pierde resto si R no divide a 16 (§5.4)
 
 **Registros** — el que más aprieta con D grande
 
-9. `acc[BLOCK_M, D_v]` fp32 = `BLOCK_M × D_v × 4` B → `/wave` = VGPR/lane
-10. Palancas componibles: wave size (÷2), partir `D_v` internamente (÷2), dot2 en
+1. `acc[BLOCK_M, D_v]` fp32 = `BLOCK_M × D_v × 4` B → `/wave` = VGPR/lane
+2. Palancas componibles: wave size (÷2), partir `D_v` internamente (÷2), dot2 en
     `P@V` (§6.1)
-11. **Objetivo ≤ 96 VGPR/lane** para no perder ocupación (§2.2)
+3. **Objetivo ≤ 96 VGPR/lane** para no perder ocupación (§2.2)
 
-**Memoria**
+### Memoria
 
-12. **Padear el stride de head/página fuera de potencia de 2** (§7.1)
-13. Profundidad de pipeline: 4–6 loads en vuelo por SIMD, máx ~10 por wave (§7.2)
-14. `TILE`: bytes/tile = `TILE × D × 2`; subir TILE si D es pequeño (§6.4)
-15. K/V non-temporal bypassing L1; Q a LDS (§8.2)
-16. Lecturas de LDS con `b64`, escrituras con `b128` (§7.4)
-17. Escalonar el offset de inicio de KV por WG en múltiplos de 256 B (§7.5)
+1. **Padear el stride de head/página fuera de potencia de 2** (§7.1)
+2. Profundidad de pipeline: 4–6 loads en vuelo por SIMD, máx ~10 por wave (§7.2)
+3. `TILE`: bytes/tile = `TILE × D × 2`; subir TILE si D es pequeño (§6.4)
+4. K/V non-temporal bypassing L1; Q a LDS (§8.2)
+5. Lecturas de LDS con `b64`, escrituras con `b128` (§7.4)
+6. Escalonar el offset de inicio de KV por WG en múltiplos de 256 B (§7.5)
 
 ---
 
@@ -1277,20 +1309,20 @@ resultados.
 
 ### Trabajo de integración (medido y especificado, no implementado)
 
-2. **Guard de paso de fila** (§7.1): la condición es una línea en
+1. **Guard de paso de fila** (§7.1): la condición es una línea en
    `triton_attn.py:383`, pero `kv_cache.split(hs, dim=-1)` (línea 687) asume que
    la última dim es exactamente `2*hs`. Hace falta el recorte de vista que ya usa
    la rama de cuantización per-token-head. **Ese es el trabajo real.**
-3. **Portar el reparto de v6 (D∈{64,128,256}) al kernel paginado.** v6 es denso;
+2. **Portar el reparto de v6 (D∈{64,128,256}) al kernel paginado.** v6 es denso;
    el paginado es el que iría a vLLM.
-4. **Aplicar la receta de VOPD por bancos** (§2.4) al kernel real. F8 no la
+3. **Aplicar la receta de VOPD por bancos** (§2.4) al kernel real. F8 no la
    probó: su kernel ya emite 74 `v_dual` sin tocarla.
 
 ### Abierto
 
-5. **El 9.5 % hasta el roofline** (150.20 → 135.87 µs). No son bytes:
+1. **El 9.5 % hasta el roofline** (150.20 → 135.87 µs). No son bytes:
    `FETCH_SIZE` está a 1.03× del ideal. Es ancho de banda efectivo y latencia.
-6. **Bancos de VGPR en WMMA**: 6 % teórico con receta verificada, pero solo
+2. **Bancos de VGPR en WMMA**: 6 % teórico con receta verificada, pero solo
    aplica si `P@V` acabara en WMMA — y el veredicto es dot2 (§5.3).
 
 ### Descartado tras medir
