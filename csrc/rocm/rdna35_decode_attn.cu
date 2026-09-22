@@ -107,8 +107,16 @@ __device__ __forceinline__ float fast_div(float num, float den) {
 
 // byte offset (in fp16 elements) of the K row for (token j, kv head kvh),
 // given the physical block already resolved for j.
-__device__ __forceinline__ size_t kv_off(int blk, int j, int kvh) {
-  const int slot = j % BS;
+// j is unsigned so that `% BS` is a mask rather than the five-instruction
+// signed sequence (ashr/lshr/add/and/sub) the compiler must emit when the sign
+// is unknown.  The token index is non-negative by construction -- it starts at
+// gw*KPW and only increases -- but nothing in the types says so.
+//
+// Cast at the call, do not make the loop induction variable itself unsigned:
+// that also removes the sequence but measured 13% WORSE at S=128 on the
+// experimental fork, by disturbing the scheduling of the load clause.
+__device__ __forceinline__ size_t kv_off(int blk, unsigned j, int kvh) {
+  const unsigned slot = j % BS;
 #if LAYOUT == 0  // NHD: (NB, BS, HKV, 2D)
   return (size_t)blk * PAGE_ELEMS +
          ((size_t)slot * NUM_KV_HEADS + kvh) * KV_ROW;
@@ -134,10 +142,18 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   const int h = blockIdx.y;
   const int kvh = h / GQA;
 
+  // 32-bit offsets on purpose: the whole Q tile is MAXM*NUM_Q_HEADS*HEAD_DIM
+  // elements, so the index cannot exceed 16 bits here, and size_t arithmetic
+  // makes the compiler build a full 64-bit address in VGPRs (v_lshlrev_b64
+  // plus add_co pairs) for each of the MAXM loads instead of using the
+  // SGPR-base + 32-bit-VGPR-offset form.
   f4v qr[MAXM];
 #pragma unroll
-  for (int m = 0; m < MAXM; ++m)
-    qr[m] = *(const f4v*)(q + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + dl);
+  for (int m = 0; m < MAXM; ++m) {
+    const unsigned qoff =
+        ((unsigned)m * NUM_Q_HEADS + (unsigned)h) * HEAD_DIM + (unsigned)dl;
+    qr[m] = *(const f4v*)(q + qoff);
+  }
 
   float acc[MAXM][DPL], mx[MAXM], ls[MAXM];
 #pragma unroll
@@ -185,15 +201,52 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // tokens share a block, and the value is wave-uniform, so the alternative
     // is four vector loads of the same 4 bytes broadcast to 32 lanes -- a third
     // of the loop's VMEM slots spent re-reading one integer.
-    const int blk = __builtin_amdgcn_readfirstlane(bt[jb / BS]);
-#pragma unroll
+    const int blk = __builtin_amdgcn_readfirstlane(bt[(unsigned)jb / BS]);
+#if LAYOUT == 1
+    // Under HND the tile's KPW tokens are consecutive slots of one block (that
+    // is what the BS % KPW assert buys), so they sit at a fixed KV_ROW stride
+    // and the whole tile addresses off a single base plus compile-time
+    // offsets.  The largest is (KPW-1)*KV_ROW + HEAD_DIM = 3584 B, inside the
+    // i13 INST_OFFSET, so one address feeds all eight loads instead of KPW
+    // independent ones -- and the scalar block-table load feeds one address
+    // chain rather than four.  NHD cannot do this: its token stride is
+    // NUM_KV_HEADS*KV_ROW, which overflows the immediate.
+    const size_t base = kv_off(blk, (unsigned)jb, kvh) + dl;
+  #pragma unroll
     for (int c = 0; c < KPW; ++c) {
-      int jj = jb + c;
-      jj = (jj < S) ? jj : (S - 1);
-      const size_t off = kv_off(blk, jj, kvh) + dl;
+      const size_t off = base + (size_t)c * KV_ROW;
       kr[c] = *(const f4v*)(kv + off);
       vr[c] = *(const f4v*)(kv + off + HEAD_DIM);
     }
+    // Tokens past S read whatever the page holds beyond the sequence.  The
+    // address is in bounds by construction, not by luck: jb is a multiple of
+    // KPW and BS % KPW == 0, so slot = jb % BS is too and slot + KPW-1 <= BS-1
+    // keeps the tile inside the block; the furthest element of the furthest
+    // lane is HEAD_DIM + 31*DPL + 7 = 511 < KV_ROW, so it stays inside the
+    // row, hence the page, which vLLM allocates whole.
+    //
+    // The data is another matter: 0 * NaN is NaN and would poison the
+    // accumulator even though the causal mask already zeroed this token's
+    // weight.  K needs no guard -- its garbage dies in the mask's select.
+    //
+    // Only the last tile of a sequence whose length is not a multiple of KPW
+    // can overrun, so the test is a wave-uniform scalar branch; testing per
+    // element instead costs KPW*4 v_cndmask on every tile.
+    if (__builtin_expect(jb + KPW > S, 0)) {
+  #pragma unroll
+      for (int c = 0; c < KPW; ++c)
+        if (jb + c >= S) vr[c] = f4v{0.f, 0.f, 0.f, 0.f};
+    }
+#else
+  #pragma unroll
+    for (int c = 0; c < KPW; ++c) {
+      int jj = jb + c;
+      jj = (jj < S) ? jj : (S - 1);
+      const size_t off = kv_off(blk, (unsigned)jj, kvh) + dl;
+      kr[c] = *(const f4v*)(kv + off);
+      vr[c] = *(const f4v*)(kv + off + HEAD_DIM);
+    }
+#endif
 
     float s[KPW][MAXM];
 #pragma unroll
@@ -212,12 +265,24 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 // whole context sweep.  The inner loop uses no LDS, so the LDS pipe is idle
 // and ds_bpermute runs there in parallel; DPP moves the work onto the busy
 // VALU pipe and costs a third of the dual-issue pairing as well.
+//
+// ds_bpermute is called directly rather than through __shfl_xor, which cannot
+// see that the partner index is in range and clamps it: a v_cmp_gt_u32 against
+// 32 and a v_cndmask per stride, guarding a condition that `lane ^ st` with
+// lane < 32 and st <= 16 can never violate, plus five VGPRs held live for the
+// whole kernel to carry the clamped indices.
 #pragma unroll
-    for (int st = 1; st < WAVE; st <<= 1)
+    for (int st = 1; st < WAVE; st <<= 1) {
+      const int addr = (lane ^ st) << 2;  // ds_bpermute indexes lanes by byte
 #pragma unroll
       for (int c = 0; c < KPW; ++c)
 #pragma unroll
-        for (int m = 0; m < MAXM; ++m) s[c][m] += __shfl_xor(s[c][m], st, WAVE);
+        for (int m = 0; m < MAXM; ++m)
+          s[c][m] = __builtin_bit_cast(
+                        float, __builtin_amdgcn_ds_bpermute(
+                                   addr, __builtin_bit_cast(int, s[c][m]))) +
+                    s[c][m];
+    }
 
     // (jj <= ctx + m) already implies (jj < S): ctx + m <= S - 1 for every m,
     // so the bound test this mask also carried was dead weight.
