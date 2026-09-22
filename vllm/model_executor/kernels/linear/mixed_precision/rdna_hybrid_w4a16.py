@@ -734,7 +734,7 @@ def _rdna_hybrid_w4a16_apply_impl(
     # a trace that reports only MxNxK cannot be turned into a bandwidth number.
     # Emitting g=<group_size> and sym/asym makes the label self-describing.
     # Use the same `key=value` spelling as every other quantized GEMM scope
-    # (the MoE ones, awq_gemv_*), so label consumers need one grammar.
+    # so label consumers need one grammar.
     _gz = f"g={group_size} {'asym' if w_zp is not None else 'sym'}"
 
     # Use the HIP skinny kernel for small batch sizes (fast decode path).

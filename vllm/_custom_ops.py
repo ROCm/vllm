@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from contextlib import nullcontext
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -15,7 +14,6 @@ from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -497,21 +495,14 @@ def awq_dequantize(
     split_k_iters: int,
     thx: int,
     thy: int,
-    output_k: int | None = None,  # Optional: output only first output_k rows
 ) -> torch.Tensor:
     if envs.VLLM_USE_TRITON_AWQ:
         from vllm.model_executor.layers.quantization.awq_triton import (
             awq_dequantize_triton,
         )
 
-        return awq_dequantize_triton(qweight, scales, zeros, output_k=output_k)
-    # Native kernel doesn't support output_k, so slice afterwards if needed
-    result = torch.ops._C.awq_dequantize(
-        qweight, scales, zeros, split_k_iters, thx, thy
-    )
-    if output_k is not None and result.shape[0] > output_k:
-        result = result[:output_k, :].contiguous()
-    return result
+        return awq_dequantize_triton(qweight, scales, zeros)
+    return torch.ops._C.awq_dequantize(qweight, scales, zeros, split_k_iters, thx, thy)
 
 
 if hasattr(torch.ops._C, "awq_dequantize"):
@@ -531,121 +522,18 @@ if hasattr(torch.ops._C, "awq_dequantize"):
         return torch.empty((in_c, out_c), dtype=scales.dtype, device=scales.device)
 
 
-def _awq_gemm(
+def awq_gemm(
     input: torch.Tensor,
     qweight: torch.Tensor,
     scales: torch.Tensor,
     qzeros: torch.Tensor,
     split_k_iters: int,
 ) -> torch.Tensor:
-    # num_tokens >= threshold
-    FP16_MATMUL_HEURISTIC_CONDITION = input.shape[0] >= 64
-
-    if FP16_MATMUL_HEURISTIC_CONDITION:
-        from vllm.platforms import current_platform
-
-        # Experimental: Use TN path on ROCm for hipBLASLt TN format
-        # Currently DISABLED by default as it's slower due to:
-        # 1. Transposed dequantize kernel is 2-3x slower than NN dequantize
-        # 2. torch.compile/inductor inserts contiguous() calls for transposed views
-        # The ~5% GEMM speedup from hipBLASLt TN does not compensate for these overheads.
-        if current_platform.is_rocm() and envs.VLLM_AWQ_USE_TN_GEMM:
-            from vllm.model_executor.layers.quantization.awq_triton import (
-                awq_dequantize_triton_transposed,
-            )
-
-            # Get actual K dimension (may be less than qweight K if padded)
-            M = input.shape[0]
-            K = input.shape[-1]
-            N = qweight.shape[1] * 8
-            # Pass output_k to avoid allocating/computing padded values
-            weight_t = awq_dequantize_triton_transposed(
-                qweight, scales, qzeros, output_k=K
-            )
-            # TN GEMM: input[M,K] @ weight_t[N,K].T → output[M,N]
-            ctx = (
-                nullcontext()
-                if torch.compiler.is_compiling()
-                else torch.profiler.record_function(f"BLAS {M}x{N}x{K}")
-            )
-            with ctx:
-                return torch.mm(input, weight_t.T)
-
-        # NN path (default for non-ROCm or when TN disabled)
-        # Pass output_k to avoid computing padded rows
-        M = input.shape[0]
-        K = input.shape[-1]
-        N = qweight.shape[1] * 8
-        out = awq_dequantize(qweight, scales, qzeros, 0, 0, 0, output_k=K)
-        ctx = (
-            nullcontext()
-            if torch.compiler.is_compiling()
-            else torch.profiler.record_function(f"BLAS {M}x{N}x{K}")
-        )
-        with ctx:
-            return torch.matmul(input, out)
-
     if envs.VLLM_USE_TRITON_AWQ:
         from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton
 
         return awq_gemm_triton(input, qweight, scales, qzeros, split_k_iters)
-
-    # Handle padded weights for native kernel: pad input to match
-    K = input.shape[-1]
-    weight_K = qweight.shape[0]
-    if weight_K > K:
-        input_padded = torch.zeros(
-            (*input.shape[:-1], weight_K), dtype=input.dtype, device=input.device
-        )
-        input_padded[..., :K] = input
-        input = input_padded
     return torch.ops._C.awq_gemm(input, qweight, scales, qzeros, split_k_iters)
-
-
-def awq_gemv_hip(
-    activation: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-    split_k: int = 0,
-) -> torch.Tensor:
-    """AWQ GEMV kernel optimized for ROCm/HIP (RDNA3/3.5).
-
-    Only supports:
-    - M=1 (single token)
-    - group_size=128
-    - N divisible by 8
-
-    Args:
-        activation: [K] or [1, K] half tensor
-        qweight: [K, N/8] int32 tensor (8 int4 values per uint32)
-        scales: [K/G, N] half tensor
-        qzeros: [K/G, N/8] int32 tensor
-        split_k: Split-k factor (1/2/4/8/16). 0 = auto-detect via heuristic.
-
-    Returns:
-        output: [N] half tensor
-    """
-    return torch.ops._C.awq_gemv_hip(activation, qweight, scales, qzeros, split_k)
-
-
-def _awq_gemm_fake_impl(
-    input: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    qzeros: torch.Tensor,
-    split_k_iters: int,
-) -> torch.Tensor:
-    M, N = input.shape[0], qweight.shape[1] * 8
-    return torch.empty((M, N), dtype=scales.dtype, device=input.device)
-
-
-direct_register_custom_op(
-    op_name="awq_gemm",
-    op_func=_awq_gemm,
-    fake_impl=_awq_gemm_fake_impl,
-)
-awq_gemm = torch.ops.vllm.awq_gemm
 
 
 if hasattr(torch.ops._C, "awq_gemm"):
