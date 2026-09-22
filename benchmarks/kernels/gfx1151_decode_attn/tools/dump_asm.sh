@@ -13,7 +13,7 @@ VENV=${VENV:-/scratch/rogarcia/vllm/.venv}
 HIPCC=${HIPCC:-$VENV/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc}
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CSRC="$(cd "$HERE/../../../../csrc/rocm" && pwd)"
-SRC=${SRC:-rdna35_decode_attn.cu}          # or rdna35_decode_attn_smallgrid.cu
+SRC=${SRC:-rdna35_decode_attn.cu}
 OUT=${1:-/tmp/kernel.s}; shift || true
 
 TU=$(mktemp /tmp/inst_XXXX.cu)

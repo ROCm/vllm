@@ -159,8 +159,8 @@ __device__ __forceinline__ float fast_div(float num, float den) {
 // gw*KPW and only increases -- but nothing in the types says so.
 //
 // Cast at the call, do not make the loop induction variable itself unsigned:
-// that also removes the sequence but measured 13% WORSE at S=128 on the
-// experimental fork, by disturbing the scheduling of the load clause.
+// that also removes the sequence but measured 13% WORSE at S=128 (7.59 -> 8.56
+// at Hq=8/Hkv=4), by disturbing the scheduling of the load clause.
 __device__ __forceinline__ size_t kv_off(int blk, unsigned j, int kvh) {
   const unsigned slot = j % BS;
 #if LAYOUT == 0  // NHD: (NB, BS, HKV, 2D)

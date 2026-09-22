@@ -50,7 +50,6 @@ def main() -> None:
     p.add_argument("--block", type=int, nargs="+", default=[None])
     p.add_argument("--kpw", type=int, nargs="+", default=[None])
     p.add_argument("--msplit", type=int, nargs="+", default=[None])
-    p.add_argument("--experimental", action="store_true")
     p.add_argument(
         "--mutate",
         type=int,
@@ -96,7 +95,7 @@ def main() -> None:
         )
         bt = torch.arange(blocks, device=dev, dtype=torch.int32)
 
-        kwargs = {"mutate": args.mutate, "experimental": args.experimental}
+        kwargs = {"mutate": args.mutate}
         if nseg is not None:
             kwargs["nseg"] = nseg
         if block is not None:

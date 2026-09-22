@@ -10,7 +10,7 @@ metadata and the timer are identical; only the kernel launch differs.
         PYTHONPATH=$PWD amd-gpu-lock <venv>/bin/python \\
         benchmarks/kernels/gfx1151_decode_attn/tools/sweep.py --hq 8 --hkv 4
 
-Pass --nseg/--block/--experimental to override what the backend would pick,
+Pass --nseg/--block/--msplit/--kpw to override what the backend would pick,
 which is how the tuning sweeps are run.
 """
 
@@ -42,11 +42,6 @@ def main() -> None:
     p.add_argument("--block", type=int, default=None, help="override threads/WG")
     p.add_argument("--kpw", type=int, default=None, help="override keys/wave/tile")
     p.add_argument("--msplit", type=int, default=None, help="waves sharing MAXM")
-    p.add_argument(
-        "--experimental",
-        action="store_true",
-        help="compile from rdna35_decode_attn_smallgrid.cu",
-    )
     p.add_argument("--triton", action="store_true", help="also measure Triton")
     args = p.parse_args()
 
@@ -63,7 +58,6 @@ def main() -> None:
             ("block", args.block),
             ("kpw", args.kpw),
             ("msplit", args.msplit),
-            ("experimental", args.experimental or None),
         )
         if v is not None
     }

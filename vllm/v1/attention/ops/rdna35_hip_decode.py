@@ -29,9 +29,6 @@ _NWAVE = _BLOCK // _WAVE
 # checkout whose name contains '$' would be mangled into a missing file.
 _CSRC = Path(__file__).resolve().parents[4] / "csrc" / "rocm"
 _SOURCE = _CSRC / "rdna35_decode_attn.cu"
-# Scratch copy for chasing shapes the production kernel serves badly. Kept as a
-# separate file so experiments cannot regress what is already measured.
-_SOURCE_EXPERIMENTAL = _CSRC / "rdna35_decode_attn_smallgrid.cu"
 
 
 @dataclass(frozen=True)
@@ -47,8 +44,6 @@ class KernelVariant:
     nseg: int = 1
     kpw: int = 4
     mutate: int = 0
-    # Compile from the experimental fork rather than the production kernel.
-    experimental: bool = False
     # Threads per workgroup; block // 32 waves cooperate on one head-segment.
     block: int = _BLOCK
     # How many waves share the query-token dimension. 1 gives every wave all
@@ -84,17 +79,13 @@ class KernelVariant:
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
-            f"_b{self.block}_ms{self.msplit}{'_x' if self.experimental else ''}"
+            f"_b{self.block}_ms{self.msplit}"
             f"_f{int(self.fused)}"
         )
 
     @property
     def name(self) -> str:
         return f"rdna35_decode_{self.suffix}"
-
-    @property
-    def source(self) -> Path:
-        return _SOURCE_EXPERIMENTAL if self.experimental else _SOURCE
 
     @property
     def partials_per_head(self) -> int:
@@ -131,7 +122,7 @@ def load(variant: KernelVariant) -> Any:
     if variant in _loaded:
         return _loaded[variant]
 
-    source = variant.source
+    source = _SOURCE
     if not source.is_file():
         raise RuntimeError(
             f"kernel source not found at {source}; this loader only works "
