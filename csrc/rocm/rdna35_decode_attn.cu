@@ -67,6 +67,29 @@
 #ifndef FUSED
   #define FUSED 1
 #endif
+// Query tokens staged in LDS per barrier pair.  One pair per token is 2*MAXM
+// whole-workgroup rendezvous; staging MSTAGE at once divides that by MSTAGE
+// for MSTAGE times the LDS.
+//
+// Measured (Hq=8/Hkv=4, S=128): 8 barriers 8.78 us, 4 barriers 8.64, 2
+// barriers 8.49 -- take as many as the LDS budget allows.  MSTAGE=4 costs
+// occupancy on paper (33 KiB leaves 3 workgroups per WGP = 24 waves against
+// the 48 the 120-VGPR allocation permits) and is still the fastest, at every
+// context including 32768.  Occupancy is not what limits this kernel; barrier
+// depth is worth more than resident waves.
+//
+// Capped at 32 KiB so the 64 KiB per-workgroup ceiling cannot be reached, and
+// falls back for odd MAXM, which cannot be staged in pairs.
+#define LDS_STAGE_BYTES (NWAVE * HEAD_DIM * 4)
+#ifndef MSTAGE
+  #if (MAXM % 4 == 0) && (4 * LDS_STAGE_BYTES <= 32768)
+    #define MSTAGE 4
+  #elif (MAXM % 2 == 0) && (2 * LDS_STAGE_BYTES <= 32768)
+    #define MSTAGE 2
+  #else
+    #define MSTAGE 1
+  #endif
+#endif
 
 #define WAVE 32
 #define NWAVE (BLOCK / WAVE)
@@ -87,6 +110,9 @@ static_assert(PAGE_PAD % 8 == 0, "PAGE_PAD must keep pages 16B aligned");
 // Lets the block table be read once per tile instead of once per token: jb is
 // always a multiple of KPW, so jb..jb+KPW-1 cannot straddle two blocks.
 static_assert(BS % KPW == 0, "a KPW tile must not straddle two blocks");
+static_assert(MAXM % MSTAGE == 0, "MSTAGE must divide MAXM");
+static_assert(MSTAGE * LDS_STAGE_BYTES <= 65536,
+              "staged partials must fit the 64 KiB per-workgroup LDS");
 
 typedef _Float16 h2v __attribute__((ext_vector_type(2)));
 typedef float f4v __attribute__((ext_vector_type(4)));
@@ -346,61 +372,73 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // second kernel costs a 2 MiB round trip and a launch, which at S=128 is as
   // many bytes as the KV stream itself.
   //
-  // Staged one m at a time to keep LDS at NWAVE*HEAD_DIM floats (8 KiB) rather
-  // than MAXM times that.
-  __shared__ float lds_acc[NWAVE * HEAD_DIM];
-  __shared__ float lds_m[NWAVE];
-  __shared__ float lds_l[NWAVE];
+  // Staged MSTAGE tokens at a time: the buffer is reused across stages, so each
+  // stage costs a barrier pair, and MSTAGE > 1 amortises those rendezvous over
+  // more tokens for proportionally more LDS.
+  __shared__ float lds_acc[MSTAGE * NWAVE * HEAD_DIM];
+  __shared__ float lds_m[MSTAGE * NWAVE];
+  __shared__ float lds_l[MSTAGE * NWAVE];
 
-  for (int m = 0; m < MAXM; ++m) {
-    __syncthreads();  // the previous m's readers are done with lds_acc
+  for (int m0 = 0; m0 < MAXM; m0 += MSTAGE) {
+    __syncthreads();  // the previous stage's readers are done with lds_acc
   #pragma unroll
-    for (int i = 0; i < DPL; ++i) lds_acc[wave * HEAD_DIM + dl + i] = acc[m][i];
-    if (lane == 0) {
-      lds_m[wave] = mx[m];
-      lds_l[wave] = ls[m];
+    for (int k = 0; k < MSTAGE; ++k) {
+  #pragma unroll
+      for (int i = 0; i < DPL; ++i)
+        lds_acc[((size_t)k * NWAVE + wave) * HEAD_DIM + dl + i] =
+            acc[m0 + k][i];
+      if (lane == 0) {
+        lds_m[k * NWAVE + wave] = mx[m0 + k];
+        lds_l[k * NWAVE + wave] = ls[m0 + k];
+      }
     }
     __syncthreads();
 
-    float gmax = -INFINITY;
   #pragma unroll
-    for (int w = 0; w < NWAVE; ++w) gmax = fmaxf(gmax, lds_m[w]);
+    for (int k = 0; k < MSTAGE; ++k) {
+      const int m = m0 + k;
+      const int wb = k * NWAVE;
 
-    // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight is
-    // exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
-    // workgroup can be empty though, and then gmax is -inf as well:
-    // (-inf) - (-inf) is NaN, which would poison the partial.
-  #if NSEG > 1
-    const bool empty = (gmax == -INFINITY);
-  #endif
-    float a[NWAVE], den = 0.f;
+      float gmax = -INFINITY;
   #pragma unroll
-    for (int w = 0; w < NWAVE; ++w) {
+      for (int w = 0; w < NWAVE; ++w) gmax = fmaxf(gmax, lds_m[wb + w]);
+
+      // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight
+      // is exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
+      // workgroup can be empty though, and then gmax is -inf as well:
+      // (-inf) - (-inf) is NaN, which would poison the partial.
   #if NSEG > 1
-      a[w] = empty ? 0.f : __builtin_amdgcn_exp2f(lds_m[w] - gmax);
+      const bool empty = (gmax == -INFINITY);
+  #endif
+      float a[NWAVE], den = 0.f;
+  #pragma unroll
+      for (int w = 0; w < NWAVE; ++w) {
+  #if NSEG > 1
+        a[w] = empty ? 0.f : __builtin_amdgcn_exp2f(lds_m[wb + w] - gmax);
   #else
-      a[w] = __builtin_amdgcn_exp2f(lds_m[w] - gmax);
+        a[w] = __builtin_amdgcn_exp2f(lds_m[wb + w] - gmax);
   #endif
-      den = fmaf(a[w], lds_l[w], den);
-    }
+        den = fmaf(a[w], lds_l[wb + w], den);
+      }
 
-    float num = 0.f;
+      float num = 0.f;
   #pragma unroll
-    for (int w = 0; w < NWAVE; ++w)
-      num = fmaf(a[w], lds_acc[w * HEAD_DIM + tid], num);
+      for (int w = 0; w < NWAVE; ++w)
+        num = fmaf(a[w], lds_acc[((size_t)wb + w) * HEAD_DIM + tid], num);
   #if NSEG == 1
-    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
-        (OutT)fast_div(num, den);
+      out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
+          (OutT)fast_div(num, den);
   #else
-    // (num, gmax, den) is itself a valid partial softmax state, so hand the
-    // global reduction one per (head, segment) rather than NWAVE of them.
-    const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
-    p_acc[pb * HEAD_DIM + tid] = num;
-    if (tid == 0) {
-      p_m[pb] = gmax;
-      p_l[pb] = den;
-    }
+      // (num, gmax, den) is itself a valid partial softmax state, so hand the
+      // global reduction one per (head, segment) rather than NWAVE of them.
+      const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
+      p_acc[pb * HEAD_DIM + tid] = num;
+      if (tid == 0) {
+        p_m[pb] = gmax;
+        p_l[pb] = den;
+      }
   #endif
+    }
   }
 #else
   const size_t base = ((size_t)h * (NSEG * NWAVE) + seg * NWAVE + wave) * MAXM;
