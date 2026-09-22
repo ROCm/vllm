@@ -67,32 +67,47 @@
 #ifndef FUSED
   #define FUSED 1
 #endif
-// Query tokens staged in LDS per barrier pair.  One pair per token is 2*MAXM
-// whole-workgroup rendezvous; staging MSTAGE at once divides that by MSTAGE
-// for MSTAGE times the LDS.
+// How many waves share the query-token dimension.  This is the one knob that
+// separates the two decompositions that used to be two kernels:
 //
-// Measured (Hq=8/Hkv=4, S=128): 8 barriers 8.78 us, 4 barriers 8.64, 2
-// barriers 8.49 -- take as many as the LDS budget allows.  MSTAGE=4 costs
-// occupancy on paper (33 KiB leaves 3 workgroups per WGP = 24 waves against
-// the 48 the 120-VGPR allocation permits) and is still the fastest, at every
-// context including 32768.  Occupancy is not what limits this kernel; barrier
-// depth is worth more than resident waves.
+//   MSPLIT == 1      every wave carries all MAXM tokens over its own KV slice
+//   MSPLIT == MAXM   every wave carries one token and shares its slice
 //
-// Capped at 32 KiB so the 64 KiB per-workgroup ceiling cannot be reached, and
-// falls back for odd MAXM, which cannot be staged in pairs.
-#define LDS_STAGE_BYTES (NWAVE * HEAD_DIM * 4)
-#ifndef MSTAGE
-  #if (MAXM % 4 == 0) && (4 * LDS_STAGE_BYTES <= 32768)
-    #define MSTAGE 4
-  #elif (MAXM % 2 == 0) && (2 * LDS_STAGE_BYTES <= 32768)
-    #define MSTAGE 2
+// and any divisor in between.  MPW tokens per wave, NSLICE KV slices per
+// workgroup, and the product MPW*NWAVE == MAXM*NSLICE is the partial count
+// either way -- which is why the LDS footprint is 32 KiB at MSPLIT=1 and
+// 8 KiB at MSPLIT=MAXM for MAXM=4.
+//
+// Raising it trades KV parallelism for serial depth: the workgroup covers
+// NSLICE slices instead of NWAVE, and each wave's epilogue merges NSLICE
+// partials instead of NWAVE.  It pays when the fixed cost is large next to the
+// KV budget, which is the head-starved regime -- measured 1.14x at
+// Hq=8/Hkv=4 and 6% worse at Hq=32/Hkv=16, both at S=128.  Default 1, the
+// decomposition every measurement before this change was taken with.
+// Each partial row costs HEAD_DIM floats of acc plus its m and l scalars; the
+// two scalar arrays are what took MAXM=8 at MSPLIT=1 to 66048 B, over the
+// 64 KiB ceiling, when only lds_acc was counted.
+#define LDS_ROW_BYTES (HEAD_DIM * 4 + 8)
+#define LDS_FOR(MS) ((MAXM / (MS)) * NWAVE * LDS_ROW_BYTES)
+
+// Default to the decomposition every measurement before this change was taken
+// with, raising it only when the partials would not otherwise fit.
+#ifndef MSPLIT
+  #if LDS_FOR(1) <= 65536
+    #define MSPLIT 1
+  #elif (MAXM % 2 == 0) && (NWAVE % 2 == 0) && (LDS_FOR(2) <= 65536)
+    #define MSPLIT 2
+  #elif (MAXM % 4 == 0) && (NWAVE % 4 == 0) && (LDS_FOR(4) <= 65536)
+    #define MSPLIT 4
   #else
-    #define MSTAGE 1
+    #define MSPLIT 8
   #endif
 #endif
 
 #define WAVE 32
 #define NWAVE (BLOCK / WAVE)
+#define MPW (MAXM / MSPLIT)      // query tokens carried by one wave
+#define NSLICE (NWAVE / MSPLIT)  // KV slices a workgroup covers
 #define DPL (HEAD_DIM / WAVE)
 #define KV_ROW (2 * HEAD_DIM + KV_PAD)  // K and V packed, then pad
 #define PAGE_ELEMS (BS * NUM_KV_HEADS * KV_ROW + PAGE_PAD)
@@ -110,9 +125,14 @@ static_assert(PAGE_PAD % 8 == 0, "PAGE_PAD must keep pages 16B aligned");
 // Lets the block table be read once per tile instead of once per token: jb is
 // always a multiple of KPW, so jb..jb+KPW-1 cannot straddle two blocks.
 static_assert(BS % KPW == 0, "a KPW tile must not straddle two blocks");
-static_assert(MAXM % MSTAGE == 0, "MSTAGE must divide MAXM");
-static_assert(MSTAGE * LDS_STAGE_BYTES <= 65536,
-              "staged partials must fit the 64 KiB per-workgroup LDS");
+static_assert(NWAVE % MSPLIT == 0 && MAXM % MSPLIT == 0,
+              "MSPLIT must divide both the wave count and the token count");
+static_assert(LDS_FOR(MSPLIT) <= 65536,
+              "partials must fit the 64 KiB per-workgroup LDS; raise MSPLIT");
+#if MSPLIT > 1
+static_assert(FUSED,
+              "the token-per-wave split only implements the fused epilogue");
+#endif
 
 typedef _Float16 h2v __attribute__((ext_vector_type(2)));
 typedef float f4v __attribute__((ext_vector_type(4)));
@@ -167,34 +187,41 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   const int dl = lane * DPL;
   const int h = blockIdx.y;
   const int kvh = h / GQA;
+  // Wave w owns tokens mbase, mbase+MSPLIT, ... and KV slice w / MSPLIT.  At
+  // MSPLIT == 1 that is mbase = 0 and slice = wave, i.e. every wave takes
+  // every token over its own slice.
+  const int mbase = wave % MSPLIT;
+  const int slice = wave / MSPLIT;
 
   // 32-bit offsets on purpose: the whole Q tile is MAXM*NUM_Q_HEADS*HEAD_DIM
   // elements, so the index cannot exceed 16 bits here, and size_t arithmetic
   // makes the compiler build a full 64-bit address in VGPRs (v_lshlrev_b64
   // plus add_co pairs) for each of the MAXM loads instead of using the
   // SGPR-base + 32-bit-VGPR-offset form.
-  f4v qr[MAXM];
+  f4v qr[MPW];
 #pragma unroll
-  for (int m = 0; m < MAXM; ++m) {
+  for (int t = 0; t < MPW; ++t) {
     const unsigned qoff =
-        ((unsigned)m * NUM_Q_HEADS + (unsigned)h) * HEAD_DIM + (unsigned)dl;
-    qr[m] = *(const f4v*)(q + qoff);
+        ((unsigned)(mbase + t * MSPLIT) * NUM_Q_HEADS + (unsigned)h) *
+            HEAD_DIM +
+        (unsigned)dl;
+    qr[t] = *(const f4v*)(q + qoff);
   }
 
-  float acc[MAXM][DPL], mx[MAXM], ls[MAXM];
+  float acc[MPW][DPL], mx[MPW], ls[MPW];
 #pragma unroll
-  for (int m = 0; m < MAXM; ++m) {
+  for (int t = 0; t < MPW; ++t) {
 #pragma unroll
-    for (int i = 0; i < DPL; ++i) acc[m][i] = 0.f;
-    mx[m] = -INFINITY;
-    ls[m] = 0.f;
+    for (int i = 0; i < DPL; ++i) acc[t][i] = 0.f;
+    mx[t] = -INFINITY;
+    ls[t] = 0.f;
   }
 
   const float scale2 = scale * LOG2E;
   const int ctx = S - MAXM;
 #if ILV
   #if NSEG == 1
-  const int gw = seg * NWAVE + wave;
+  const int gw = seg * NSLICE + slice;
   #else
   // Correctness, not speed: without readfirstlane the compiler cannot see that
   // jstart is wave-uniform, so it guards the loop with s_and_saveexec and only
@@ -203,17 +230,17 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // still fires, so its neighbours read uninitialised LDS.  Only NSEG > 1 can
   // leave a whole wave empty -- and forcing the SGPR costs ~20% at NSEG == 1,
   // so it stays out of that path.
-  const int gw = __builtin_amdgcn_readfirstlane(seg * NWAVE + wave);
+  const int gw = __builtin_amdgcn_readfirstlane(seg * NSLICE + slice);
   #endif
   const int j1 = S;
   const int jstart = gw * KPW;
-  const int jstep = NSEG * NWAVE * KPW;
+  const int jstep = NSEG * NSLICE * KPW;
 #else
   const int sl0 = (S + NSEG - 1) / NSEG;
   const int seg_len = (sl0 + KPW - 1) / KPW * KPW;
   const int j1 = min(S, seg * seg_len + seg_len);
-  const int jstart = seg * seg_len + wave * KPW;
-  const int jstep = NWAVE * KPW;
+  const int jstart = seg * seg_len + slice * KPW;
+  const int jstep = NSLICE * KPW;
 #endif
 
   for (int jb = jstart; jb < j1; jb += jstep) {
@@ -274,17 +301,17 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     }
 #endif
 
-    float s[KPW][MAXM];
+    float s[KPW][MPW];
 #pragma unroll
     for (int c = 0; c < KPW; ++c)
 #pragma unroll
-      for (int m = 0; m < MAXM; ++m) {
-        float t = 0.f;
+      for (int t = 0; t < MPW; ++t) {
+        float d = 0.f;
 #pragma unroll
         for (int e = 0; e < 4; ++e)
-          t = __builtin_amdgcn_fdot2(as_h2(qr[m][e]), as_h2(kr[c][e]), t,
+          d = __builtin_amdgcn_fdot2(as_h2(qr[t][e]), as_h2(kr[c][e]), d,
                                      false);
-        s[c][m] = t;
+        s[c][t] = d;
       }
 
 // Measured: lowering these to DPP row_xmask instead is 18% SLOWER across the
@@ -303,11 +330,11 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 #pragma unroll
       for (int c = 0; c < KPW; ++c)
 #pragma unroll
-        for (int m = 0; m < MAXM; ++m)
-          s[c][m] = __builtin_bit_cast(
+        for (int t = 0; t < MPW; ++t)
+          s[c][t] = __builtin_bit_cast(
                         float, __builtin_amdgcn_ds_bpermute(
-                                   addr, __builtin_bit_cast(int, s[c][m]))) +
-                    s[c][m];
+                                   addr, __builtin_bit_cast(int, s[c][t]))) +
+                    s[c][t];
     }
 
     // (jj <= ctx + m) already implies (jj < S): ctx + m <= S - 1 for every m,
@@ -320,48 +347,49 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     for (int c = 0; c < KPW; ++c) {
       const int jj = jb + c;
 #pragma unroll
-      for (int m = 0; m < MAXM; ++m) {
+      for (int t = 0; t < MPW; ++t) {
+        const int m = mbase + t * MSPLIT;
 #if MUTATE == 1
         const bool valid = (jj <= ctx + m + 1);
 #else
         const bool valid = (jj <= ctx + m);
 #endif
-        s[c][m] = valid ? s[c][m] * scale2 : -INFINITY;
+        s[c][t] = valid ? s[c][t] * scale2 : -INFINITY;
       }
     }
 
 #pragma unroll
-    for (int m = 0; m < MAXM; ++m) {
-      float mnew = mx[m];
+    for (int t = 0; t < MPW; ++t) {
+      float mnew = mx[t];
 #pragma unroll
-      for (int c = 0; c < KPW; ++c) mnew = fmaxf(mnew, s[c][m]);
+      for (int c = 0; c < KPW; ++c) mnew = fmaxf(mnew, s[c][t]);
       const float alpha =
-          (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(mx[m] - mnew);
-      mx[m] = mnew;
-      ls[m] *= alpha;
+          (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(mx[t] - mnew);
+      mx[t] = mnew;
+      ls[t] *= alpha;
 #pragma unroll
-      for (int i = 0; i < DPL; ++i) acc[m][i] *= alpha;
+      for (int i = 0; i < DPL; ++i) acc[t][i] *= alpha;
       float lsum = 0.f;
 #pragma unroll
       for (int c = 0; c < KPW; ++c) {
         const float p =
-            (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(s[c][m] - mnew);
-        s[c][m] = p;
+            (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(s[c][t] - mnew);
+        s[c][t] = p;
         lsum += p;
       }
-      ls[m] += lsum;
+      ls[t] += lsum;
     }
 
 #pragma unroll
     for (int c = 0; c < KPW; ++c) {
       const _Float16* vv = (const _Float16*)&vr[c];
 #pragma unroll
-      for (int m = 0; m < MAXM; ++m)
+      for (int t = 0; t < MPW; ++t)
 #pragma unroll
         // Not worth pairing into VOPD: thinning this loop to 1/8 of its work
         // buys 2.2% at S=128, and perfect dual-issue is only worth half of it.
         // Occupancy already hides the VALU behind other waves' loads.
-        for (int i = 0; i < DPL; ++i) acc[m][i] += s[c][m] * (float)vv[i];
+        for (int i = 0; i < DPL; ++i) acc[t][i] += s[c][t] * (float)vv[i];
     }
   }
 
@@ -372,73 +400,71 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // second kernel costs a 2 MiB round trip and a launch, which at S=128 is as
   // many bytes as the KV stream itself.
   //
-  // Staged MSTAGE tokens at a time: the buffer is reused across stages, so each
-  // stage costs a barrier pair, and MSTAGE > 1 amortises those rendezvous over
-  // more tokens for proportionally more LDS.
-  __shared__ float lds_acc[MSTAGE * NWAVE * HEAD_DIM];
-  __shared__ float lds_m[MSTAGE * NWAVE];
-  __shared__ float lds_l[MSTAGE * NWAVE];
+  // Every wave writes its MPW partials once, so all MAXM*NSLICE of them are
+  // live at the same time and a single barrier serves the whole reduction.
+  // The row for (token m, slice s) is (m/MSPLIT)*NWAVE + m%MSPLIT + s*MSPLIT,
+  // which at MSPLIT == 1 is m*NWAVE + s and at MSPLIT == MAXM is m + s*MAXM.
+  __shared__ float lds_acc[MPW * NWAVE * HEAD_DIM];
+  __shared__ float lds_m[MPW * NWAVE];
+  __shared__ float lds_l[MPW * NWAVE];
 
-  for (int m0 = 0; m0 < MAXM; m0 += MSTAGE) {
-    __syncthreads();  // the previous stage's readers are done with lds_acc
   #pragma unroll
-    for (int k = 0; k < MSTAGE; ++k) {
+  for (int t = 0; t < MPW; ++t) {
   #pragma unroll
-      for (int i = 0; i < DPL; ++i)
-        lds_acc[((size_t)k * NWAVE + wave) * HEAD_DIM + dl + i] =
-            acc[m0 + k][i];
-      if (lane == 0) {
-        lds_m[k * NWAVE + wave] = mx[m0 + k];
-        lds_l[k * NWAVE + wave] = ls[m0 + k];
-      }
+    for (int i = 0; i < DPL; ++i)
+      lds_acc[((size_t)t * NWAVE + wave) * HEAD_DIM + dl + i] = acc[t][i];
+    if (lane == 0) {
+      lds_m[t * NWAVE + wave] = mx[t];
+      lds_l[t * NWAVE + wave] = ls[t];
     }
-    __syncthreads();
+  }
+  __syncthreads();
 
   #pragma unroll
-    for (int k = 0; k < MSTAGE; ++k) {
-      const int m = m0 + k;
-      const int wb = k * NWAVE;
+  for (int m = 0; m < MAXM; ++m) {
+    const int wb = (m / MSPLIT) * NWAVE + (m % MSPLIT);
 
-      float gmax = -INFINITY;
+    float gmax = -INFINITY;
   #pragma unroll
-      for (int w = 0; w < NWAVE; ++w) gmax = fmaxf(gmax, lds_m[wb + w]);
+    for (int s = 0; s < NSLICE; ++s) gmax = fmaxf(gmax, lds_m[wb + s * MSPLIT]);
 
-      // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight
-      // is exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
-      // workgroup can be empty though, and then gmax is -inf as well:
-      // (-inf) - (-inf) is NaN, which would poison the partial.
+    // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight
+    // is exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
+    // workgroup can be empty though, and then gmax is -inf as well:
+    // (-inf) - (-inf) is NaN, which would poison the partial.
   #if NSEG > 1
-      const bool empty = (gmax == -INFINITY);
+    const bool empty = (gmax == -INFINITY);
   #endif
-      float a[NWAVE], den = 0.f;
+    float a[NSLICE], den = 0.f;
   #pragma unroll
-      for (int w = 0; w < NWAVE; ++w) {
+    for (int s = 0; s < NSLICE; ++s) {
+      const int w = wb + s * MSPLIT;
   #if NSEG > 1
-        a[w] = empty ? 0.f : __builtin_amdgcn_exp2f(lds_m[wb + w] - gmax);
+      a[s] = empty ? 0.f : __builtin_amdgcn_exp2f(lds_m[w] - gmax);
   #else
-        a[w] = __builtin_amdgcn_exp2f(lds_m[wb + w] - gmax);
+      a[s] = __builtin_amdgcn_exp2f(lds_m[w] - gmax);
   #endif
-        den = fmaf(a[w], lds_l[wb + w], den);
-      }
+      den = fmaf(a[s], lds_l[w], den);
+    }
 
-      float num = 0.f;
+    float num = 0.f;
   #pragma unroll
-      for (int w = 0; w < NWAVE; ++w)
-        num = fmaf(a[w], lds_acc[((size_t)wb + w) * HEAD_DIM + tid], num);
+    for (int s = 0; s < NSLICE; ++s)
+      num =
+          fmaf(a[s], lds_acc[((size_t)wb + s * MSPLIT) * HEAD_DIM + tid], num);
   #if NSEG == 1
-      out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
-          (OutT)fast_div(num, den);
+    out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + tid] =
+        (OutT)fast_div(num, den);
   #else
-      // (num, gmax, den) is itself a valid partial softmax state, so hand the
-      // global reduction one per (head, segment) rather than NWAVE of them.
-      const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
-      p_acc[pb * HEAD_DIM + tid] = num;
-      if (tid == 0) {
-        p_m[pb] = gmax;
-        p_l[pb] = den;
-      }
-  #endif
+    // (num, gmax, den) is itself a valid partial softmax state, so hand the
+    // global reduction one per (head, segment) rather than NWAVE of them.
+    const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
+    p_acc[pb * HEAD_DIM + tid] = num;
+    if (tid == 0) {
+      p_m[pb] = gmax;
+      p_l[pb] = den;
     }
+  #endif
   }
 #else
   const size_t base = ((size_t)h * (NSEG * NWAVE) + seg * NWAVE + wave) * MAXM;

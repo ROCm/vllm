@@ -41,6 +41,7 @@ def main() -> None:
     p.add_argument("--nseg", type=int, default=None, help="override NSEG")
     p.add_argument("--block", type=int, default=None, help="override threads/WG")
     p.add_argument("--kpw", type=int, default=None, help="override keys/wave/tile")
+    p.add_argument("--msplit", type=int, default=None, help="waves sharing MAXM")
     p.add_argument(
         "--experimental",
         action="store_true",
@@ -61,6 +62,7 @@ def main() -> None:
             ("nseg", args.nseg),
             ("block", args.block),
             ("kpw", args.kpw),
+            ("msplit", args.msplit),
             ("experimental", args.experimental or None),
         )
         if v is not None

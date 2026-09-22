@@ -49,6 +49,7 @@ def main() -> None:
     p.add_argument("--nseg", type=int, nargs="+", default=[None])
     p.add_argument("--block", type=int, nargs="+", default=[None])
     p.add_argument("--kpw", type=int, nargs="+", default=[None])
+    p.add_argument("--msplit", type=int, nargs="+", default=[None])
     p.add_argument("--experimental", action="store_true")
     p.add_argument(
         "--mutate",
@@ -66,8 +67,8 @@ def main() -> None:
 
     dev = torch.device("cuda")
     failures = 0
-    for s, layout, nseg, block, kpw in itertools.product(
-        args.contexts, args.layouts, args.nseg, args.block, args.kpw
+    for s, layout, nseg, block, kpw, msplit in itertools.product(
+        args.contexts, args.layouts, args.nseg, args.block, args.kpw, args.msplit
     ):
         torch.manual_seed(0)
         # Round up, so S need not be a multiple of the page: a tile that runs
@@ -102,6 +103,8 @@ def main() -> None:
             kwargs["block"] = block
         if kpw is not None:
             kwargs["kpw"] = kpw
+        if msplit is not None:
+            kwargs["msplit"] = msplit
         variant = KernelVariant(
             args.head_dim, args.hq, args.hkv, args.m, args.block_size, layout, **kwargs
         )
@@ -118,7 +121,7 @@ def main() -> None:
         if args.mutate:
             ok = not ok  # the negative control must be detected
         failures += not ok
-        label = f"S={s} layout={layout} nseg={nseg} block={block} kpw={kpw}"
+        label = f"S={s} l={layout} nseg={nseg} blk={block} kpw={kpw} ms={msplit}"
         print(f"{label:<44} max_rel={max_rel:.3e}  {'PASS' if ok else 'FAIL'}")
 
     sys.exit(1 if failures else 0)

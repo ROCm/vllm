@@ -51,6 +51,29 @@ class KernelVariant:
     experimental: bool = False
     # Threads per workgroup; block // 32 waves cooperate on one head-segment.
     block: int = _BLOCK
+    # How many waves share the query-token dimension. 1 gives every wave all
+    # max_m tokens over its own KV slice; max_m gives every wave one token and
+    # a slice shared with its neighbours.
+    msplit: int = 1
+
+    def __post_init__(self) -> None:
+        # Raise msplit until the partials fit LDS.  Each of the
+        # (max_m / msplit) * waves rows costs head_size floats plus the m and l
+        # scalars, so max_m = 8 at head_size = 256 does not fit at msplit = 1.
+        # Resolved here rather than in the kernel so the variant name, and
+        # therefore the compiled symbol, matches what is actually built.
+        waves = self.block // _WAVE
+        row = self.head_size * 4 + 8
+        ms = self.msplit
+        while (
+            ms < self.max_m
+            and (self.max_m // ms) * waves * row > 65536
+            and self.max_m % (ms * 2) == 0
+            and waves % (ms * 2) == 0
+        ):
+            ms *= 2
+        object.__setattr__(self, "msplit", ms)
+
     # Merge the per-wave partials in LDS inside the main kernel rather than in
     # a second pass over global memory. Only valid with nseg == 1.
     fused: bool = True
@@ -61,7 +84,7 @@ class KernelVariant:
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
-            f"_b{self.block}{'_x' if self.experimental else ''}"
+            f"_b{self.block}_ms{self.msplit}{'_x' if self.experimental else ''}"
             f"_f{int(self.fused)}"
         )
 
@@ -138,6 +161,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DMUTATE={variant.mutate}",
         f"-DFUSED={int(variant.fused)}",
         f"-DBLOCK={variant.block}",
+        f"-DMSPLIT={variant.msplit}",
     ]
     logger.info("Compiling %s", variant.name)
     module = load_extension(
