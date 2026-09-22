@@ -27,9 +27,11 @@ _NWAVE = _BLOCK // _WAVE
 
 # resolve() matters: ninja re-expands the path through a shell, so a symlinked
 # checkout whose name contains '$' would be mangled into a missing file.
-_SOURCE = (
-    Path(__file__).resolve().parents[4] / "csrc" / "rocm" / "rdna35_decode_attn.cu"
-)
+_CSRC = Path(__file__).resolve().parents[4] / "csrc" / "rocm"
+_SOURCE = _CSRC / "rdna35_decode_attn.cu"
+# Scratch copy for chasing shapes the production kernel serves badly. Kept as a
+# separate file so experiments cannot regress what is already measured.
+_SOURCE_EXPERIMENTAL = _CSRC / "rdna35_decode_attn_smallgrid.cu"
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,8 @@ class KernelVariant:
     nseg: int = 1
     kpw: int = 4
     mutate: int = 0
+    # Compile from the experimental fork rather than the production kernel.
+    experimental: bool = False
     # Merge the per-wave partials in LDS inside the main kernel rather than in
     # a second pass over global memory. Only valid with nseg == 1.
     fused: bool = True
@@ -55,12 +59,17 @@ class KernelVariant:
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
+            f"{'_x' if self.experimental else ''}"
             f"_f{int(self.fused)}"
         )
 
     @property
     def name(self) -> str:
         return f"rdna35_decode_{self.suffix}"
+
+    @property
+    def source(self) -> Path:
+        return _SOURCE_EXPERIMENTAL if self.experimental else _SOURCE
 
     @property
     def partials_per_head(self) -> int:
@@ -96,9 +105,10 @@ def load(variant: KernelVariant) -> Any:
     if variant in _loaded:
         return _loaded[variant]
 
-    if not _SOURCE.is_file():
+    source = variant.source
+    if not source.is_file():
         raise RuntimeError(
-            f"kernel source not found at {_SOURCE}; this loader only works "
+            f"kernel source not found at {source}; this loader only works "
             "from a source checkout, not an installed wheel"
         )
 
@@ -128,7 +138,7 @@ def load(variant: KernelVariant) -> Any:
     logger.info("Compiling %s", variant.name)
     module = load_extension(
         name=variant.name,
-        sources=[str(_SOURCE)],
+        sources=[str(source)],
         extra_cuda_cflags=flags,
         extra_ldflags=_hip_runtime_ldflags(),
     )
