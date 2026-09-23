@@ -88,7 +88,25 @@
 #define NWAVE (BLOCK / WAVE)
 #define MPW (MAXM / MSPLIT)      // query tokens carried by one wave
 #define NSLICE (NWAVE / MSPLIT)  // KV slices a workgroup covers
-#define DPL (HEAD_DIM / WAVE)
+// Eight fp16 per lane is one b128, the width this memory system sustains, so
+// it is held fixed and the wave is divided instead: LPR lanes cover one row
+// and the WAVE/LPR groups each take a different token.  D=512 is the one that
+// cannot -- 512/8 would need 64 lanes -- so it keeps two b128 per lane.
+// Only D=128 takes it.  Measured across the shape table: 128 improves on all
+// 28 of its shapes, 0.87-0.97x.  64 is mixed -- 0.95x at Hq=32/Hkv=8 but
+// 1.10x at Hq=16/Hkv=2, where the KV budget is so small the kernel is
+// latency-bound and the registers the split costs outweigh the wider load.
+// 256 already loads b128 and 512 cannot: 512/8 would want 64 lanes per row.
+#define DPL (HEAD_DIM == 128 ? 8 : HEAD_DIM / WAVE)
+#define LPR (HEAD_DIM / DPL)  // lanes covering one row
+#define SUB (WAVE / LPR)      // tokens a wave carries side by side
+// Widening the load must not widen the tile.  A lane held KPW rows of DPL
+// fp16; now it holds KPWE rows of 8, and KPWE*SUB == KPW keeps both the tile
+// at the same tokens and the bytes in flight per lane unchanged -- the same
+// bytes arrive in fewer, wider transactions, which is the whole point.
+// Without this the tile grew SUB-fold and at S=128 the extra slots simply went
+// unused: Hq=16/Hkv=2/D=64 measured 5.79 -> 6.44 us, half the waves idle.
+#define KPWE ((KPW / SUB) > 0 ? (KPW / SUB) : 1)
 #define KV_ROW (2 * HEAD_DIM + KV_PAD)  // K and V packed, then pad
 #define PAGE_ELEMS (BS * NUM_KV_HEADS * KV_ROW + PAGE_PAD)
 #define GQA (NUM_Q_HEADS / NUM_KV_HEADS)
@@ -103,7 +121,7 @@
 // two scalar arrays are what took MAXM=8 at MSPLIT=1 to 66048 B, over the
 // 64 KiB ceiling, when only lds_acc was counted.
 #define LDS_ROW_BYTES (HEAD_DIM * 4 + 8)
-#define LDS_FOR(MS) ((MAXM / (MS)) * NWAVE * LDS_ROW_BYTES)
+#define LDS_FOR(MS) ((MAXM / (MS)) * NWAVE * SUB * LDS_ROW_BYTES)
 
 // Default to the decomposition every measurement before this change was taken
 // with, raising it only when the partials would not otherwise fit.
@@ -139,13 +157,17 @@
 // Partials the global reduction merges, when it runs at all.
 #define NPART (FUSED ? NSEG : NSEG * NWAVE)
 #define LOG2E 1.44269504088896340736f
+// Partials one workgroup produces per query token: one per KV slice per group.
+#define NPARTW (NSLICE * SUB)
 
 // DPL fp16 per lane covers HEAD_DIM across the wave: 2, 4, 8 and 16 elements
 // for D = 64, 128, 256 and 512, which the compiler issues as b32, b64, b128
 // and a pair of b128.  Only 256 loads at the full b128 width the memory system
 // likes; the narrow ends are correct first and fast later.
-static_assert(DPL >= 2 && (DPL & (DPL - 1)) == 0,
-              "HEAD_DIM/32 must be a power of two of at least 2");
+static_assert(LPR >= 1 && LPR <= WAVE && WAVE % LPR == 0,
+              "a row must be covered by a whole divisor of the wave");
+static_assert(BS % (SUB * KPWE) == 0,
+              "a tile of SUB*KPWE tokens must not straddle two blocks");
 #if FUSED
 static_assert(HEAD_DIM % BLOCK == 0 || BLOCK % HEAD_DIM == 0,
               "the fused epilogue strides the output by BLOCK");
@@ -208,6 +230,20 @@ __device__ __forceinline__ size_t kv_off(int blk, unsigned j, int kvh) {
 // 128 VGPR with no spills is the right operating point: asking the compiler for
 // more waves per EU drops it to 96 VGPR but spills 120 B, which costs 2.1x at
 // S=128 and 2.5x elsewhere.  Occupancy is not what limits this kernel.
+// LDS row holding partial p of the token whose wave base is wb.  p splits into
+// a KV slice and a wave group; at SUB == 1 it collapses to wb + p*MSPLIT,
+// which is what the single-token-per-wave layout used.
+// A partial's softmax weight.  An empty segment carries m = -INFINITY, so
+// exp2 of -inf is zero and it drops out; when every partial is empty gmax is
+// -inf too and (-inf) - (-inf) would be NaN, so that case is selected away.
+__device__ __forceinline__ float weight_of(float m, float gmax) {
+  return (gmax == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(m - gmax);
+}
+
+__device__ __forceinline__ int partial_row(int wb, int p) {
+  return (wb + (p / SUB) * MSPLIT) * SUB + (p % SUB);
+}
+
 template <typename OutT>
 __global__ __launch_bounds__(BLOCK) void decode_attn(
     const _Float16* __restrict__ q, const _Float16* __restrict__ kv,
@@ -218,7 +254,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   const int tid = threadIdx.x;
   const int lane = tid & (WAVE - 1);
   const int wave = tid / WAVE;
-  const int dl = lane * DPL;
+  const int lrow = lane % LPR;  // this lane's slice of the row
+  const int grp = lane / LPR;   // which of the SUB tokens it carries
+  const int dl = lrow * DPL;
   const int h = blockIdx.y;
   const int kvh = h / GQA;
   // Wave w owns tokens mbase, mbase+MSPLIT, ... and KV slice w / MSPLIT.  At
@@ -267,14 +305,14 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   const int gw = __builtin_amdgcn_readfirstlane(seg * NSLICE + slice);
   #endif
   const int j1 = S;
-  const int jstart = gw * KPW;
-  const int jstep = NSEG * NSLICE * KPW;
+  const int jstart = gw * KPWE * SUB;
+  const int jstep = NSEG * NSLICE * KPWE * SUB;
 #else
   const int sl0 = (S + NSEG - 1) / NSEG;
-  const int seg_len = (sl0 + KPW - 1) / KPW * KPW;
+  const int seg_len = (sl0 + KPWE * SUB - 1) / (KPWE * SUB) * (KPWE * SUB);
   const int j1 = min(S, seg * seg_len + seg_len);
-  const int jstart = seg * seg_len + slice * KPW;
-  const int jstep = NSLICE * KPW;
+  const int jstart = seg * seg_len + slice * KPWE * SUB;
+  const int jstep = NSLICE * KPWE * SUB;
 #endif
 
   for (int jb = jstart; jb < j1; jb += jstep) {
@@ -283,7 +321,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // hides behind the dot products, the lane reduction and the softmax.
     // Measured: deferring V to just before P@V costs 5.5% at S=32768, where
     // keeping eight loads in flight is what sustains the bandwidth.
-    fvec kr[KPW], vr[KPW];
+    fvec kr[KPWE], vr[KPWE];
     // One block-table read per tile, forced into a scalar register.  The four
     // tokens share a block, and the value is wave-uniform, so the alternative
     // is four vector loads of the same 4 bytes broadcast to 32 lanes -- a third
@@ -298,10 +336,11 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // independent ones -- and the scalar block-table load feeds one address
     // chain rather than four.  NHD cannot do this: its token stride is
     // NUM_KV_HEADS*KV_ROW, which overflows the immediate.
-    const size_t base = kv_off(blk, (unsigned)jb, kvh) + dl;
+    const size_t base =
+        kv_off(blk, (unsigned)jb, kvh) + (size_t)grp * KV_ROW + dl;
   #pragma unroll
-    for (int c = 0; c < KPW; ++c) {
-      const size_t off = base + (size_t)c * KV_ROW;
+    for (int c = 0; c < KPWE; ++c) {
+      const size_t off = base + (size_t)c * SUB * KV_ROW;
       kr[c] = *(const fvec*)(kv + off);
       vr[c] = *(const fvec*)(kv + off + HEAD_DIM);
     }
@@ -319,15 +358,15 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // Only the last tile of a sequence whose length is not a multiple of KPW
     // can overrun, so the test is a wave-uniform scalar branch; testing per
     // element instead costs KPW*4 v_cndmask on every tile.
-    if (__builtin_expect(jb + KPW > S, 0)) {
+    if (__builtin_expect(jb + KPWE * SUB > S, 0)) {
   #pragma unroll
-      for (int c = 0; c < KPW; ++c)
-        if (jb + c >= S) vr[c] = fvec{};
+      for (int c = 0; c < KPWE; ++c)
+        if (jb + c * SUB + grp >= S) vr[c] = fvec{};
     }
 #else
   #pragma unroll
-    for (int c = 0; c < KPW; ++c) {
-      int jj = jb + c;
+    for (int c = 0; c < KPWE; ++c) {
+      int jj = jb + c * SUB + grp;
       jj = (jj < S) ? jj : (S - 1);
       const size_t off = kv_off(blk, (unsigned)jj, kvh) + dl;
       kr[c] = *(const fvec*)(kv + off);
@@ -335,9 +374,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     }
 #endif
 
-    float s[KPW][MPW];
+    float s[KPWE][MPW];
 #pragma unroll
-    for (int c = 0; c < KPW; ++c)
+    for (int c = 0; c < KPWE; ++c)
 #pragma unroll
       for (int t = 0; t < MPW; ++t) {
         float d = 0.f;
@@ -359,10 +398,10 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 // lane < 32 and st <= 16 can never violate, plus five VGPRs held live for the
 // whole kernel to carry the clamped indices.
 #pragma unroll
-    for (int st = 1; st < WAVE; st <<= 1) {
+    for (int st = 1; st < LPR; st <<= 1) {
       const int addr = (lane ^ st) << 2;  // ds_bpermute indexes lanes by byte
 #pragma unroll
-      for (int c = 0; c < KPW; ++c)
+      for (int c = 0; c < KPWE; ++c)
 #pragma unroll
         for (int t = 0; t < MPW; ++t)
           s[c][t] = __builtin_bit_cast(
@@ -378,8 +417,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // a wave-uniform branch costs 1.6-7.7%.  The branch stops the scheduler
     // software-pipelining across it, which is worth more than the selects.
 #pragma unroll
-    for (int c = 0; c < KPW; ++c) {
-      const int jj = jb + c;
+    for (int c = 0; c < KPWE; ++c) {
+      const int jj = jb + c * SUB + grp;
 #pragma unroll
       for (int t = 0; t < MPW; ++t) {
         const int m = mbase + t * MSPLIT;
@@ -396,7 +435,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     for (int t = 0; t < MPW; ++t) {
       float mnew = mx[t];
 #pragma unroll
-      for (int c = 0; c < KPW; ++c) mnew = fmaxf(mnew, s[c][t]);
+      for (int c = 0; c < KPWE; ++c) mnew = fmaxf(mnew, s[c][t]);
       const float alpha =
           (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(mx[t] - mnew);
       mx[t] = mnew;
@@ -405,7 +444,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       for (int i = 0; i < DPL; ++i) acc[t][i] *= alpha;
       float lsum = 0.f;
 #pragma unroll
-      for (int c = 0; c < KPW; ++c) {
+      for (int c = 0; c < KPWE; ++c) {
         const float p =
             (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(s[c][t] - mnew);
         s[c][t] = p;
@@ -415,7 +454,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     }
 
 #pragma unroll
-    for (int c = 0; c < KPW; ++c) {
+    for (int c = 0; c < KPWE; ++c) {
       const _Float16* vv = (const _Float16*)&vr[c];
 #pragma unroll
       for (int t = 0; t < MPW; ++t)
@@ -438,18 +477,22 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // live at the same time and a single barrier serves the whole reduction.
   // The row for (token m, slice s) is (m/MSPLIT)*NWAVE + m%MSPLIT + s*MSPLIT,
   // which at MSPLIT == 1 is m*NWAVE + s and at MSPLIT == MAXM is m + s*MAXM.
-  __shared__ float lds_acc[MPW * NWAVE * HEAD_DIM];
-  __shared__ float lds_m[MPW * NWAVE];
-  __shared__ float lds_l[MPW * NWAVE];
+  // SUB rows per wave now, not one: the groups of a wave hold the same output
+  // elements over different tokens, so their partials are merged here with the
+  // ones from the other KV slices rather than in a separate in-wave butterfly.
+  __shared__ float lds_acc[MPW * NWAVE * SUB * HEAD_DIM];
+  __shared__ float lds_m[MPW * NWAVE * SUB];
+  __shared__ float lds_l[MPW * NWAVE * SUB];
 
   #pragma unroll
   for (int t = 0; t < MPW; ++t) {
   #pragma unroll
     for (int i = 0; i < DPL; ++i)
-      lds_acc[((size_t)t * NWAVE + wave) * HEAD_DIM + dl + i] = acc[t][i];
-    if (lane == 0) {
-      lds_m[t * NWAVE + wave] = mx[t];
-      lds_l[t * NWAVE + wave] = ls[t];
+      lds_acc[((size_t)(t * NWAVE + wave) * SUB + grp) * HEAD_DIM + dl + i] =
+          acc[t][i];
+    if (lrow == 0) {
+      lds_m[(t * NWAVE + wave) * SUB + grp] = mx[t];
+      lds_l[(t * NWAVE + wave) * SUB + grp] = ls[t];
     }
   }
   __syncthreads();
@@ -460,25 +503,22 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 
     float gmax = -INFINITY;
   #pragma unroll
-    for (int s = 0; s < NSLICE; ++s) gmax = fmaxf(gmax, lds_m[wb + s * MSPLIT]);
+    for (int p = 0; p < NPARTW; ++p)
+      gmax = fmaxf(gmax, lds_m[partial_row(wb, p)]);
 
     // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight
     // is exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
     // workgroup can be empty though, and then gmax is -inf as well:
     // (-inf) - (-inf) is NaN, which would poison the partial.
-  #if NSEG > 1
-    const bool empty = (gmax == -INFINITY);
-  #endif
-    float a[NSLICE], den = 0.f;
+    // Kept live rather than recomputed in the d loop: recomputing trades 32
+    // VGPR at D=64 for a 1.5x loss at D=128 (122.62 -> 184.23 us at S=4096),
+    // which is the wrong side of that trade.
+    float a[NPARTW], den = 0.f;
   #pragma unroll
-    for (int s = 0; s < NSLICE; ++s) {
-      const int w = wb + s * MSPLIT;
-  #if NSEG > 1
-      a[s] = empty ? 0.f : __builtin_amdgcn_exp2f(lds_m[w] - gmax);
-  #else
-      a[s] = __builtin_amdgcn_exp2f(lds_m[w] - gmax);
-  #endif
-      den = fmaf(a[s], lds_l[w], den);
+    for (int p = 0; p < NPARTW; ++p) {
+      const int w = partial_row(wb, p);
+      a[p] = weight_of(lds_m[w], gmax);
+      den = fmaf(a[p], lds_l[w], den);
     }
 
   #if NSEG > 1
@@ -502,9 +542,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   #endif
       float num = 0.f;
   #pragma unroll
-      for (int s = 0; s < NSLICE; ++s)
+      for (int p = 0; p < NPARTW; ++p)
         num =
-            fmaf(a[s], lds_acc[((size_t)wb + s * MSPLIT) * HEAD_DIM + d], num);
+            fmaf(a[p], lds_acc[(size_t)partial_row(wb, p) * HEAD_DIM + d], num);
   #if NSEG == 1
       out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d] =
           (OutT)fast_div(num, den);
