@@ -6,6 +6,13 @@ Roofline del protocolo: 230 GiB/s → `t_roof = 2·S·Hkv·D·2 / 230GiB/s`.
 **Estado: COMPLETO** para la cobertura. **ABIERTO** para la optimización: el
 bucle ya ha encontrado dos cosas que valen hasta 2× y aún no están arregladas.
 
+> **Corrección.** Todo lo que sigue se mide a **S=128**, el único contexto que
+> `roofline.py` recorre. "Ganamos en las 49" es cierto ahí y falso en el rango
+> completo: el geomean sobre 7 contextos es **0.933×** y perdemos en 15 de 27
+> configuraciones a partir de S=4096. La tabla completa está en f12 y el
+> catálogo por configuración en HANDOFF.md §1. Medir un solo contexto y creerlo
+> es el error; está anotado como trampa en HANDOFF.md §5.1.
+>
 > Este informe **sustituye las tablas de f10**. Aquellas se midieron antes de
 > la reducción fusionada (`be0f2083d9`), que se llevó ~1.2 µs planos de cada
 > celda, y antes de que el kernel sirviera más de un tamaño de cabeza.
