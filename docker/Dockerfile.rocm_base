@@ -9,8 +9,8 @@ ARG PYTORCH_AUDIO_BRANCH="v2.11.0"
 ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
 ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
-ARG AITER_BRANCH="v0.1.22.post1"
-ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_WHEEL_INDEX_URL="https://rocm.frameworks-nightlies.amd.com/whl-multi-arch/amd-aiter/"
+ARG AITER_WHEEL_NAME="amd_aiter-0.1.23+rocm7.2.3.49c6fdd.d20260922-cp312-cp312-linux_x86_64.whl"
 ARG MORI_BRANCH="v1.1.0"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
 ARG ROCM_SYSTEMS_REPO="https://github.com/ROCm/rocm-systems.git"
@@ -255,24 +255,10 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 ### AITER Build
 ###
 FROM base AS build_aiter
-ARG AITER_BRANCH
-ARG AITER_REPO
-ARG USE_SCCACHE
-RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
-    pip install /install/*.whl
-RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO}
-RUN cd aiter \
-    && git submodule update --init --recursive \
-    && pip install -r requirements.txt
-RUN pip install pyyaml && cd aiter \
-    && if [ "$USE_SCCACHE" = "1" ]; then \
-           export HIP_CLANG_PATH=/opt/sccache-wrappers \
-           && sccache --show-stats; \
-       fi \
-    && PREBUILD_KERNELS=1 AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${AITER_ROCM_ARCH} python3 setup.py bdist_wheel --dist-dir=dist \
-    && if [ "$USE_SCCACHE" = "1" ]; then sccache --show-stats; fi \
-    && ls /app/aiter/dist/*.whl
-RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
+ARG AITER_WHEEL_INDEX_URL
+ARG AITER_WHEEL_NAME
+RUN mkdir -p /app/install \
+    && curl -fL -o /app/install/${AITER_WHEEL_NAME} ${AITER_WHEEL_INDEX_URL}${AITER_WHEEL_NAME}
 
 
 ###
@@ -452,8 +438,8 @@ ARG PYTORCH_AUDIO_BRANCH
 ARG PYTORCH_AUDIO_REPO
 ARG FA_BRANCH
 ARG FA_REPO
-ARG AITER_BRANCH
-ARG AITER_REPO
+ARG AITER_WHEEL_INDEX_URL
+ARG AITER_WHEEL_NAME
 ARG MORI_BRANCH
 ARG MORI_REPO
 ARG ROCM_SYSTEMS_REPO
@@ -473,7 +459,7 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "PYTORCH_AUDIO_REPO: ${PYTORCH_AUDIO_REPO}" >> /app/versions.txt \
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
-    && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
-    && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt \
+    && echo "AITER_WHEEL_INDEX_URL: ${AITER_WHEEL_INDEX_URL}" >> /app/versions.txt \
+    && echo "AITER_WHEEL_NAME: ${AITER_WHEEL_NAME}" >> /app/versions.txt \
     && echo "MORI_BRANCH: ${MORI_BRANCH}" >> /app/versions.txt \
     && echo "MORI_REPO: ${MORI_REPO}" >> /app/versions.txt
