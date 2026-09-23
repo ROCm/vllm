@@ -157,6 +157,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
+    VLLM_ROCM_W4A16_HIPBLASLT: Literal["off", "decode", "prefill", "all"] = "off"
+    VLLM_HIPBLASLT_W4A16_ROOT: str | None = None
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1253,9 +1255,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the single-kernel HIP gated delta net prefill on RDNA3.5.
     # Set to 0 to fall back to the Triton kernels.
     # By default is enabled.
-    "VLLM_GDN_HIP": lambda: (
-        os.getenv("VLLM_GDN_HIP", "True").lower() in ("true", "1")
-    ),
+    "VLLM_GDN_HIP": lambda: os.getenv("VLLM_GDN_HIP", "True").lower() in ("true", "1"),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (
@@ -1386,6 +1386,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Route the gfx11/gfx12 W4A16 GEMM through hipBLASLt instead of the
+    # RDNAHybrid kernels: "decode" replaces the HIP skinny path, "prefill" the
+    # Triton path, "all" both. Needs VLLM_HIPBLASLT_W4A16_ROOT.
+    "VLLM_ROCM_W4A16_HIPBLASLT": env_with_choices(
+        "VLLM_ROCM_W4A16_HIPBLASLT",
+        "off",
+        ["off", "decode", "prefill", "all"],
+    ),
+    # Built rocm-libraries checkout whose hipBLASLt exposes the w4a16 API; the
+    # extension for VLLM_ROCM_W4A16_HIPBLASLT is compiled against it on demand.
+    "VLLM_HIPBLASLT_W4A16_ROOT": lambda: os.environ.get(
+        "VLLM_HIPBLASLT_W4A16_ROOT", None
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
@@ -2311,6 +2324,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_XLA_CACHE_PATH",
         "VLLM_CONFIG_ROOT",
         "LD_LIBRARY_PATH",
+        # Where the w4a16-capable hipBLASLt is built, not whether it is used
+        # (VLLM_ROCM_W4A16_HIPBLASLT carries that and stays a factor).
+        "VLLM_HIPBLASLT_W4A16_ROOT",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
