@@ -10,6 +10,9 @@ rebuild.  It is consequently a development and benchmarking path, not part of
 a shipped wheel.
 """
 
+import os
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -168,6 +171,37 @@ def load(variant: KernelVariant) -> Any:
     )
     _loaded[variant] = module
     return module
+
+
+def precompile(variants: "Iterable[KernelVariant]", workers: int | None = None) -> None:
+    """Build several variants at once.
+
+    Each variant is already its own translation unit and its own ninja
+    invocation, so they are independent; torch takes a file lock per extension
+    name, which differs per variant, so concurrent builds do not collide.
+
+    This matters more than it looks. A cold build is ~19.6 s, of which the
+    kernel itself is 0.57 s -- the rest is torch/extension.h and the link. So
+    the cost is per-variant and fixed, and the 27 distinct variants of the
+    shape table cost nine minutes serially before a single measurement can be
+    taken. Spread over the machine that is well under a minute.
+    """
+    todo = [v for v in variants if v not in _loaded]
+    if not todo:
+        return
+    n = workers or min(len(todo), (os.cpu_count() or 8))
+    logger.info("Compiling %d kernel variants across %d workers", len(todo), n)
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {pool.submit(load, v): v for v in todo}
+        for fut, variant in futures.items():
+            try:
+                fut.result()
+            except Exception:
+                # A shape the kernel refuses to build is a normal outcome --
+                # D=96 is three fp16 per lane and static_asserts. This is a
+                # warm-up, not a gate: let the real load report it where the
+                # caller already handles a fallback.
+                logger.debug("%s did not build; leaving it to the caller", variant.name)
 
 
 def make_scratch(

@@ -21,9 +21,11 @@ Triton's number as if it were ours; that has happened twice on this project.
 """
 
 import argparse
+import contextlib
 import csv
 import statistics
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +134,39 @@ def main() -> None:
 
     backend_mod.make_scratch = cached
 
+    # Build every variant the pass needs before timing anything. A cold build
+    # is ~19.6 s and they are independent, so serially the 27 distinct variants
+    # of this table cost nine minutes before the first measurement; spread over
+    # the machine it is under a minute. Nothing here is timed, so a build that
+    # lands late cannot contaminate a number.
+    from vllm.v1.attention.backends.rdna35_hip_attn import _msplit_for, _segments_for
+    from vllm.v1.attention.ops.rdna35_hip_decode import KernelVariant, precompile
+
+    wanted = []
+    for _, hq, hkv, d in rows:
+        for layout in (0, 1):
+            with contextlib.suppress(Exception):
+                wanted.append(
+                    KernelVariant(
+                        d,
+                        hq,
+                        hkv,
+                        args.m,
+                        args.block_size,
+                        layout,
+                        nseg=_segments_for(hq),
+                        msplit=_msplit_for(hkv, args.m),
+                    )
+                )
+    precompile(wanted)
+    # Let the machine settle before timing anything.  Compiling saturates the
+    # cores and moves the SoC clock, which is the contamination 00-protocol.md
+    # invented quiet-lock to avoid; doing it in-process moments before the
+    # first measurement is the same mistake by another route.  A pass taken
+    # straight after a 50-way rebuild reported three shapes falling back that
+    # were served on every quiet run before and after.
+    time.sleep(5)
+
     hdr = f"{'model':<36} {'Hq':>3} {'Hkv':>4} {'D':>4} {'ran':>4} {'max_rel':>9}"
     hdr += f" {'us':>9} {'%roof':>6}"
     if args.triton:
@@ -180,6 +215,10 @@ def main() -> None:
         ran = any(i.kernel_calls for i in impls) and not any(
             i.fallback_calls for i in impls
         )
+        # Why, not just whether.  warning_once suppresses the backend's own
+        # message after the first shape hits a given reason, so a pass over
+        # many shapes hides every fallback but the first.
+        why = next((i._rejected for i in impls if i._rejected), None)
 
         line = f"{model:<36} {hq:>3} {hkv:>4} {d:>4} {'yes' if ran else 'NO':>4}"
         line += f" {'-' if rel is None else f'{rel:.2e}':>9}"
@@ -187,6 +226,8 @@ def main() -> None:
         if args.triton:
             t = timeit("TRITON_ATTN")
             line += f" {t:>9.2f} {t / us:>5.2f}x"
+        if not ran and why:
+            line += f"  <- {why}"
         print(line, flush=True)
         out_rows.append((roof / us * 100, ran, model, hq, hkv, d, us))
 
