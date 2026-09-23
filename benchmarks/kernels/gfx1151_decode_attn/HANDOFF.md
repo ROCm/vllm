@@ -236,9 +236,45 @@ The one sentence worth internalising is still the design report's:
 
 ## 7. Reproducing
 
+### Environment
+
+There is **no `.venv` in the worktree**; everything runs from the one in the
+main tree.
+
+| | |
+| --- | --- |
+| venv | `/scratch/rogarcia/vllm/.venv` |
+| torch | 2.12.0+rocm10.1.0a20260803 |
+| hipcc | `<venv>/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc` |
+| compiled `.so` | `/scratch/rogarcia/vllm/vllm/*.so`, symlinked into the worktree |
+
+The combination is the point: the interpreter and the dependencies come from
+the main tree, but `PYTHONPATH=$PWD` makes `import vllm` resolve to the
+worktree, so you measure the code you are editing. Without it `import vllm`
+silently falls back to the installed tree and you benchmark a different kernel
+— 281 us instead of 199, no error, no warning. Two agents hit that
+independently. Verify when in doubt:
+
+```bash
+PYTHONPATH=$PWD python -c "import vllm; print(vllm.__file__)"
+```
+
+The `.so` files are gitignored, so a fresh worktree needs them linked before
+anything runs:
+
+```bash
+for f in /scratch/rogarcia/vllm/vllm/*.so; do ln -sf "$f" vllm/; done
+```
+
+`amd-gpu-lock` needs `amd-smi`, which only appears with the venv on PATH. The
+login shell here is csh, so `source`/`export` have to go inside `bash -c`.
+
+### Commands
+
 ```bash
 cd <worktree>
-export PATH=<venv>/bin:$PATH PYTHONPATH=$PWD VLLM_KV_CACHE_LAYOUT=HND
+export PATH=/scratch/rogarcia/vllm/.venv/bin:$PATH PYTHONPATH=$PWD \
+    VLLM_KV_CACHE_LAYOUT=HND
 
 # the gate, and where to look next
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/roofline.py
