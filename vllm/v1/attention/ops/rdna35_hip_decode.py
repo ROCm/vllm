@@ -173,6 +173,36 @@ def load(variant: KernelVariant) -> Any:
     return module
 
 
+# Measured peak RSS of one build: 1.15 GB, almost all of it torch's headers.
+# Budgeted at 2 GB because the measurement is a single sample and the cost of
+# being wrong is an OOM that takes the machine with it, not a slow build.
+_BUILD_RSS_BYTES = 2 << 30
+
+
+def _parallel_budget(n: int) -> int:
+    """How many builds fit in memory, not how many cores exist.
+
+    A build peaks at 1.15 GB, so 32 of them want more than this machine has --
+    running one per core filled 30 GB of RAM and had to be killed.  Memory is
+    the binding constraint here, and it is read at call time because what is
+    free depends on what else is running.
+    """
+    free = _available_bytes()
+    by_mem = max(1, int(free * 0.7) // _BUILD_RSS_BYTES)
+    return max(1, min(n, os.cpu_count() or 8, by_mem))
+
+
+def _available_bytes() -> int:
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 8 << 30
+
+
 def precompile(variants: "Iterable[KernelVariant]", workers: int | None = None) -> None:
     """Build several variants at once.
 
@@ -189,8 +219,13 @@ def precompile(variants: "Iterable[KernelVariant]", workers: int | None = None) 
     todo = [v for v in variants if v not in _loaded]
     if not todo:
         return
-    n = workers or min(len(todo), (os.cpu_count() or 8))
-    logger.info("Compiling %d kernel variants across %d workers", len(todo), n)
+    n = workers or _parallel_budget(len(todo))
+    logger.info(
+        "Compiling %d kernel variants across %d workers (%.1f GiB available)",
+        len(todo),
+        n,
+        _available_bytes() / (1 << 30),
+    )
     with ThreadPoolExecutor(max_workers=n) as pool:
         futures = {pool.submit(load, v): v for v in todo}
         for fut, variant in futures.items():
