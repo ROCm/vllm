@@ -37,6 +37,27 @@ def _skip_unless_gfx1151():
         pytest.skip("kernel is built for gfx1151")
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _build_variants():
+    """Build the three variants this module needs before any test runs.
+
+    They are independent builds of ~19.6 s each, almost all of it torch's
+    headers rather than the kernel, so serially they were the whole runtime of
+    the suite on a cold cache. Built together it is one build's worth.
+
+    Not a correctness concern: a build that fails here fails again in the test
+    that needs it, where it is reported against that test rather than as a
+    collection error.
+    """
+    from vllm.platforms.rocm import on_gfx1151
+
+    if not on_gfx1151():
+        return
+    rdna35.precompile(
+        [_variant(layout=0), _variant(layout=1), _variant(layout=1, mutate=1)]
+    )
+
+
 def _variant(layout: int = 1, mutate: int = 0):
     return rdna35.KernelVariant(
         head_size=HEAD_DIM,

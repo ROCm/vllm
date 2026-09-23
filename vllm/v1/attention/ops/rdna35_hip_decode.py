@@ -221,7 +221,11 @@ def precompile(variants: "Iterable[KernelVariant]", workers: int | None = None) 
     shape table cost nine minutes serially before a single measurement can be
     taken. Spread over the machine that is well under a minute.
     """
-    todo = [v for v in variants if v not in _loaded]
+    # Deduplicated: two threads building the same variant would race on the
+    # same build directory and the same _loaded entry.  Callers hand over
+    # whatever their loop produced -- roofline builds both layouts per shape
+    # and shapes repeat -- so duplicates are the normal case, not a mistake.
+    todo = list(dict.fromkeys(v for v in variants if v not in _loaded))
     if not todo:
         return
     n = workers or _parallel_budget(len(todo))
