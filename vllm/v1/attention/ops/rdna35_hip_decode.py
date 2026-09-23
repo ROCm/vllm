@@ -53,6 +53,9 @@ class KernelVariant:
     # max_m tokens over its own KV slice; max_m gives every wave one token and
     # a slice shared with its neighbours.
     msplit: int = 1
+    # 1 strides each wave across the whole context; 0 gives each segment a
+    # contiguous run of it.  Only ever run at 1.
+    ilv: int = 1
     # Finish the cross-workgroup reduction inside decode_attn instead of
     # launching reduce_segments for it.  On by default: worth ~1.2 us flat, and
     # a no-op at nseg == 1 where no second kernel runs anyway.
@@ -86,7 +89,8 @@ class KernelVariant:
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
-            f"_b{self.block}_ms{self.msplit}{'' if self.fusedred else '_nofr'}"
+            f"_b{self.block}_ms{self.msplit}_i{self.ilv}"
+            f"{'' if self.fusedred else '_nofr'}"
             f"_f{int(self.fused)}"
         )
 
@@ -160,6 +164,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DFUSED={int(variant.fused)}",
         f"-DBLOCK={variant.block}",
         f"-DMSPLIT={variant.msplit}",
+        f"-DILV={variant.ilv}",
         f"-DFUSEDRED={int(variant.fusedred)}",
     ]
     logger.info("Compiling %s", variant.name)

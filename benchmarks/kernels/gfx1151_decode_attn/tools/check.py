@@ -50,6 +50,7 @@ def main() -> None:
     p.add_argument("--block", type=int, nargs="+", default=[None])
     p.add_argument("--kpw", type=int, nargs="+", default=[None])
     p.add_argument("--msplit", type=int, nargs="+", default=[None])
+    p.add_argument("--ilv", type=int, default=None)
     p.add_argument("--no-fusedred", dest="fusedred", action="store_false")
     p.add_argument(
         "--repeat",
@@ -71,10 +72,41 @@ def main() -> None:
         KernelVariant,
         load,
         make_scratch,
+        precompile,
     )
 
     dev = torch.device("cuda")
     failures = 0
+
+    # Build every variant the matrix needs before checking any of them.  The
+    # variant does not depend on S, so the product below is usually a handful
+    # of builds at ~19.6 s each -- serially that is minutes of nothing before
+    # the first result.  Failures are left for the loop, which reports them
+    # against the shape that asked for them.
+    def variant_for(layout, nseg, block, kpw, msplit):
+        kw = {"mutate": args.mutate, "fusedred": args.fusedred}
+        if args.ilv is not None:
+            kw["ilv"] = args.ilv
+        for name, val in (
+            ("nseg", nseg),
+            ("block", block),
+            ("kpw", kpw),
+            ("msplit", msplit),
+        ):
+            if val is not None:
+                kw[name] = val
+        return KernelVariant(
+            args.head_dim, args.hq, args.hkv, args.m, args.block_size, layout, **kw
+        )
+
+    precompile(
+        [
+            variant_for(*combo)
+            for combo in itertools.product(
+                args.layouts, args.nseg, args.block, args.kpw, args.msplit
+            )
+        ]
+    )
     for s, layout, nseg, block, kpw, msplit in itertools.product(
         args.contexts, args.layouts, args.nseg, args.block, args.kpw, args.msplit
     ):
@@ -104,18 +136,7 @@ def main() -> None:
         )
         bt = torch.arange(blocks, device=dev, dtype=torch.int32)
 
-        kwargs = {"mutate": args.mutate, "fusedred": args.fusedred}
-        if nseg is not None:
-            kwargs["nseg"] = nseg
-        if block is not None:
-            kwargs["block"] = block
-        if kpw is not None:
-            kwargs["kpw"] = kpw
-        if msplit is not None:
-            kwargs["msplit"] = msplit
-        variant = KernelVariant(
-            args.head_dim, args.hq, args.hkv, args.m, args.block_size, layout, **kwargs
-        )
+        variant = variant_for(layout, nseg, block, kpw, msplit)
         module = load(variant)
         acc, smax, ssum, arrivals = make_scratch(variant, dev)
         out = torch.empty_like(q)

@@ -43,6 +43,7 @@ def main() -> None:
     p.add_argument("--block", type=int, default=None, help="override threads/WG")
     p.add_argument("--kpw", type=int, default=None, help="override keys/wave/tile")
     p.add_argument("--msplit", type=int, default=None, help="waves sharing MAXM")
+    p.add_argument("--ilv", type=int, default=None, help="0 = contiguous KV runs")
     p.add_argument(
         "--no-fusedred",
         dest="fusedred",
@@ -65,6 +66,7 @@ def main() -> None:
             ("block", args.block),
             ("kpw", args.kpw),
             ("msplit", args.msplit),
+            ("ilv", args.ilv),
             ("fusedred", None if args.fusedred else False),
         )
         if v is not None
