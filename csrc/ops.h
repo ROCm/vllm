@@ -45,12 +45,6 @@ void gelu_quick(torch::Tensor& out, torch::Tensor& input);
 
 void relu_squared(torch::Tensor& out, torch::Tensor& input);
 
-#ifdef USE_ROCM
-torch::Tensor awq_gemv_hip(torch::Tensor activation, torch::Tensor qweight,
-                           torch::Tensor scales, torch::Tensor qzeros,
-                           int64_t split_k);
-#endif
-
 void static_scaled_int8_quant(torch::Tensor& out, torch::Tensor const& input,
                               torch::Tensor const& scale,
                               std::optional<torch::Tensor> const& azp);

@@ -932,22 +932,15 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
-        if current_platform.is_rocm():
-            # ops.awq_gemm picks fused vs dequant+matmul itself, at a threshold
-            # tuned for ROCm (64 rather than 256) and via the Triton dequant
-            # path, since _C.awq_dequantize is not built here. Letting the
-            # heuristic below pre-empt it would override both.
-            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
+        # num_tokens >= threshold
+        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+        # Batch invariant mode requires torch.matmul path
+        # for Triton override
+        if FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
+            out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
+            out = torch.matmul(reshaped_x, out)
         else:
-            # num_tokens >= threshold
-            FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
-            # Batch invariant mode requires torch.matmul path
-            # for Triton override
-            if FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:
-                out = ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0)
-                out = torch.matmul(reshaped_x, out)
-            else:
-                out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
+            out = ops.awq_gemm(reshaped_x, qweight, scales, qzeros, pack_factor)
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)

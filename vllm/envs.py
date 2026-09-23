@@ -121,8 +121,6 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
-    VLLM_USE_TRITON_AWQ_GEMV: bool = True
-    VLLM_AWQ_USE_TN_GEMM: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
@@ -1183,15 +1181,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
-    # If set, vLLM will use Triton GEMV kernels for AWQ (requires VLLM_USE_TRITON_AWQ).
-    # This is enabled by default for optimized single-token inference.
-    "VLLM_USE_TRITON_AWQ_GEMV": lambda: bool(
-        int(os.getenv("VLLM_USE_TRITON_AWQ_GEMV", "1"))
-    ),
-    # If set, use TN GEMM path (transposed dequant + hipBLASLt) for AWQ prefill.
-    # Currently disabled by default due to .T contiguity overhead.
-    # TODO: Optimize to avoid the transpose copy overhead.
-    "VLLM_AWQ_USE_TN_GEMM": lambda: bool(int(os.getenv("VLLM_AWQ_USE_TN_GEMM", "0"))),
     # If set, monkey-patch triton.runtime.autotuner.Autotuner.run to skip
     # benchmarking and select the first valid config (walking past invalid
     # ones). Used to eliminate autotuning variability when measuring kernel

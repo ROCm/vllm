@@ -17,18 +17,6 @@
 // https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit#heading=h.ptttacy8y1u9
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
-TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
-  // vLLM custom ops
-
-#ifdef USE_ROCM
-  // AWQ GEMV for ROCm (optimized for RDNA3/3.5)
-  ops.def(
-      "awq_gemv_hip(Tensor activation, Tensor qweight, Tensor scales, "
-      "Tensor qzeros, int split_k) -> Tensor");
-  ops.impl("awq_gemv_hip", torch::kCUDA, &awq_gemv_hip);
-#endif
-}
-
 #ifdef USE_ROCM
 TORCH_LIBRARY_FRAGMENT(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   // Quick Reduce all-reduce kernels (ROCm-only; stays on legacy _C).
