@@ -588,10 +588,20 @@ def test_aiter_moe_situv2_syncs_aiter_a4w4_env(
         assert "AITER_SITUV2_A8W4" not in os.environ
 
 
-def test_aiter_moe_situv2_legacy_a8w4_alias_enables_a4w4(
+def test_aiter_moe_situv2_legacy_a8w4_alias_enables_genuine_a8w4(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Deprecated VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4 still enables SiTUv2 a4w4."""
+    """VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4 (alone) selects the genuine a8w4
+    kernel, matching its name, rather than silently rerouting to a4w4.
+
+    Regression test: prior to this fix, setting only this legacy-named alias
+    still set AITER_SITUV2_A4W4=1, silently downgrading callers who asked for
+    a8w4 by name onto AITER's a4w4 FlyDSL SiTUv2 MoE kernel -- which leaks
+    GPU memory under sustained long-context, high-concurrency, cache-miss
+    traffic (confirmed via isolated A/B repro on MI355X with Kimi-K3: the
+    identical workload crashes with HSA_STATUS_ERROR_OUT_OF_RESOURCES within
+    ~2 minutes on a4w4 but runs indefinitely on a8w4).
+    """
     from vllm._aiter_ops import rocm_aiter_ops
 
     _assert_aiter_supported()
@@ -602,6 +612,33 @@ def test_aiter_moe_situv2_legacy_a8w4_alias_enables_a4w4(
         mp.delenv("VLLM_ROCM_USE_AITER_MOE_SITUV2", raising=False)
         mp.setenv("VLLM_ROCM_USE_AITER", "1")
         mp.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
+        mp.setenv("VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4", "1")
+        _reload_envs()
+        rocm_aiter_ops.refresh_env_variables()
+
+        import os
+
+        assert os.environ.get("AITER_SITUV2_A8W4") == "1"
+        assert "AITER_SITUV2_A4W4" not in os.environ
+
+
+def test_aiter_moe_situv2_base_flag_wins_over_legacy_a8w4_alias(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When both the current flag and the legacy alias are set, the current
+    (non-legacy) VLLM_ROCM_USE_AITER_MOE_SITUV2 flag keeps its documented
+    a4w4 behavior -- only setting the legacy alias *alone* selects a8w4.
+    """
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    _assert_aiter_supported()
+
+    with monkeypatch.context() as mp:
+        mp.delenv("AITER_SITUV2_A8W4", raising=False)
+        mp.delenv("AITER_SITUV2_A4W4", raising=False)
+        mp.setenv("VLLM_ROCM_USE_AITER", "1")
+        mp.setenv("VLLM_ROCM_USE_AITER_MOE", "1")
+        mp.setenv("VLLM_ROCM_USE_AITER_MOE_SITUV2", "1")
         mp.setenv("VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4", "1")
         _reload_envs()
         rocm_aiter_ops.refresh_env_variables()

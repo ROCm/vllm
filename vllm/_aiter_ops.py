@@ -1871,12 +1871,33 @@ _OPS_REGISTERED = False
 
 
 def _sync_aiter_situv2_moe_env() -> None:
-    """Mirror the SiTUv2 MoE toggle into AITER's a4w4 dispatch env.
+    """Mirror the SiTUv2 MoE toggle into AITER's a8w4/a4w4 dispatch env.
 
     AITER selects afp8 vs afp4 activation kernels via AITER_SITUV2_A8W4 /
     AITER_SITUV2_A4W4 (see ROCm/aiter fused_moe.py, A8W4 checked first).
-    When VLLM_ROCM_USE_AITER_MOE_SITUV2 is enabled we route to a4w4
-    (afp4_wfp4_fp4 kernels) and clear any legacy AITER_SITUV2_A8W4 override.
+
+    Two vLLM-level knobs exist and must NOT be conflated:
+      * VLLM_ROCM_USE_AITER_MOE_SITUV2 (the current flag) routes to a4w4
+        (afp4_wfp4_fp4 kernels).
+      * VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4 is a legacy-named alias that,
+        prior to this fix, was silently treated as just another spelling
+        of the flag above -- i.e. setting it also selected the a4w4
+        kernel, despite its name and every existing recipe/doc describing
+        it as selecting the a8w4 (fp8-activation) kernel. That mismatch
+        is a real bug, not a cosmetic one: AITER's a4w4 FlyDSL 2-stage
+        SiTUv2 MoE kernel (flydsl_moe1_afp4_wfp4_bf16_* /
+        flydsl_moe2_layout_afp4_wfp4_bf16_*) leaks GPU memory under
+        sustained long-context, high-concurrency, cache-miss-heavy
+        traffic (confirmed via an isolated A/B repro on MI355X: identical
+        workload runs indefinitely with AITER_SITUV2_A8W4 and crashes
+        with HSA_STATUS_ERROR_OUT_OF_RESOURCES / "Available Free mem: 0
+        MB" within ~2 minutes with AITER_SITUV2_A4W4). Recipes that set
+        VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4 expecting the a8w4 kernel were
+        therefore being silently downgraded onto the leaking a4w4 kernel.
+        We now honor the alias literally: if only the "_A8W4"-named var is
+        set (and the current, non-legacy flag is not), select genuine
+        a8w4. The non-legacy VLLM_ROCM_USE_AITER_MOE_SITUV2 flag keeps its
+        existing, documented a4w4 behavior.
 
     Requires AITER with ROCm/aiter#4463 (first tagged in v0.1.20): a4w4
     dispatch plus kimik3_a4w4_{un,}tuned_fmoe.csv. Older AITER still runs
@@ -1887,11 +1908,26 @@ def _sync_aiter_situv2_moe_env() -> None:
 
     import vllm.envs as envs
 
-    if envs.VLLM_ROCM_USE_AITER_MOE_SITUV2:
+    situv2_base = os.getenv("VLLM_ROCM_USE_AITER_MOE_SITUV2", "0").lower() in (
+        "true",
+        "1",
+    )
+    situv2_legacy_a8w4_alias = os.getenv(
+        "VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4", "0"
+    ).lower() in ("true", "1")
+
+    if situv2_legacy_a8w4_alias and not situv2_base:
+        # Only the legacy-named alias is set: honor its name and select
+        # the genuine (non-leaking) a8w4 kernel instead of silently
+        # rerouting to a4w4.
+        os.environ["AITER_SITUV2_A8W4"] = "1"
+        os.environ.pop("AITER_SITUV2_A4W4", None)
+    elif envs.VLLM_ROCM_USE_AITER_MOE_SITUV2:
         os.environ["AITER_SITUV2_A4W4"] = "1"
         os.environ.pop("AITER_SITUV2_A8W4", None)
     else:
         os.environ.pop("AITER_SITUV2_A4W4", None)
+        os.environ.pop("AITER_SITUV2_A8W4", None)
 
 
 class rocm_aiter_ops:

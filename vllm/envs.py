@@ -1262,12 +1262,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_MOE": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
     ),
-    # Route K3 SiTU MXFP4 MoE through the FlyDSL SiTUv2 path (a4w4 fp4
-    # activations, separated gate/up layout) instead of default a16w4. vLLM
-    # sets AITER_SITUV2_A4W4 at init when this flag is on and clears any
-    # legacy AITER_SITUV2_A8W4 override (AITER checks A8W4 first).
-    # VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4 is a deprecated alias for existing
-    # recipes; it does not select a8w4 kernels.
+    # Route K3 SiTU MXFP4 MoE through the FlyDSL SiTUv2 path instead of the
+    # default a16w4. vLLM sets AITER_SITUV2_A4W4 (fp4 activations, separated
+    # gate/up layout) at init when VLLM_ROCM_USE_AITER_MOE_SITUV2 is on.
+    # VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4 is a legacy-named alias: setting it
+    # *alone* selects the genuine a8w4 (fp8-activation) kernel, matching its
+    # name -- see _sync_aiter_situv2_moe_env() in vllm/_aiter_ops.py. It used
+    # to silently reroute to a4w4 like the base flag; that was fixed because
+    # AITER's a4w4 FlyDSL SiTUv2 MoE kernel leaks GPU memory under sustained
+    # long-context, high-concurrency, cache-miss-heavy traffic (confirmed via
+    # isolated A/B repro: identical Kimi-K3 workload on MI355X crashes with
+    # HSA_STATUS_ERROR_OUT_OF_RESOURCES within ~2 minutes on a4w4, stable
+    # indefinitely on a8w4). If both flags are set, the base flag wins and
+    # a4w4 is still selected.
     # Needs AITER >= v0.1.20 (ROCm/aiter#4463) for the a4w4 dispatch flag
     # and tuned kimik3_a4w4_*_fmoe.csv rows; otherwise FlyDSL uses heuristics.
     "VLLM_ROCM_USE_AITER_MOE_SITUV2": lambda: (
