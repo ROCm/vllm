@@ -115,7 +115,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     # lazy import to avoid triggering `torch.compile` too early
     from vllm.config.quantization import _ONLINE_SHORTHANDS
     from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
-    from vllm.models.deepseek_v4 import DeepseekV4FP8Config
+    from vllm.models.deepseek_v4_1 import DeepseekV4FP8Config
 
     from .auto_awq import AutoAWQConfig
     from .auto_gptq import AutoGPTQConfig

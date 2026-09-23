@@ -26,6 +26,7 @@ from vllm.platforms.rocm import _ON_GFX950
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWABackend,
@@ -467,6 +468,11 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
         return "ROCM_FLASHMLA_SPARSE_DSV4"
 
     @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # shared DeepseekV4IndexerBackend only supports 256
+        return [256]
+
+    @staticmethod
     def get_builder_cls() -> type[DeepseekV4SparseMLAMetadataBuilder]:
         return DeepseekV4SparseMLAMetadataBuilder
 
@@ -507,6 +513,11 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         from vllm._aiter_ops import rocm_aiter_ops
 
         if not rocm_aiter_ops.is_enabled():
+            return
+        # aiter gemm_a8w8_blockscale_bpreshuffle is disabled on gfx1250
+        from vllm.platforms.rocm import on_gfx1250
+
+        if on_gfx1250():
             return
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             _upcast_e8m0_to_fp32,

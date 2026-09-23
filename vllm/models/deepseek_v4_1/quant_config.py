@@ -14,7 +14,9 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QuantizationMethods
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.models.deepseek_v4.quant_config import (
+    DeepseekV4FP8Config as _DeepseekV4FP8ConfigBase,
+)
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
@@ -30,7 +32,7 @@ if TYPE_CHECKING:
     )
 
 
-class DeepseekV4FP8Config(Fp8Config):
+class DeepseekV4FP8Config(_DeepseekV4FP8ConfigBase):
     """FP8 config for DeepSeek V4 with expert-dtype-aware MoE dispatch.
 
     DeepSeek V4 checkpoints always use FP8 block quantization for
