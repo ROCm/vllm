@@ -46,7 +46,8 @@ def _build_inputs(M, N, K, group_size, dtype, has_zp):
     """Weights, scales and zero-points exactly as the layer hands them over."""
     x_mk = (0.25 * torch.randn((M, K), device=device, dtype=torch.float32)).to(dtype)
     w_int4_nk = torch.randint(0, 16, (N, K), device=device, dtype=torch.int32)
-    w_q = hybrid_module.pack_int4_exllama_shuffle(w_int4_nk).contiguous()
+    # hipBLASLt dropped the ExLlama encoding; its weights are plain K order.
+    w_q = hybrid_module.pack_int4_plain(w_int4_nk).contiguous()
     scales_nkg = (
         0.05 * torch.rand((N, K // group_size), device=device, dtype=torch.float32)
     ).to(dtype)

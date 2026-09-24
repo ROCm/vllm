@@ -12,7 +12,7 @@
 // hipBLASLt's m = vLLM's N (output features) and hipBLASLt's n = vLLM's M
 // (batch), in TN orientation:
 //
-//   A  HIP_R_4I  (k x m, lda)  <- w_q [N, K/2] int8, ExLlama shuffle
+//   A  HIP_R_4I  (k x m, lda)  <- w_q [N, K/2] int8, nibbles in K order
 //   B  fp16/bf16 (k x n, K)    <- x   [M, K]
 //   D  fp16/bf16 (m x n, N)    <- out [M, N] row-major
 //
@@ -79,12 +79,24 @@ hipblasLtMatmulMatrixScale_t scale_mode_of(int64_t group_size, bool has_zp) {
   }
 }
 
-// A plan is shared by every call with the same weight shape. The two things
-// that do vary -- the batch size (the layouts' column count) and the layer's
-// scale pointer -- are set on every call, which keeps the cache bounded by the
-// number of distinct weight shapes rather than by the batch sizes seen. The
-// w4a16 kernels come from a FreeSize logic file, so the heuristic returns the
-// same solution whatever the batch size it was queried with.
+// Once the library carries size-specialised logic -- an Equality table, or a
+// decode-tuned solution -- the heuristic's answer depends on the batch size, so
+// a plan queried at one batch size must not be reused at another. Reusing one
+// silently pins every call to whichever batch size happened to touch the layer
+// first, which during start-up is a profile-run prefill: decode then replays a
+// prefill-tuned kernel and the library is never asked about n=1 at all.
+//
+// Keying on the exact batch size would grow the cache with every prefill
+// length, so it is bucketed to the next power of two: one entry per shape per
+// octave, and decode (n=1) gets its own query, which is the case whose best
+// kernel differs most. Within a bucket only the layouts' column count and the
+// layer's scale pointer vary, and both are set on every call.
+int64_t batch_bucket(int64_t M) {
+  int64_t b = 1;
+  while (b < M) b <<= 1;
+  return b;
+}
+
 struct Plan {
   hipblasLtMatmulDesc_t desc = nullptr;
   hipblasLtMatrixLayout_t layout_a = nullptr;
@@ -94,21 +106,26 @@ struct Plan {
   size_t workspace_bytes = 0;
 };
 
-using PlanKey = std::tuple<int, int64_t, int64_t, int64_t, int64_t, bool>;
+using PlanKey =
+    std::tuple<int, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
 
 Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K, int64_t lda,
                int64_t group_size, bool has_zp, const void* scale_ptr) {
   static std::map<PlanKey, Plan> cache;
-  const PlanKey key{static_cast<int>(dtype), N, K, lda, group_size, has_zp};
+  const int64_t bucket = batch_bucket(M);
+  const PlanKey key{static_cast<int>(dtype), N,       K,     lda,
+                    group_size,              has_zp,  bucket};
   auto it = cache.find(key);
   if (it != cache.end()) return it->second;
 
   const hipDataType act = hip_type_of(dtype);
   Plan plan;
 
+  // Queried at the bucket, not at M, so every call in the bucket shares the
+  // solution the heuristic picked for a batch size of that magnitude.
   LT_CHECK(hipblasLtMatrixLayoutCreate(&plan.layout_a, HIP_R_4I, K, N, lda));
-  LT_CHECK(hipblasLtMatrixLayoutCreate(&plan.layout_b, act, K, M, K));
-  LT_CHECK(hipblasLtMatrixLayoutCreate(&plan.layout_d, act, N, M, N));
+  LT_CHECK(hipblasLtMatrixLayoutCreate(&plan.layout_b, act, K, bucket, K));
+  LT_CHECK(hipblasLtMatrixLayoutCreate(&plan.layout_d, act, N, bucket, N));
 
   LT_CHECK(hipblasLtMatmulDescCreate(&plan.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
   hipblasOperation_t op_a = HIPBLAS_OP_T, op_b = HIPBLAS_OP_N;
@@ -117,7 +134,7 @@ Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K, int64_t ld
   LT_CHECK(hipblasLtMatmulDescSetAttribute(plan.desc, HIPBLASLT_MATMUL_DESC_TRANSB,
                                            &op_b, sizeof(op_b)));
 
-  int32_t encoding = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXLLAMA_EXT;
+  int32_t encoding = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;
   LT_CHECK(hipblasLtMatmulDescSetAttribute(
       plan.desc, HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT, &encoding,
       sizeof(encoding)));
@@ -145,7 +162,8 @@ Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K, int64_t ld
                                            plan.layout_d, pref, 1, heuristic,
                                            &found));
   LT_CHECK(hipblasLtMatmulPreferenceDestroy(pref));
-  TORCH_CHECK(found > 0, "hipblaslt_w4a16: no solution for M=", M, " N=", N,
+  TORCH_CHECK(found > 0, "hipblaslt_w4a16: no solution for M=", M,
+              " (queried at ", bucket, ") N=", N,
               " K=", K, " lda=", lda, " group_size=", group_size, " ",
               (has_zp ? "asym" : "sym"), " ", dtype,
               " -- this hipBLASLt has no kernel for that combination");
