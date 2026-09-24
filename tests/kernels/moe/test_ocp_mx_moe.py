@@ -46,8 +46,10 @@ if ROCM_AVAILABLE:
     ROCM_TRITON_KERNELS_AVAILABLE = has_triton_kernels()
     ROCM_GFX950 = on_gfx950()
 
+    if ROCM_TRITON_KERNELS_AVAILABLE:
+        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
+
     if ROCM_AITER_AVAILABLE:
-        from aiter.ops.triton.moe.quant_moe import upcast_from_mxfp
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
 if TRTLLM_GEN_MXFP4_AVAILABLE:
