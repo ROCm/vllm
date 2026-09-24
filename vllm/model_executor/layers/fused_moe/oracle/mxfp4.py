@@ -1169,10 +1169,10 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             return (w13_data, w2_data, w13_scale, w2_scale,
                     w13_bias, w2_bias)
 
-        from vllm._aiter_ops import rocm_aiter_ops
-
         # e8m0_shuffle on weight scales (GFX950 swizzle layout)
         from aiter.utility.fp4_utils import e8m0_shuffle
+
+        from vllm._aiter_ops import rocm_aiter_ops
 
         s0, s1, _ = w13_weight_scale.shape
         w13_weight_scale.data = e8m0_shuffle(w13_weight_scale.view(s0 * s1, -1)).view(
