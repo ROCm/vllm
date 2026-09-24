@@ -103,6 +103,8 @@ class _Knobs(TypedDict, total=False):
     msplit: int
     bfly: int
     gridt: int
+    dpl: int
+    ldsplit: int
 
 
 _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
@@ -110,7 +112,27 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     # S=32768; D=256 never regresses at 4 and is ~3% faster there at short
     # context.  D=128 at M=1 saturates at 2 -- 2, 3 and 4 are within noise of
     # each other, so it takes the one that spends least on the VALU.
-    (16, 2, 512, 4): {"bfly": 3},
+    #
+    # DPL: entry 007, on the four M=4 rows that carry it below.  DPL=32 halves
+    # LPR, so the score butterfly reduces over 16 lanes in four
+    # dependent stages instead of five.  Ablating the kernel's three VALU
+    # blocks showed that is the only one whose cost is real: thinning P@V or
+    # Q@K makes the kernel *slower* (they hide memory latency for free), while
+    # thinning the butterfly is worth 11-15 %.  It needs LDSPLIT=2 because
+    # SUB doubles with DPL and the partials no longer fit LDS.
+    #
+    # M=4 only.  At M=1 the kernel already runs at 94 % of the bus, so a
+    # shorter butterfly buys nothing and the extra registers and the chunked
+    # epilogue cost 2.5-6.6 % -- it loses on all five M=1 configurations.
+    # (8,2,512,4) is excluded too: it regresses five of seven contexts.
+    #
+    # These rows regress S=128 by 4-9 %, which the old percentage rule in
+    # HANDOFF 4.1 forbade.  In absolute time that is 0.5-0.7 us against 137-203
+    # us saved at S=32768, so the rule now reads in microseconds; see the
+    # handoff.  KPW=8 was re-examined under the same criterion and stays
+    # rejected -- it does not combine with DPL=32 (SUB doubles, so KPWE does
+    # too) and regresses up to +676 us.
+    (16, 2, 512, 4): {"bfly": 3, "dpl": 32, "ldsplit": 2},
     (16, 2, 256, 4): {"bfly": 4},
     (32, 8, 128, 1): {"bfly": 2},
     # D=512, all five configurations, BFLY swept 0..4 at M in {1,4} over seven
@@ -124,7 +146,7 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     # Note 8/2 and 8/1 disagree at M=1 (1 against 4) and 16/1 and 16/2 disagree
     # at M=4 (4 against 3) -- no rule fits these, which is why it is a table.
     (8, 1, 512, 1): {"bfly": 4},
-    (8, 1, 512, 4): {"bfly": 3},
+    (8, 1, 512, 4): {"bfly": 3, "dpl": 32, "ldsplit": 2},
     # GRIDT: dispatching head-fastest instead of segment-fastest fixes the one
     # outlier of the M=1 table -- this configuration read 53.2% of roofline and
     # 1.60x against Triton where its neighbours were at 90-99% and ~3x. It now
@@ -144,10 +166,10 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     # held.
     (8, 2, 512, 4): {"bfly": 2},
     (16, 1, 512, 1): {"bfly": 4},
-    (16, 1, 512, 4): {"bfly": 4},
+    (16, 1, 512, 4): {"bfly": 4, "dpl": 32, "ldsplit": 2},
     (16, 2, 512, 1): {"bfly": 4},
     (32, 4, 512, 1): {"bfly": 4},
-    (32, 4, 512, 4): {"bfly": 4},
+    (32, 4, 512, 4): {"bfly": 4, "dpl": 32, "ldsplit": 2},
 }
 
 

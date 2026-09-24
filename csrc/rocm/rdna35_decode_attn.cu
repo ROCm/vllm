@@ -72,6 +72,21 @@
 #ifndef GRIDT
   #define GRIDT 0
 #endif
+// Measurement only -- ABLATE != 0 COMPUTES THE WRONG ANSWER on purpose.
+//
+// The KV bytes per tile do not depend on MAXM but the arithmetic over them
+// does, so at MAXM > 1 what bounds this kernel is per-query-row VALU work.
+// Each bit thins one block of it to a single iteration and leaves the loads,
+// the loop and the epilogue intact, so the delta is that block alone and the
+// result is an upper bound on what restructuring it could ever buy.
+//
+//   1  P@V accumulation      2  score butterfly      4  Q@K dot product
+//
+// check.py MUST fail on any non-zero value; if it passes, the block was
+// already dead and the measurement means nothing.
+#ifndef ABLATE
+  #define ABLATE 0
+#endif
 // Merge the NWAVE per-wave partials inside the workgroup, in LDS, instead of
 // routing them through global memory.  With NSEG==1 that finishes the job and
 // no second kernel runs.  With NSEG>1 a head's partials do span workgroups so
@@ -110,7 +125,9 @@
 // 1.10x at Hq=16/Hkv=2, where the KV budget is so small the kernel is
 // latency-bound and the registers the split costs outweigh the wider load.
 // 256 already loads b128 and 512 cannot: 512/8 would want 64 lanes per row.
-#define DPL (HEAD_DIM == 128 ? 8 : HEAD_DIM / WAVE)
+#ifndef DPL
+  #define DPL (HEAD_DIM == 128 ? 8 : HEAD_DIM / WAVE)
+#endif
 #define LPR (HEAD_DIM / DPL)  // lanes covering one row
 #define SUB (WAVE / LPR)      // tokens a wave carries side by side
 // Widening the load must not widen the tile.  A lane held KPW rows of DPL
@@ -142,8 +159,28 @@
 // The reader pays for it: consecutive d now straddle the pad, which costs a
 // 2-way conflict there.  Trading 16-way on the write for 2-way on the read.
 #define LDS_SLICE (DPL + 1)
-#define LDS_STRIDE (LPR * LDS_SLICE)
-#define LDS_OFF(d) (((d) / DPL) * LDS_SLICE + ((d) % DPL))
+// Passes the epilogue cuts the head dimension into before reducing in LDS.
+//
+// The partial count is MAXM*NSLICE*SUB and each partial costs HEAD_DIM floats,
+// so the accumulator alone can spend the entire 64 KiB: at D=512/MAXM=4 that
+// happens at NSLICE=8, and again at DPL=32 where SUB doubles the row count.
+// No pad or swizzle recovers those cases -- the budget is gone before the pad
+// is counted.
+//
+// Cutting the reduction into LDSPLIT passes over d divides the *simultaneous*
+// footprint instead. Each pass stores only its slice of every partial, so the
+// cost is one extra barrier per pass and the softmax arithmetic is untouched.
+// 1 is the single-pass layout, byte for byte.
+//
+// It is an enabler, not an optimisation: on its own it measures neutral. What
+// it buys is configurations the ceiling would otherwise forbid.
+#ifndef LDSPLIT
+  #define LDSPLIT 1
+#endif
+#define CHUNK_LPR (LPR / LDSPLIT)     // lane-rows whose slice is resident
+#define CHUNK_D (HEAD_DIM / LDSPLIT)  // output elements resident per pass
+#define LDS_STRIDE (CHUNK_LPR * LDS_SLICE)
+#define LDS_OFF(d) ((((d) % CHUNK_D) / DPL) * LDS_SLICE + ((d) % DPL))
 #define LDS_ROW_BYTES (LDS_STRIDE * 4 + 8)
 #define LDS_FOR(MS) ((MAXM / (MS)) * NWAVE * SUB * LDS_ROW_BYTES)
 
@@ -203,6 +240,14 @@ static_assert(PAGE_PAD % 8 == 0, "PAGE_PAD must keep pages 16B aligned");
 static_assert(BS % KPW == 0, "a KPW tile must not straddle two blocks");
 static_assert(NWAVE % MSPLIT == 0 && MAXM % MSPLIT == 0,
               "MSPLIT must divide both the wave count and the token count");
+// A lane owns DPL consecutive d, so a chunk boundary must fall between lanes
+// rather than inside one: only then does a lane's whole slice belong to one
+// pass, and the chunk predicate stay a comparison on lrow.
+static_assert(LPR % LDSPLIT == 0,
+              "LDSPLIT must divide the lanes covering one row");
+#if LDSPLIT > 1
+static_assert(FUSED, "LDSPLIT only applies to the fused epilogue");
+#endif
 static_assert(LDS_FOR(MSPLIT) <= 65536,
               "partials must fit the 64 KiB per-workgroup LDS; raise MSPLIT");
 #if MSPLIT > 1
@@ -428,7 +473,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       for (int t = 0; t < MPW; ++t) {
         float d = 0.f;
 #pragma unroll
-        for (int e = 0; e < FPL; ++e)
+        for (int e = 0; e < ((ABLATE & 4) ? 1 : FPL); ++e)
           d = __builtin_amdgcn_fdot2(as_h2(qr[t][e]), as_h2(kr[c][e]), d,
                                      false);
         s[c][t] = d;
@@ -483,7 +528,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
        ? BFLY_VALU(st, v)          \
        : __builtin_amdgcn_ds_bpermute(addr, __builtin_bit_cast(int, v)))
 #pragma unroll
-    for (int st = 1; st < LPR; st <<= 1) {
+    for (int st = 1; st < ((ABLATE & 2) ? 2 : LPR); st <<= 1) {
       const int addr = (lane ^ st) << 2;  // ds_bpermute indexes lanes by byte
 #pragma unroll
       for (int c = 0; c < KPWE; ++c)
@@ -546,7 +591,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
         // Not worth pairing into VOPD: thinning this loop to 1/8 of its work
         // buys 2.2% at S=128, and perfect dual-issue is only worth half of it.
         // Occupancy already hides the VALU behind other waves' loads.
-        for (int i = 0; i < DPL; ++i) acc[t][i] += s[c][t] * (float)vv[i];
+        for (int i = 0; i < ((ABLATE & 1) ? 1 : DPL); ++i)
+          acc[t][i] += s[c][t] * (float)vv[i];
     }
   }
 
@@ -568,75 +614,92 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   __shared__ float lds_m[MPW * NWAVE * SUB];
   __shared__ float lds_l[MPW * NWAVE * SUB];
 
+  // m and l are per-partial scalars, not per-element, so they are written once
+  // and outlive every chunk; only the accumulator is re-staged per pass.
   #pragma unroll
-  for (int t = 0; t < MPW; ++t) {
-  #pragma unroll
-    for (int i = 0; i < DPL; ++i)
-      lds_acc[((size_t)(t * NWAVE + wave) * SUB + grp) * LDS_STRIDE +
-              lrow * LDS_SLICE + i] = acc[t][i];
+  for (int t = 0; t < MPW; ++t)
     if (lrow == 0) {
       lds_m[(t * NWAVE + wave) * SUB + grp] = mx[t];
       lds_l[(t * NWAVE + wave) * SUB + grp] = ls[t];
     }
-  }
-  __syncthreads();
 
   #pragma unroll
-  for (int m = 0; m < MAXM; ++m) {
-    const int wb = (m / MSPLIT) * NWAVE + (m % MSPLIT);
-
-    float gmax = -INFINITY;
-  #pragma unroll
-    for (int p = 0; p < NPARTW; ++p)
-      gmax = fmaxf(gmax, lds_m[partial_row(wb, p)]);
-
-    // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight
-    // is exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
-    // workgroup can be empty though, and then gmax is -inf as well:
-    // (-inf) - (-inf) is NaN, which would poison the partial.
-    // Kept live rather than recomputed in the d loop: recomputing trades 32
-    // VGPR at D=64 for a 1.5x loss at D=128 (122.62 -> 184.23 us at S=4096),
-    // which is the wrong side of that trade.
-    float a[NPARTW], den = 0.f;
-  #pragma unroll
-    for (int p = 0; p < NPARTW; ++p) {
-      const int w = partial_row(wb, p);
-      a[p] = weight_of(lds_m[w], gmax);
-      den = fmaf(a[p], lds_l[w], den);
-    }
-
-  #if NSEG > 1
-    // (num, gmax, den) is itself a valid partial softmax state, so hand the
-    // global reduction one per (head, segment) rather than NWAVE of them.
-    const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
-    if (tid == 0) {
-      p_m[pb] = gmax;
-      p_l[pb] = den;
-    }
+  for (int cc = 0; cc < LDSPLIT; ++cc) {
+  #if LDSPLIT > 1
+    // Readers of the previous chunk must be done before its storage is reused.
+    if (cc) __syncthreads();
+    if (lrow / CHUNK_LPR == cc)
   #endif
-    // BLOCK need not equal HEAD_DIM once D is free: D=512 has more output
-    // elements than threads and D=64 has fewer.  The equal case is spelled
-    // out because the compiler cannot prove tid < HEAD_DIM and otherwise
-    // wraps the body in an exec mask and a branch on a condition that is
-    // always true.
-  #if BLOCK == HEAD_DIM
-    const int d = tid;
     {
-  #else
-    for (int d = tid; d < HEAD_DIM; d += BLOCK) {
-  #endif
-      float num = 0.f;
+  #pragma unroll
+      for (int t = 0; t < MPW; ++t)
+  #pragma unroll
+        for (int i = 0; i < DPL; ++i)
+          lds_acc[((size_t)(t * NWAVE + wave) * SUB + grp) * LDS_STRIDE +
+                  (lrow % CHUNK_LPR) * LDS_SLICE + i] = acc[t][i];
+    }
+    __syncthreads();
+
+  #pragma unroll
+    for (int m = 0; m < MAXM; ++m) {
+      const int wb = (m / MSPLIT) * NWAVE + (m % MSPLIT);
+
+      float gmax = -INFINITY;
   #pragma unroll
       for (int p = 0; p < NPARTW; ++p)
-        num = fmaf(
-            a[p], lds_acc[(size_t)partial_row(wb, p) * LDS_STRIDE + LDS_OFF(d)],
-            num);
-  #if NSEG == 1
-      out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d] =
-          (OutT)fast_div(num, den);
-  #else
-      p_acc[pb * HEAD_DIM + d] = num;
+        gmax = fmaxf(gmax, lds_m[partial_row(wb, p)]);
+
+      // A wave with no tiles carries mx = -INFINITY and ls = 0, so its weight
+      // is exp2(-inf) = 0 and it drops out on its own.  With NSEG > 1 a whole
+      // workgroup can be empty though, and then gmax is -inf as well:
+      // (-inf) - (-inf) is NaN, which would poison the partial.
+      // Kept live rather than recomputed in the d loop: recomputing trades 32
+      // VGPR at D=64 for a 1.5x loss at D=128 (122.62 -> 184.23 us at S=4096),
+      // which is the wrong side of that trade.
+      float a[NPARTW], den = 0.f;
+  #pragma unroll
+      for (int p = 0; p < NPARTW; ++p) {
+        const int w = partial_row(wb, p);
+        a[p] = weight_of(lds_m[w], gmax);
+        den = fmaf(a[p], lds_l[w], den);
+      }
+
+  #if NSEG > 1
+      // (num, gmax, den) is itself a valid partial softmax state, so hand the
+      // global reduction one per (head, segment) rather than NWAVE of them.
+      const size_t pb = ((size_t)h * NSEG + seg) * MAXM + m;
+      // Every chunk recomputes the same value; only the first publishes it.
+      if (tid == 0 && cc == 0) {
+        p_m[pb] = gmax;
+        p_l[pb] = den;
+      }
   #endif
+      // BLOCK need not equal HEAD_DIM once D is free: D=512 has more output
+      // elements than threads and D=64 has fewer.  The equal case is spelled
+      // out because the compiler cannot prove tid < HEAD_DIM and otherwise
+      // wraps the body in an exec mask and a branch on a condition that is
+      // always true.  A chunked epilogue covers less than HEAD_DIM per pass, so
+      // it always takes the general loop.
+  #if BLOCK == HEAD_DIM && LDSPLIT == 1
+      const int d = tid;
+      {
+  #else
+      for (int d = cc * CHUNK_D + tid; d < (cc + 1) * CHUNK_D; d += BLOCK) {
+  #endif
+        float num = 0.f;
+  #pragma unroll
+        for (int p = 0; p < NPARTW; ++p)
+          num = fmaf(
+              a[p],
+              lds_acc[(size_t)partial_row(wb, p) * LDS_STRIDE + LDS_OFF(d)],
+              num);
+  #if NSEG == 1
+        out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d] =
+            (OutT)fast_div(num, den);
+  #else
+        p_acc[pb * HEAD_DIM + d] = num;
+  #endif
+      }
     }
   }
 

@@ -64,23 +64,39 @@ class KernelVariant:
     # head reads byte-identical addresses, so this decides whether adjacent
     # workgroups share lines or merely neighbour them.
     gridt: int = 0
+    # Measurement only: thins one VALU block and returns wrong numbers. See the
+    # ABLATE comment in the kernel.
+    ablate: int = 0
+    # fp16 per lane of a row. 0 keeps the kernel's own rule. Lowering LPR =
+    # head_size/dpl shortens the butterfly's dependency chain by a stage, at
+    # the cost of registers and of SUB rows of LDS partials.
+    dpl: int = 0
+    # Passes the epilogue cuts the head dimension into before reducing in LDS.
+    # An enabler: neutral on its own, it lifts the ceiling that would otherwise
+    # forbid a configuration outright.
+    ldsplit: int = 1
     # Finish the cross-workgroup reduction inside decode_attn instead of
     # launching reduce_segments for it.  On by default: worth ~1.2 us flat, and
     # a no-op at nseg == 1 where no second kernel runs anyway.
     fusedred: bool = True
 
     def __post_init__(self) -> None:
-        # Raise msplit until the partials fit LDS.  Each of the
-        # (max_m / msplit) * waves rows costs head_size floats plus the m and l
-        # scalars, so max_m = 8 at head_size = 256 does not fit at msplit = 1.
-        # Resolved here rather than in the kernel so the variant name, and
-        # therefore the compiled symbol, matches what is actually built.
+        # Raise msplit until the partials fit LDS.  Mirrors the kernel's
+        # LDS_FOR() exactly -- the per-lane-slice pad, the sub grouping and the
+        # ldsplit chunking -- because the kernel static_asserts on the same
+        # bound, so an approximation here is a build failure rather than a
+        # slower choice.  Resolved here rather than in the kernel so the
+        # variant name, and therefore the compiled symbol, matches what is
+        # actually built.
         waves = self.block // _WAVE
-        row = self.head_size * 4 + 8
+        dpl = self.dpl or (8 if self.head_size == 128 else self.head_size // _WAVE)
+        lpr = self.head_size // dpl
+        sub = _WAVE // lpr
+        row = (lpr // self.ldsplit) * (dpl + 1) * 4 + 8
         ms = self.msplit
         while (
             ms < self.max_m
-            and (self.max_m // ms) * waves * row > 65536
+            and (self.max_m // ms) * waves * sub * row > 65536
             and self.max_m % (ms * 2) == 0
             and waves % (ms * 2) == 0
         ):
@@ -99,6 +115,9 @@ class KernelVariant:
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
             f"_b{self.block}_ms{self.msplit}_i{self.ilv}_bf{self.bfly}"
             f"{'_gt' if self.gridt else ''}"
+            f"{'' if not self.ablate else f'_ab{self.ablate}'}"
+            f"{'' if not self.dpl else f'_dpl{self.dpl}'}"
+            f"{'' if self.ldsplit == 1 else f'_ls{self.ldsplit}'}"
             f"{'' if self.fusedred else '_nofr'}"
             f"_f{int(self.fused)}"
         )
@@ -233,6 +252,9 @@ def load(variant: KernelVariant) -> Any:
         f"-DILV={variant.ilv}",
         f"-DBFLY={variant.bfly}",
         f"-DGRIDT={variant.gridt}",
+        f"-DABLATE={variant.ablate}",
+        f"-DLDSPLIT={variant.ldsplit}",
+        *([f"-DDPL={variant.dpl}"] if variant.dpl else []),
         f"-DFUSEDRED={int(variant.fusedred)}",
     ]
     logger.info("Compiling %s", variant.name)

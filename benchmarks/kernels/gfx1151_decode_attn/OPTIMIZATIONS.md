@@ -773,3 +773,104 @@ only 4, 8 and 16.
 `_knobs_for` for the whole run. Measuring a knob against the golden across all
 70 cells is what separated this from the three-context sweep that made it look
 like a win.
+
+---
+
+## 007 — Shorten the score butterfly by widening the lane slice
+
+**Status:** landed on four of the five D=512 M=4 configurations, as
+`{"dpl": 32, "ldsplit": 2}` rows. M=1 keeps `DPL=16`.
+
+### How the ablation found it
+
+`ABLATE` thins one VALU block to a single iteration and leaves the loads, the
+loop and the epilogue intact. It returns wrong numbers on purpose — every bit
+must make `check.py` fail, and all three do — so the delta bounds what
+restructuring that block could ever buy. `16/1/512` at M=4:
+
+| ablated | S=8192 | S=32768 | |
+| --- | --- | --- | --- |
+| nothing | 192.33 | 771.35 | |
+| P@V (16 -> 1) | 215.71 | 837.84 | **+12 % slower** |
+| Q@K (8 -> 1) | 212.66 | 821.77 | **+11 % slower** |
+| butterfly (5 -> 1 stages) | 163.29 | 684.24 | -15 % / -11 % |
+
+**Removing arithmetic makes the kernel slower in two of three cases.** That
+work is hiding memory latency for free; take it away and the wave stalls on the
+loads instead. It is the sharpest evidence yet that this kernel is not
+VALU-throughput bound, and it refuted a model — `time ~ max(bytes/BW, M*c)` —
+that had fitted M=1, M=2 and M=4 to within 10 % an hour earlier. The fit was a
+coincidence.
+
+Only the butterfly costs real time, and the reason is structural: its strides
+are a dependency chain (stride 2 consumes stride 1), so unlike P@V and Q@K it
+cannot be overlapped with anything.
+
+### The change
+
+`DPL` is fp16 per lane of a row; `LPR = HEAD_DIM/DPL` lanes cover one row and
+the butterfly runs `log2(LPR)` stages. At D=512 the rule gave `DPL=16`,
+`LPR=32`, five stages. `DPL=32` gives `LPR=16` and **four**.
+
+```c
+#ifndef DPL
+  #define DPL (HEAD_DIM == 128 ? 8 : HEAD_DIM / WAVE)
+#endif
+```
+
+`SUB = WAVE/LPR` doubles to 2, so the partial count doubles and LDS overflows:
+32 rows x 528 floats + scalars = 67840 B against a 65536 B ceiling. `LDSPLIT=2`
+chunks the epilogue's reduction over the head dimension and brings it to
+34052 B. LDSPLIT is an enabler, not an optimisation — on its own it measures
+neutral (191.55 against 193.97 us).
+
+| | instructions | LDS | VGPR | spill |
+| --- | --- | --- | --- | --- |
+| DPL=16 | 1329 | 34948 | 127 | 0 |
+| DPL=32 + LDSPLIT=2 | 1760 | 34052 | 193 | 0 |
+
+### What it measured
+
+D=512 matrix, against the previous golden:
+
+| | geomean vs Triton | worst | losses |
+| --- | --- | --- | --- |
+| M=1 before / after | 2.963x / **2.965x** | 1.65x | 0 |
+| M=4 before / after | 2.928x / **3.044x** | 1.91x -> **2.13x** | 0 |
+
+Per configuration at M=4, and why one is excluded:
+
+| Hq/Hkv | geomean | worst cell | landed |
+| --- | --- | --- | --- |
+| 16/1 | 0.915 | +0.54 us | yes |
+| 32/4 | 0.944 | +0.47 us | yes |
+| 16/2 | 0.970 | +0.69 us | yes |
+| 8/1 | 0.989 | +0.66 us | yes |
+| 8/2 | 1.015 | +6.86 us | **no** — regresses five of seven contexts |
+
+`16/1` at M=4, the configuration this whole investigation started from, goes
+from 33.6 % to 40.8 % of roofline at S=32768 and 815.7 -> 670.6 us.
+
+### Why M=4 only
+
+At M=1 the kernel already streams at 94 % of the bus, so a shorter butterfly
+buys nothing while 193 VGPRs against 127 and the chunked epilogue cost real
+time. It loses on all five M=1 configurations, 2.5-6.6 %.
+
+### It changed the acceptance rule
+
+These rows regress S=128 by 4-9 %, which the old percentage rule forbade. In
+absolute time that is 0.47-0.69 us against 137-203 us saved at S=32768. HANDOFF
+§4.1 now reads in microseconds; see the note there.
+
+`KPW=8` (entry 006) was re-examined under the new criterion and stays rejected
+on its own merits: it does not combine with `DPL=32` — `SUB` doubles so `KPWE`
+does too — and the combination regresses up to +676 us, while on `16/1` alone
+`DPL=32` is simply better (0.915 against 0.981).
+
+### Not done
+
+`BFLY` was not re-tuned under the shorter butterfly, and it should be. A
+three-point sweep on `16/1` at M=4 put `bfly=0` 6.7 % ahead at S=32768, but
+those cells carried 10-13 % spread, so it is not resolvable at that sample
+size. D=64, D=128 and D=256 were not measured at all.

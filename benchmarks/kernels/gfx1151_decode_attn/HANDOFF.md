@@ -7,146 +7,182 @@ items is actually worth doing.
 Everything here was measured on a Radeon 8060S (gfx1151), batch = 1 sequence,
 fp16, HND. Nothing is estimated.
 
+Three files carry the record and they do different jobs:
+
+| file | what it is |
+| --- | --- |
+| this one | state, open work, traps |
+| `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with before/after ISA, the C++ diff and the numbers |
+| `golden/` | best measured result per head size; replace only when beaten |
+| `reports/` | the original investigation record. **Its `%roof` numbers are superseded** -- see §3 |
+
 ---
 
 ## 1. Where things stand
 
-The kernel is **integrated and selected by a backend**, not a standalone
-experiment. `RDNA35_HIP_ATTN` serves 49 of the 50 shapes in
-`tools/shapes.csv`; the one it refuses is D=96, which is three fp16 per lane
-and has no single load width.
+The kernel is integrated and selected by a backend, not a standalone
+experiment. `RDNA35_HIP_ATTN` serves 49 of the 50 shapes in `tools/shapes.csv`;
+the one it refuses is D=96, which is three fp16 per lane and has no single load
+width. One kernel, `csrc/rocm/rdna35_decode_attn.cu`.
 
-One kernel, `csrc/rocm/rdna35_decode_attn.cu`. The small-grid fork that used to
-live beside it is gone — its decomposition is the `MSPLIT` knob now.
+`tools/shapes.csv` also carries nine sliding-window rows (gemma-3, gemma-4,
+paligemma2). The kernel is full-context, so every tool skips them and says so.
 
 ### The honest performance picture
 
-**We win at short context and lose at long.** Across 27 distinct
-configurations and 7 contexts, geomean **0.933x** against the Triton kernel
-vLLM ships:
+Full matrix, all 27 configurations x 7 contexts x M in {1,4}, against the
+Triton kernel vLLM ships:
 
-| S | geomean | configurations we lose |
-| --- | --- | --- |
-| 128 | 1.605x | 0 / 27 |
-| 512 | 1.268x | 8 / 27 |
-| 1024 | 1.053x | 13 / 27 |
-| 4096 | 0.791x | 15 / 27 |
-| 8192 | 0.735x | 15 / 27 |
-| 16384 | 0.713x | 15 / 27 |
-| 32768 | 0.691x | 15 / 27 |
+| M | geomean vs Triton | losses | median %roof |
+| --- | --- | --- | --- |
+| 1 (plain decode) | 1.176x | 61/182 | 71.3 % |
+| 4 (speculative) | 0.975x | 80/182 | 47.7 % |
 
-Full table in `reports/f12-matrix.md`, per-configuration geomeans below.
+That average hides a very wide spread by head size:
 
-Be careful with `reports/f11-shape-coverage.md`: it reports winning every
-shape, which is true **only at S=128**, the one context `roofline.py` measures.
-That is the mistake to avoid repeating — a gate that measures one context will
-tell you you are winning while you lose everywhere else.
+| D | M=1 | M=4 | tuned configs |
+| --- | --- | --- | --- |
+| 64 | 0.67x | **0.47x** | 0/4 |
+| 128 | 0.86x | 0.67x | 1/10 |
+| 256 | 1.33x | 1.15x | 1/7 |
+| 512 | **2.89x** | **2.91x** | 5/5 |
 
-### Which configurations lose
+D=512 is fully tuned and wins everywhere with zero losses. D=64 and D=128 are
+where we lose, and they are almost entirely untuned. **The single largest
+available win is calibrating the other head sizes the way D=512 was**; see §4.1.
 
-Worst first, geomean over the 7 contexts. `+n` is how many more models share
-the configuration.
-
-| geomean | Hq | Hkv | D | models |
-| --- | --- | --- | --- | --- |
-| 0.36x | 16 | 2 | 64 | MiniCPM-V-0.53B +1 |
-| 0.36x | 14 | 2 | 64 | Qwen2.5-0.5B |
-| 0.40x | 28 | 4 | 128 | Qwen2.5-7B **+4** |
-| 0.40x | 32 | 8 | 64 | Llama-3.2-1B |
-| 0.42x | 32 | 4 | 128 | Qwen3-30B-A3B +1 |
-| 0.55x | 24 | 8 | 128 | Llama-3.2-3B +1 |
-| 0.57x | 40 | 8 | 128 | Nemotron-3-Nano |
-| 0.57x | 32 | 8 | 128 | Qwen3-4B **+7** |
-| 0.61x | 32 | 2 | 128 | MiniCPM-V-custom |
-| 0.72x | 24 | 4 | 256 | Qwen3.6-27B |
-| 0.77x | 16 | 2 | 128 | Qwen2.5-3B +2 |
-| 0.95x | 32 | 32 | 64 | SmolLM2-1.7B |
-| 0.98x | 16 | 2 | 256 | Qwen3.5-35B +1 |
-
-Everything at D=512 wins by 1.95x-2.96x. D=256 wins except the two above.
-The losses are concentrated in D=64 and D=128 with small Hkv.
+These numbers predate the LDS change in `OPTIMIZATIONS.md` 003, which is worth
+another ~2-3 % across the board. `golden/d512.md` is current.
 
 ---
 
 ## 2. The loop
 
 ```text
-roofline.py  ->  worst shape  ->  ISA / measured wiki / first principles
-     ^                                          |
-     +--------------  commit  <-  validate  <---+
+matrix.py / roofline.py  ->  worst shape  ->  ISA, profiler, measured wiki
+        ^                                             |
+        +----------  golden + OPTIMIZATIONS  <-  validate  <-+
 ```
 
 | tool | what it answers | cost |
 | --- | --- | --- |
-| `tools/roofline.py` | where to look next; also the regression gate | minutes |
-| `tools/sweep.py` | one configuration, a matrix of knobs x contexts | minutes |
-| `tools/check.py` | correctness, with `--repeat` and `--mutate` | seconds |
-| `tools/matrix.py` | what we ship: every configuration x context vs Triton | ~19 min |
+| `tools/matrix.py` | what we ship: every configuration x context x M vs Triton | 1m52s for D=512, ~13 min for all |
+| `tools/roofline.py` | the regression gate, and where to look next | minutes |
+| `tools/sweep.py` | one configuration, a matrix of knobs x contexts | seconds |
 | `tools/tune.py` | searches (NSEG, MSPLIT) scoring the **worst** context | long |
+| `tools/check.py` | correctness, with `--repeat` and `--mutate` | seconds |
+| `tools/shapeset.py` | shared shape loading, filtering and the roofline | -- |
 | `tools/dump_asm.sh` | ISA for one variant | seconds |
 
-All of them build variants in parallel. A cold build is ~19.6 s of which the
-kernel is 0.57 s -- the rest is `torch/extension.h` -- so compilation, not
-measurement, was the cost of the loop until that was fixed.
+All of them share `shapeset.py`, so `--hkv 8`, `--gqa 4`, `--head-dim 512` and
+`--filter <model>` select the same rows everywhere. Call them **without
+arguments** unless you mean something specific -- the defaults are the
+considered choice. `matrix.py` keeps all seven contexts; the tuning tools use
+128 / 16384 / 32768, which is the shortest context where fixed cost dominates
+plus the two longest where bandwidth does.
 
 `roofline.py`'s `ran` column is not optional reading. The backend falls back to
 Triton silently, and a harness that does not check reports Triton as ours.
 
+### Measurement protocol, which changed
+
+**`--reps` defaults to 1.** `do_bench` already medians many iterations inside
+one call; a rep only resamples allocation and graph-capture placement. Measured
+drift of single-rep against the old `--reps 3`: 0.33 % median, 1.66 % p90,
+4.43 % worst -- the same envelope, at a third of the cost.
+
+**Every tool prints a `spread` column**, which is `do_bench`'s own dispersion
+inside the cell (1.5 % median, 6.4 % worst typically). Read it before believing
+any small difference. Cells occasionally report 100 %+ spread; those are not
+measurements.
+
+**No warm-up calls.** Every variant is precompiled and the loader is then
+*sealed*: `load()` raises `UnexpectedBuildError` rather than building something
+inside the timed region. This replaced a discarded call per cell and halved
+every run. It has since caught four real precompile/runtime divergences that
+the warm-up had been silently absorbing.
+
 ---
 
-## 3. The knobs
+## 3. The roofline, which also changed
 
-| knob | values | chosen by | tuned? |
-| --- | --- | --- | --- |
-| `NSEG` | 1..32 | `_segments_for`, targets 32 workgroups | **badly** |
-| `MSPLIT` | divisors of MAXM and NWAVE | `_MSPLIT_KV_HEADS`, a 4-point table | partly |
-| `BLOCK` | 128, 256, 512 | fixed 256 | **no** |
-| `KPW` | divisors of BS | fixed 4 | no |
-| `ILV` | 0, 1 | fixed 1 | measured, 1 wins |
-| `FUSEDRED` | 0, 1 | 1 | measured, 1 wins |
+`shapeset.roofline_us()` counts one kernel dispatch (1.48 us, the measured
+per-dispatch overhead on this SKU under a HIP graph), plus Q in, KV in, output
+out, and the block table. It previously counted **KV alone**.
 
-`_TARGET_WORKGROUPS = 32` **is the worst of four values at every head size
-measured** and is the single largest known loss. For Hq=32 it picks NSEG=1 and
-costs between 1.6x and 3.7x.
+It deliberately excludes the split-KV partials our kernel pushes through global
+memory: at S=128 those are 514 KiB against 512 KiB of KV, so counting them
+would double the denominator on exactly the shapes that look worst. It counts
+one dispatch, not NSEG of them, for the same reason -- the decomposition is
+ours, the single launch is not.
+
+The correction is +25 % at S=128/M=4 and under +0.1 % at S=32768, and it is
+larger at M=4 than at M=1, so **it was systematically biasing M=4 to look
+worse**. Any `%roof` in `reports/` or in an old golden is understated at short
+context. `vs Triton` is unaffected.
 
 ---
 
 ## 4. What to do next, in order
 
-### 4.1 Retune NSEG and MSPLIT per configuration
+### 4.1 Calibrate the other head sizes
 
-This is the work in progress and the biggest available win. Done one
-configuration at a time, not as a global sweep.
+D=512 is done: 10 rows in `_TUNED`, zero losses, 2.9x. D=64, D=128 and D=256
+are essentially untuned and are where every loss is. D=256 is the best target
+-- 14 configuration/M pairs, only one tuned, already 1.33x/1.15x with 91 % of
+cells winning, and one real loser (`Hq=24/Hkv=4/M=4` at 0.72x).
 
-`Hq=32/Hkv=8/D=128` (8 models) is finished and is the template: tuning takes
-the worst context from **0.41x to 0.89x**, but **no combination of all five
-knobs wins everywhere**. At S=32768 we reach 82.6% of roofline and Triton
-reaches 93.0%.
+D=64 at 0.47x is the worst but is only 4 configurations, `DPL=2` is the
+narrowest load in the table, and the kernel comment already flags it as
+latency-bound. Expect a structural answer there, not a knob.
 
-So expect retuning to convert most losses into near-parity, not into wins.
-That is still worth roughly 2x on the shapes concerned.
+The loop per configuration: `sweep.py --hq .. --hkv .. --head-dim .. --m ..
+--bfly 0 1 2 3 4`, pick by best geomean, add the row, move on. **Add the row
+before moving to the next configuration.** Nothing measured may stay on the
+fallback.
+
+#### The acceptance rule reads in microseconds, not percent
+
+This rule used to be "regress no cell by more than the ~3.3 % harness noise".
+It was changed when `DPL=32` (OPTIMIZATIONS 007) hit it: that knob regresses
+S=128 by 4-9 % and wins 9-17 % at long context. In absolute time the regression
+is **0.47-0.69 us** and the win is **137-203 us** — a 200-400x asymmetry a
+percentage threshold cannot see. Cells are three orders of magnitude apart in
+absolute cost across the context range, so equal percentages are not equal
+costs.
+
+A candidate is accepted when the geomean improves **and** no cell regresses by
+a large absolute amount. That second half is what still rejects things: `KPW=8`
+on `(32,4,512,4)` has a better geomean than the default and regresses S=32768
+by +843 us, and `DPL=32` combined with `KPW=8` regresses up to +676 us. Both
+are refused.
+
+Report both numbers when proposing a row. A percentage alone at S=128 means
+almost nothing, and a percentage alone at S=32768 hides how much time it is.
 
 ### 4.2 Find out why Triton beats us at long context
 
-After 4.1 this is what is left, and it is not a tuning problem. On
-`Hq=32/Hkv=8/D=128` at S=32768 Triton extracts 93.0% of the KV roofline and
-our best configuration extracts 82.6%. Nobody has looked at what it does
-differently. This is the least-charted territory here.
+Unchanged and still the least-charted territory. Triton's split-KV partials are
+fp32 and the same shape as ours (`triton_attn.py:211`, allocated once in the
+metadata builder), so they pay the same overhead we do and still win. The
+interesting question is not "can we cut partials" but "why is their
+identical-shaped overhead cheaper".
 
-### 4.3 Support D=96
+### 4.3 Make the per-workgroup fixed path cheaper
 
-One shape, Phi-3.5-vision. 96/32 is three fp16 per lane, not a power of two,
-so it needs either a non-power-of-two lane group or a padded load. Deliberately
-out of scope so far.
+At `S=128, M=4` the call is **81 % fixed cost** (fit over the context range;
+the per-key slope is flat at ~11.2 ns/key from 128 to 32768). Of that, 1.48 us
+is dispatch and the rest is prologue, LDS reduction and partial publication.
+§6 shows this cannot be amortised by more parallelism or removed by layout, so
+it needs the fixed path itself to get cheaper -- a restructure, not a knob.
 
-### 4.4 The batch axis
+### 4.4 Support D=96, and the batch axis
 
-The kernel serves **one sequence**; the backend rejects batch > 1 to Triton.
-Every number in this document is batch = 1. In real serving decode is batched,
-so today we do not participate. Note that B and NSEG are substitutes -- both
-exist to fill the machine -- so introducing B pushes NSEG towards 1 and makes
-most of the split-KV machinery inert. It is a different regime, not an
-extension of this one.
+One shape, Phi-3.5-vision; 96/32 is three fp16 per lane. And the kernel serves
+one sequence -- the backend rejects batch > 1 to Triton, so in real batched
+decode we do not participate. B and NSEG are substitutes, so introducing B
+pushes NSEG towards 1 and makes most of the split-KV machinery inert. A
+different regime, not an extension of this one.
 
 ---
 
@@ -154,83 +190,92 @@ extension of this one.
 
 ### 5.1 Measuring one context and believing it
 
-`roofline.py` measures S=128. It is the right choice for finding fixed cost and
-the wrong one for judging whether we ship. See §1.
+`roofline.py` measures S=128. Right for finding fixed cost, wrong for judging
+whether we ship. `reports/f11-shape-coverage.md` claims we win every shape;
+that is true only at S=128.
 
-### 5.2 The harness times the JIT build
+### 5.2 Profiling on a hot cache
 
-The kernel compiles on its first `_prepare`, which lands inside
-`do_bench`'s own calibration -- and `do_bench` sizes `n_repeat` from it, so a
-build measuring seconds does not just add time, it makes the whole median
-wrong. Seen as 66.90 us next to a true 7.58. Every tool now does a discarded
-run first.
+The harness sets `min_working_set_mb=96`, which at `S=128, D=512, Hkv=1` means
+`layers_for_working_set` picks **384 layers** so every layer's KV is cold. A
+micro-driver reusing one 256 KiB buffer runs hot and measures a different
+kernel. The LDS fix looked like -21.7 % hot and is ~2-3 % in the harness; a
+rejected variant looked 28 % worse hot and is ~1.5 % worse in the harness.
+**Profile with the harness's working set or every number is flattered.**
 
-### 5.3 An override the backend would not have chosen rebuilds every forward
+### 5.3 Overriding a knob the backend would not have chosen
 
-`self._variant` then disagrees with what `_prepare` computes forever, and
-`make_scratch` zeroes the arrival counters, which is a device memset -- an
-extra kernel launch inside the timed region. It charged ~2 us to every
-overridden configuration, including ones where the override changed no
-generated code. Scratch is memoised in every tool for this reason.
+`self._variant` then disagrees with `_prepare` forever. Two consequences: the
+scratch is reallocated every forward (memoise it -- every tool does), and
+`replace()` carries forward a MSPLIT that `__post_init__` already raised for
+the *old* BLOCK. `sweep.py` rebuilds from `_knobs_for` before applying an
+override for this reason; anything else that overrides knobs must do the same.
 
 ### 5.4 Compiling immediately before measuring
 
-Saturates the cores and moves the SoC clock. A pass taken straight after a
-50-way rebuild reported three shapes falling back that are served on every
-quiet run. The tools settle before timing. This is what `quiet-lock` in
-`reports/00-protocol.md` exists for.
+Saturates the cores and moves the SoC clock. The tools settle for 5 s. See
+`reports/00-protocol.md`.
 
-### 5.5 Parallel builds are bounded by memory, not cores
+### 5.5 Parallel builds
 
-A build peaks at 1.15 GB. One per core wanted more than twice this machine's
-30 GB and had to be killed.
+Bounded by memory (a build peaks at 1.15 GB), and previously racy: torch
+hipifies on ROCm keyed on the **absolute source path** in a process-global
+dict, so every variant collided on one key and ~10 % of builds silently
+produced unhipified CUDA. `load()` now stages a private copy of the source per
+variant. If builds start vanishing again, look there first.
 
 ### 5.6 `.gitignore` eats new files
 
-`*.csv` and `*_hip*` both match things we add. `shapes.csv` needed
-`git add -f`. An earlier commit silently dropped eight kernels this way.
+`*.csv` and `*_hip*` both match things we add. `shapes.csv` needed `git add -f`.
 
 ### 5.7 An identifier the preprocessor has not seen is 0 inside `#if`
 
-The `MSPLIT` fallback rule read `NWAVE` before it was defined, so every branch
-compared `0 <= 65536` and it always chose 1. It had never worked; D=512 was the
-first shape where the fallback mattered.
+The MSPLIT fallback read `NWAVE` before it was defined and always chose 1.
 
 ### 5.8 `max_abs` is not a sufficient correctness criterion
 
-A causal off-by-one of a single key gives `max_rel = 1.2e-03` at S=2048 and
-passes a 2e-2 threshold. The error scales as ~1/S while the tolerance is fixed,
-so **longer contexts hide more bugs**. Validate with `max_rel <= 1e-3`, a short
-S, the `S=50` partial tile, `--repeat` for state left between launches, and the
-`--mutate 1` negative control.
+A causal off-by-one gives `max_rel = 1.2e-03` at S=2048 and passes a 2e-2
+threshold. Error scales as ~1/S while tolerance is fixed, so **longer contexts
+hide more bugs**. Validate with `max_rel <= 1e-3`, a short S, the S=50 partial
+tile, `--repeat`, and the `--mutate 1` negative control.
 
 ### 5.9 Harness flakiness
 
-Triton at S=512 sporadically faults or spikes. One cold-build pytest run failed
-the two layout=0 reference tests and has never reproduced. Treat anything under
-~2% as noise -- that floor is measured, from 161 repeated cells in the matrix
-run: 0.2% median, 1.4% p90, 3.3% worst.
+Treat anything under ~2 % as noise. Do not compare a cell against a run that
+starts at a large context: a narrow `--contexts 8192 16384 32768` pass inflated
+the first cell of each configuration by up to 10x -- 161 us read as 1094 --
+because walking up from S=128 is what warms the allocator.
 
 ---
 
 ## 6. Refuted — do not re-derive
 
+`OPTIMIZATIONS.md` carries the full tables. Summary:
+
 | idea | verdict |
 | --- | --- |
-| WGP alignment as a criterion | refuted three times; NSEG=5 is exactly 40 WGs and loses to 6 and 7 |
-| Occupancy limits this kernel | refuted from three axes; 33 KiB of LDS and half the waves is faster |
-| DPP for the score butterfly | +1.5% at S=128, **-34%** at 32k; the ISA forbids pairing DPP in VOPD |
-| Contiguous KV runs (`ILV=0`) | 658 -> 1032 us at 32k; locality beats sequentiality |
-| Prefetching the block table | +2.2% at 1024, -1.9% at 32k, net nothing |
-| Unsigned loop induction variable | fewer instructions, **13% slower** |
-| Instruction count predicts time | 67 instructions removed bought 1.5%; 16 bought 5% |
-| MSPLIT gain follows bytes/token | not monotonic in Hkv: +3.8 / +7.5 / +11.1 / +3.6% |
-| Non-temporal K/V loads | 1.84x worse; destroys the GQA reuse |
-| `global_load_lds` | does not exist on gfx1151 |
+| WGP alignment as a criterion | refuted three times |
+| **Occupancy is the problem** | refuted from three directions -- entry 004 |
+| NSEG up for more occupancy | occupancy 9.1 -> 13.8 %, time +19 % short / +59 % long |
+| BLOCK down for more workgroups | equal waves, better CU spread, 47 % slower |
+| BLOCK up | 10.9 % better at S=128, 12 % worse at 32k, unstable |
+| Zero LDS bank conflicts | rotate swizzle reaches 0.00 % and is slower: it costs the wide store |
+| A pad that keeps `ds_store_b128` | `pad=4` ties `pad=1` and costs 18 % more LDS |
+| DPP for the score butterfly | -34 % at 32k; it cannot pair in VOPD |
+| `__builtin_assume` for speed | -26 instructions, no measurable time. Kept for codegen only |
+| `bound_ctrl` on permlane | -79 instructions, no time, VGPR up. Reverted |
+| Separate `reduce_segments` kernel | 3.3 % worse at S=128; the in-kernel tail beats a second dispatch |
+| Contiguous KV runs (`ILV=0`) | 658 -> 1032 us at 32k |
+| Non-temporal K/V loads | 1.84x worse |
+| Instruction count predicts time | **failed four times**; measure |
 
-The one sentence worth internalising is still the design report's:
+Two sentences worth internalising. The design report's:
 
 > In this regime the scarce resource is cache locality, not grid parallelism.
+
+and its corollary from this session: **the obvious extremum keeps losing to a
+middle value.** All-VALU butterfly lost to three-to-one; zero bank conflicts
+lost to a partial fix; maximum occupancy lost to the default.
 
 ---
 
@@ -238,36 +283,30 @@ The one sentence worth internalising is still the design report's:
 
 ### Environment
 
-There is **no `.venv` in the worktree**; everything runs from the one in the
-main tree.
+There is **no `.venv` in the worktree**; everything runs from the main tree's.
 
 | | |
 | --- | --- |
 | venv | `/scratch/rogarcia/vllm/.venv` |
 | torch | 2.12.0+rocm10.1.0a20260803 |
-| hipcc | `<venv>/lib/python3.12/site-packages/_rocm_sdk_devel/bin/hipcc` |
 | compiled `.so` | `/scratch/rogarcia/vllm/vllm/*.so`, symlinked into the worktree |
 
-The combination is the point: the interpreter and the dependencies come from
-the main tree, but `PYTHONPATH=$PWD` makes `import vllm` resolve to the
-worktree, so you measure the code you are editing. Without it `import vllm`
-silently falls back to the installed tree and you benchmark a different kernel
-— 281 us instead of 199, no error, no warning. Two agents hit that
-independently. Verify when in doubt:
+`PYTHONPATH=$PWD` makes `import vllm` resolve to the worktree. Without it you
+benchmark the installed tree -- 281 us instead of 199, no error, no warning.
+Two agents hit that independently. Verify:
 
 ```bash
 PYTHONPATH=$PWD python -c "import vllm; print(vllm.__file__)"
 ```
 
-The `.so` files are gitignored, so a fresh worktree needs them linked before
-anything runs:
+The `.so` files are gitignored, so a fresh worktree needs them linked:
 
 ```bash
 for f in /scratch/rogarcia/vllm/vllm/*.so; do ln -sf "$f" vllm/; done
 ```
 
 `amd-gpu-lock` needs `amd-smi`, which only appears with the venv on PATH. The
-login shell here is csh, so `source`/`export` have to go inside `bash -c`.
+login shell is csh, so `source`/`export` go inside `bash -c`.
 
 ### Commands
 
@@ -279,15 +318,28 @@ export PATH=/scratch/rogarcia/vllm/.venv/bin:$PATH PYTHONPATH=$PWD \
 # the gate, and where to look next
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/roofline.py
 
-# one configuration, a matrix of knobs against contexts
+# what we ship
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py
+
+# one configuration against a knob
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/sweep.py \
-    --hq 32 --hkv 8 --head-dim 128 --nseg 2 4 --msplit 2 4 --triton
+    --hq 8 --hkv 1 --head-dim 512 --m 4 --bfly 0 1 2 3 4
 
 # correctness: partial tile, repeated launches, negative control
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/check.py \
-    --hq 32 --hkv 8 --head-dim 128 --repeat 10 --contexts 48 50 1020 1024
+    --hq 32 --hkv 8 --head-dim 128 --repeat 10
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/check.py \
-    --hq 32 --hkv 8 --head-dim 128 --mutate 1 --contexts 48 --layouts 1
+    --hq 32 --hkv 8 --head-dim 128 --mutate 1 --layouts 1
 
 amd-gpu-lock python -m pytest tests/kernels/attention/test_rdna35_hip_decode.py
 ```
+
+### Profiling
+
+`rocprofv3` is in the same venv and works with torch loaded, despite the
+wiki's warning. Counters that earned their keep: `LDSBankConflict`,
+`MemUnitBusy`, `OccupancyPercent`, `MeanOccupancyPerActiveCU`, `SQ_WAVES`,
+`SQ_INSTS_VALU`. One counter group per pass; filter with
+`--kernel-include-regex decode_attn`. `--kernel-trace` gives per-dispatch
+kernel duration and the gap to the next dispatch, which is how we separated
+kernel time from launch overhead. Re-read §5.2 before trusting any of it.

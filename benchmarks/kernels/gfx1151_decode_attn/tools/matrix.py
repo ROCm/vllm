@@ -66,6 +66,18 @@ def main() -> None:
         default=None,
         help="force KPW on every configuration, overriding the heuristics",
     )
+    p.add_argument(
+        "--dpl",
+        type=int,
+        default=None,
+        help="force DPL on every configuration, overriding the heuristics",
+    )
+    p.add_argument(
+        "--ldsplit",
+        type=int,
+        default=None,
+        help="force LDSPLIT on every configuration, overriding the heuristics",
+    )
     args = p.parse_args()
 
     from common import BenchmarkConfig
@@ -83,7 +95,14 @@ def main() -> None:
     # the backend namespace, so rebinding only the local name here would
     # precompile one set of variants and measure another.
     forced = {
-        k: v for k, v in (("gridt", args.gridt), ("kpw", args.kpw)) if v is not None
+        k: v
+        for k, v in (
+            ("gridt", args.gridt),
+            ("kpw", args.kpw),
+            ("dpl", args.dpl),
+            ("ldsplit", args.ldsplit),
+        )
+        if v is not None
     }
     if forced:
         _heuristic = _knobs_for

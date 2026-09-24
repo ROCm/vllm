@@ -75,6 +75,27 @@ def main() -> None:
         "--bfly", type=int, nargs="+", default=[None], help="1 = permlane butterfly"
     )
     p.add_argument(
+        "--ldsplit",
+        type=int,
+        nargs="+",
+        default=[None],
+        help="passes the epilogue cuts HEAD_DIM into; >1 lifts the LDS ceiling",
+    )
+    p.add_argument(
+        "--dpl",
+        type=int,
+        nargs="+",
+        default=[None],
+        help="fp16 per lane of a row; sets LPR and so the butterfly depth",
+    )
+    p.add_argument(
+        "--ablate",
+        type=int,
+        nargs="+",
+        default=[None],
+        help="MEASUREMENT ONLY, wrong numbers: thin 1=PV 2=bfly 4=QK",
+    )
+    p.add_argument(
         "--gridt",
         type=int,
         nargs="+",
@@ -102,7 +123,18 @@ def main() -> None:
         seal,
     )
 
-    knobs = ("nseg", "block", "kpw", "msplit", "ilv", "bfly", "gridt")
+    knobs = (
+        "nseg",
+        "block",
+        "kpw",
+        "msplit",
+        "ilv",
+        "bfly",
+        "gridt",
+        "ablate",
+        "dpl",
+        "ldsplit",
+    )
     combos = [
         {k: v for k, v in zip(knobs, vals, strict=True) if v is not None}
         for vals in itertools.product(*(getattr(args, k) for k in knobs))

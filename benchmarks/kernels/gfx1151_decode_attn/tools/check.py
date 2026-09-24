@@ -53,6 +53,9 @@ def main() -> None:
     p.add_argument("--ilv", type=int, default=None)
     p.add_argument("--bfly", type=int, default=None)
     p.add_argument("--gridt", type=int, default=None)
+    p.add_argument("--ablate", type=int, default=None)
+    p.add_argument("--ldsplit", type=int, default=None)
+    p.add_argument("--dpl", type=int, default=None)
     p.add_argument("--no-fusedred", dest="fusedred", action="store_false")
     p.add_argument(
         "--repeat",
@@ -93,6 +96,12 @@ def main() -> None:
             kw["bfly"] = args.bfly
         if args.gridt is not None:
             kw["gridt"] = args.gridt
+        if args.ablate is not None:
+            kw["ablate"] = args.ablate
+        if args.ldsplit is not None:
+            kw["ldsplit"] = args.ldsplit
+        if args.dpl is not None:
+            kw["dpl"] = args.dpl
         for name, val in (
             ("nseg", nseg),
             ("block", block),
