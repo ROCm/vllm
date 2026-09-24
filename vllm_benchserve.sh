@@ -21,7 +21,7 @@
 set -uo pipefail
 
 PORT=8000
-CANONICAL_ORDER=(gptoss dsr1 dsv4f minimax)
+CANONICAL_ORDER=(gptoss dsr1 dsv4f minimax llama)
 
 # --- bench-serve parameters ---
 INPUT_LEN=1024
@@ -37,6 +37,7 @@ declare -A MODEL_PATHS=(
   [dsr1]="/data/models/DeepSeek-R1-0528-MXFP4"
   [dsv4f]="/data/models/DeepSeek-V4-Flash"
   [minimax]="/data/models/MiniMax-M3-MXFP4"
+  [llama]="/data/models/Llama-3.1-405B-Instruct-MXFP4-Preview"
 )
 
 # --- serve-time environment (verbatim from each serve script) ---
@@ -45,6 +46,7 @@ declare -A MODEL_ENV=(
   [dsr1]="TRITON_HIP_USE_ASYNC_COPY=0 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=0 HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_ROCM_AITER_FUSED_MOE_TRITON_GEMM_A4W4=1 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0 VLLM_ROCM_USE_AITER_FP8BMM=0"
   [dsv4f]="VLLM_FORCE_TORCH_BLOCK_FP8=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_TRITON_GEMM=1 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
   [minimax]="VLLM_DISABLE_COMPILE_CACHE=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=0 HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_ROCM_AITER_FUSED_MOE_TRITON_GEMM_A4W4=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0 VLLM_ROCM_USE_AITER_FP8BMM=0"
+  [llama]="VLLM_ROCM_USE_AITER=1"
 )
 
 # --- serve args (everything except --model/--host/--port, which we add).
@@ -55,19 +57,21 @@ declare -A MODEL_SERVE=(
   [dsr1]="--trust-remote-code --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 8192 --dtype auto --tensor-parallel-size 1 --distributed-executor-backend mp --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.90 --compilation-config {\"mode\":0,\"pass_config\":{\"fuse_attn_quant\":true,\"eliminate_noops\":true,\"fuse_norm_quant\":true,\"fuse_mla_dual_rms_norm\":false,\"enable_qk_norm_rope_fusion\":false},\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\",\"+quant_fp8\"]}"
   [dsv4f]="--tensor-parallel-size 1 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768"
   [minimax]="--trust-remote-code --language-model-only --skip-mm-profiling --block-size 128 --enforce-eager --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 32768 --dtype auto --tensor-parallel-size 1 --distributed-executor-backend mp --max-num-batched-tokens 32768 --max-num-seqs 32 --gpu-memory-utilization 0.90 --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice"
+  [llama]="--tensor-parallel-size 1 --no-enable-prefix-caching --kv-cache-dtype fp8 --max-model-len 8192 --gpu-memory-utilization 0.90"
 )
 
 usage() {
   cat <<EOF
-Usage: ./vllm_benchserve.sh [--gptoss [PATH]] [--dsr1 [PATH]] [--dsv4f [PATH]] [--minimax [PATH]] [--long] [--port N] [--list]
+Usage: ./vllm_benchserve.sh [--gptoss [PATH]] [--dsr1 [PATH]] [--dsv4f [PATH]] [--minimax [PATH]] [--llama [PATH]] [--long] [--port N] [--list]
   --gptoss  [PATH]   run gpt-oss-120b-w-mxfp4-a-fp8   (optional model-path override)
   --dsr1    [PATH]   run DeepSeek-R1-0528-MXFP4        (optional model-path override)
   --dsv4f    [PATH]   run DeepSeek-V4-Flash             (optional model-path override)
   --minimax [PATH]   run MiniMax-M3-MXFP4              (optional model-path override)
+  --llama   [PATH]   run Llama-3.1-405B-Instruct-MXFP4-Preview (optional model-path override)
   --long             sweep concurrencies ${LONG_CONCURRENCIES[*]} (default: ${CONCURRENCIES[*]})
   --port N           server port (default: $PORT)
   --list             list models + default paths and exit
-With no model flag, all four run in order: ${CANONICAL_ORDER[*]}
+With no model flag, all five run in order: ${CANONICAL_ORDER[*]}
 Each model: serve -> vllm bench serve (random ${INPUT_LEN}/${OUTPUT_LEN} isl/osl @ conc ${CONCURRENCIES[*]}) -> shutdown.
 Logs stream to this terminal.
 EOF
@@ -78,7 +82,7 @@ declare -A PATH_OVERRIDE=()
 SELECTED=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --gptoss|--dsr1|--dsv4f|--minimax)
+    --gptoss|--dsr1|--dsv4f|--minimax|--llama)
       key="${1#--}"
       SELECTED+=("$key")
       if [[ $# -ge 2 && "$2" != -* ]]; then PATH_OVERRIDE[$key]="$2"; shift 2; else shift; fi
@@ -141,7 +145,7 @@ run_model() {
 
   # --- start server (logs stream to this terminal) ---
   echo "[$key] starting vllm serve ..."
-  ( export $env; vllm serve --model "$model" --host localhost --port "$PORT" $serve ) &
+  ( ulimit -c 0; export $env; vllm serve --model "$model" --host localhost --port "$PORT" $serve ) &
   server_pid=$!
 
   local ready=0
