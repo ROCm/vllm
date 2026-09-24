@@ -60,6 +60,12 @@ def main() -> None:
         default=None,
         help="force GRIDT on every configuration, overriding the heuristics",
     )
+    p.add_argument(
+        "--kpw",
+        type=int,
+        default=None,
+        help="force KPW on every configuration, overriding the heuristics",
+    )
     args = p.parse_args()
 
     from common import BenchmarkConfig
@@ -76,11 +82,14 @@ def main() -> None:
     # Patch the module's own binding too: _prepare resolves _knobs_for through
     # the backend namespace, so rebinding only the local name here would
     # precompile one set of variants and measure another.
-    if args.gridt is not None:
+    forced = {
+        k: v for k, v in (("gridt", args.gridt), ("kpw", args.kpw)) if v is not None
+    }
+    if forced:
         _heuristic = _knobs_for
 
         def _knobs_for(hq, hkv, d, m):  # noqa: F811
-            return {**_heuristic(hq, hkv, d, m), "gridt": args.gridt}
+            return {**_heuristic(hq, hkv, d, m), **forced}
 
         backend_mod._knobs_for = _knobs_for
 

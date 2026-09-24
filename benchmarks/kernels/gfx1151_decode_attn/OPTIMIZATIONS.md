@@ -710,3 +710,66 @@ without more points.
 
 D=64, D=128 and D=256. The exploration ran them with `GRIDT=1` forced but no
 baseline was taken to compare against.
+
+---
+
+## 006 — Widen the KV tile to eight keys per wave (rejected)
+
+**Status:** rejected. `KPW=4` stays everywhere; `kpw` is deliberately *not*
+added to `_Knobs`.
+
+### Why it looked promising
+
+At `16/1/512` and M=4, the configuration this investigation started from, a
+focused sweep over 2048/16384/32768 with `--reps 3` put `KPW=8` ahead at every
+point: -3.3 %, -2.4 %, -8.4 %. A wider tile amortises the block-table read and
+the address arithmetic over twice the keys and keeps twice the loads in flight,
+which is the one thing the long-context end of this kernel is short of.
+
+### ISA
+
+| KPW | instructions | `global_load_b128` | VGPR | spill |
+| --- | --- | --- | --- | --- |
+| 4 | 1340 | 22 | 127 | 0 |
+| 8 | 1823 | 38 | 192 | 0 |
+| 16 | 2972 | 70 | 256 | **93 B** |
+
+16 spills and is 3.5x slower; it is not a candidate. 8 is clean.
+
+### What killed it
+
+Forced across the whole D=512 matrix, `KPW=8` is not a global win at all:
+
+| | geomean vs Triton | losses |
+| --- | --- | --- |
+| M=1, KPW=4 | **2.963x** | 0 |
+| M=1, KPW=8 | 2.629x | 1 |
+| M=4, KPW=4 | **2.928x** | 0 |
+| M=4, KPW=8 | 2.781x | 0 |
+
+Eight of the ten configuration/M pairs regress, several severely (`8/2` at M=4
+and `16/2` at M=1 both peak above +113 %).
+
+Two pairs looked landable and neither survives the rule in HANDOFF §4.1 --
+choose the value that regresses no cell by more than the ~3.3 % harness noise:
+
+- `32/4` M=4: -6 % to -14 % from S=128 to S=8192, then **+5.0 % at 16384 and
+  +39.0 % at 32768**. A large, unambiguous long-context regression.
+- `16/1` M=4: monotonic in context, -10.7 % at S=32768, but **+4.6 % at
+  S=128**. Re-measured on its own with `--reps 5`: 8.32 -> 8.70 us, the same
+  +4.6 %. Reproducible, so it is a real trade, not noise.
+
+The second is the interesting one and it is still a reject. Trading 4.6 % at
+short context for 10.7 % at long is exactly the "knowingly bad trade at some
+context" the rule exists to refuse, and the one-configuration-per-shape
+constraint means it cannot be taken only where it pays.
+
+There is no middle value to fall back on: `BS % KPW == 0` with `BS=16` admits
+only 4, 8 and 16.
+
+### Tooling
+
+`matrix.py` grew `--kpw` alongside `--gridt`, both of which override
+`_knobs_for` for the whole run. Measuring a knob against the golden across all
+70 cells is what separated this from the three-context sweep that made it look
+like a win.
