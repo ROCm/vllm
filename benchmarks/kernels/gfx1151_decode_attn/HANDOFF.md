@@ -30,29 +30,34 @@ paligemma2). The kernel is full-context, so every tool skips them and says so.
 
 ### The honest performance picture
 
-Full matrix, all 27 configurations x 7 contexts x M in {1,4}, against the
-Triton kernel vLLM ships:
+By head size, against the Triton kernel vLLM ships, geomean over 7 contexts:
 
-| M | geomean vs Triton | losses | median %roof |
-| --- | --- | --- | --- |
-| 1 (plain decode) | 1.176x | 61/182 | 71.3 % |
-| 4 (speculative) | 0.975x | 80/182 | 47.7 % |
+| D | M=1 | M=4 | tuned configs | measured |
+| --- | --- | --- | --- | --- |
+| 64 | 0.67x | **0.47x** | 0/4 | before 2026-09-24 |
+| 128 | 0.86x | 0.67x | 1/10 | before 2026-09-24 |
+| 256 | 1.33x | 1.15x | 1/7 | before 2026-09-24 |
+| 512 | **2.96x** | **3.08x** | 5/5 | 2026-09-24, `golden/d512.md` |
 
-That average hides a very wide spread by head size:
+D=512 is fully tuned and wins everywhere with zero losses in 70 cells. D=64 and
+D=128 are where we lose, and they are almost entirely untuned. **The single
+largest available win is calibrating the other head sizes the way D=512 was**;
+see §4.1.
 
-| D | M=1 | M=4 | tuned configs |
-| --- | --- | --- | --- |
-| 64 | 0.67x | **0.47x** | 0/4 |
-| 128 | 0.86x | 0.67x | 1/10 |
-| 256 | 1.33x | 1.15x | 1/7 |
-| 512 | **2.89x** | **2.91x** | 5/5 |
+**Only the D=512 row is current.** The other three are from an earlier full-
+matrix pass and have not been re-measured since. Everything landed on
+2026-09-24 (`GRIDT`, `DPL`/`LDSPLIT`, the `BFLY` re-sweep) is scoped to
+`_TUNED` rows that name D=512 configurations, so those head sizes are
+unaffected by construction -- with one exception worth knowing: restoring
+`LDSPLIT` moved the m/l stores out of the accumulator loop in the shared
+epilogue, which changes codegen on **every** shape (1340 -> 1329 instructions
+at D=512). It is semantically identical and measured neutral on D=512, but it
+was not re-measured on D=64/128/256.
 
-D=512 is fully tuned and wins everywhere with zero losses. D=64 and D=128 are
-where we lose, and they are almost entirely untuned. **The single largest
-available win is calibrating the other head sizes the way D=512 was**; see §4.1.
-
-These numbers predate the LDS change in `OPTIMIZATIONS.md` 003, which is worth
-another ~2-3 % across the board. `golden/d512.md` is current.
+There is deliberately no whole-matrix aggregate here any more. The old one
+(1.176x at M=1, 0.975x at M=4) averaged a tuned head size with three untuned
+ones, which made it move for reasons that had nothing to do with the change
+being evaluated. Read the per-head-size row, or `golden/`.
 
 ---
 
@@ -66,9 +71,9 @@ matrix.py / roofline.py  ->  worst shape  ->  ISA, profiler, measured wiki
 
 | tool | what it answers | cost |
 | --- | --- | --- |
-| `tools/matrix.py` | what we ship: every configuration x context x M vs Triton | 1m52s for D=512, ~13 min for all |
+| `tools/matrix.py` | what we ship: every configuration x context x M vs Triton. `--gridt/--kpw/--dpl/--ldsplit` force a knob across the whole run | ~2 min for D=512, ~13 min for all |
 | `tools/roofline.py` | the regression gate, and where to look next | minutes |
-| `tools/sweep.py` | one configuration, a matrix of knobs x contexts | seconds |
+| `tools/sweep.py` | one configuration, a matrix of knobs x contexts | ~1 min warm, ~2 cold |
 | `tools/tune.py` | searches (NSEG, MSPLIT) scoring the **worst** context | long |
 | `tools/check.py` | correctness, with `--repeat` and `--mutate` | seconds |
 | `tools/shapeset.py` | shared shape loading, filtering and the roofline | -- |
@@ -127,10 +132,20 @@ context. `vs Triton` is unaffected.
 
 ### 4.1 Calibrate the other head sizes
 
-D=512 is done: 10 rows in `_TUNED`, zero losses, 2.9x. D=64, D=128 and D=256
-are essentially untuned and are where every loss is. D=256 is the best target
--- 14 configuration/M pairs, only one tuned, already 1.33x/1.15x with 91 % of
-cells winning, and one real loser (`Hq=24/Hkv=4/M=4` at 0.72x).
+D=512 is done: 10 rows in `_TUNED`, zero losses, **2.96x at M=1 and 3.08x at
+M=4**. D=64, D=128 and D=256 are essentially untuned and are where every loss
+is. D=256 is the best target -- 14 configuration/M pairs, only one tuned,
+already 1.33x/1.15x with 91 % of cells winning, and one real loser
+(`Hq=24/Hkv=4/M=4` at 0.72x).
+
+Four knobs now carry D=512 and **none of them has been measured anywhere else**:
+`GRIDT` (entry 005), `DPL`/`LDSPLIT` (007) and the re-swept `BFLY` (008). All
+default to the old behaviour outside the rows that name them, so the other head
+sizes are unaffected -- but that also means the first thing to try on D=256 is
+the knobs that already paid, not a fresh search. `DPL` in particular is a rule,
+not a table entry, for every shape that does not override it: at D=256 the
+default is already `DPL=8, LPR=32`, five butterfly stages, so `DPL=16` is the
+analogous move and costs `SUB=2` in LDS the same way.
 
 D=64 at 0.47x is the worst but is only 4 configurations, `DPL=2` is the
 narrowest load in the table, and the kernel comment already flags it as
@@ -175,6 +190,28 @@ the per-key slope is flat at ~11.2 ns/key from 128 to 32768). Of that, 1.48 us
 is dispatch and the rest is prologue, LDS reduction and partial publication.
 §6 shows this cannot be amortised by more parallelism or removed by layout, so
 it needs the fixed path itself to get cheaper -- a restructure, not a knob.
+
+The *per-key* path, by contrast, is now charted. Entry 007 ablated it -- each
+VALU block thinned to one iteration, which returns wrong numbers and so bounds
+what restructuring it could buy:
+
+| ablated | S=8192 | S=32768 | |
+| --- | --- | --- | --- |
+| nothing | 192.33 | 771.35 | |
+| P@V | 215.71 | 837.84 | **+12 % slower** |
+| Q@K | 212.66 | 821.77 | **+11 % slower** |
+| butterfly | 163.29 | 684.24 | -15 % / -11 % |
+
+**Removing arithmetic makes the kernel slower in two of three cases**: P@V and
+Q@K are hiding memory latency for free. Do not try to cut them. Only the
+butterfly costs real time, because its strides are a dependency chain nothing
+can overlap -- and entry 007 has already taken one stage out of it. What is
+left there is one more stage (`DPL=64` would need `LPR=8`, and `SUB=4` puts the
+partials far over the LDS ceiling even chunked), so expect little.
+
+`ABLATE` is still in the kernel. It is measurement scaffolding: every bit must
+make `check.py` fail, and if one passes, that block was already dead and the
+number means nothing.
 
 ### 4.4 Support D=96, and the batch axis
 
@@ -239,12 +276,32 @@ threshold. Error scales as ~1/S while tolerance is fixed, so **longer contexts
 hide more bugs**. Validate with `max_rel <= 1e-3`, a short S, the S=50 partial
 tile, `--repeat`, and the `--mutate 1` negative control.
 
+**The negative control is vacuous at M=1.** `MUTATE=1` admits one key past the
+causal bound, but at M=1 the single query token already attends to every key:
+`ctx + m` is `S-1`, the extra index is `S`, which does not exist and whose V is
+zeroed. So the mutated kernel returns the correct answer and `check.py` reports
+`FAIL` -- meaning the control did not fire, not that the kernel is wrong.
+Validate an M=1 shape's causal masking at `--m 4` on the same configuration.
+
 ### 5.9 Harness flakiness
 
 Treat anything under ~2 % as noise. Do not compare a cell against a run that
 starts at a large context: a narrow `--contexts 8192 16384 32768` pass inflated
 the first cell of each configuration by up to 10x -- 161 us read as 1094 --
 because walking up from S=128 is what warms the allocator.
+
+### 5.10 The sweep's label is not what got compiled
+
+`KernelVariant.__post_init__` silently raises MSPLIT until the partials fit
+LDS, so `--msplit 1` can build `ms2` and `--msplit 2` can build `ms4`. Two rows
+of a sweep then show the same binary under different labels, and the small gap
+between them reads as a knob effect. This happened three times in one session:
+`block=512 msplit=2` was really `ms4`, `msplit=1 ldsplit=1` was really `ms2`,
+and `dpl=32 ldsplit=1` was really `ms4` -- the last one nearly landed as
+evidence that DPL was slow when it was measuring MPW=1.
+
+**Check the variant suffix in the compile log, not the sweep's column header.**
+Two rows with near-identical times are the tell.
 
 ---
 
@@ -268,14 +325,32 @@ because walking up from S=128 is what warms the allocator.
 | Contiguous KV runs (`ILV=0`) | 658 -> 1032 us at 32k |
 | Non-temporal K/V loads | 1.84x worse |
 | Instruction count predicts time | **failed four times**; measure |
+| Put M on the grid instead of in the workgroup | proxy with the identical grid, per-WG work and working set: 376 us against 194, even dispatched head-fastest as intended. M inside the workgroup buys K/V reuse *in registers*; moving it out turns that into memory traffic |
+| Occupancy, again, at M=4 | the proxy gets 96 VGPRs and the full 16 waves/SIMD and is the worst row measured; the three M=4 decompositions all sit at 224 VGPRs and 6 waves yet differ. Occupancy orders nothing here either |
+| Cutting VGPRs to raise occupancy | wrong direction: registers are the reuse mechanism. Splitting M=4 into two M=2 launches does not even lower them (MPW is what costs, and MSPLIT already halved it) and is 5-8 % worse |
+| Driving the KV re-read factor to 1.00x | a M=4 configuration with *perfect* reuse exists (MPW=1) and is the slowest of four, at 70 GB/s. Reuse and memory-level parallelism are one dial: NSLICE 2/4/8 gives reuse 1.00x/1.96x/7.57x and 71/148/412 GB/s |
+| `time ~ max(bytes/BW, M*c)` | fitted M=1, M=2 and M=4 to within 10 % and was refuted by the ablation an hour later. A three-point fit is not a mechanism |
+| KPW=8 | entry 006. Flattered by a three-context sweep, killed by the full matrix |
 
 Two sentences worth internalising. The design report's:
 
 > In this regime the scarce resource is cache locality, not grid parallelism.
 
-and its corollary from this session: **the obvious extremum keeps losing to a
-middle value.** All-VALU butterfly lost to three-to-one; zero bank conflicts
-lost to a partial fix; maximum occupancy lost to the default.
+and its corollary: **the obvious extremum usually loses to a middle value** --
+all-VALU butterfly lost to three-to-one, zero bank conflicts lost to a partial
+fix, maximum occupancy lost to the default. *Usually*, not always: entry 008
+moved two rows to `BFLY=0`, an extremum, once entry 007 changed the shape it
+was balancing. A heuristic about knobs is not a law about them, and the only
+way to tell is to re-sweep after the neighbourhood changes.
+
+### A note on `%roof` at M=4
+
+It is a poor guide there and has cost time twice. The denominator counts KV
+once, but M=4 reads the same bytes as M=1 and does four times the arithmetic
+over them, so a low `%roof` at M=4 says the shape is compute-heavy, not that
+bandwidth is being wasted. `16/1/512` at M=4 read 37 % and was never
+bandwidth-limited. Compare an M=4 candidate by achieved GB/s and by absolute
+microseconds, and compare a row against its own previous value.
 
 ---
 
@@ -339,7 +414,18 @@ amd-gpu-lock python -m pytest tests/kernels/attention/test_rdna35_hip_decode.py
 `rocprofv3` is in the same venv and works with torch loaded, despite the
 wiki's warning. Counters that earned their keep: `LDSBankConflict`,
 `MemUnitBusy`, `OccupancyPercent`, `MeanOccupancyPerActiveCU`, `SQ_WAVES`,
-`SQ_INSTS_VALU`. One counter group per pass; filter with
+`SQ_INSTS_VALU`, `FETCH_SIZE`. The CSV also reports `VGPR_Count`,
+`LDS_Block_Size` and the kernel name, which is the cheapest way to confirm
+which variant actually ran (see §5.10).
+
+**`FETCH_SIZE` is not DRAM traffic.** It matches the distinct bytes exactly on
+a clean streaming case (16.02 MiB measured against 16.00 expected at M=1), but
+elsewhere it implies rates above the 247 GB/s bus -- 776 GB/s on one shape --
+so it counts request volume including cache hits. Use it for direction and for
+comparing two variants of the same shape, never as an absolute byte count, and
+never compare it across contexts: it runs 1.42x at S=8192 and 4.36x at S=32768
+on the same configuration purely because 16 MiB of KV fits the 32 MiB MALL and
+64 MiB does not. One counter group per pass; filter with
 `--kernel-include-regex decode_attn`. `--kernel-trace` gives per-dispatch
 kernel duration and the gap to the next dispatch, which is how we separated
 kernel time from launch overhead. Re-read §5.2 before trusting any of it.
