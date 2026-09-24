@@ -258,7 +258,7 @@ FROM base AS build_aiter
 ARG AITER_WHEEL_INDEX_URL
 ARG AITER_WHEEL_NAME
 RUN mkdir -p /app/install \
-    && curl -fL -o /app/install/${AITER_WHEEL_NAME} ${AITER_WHEEL_INDEX_URL}${AITER_WHEEL_NAME}
+    && curl -fL -o /app/install/${AITER_WHEEL_NAME} "${AITER_WHEEL_INDEX_URL}$(echo ${AITER_WHEEL_NAME} | sed 's/+/%2B/g')"
 
 
 ###
