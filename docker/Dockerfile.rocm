@@ -645,6 +645,22 @@ RUN /bin/bash -lc 'set -euo pipefail; \
  esac'
 
 # -----------------------
+# mooncake-transfer-engine-rocm build stage (Python 3.14 wheel)
+#
+# No published wheel exists for cp314 (upstream Mooncake's pinned pybind11
+# submodule predates Python 3.14 support, added in pybind11 v3.0.0). Build it
+# from source here, the same way AITER is built from source above: fresh
+# clone, bump the pybind11 pin, build. No fork required.
+FROM base AS build_mooncake_rocm
+RUN git clone --recursive https://github.com/kvcache-ai/Mooncake.git /mooncake \
+    && cd /mooncake \
+    && git submodule set-branch --branch v3.1.0 extern/pybind11 \
+    && cd extern/pybind11 && git fetch --tags && git checkout v3.1.0 && cd ../.. \
+    && export PATH="/opt/rocm/bin:$PATH" \
+    && HIP_BUILD=1 PYTHON_VERSION=3.14 OUTPUT_DIR=dist-rocm-py314 ./scripts/build_wheel.sh \
+    && ls /mooncake/mooncake-wheel/dist-rocm-py314/*.whl
+
+# -----------------------
 # vLLM wheel release build stage (for building distributable wheels)
 # This stage pins dependencies to custom ROCm wheel versions and handles version detection
 FROM fetch_vllm AS build_vllm_wheel_release
@@ -681,6 +697,11 @@ RUN if [ -n "$(ls /tmp/base-wheels/*.whl 2>/dev/null)" ]; then \
         echo "Wheel releases require pre-built ROCm wheels."; \
         exit 1; \
     fi
+
+# Add the locally-built mooncake-transfer-engine-rocm cp314 wheel so
+# --find-links /install resolves it below instead of failing against PyPI
+# (which has no cp314 build). See build_mooncake_rocm stage above.
+COPY --from=build_mooncake_rocm /mooncake/mooncake-wheel/dist-rocm-py314/*.whl /install/
 
 # GIT_REPO_CHECK: Verify repo is clean and tags are available (for release builds)
 # This matches CUDA's Dockerfile behavior for proper version detection via setuptools_scm
