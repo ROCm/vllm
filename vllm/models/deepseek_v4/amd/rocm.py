@@ -2,11 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from typing import cast
 
 import torch
 
+from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -14,6 +16,7 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
@@ -26,8 +29,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
+    DeepseekV4SWACache,
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
@@ -508,10 +513,66 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
         return DeepseekV4ROCMAiterMLASparseMetadataBuilder
 
 
+def _use_aiter_sparse_decode() -> bool:
+    """Whether to run aiter's sparse-MLA decode, which also selects the KV
+    record layout.
+
+    One knob, not two: aiter's 2buff kernel reads the ALIGNED 640-byte record
+    (448 NoPE | 14 duplicated UE8M0 | 50 pad | 128 RoPE) and nothing else
+    reads it, so the layout and the kernel have to move together.
+    """
+    return os.environ.get("VLLM_DSV4_AITER_SPARSE_DECODE") == "1"
+
+
+class DeepseekV4ROCMAiterSWACache(DeepseekV4SWACache):
+    """The SWA cache, pitched to the aligned record when aiter decodes.
+
+    Same reasoning as the top-k spec in DeepseekV4ROCMAiterMLAAttention: the
+    two caches hold the identical record, so their specs move together or the
+    pooled block stride stops being a whole number of records.
+    """
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if (
+            not _use_aiter_sparse_decode()
+            or self.cache_config.cache_dtype != "fp8_ds_mla"
+        ):
+            return spec
+        # page_size_padded is NOT an ordinary field: __post_init__ stamps it
+        # from (alignment, state_content_bytes) and only when padding is
+        # actually needed. Carrying the base's value over would keep a padding
+        # computed for the 576/584 record, which is smaller than the 640 page
+        # and trips the spec's own >= assertion. Clear it and let
+        # __post_init__ recompute -- at 640 the page is already a multiple of
+        # the alignment, so it correctly stays None.
+        return replace(
+            spec,
+            alignment=640,
+            state_content_bytes=640,
+            page_size_padded=None,
+        )
+
+
+class DeepseekV4ROCMAiterCompressor(DeepseekCompressor):
+    """The compressor, writing the aligned record when aiter decodes.
+
+    The aligned record interleaves each token's scales, so the token stride is
+    the whole record; the packed layout strides by data only.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.head_dim == 512 and _use_aiter_sparse_decode():
+            self._token_stride = 640
+
+
 class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
+    swa_cache_cls = DeepseekV4ROCMAiterSWACache
+    compressor_cls = DeepseekV4ROCMAiterCompressor
 
     def __init__(self, *args, **kwargs):
         vllm_config = args[0] if args else kwargs["vllm_config"]
@@ -523,6 +584,83 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         self._fused_compressor_weight: torch.Tensor | None
         self.register_buffer("_fused_compressor_weight", None, persistent=False)
         self._fused_compressor_split_sizes: tuple[int, int] | None = None
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """The base spec, re-pitched to the aligned record when aiter decodes.
+
+        ``alignment`` has to move WITH the record size: left at 576 the pooled
+        block stride stays a multiple of 576, the descriptor unit falls back to
+        gcd(640, stride) = 64, and the row index stops being the slot index --
+        which is the whole point of the padding.
+
+        A replace() of the base's spec rather than a rebuild of it, so a change
+        to any other field upstream carries over on its own.
+        """
+        spec = super().get_kv_cache_spec(vllm_config)
+        if (
+            spec is None
+            or not _use_aiter_sparse_decode()
+            or self.kv_cache_dtype != "fp8_ds_mla"
+        ):
+            return spec
+        # page_size_padded is NOT an ordinary field: __post_init__ stamps it
+        # from (alignment, state_content_bytes) and only when padding is
+        # actually needed. Carrying the base's value over would keep a padding
+        # computed for the 576/584 record, which is smaller than the 640 page
+        # and trips the spec's own >= assertion. Clear it and let
+        # __post_init__ recompute -- at 640 the page is already a multiple of
+        # the alignment, so it correctly stays None.
+        return replace(
+            spec,
+            alignment=640,
+            state_content_bytes=640,
+            page_size_padded=None,
+        )
+
+    def _fused_qnorm_rope_kv_insert(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata,
+    ) -> torch.Tensor:
+        """aiter's fused producer, or the base's .cu one.
+
+        The .cu producer writes the packed record; aiter's Triton kernel writes
+        the aligned one, fused the same way -- head-slot dispatch, one extra
+        slot per token carrying the KV row -- so this path needs no
+        C-extension rebuild.
+        """
+        if not _use_aiter_sparse_decode() or not isinstance(attn_metadata, dict):
+            return super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+        swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+        assert swa_metadata is not None
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        if swa_kv_cache.dtype != torch.uint8:
+            return super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
+        from aiter.ops.triton.quant.fused_mxfp8_quant import (
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned,
+        )
+
+        assert positions.dtype == torch.int64
+        # pack_q is off here: the decode dispatch still packs Q as its own
+        # pass, and folding that in means plumbing the packed tensor down to
+        # it rather than just asking for it.
+        return fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+            q,
+            kv,
+            swa_kv_cache,
+            swa_metadata.slot_mapping,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            swa_metadata.block_size,
+            self.eps,
+            self.padded_heads,
+            apply_q_norm=True,
+            pack_q=False,
+        )
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

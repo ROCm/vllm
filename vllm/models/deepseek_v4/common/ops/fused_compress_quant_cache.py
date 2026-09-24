@@ -136,6 +136,9 @@ def compress_norm_rope_store_triton(
         FP8_MAX=448.0,
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
+        SC_IN_REC=448 if token_stride == 640 else 0,
+        ROPE_IN_REC=512 if token_stride == 640 else 448,
+        SC_STEP=2 if token_stride == 640 else 1,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         num_warps=num_warps,
@@ -180,6 +183,9 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     FP8_MAX: tl.constexpr,  # 448.0
     QUANT_BLOCK: tl.constexpr,  # 64 for DeepseekV4
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
+    SC_IN_REC: tl.constexpr,  # 0 packed, 448 aligned
+    ROPE_IN_REC: tl.constexpr,  # 448 packed, 512 aligned
+    SC_STEP: tl.constexpr,  # 1 packed, 2 aligned (each scale written twice)
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
@@ -264,11 +270,18 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
-    scale_ptr = (
-        cache_block_ptr
-        + kv_cache_block_size * TOKEN_STRIDE
-        + kv_pos_in_block * SCALE_DIM
-    )
+    # SC_IN_REC > 0: interleaved -- each token's scales live inside its own
+    # record. 0: packed -- the scales are grouped after the block's token data.
+    if SC_IN_REC > 0:
+        scale_ptr = (
+            cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
+        )
+    else:
+        scale_ptr = (
+            cache_block_ptr
+            + kv_cache_block_size * TOKEN_STRIDE
+            + kv_pos_in_block * SCALE_DIM
+        )
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM  # 448
     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2  # 32
@@ -302,11 +315,22 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
     encoded = tl.maximum(tl.minimum(encoded, max_encoded), 0.0)
     tl.store(
-        scale_ptr + scale_idx,
+        scale_ptr + scale_idx * SC_STEP,
         encoded.to(tl.uint8),
         mask=scale_idx < N_NOPE_BLOCKS,
     )
-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+    if SC_STEP == 2:
+        # one byte per 32 columns: what the decode kernel's scaled MMA reads,
+        # against a 64-element quant group
+        tl.store(
+            scale_ptr + scale_idx * SC_STEP + 1,
+            encoded.to(tl.uint8),
+            mask=scale_idx < N_NOPE_BLOCKS,
+        )
+    else:
+        # the packed region is 8 bytes for 7 groups; an unwritten 0xFF is E8M0
+        # NaN and 0 * NaN poisons a whole score row
+        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
 
     # Register-based GPT-J RoPE in fp32.
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
@@ -332,7 +356,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
         result = tl.where(result == result, result, 0.0)
 
     # Store rotated rope portion as bf16 into the cache's bf16 area.
-    bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+    bf16_ptr = (fp8_ptr + ROPE_IN_REC).to(tl.pointer_type(tl.bfloat16))
     rope_local = block - NOPE_HEAD_DIM
     is_rope = (block >= NOPE_HEAD_DIM) & mask
     tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
@@ -456,6 +480,9 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     FP8_MAX: tl.constexpr,
     QUANT_BLOCK: tl.constexpr,
     TOKEN_STRIDE: tl.constexpr,
+    SC_IN_REC: tl.constexpr,  # 0 packed, 448 aligned
+    ROPE_IN_REC: tl.constexpr,  # 448 packed, 512 aligned
+    SC_STEP: tl.constexpr,  # 1 packed, 2 aligned (each scale written twice)
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
@@ -489,11 +516,18 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
-    scale_ptr = (
-        cache_block_ptr
-        + kv_cache_block_size * TOKEN_STRIDE
-        + kv_pos_in_block * SCALE_DIM
-    )
+    # SC_IN_REC > 0: interleaved -- each token's scales live inside its own
+    # record. 0: packed -- the scales are grouped after the block's token data.
+    if SC_IN_REC > 0:
+        scale_ptr = (
+            cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
+        )
+    else:
+        scale_ptr = (
+            cache_block_ptr
+            + kv_cache_block_size * TOKEN_STRIDE
+            + kv_pos_in_block * SCALE_DIM
+        )
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
@@ -519,9 +553,18 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     max_encoded: tl.constexpr = 254.0 if SANITIZE_CACHE_NANS else 255.0
     encoded = tl.maximum(tl.minimum(exponents + 127.0, max_encoded), 0.0)
     tl.store(
-        scale_ptr + scale_idx, encoded.to(tl.uint8), mask=scale_idx < N_NOPE_BLOCKS
+        scale_ptr + scale_idx * SC_STEP,
+        encoded.to(tl.uint8),
+        mask=scale_idx < N_NOPE_BLOCKS,
     )
-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+    if SC_STEP == 2:
+        tl.store(
+            scale_ptr + scale_idx * SC_STEP + 1,
+            encoded.to(tl.uint8),
+            mask=scale_idx < N_NOPE_BLOCKS,
+        )
+    else:
+        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
 
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
     NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
@@ -539,7 +582,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     result = tl.interleave(new_even, new_odd)
     if SANITIZE_CACHE_NANS:
         result = tl.where(result == result, result, 0.0)
-    bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+    bf16_ptr = (fp8_ptr + ROPE_IN_REC).to(tl.pointer_type(tl.bfloat16))
     rope_local = block - NOPE_HEAD_DIM
     is_rope = (block >= NOPE_HEAD_DIM) & mask
     tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
@@ -607,6 +650,9 @@ def _launch_two_stage_sparse_attn_compressor(
         FP8_MAX=448.0,
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
+        SC_IN_REC=448 if token_stride == 640 else 0,
+        ROPE_IN_REC=512 if token_stride == 640 else 448,
+        SC_STEP=2 if token_stride == 640 else 1,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         SANITIZE_CACHE_NANS=_ON_GFX950,
@@ -741,6 +787,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     FP8_MAX: tl.constexpr,  # 448.0
     QUANT_BLOCK: tl.constexpr,  # 128 for indexer
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
+    SC_IN_REC: tl.constexpr,  # 0 packed, 576 interleaved
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
@@ -826,11 +873,18 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
-    scale_ptr = (
-        cache_block_ptr
-        + kv_cache_block_size * TOKEN_STRIDE
-        + kv_pos_in_block * SCALE_DIM
-    )
+    # SC_IN_REC > 0: interleaved -- each token's scales live inside its own
+    # record. 0: packed -- the scales are grouped after the block's token data.
+    if SC_IN_REC > 0:
+        scale_ptr = (
+            cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
+        )
+    else:
+        scale_ptr = (
+            cache_block_ptr
+            + kv_cache_block_size * TOKEN_STRIDE
+            + kv_pos_in_block * SCALE_DIM
+        )
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
@@ -926,6 +980,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     FP8_MAX: tl.constexpr,  # unused for MXFP4 (kept for signature parity)
     QUANT_BLOCK: tl.constexpr,  # 32 for MXFP4
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
+    SC_IN_REC: tl.constexpr,  # 0 packed, 576 interleaved
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
 ):
@@ -1013,11 +1068,18 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
 
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     val_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
-    scale_ptr = (
-        cache_block_ptr
-        + kv_cache_block_size * TOKEN_STRIDE
-        + kv_pos_in_block * SCALE_DIM
-    )
+    # SC_IN_REC > 0: interleaved -- each token's scales live inside its own
+    # record. 0: packed -- the scales are grouped after the block's token data.
+    if SC_IN_REC > 0:
+        scale_ptr = (
+            cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
+        )
+    else:
+        scale_ptr = (
+            cache_block_ptr
+            + kv_cache_block_size * TOKEN_STRIDE
+            + kv_pos_in_block * SCALE_DIM
+        )
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
@@ -1300,6 +1362,7 @@ class FusedKVCompressNormRopeInsertIndexerTritonKernel(
             FP8_MAX=448.0,
             QUANT_BLOCK=quant_block,
             TOKEN_STRIDE=token_stride,
+            SC_IN_REC=576 if token_stride == 640 else 0,
             SCALE_DIM=scale_dim,
             KV_BLOCK_STRIDE=kv_cache.stride(0),
             num_warps=1,

@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -2906,6 +2907,88 @@ def _decode_gfx950_num_splits(
     return num_splits
 
 
+_DSV4_AITER_SPARSE_DECODE_ENV = "VLLM_DSV4_AITER_SPARSE_DECODE"
+
+
+def _dsv4_aiter_sparse_decode_enabled() -> bool:
+    return os.environ.get(_DSV4_AITER_SPARSE_DECODE_ENV, "0") == "1"
+
+
+@functools.cache
+def _dsv4_aiter_sparse_decode_fns():
+    """(driver, packer) from aiter, or None if this build does not carry them.
+
+    Cached because the import walks aiter's jit module; returning None rather
+    than raising keeps an aiter without the v4 kernel from breaking decode --
+    the caller falls through to the incumbent.
+    """
+    try:
+        # One kernel now: aiter's 2buff. The public entry point slices the
+        # aligned 640-byte record into the two buffers it reads -- 512 B of
+        # NoPE + duplicated scales, then the bf16 RoPE row -- so there is
+        # nothing here to select between.
+        from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+        from aiter.ops.triton.quant.fused_mxfp8_quant import (
+            fused_deepseek_v4_mxfp8_quant_q_pack,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "%s=1 but this aiter build has no pa_decode_sparse / "
+            "fused_deepseek_v4_mxfp8_quant_q_pack; falling back to the "
+            "built-in gfx1250 kernel",
+            _DSV4_AITER_SPARSE_DECODE_ENV,
+        )
+        return None
+    return pa_decode_sparse, fused_deepseek_v4_mxfp8_quant_q_pack
+
+
+def _dsv4_aiter_sparse_decode(
+    q,
+    main_cache,
+    main_indices,
+    main_indptr,
+    extra_cache,
+    extra_indices,
+    extra_indptr,
+    attn_sink,
+    scale,
+    out,
+):
+    """aiter's two-stream sparse decode. Returns None to decline the work.
+
+    main = the SWA window (vLLM's swa_kv_cache), extra = the top-k stream
+    (vLLM's kv_cache) -- the convention aiter's driver expects.
+    """
+    fns = _dsv4_aiter_sparse_decode_fns()
+    if fns is None:
+        return None
+    decode, pack_q = fns
+
+    # Q arrives bf16; the kernel reads packed fp8 + a bf16 RoPE plane. This pass
+    # is what plan section 17 folds into the fused producer.
+    q_packed, q_rope = pack_q(q)
+
+    kw = {}
+    if extra_cache is not None:
+        kw = {
+            "extra_cache": extra_cache,
+            "extra_indices": extra_indices,
+            "extra_indptr": extra_indptr,
+        }
+    return decode(
+        q_packed,
+        main_cache,
+        main_indices,
+        main_indptr,
+        attn_sink,
+        scale,
+        q_rope=q_rope,
+        has_invalid=False,
+        out=out,
+        **kw,
+    )
+
+
 def _rocm_sparse_attn_decode_ragged_triton(
     q: torch.Tensor,
     main_cache: torch.Tensor,
@@ -3001,7 +3084,9 @@ def _rocm_sparse_attn_decode_ragged_triton(
     comb_dim = nope_head_dim + rope_head_dim
     is_fnuz = current_platform.is_fp8_fnuz()
 
-    if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
+    if not (
+        _ON_GFX942 or _ON_GFX950 or _ON_GFX1250
+    ):  # Fallback path for un-tuned architectures.
         block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
@@ -3080,7 +3165,37 @@ def _rocm_sparse_attn_decode_ragged_triton(
         device=q.device,
     )
 
-    if _ON_GFX950:
+    # ── opt-in: aiter's gluon sparse-MLA decode (gfx1250, a8w8) ──────────
+    # The kernel above is the incumbent on gfx1250 and has measured numbers, so
+    # this replaces it only when asked for. See plan section 17.
+    if _ON_GFX1250 and _dsv4_aiter_sparse_decode_enabled():
+        aiter_out = _dsv4_aiter_sparse_decode(
+            q=q,
+            main_cache=main_cache,
+            main_indices=main_indices,
+            main_indptr=main_indptr,
+            extra_cache=extra_cache if has_extra else None,
+            extra_indices=extra_indices if has_extra else None,
+            extra_indptr=extra_indptr if has_extra else None,
+            attn_sink=attn_sink if has_attn_sink else None,
+            scale=scale,
+            out=out,
+        )
+        if aiter_out is not None:
+            return aiter_out
+
+    # gfx1250 takes this kernel too. Both partial kernels are plain Triton
+    # (tl.dot / tl.load, no MFMA intrinsics), so "gfx950" names where the
+    # tiling was tuned, not a hardware requirement; measured on gfx1250 at
+    # H=32 (TP4) it beats the generic partial kernel by 23-28% everywhere.
+    #
+    # The gfx950 SPLIT HEURISTIC above is deliberately NOT extended to gfx1250:
+    # at T=16 the generic _decode_num_splits is 19-23% faster, at T=24/32/48
+    # they tie, and only T=64/kv_len=384 favours the gfx950 one (by 18%).
+    # Measured vs the fallback this replaces: T=16 kv384 43.1 -> 9.1us,
+    # T=16 kv136 18.4 -> 6.7us, T=64 kv384 44.6 -> 18.9us, T=64 kv136
+    # 19.2 -> 11.6us.
+    if _ON_GFX950 or _ON_GFX1250:
         _sparse_attn_decode_gfx950_partial_kernel[
             (num_queries, num_splits, heads_blocks)
         ](
@@ -3375,7 +3490,18 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
-    direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
+    # gfx1250 runs the same partial+reduce pair as gfx950 since Option A, so the
+    # reduce can write the caller's buffer directly. Gated on _ON_GFX950 alone it
+    # fell back to `output.copy_(attn_out)` below -- a same-dtype D2D blit, one
+    # per layer, visible in trace_10 as __amd_rocclr_copyBuffer (244) plus Memcpy
+    # DtoD (61) = 305, exactly one per sparse decode. Decode cost is only
+    # 0.145 ms/step (below the 0.6-2.2% noise floor, and a TPOT A/B measured no
+    # change); the prefill copy is 5.6x dearer per call at 13.39 us.
+    direct_out = (
+        output
+        if (_ON_GFX950 or _ON_GFX1250) and output.dtype == torch.bfloat16
+        else None
+    )
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,

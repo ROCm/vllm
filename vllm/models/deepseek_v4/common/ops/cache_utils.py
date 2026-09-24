@@ -56,6 +56,10 @@ def quantize_and_insert_k_kernel(
     quant_block: tl.constexpr,  # 64 (quantization block size)
     cache_block_size: tl.constexpr,  # 64 (paged cache block size)
     token_data_size: tl.constexpr,  # 576 bytes per token data
+    rec_bytes: tl.constexpr,  # 584 packed, 640 aligned
+    sc_in_rec: tl.constexpr,  # 0 packed, 448 aligned
+    rope_in_rec: tl.constexpr,  # 448 packed, 512 aligned
+    sc_step: tl.constexpr,  # 1 packed, 2 aligned (each scale written twice)
     block_stride: tl.constexpr,  # total bytes per block (padded)
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
@@ -96,17 +100,23 @@ def quantize_and_insert_k_kernel(
 
     # Token data pointer: token data is stored contiguously at start of block
     # Each token's data is at offset pos_in_block * token_data_size
-    token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+    # rec_bytes == token_data_size selects the PACKED layout (scales grouped in a
+    # per-block region); rec_bytes > token_data_size selects the interleaved
+    # layout, where each token's scales sit at +sc_in_rec inside its own record.
+    token_data_ptr = cache_block_ptr + pos_in_block * rec_bytes
+    if sc_in_rec > 0:
+        token_scale_ptr = token_data_ptr + sc_in_rec
+    else:
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
 
-    # Scale pointer: scales are stored after ALL token data in the block
-    # Scale for this token is at offset (64 * 576) + pos_in_block * 8
-    token_scale_ptr = (
-        cache_block_ptr + cache_block_size * token_data_size + pos_in_block * scale_dim
-    )
-
-    # Token data layout: [0:448] fp8, [448:576] bf16
+    # fp8 always starts the record; the bf16 half follows it on the packed
+    # record and follows the scales and pad on the aligned one.
     token_fp8_ptr = token_data_ptr
-    token_bf16_ptr = token_data_ptr + fp8_dim
+    token_bf16_ptr = token_data_ptr + rope_in_rec
 
     # ========== Quantize and store FP8 portion (first 448 elements) ==========
     # Using UE8M0 quantization strategy (scale is power of 2, stored as uint8 exponent)
@@ -150,10 +160,21 @@ def quantize_and_insert_k_kernel(
             # During dequant: scale = 2^(stored_value - 127)
             encoded_scale = exponent + 127.0
             encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-            tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
+            tl.store(
+                token_scale_ptr + qblock_idx * sc_step, encoded_scale.to(tl.uint8)
+            )
+            if sc_step == 2:
+                tl.store(
+                    token_scale_ptr + qblock_idx * sc_step + 1,
+                    encoded_scale.to(tl.uint8),
+                )
 
-    # Padding scale at index 7
-    tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
+    if sc_step == 1:
+        # The packed region is 8 bytes per token for 7 groups. An unwritten pad
+        # byte of 0xFF is E8M0 NaN and 0 * NaN poisons a whole score row.
+        # The aligned record has no such byte: its 14 scales fill their span and
+        # the decode descriptor zero-fills the two MX blocks past them.
+        tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
 
     # ========== Store BF16 portion (last 64 elements, no quantization) ==========
     bf16_input_offset = fp8_dim
@@ -164,6 +185,25 @@ def quantize_and_insert_k_kernel(
         chunk_offsets = i * 16 + tl.arange(0, 16)
         bf16_vals = tl.load(input_row_ptr + bf16_input_offset + chunk_offsets)
         tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+
+
+def _rec_geometry(k_cache):
+    """(rec_bytes, sc_in_rec, rope_in_rec, sc_step) from the record size.
+
+    584 -> packed: fp8 [0,448) | bf16 [448,576), scales in a per-block region
+    640 -> aligned: fp8 [0,448) | scales [448,462) | pad | bf16 [512,640)
+
+    The PACKED stride between tokens is 576, not 584: its scales are not in the
+    record, they are in a region after the block's token data, and 584 is only
+    the per-token accounting size. Returning 584 here walks every token 8 bytes
+    too far.
+
+    ``sc_step`` is 2 on the aligned record because every group's scale is
+    written twice -- one byte per 32 columns, which is what the decode kernel's
+    scaled MMA reads, against a 64-element quant group.
+    """
+    rec = int(k_cache.shape[-1]) if k_cache.dim() == 3 else 584
+    return (640, 448, 512, 2) if rec == 640 else (576, 0, 448, 1)
 
 
 def quantize_and_insert_k_cache(
@@ -209,6 +249,7 @@ def quantize_and_insert_k_cache(
         _, FP8_MAX = get_fp8_min_max()
     else:
         FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+    _REC_B, _SC_OFF, _ROPE_OFF, _SC_STEP = _rec_geometry(k_cache)
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     grid = (num_tokens,)
@@ -225,6 +266,10 @@ def quantize_and_insert_k_cache(
         quant_block=QUANT_BLOCK_SIZE,
         cache_block_size=block_size,
         token_data_size=TOKEN_DATA_SIZE,
+        rec_bytes=_REC_B,
+        sc_in_rec=_SC_OFF,
+        rope_in_rec=_ROPE_OFF,
+        sc_step=_SC_STEP,
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
@@ -265,6 +310,10 @@ class DequantizeAndGatherKCacheKernel(
         quant_block: tl.constexpr,  # 64 (quantization block size)
         cache_block_size: tl.constexpr,  # 64 or 128 (paged cache block size)
         token_data_size: tl.constexpr,  # 576 bytes per token data
+        rec_bytes: tl.constexpr,  # 584 packed, 640 aligned
+        sc_in_rec: tl.constexpr,  # 0 packed, 448 aligned
+        rope_in_rec: tl.constexpr,  # 448 packed, 512 aligned
+        sc_step: tl.constexpr,  # 1 packed, 2 aligned
         block_stride: tl.constexpr,  # total bytes per block (padded) int32
         output_dim: tl.constexpr,  # 512
         fp8_max: tl.constexpr,
@@ -301,19 +350,22 @@ class DequantizeAndGatherKCacheKernel(
                 k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
             )
 
-            # Token data pointer
-            token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+            # see the writer: sc_in_rec > 0 means the scales are inside the
+            # record rather than in a per-block region
+            token_data_ptr = cache_block_ptr + pos_in_block * rec_bytes
+            if sc_in_rec > 0:
+                token_scale_ptr = token_data_ptr + sc_in_rec
+            else:
+                token_scale_ptr = (
+                    cache_block_ptr
+                    + cache_block_size * token_data_size
+                    + pos_in_block * scale_dim
+                )
 
-            # Scale pointer: after all token data
-            token_scale_ptr = (
-                cache_block_ptr
-                + cache_block_size * token_data_size
-                + pos_in_block * scale_dim
-            )
-
-            # Token data layout: [0:448] fp8, [448:576] bf16
+            # see the writer: the bf16 half sits at rope_in_rec, which the
+            # aligned record pushes past its inline scales and pad
             token_fp8_ptr = token_data_ptr
-            token_bf16_ptr = token_data_ptr + fp8_dim
+            token_bf16_ptr = token_data_ptr + rope_in_rec
 
             # Output pointer for this token (flattened)
             output_row_ptr = (
@@ -342,7 +394,9 @@ class DequantizeAndGatherKCacheKernel(
 
                     # Load and decode UE8M0 scale
                     # UE8M0: scale = 2^(stored_value - 127)
-                    encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+                    encoded_scale = tl.load(
+                        token_scale_ptr + qblock_idx * sc_step
+                    )
                     exponent = encoded_scale.to(tl.float32) - 127.0
                     scale = tl.exp2(exponent)
 
@@ -479,6 +533,7 @@ class DequantizeAndGatherKCacheKernel(
         use_fnuz: bool = False,
     ) -> LaunchSpec:
         num_reqs = seq_lens.shape[0]
+        _REC_B, _SC_OFF, _ROPE_OFF, _SC_STEP = _rec_geometry(k_cache)
         return (num_reqs, self.NUM_WORKERS), dict(
             out_stride0=out.stride(0),
             out_stride1=out.stride(1),
@@ -489,6 +544,10 @@ class DequantizeAndGatherKCacheKernel(
             quant_block=64,
             cache_block_size=block_size,
             token_data_size=576,
+            rec_bytes=_REC_B,
+            sc_in_rec=_SC_OFF,
+            rope_in_rec=_ROPE_OFF,
+            sc_step=_SC_STEP,
             block_stride=k_cache.stride(0),
             output_dim=512,
             fp8_max=448.0,

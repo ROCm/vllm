@@ -142,6 +142,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
     # Provided by the platform subclass.
     backend_cls: ClassVar[type[AttentionBackend]]
+    # The collaborator classes this layer builds. Named here so a
+    # platform subclass can supply its own -- both are constructed in
+    # __init__ below, and the SWA cache registers itself in the forward
+    # context, so there is no later point at which to swap them.
+    swa_cache_cls: ClassVar[type] = DeepseekV4SWACache
+    compressor_cls: ClassVar[type] = DeepseekCompressor
     # Backend for the SWA cache layer; None uses the default SWA backend.
     swa_backend_cls: ClassVar[type[AttentionBackend] | None] = None
     # KV-cache per-token block format (both layouts are paged). True (default)
@@ -337,7 +343,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
         )
 
-        self.swa_cache_layer = DeepseekV4SWACache(
+        self.swa_cache_layer = self.swa_cache_cls(
             head_dim=self.head_dim,
             window_size=self.window_size,
             dtype=self.kv_cache_torch_dtype,
@@ -358,7 +364,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # attention setup above so its KV-cache prefix (self.prefix) is set.
         self.compressor = None
         if self.compress_ratio > 1:
-            self.compressor = DeepseekCompressor(
+            self.compressor = self.compressor_cls(
                 vllm_config=vllm_config,
                 compress_ratio=self.compress_ratio,
                 hidden_size=self.hidden_size,
