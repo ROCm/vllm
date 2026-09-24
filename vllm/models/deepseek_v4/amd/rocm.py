@@ -641,9 +641,20 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
+        from aiter.tuned_gemm import tgemm
+
         fused_weight = self._fused_compressor_weight
         split_sizes = self._fused_compressor_split_sizes
         if fused_weight is None or split_sizes is None:
+            if self.compressor is not None and self.indexer is None:
+                # HCA (cr=128) layers
+                qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
+                kv_score = tgemm.mm(
+                    hidden_states,
+                    self.compressor.fused_wkv_wgate.weight,
+                    otype=torch.float32,
+                )
+                return qr_kv, kv_score, None, None
             return super()._run_parallel_input_projections(hidden_states)
 
         indexer = self.indexer
@@ -651,10 +662,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             raise RuntimeError("Fused compressor weight requires a C4 indexer")
 
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
-        fused_scores = torch.mm(
+        fused_scores = tgemm.mm(
             hidden_states,
-            fused_weight.T,
-            out_dtype=torch.float32,
+            fused_weight,
+            otype=torch.float32,
         )
         kv_score, indexer_kv_score = fused_scores.split(split_sizes, dim=-1)
         indexer_weights, _ = indexer.weights_proj(hidden_states)
@@ -722,7 +733,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             kv_weight=self.kv_norm.weight.data,
             kv_epsilon=self.eps,
             group_size=128,
-            transpose_scale=False,
+            transpose_scale=True,
         )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

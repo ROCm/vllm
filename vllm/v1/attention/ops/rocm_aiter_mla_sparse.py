@@ -22,10 +22,11 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
+    from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950, _ON_GFX1250
 else:
     _ON_GFX942 = False
     _ON_GFX950 = False
+    _ON_GFX1250 = False
 
 logger = init_logger(__name__)
 
@@ -656,7 +657,7 @@ def rocm_fp8_paged_mqa_logits(
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
 
     if aiter_paged_mqa_logits_module is not None:
-        if _ON_GFX942 or _ON_GFX950:
+        if _ON_GFX942 or _ON_GFX950 or _ON_GFX1250:
             deepgemm_fp8_paged_mqa_logits = (
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
@@ -894,7 +895,7 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         # batch_size * next_n <= hidden_states.shape[0] == max_num_batched_tokens
-        if _ON_GFX942 or _ON_GFX950:
+        if _ON_GFX942 or _ON_GFX950 or _ON_GFX1250:
             workspace_manager.get_simultaneous(
                 ((hidden_states.shape[0], max_model_len), torch.float32),
             )
@@ -1279,7 +1280,15 @@ def rocm_inv_rope_einsum(
         wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1]
     )
 
-    return torch.einsum("tgd,grd->tgr", o_ref, wo_a_weight)
+    from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import batched_gemm_bf16
+
+    z = torch.empty(
+        (o_ref.shape[0], n_local_groups, o_lora_rank),
+        dtype=o_ref.dtype,
+        device=o_ref.device,
+    )
+    batched_gemm_bf16(o_ref.transpose(0, 1), wo_a_weight, YQ=z.transpose(0, 1))
+    return z
 
 
 _DSV4_SPARSE_NOPE_DIM = 448
