@@ -220,6 +220,7 @@ class Mxfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 w2_weight_scale=w2_scale,
                 w13_bias=w13_bias,
                 w2_bias=w2_bias,
+                activation=self.moe.activation,
             )
         )
 
