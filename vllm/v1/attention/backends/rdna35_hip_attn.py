@@ -132,7 +132,15 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     # handoff.  KPW=8 was re-examined under the same criterion and stays
     # rejected -- it does not combine with DPL=32 (SUB doubles, so KPWE does
     # too) and regresses up to +676 us.
-    (16, 2, 512, 4): {"bfly": 3, "dpl": 32, "ldsplit": 2},
+    #
+    # BFLY was re-swept under the shorter butterfly and moved on two of the
+    # four: 8/1 and 16/2 go from 3 to 0, worth 3.3-3.8 % geomean and winning at
+    # all seven contexts in two independent runs.  BFLY=0 puts the whole
+    # butterfly on the LDS pipe, which the main loop still never touches, and
+    # a four-stage reduction leaves the VALU with more register pressure per
+    # element than a five-stage one did -- so the idle pipe is worth more now.
+    # 16/1 and 32/4 re-confirmed their existing 4; no value beat it.
+    (16, 2, 512, 4): {"bfly": 0, "dpl": 32, "ldsplit": 2},
     (16, 2, 256, 4): {"bfly": 4},
     (32, 8, 128, 1): {"bfly": 2},
     # D=512, all five configurations, BFLY swept 0..4 at M in {1,4} over seven
@@ -146,7 +154,7 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     # Note 8/2 and 8/1 disagree at M=1 (1 against 4) and 16/1 and 16/2 disagree
     # at M=4 (4 against 3) -- no rule fits these, which is why it is a table.
     (8, 1, 512, 1): {"bfly": 4},
-    (8, 1, 512, 4): {"bfly": 3, "dpl": 32, "ldsplit": 2},
+    (8, 1, 512, 4): {"bfly": 0, "dpl": 32, "ldsplit": 2},
     # GRIDT: dispatching head-fastest instead of segment-fastest fixes the one
     # outlier of the M=1 table -- this configuration read 53.2% of roofline and
     # 1.60x against Triton where its neighbours were at 90-99% and ~3x. It now

@@ -870,7 +870,60 @@ does too — and the combination regresses up to +676 us, while on `16/1` alone
 
 ### Not done
 
-`BFLY` was not re-tuned under the shorter butterfly, and it should be. A
-three-point sweep on `16/1` at M=4 put `bfly=0` 6.7 % ahead at S=32768, but
-those cells carried 10-13 % spread, so it is not resolvable at that sample
-size. D=64, D=128 and D=256 were not measured at all.
+D=64, D=128 and D=256 were not measured at all. `BFLY` was re-tuned under the
+shorter butterfly in entry 008.
+
+---
+
+## 008 — Re-tune BFLY under the four-stage butterfly
+
+**Status:** landed. `(8,1,512,4)` and `(16,2,512,4)` go from `BFLY=3` to
+`BFLY=0`. `(16,1,512,4)` and `(32,4,512,4)` keep 4.
+
+### Why re-sweep at all
+
+Entry 007 halved `LPR`, so the butterfly is four dependent stages instead of
+five and each stage carries a different balance of work. `BFLY` splits that
+work between the two cross-lane pipes -- `ds_bpermute` on the LDS pipe against
+`v_permlane16` on the VALU -- so changing the number of stages changes what the
+right split is. Entry 003 set the precedent: an LDS change invalidated one
+neighbouring `BFLY` row and the rest had to be re-checked.
+
+No code changed here. This is the knob being re-measured in its new regime.
+
+### What it measured
+
+`BFLY` 0..4, four configurations, seven contexts, `--reps 1`, against the
+golden:
+
+| Hq/Hkv | current | best | geomean | worst cell |
+| --- | --- | --- | --- | --- |
+| 8/1 | 3 | **0** | 0.9652 | -0.07 us (nothing regresses) |
+| 16/2 | 3 | **0** | 0.9657 | -0.17 us (nothing regresses) |
+| 16/1 | 4 | 4 | 0.9990 at bfly=0 | +1.59 us |
+| 32/4 | 4 | 4 | 1.0289 at next best | -- |
+
+Both moves confirmed in a second independent run: `8/1` wins -1.1 % to -5.8 %
+across all seven contexts, `16/2` -1.9 % to -8.6 %. D=512 matrix afterwards:
+M=4 geomean **3.044x -> 3.081x**, 0 losses in 35 cells; M=1 unchanged.
+
+`BFLY=0` puts the whole butterfly on the LDS pipe, which the main loop still
+never touches at any `BFLY`. A four-stage reduction leaves the VALU with more
+register pressure per element than a five-stage one did, so the idle pipe is
+worth more than it was -- the same argument entry 001 used, landing on the
+other extreme now that the shape changed.
+
+### The reading this corrected
+
+`16/1` had looked 6.7 % better at `bfly=0` in a three-point sweep whose cells
+carried 10-13 % spread, and that reading went into the golden's caveats as a
+follow-up worth taking. A clean seven-context pass puts it at 0.9990. It was
+noise, and a knob with 10 % spread on the deciding cell is not a finding.
+
+### Cost
+
+269 s for the four-configuration sweep, 45 s for the confirmation once the
+builds were cached. An earlier attempt at `--reps 5` was abandoned: reps
+resample allocation and graph placement, not `do_bench`'s within-cell
+dispersion, so they cost 5x and do not resolve what a second independent run
+resolves for 45 s. See HANDOFF §2.
