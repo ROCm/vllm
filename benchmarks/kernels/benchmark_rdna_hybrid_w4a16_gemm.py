@@ -52,6 +52,15 @@ WEIGHT_SHAPES = {
         ([4096, 28672], 1),  # gate_up_proj
         ([14336, 4096], 0),  # down_proj
     ],
+    # Hybrid linear-attention model: 48 of 64 layers carry linear_attn, the
+    # other 16 full attention, so in_proj_qkv and attn.qkv are both present.
+    "cyankiwi/Qwen3.6-27B-AWQ-INT4": [
+        ([5120, 34816], 1),  # mlp.gate_up_proj
+        ([17408, 5120], 0),  # mlp.down_proj
+        ([5120, 16384], 1),  # linear_attn.in_proj_qkv
+        ([6144, 5120], 0),  # linear_attn.out_proj
+        ([5120, 14336], 1),  # attn.qkv (full-attention layers)
+    ],
 }
 
 

@@ -6,11 +6,15 @@ Experimental: gated off by default behind ``VLLM_ROCM_W4A16_HIPBLASLT`` and
 built on demand against a hipBLASLt checkout that exposes the w4a16 API
 (``VLLM_HIPBLASLT_W4A16_ROOT``), so a stock ROCm SDK build is unaffected.
 
-The weight and activation buffers are handed to hipBLASLt exactly as the
-existing kernels see them -- see ``csrc/rocm/hipblaslt_w4a16.cu`` for the index
-mapping. The one thing that has to be rebuilt is the zero-point region, because
-hipBLASLt wants it appended to the scales in one allocation and ordered
-``[rowpair][group]`` rather than vLLM's ``[group][rowpair]``.
+Activations and the output are handed over untouched -- see
+``csrc/rocm/hipblaslt_w4a16.cu`` for the index mapping. Two things do have to
+be rebuilt at load time:
+
+* the weights, since hipBLASLt dropped the ExLlama int4 encoding and now needs
+  plain K order, which is why only "off" and "all" are valid modes;
+* the zero-point region, which hipBLASLt wants appended to the scales in one
+  allocation and ordered ``[rowpair][group]`` rather than vLLM's
+  ``[group][rowpair]``.
 """
 
 import functools
@@ -26,8 +30,9 @@ logger = init_logger(__name__)
 
 MODE_DECODE = 1
 MODE_PREFILL = 2
+MODE_ALL = MODE_DECODE | MODE_PREFILL
 
-_MODES = {"off": 0, "decode": MODE_DECODE, "prefill": MODE_PREFILL, "all": 3}
+_MODES = {"off": 0, "decode": MODE_DECODE, "prefill": MODE_PREFILL, "all": MODE_ALL}
 
 # Matches c_blockScaleAZeroPointAlignment in hipBLASLt's tensile_host.cpp.
 ZERO_POINT_ALIGNMENT = 256
@@ -35,8 +40,24 @@ ZERO_POINT_ALIGNMENT = 256
 
 @functools.cache
 def hipblaslt_w4a16_mode() -> int:
-    """Bitmask of the paths ``VLLM_ROCM_W4A16_HIPBLASLT`` routes to hipBLASLt."""
-    return _MODES[envs.VLLM_ROCM_W4A16_HIPBLASLT]
+    """Bitmask of the paths ``VLLM_ROCM_W4A16_HIPBLASLT`` routes to hipBLASLt.
+
+    Only "off" and "all" are usable. hipBLASLt dropped the ExLlama int4
+    encoding, so its weights must be packed in plain K order, while
+    ``wvSplitK_int4_g`` and the Triton kernel read the ExLlama shuffle. One
+    buffer cannot serve both, and duplicating it costs a second copy of the
+    whole weight -- so a mode that splits the GEMMs between them would either
+    read garbage or double the weight footprint.
+    """
+    mode = _MODES[envs.VLLM_ROCM_W4A16_HIPBLASLT]
+    if mode not in (0, MODE_ALL):
+        raise ValueError(
+            f"VLLM_ROCM_W4A16_HIPBLASLT={envs.VLLM_ROCM_W4A16_HIPBLASLT!r} is no "
+            "longer supported: hipBLASLt needs plain-K-order weights and the "
+            "in-tree kernels need the ExLlama shuffle, so the two cannot share "
+            "one weight buffer. Use 'off' or 'all'."
+        )
+    return mode
 
 
 def _root() -> Path:
@@ -133,7 +154,7 @@ def _ext():
 
 def hipblaslt_w4a16_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
-    w_q: torch.Tensor,  # [N, K//2] int8, ExLlama shuffle
+    w_q: torch.Tensor,  # [N, K//2] int8, nibbles in K order
     scale: torch.Tensor,  # [N, K//G] (symmetric) or the combined buffer (asym)
     group_size: int,
     has_zp: bool,

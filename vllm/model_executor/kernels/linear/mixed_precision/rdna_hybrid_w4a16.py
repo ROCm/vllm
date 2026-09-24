@@ -604,6 +604,24 @@ def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
     )
 
 
+def pack_int4_plain(w_uint4: torch.Tensor) -> torch.Tensor:
+    """Pack uint4 values in K order: [N, K] -> [N, K//8] int32, element j at bit 4*j.
+
+    hipBLASLt's HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT addresses element
+    ``idx`` at byte ``idx/2``, low nibble when ``idx`` is even -- i.e. no
+    shuffle. Used only when the hipBLASLt path owns every W4A16 GEMM; the HIP
+    skinny and Triton kernels read the ExLlama order and cannot share this
+    buffer.
+    """
+    N_dim, K_dim = w_uint4.shape
+    assert K_dim % 8 == 0
+    g = w_uint4.to(torch.uint8).view(N_dim, K_dim // 8, 8).to(torch.int32)
+    out = g[:, :, 0]
+    for j in range(1, 8):
+        out = out | (g[:, :, j] << (4 * j))
+    return out
+
+
 # gfx1151 packed-weight row stride: throughput is a period-512 B function of the
 # stride, and wants a multiple of 128 that is not a multiple of 512.
 _CLIFF_PERIOD_BYTES = 512
@@ -658,12 +676,18 @@ def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
     return buf[:, :cols]  # inherits stride(0) = cols + pad_groups
 
 
-def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def pack_skinny_int4(
+    unpacked: torch.Tensor, shuffle: bool = True
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
     Single source of truth for the skinny weight memory layout: ExLlama shuffle
     to [N, K//8] int32, then -- on gfx1151 only -- pad each row so the packed
-    row stride lands on 256 bytes modulo 512. Used by both
+    row stride lands on 256 bytes modulo 512.
+
+    ``shuffle=False`` packs in plain K order instead, for the hipBLASLt path
+    (whose ExLlama encoding was removed upstream). The row-stride pad is an
+    addressing property, not an encoding one, so it applies either way. Used by both
     ``process_weights_after_loading`` and the perf benchmark so the benchmark can
     never drift from the production stride.
 
@@ -672,7 +696,7 @@ def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     than adding a fixed pad: the pad costs pad/(K/2) of weight memory, which
     comes straight out of KV-cache space on an APU.
     """
-    shuffled = pack_int4_exllama_shuffle(unpacked)
+    shuffled = (pack_int4_exllama_shuffle if shuffle else pack_int4_plain)(unpacked)
     n_rows, k8 = shuffled.shape
     k_packed_bytes = k8 * 4  # int32 -> bytes
     pad_bytes = _cliff_pad_bytes(k_packed_bytes)
@@ -963,8 +987,15 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         if getattr(w_q_raw, "output_dim", 0) != 0:
             unpacked = unpacked.t().contiguous()
 
-        # ---- Pack into skinny [N, K//8] (ExLlama shuffle + gfx1151 cliff pad) ----
-        w_q_skinny, w_q_skinny_i32 = pack_skinny_int4(unpacked)
+        # ---- Pack into skinny [N, K//8] (+ gfx1151 cliff pad) ----
+        # hipBLASLt dropped the ExLlama int4 encoding, so when it owns every
+        # W4A16 GEMM the weights go down in plain K order instead. That is only
+        # safe because in that mode neither wvSplitK_int4_g nor the Triton
+        # kernel is reached -- they still read the ExLlama shuffle, and
+        # hipblaslt_w4a16_mode() rejects the mixed modes for that reason.
+        w_q_skinny, w_q_skinny_i32 = pack_skinny_int4(
+            unpacked, shuffle=not hipblaslt_w4a16_mode()
+        )
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
         permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
