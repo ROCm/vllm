@@ -12,7 +12,7 @@ two are identical by construction rather than by maintenance. Only the kernel
 launch differs, and anything the kernel does not cover falls back to Triton.
 """
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypedDict
 
 import torch
 
@@ -77,6 +77,101 @@ def _msplit_for(num_kv_heads: int, max_m: int) -> int:
     if num_kv_heads in _MSPLIT_KV_HEADS and max_m % 2 == 0:
         return 2
     return 1
+
+
+# Best knobs measured per configuration, keyed on (Hq, Hkv, D, M).
+#
+# The heuristics above are rules fitted to the whole shape table; this is the
+# exceptions list, and it wins where both apply.  Rows carry only the knobs
+# actually measured -- a partial row is normal, and a configuration absent here
+# behaves exactly as it did before the table existed, so landing a row can only
+# affect the configuration it names.
+#
+# M is part of the key because every knob we have measured disagrees across it:
+# BFLY saturates at 2 for D=128 at M=1 but wants 3 or 4 at M=4, and D=512 at
+# M=4 is forced onto MSPLIT=2 by the LDS ceiling while M=1 is not.  A row tuned
+# at one M says nothing about the other.
+#
+# Provenance is OPTIMIZATIONS.md (per knob) and golden/ (per shape).  Do not add
+# a row without a measurement behind it; the point of this table is that it is
+# the measured exceptions, not a second set of guesses.
+class _Knobs(TypedDict, total=False):
+    """Launch knobs a configuration may pin.  Total=False: a row sets only what
+    was measured."""
+
+    nseg: int
+    msplit: int
+    bfly: int
+    gridt: int
+
+
+_TUNED: dict[tuple[int, int, int, int], _Knobs] = {
+    # BFLY: entry 001.  D=512 takes 3 rather than 4 because 4 regresses 7.9% at
+    # S=32768; D=256 never regresses at 4 and is ~3% faster there at short
+    # context.  D=128 at M=1 saturates at 2 -- 2, 3 and 4 are within noise of
+    # each other, so it takes the one that spends least on the VALU.
+    (16, 2, 512, 4): {"bfly": 3},
+    (16, 2, 256, 4): {"bfly": 4},
+    (32, 8, 128, 1): {"bfly": 2},
+    # D=512, all five configurations, BFLY swept 0..4 at M in {1,4} over seven
+    # contexts.  Chosen by best geomean among the values that regress no cell
+    # by more than the 3.3% measured worst-case harness noise, so a row can be
+    # a small win but never a knowingly bad trade at any context.
+    #
+    # M=4 is where this knob pays: -4.5% to -22.6% geomean.  M=1 is already
+    # near the bus on most of these shapes and moves by -0.7% to -5.3%; those
+    # rows are recorded because they were measured, not because they matter.
+    # Note 8/2 and 8/1 disagree at M=1 (1 against 4) and 16/1 and 16/2 disagree
+    # at M=4 (4 against 3) -- no rule fits these, which is why it is a table.
+    (8, 1, 512, 1): {"bfly": 4},
+    (8, 1, 512, 4): {"bfly": 3},
+    # GRIDT: dispatching head-fastest instead of segment-fastest fixes the one
+    # outlier of the M=1 table -- this configuration read 53.2% of roofline and
+    # 1.60x against Triton where its neighbours were at 90-99% and ~3x. It now
+    # reads 97.3% and 3.02x, and it improves at all seven contexts, by more the
+    # longer the context: -1.0% at S=128 rising to -45.9% at S=32768,
+    # reproduced in two independent runs.
+    #
+    # Deliberately not a rule. The same knob costs 4-15% on (8,1,512,4) and
+    # 2-15% on (16,2,512,1), and nothing in head count, GQA or KV stream count
+    # separates the three -- only measurement does. Across the whole D=512
+    # matrix it is neutral (geomean 1.001), which is exactly the signature of a
+    # knob that belongs in the exceptions list rather than in _knobs_for.
+    (8, 2, 512, 1): {"bfly": 1, "gridt": 1},
+    # Retuned after the LDS padding (OPTIMIZATIONS.md 003) moved this one: 3
+    # became 741 us at S=32768 against 590 for 2, a 20% swing.  The only
+    # configuration the LDS change invalidated -- the rest were re-checked and
+    # held.
+    (8, 2, 512, 4): {"bfly": 2},
+    (16, 1, 512, 1): {"bfly": 4},
+    (16, 1, 512, 4): {"bfly": 4},
+    (16, 2, 512, 1): {"bfly": 4},
+    (32, 4, 512, 1): {"bfly": 4},
+    (32, 4, 512, 4): {"bfly": 4},
+}
+
+
+def _knobs_for(
+    num_q_heads: int, num_kv_heads: int, head_size: int, max_m: int
+) -> _Knobs:
+    """Launch knobs for one configuration: the heuristics, then the measured
+    overrides on top.
+
+    Args:
+        num_q_heads: Query heads.
+        num_kv_heads: KV heads.
+        head_size: Head dimension.
+        max_m: Query tokens per sequence.
+
+    Returns:
+        Keyword arguments for `KernelVariant`.
+    """
+    knobs: _Knobs = {
+        "nseg": _segments_for(num_q_heads),
+        "msplit": _msplit_for(num_kv_heads, max_m),
+    }
+    knobs.update(_TUNED.get((num_q_heads, num_kv_heads, head_size, max_m), {}))
+    return knobs
 
 
 # The JIT-compiled module plus the scratch buffers sized for it.  The module is
@@ -183,8 +278,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         q = kwargs["q"]
         block_size = kv_cache.shape[2]
         variant = KernelVariant(
-            nseg=_segments_for(self.num_heads),
-            msplit=_msplit_for(self.num_kv_heads, q.shape[0]),
+            **_knobs_for(self.num_heads, self.num_kv_heads, self.head_size, q.shape[0]),
             head_size=self.head_size,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,

@@ -20,7 +20,6 @@ the geomean alongside to break ties.
 
 import argparse
 import contextlib
-import csv
 import math
 import statistics
 import sys
@@ -28,9 +27,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+import torch
+
 _HERE = Path(__file__).resolve()
 _ROOT = _HERE.parents[4]
 sys.path.insert(0, str(_ROOT / "benchmarks" / "attention_benchmarks"))
+sys.path.insert(0, str(_HERE.parent))
+
+import shapeset  # noqa: E402
 
 PEAK_GIBS = 230.0
 # Measured sweet spot is 64-128 workgroups; 32 is the worst value at every head
@@ -45,15 +49,15 @@ def geomean(xs):
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--shapes", default=str(_HERE.parent / "shapes.csv"))
+    shapeset.add_arguments(p)
     p.add_argument("--m", type=int, default=4)
     p.add_argument("--block-size", type=int, default=16)
-    p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--reps", type=int, default=1)
     p.add_argument(
         "--search",
         type=int,
         nargs="+",
-        default=[128, 1024, 8192, 32768],
+        default=[128, 16384, 32768],
         help="contexts the search runs on; the winner is verified on --verify",
     )
     p.add_argument(
@@ -68,14 +72,23 @@ def main() -> None:
     from runner import run_attention_benchmark
 
     import vllm.v1.attention.backends.rdna35_hip_attn as backend_mod
-    from vllm.v1.attention.ops.rdna35_hip_decode import KernelVariant, precompile
+    from vllm.v1.attention.ops.rdna35_hip_decode import (
+        KernelVariant,
+        precompile,
+        seal,
+    )
 
-    groups: dict[tuple[int, int, int], list[str]] = {}
-    with open(args.shapes) as fh:
-        for r in csv.DictReader(fh):
-            groups.setdefault((int(r["Hq"]), int(r["Hkv"]), int(r["D"])), []).append(
-                r["model"]
-            )
+    # Windowed rows are dropped, not tuned: the kernel is full-context, so a
+    # knob scored against them would be scored against the wrong byte count.
+    # The window still keys the group, so a model contributing both a windowed
+    # and a full-context layer does not collapse into one entry.
+    shapes, _windowed = shapeset.load(args)
+    if not shapes:
+        print(f"no shapes match {shapeset.describe(args) or 'the given filters'}")
+        return
+    groups: dict[tuple[int, int, int, int], list[str]] = {}
+    for sh in shapes:
+        groups.setdefault((sh.hq, sh.hkv, sh.d, sh.window), []).append(sh.model)
 
     def candidates(hq):
         out = []
@@ -98,8 +111,14 @@ def main() -> None:
 
     backend_mod.make_scratch = cached
 
+    # The override replaces only NSEG and MSPLIT on top of whatever _prepare
+    # computed, so the rest of the base -- BFLY in particular -- has to come
+    # from the same place the backend gets it.
+    from vllm.v1.attention.backends.rdna35_hip_attn import _knobs_for
+
     wanted = []
-    for hq, hkv, d in groups:
+    for hq, hkv, d, _window in groups:
+        base = dict(_knobs_for(hq, hkv, d, args.m))
         for nseg, msplit in candidates(hq):
             with contextlib.suppress(Exception):
                 wanted.append(
@@ -110,11 +129,35 @@ def main() -> None:
                         args.m,
                         args.block_size,
                         1,
-                        nseg=nseg,
-                        msplit=msplit,
+                        **{**base, "nseg": nseg, "msplit": msplit},
+                    )
+                )
+    # The base variant too, for the same reason as sweep.py: the unpatched
+    # _prepare builds the backend's own choice before the override lands.
+    for hq, hkv, d, _window in groups:
+        for layout in (0, 1):
+            with contextlib.suppress(Exception):
+                wanted.append(
+                    KernelVariant(
+                        d,
+                        hq,
+                        hkv,
+                        args.m,
+                        args.block_size,
+                        layout,
+                        **_knobs_for(hq, hkv, d, args.m),
                     )
                 )
     precompile(wanted)
+    # Nothing may build from here on: a build inside do_bench corrupts the
+    # median it reports (258% measured), which is why every cell used to pay a
+    # discarded warm-up call.  Sealing makes the same hazard a loud failure and
+    # halves the run.  Scratch is realised now for the same reason -- its memset
+    # would otherwise land in the first timed iteration.
+    for variant in wanted:
+        with contextlib.suppress(Exception):
+            cached(variant, torch.device("cuda:0"))
+    seal()
     time.sleep(5)  # clocks settle after a parallel build; see 00-protocol.md
 
     from dataclasses import replace
@@ -148,7 +191,6 @@ def main() -> None:
             block_size=args.block_size,
             device="cuda:0",
         )
-        run_attention_benchmark(cfg)
         return statistics.median(
             run_attention_benchmark(cfg).median_time * 1e6 for _ in range(args.reps)
         )
@@ -158,7 +200,9 @@ def main() -> None:
         "default peor |"
     )
     print("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
-    for (hq, hkv, d), models in sorted(groups.items(), key=lambda kv: kv[0][::-1]):
+    for (hq, hkv, d, _window), models in sorted(
+        groups.items(), key=lambda kv: kv[0][::-1]
+    ):
         tri = {s: timeit("TRITON_ATTN", hq, hkv, d, s) for s in args.search}
         override.clear()
         base = {s: timeit("RDNA35_HIP_ATTN", hq, hkv, d, s) for s in args.search}

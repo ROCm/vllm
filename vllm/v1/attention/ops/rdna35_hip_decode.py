@@ -56,6 +56,14 @@ class KernelVariant:
     # 1 strides each wave across the whole context; 0 gives each segment a
     # contiguous run of it.  Only ever run at 1.
     ilv: int = 1
+    # Which cross-lane mechanism carries the score butterfly: 0 = ds_bpermute
+    # on the LDS pipe, 1 = v_permlane16/x16 on the VALU.
+    bfly: int = 0
+    # 1 dispatches the grid as (num_q_heads, nseg) instead of (nseg,
+    # num_q_heads), so the q head is the fastest axis. Every q head of one kv
+    # head reads byte-identical addresses, so this decides whether adjacent
+    # workgroups share lines or merely neighbour them.
+    gridt: int = 0
     # Finish the cross-workgroup reduction inside decode_attn instead of
     # launching reduce_segments for it.  On by default: worth ~1.2 us flat, and
     # a no-op at nseg == 1 where no second kernel runs anyway.
@@ -89,7 +97,8 @@ class KernelVariant:
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
-            f"_b{self.block}_ms{self.msplit}_i{self.ilv}"
+            f"_b{self.block}_ms{self.msplit}_i{self.ilv}_bf{self.bfly}"
+            f"{'_gt' if self.gridt else ''}"
             f"{'' if self.fusedred else '_nofr'}"
             f"_f{int(self.fused)}"
         )
@@ -128,19 +137,76 @@ def _hip_runtime_ldflags() -> list[str]:
     return [f"-L{sdk_lib}"] if (sdk_lib / "libamdhip64.so").exists() else []
 
 
+def _staged_source(name: str) -> Path:
+    """Copy the kernel source into this variant's own build directory.
+
+    On ROCm, torch hipifies each source before compiling it, and does so where
+    the source lives: it writes ``rdna35_decode_attn.hip`` next to the ``.cu``
+    and records the result in ``hipify_python.HIPIFY_FINAL_RESULT``, a global
+    dict keyed by the absolute source path. Every variant compiles the same
+    file, so concurrent builds collide on that one key: the later one resets
+    the entry to a fresh record whose ``hipified_path`` is still the raw
+    ``.cu``, and the earlier build reads that back and compiles unhipified
+    CUDA, failing on ``cuda_runtime_api.h``. The generated ``.hip`` is shared
+    too, and is unlinked by whichever build's ``GeneratedFileCleaner`` exits
+    first, under the feet of the others. Giving each variant its own copy
+    gives it its own hipify key, its own ``.hip`` and its own cleanup.
+    """
+    from torch.utils.cpp_extension import _get_build_directory
+
+    staged = Path(_get_build_directory(name, False)) / _SOURCE.name
+    text = _SOURCE.read_bytes()
+    # Rewrite only on a real change: ninja keys off mtime, so touching this
+    # every time would force a full rebuild on every warm start.
+    if not staged.is_file() or staged.read_bytes() != text:
+        staged.write_bytes(text)
+    return staged
+
+
+class UnexpectedBuildError(RuntimeError):
+    """A variant was requested that precompilation did not cover."""
+
+
+_sealed = False
+
+
+def seal(on: bool = True) -> None:
+    """Refuse to JIT-build any further variant.
+
+    For benchmark harnesses. A build landing inside ``do_bench`` does not just
+    add time: ``do_bench`` sizes its repeat count from a calibration run, so a
+    build during calibration corrupts the median it reports -- measured here as
+    104.59 us against a true 29.99, a 258% error, with no warning. Harnesses
+    used to dodge that with a discarded warm-up call per cell, which doubled
+    the run. Sealing after ``precompile`` turns the same hazard into a loud
+    failure instead, and the warm-up call can go.
+
+    Args:
+        on: True to refuse builds, False to allow them again.
+    """
+    global _sealed
+    _sealed = on
+
+
 def load(variant: KernelVariant) -> Any:
     """Compile (or fetch) the extension for ``variant``."""
     if variant in _loaded:
         return _loaded[variant]
+    if _sealed:
+        raise UnexpectedBuildError(
+            f"{variant.name} was not precompiled, and building it now would "
+            "land inside the timed region. Precompile it or unseal."
+        )
 
-    source = _SOURCE
-    if not source.is_file():
+    if not _SOURCE.is_file():
         raise RuntimeError(
-            f"kernel source not found at {source}; this loader only works "
+            f"kernel source not found at {_SOURCE}; this loader only works "
             "from a source checkout, not an installed wheel"
         )
 
     from torch.utils.cpp_extension import load as load_extension
+
+    source = _staged_source(variant.name)
 
     flags = [
         "-O3",
@@ -165,6 +231,8 @@ def load(variant: KernelVariant) -> Any:
         f"-DBLOCK={variant.block}",
         f"-DMSPLIT={variant.msplit}",
         f"-DILV={variant.ilv}",
+        f"-DBFLY={variant.bfly}",
+        f"-DGRIDT={variant.gridt}",
         f"-DFUSEDRED={int(variant.fusedred)}",
     ]
     logger.info("Compiling %s", variant.name)
@@ -211,9 +279,9 @@ def _available_bytes() -> int:
 def precompile(variants: "Iterable[KernelVariant]", workers: int | None = None) -> None:
     """Build several variants at once.
 
-    Each variant is already its own translation unit and its own ninja
-    invocation, so they are independent; torch takes a file lock per extension
-    name, which differs per variant, so concurrent builds do not collide.
+    Each variant is already its own translation unit, its own ninja invocation
+    and -- since ``_staged_source`` gives it a private copy of the kernel --
+    its own hipify output, so concurrent builds do not collide.
 
     This matters more than it looks. A cold build is ~19.6 s, of which the
     kernel itself is 0.57 s -- the rest is torch/extension.h and the link. So
@@ -245,7 +313,11 @@ def precompile(variants: "Iterable[KernelVariant]", workers: int | None = None) 
                 # D=96 is three fp16 per lane and static_asserts. This is a
                 # warm-up, not a gate: let the real load report it where the
                 # caller already handles a fallback.
-                logger.debug("%s did not build; leaving it to the caller", variant.name)
+                logger.debug(
+                    "%s did not build; leaving it to the caller",
+                    variant.name,
+                    exc_info=True,
+                )
 
 
 def make_scratch(

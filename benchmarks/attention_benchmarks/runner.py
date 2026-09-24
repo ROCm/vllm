@@ -133,11 +133,29 @@ def _build_common_attn_metadata(
     )
 
 
+class _DropCastWarning(logging.Filter):
+    """Drop vLLM's bfloat16 -> float16 cast warning.
+
+    The stand-in model's config is bfloat16 and this harness asks for float16
+    on purpose (see the dtype argument below), so the cast is expected and the
+    warning fires once per ModelConfig -- once per benchmarked cell, thousands
+    of lines in a sweep. Scoped to that one message rather than to the logger
+    or the level, because the warning that must stay visible is the backend
+    announcing it fell back to Triton.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith("Casting ")
+
+
 def _create_vllm_config(
     config: BenchmarkConfig,
     max_num_blocks: int,
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
+    cast_logger = logging.getLogger("vllm.config.model")
+    if not any(isinstance(f, _DropCastWarning) for f in cast_logger.filters):
+        cast_logger.addFilter(_DropCastWarning())
     model_config = ModelConfig(
         model="HuggingFaceTB/SmolLM2-135M",  # Use public model to avoid login issues
         tokenizer="HuggingFaceTB/SmolLM2-135M",

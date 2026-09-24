@@ -22,7 +22,6 @@ Triton's number as if it were ours; that has happened twice on this project.
 
 import argparse
 import contextlib
-import csv
 import statistics
 import sys
 import time
@@ -34,8 +33,10 @@ import torch
 _HERE = Path(__file__).resolve()
 _ROOT = _HERE.parents[4]
 sys.path.insert(0, str(_ROOT / "benchmarks" / "attention_benchmarks"))
+sys.path.insert(0, str(_HERE.parent))
 
-PEAK_GIBS = 230.0
+import shapeset  # noqa: E402
+
 RTOL = 1e-3
 
 
@@ -59,9 +60,10 @@ def correctness(hq, hkv, d, m, block_size, s=48):
     S=48 rather than 128: a causal off-by-one moves the softmax by ~1/S while
     the tolerance is fixed, so a short context is the one that catches it.
     """
-    from vllm.v1.attention.backends.rdna35_hip_attn import _msplit_for, _segments_for
+    from vllm.v1.attention.backends.rdna35_hip_attn import _knobs_for
     from vllm.v1.attention.ops.rdna35_hip_decode import (
         KernelVariant,
+        UnexpectedBuildError,
         load,
         make_scratch,
     )
@@ -81,11 +83,13 @@ def correctness(hq, hkv, d, m, block_size, s=48):
             m,
             block_size,
             1,
-            nseg=_segments_for(hq),
-            msplit=_msplit_for(hkv, m),
+            **_knobs_for(hq, hkv, d, m),
         )
         module = load(variant)
         acc, smax, ssum, arrivals = make_scratch(variant, dev)
+    except UnexpectedBuildError:
+        # Never swallowed: the seal exists to be heard.
+        raise
     except Exception:
         return None
     out = torch.empty_like(q)
@@ -100,13 +104,18 @@ def correctness(hq, hkv, d, m, block_size, s=48):
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--shapes", default=str(_HERE.parent / "shapes.csv"))
+    shapeset.add_arguments(p)
     p.add_argument("--s", type=int, default=128)
     p.add_argument("--m", type=int, default=4)
     p.add_argument("--block-size", type=int, default=16)
-    p.add_argument("--reps", type=int, default=3)
+    p.add_argument(
+        "--reps",
+        type=int,
+        default=1,
+        help="whole re-setups per cell; do_bench medians many iterations "
+        "inside one already",
+    )
     p.add_argument("--triton", action="store_true", help="also time TRITON_ATTN")
-    p.add_argument("--filter", default="", help="substring match on the model name")
     p.add_argument("--skip-check", action="store_true", help="timings only")
     args = p.parse_args()
 
@@ -115,12 +124,10 @@ def main() -> None:
 
     import vllm.v1.attention.backends.rdna35_hip_attn as backend_mod
 
-    rows = []
-    with open(args.shapes) as fh:
-        for r in csv.DictReader(fh):
-            if args.filter and args.filter not in r["model"]:
-                continue
-            rows.append((r["model"], int(r["Hq"]), int(r["Hkv"]), int(r["D"])))
+    rows, windowed = shapeset.load(args)
+    if not rows:
+        print(f"no shapes match {shapeset.describe(args) or 'the given filters'}")
+        return
 
     # Scratch is memoised for the same reason sweep.py memoises it: a rebuild
     # per forward drags a device memset into the timed region.
@@ -139,11 +146,15 @@ def main() -> None:
     # of this table cost nine minutes before the first measurement; spread over
     # the machine it is under a minute. Nothing here is timed, so a build that
     # lands late cannot contaminate a number.
-    from vllm.v1.attention.backends.rdna35_hip_attn import _msplit_for, _segments_for
-    from vllm.v1.attention.ops.rdna35_hip_decode import KernelVariant, precompile
+    from vllm.v1.attention.backends.rdna35_hip_attn import _knobs_for
+    from vllm.v1.attention.ops.rdna35_hip_decode import (
+        KernelVariant,
+        precompile,
+        seal,
+    )
 
     wanted = []
-    for _, hq, hkv, d in rows:
+    for _, hq, hkv, d, _window in rows:
         for layout in (0, 1):
             with contextlib.suppress(Exception):
                 wanted.append(
@@ -154,11 +165,19 @@ def main() -> None:
                         args.m,
                         args.block_size,
                         layout,
-                        nseg=_segments_for(hq),
-                        msplit=_msplit_for(hkv, args.m),
+                        **_knobs_for(hq, hkv, d, args.m),
                     )
                 )
     precompile(wanted)
+    # Nothing may build from here on: a build inside do_bench corrupts the
+    # median it reports (258% measured), which is why every cell used to pay a
+    # discarded warm-up call.  Sealing makes the same hazard a loud failure and
+    # halves the run.  Scratch is realised now for the same reason -- its memset
+    # would otherwise land in the first timed iteration.
+    for variant in wanted:
+        with contextlib.suppress(Exception):
+            cached(variant, torch.device("cuda:0"))
+    seal()
     # Let the machine settle before timing anything.  Compiling saturates the
     # cores and moves the SoC clock, which is the contamination 00-protocol.md
     # invented quiet-lock to avoid; doing it in-process moments before the
@@ -167,20 +186,25 @@ def main() -> None:
     # were served on every quiet run before and after.
     time.sleep(5)
 
+    active = shapeset.describe(args)
+    if active:
+        print(f"filtered to {len(rows)} shapes: {active}")
     hdr = f"{'model':<36} {'Hq':>3} {'Hkv':>4} {'D':>4} {'ran':>4} {'max_rel':>9}"
-    hdr += f" {'us':>9} {'%roof':>6}"
+    hdr += f" {'us':>9} {'%roof':>6} {'spread':>7}"
     if args.triton:
         hdr += f" {'triton':>9} {'vs':>6}"
     print(hdr)
 
     out_rows = []
-    for model, hq, hkv, d in rows:
+    for model, hq, hkv, d, _window in rows:
         rel = (
             None
             if args.skip_check
             else correctness(hq, hkv, d, args.m, args.block_size, s=48)
         )
-        roof = args.s * 2 * hkv * d * 2 / (PEAK_GIBS * 1024**3) * 1e6
+        roof = shapeset.roofline_us(
+            hq, hkv, d, args.m, args.s, block_size=args.block_size
+        )
 
         def timeit(backend, d=d, hq=hq, hkv=hkv):
             cfg = BenchmarkConfig(
@@ -194,11 +218,9 @@ def main() -> None:
                 block_size=args.block_size,
                 device="cuda:0",
             )
-            run_attention_benchmark(cfg)
-            ts = [
-                run_attention_benchmark(cfg).median_time * 1e6 for _ in range(args.reps)
-            ]
-            return statistics.median(ts)
+            rs = [run_attention_benchmark(cfg) for _ in range(args.reps)]
+            spread = max(r.std_time / r.median_time for r in rs) * 100
+            return statistics.median(r.median_time for r in rs) * 1e6, spread
 
         impls: list[Any] = []
         orig_init = backend_mod.Rdna35HipAttentionImpl.__init__
@@ -209,7 +231,7 @@ def main() -> None:
 
         backend_mod.Rdna35HipAttentionImpl.__init__ = spy
         try:
-            us = timeit("RDNA35_HIP_ATTN")
+            us, spread = timeit("RDNA35_HIP_ATTN")
         finally:
             backend_mod.Rdna35HipAttentionImpl.__init__ = orig_init
         ran = any(i.kernel_calls for i in impls) and not any(
@@ -222,9 +244,9 @@ def main() -> None:
 
         line = f"{model:<36} {hq:>3} {hkv:>4} {d:>4} {'yes' if ran else 'NO':>4}"
         line += f" {'-' if rel is None else f'{rel:.2e}':>9}"
-        line += f" {us:>9.2f} {roof / us * 100:>5.1f}%"
+        line += f" {us:>9.2f} {roof / us * 100:>5.1f}% {spread:>6.1f}%"
         if args.triton:
-            t = timeit("TRITON_ATTN")
+            t, _ = timeit("TRITON_ATTN")
             line += f" {t:>9.2f} {t / us:>5.2f}x"
         if not ran and why:
             line += f"  <- {why}"
@@ -242,6 +264,8 @@ def main() -> None:
             by_d[d] = by_d.get(d, 0) + 1
         spread = ", ".join(f"D={k}: {v}" for k, v in sorted(by_d.items()))
         print(f"\nnot served, {len(missing)} of {len(out_rows)} shapes -> {spread}")
+    if windowed:
+        print(f"skipped {windowed} sliding-window shapes: the kernel is full-context")
 
 
 if __name__ == "__main__":

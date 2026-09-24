@@ -51,6 +51,8 @@ def main() -> None:
     p.add_argument("--kpw", type=int, nargs="+", default=[None])
     p.add_argument("--msplit", type=int, nargs="+", default=[None])
     p.add_argument("--ilv", type=int, default=None)
+    p.add_argument("--bfly", type=int, default=None)
+    p.add_argument("--gridt", type=int, default=None)
     p.add_argument("--no-fusedred", dest="fusedred", action="store_false")
     p.add_argument(
         "--repeat",
@@ -87,6 +89,10 @@ def main() -> None:
         kw = {"mutate": args.mutate, "fusedred": args.fusedred}
         if args.ilv is not None:
             kw["ilv"] = args.ilv
+        if args.bfly is not None:
+            kw["bfly"] = args.bfly
+        if args.gridt is not None:
+            kw["gridt"] = args.gridt
         for name, val in (
             ("nseg", nseg),
             ("block", block),

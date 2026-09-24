@@ -59,6 +59,19 @@
 #ifndef ILV
   #define ILV 1
 #endif
+// How the score butterfly is shared between the two cross-lane pipes, in
+// quarters of its elements: 0 puts every element on the LDS pipe
+// (ds_bpermute), 4 puts every element on the VALU (v_permlane16/x16), 3 splits
+// them three to one.  Neither extreme is best -- see the butterfly itself, and
+// OPTIMIZATIONS.md entry 001.
+#ifndef BFLY
+  #define BFLY 0
+#endif
+// 1 transposes the grid to (NUM_Q_HEADS, NSEG), making the head the fastest
+// axis.  See the comment where seg and h are read.
+#ifndef GRIDT
+  #define GRIDT 0
+#endif
 // Merge the NWAVE per-wave partials inside the workgroup, in LDS, instead of
 // routing them through global memory.  With NSEG==1 that finishes the job and
 // no second kernel runs.  With NSEG>1 a head's partials do span workgroups so
@@ -120,7 +133,18 @@
 // Each partial row costs HEAD_DIM floats of acc plus its m and l scalars; the
 // two scalar arrays are what took MAXM=8 at MSPLIT=1 to 66048 B, over the
 // 64 KiB ceiling, when only lds_acc was counted.
-#define LDS_ROW_BYTES (HEAD_DIM * 4 + 8)
+// One float of padding per lane slice.  A lane owns DPL consecutive floats of
+// a row, so unpadded its slice starts at lrow*DPL and the bank index
+// (lrow*DPL) % 32 takes gcd(DPL,32) distinct values -- two of them at D=512,
+// i.e. every lane in the wave piles onto one of two banks and the write
+// serialises 16 ways.  Profiled at 43% LDSBankConflict.  DPL is always even,
+// so DPL+1 is coprime with 32 and the slice starts spread over all 32 banks.
+// The reader pays for it: consecutive d now straddle the pad, which costs a
+// 2-way conflict there.  Trading 16-way on the write for 2-way on the read.
+#define LDS_SLICE (DPL + 1)
+#define LDS_STRIDE (LPR * LDS_SLICE)
+#define LDS_OFF(d) (((d) / DPL) * LDS_SLICE + ((d) % DPL))
+#define LDS_ROW_BYTES (LDS_STRIDE * 4 + 8)
 #define LDS_FOR(MS) ((MAXM / (MS)) * NWAVE * SUB * LDS_ROW_BYTES)
 
 // Default to the decomposition every measurement before this change was taken
@@ -250,14 +274,27 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     const int* __restrict__ bt, float* __restrict__ p_acc,
     float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
     OutT* __restrict__ out, int S, float scale) {
+  // Which grid axis is dispatched fastest.  Workgroups adjacent in launch
+  // order are the ones most likely to be co-resident and to hit each other's
+  // lines, and every q head of a kv head reads byte-identical addresses, so
+  // ordering by head rather than by segment is what makes that sharing
+  // available.  0 is the original (NSEG, NUM_Q_HEADS).
+#if GRIDT
+  const int seg = blockIdx.y;
+#else
   const int seg = blockIdx.x;
+#endif
   const int tid = threadIdx.x;
   const int lane = tid & (WAVE - 1);
   const int wave = tid / WAVE;
   const int lrow = lane % LPR;  // this lane's slice of the row
   const int grp = lane / LPR;   // which of the SUB tokens it carries
   const int dl = lrow * DPL;
+#if GRIDT
+  const int h = blockIdx.x;
+#else
   const int h = blockIdx.y;
+#endif
   const int kvh = h / GQA;
   // Wave w owns tokens mbase, mbase+MSPLIT, ... and KV slice w / MSPLIT.  At
   // MSPLIT == 1 that is mbase = 0 and slice = wave, i.e. every wave takes
@@ -289,6 +326,12 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     ls[t] = 0.f;
   }
 
+  // S is the sequence length the backend was handed, and it rejects an empty
+  // one before it ever reaches here, so the loop below runs at least once and
+  // ctx cannot underflow past -MAXM.  Stating it drops the zero-trip guard and
+  // a compare; the codegen is smaller either way, and at this shape 81% of the
+  // call is fixed cost, so do not expect it to show up as time.
+  __builtin_assume(S > 0);
   const float scale2 = scale * LOG2E;
   const int ctx = S - MAXM;
 #if ILV
@@ -327,6 +370,10 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // is four vector loads of the same 4 bytes broadcast to 32 lanes -- a third
     // of the loop's VMEM slots spent re-reading one integer.
     const int blk = __builtin_amdgcn_readfirstlane(bt[(unsigned)jb / BS]);
+    // Block-table entries are page indices into the KV cache, never negative.
+    // Without this the signed int forces the sign-extension path when blk
+    // feeds the 64-bit address below.
+    __builtin_assume(blk >= 0);
 #if LAYOUT == 1
     // Under HND the tile's KPW tokens are consecutive slots of one block (that
     // is what the BS % KPW assert buys), so they sit at a fixed KV_ROW stride
@@ -387,16 +434,54 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
         s[c][t] = d;
       }
 
-// Measured: lowering these to DPP row_xmask instead is 18% SLOWER across the
-// whole context sweep.  The inner loop uses no LDS, so the LDS pipe is idle
-// and ds_bpermute runs there in parallel; DPP moves the work onto the busy
-// VALU pipe and costs a third of the dual-issue pairing as well.
-//
-// ds_bpermute is called directly rather than through __shfl_xor, which cannot
-// see that the partner index is in range and clamps it: a v_cmp_gt_u32 against
-// 32 and a v_cndmask per stride, guarding a condition that `lane ^ st` with
-// lane < 32 and st <= 16 can never violate, plus five VGPRs held live for the
-// whole kernel to carry the clamped indices.
+    // Measured: lowering these to DPP row_xmask instead is 18% SLOWER across
+    // the whole context sweep.  The inner loop uses no LDS, so the LDS pipe is
+    // idle and ds_bpermute runs there in parallel; DPP moves the work onto the
+    // busy VALU pipe and costs a third of the dual-issue pairing as well.
+    //
+    // ds_bpermute is called directly rather than through __shfl_xor, which
+    // cannot see that the partner index is in range and clamps it: a
+    // v_cmp_gt_u32 against 32 and a v_cndmask per stride, guarding a condition
+    // that `lane ^ st` with lane < 32 and st <= 16 can never violate, plus five
+    // VGPRs held live for the whole kernel to carry the clamped indices.
+    //
+    // BFLY routes each butterfly element to one of the two pipes: ds_bpermute
+    // on the LDS pipe, or v_permlane16/x16 on the VALU.  Unlike DPP, permlane
+    // keeps the adds plain and VOPD-pairable, which is why it wins where DPP
+    // lost.
+    //
+    // The split is over elements, not strides.  The strides are a dependence
+    // chain
+    // -- stride 2 consumes stride 1 -- so moving whole strides to the other
+    // pipe buys nothing, while the KPWE*MPW elements inside one stride are
+    // independent and can occupy both pipes at once.  BFLY is that ratio in
+    // quarters: 0 sends every element to the LDS pipe, 4 sends every element to
+    // the VALU.
+#define BFLY_ON_VALU(idx) (((idx) & 3) < BFLY)
+// Nibble i of the (lo, hi) pair is the source lane for destination lane i
+// inside each 16-lane row, so the pair encodes an XOR-by-st swizzle.
+#define BFLY_LO(st)          \
+  ((st) == 1   ? 0x67452301u \
+   : (st) == 2 ? 0x54761032u \
+   : (st) == 4 ? 0x32107654u \
+               : 0xFEDCBA98u)
+#define BFLY_HI(st)          \
+  ((st) == 1   ? 0xEFCDAB89u \
+   : (st) == 2 ? 0xDCFE98BAu \
+   : (st) == 4 ? 0xBA98FEDCu \
+               : 0x76543210u)
+// st == 16 is the only stride that leaves the 16-lane row.
+#define BFLY_VALU(st, v)                                                    \
+  ((st) >= 16 ? __builtin_amdgcn_permlanex16(                               \
+                    __builtin_bit_cast(int, v), __builtin_bit_cast(int, v), \
+                    0x76543210u, 0xFEDCBA98u, false, false)                 \
+              : __builtin_amdgcn_permlane16(                                \
+                    __builtin_bit_cast(int, v), __builtin_bit_cast(int, v), \
+                    BFLY_LO(st), BFLY_HI(st), false, false))
+#define BFLY_XOR(st, addr, idx, v) \
+  (BFLY_ON_VALU(idx)               \
+       ? BFLY_VALU(st, v)          \
+       : __builtin_amdgcn_ds_bpermute(addr, __builtin_bit_cast(int, v)))
 #pragma unroll
     for (int st = 1; st < LPR; st <<= 1) {
       const int addr = (lane ^ st) << 2;  // ds_bpermute indexes lanes by byte
@@ -405,8 +490,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 #pragma unroll
         for (int t = 0; t < MPW; ++t)
           s[c][t] = __builtin_bit_cast(
-                        float, __builtin_amdgcn_ds_bpermute(
-                                   addr, __builtin_bit_cast(int, s[c][t]))) +
+                        float, BFLY_XOR(st, addr, c * MPW + t, s[c][t])) +
                     s[c][t];
     }
 
@@ -480,7 +564,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // SUB rows per wave now, not one: the groups of a wave hold the same output
   // elements over different tokens, so their partials are merged here with the
   // ones from the other KV slices rather than in a separate in-wave butterfly.
-  __shared__ float lds_acc[MPW * NWAVE * SUB * HEAD_DIM];
+  __shared__ float lds_acc[MPW * NWAVE * SUB * LDS_STRIDE];
   __shared__ float lds_m[MPW * NWAVE * SUB];
   __shared__ float lds_l[MPW * NWAVE * SUB];
 
@@ -488,8 +572,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   for (int t = 0; t < MPW; ++t) {
   #pragma unroll
     for (int i = 0; i < DPL; ++i)
-      lds_acc[((size_t)(t * NWAVE + wave) * SUB + grp) * HEAD_DIM + dl + i] =
-          acc[t][i];
+      lds_acc[((size_t)(t * NWAVE + wave) * SUB + grp) * LDS_STRIDE +
+              lrow * LDS_SLICE + i] = acc[t][i];
     if (lrow == 0) {
       lds_m[(t * NWAVE + wave) * SUB + grp] = mx[t];
       lds_l[(t * NWAVE + wave) * SUB + grp] = ls[t];
@@ -531,9 +615,10 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     }
   #endif
     // BLOCK need not equal HEAD_DIM once D is free: D=512 has more output
-    // elements than threads and D=64 has fewer.  The equal case is spelled out
-    // because the compiler cannot prove tid < HEAD_DIM and otherwise wraps the
-    // body in an exec mask and a branch on a condition that is always true.
+    // elements than threads and D=64 has fewer.  The equal case is spelled
+    // out because the compiler cannot prove tid < HEAD_DIM and otherwise
+    // wraps the body in an exec mask and a branch on a condition that is
+    // always true.
   #if BLOCK == HEAD_DIM
     const int d = tid;
     {
@@ -543,8 +628,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       float num = 0.f;
   #pragma unroll
       for (int p = 0; p < NPARTW; ++p)
-        num =
-            fmaf(a[p], lds_acc[(size_t)partial_row(wb, p) * HEAD_DIM + d], num);
+        num = fmaf(
+            a[p], lds_acc[(size_t)partial_row(wb, p) * LDS_STRIDE + LDS_OFF(d)],
+            num);
   #if NSEG == 1
       out[((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d] =
           (OutT)fast_div(num, den);
@@ -682,7 +768,11 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  #if GRIDT
+  dim3 grid(NUM_Q_HEADS, NSEG), block(BLOCK);
+  #else
   dim3 grid(NSEG, NUM_Q_HEADS), block(BLOCK);
+  #endif
   dim3 rgrid(MAXM, NUM_Q_HEADS);
 
   const auto* qp = reinterpret_cast<const _Float16*>(q.data_ptr());
