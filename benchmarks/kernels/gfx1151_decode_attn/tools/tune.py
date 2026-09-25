@@ -65,11 +65,22 @@ def space(hq, hkv, d, start):
         "pf": [0, 1],
         "target": list(TARGETS),
         "minb": [1, 2, 4],
+        # The dot decomposition's own knobs.
+        "dnseg": [1, 2, 4, 8],
+        "bfly": [0, 2, 4],
+        "gt": [0, 1],
     }
 
 
 def knobs_of(hkv, cand):
     """KernelVariant keyword arguments for a search point."""
+    if cand.get("dot"):
+        k = {"dot": 1, "nw": cand["nw"], "nseg": cand["dnseg"]}
+        if cand["bfly"]:
+            k["bfly"] = cand["bfly"]
+        if cand["gt"]:
+            k["gt"] = 1
+        return k
     k = {
         "nw": cand["nw"],
         "rg": cand["rg"],
@@ -258,15 +269,27 @@ def main() -> None:
             if rs_max > 1:
                 starts.append(dict(start, rg=1, rspl=rs_max, nw=4, target=32))
 
-            def descend(ctxs, starts=starts, scores=scores):
+            # The dot decomposition, a start of its own: it shares no knob
+            # with WMMA but the waves.  Only for short contexts, where it can
+            # win (reference/: never past ~4k keys).
+            dot_start = dict(start, dot=1, nw=8, dnseg=2, bfly=0, gt=0)
+
+            def descend(ctxs, starts=starts, dot_start=dot_start, dot=False):
                 found = [descend_from(ctxs, s) for s in starts]
+                if dot:
+                    found.append(descend_from(ctxs, dot_start))
                 return max(found, key=lambda f: f[1][0])
 
             def descend_from(ctxs, start, values=values, scores=scores):
                 best = dict(start)
                 evaluate([best], ctxs)
                 for _ in range(args.rounds):
-                    for knob in ("nw", "dspl", "rg", "rspl", "pf", "target", "minb"):
+                    knobs_ = (
+                        ("nw", "dnseg", "bfly", "gt")
+                        if best.get("dot")
+                        else ("nw", "dspl", "rg", "rspl", "pf", "target", "minb")
+                    )
+                    for knob in knobs_:
                         cands = [dict(best, **{knob: v}) for v in values[knob]]
                         if knob == "rspl":
                             # rspl splits rows inside the workgroup that rg
@@ -285,7 +308,7 @@ def main() -> None:
             if args.split:
                 short = tuple(s for s in args.contexts if s < args.split)
                 long_ = tuple(s for s in args.contexts if s >= args.split)
-                best_a, (g_a, cells_a) = descend(short)
+                best_a, (g_a, cells_a) = descend(short, dot=True)
                 best_b, (g_b, cells_b) = descend(long_)
                 knobs = knobs_of(hkv, best_a)
                 kb = knobs_of(hkv, best_b)

@@ -89,6 +89,17 @@
   #ifndef PF
     #define PF 0
   #endif
+  // 1 runs the per-q-head dot-product decomposition instead of WMMA (see
+  // the dot body), with BFLY and GT its butterfly split and grid order.
+  #ifndef DOT
+    #define DOT 0
+  #endif
+  #ifndef BFLY
+    #define BFLY 0
+  #endif
+  #ifndef GT
+    #define GT 0
+  #endif
 
   // A second decomposition for long sequences: at S >= SW the kernel runs
   // mode B with the knobs below instead of mode A's.  The grid and the block
@@ -119,6 +130,15 @@
   #endif
   #ifndef PF2
     #define PF2 PF
+  #endif
+  #ifndef DOT2
+    #define DOT2 DOT
+  #endif
+  #ifndef BFLY2
+    #define BFLY2 BFLY
+  #endif
+  #ifndef GT2
+    #define GT2 GT
   #endif
 
   // Measurement only, wrong answers: 1 skips the V loads, 2 thins P@V to one
@@ -181,6 +201,7 @@ typedef elem_t e16 __attribute__((ext_vector_type(16)));
 typedef elem_t e8 __attribute__((ext_vector_type(8)));
 typedef elem_t e2 __attribute__((ext_vector_type(2)));
 typedef short s16 __attribute__((ext_vector_type(16)));
+typedef short s2v __attribute__((ext_vector_type(2)));
 typedef float f8 __attribute__((ext_vector_type(8)));
 typedef float f4 __attribute__((ext_vector_type(4)));
 typedef unsigned u8v __attribute__((ext_vector_type(8)));
@@ -308,6 +329,9 @@ __device__ __forceinline__ e16 p_frag(const float* p) {
   #define M_RSPL RSPL
   #define M_NW NW
   #define M_PF PF
+  #define M_DOT DOT
+  #define M_BFLY BFLY
+  #define M_GT GT
 namespace mode_a {
   #include __FILE_NAME__
 }  // namespace mode_a
@@ -318,6 +342,9 @@ namespace mode_a {
   #undef M_RSPL
   #undef M_NW
   #undef M_PF
+  #undef M_DOT
+  #undef M_BFLY
+  #undef M_GT
   #if SW
     #define M_NSEG NSEG2
     #define M_RG RG2
@@ -326,6 +353,9 @@ namespace mode_a {
     #define M_RSPL RSPL2
     #define M_NW NW2
     #define M_PF PF2
+    #define M_DOT DOT2
+    #define M_BFLY BFLY2
+    #define M_GT GT2
 namespace mode_b {
     #include __FILE_NAME__
 }  // namespace mode_b
@@ -336,6 +366,9 @@ namespace mode_b {
     #undef M_RSPL
     #undef M_NW
     #undef M_PF
+    #undef M_DOT
+    #undef M_BFLY
+    #undef M_GT
   #else
 namespace mode_b = mode_a;
   #endif
@@ -475,68 +508,422 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
   // ---------------------------------------------------------------- body ----
   // Everything below depends on the decomposition knobs, read through their
   // M_ names; the outer pass instantiates it once per mode.
-  #define ROWS_W (ROWS / M_RG)
-  #define RTILES ((ROWS_W + 15) / 16)
-  #define ROWPAD (RTILES * 16)
-  #define TILES (M_NW / (M_DSPL * M_RSPL))
-  // Row tiles per wave; wave rs of a tile carries row tiles rs, rs + M_RSPL,
-  // ...
-  #define RTW (RTILES / M_RSPL)
-  // With M_RSPL > 1 the tile is shared: each of its M_RSPL waves loads EPW of
-  // the eight key pairs, stages them in LDS, and all read the whole tile back.
-  #define SHT (M_RSPL > 1)
-  #define EPW (8 / M_RSPL)
-  #define KBLK (16 * TILES)
-  #define DPART (HEAD_DIM / M_DSPL)
-  // d per lane of a K or V row: lane l16 owns DPART/16 consecutive d.
-  #define VD (DPART / 16)
-  #define NCP (NCHUNK / M_DSPL)
-  // P reaches P@V as a high plus a low half, ~22 bits rather than 11 in fp16
-  // and ~16 rather than 8 in bf16: with one fp16 P the output misses the 1e-3
-  // relative bound wherever it is near zero.  When a row tile has at most 8
-  // real rows the low half rides in the padding columns of the same WMMA;
-  // otherwise it takes a second one.
-  #define PPACK (ROWS_W <= 8)
+  #if M_DOT
+    // ------------------------------------------------------- dot body ----
+    // The per-q-head dot-product decomposition (OPTIMIZATIONS 001-008, kept in
+    // reference/): one workgroup per (q head, segment), every wave a slice of
+    // KPW keys at a time with the whole head dim across its lanes, Q@K as fdot2
+    // and a butterfly across the lanes of a row, P@V on the VALU.  No WMMA
+    // padding and no score exchange, which is what wins at short context: few
+    // keys per kv head leave the WMMA path's 16-row tiles mostly empty and its
+    // cross-wave traffic exposed.  Each kv head's KV is read once per q head,
+    // through L2.
+    #define D_DPL (HEAD_DIM == 128 ? 8 : HEAD_DIM / WAVE)
+    #define D_LPR (HEAD_DIM / D_DPL)
+    #define D_SUB (WAVE / D_LPR)
+    #define D_KPW 4
+    #define D_KPWE ((D_KPW / D_SUB) > 0 ? (D_KPW / D_SUB) : 1)
+    #define D_FPL (D_DPL / 2)
+    #define D_SLICE (D_DPL + 1)
+    #define D_STRIDE (D_LPR * D_SLICE)
+    #define D_NPARTW (M_NW * D_SUB)
+    #define D_ACC_BYTES (MAXM * M_NW * D_SUB * D_STRIDE * 4)
+    #define D_ML_BYTES (MAXM * M_NW * D_SUB * 4)
 
-  // Per-wave K tile: 16 keys of DPART halves.  K is read row-wise, like V, and
-  // transposed to the lane-per-key WMMA operand through it; the 16-byte pad
-  // puts the sixteen keys one operand read touches on distinct banks.
-  #define KT_ROW (DPART * 2 + 16)
-  #define KT_BYTES (M_NW * 16 * KT_ROW)
-  #define QS_BYTES (ROWPAD * (HEAD_DIM + QPAD) * 2)
-  #define MROW (DPART + PADM)
-  #define RV (ROWS_W < 16 ? ROWS_W : 16)
-  #define MSLOT (RV * MROW)
-  #define SLOTS_FIT(t) ((t) * M_DSPL * M_RSPL * MSLOT * 4 <= MBUDGET)
-  // Live tiles after the merge's tree rounds: the most that fit the budget.
-  #define TFIN                          \
-    (SLOTS_FIT(TILES)       ? TILES     \
-     : SLOTS_FIT(TILES / 2) ? TILES / 2 \
-     : SLOTS_FIT(TILES / 4) ? TILES / 4 \
-     : SLOTS_FIT(TILES / 8) ? TILES / 8 \
-                            : 1)
-  #define MRG_SLOTS \
-    (TFIN == TILES ? TILES : (TFIN > TILES / 2 ? TFIN : TILES / 2))
-  #define MRG_BYTES \
-    (TILES == 1 && M_RSPL == 1 ? 0 : MRG_SLOTS * M_DSPL * M_RSPL * MSLOT * 4)
-  #if SHT
-    // Per (tile, d part) a K and a V tile, double-buffered, and the score
-    // exchange apart from them: partners may still read the shared K.
-    #define TB_BYTES (2 * TILES * M_DSPL * 2 * 16 * KT_ROW)
-    #define SX_BYTES (M_DSPL > 1 ? M_NW * RTW * 1024 : 0)
-    #define LOOP_BYTES (QS_BYTES + TB_BYTES + SX_BYTES)
+static_assert(D_LPR >= 1 && D_LPR <= WAVE && WAVE % D_LPR == 0,
+              "a row must be covered by a whole divisor of the wave");
+static_assert(BS % (D_SUB * D_KPWE) == 0,
+              "a tile of SUB*KPWE tokens must not straddle two blocks");
+static_assert(D_ACC_BYTES + 2 * D_ML_BYTES + 16 <= 65536,
+              "the dot mode's partials must fit LDS");
+
+typedef float fvec __attribute__((ext_vector_type(D_FPL)));
+
+constexpr int kLds = D_ACC_BYTES + 2 * D_ML_BYTES + 16;
+constexpr int kGrid = M_NSEG * NUM_Q_HEADS;
+// One arrival counter per q head.
+constexpr int kCnt = NUM_Q_HEADS;
+constexpr bool kSharedMerge = false;
+
+__device__ __forceinline__ void dot_coords(int& seg, int& h) {
+  const int bid = blockIdx.x;
+    #if M_GT
+  // Head fastest: the q heads of a kv head, which read byte-identical KV,
+  // are dispatched side by side.
+  h = bid % NUM_Q_HEADS;
+  seg = bid / NUM_Q_HEADS;
+    #else
+  seg = bid % M_NSEG;
+  h = bid / M_NSEG;
+    #endif
+}
+
+// The block index of wave's first tile, which goes out before S is known.
+__device__ __forceinline__ int first_pages(const int* __restrict__ bt,
+                                           int bt_width) {
+  int seg, h;
+  dot_coords(seg, h);
+  const int gw =
+      __builtin_amdgcn_readfirstlane(seg * M_NW + threadIdx.x / WAVE);
+  return bt[min(gw * D_KPWE * D_SUB / BS, bt_width - 1)];
+}
+
+__device__ __forceinline__ float dot2(float a, float b, float c) {
+    #if KV_BF16
+  return __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(s2v, a),
+                                         __builtin_bit_cast(s2v, b), c, false);
+    #else
+  return __builtin_amdgcn_fdot2(__builtin_bit_cast(e2, a),
+                                __builtin_bit_cast(e2, b), c, false);
+    #endif
+}
+
+__device__ __forceinline__ int partial_row(int wb, int p) {
+  return wb * D_SUB + p;
+}
+
+    // BFLY routes each butterfly element to the LDS pipe (ds_bpermute) or the
+    // VALU (permlane), in quarters; see OPTIMIZATIONS 001.
+    #define BFLY_ON_VALU(idx) (((idx) & 3) < M_BFLY)
+    #define BFLY_LO(st)          \
+      ((st) == 1   ? 0x67452301u \
+       : (st) == 2 ? 0x54761032u \
+       : (st) == 4 ? 0x32107654u \
+                   : 0xFEDCBA98u)
+    #define BFLY_HI(st)          \
+      ((st) == 1   ? 0xEFCDAB89u \
+       : (st) == 2 ? 0xDCFE98BAu \
+       : (st) == 4 ? 0xBA98FEDCu \
+                   : 0x76543210u)
+    #define BFLY_VALU(st, v)                                             \
+      ((st) >= 16                                                        \
+           ? __builtin_amdgcn_permlanex16(                               \
+                 __builtin_bit_cast(int, v), __builtin_bit_cast(int, v), \
+                 0x76543210u, 0xFEDCBA98u, false, false)                 \
+           : __builtin_amdgcn_permlane16(                                \
+                 __builtin_bit_cast(int, v), __builtin_bit_cast(int, v), \
+                 BFLY_LO(st), BFLY_HI(st), false, false))
+    #define BFLY_XOR(st, addr, idx, v) \
+      (BFLY_ON_VALU(idx)               \
+           ? BFLY_VALU(st, v)          \
+           : __builtin_amdgcn_ds_bpermute(addr, __builtin_bit_cast(int, v)))
+
+template <typename OutT>
+__device__ __forceinline__ void body(
+    const elem_t* __restrict__ q, const elem_t* __restrict__ kv,
+    const int* __restrict__ bt, float* __restrict__ p_acc,
+    float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
+    OutT* __restrict__ out, const int S, int pages, int bt_width, float scale,
+    int coop, char* __restrict__ lds) {
+  (void)coop;
+  if (blockIdx.x >= kGrid) return;
+  const int tid = threadIdx.x;
+  const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE);
+  if (M_NW < BLOCK / WAVE && wave >= M_NW) return;
+  int seg, h;
+  dot_coords(seg, h);
+  const int lane = tid & (WAVE - 1);
+  const int lrow = lane % D_LPR;  // this lane's slice of the row
+  const int grp = lane / D_LPR;   // which of the SUB keys it carries
+  const int dl = lrow * D_DPL;
+  const int kvh = h / GQA;
+
+  fvec qr[MAXM];
+    #pragma unroll
+  for (int t = 0; t < MAXM; ++t) {
+    const unsigned qoff =
+        ((unsigned)t * NUM_Q_HEADS + (unsigned)h) * HEAD_DIM + (unsigned)dl;
+    qr[t] = *(const fvec*)(q + qoff);
+  }
+
+  float acc[MAXM][D_DPL], mx[MAXM], ls[MAXM];
+    #pragma unroll
+  for (int t = 0; t < MAXM; ++t) {
+    #pragma unroll
+    for (int i = 0; i < D_DPL; ++i) acc[t][i] = 0.f;
+    mx[t] = -INFINITY;
+    ls[t] = 0.f;
+  }
+
+  __builtin_assume(S > 0);
+  const float scale2 = scale * LOG2E;
+  const int ctx = S - MAXM;
+  // readfirstlane: without it the compiler cannot see the start is
+  // wave-uniform and guards the loop with an exec mask, so a wave with no
+  // tiles reached the LDS stores with exec = 0 (reference kernel, NSEG > 1).
+  const int gw = __builtin_amdgcn_readfirstlane(seg * M_NW + wave);
+  const int jstart = gw * D_KPWE * D_SUB;
+  const int jstep = M_NSEG * M_NW * D_KPWE * D_SUB;
+  // The first tile's block came in with S; each later one is read a tile
+  // ahead, so no tile's loads wait on the block table.
+  int blk = __builtin_amdgcn_readfirstlane(pages);
+
+  for (int jb = jstart; jb < S; jb += jstep) {
+    fvec kr[D_KPWE], vr[D_KPWE];
+    __builtin_assume(blk >= 0);
+    #if LAYOUT == 1
+    const size_t base = (size_t)blk * PAGE_ELEMS +
+                        ((size_t)kvh * BS + (unsigned)jb % BS) * KV_ROW +
+                        (size_t)grp * KV_ROW + dl;
+      #pragma unroll
+    for (int c = 0; c < D_KPWE; ++c) {
+      const size_t off = base + (size_t)c * D_SUB * KV_ROW;
+      kr[c] = *(const fvec*)(kv + off);
+      vr[c] = *(const fvec*)(kv + off + HEAD_DIM);
+    }
+    #else
+      #pragma unroll
+    for (int c = 0; c < D_KPWE; ++c) {
+      const unsigned jj = (unsigned)min(jb + c * D_SUB + grp, S - 1);
+      const size_t off = (size_t)blk * PAGE_ELEMS +
+                         ((size_t)(jj % BS) * NUM_KV_HEADS + kvh) * KV_ROW + dl;
+      kr[c] = *(const fvec*)(kv + off);
+      vr[c] = *(const fvec*)(kv + off + HEAD_DIM);
+    }
+    #endif
+    blk = __builtin_amdgcn_readfirstlane(
+        bt[min((jb + jstep) / BS, bt_width - 1)]);
+    // Keys past S read whatever their page holds; K's garbage dies in the
+    // mask, V's must not reach the accumulator as 0 * NaN.
+    if (__builtin_expect(jb + D_KPWE * D_SUB > S, 0)) {
+    #pragma unroll
+      for (int c = 0; c < D_KPWE; ++c)
+        if (jb + c * D_SUB + grp >= S) vr[c] = fvec{};
+    }
+
+    float s[D_KPWE][MAXM];
+    #pragma unroll
+    for (int c = 0; c < D_KPWE; ++c)
+    #pragma unroll
+      for (int t = 0; t < MAXM; ++t) {
+        float d = 0.f;
+    #pragma unroll
+        for (int e = 0; e < D_FPL; ++e) d = dot2(qr[t][e], kr[c][e], d);
+        s[c][t] = d;
+      }
+    #pragma unroll
+    for (int st = 1; st < D_LPR; st <<= 1) {
+      const int addr = (lane ^ st) << 2;
+    #pragma unroll
+      for (int c = 0; c < D_KPWE; ++c)
+    #pragma unroll
+        for (int t = 0; t < MAXM; ++t)
+          s[c][t] = __builtin_bit_cast(
+                        float, BFLY_XOR(st, addr, c * MAXM + t, s[c][t])) +
+                    s[c][t];
+    }
+    #pragma unroll
+    for (int c = 0; c < D_KPWE; ++c) {
+      const int jj = jb + c * D_SUB + grp;
+    #pragma unroll
+      for (int t = 0; t < MAXM; ++t) {
+    #if MUTATE == 1
+        const bool valid = (jj <= ctx + t + 1);
+    #else
+        const bool valid = (jj <= ctx + t);
+    #endif
+        s[c][t] = valid ? s[c][t] * scale2 : -INFINITY;
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < MAXM; ++t) {
+      float mnew = mx[t];
+    #pragma unroll
+      for (int c = 0; c < D_KPWE; ++c) mnew = fmaxf(mnew, s[c][t]);
+      const float alpha =
+          (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(mx[t] - mnew);
+      mx[t] = mnew;
+      ls[t] *= alpha;
+    #pragma unroll
+      for (int i = 0; i < D_DPL; ++i) acc[t][i] *= alpha;
+      float lsum = 0.f;
+    #pragma unroll
+      for (int c = 0; c < D_KPWE; ++c) {
+        const float p =
+            (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(s[c][t] - mnew);
+        s[c][t] = p;
+        lsum += p;
+      }
+      ls[t] += lsum;
+    }
+    #pragma unroll
+    for (int c = 0; c < D_KPWE; ++c) {
+      const elem_t* vv = (const elem_t*)&vr[c];
+    #pragma unroll
+      for (int t = 0; t < MAXM; ++t)
+    #pragma unroll
+        for (int i = 0; i < D_DPL; ++i) acc[t][i] += s[c][t] * (float)vv[i];
+    }
+  }
+
+  // The waves' partials meet in LDS, then (with segments) in global memory.
+  float* const lds_acc = reinterpret_cast<float*>(lds);
+  float* const lds_m = reinterpret_cast<float*>(lds + D_ACC_BYTES);
+  float* const lds_l = lds_m + MAXM * M_NW * D_SUB;
+  int& lds_last = *reinterpret_cast<int*>(lds_l + MAXM * M_NW * D_SUB);
+    #pragma unroll
+  for (int t = 0; t < MAXM; ++t) {
+    if (lrow == 0) {
+      lds_m[(t * M_NW + wave) * D_SUB + grp] = mx[t];
+      lds_l[(t * M_NW + wave) * D_SUB + grp] = ls[t];
+    }
+    #pragma unroll
+    for (int i = 0; i < D_DPL; ++i)
+      lds_acc[((t * M_NW + wave) * D_SUB + grp) * D_STRIDE + lrow * D_SLICE +
+              i] = acc[t][i];
+  }
+  lds_barrier();
+
+    #pragma unroll
+  for (int t = 0; t < MAXM; ++t) {
+    const int wb = t * M_NW;
+    float gmax = -INFINITY;
+    #pragma unroll
+    for (int p = 0; p < D_NPARTW; ++p)
+      gmax = fmaxf(gmax, lds_m[partial_row(wb, p)]);
+    float a[D_NPARTW], den = 0.f;
+    #pragma unroll
+    for (int p = 0; p < D_NPARTW; ++p) {
+      const int w = partial_row(wb, p);
+      a[p] = weight_of(lds_m[w], gmax);
+      den = fmaf(a[p], lds_l[w], den);
+    }
+    const size_t pb = ((size_t)h * M_NSEG + seg) * MAXM + t;
+    #if M_NSEG > 1
+    if (tid == 0) {
+      p_m[pb] = gmax;
+      p_l[pb] = den;
+    }
+    #endif
+    for (int d = tid; d < HEAD_DIM; d += M_NW * WAVE) {
+      float num = 0.f;
+    #pragma unroll
+      for (int p = 0; p < D_NPARTW; ++p)
+        num = fmaf(a[p],
+                   lds_acc[partial_row(wb, p) * D_STRIDE +
+                           (d / D_DPL) * D_SLICE + d % D_DPL],
+                   num);
+    #if M_NSEG == 1
+      out[((size_t)t * NUM_Q_HEADS + h) * HEAD_DIM + d] =
+          to_elem(num * __builtin_amdgcn_rcpf(den));
+    #else
+      p_acc[pb * HEAD_DIM + d] = num;
+    #endif
+    }
+  }
+
+    #if M_NSEG > 1
+  // Last arriver for this head merges; it resets the counter for the next
+  // launch, so a graph replay starts clean.
+  __threadfence();
+  if (tid == 0) lds_last = (atomicAdd(&p_cnt[h], 1) == M_NSEG - 1);
+  lds_barrier();
+  if (!lds_last) return;
+  if (tid == 0) p_cnt[h] = 0;
+  __threadfence();
+      #pragma unroll
+  for (int t = 0; t < MAXM; ++t) {
+    const size_t rb = (size_t)h * M_NSEG * MAXM + t;
+    float gmax = -INFINITY;
+      #pragma unroll
+    for (int s = 0; s < M_NSEG; ++s)
+      gmax = fmaxf(gmax, p_m[rb + (size_t)s * MAXM]);
+    for (int d = tid; d < HEAD_DIM; d += M_NW * WAVE) {
+      float num = 0.f, den = 0.f;
+      #pragma unroll
+      for (int s = 0; s < M_NSEG; ++s) {
+        const size_t b = rb + (size_t)s * MAXM;
+        const float a = weight_of(p_m[b], gmax);
+        den = fmaf(a, p_l[b], den);
+        num = fmaf(a, p_acc[b * HEAD_DIM + d], num);
+      }
+      out[((size_t)t * NUM_Q_HEADS + h) * HEAD_DIM + d] =
+          to_elem(num * __builtin_amdgcn_rcpf(den));
+    }
+  }
+    #endif
+}
+
+    #undef D_DPL
+    #undef D_LPR
+    #undef D_SUB
+    #undef D_KPW
+    #undef D_KPWE
+    #undef D_FPL
+    #undef D_SLICE
+    #undef D_STRIDE
+    #undef D_NPARTW
+    #undef D_ACC_BYTES
+    #undef D_ML_BYTES
+    #undef BFLY_ON_VALU
+    #undef BFLY_LO
+    #undef BFLY_HI
+    #undef BFLY_VALU
+    #undef BFLY_XOR
   #else
-    #define LOOP_BYTES (QS_BYTES + KT_BYTES)
-  #endif
-  #define LDS_RAW (LOOP_BYTES > MRG_BYTES ? LOOP_BYTES : MRG_BYTES)
-  // Split KV: a single workgroup merging every segment's partials is bound by
-  // its own CU's bandwidth once they reach 64 KiB -- 2 us at 256 KiB.  Past
-  // that the segments wait for each other and each merges a slice instead.
-  #define SHARED_MERGE (ROWS_W * HEAD_DIM * M_NSEG * 4 >= 64 * 1024)
-  #define M_BLOCK (M_NW * WAVE)
-  // m_s, l_s, gm_s, gl_s and the merge's go flag, after the raw buffer.
-  #define LDS_MS ((LDS_RAW + 15) / 16 * 16)
-  #define LDS_ALL (LDS_MS + (2 * M_NW * ROWPAD + 2 * ROWPAD) * 4 + 16)
+    #define ROWS_W (ROWS / M_RG)
+    #define RTILES ((ROWS_W + 15) / 16)
+    #define ROWPAD (RTILES * 16)
+    #define TILES (M_NW / (M_DSPL * M_RSPL))
+    // Row tiles per wave; wave rs of a tile carries row tiles rs, rs + M_RSPL,
+    // ...
+    #define RTW (RTILES / M_RSPL)
+    // With M_RSPL > 1 the tile is shared: each of its M_RSPL waves loads EPW of
+    // the eight key pairs, stages them in LDS, and all read the whole tile
+    // back.
+    #define SHT (M_RSPL > 1)
+    #define EPW (8 / M_RSPL)
+    #define KBLK (16 * TILES)
+    #define DPART (HEAD_DIM / M_DSPL)
+    // d per lane of a K or V row: lane l16 owns DPART/16 consecutive d.
+    #define VD (DPART / 16)
+    #define NCP (NCHUNK / M_DSPL)
+    // P reaches P@V as a high plus a low half, ~22 bits rather than 11 in fp16
+    // and ~16 rather than 8 in bf16: with one fp16 P the output misses the 1e-3
+    // relative bound wherever it is near zero.  When a row tile has at most 8
+    // real rows the low half rides in the padding columns of the same WMMA;
+    // otherwise it takes a second one.
+    #define PPACK (ROWS_W <= 8)
+
+    // Per-wave K tile: 16 keys of DPART halves.  K is read row-wise, like V,
+    // and transposed to the lane-per-key WMMA operand through it; the 16-byte
+    // pad puts the sixteen keys one operand read touches on distinct banks.
+    #define KT_ROW (DPART * 2 + 16)
+    #define KT_BYTES (M_NW * 16 * KT_ROW)
+    #define QS_BYTES (ROWPAD * (HEAD_DIM + QPAD) * 2)
+    #define MROW (DPART + PADM)
+    #define RV (ROWS_W < 16 ? ROWS_W : 16)
+    #define MSLOT (RV * MROW)
+    #define SLOTS_FIT(t) ((t) * M_DSPL * M_RSPL * MSLOT * 4 <= MBUDGET)
+    // Live tiles after the merge's tree rounds: the most that fit the budget.
+    #define TFIN                          \
+      (SLOTS_FIT(TILES)       ? TILES     \
+       : SLOTS_FIT(TILES / 2) ? TILES / 2 \
+       : SLOTS_FIT(TILES / 4) ? TILES / 4 \
+       : SLOTS_FIT(TILES / 8) ? TILES / 8 \
+                              : 1)
+    #define MRG_SLOTS \
+      (TFIN == TILES ? TILES : (TFIN > TILES / 2 ? TFIN : TILES / 2))
+    #define MRG_BYTES \
+      (TILES == 1 && M_RSPL == 1 ? 0 : MRG_SLOTS * M_DSPL * M_RSPL * MSLOT * 4)
+    #if SHT
+      // Per (tile, d part) a K and a V tile, double-buffered, and the score
+      // exchange apart from them: partners may still read the shared K.
+      #define TB_BYTES (2 * TILES * M_DSPL * 2 * 16 * KT_ROW)
+      #define SX_BYTES (M_DSPL > 1 ? M_NW * RTW * 1024 : 0)
+      #define LOOP_BYTES (QS_BYTES + TB_BYTES + SX_BYTES)
+    #else
+      #define LOOP_BYTES (QS_BYTES + KT_BYTES)
+    #endif
+    #define LDS_RAW (LOOP_BYTES > MRG_BYTES ? LOOP_BYTES : MRG_BYTES)
+    // Split KV: a single workgroup merging every segment's partials is bound by
+    // its own CU's bandwidth once they reach 64 KiB -- 2 us at 256 KiB.  Past
+    // that the segments wait for each other and each merges a slice instead.
+    #define SHARED_MERGE (ROWS_W * HEAD_DIM * M_NSEG * 4 >= 64 * 1024)
+    #define M_BLOCK (M_NW * WAVE)
+    // m_s, l_s, gm_s, gl_s and the merge's go flag, after the raw buffer.
+    #define LDS_MS ((LDS_RAW + 15) / 16 * 16)
+    #define LDS_ALL (LDS_MS + (2 * M_NW * ROWPAD + 2 * ROWPAD) * 4 + 16)
 
 static_assert(GQA % M_RG == 0, "row groups split whole q heads");
 static_assert(M_NW % (M_DSPL * M_RSPL) == 0, "whole tiles per workgroup");
@@ -548,11 +935,11 @@ static_assert(TILES <= WAVE, "one lane per tile loads its page index");
 static_assert(M_DSPL == 1 || SHT || RTW * 1024 <= 16 * KT_ROW,
               "the score exchange must fit a wave's K tile");
 
-  #if VD == 8
+    #if VD == 8
 typedef u4v vrow_t;
-  #else
+    #else
 typedef u2v vrow_t;
-  #endif
+    #endif
 
 // One wave's share of a tile: half hi of the wave holds keys 2e + hi, lane
 // l16 VD contiguous d of each, for K and for V.  WMMA wants the two halves of
@@ -596,7 +983,7 @@ __device__ __forceinline__ e16 v_frag(const vrow_t* v, int j) {
   // into the low half of the result.
   const unsigned sel = (j & 1) ? 0x07060302u : 0x05040100u;
   u8v r;
-  #pragma unroll
+    #pragma unroll
   for (int a = 0; a < 4; ++a) {
     r[a] = __builtin_amdgcn_perm(v[2 * a + 1][w], v[2 * a][w], sel);
     r[4 + a] = xhalf_u(r[a]);
@@ -609,12 +996,12 @@ __device__ __forceinline__ e16 v_frag(const vrow_t* v, int j) {
 __device__ __forceinline__ void store_rows(float* dst, const f8* acc, int l16,
                                            int hi, int stride = MROW) {
   float* row = dst + l16 * stride;
-  #pragma unroll
+    #pragma unroll
   for (int e = 0; e < 8; ++e) {
     float v[VD];
-  #pragma unroll
+    #pragma unroll
     for (int j = 0; j < VD; ++j) v[j] = acc[j][e];
-  #pragma unroll
+    #pragma unroll
     for (int k = 0; k < VD; k += 4)
       *(f4*)(row + VD * (2 * e + hi) + k) = *(const f4*)(v + k);
   }
@@ -623,12 +1010,12 @@ __device__ __forceinline__ void store_rows(float* dst, const f8* acc, int l16,
 __device__ __forceinline__ void add_rows(f8* acc, const float* src, int l16,
                                          int hi) {
   const float* row = src + l16 * MROW;
-  #pragma unroll
+    #pragma unroll
   for (int e = 0; e < 8; ++e)
-  #pragma unroll
+    #pragma unroll
     for (int k = 0; k < VD; k += 4) {
       const f4 v = *(const f4*)(row + VD * (2 * e + hi) + k);
-  #pragma unroll
+    #pragma unroll
       for (int j = 0; j < 4; ++j) acc[k + j][e] += v[j];
     }
 }
@@ -661,8 +1048,8 @@ __device__ __forceinline__ void body(
   const int tw = wave / (M_DSPL * M_RSPL);  // this wave's tile within the block
   const int rs = (wave / M_DSPL) % M_RSPL;  // its share of the row tiles
   const int dp = wave % M_DSPL;             // and its part of the head dim
-  // Workgroup row tile of this wave's row tile rt.
-  #define RT(rt) ((rt) * M_RSPL + rs)
+    // Workgroup row tile of this wave's row tile rt.
+    #define RT(rt) ((rt) * M_RSPL + rs)
   // A mode may use fewer waves than the block was launched with; the rest
   // leave now, and a finished wave no longer counts at a barrier.
   if (M_NW < BLOCK / WAVE && wave >= M_NW) return;
@@ -687,7 +1074,7 @@ __device__ __forceinline__ void body(
   // behind it, until the last KV byte landed.
   constexpr int QITER = (ROWPAD * HEAD_DIM + M_BLOCK * 8 - 1) / (M_BLOCK * 8);
   e8 qx[QITER];
-  #pragma unroll
+    #pragma unroll
   for (int it = 0; it < QITER; ++it) {
     const int i = (it * M_BLOCK + tid) * 8;
     // Unconditional, from a clamped row: a load under a branch made the
@@ -711,21 +1098,21 @@ __device__ __forceinline__ void body(
   char* const lds_raw = lds;
   auto q_s = reinterpret_cast<elem_t(*)[HEAD_DIM + QPAD]>(lds_raw);
   float* mrg_s = reinterpret_cast<float*>(lds_raw);
-  #if SHT
+    #if SHT
   // This wave's tile group's K tile in buffer `buf`; its V tile follows.
   char* const tb_s = lds_raw + QS_BYTES + (tw * M_DSPL + dp) * 2 * 16 * KT_ROW;
-    #define KT_BUF(buf) (tb_s + (buf) * (TB_BYTES / 2))
+      #define KT_BUF(buf) (tb_s + (buf) * (TB_BYTES / 2))
   float* sx_s = reinterpret_cast<float*>(lds_raw + QS_BYTES + TB_BYTES);
-    #define SX_SLOT(w) ((w) * RTW * 256)
-  #else
+      #define SX_SLOT(w) ((w) * RTW * 256)
+    #else
   char* kt_s = lds_raw + QS_BYTES + wave * 16 * KT_ROW;
   // Wave w's partial scores go in wave w's own K tile.  It writes them only
   // after its own Q@K has read that tile, its partners read them between the
   // two barriers of the exchange, and it refills the tile with the next K
   // only after the second barrier.
   float* sx_s = reinterpret_cast<float*>(lds_raw + QS_BYTES);
-    #define SX_SLOT(w) ((w) * (16 * KT_ROW / 4))
-  #endif
+      #define SX_SLOT(w) ((w) * (16 * KT_ROW / 4))
+    #endif
   auto m_s = reinterpret_cast<float (*)[ROWPAD]>(lds + LDS_MS);
   auto l_s =
       reinterpret_cast<float (*)[ROWPAD]>(lds + LDS_MS + M_NW * ROWPAD * 4);
@@ -742,9 +1129,9 @@ __device__ __forceinline__ void body(
   // after it.  Blocks are issued in order, so `pages` always holds b's.
   auto issue = [&](Tile& t, int b) {
     const int page = __builtin_amdgcn_readlane(pages, tw);
-  #if !SHT
+    #if !SHT
     if (b + nseg < nblk) pages = block_pages(bt, b + nseg, lane, S);
-  #endif
+    #endif
     const elem_t* tp = kvh_base + (size_t)page * PAGE_ELEMS +
                        (size_t)((b * KBLK + tw * 16) % BS) * KEY_STRIDE +
                        (size_t)hi * KEY_STRIDE + col;
@@ -752,12 +1139,12 @@ __device__ __forceinline__ void body(
     // 3.3 us slower to land at S=128 (32/32/128), same bytes, same addresses.
     // A shared tile's wave loads only its EPW key pairs.
     const elem_t* tw_p = tp + (size_t)(SHT ? 2 * rs * EPW : 0) * KEY_STRIDE;
-  #pragma unroll
+    #pragma unroll
     for (int e = 0; e < 8 / M_RSPL; ++e)
       t.v[e] = (ABLATE & 1)
                    ? vrow_t{}
                    : *(const vrow_t*)(tw_p + 2 * e * KEY_STRIDE + HEAD_DIM);
-  #pragma unroll
+    #pragma unroll
     for (int e = 0; e < 8 / M_RSPL; ++e)
       t.k[e] =
           (ABLATE & 4) ? vrow_t{} : *(const vrow_t*)(tw_p + 2 * e * KEY_STRIDE);
@@ -765,18 +1152,18 @@ __device__ __forceinline__ void body(
     // work above them: left alone under VGPR pressure it issued a tile's K
     // two loads at a time with a wait after each.
     asm volatile("" ::: "memory");
-  #if SHT
+    #if SHT
     // A shared tile's next page indices go out after its loads: ahead of
     // them, a vector page-table load held the KV loads behind a vmcnt(0).
     // Unconditional (block_pages clamps to S), so the waits can count it.
     pages = block_pages(bt, b + nseg, lane, S);
-  #endif
+    #endif
   };
 
   Tile ta;
   issue(ta, seg);
 
-  #pragma unroll
+    #pragma unroll
   for (int it = 0; it < QITER; ++it) {
     const int i = (it * M_BLOCK + tid) * 8;
     if (i < ROWPAD * HEAD_DIM) *(e8*)&q_s[i / HEAD_DIM][i % HEAD_DIM] = qx[it];
@@ -787,16 +1174,16 @@ __device__ __forceinline__ void body(
 
   float m_run[RTW], l_run[RTW];
   f8 acc[RTW][VD];
-  #pragma unroll
+    #pragma unroll
   for (int rt = 0; rt < RTW; ++rt) {
     m_run[rt] = -INFINITY;
     l_run[rt] = 0.f;
-  #pragma unroll
+    #pragma unroll
     for (int j = 0; j < VD; ++j) acc[rt][j] = f8{};
   }
   // Token index of this lane's row in each row tile, for the causal mask.
   int mrow[RTW];
-  #pragma unroll
+    #pragma unroll
   for (int rt = 0; rt < RTW; ++rt) {
     const int r = RT(rt) * 16 + l16;
     mrow[rt] = (r < ROWS_W) ? (r % MAXM) : (MAXM - 1);
@@ -805,14 +1192,14 @@ __device__ __forceinline__ void body(
   lds_barrier();
   TS(1);
 
-  // Stage a tile's K for Q@K: rows in, keys out.  LDS ops of one wave
-  // complete in order, so no barrier.
-  // Stored as integers and read back as halves, which type-based alias
-  // analysis would let pass each other without the asm.
-  #if SHT
+    // Stage a tile's K for Q@K: rows in, keys out.  LDS ops of one wave
+    // complete in order, so no barrier.
+    // Stored as integers and read back as halves, which type-based alias
+    // analysis would let pass each other without the asm.
+    #if SHT
   // A shared tile: this wave's key pairs of K and V into buffer kb.
   auto stage = [&](const Tile& t, char* kb) {
-    #pragma unroll
+      #pragma unroll
     for (int i = 0; i < EPW; ++i) {
       const int row = (2 * (rs * EPW + i) + hi) * KT_ROW + VD * l16 * 2;
       *(vrow_t*)(kb + row) = t.k[i];
@@ -820,84 +1207,84 @@ __device__ __forceinline__ void body(
     }
     asm volatile("" ::: "memory");
   };
-  #else
+    #else
   auto stage_k = [&](const Tile& t) {
-    #pragma unroll
+      #pragma unroll
     for (int e = 0; e < 8; ++e)
       *(vrow_t*)(kt_s + (2 * e + hi) * KT_ROW + VD * l16 * 2) = t.k[e];
     asm volatile("" ::: "memory");
   };
-  #endif
+    #endif
 
   // Q@K, the softmax update and P@V for one tile whose K is staged at kb.
   // v is the tile's V in registers; a shared tile reads it from after K.
   auto process = [&](Tile& t, vrow_t* v, const char* kb, int b) {
     const int kt = b * KBLK + tw * 16;
-  #if ABLATE & 64
+    #if ABLATE & 64
     unsigned x = 0;
-    #pragma unroll
+      #pragma unroll
     for (int e = 0; e < 8 / M_RSPL; ++e)
-    #pragma unroll
+      #pragma unroll
       for (int w = 0; w < VD / 2; ++w) x ^= t.v[e][w] ^ t.k[e][w];
     acc[0][0][0] += __builtin_bit_cast(float, x & 0x3f800000u);
     return;
-  #endif
-  #if TIMING == 3
+    #endif
+    #if TIMING == 3
     if (b == seg) {
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       TS(10);
     }
-  #endif
+    #endif
     f8 s[RTW];
-  #pragma unroll
+    #pragma unroll
     for (int rt = 0; rt < RTW; ++rt) s[rt] = f8{};
-  #pragma unroll
+    #pragma unroll
     for (int c = 0; c < NCP; ++c) {
       const e16 a = *(const e16*)(kb + l16 * KT_ROW + c * 32);
-  #pragma unroll
+    #pragma unroll
       for (int rt = 0; rt < RTW; ++rt) {
         const e16 bq = *(const e16*)&q_s[RT(rt) * 16 + l16][(c0 + c) * 16];
         if (!(ABLATE & 16) || c == 0) s[rt] = wmma(a, bq, s[rt]);
       }
     }
-  #if M_DSPL > 1 && !(ABLATE & 128)
+    #if M_DSPL > 1 && !(ABLATE & 128)
     // The scores overwrite this wave's K tile, which the Q@K above read as
     // halves; keep the float stores below those reads.  Then sum the tile's
     // M_DSPL partials in the same order in every wave, so they all see
     // bit-identical S and agree on the softmax.
     asm volatile("" ::: "memory");
-    #pragma unroll
+      #pragma unroll
     for (int rt = 0; rt < RTW; ++rt)
       *(f8*)&sx_s[SX_SLOT(wave) + rt * 256 + lane * 8] = s[rt];
     lds_barrier();
-    #pragma unroll
+      #pragma unroll
     for (int rt = 0; rt < RTW; ++rt) {
       f8 sum = *(const f8*)&sx_s[SX_SLOT(wave - dp) + rt * 256 + lane * 8];
-    #pragma unroll
+      #pragma unroll
       for (int q2 = 1; q2 < M_DSPL; ++q2)
         sum += *(const f8*)&sx_s[SX_SLOT(wave - dp + q2) + rt * 256 + lane * 8];
       s[rt] = sum;
     }
-    #if !SHT
+      #if !SHT
     // Partners are done reading before anyone refills its K tile.  A shared
     // tile's barrier before the next Q@K already orders it.
     lds_barrier();
+      #endif
     #endif
-  #endif
     if (b == seg) TS(2);
-  #if SHT
+    #if SHT
     vrow_t vs[8];
-    #pragma unroll
+      #pragma unroll
     for (int e = 0; e < 8; ++e)
       vs[e] = *(const vrow_t*)(kb + 16 * KT_ROW + (2 * e + hi) * KT_ROW +
                                VD * l16 * 2);
     v = vs;
-  #endif
+    #endif
 
     // A tile that reaches past S: its keys are masked below, and their V is
     // zeroed so that a NaN in an unused slot cannot reach P@V as 0 * NaN.
     if (__builtin_expect(kt + 16 > S, 0)) {
-  #pragma unroll
+    #pragma unroll
       for (int e = 0; e < 8; ++e)
         if (kt + 2 * e + hi >= S) v[e] = vrow_t{};
     }
@@ -906,22 +1293,22 @@ __device__ __forceinline__ void body(
     // the first query token's keys needs the causal mask.  The scale is
     // applied inside the exponent: it is positive, so the max commutes.
     const bool tail = kt + 16 > ctx + 1;
-  #pragma unroll
+    #pragma unroll
     for (int rt = 0; rt < RTW; ++rt) {
       if (__builtin_expect(tail, 0)) {
-  #pragma unroll
+    #pragma unroll
         for (int e = 0; e < 8; ++e) {
           const int key = kt + 2 * e + hi;
-  #if MUTATE == 1
+    #if MUTATE == 1
           const bool valid = key <= ctx + mrow[rt] + 1 && key < S;
-  #else
+    #else
           const bool valid = key <= ctx + mrow[rt];
-  #endif
+    #endif
           if (!valid) s[rt][e] = -INFINITY;
         }
       }
       float mx = s[rt][0];
-  #pragma unroll
+    #pragma unroll
       for (int e = 1; e < 8; ++e) mx = fmaxf(mx, s[rt][e]);
       mx = fmaxf(mx, xhalf(mx)) * scale2;
       const float mnew = fmaxf(m_run[rt], mx);
@@ -929,7 +1316,7 @@ __device__ __forceinline__ void body(
           (mnew == -INFINITY) ? 1.f : __builtin_amdgcn_exp2f(m_run[rt] - mnew);
       m_run[rt] = mnew;
       float p[8], lo[8], sum = 0.f;
-  #pragma unroll
+    #pragma unroll
       for (int e = 0; e < 8; ++e) {
         p[e] = (mnew == -INFINITY) ? 0.f
                                    : __builtin_amdgcn_exp2f(__builtin_fmaf(
@@ -939,7 +1326,7 @@ __device__ __forceinline__ void body(
       }
       l_run[rt] = l_run[rt] * alpha + sum + xhalf(sum);
 
-  #if PPACK
+    #if PPACK
       // Columns 0..7 carry P's high half for rows 0..7 and columns 8..15 its
       // low half for the same rows, so one WMMA does the work of two.  A lane
       // of columns 8..15 therefore accumulates for row l16-8, and scales by
@@ -950,37 +1337,37 @@ __device__ __forceinline__ void body(
       const u8v pl = __builtin_bit_cast(u8v, p_frag(lo));
       const unsigned upper = 0u - (unsigned)(l16 >> 3);
       u8v pk;
-    #pragma unroll
+      #pragma unroll
       for (int i = 0; i < 8; ++i)
         pk[i] = (ph[i] & ~upper) | (lower8(pl[i]) & upper);
       const e16 bp = __builtin_bit_cast(e16, pk);
       const float ascale = __builtin_bit_cast(
           float, (__builtin_bit_cast(unsigned, alpha) & ~upper) |
                      (lower8(__builtin_bit_cast(unsigned, alpha)) & upper));
-  #else
+    #else
       const e16 bp = p_frag(p);
       const e16 bl = p_frag(lo);
       const float ascale = alpha;
-  #endif
-  #pragma unroll
+    #endif
+    #pragma unroll
       for (int j = 0; j < VD; ++j) {
         acc[rt][j] *= ascale;
         if ((ABLATE & 2) && j) continue;
         const e16 a = v_frag(v, j);
         acc[rt][j] = wmma(a, bp, acc[rt][j]);
-  #if !PPACK
+    #if !PPACK
         acc[rt][j] = wmma(a, bl, acc[rt][j]);
-  #endif
+    #endif
       }
     }
     asm volatile("" ::: "memory");
   };
 
-  // One tile per wave in flight.  Keeping the next tile's loads in flight
-  // as well (two register sets, or the next K and V held until the current
-  // P@V is done) needs 60-100 VGPRs more than a wave has without spilling,
-  // and spilled it measured 59 % against 77 % of roof on 32/4/128.
-  #if SHT
+    // One tile per wave in flight.  Keeping the next tile's loads in flight
+    // as well (two register sets, or the next K and V held until the current
+    // P@V is done) needs 60-100 VGPRs more than a wave has without spilling,
+    // and spilled it measured 59 % against 77 % of roof on 32/4/128.
+    #if SHT
   // Stage, put the next tile's loads in flight, then compute this one: the
   // registers a shared tile frees pay for the prefetch.  The LDS wait goes
   // before the loads, so the barrier does not wait for a page-table s_load
@@ -996,7 +1383,7 @@ __device__ __forceinline__ void body(
     process(ta, nullptr, kb, b);
     buf ^= 1;
   }
-  #elif M_PF
+    #elif M_PF
   // Two tiles per wave in flight: the next one's loads go out before this
   // one is computed.  Only where a second tile's registers fit (small D).
   Tile tb;
@@ -1009,30 +1396,30 @@ __device__ __forceinline__ void body(
     if (b + 2 * nseg < nblk) issue(ta, b + 2 * nseg);
     process(tb, tb.v, kt_s, b + nseg);
   }
-  #else
+    #else
   for (int b = seg; b < nblk; b += nseg) {
     stage_k(ta);
     process(ta, ta.v, kt_s, b);
     if (b + nseg < nblk) issue(ta, b + nseg);
   }
-  #endif
+    #endif
   TS(3);
-  #if PPACK
-    // Fold the low half's columns onto the rows they belong to.
-    #pragma unroll
+    #if PPACK
+      // Fold the low half's columns onto the rows they belong to.
+      #pragma unroll
   for (int j = 0; j < VD; ++j)
-    #pragma unroll
+      #pragma unroll
     for (int e = 0; e < 8; ++e) acc[0][j][e] += upper8f(acc[0][j][e]);
-  #endif
+    #endif
 
-  // Merge the waves.  Every wave rescales to the workgroup's max; then, if
-  // the partials of all tiles do not fit the budget, tree rounds halve the
-  // live tiles (upper half stores, lower half adds in registers) until they
-  // do; then the live tiles store and the whole workgroup sums them in one
-  // pass.  Only real rows are stored -- at M=1 and GQA=4 that is 4 of the 16
-  // a row tile carries.  Lane holds row l16 and, for element e of slice j,
-  // output d = dp*DPART + VD*(2e + hi) + j.
-  #pragma unroll
+    // Merge the waves.  Every wave rescales to the workgroup's max; then, if
+    // the partials of all tiles do not fit the budget, tree rounds halve the
+    // live tiles (upper half stores, lower half adds in registers) until they
+    // do; then the live tiles store and the whole workgroup sums them in one
+    // pass.  Only real rows are stored -- at M=1 and GQA=4 that is 4 of the 16
+    // a row tile carries.  Lane holds row l16 and, for element e of slice j,
+    // output d = dp*DPART + VD*(2e + hi) + j.
+    #pragma unroll
   for (int rt = 0; rt < RTW; ++rt)
     if (hi == 0) {
       m_s[wave][RT(rt) * 16 + l16] = m_run[rt];
@@ -1040,15 +1427,15 @@ __device__ __forceinline__ void body(
     }
   lds_barrier();
   float gsum[RTW];
-  #pragma unroll
+    #pragma unroll
   for (int rt = 0; rt < RTW; ++rt) {
     const int r = RT(rt) * 16 + l16;
     float mx = -INFINITY;
-  #pragma unroll
+    #pragma unroll
     for (int w = rs * M_DSPL + dp; w < M_NW; w += M_DSPL * M_RSPL)
       mx = fmaxf(mx, m_s[w][r]);
     float sm = 0.f;
-  #pragma unroll
+    #pragma unroll
     for (int w = rs * M_DSPL + dp; w < M_NW; w += M_DSPL * M_RSPL)
       sm += weight_of(m_s[w][r], mx) * l_s[w][r];
     gsum[rt] = sm;
@@ -1057,7 +1444,7 @@ __device__ __forceinline__ void body(
       gl_s[r] = sm;
     }
     const float f = weight_of(m_run[rt], mx);
-  #pragma unroll
+    #pragma unroll
     for (int j = 0; j < VD; ++j) acc[rt][j] *= f;
   }
 
@@ -1066,13 +1453,13 @@ __device__ __forceinline__ void body(
   const size_t pb = ((size_t)grp * M_NSEG + seg) * ROWPAD;
   const bool publish = nseg > 1;
 
-  #pragma unroll
+    #pragma unroll
   for (int rt = 0; rt < RTW; ++rt) {
     // Real rows in this row tile.
     const int rv = min(16, ROWS_W - RT(rt) * 16);
     // The previous row tile's readers must be done with the region.
     if (rt) lds_barrier();
-  #pragma unroll
+    #pragma unroll
     for (int st = TILES / 2; st >= TFIN; st >>= 1) {
       if (tw >= st && tw < 2 * st && l16 < rv)
         store_rows(mrg_s + (((tw - st) * M_RSPL + rs) * M_DSPL + dp) * MSLOT,
@@ -1083,7 +1470,7 @@ __device__ __forceinline__ void body(
                  l16, hi);
       lds_barrier();
     }
-  #if TFIN == 1
+    #if TFIN == 1
     // One live tile: its waves write straight from registers.
     if (tw == 0 && l16 < rv) {
       const int r = RT(rt) * 16 + l16;
@@ -1092,10 +1479,10 @@ __device__ __forceinline__ void body(
         const int m = r % MAXM;
         const float inv = __builtin_amdgcn_rcpf(gsum[rt]);
         OutT* o = out + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + dp * DPART;
-    #pragma unroll
+      #pragma unroll
         for (int e = 0; e < 8; ++e) {
           elem_t x[VD];
-    #pragma unroll
+      #pragma unroll
           for (int j = 0; j < VD; ++j) x[j] = to_elem(acc[rt][j][e] * inv);
           *(vrow_t*)(o + VD * (2 * e + hi)) = *(const vrow_t*)x;
         }
@@ -1104,7 +1491,7 @@ __device__ __forceinline__ void body(
                    l16, hi, HEAD_DIM);
       }
     }
-  #else
+    #else
     if (tw < TFIN && l16 < rv)
       store_rows(mrg_s + ((tw * M_RSPL + rs) * M_DSPL + dp) * MSLOT, acc[rt],
                  l16, hi);
@@ -1119,7 +1506,7 @@ __device__ __forceinline__ void body(
       const float* src = mrg_s + ((rl / 16) * M_DSPL + d / DPART) * MSLOT +
                          (rl % 16) * MROW + d % DPART;
       f4 lo4 = *(const f4*)src, hi4 = *(const f4*)(src + 4);
-    #pragma unroll
+      #pragma unroll
       for (int t = 1; t < TFIN; ++t) {
         lo4 += *(const f4*)(src + t * M_RSPL * M_DSPL * MSLOT);
         hi4 += *(const f4*)(src + t * M_RSPL * M_DSPL * MSLOT + 4);
@@ -1127,7 +1514,7 @@ __device__ __forceinline__ void body(
       if (!publish) {
         const float inv = __builtin_amdgcn_rcpf(gl_s[r]);
         e8 o;
-    #pragma unroll
+      #pragma unroll
         for (int k = 0; k < 4; ++k) {
           o[k] = to_elem(lo4[k] * inv);
           o[4 + k] = to_elem(hi4[k] * inv);
@@ -1141,24 +1528,24 @@ __device__ __forceinline__ void body(
         *(f4*)(dst + 4) = hi4;
       }
     }
-  #endif
+    #endif
   }
   TS(5);
   if (!publish) return;
 
-  // Split KV: publish (acc, m, l), and the last segment to arrive merges.
-  // Nobody waits: the late arriver is already resident when it does the
-  // atomic, and it resets the counter, so a CUDA-graph replay starts clean.
-  // With a shared merge (`coop`: the host has checked the whole grid can be
-  // resident at once, so waiting cannot deadlock) the others wait for it to
-  // bump the group's generation, and every segment merges its slice.
-  // Counting arrivals first and letting only the non-last segments fence
-  // their partials out measured 0.5-1.6 % worse: their fence then sits on
-  // the last one's path instead of ahead of its atomic.
-  #if M_RSPL > 1
+    // Split KV: publish (acc, m, l), and the last segment to arrive merges.
+    // Nobody waits: the late arriver is already resident when it does the
+    // atomic, and it resets the counter, so a CUDA-graph replay starts clean.
+    // With a shared merge (`coop`: the host has checked the whole grid can be
+    // resident at once, so waiting cannot deadlock) the others wait for it to
+    // bump the group's generation, and every segment merges its slice.
+    // Counting arrivals first and letting only the non-last segments fence
+    // their partials out measured 0.5-1.6 % worse: their fence then sits on
+    // the last one's path instead of ahead of its atomic.
+    #if M_RSPL > 1
   // gm_s holds every wave's rows; with one tile no merge barrier ordered it.
   lds_barrier();
-  #endif
+    #endif
   if (tid < ROWS_W) {
     p_m[pb + tid] = gm_s[tid];
     p_l[pb + tid] = gl_s[tid];
@@ -1200,7 +1587,7 @@ __device__ __forceinline__ void body(
     const int r = i / HEAD_DIM, d = i % HEAD_DIM;
     float pm[M_NSEG], pl[M_NSEG];
     f4 pa[M_NSEG];
-  #pragma unroll
+    #pragma unroll
     for (int sg = 0; sg < M_NSEG; ++sg) {
       const size_t row = ((size_t)grp * M_NSEG + sg) * ROWPAD + r;
       pm[sg] = sg < nseg ? p_m[row] : -INFINITY;
@@ -1208,11 +1595,11 @@ __device__ __forceinline__ void body(
       pa[sg] = sg < nseg ? *(const f4*)(p_acc + row * HEAD_DIM + d) : f4{};
     }
     float gm = -INFINITY;
-  #pragma unroll
+    #pragma unroll
     for (int sg = 0; sg < M_NSEG; ++sg) gm = fmaxf(gm, pm[sg]);
     f4 num = {};
     float den = 0.f;
-  #pragma unroll
+    #pragma unroll
     for (int sg = 0; sg < M_NSEG; ++sg) {
       const float a = weight_of(pm[sg], gm);
       den = fmaf(a, pl[sg], den);
@@ -1222,45 +1609,46 @@ __device__ __forceinline__ void body(
     const int h = kvh * GQA + rg * (GQA / M_RG) + r / MAXM;
     const int m = r % MAXM;
     OutT* o = out + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d;
-  #pragma unroll
+    #pragma unroll
     for (int k = 0; k < 4; ++k) o[k] = to_elem(num[k] * inv);
   }
   TS(7);
 }
 
-  #undef RT
-  #undef KT_BUF
-  #undef SX_SLOT
-  #undef ROWS_W
-  #undef RTILES
-  #undef ROWPAD
-  #undef TILES
-  #undef RTW
-  #undef SHT
-  #undef EPW
-  #undef KBLK
-  #undef DPART
-  #undef VD
-  #undef NCP
-  #undef PPACK
-  #undef KT_ROW
-  #undef KT_BYTES
-  #undef QS_BYTES
-  #undef MROW
-  #undef RV
-  #undef MSLOT
-  #undef SLOTS_FIT
-  #undef TFIN
-  #undef MRG_SLOTS
-  #undef MRG_BYTES
-  #undef TB_BYTES
-  #undef SX_BYTES
-  #undef LOOP_BYTES
-  #undef LOOP_BYTES
-  #undef LDS_RAW
-  #undef SHARED_MERGE
-  #undef LDS_MS
-  #undef M_BLOCK
-  #undef LDS_ALL
+    #undef RT
+    #undef KT_BUF
+    #undef SX_SLOT
+    #undef ROWS_W
+    #undef RTILES
+    #undef ROWPAD
+    #undef TILES
+    #undef RTW
+    #undef SHT
+    #undef EPW
+    #undef KBLK
+    #undef DPART
+    #undef VD
+    #undef NCP
+    #undef PPACK
+    #undef KT_ROW
+    #undef KT_BYTES
+    #undef QS_BYTES
+    #undef MROW
+    #undef RV
+    #undef MSLOT
+    #undef SLOTS_FIT
+    #undef TFIN
+    #undef MRG_SLOTS
+    #undef MRG_BYTES
+    #undef TB_BYTES
+    #undef SX_BYTES
+    #undef LOOP_BYTES
+    #undef LOOP_BYTES
+    #undef LDS_RAW
+    #undef SHARED_MERGE
+    #undef LDS_MS
+    #undef M_BLOCK
+    #undef LDS_ALL
 
-#endif  // RDNA35_BODY
+  #endif  // M_DOT
+#endif    // RDNA35_BODY

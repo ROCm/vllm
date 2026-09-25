@@ -59,6 +59,22 @@ DUAL = dict(
     rspl2=4,
     nw2=4,
 )
+# The dot-product decomposition for short sequences, WMMA above S=512.
+DUAL_DOT = dict(
+    hq=16,
+    hkv=2,
+    hd=256,
+    nw=8,
+    nseg=2,
+    dot=1,
+    bfly=4,
+    sw=512,
+    nseg2=8,
+    rg2=2,
+    minb2=2,
+    nw2=8,
+    dot2=0,
+)
 # Relative error bound per dtype.  The reference sees the same rounded inputs,
 # so what differs is the kernel's arithmetic and its output rounding -- the
 # latter alone up to 2^-8 relative in bf16.
@@ -101,6 +117,7 @@ def _build_variants():
             _variant(**SHARED, dtype=dtype),
             *(_variant(**shape, dtype=dtype) for shape in RSPL.values()),
             _variant(**DUAL, dtype=dtype),
+            _variant(**DUAL_DOT, dtype=dtype),
         )
     )
 
@@ -266,10 +283,12 @@ def test_row_tiles_split_over_waves(name, seq_len, dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seq_len", [48, 1024])
-def test_two_modes(seq_len, dtype):
-    """Both decompositions of one build: S=48 runs the first, 1024 the second."""
-    shape = dict(DUAL)
+@pytest.mark.parametrize("seq_len", [48, 208, 1024])
+@pytest.mark.parametrize("dual", ["wmma", "dot"])
+def test_two_modes(dual, seq_len, dtype):
+    """Both decompositions of one build: S=48 and 208 run the first, 1024
+    the second."""
+    shape = dict(DUAL if dual == "wmma" else DUAL_DOT)
     nseg = shape.pop("nseg")
     got, ref = _run(seq_len, nseg=nseg, repeat=2, dtype=dtype, **shape)
     assert torch.isfinite(got).all()

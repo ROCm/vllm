@@ -64,6 +64,12 @@ class KernelVariant:
     # 1 keeps a second tile's loads in flight per wave (unshared tiles only;
     # it needs a second tile's registers).
     pf: int = 0
+    # 1 runs the per-q-head dot-product decomposition instead of WMMA: nseg
+    # segments per q head, nw waves, bfly its butterfly split, gt 1 to
+    # dispatch heads fastest.  rg, minb, dspl, rspl and pf do not apply.
+    dot: int = 0
+    bfly: int = 0
+    gt: int = 0
     mutate: int = 0
     # Measurement only: skips blocks of work and returns wrong numbers.  See
     # the ABLATE comment in the kernel.
@@ -81,6 +87,9 @@ class KernelVariant:
     rspl2: int = 0
     nw2: int = 0
     pf2: int = -1
+    dot2: int = 0
+    bfly2: int = 0
+    gt2: int = 0
 
     def __post_init__(self) -> None:
         if self.dtype not in (torch.float16, torch.bfloat16):
@@ -95,6 +104,7 @@ class KernelVariant:
             f"{'' if not self.dspl else f'_ds{self.dspl}'}"
             f"{'' if self.rspl == 1 else f'_rs{self.rspl}'}"
             f"{'' if not self.pf else '_pf'}"
+            f"{'' if not self.dot else f'_dot_bf{self.bfly}_gt{self.gt}'}"
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
             f"{'_bf16' if self.dtype == torch.bfloat16 else ''}"
@@ -102,6 +112,7 @@ class KernelVariant:
                 f"_sw{self.sw}_n{self.nseg_b}_rg{self.rg_b}_mb{self.minb_b}"
                 f"_ds{self.dspl2}_rs{self.rspl_b}_w{self.nw2 or self.nw}"
                 f"_pf{self.pf_b}"
+                f"{'' if not self.dot2 else f'_dot_bf{self.bfly2}_gt{self.gt2}'}"
                 if self.sw
                 else ""
             )
@@ -127,11 +138,11 @@ class KernelVariant:
     def pf_b(self) -> int:
         return self.pf if self.pf2 < 0 else self.pf2
 
-    def _modes(self) -> list[tuple[int, int]]:
-        """(nseg, rg) of each decomposition the build carries."""
-        modes = [(self.nseg, self.rg)]
+    def _modes(self) -> list[tuple[int, int, int]]:
+        """(nseg, rg, dot) of each decomposition the build carries."""
+        modes = [(self.nseg, self.rg, self.dot)]
         if self.sw:
-            modes.append((self.nseg_b, self.rg_b))
+            modes.append((self.nseg_b, self.rg_b, self.dot2))
         return modes
 
     @property
@@ -149,10 +160,15 @@ class KernelVariant:
         and the number of counters.  The modes run one per launch, so they
         share the partials; each keeps its own counters."""
         rows = max(
-            self.num_kv_heads * rg * nseg * self.rows_padded(rg)
-            for nseg, rg in self._modes()
+            self.num_q_heads * nseg * self.max_m
+            if dot
+            else self.num_kv_heads * rg * nseg * self.rows_padded(rg)
+            for nseg, rg, dot in self._modes()
         )
-        cnt = sum(2 * self.num_kv_heads * rg for _, rg in self._modes())
+        cnt = sum(
+            self.num_q_heads if dot else 2 * self.num_kv_heads * rg
+            for _, rg, dot in self._modes()
+        )
         return (rows, self.head_size), (rows,), cnt
 
 
@@ -280,6 +296,9 @@ def load(variant: KernelVariant) -> Any:
         *([f"-DDSPL={variant.dspl}"] if variant.dspl else []),
         f"-DRSPL={variant.rspl}",
         f"-DPF={variant.pf}",
+        f"-DDOT={variant.dot}",
+        f"-DBFLY={variant.bfly}",
+        f"-DGT={variant.gt}",
         f"-DMUTATE={variant.mutate}",
         f"-DABLATE={variant.ablate}",
         f"-DKV_BF16={int(variant.dtype == torch.bfloat16)}",
@@ -293,6 +312,9 @@ def load(variant: KernelVariant) -> Any:
             f"-DRSPL2={variant.rspl_b}",
             f"-DNW2={variant.nw2 or variant.nw}",
             f"-DPF2={variant.pf_b}",
+            f"-DDOT2={variant.dot2}",
+            f"-DBFLY2={variant.bfly2}",
+            f"-DGT2={variant.gt2}",
             *([f"-DDSPL2={variant.dspl2}"] if variant.dspl2 else []),
         ]
     logger.info("Compiling %s", variant.name)
