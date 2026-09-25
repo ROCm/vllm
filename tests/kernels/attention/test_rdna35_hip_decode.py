@@ -32,6 +32,14 @@ HQ, HKV, HEAD_DIM, M, BLOCK_SIZE = 32, 16, 256, 4, 16
 # on a grid small enough (32 workgroups) to be resident at once, which the
 # host requires before it lets them wait for each other.
 SHARED = dict(hq=16, hkv=2, hd=512, rg=2, nseg=8)
+# Four row tiles per kv head, split over the waves that share each key tile
+# (RSPL).  With nw=4 there is one tile per workgroup, so no merge round orders
+# the waves' rows before they are published; nseg=16 makes the merge shared.
+RSPL = {
+    "one tile, shared merge": dict(hq=32, hkv=2, hd=128, rspl=4, nw=4, nseg=16),
+    "two tiles": dict(hq=32, hkv=2, hd=128, rspl=4, nw=8, nseg=4),
+    "with dspl": dict(hq=32, hkv=2, hd=128, rspl=2, nw=8, dspl=2, rg=2, nseg=4),
+}
 # Relative error bound per dtype.  The reference sees the same rounded inputs,
 # so what differs is the kernel's arithmetic and its output rounding -- the
 # latter alone up to 2^-8 relative in bf16.
@@ -72,6 +80,7 @@ def _build_variants():
             _variant(layout=1, nseg=4, dtype=dtype),
             _variant(layout=1, mutate=1, dtype=dtype),
             _variant(**SHARED, dtype=dtype),
+            *(_variant(**shape, dtype=dtype) for shape in RSPL.values()),
         )
     )
 
@@ -85,6 +94,9 @@ def _variant(
     hd: int = HEAD_DIM,
     rg: int = 1,
     dtype: torch.dtype = torch.float16,
+    rspl: int = 1,
+    nw: int = 8,
+    dspl: int = 0,
 ):
     # nseg > 1 with minb = 1 splits even a short context over several
     # workgroups, which is the only way to reach the cross-workgroup merge.
@@ -100,6 +112,9 @@ def _variant(
         minb=1,
         mutate=mutate,
         dtype=dtype,
+        rspl=rspl,
+        nw=nw,
+        dspl=dspl,
     )
 
 
@@ -154,16 +169,17 @@ def _run(
     **shape,
 ):
     _skip_unless_gfx1151()
-    dims = {k: v for k, v in shape.items() if k != "rg"}
+    dims = {k: v for k, v in shape.items() if k in ("hq", "hkv", "hd")}
     q, kv, block_table = _paged_inputs(seq_len, layout, dtype, **dims)
     variant = _variant(layout, mutate, nseg, dtype=build_dtype or dtype, **shape)
     module = rdna35.load(variant)
     acc, m, ln, arrivals = rdna35.make_scratch(variant, q.device)
     out = torch.empty_like(q)
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
     for _ in range(repeat):
         out.zero_()
         module.decode_attn(
-            q, kv, block_table, out, acc, m, ln, arrivals, seq_len, q.shape[2] ** -0.5
+            q, kv, block_table, out, acc, m, ln, arrivals, seq_lens, q.shape[2] ** -0.5
         )
     torch.accelerator.synchronize()
     return out.float(), _reference(q, kv, seq_len)
@@ -211,6 +227,52 @@ def test_shared_split_merge(seq_len, dtype):
     got, ref = _run(seq_len, nseg=SHARED["nseg"], repeat=3, dtype=dtype, **shape)
     assert torch.isfinite(got).all()
     assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seq_len", [48, 1024])
+@pytest.mark.parametrize("name", list(RSPL))
+def test_row_tiles_split_over_waves(name, seq_len, dtype):
+    """Waves that share a key tile through LDS and split its rows."""
+    shape = dict(RSPL[name])
+    nseg = shape.pop("nseg")
+    got, ref = _run(seq_len, nseg=nseg, repeat=2, dtype=dtype, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
+def test_graph_replay_follows_seq_lens():
+    """S is read on the device, so a captured graph serves a longer sequence.
+
+    A host int is frozen into the graph at capture: every replay would attend
+    over the capture-time length, which is what full CUDA-graph decode does.
+    """
+    _skip_unless_gfx1151()
+    long_s = 1024
+    q, kv, block_table = _paged_inputs(long_s, 1, torch.float16)
+    variant = _variant(layout=1, nseg=4)
+    module = rdna35.load(variant)
+    scratch = rdna35.make_scratch(variant, q.device)
+    out = torch.empty_like(q)
+    seq_lens = torch.tensor([48], device=q.device, dtype=torch.int32)
+
+    def launch():
+        module.decode_attn(
+            q, kv, block_table, out, *scratch, seq_lens, q.shape[2] ** -0.5
+        )
+
+    launch()  # warm-up outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for s in (48, 208, long_s):
+        seq_lens.fill_(s)
+        out.zero_()
+        graph.replay()
+        torch.accelerator.synchronize()
+        n = s // BLOCK_SIZE
+        ref = _reference(q, kv[:n], s)
+        assert _max_rel(out.float(), ref) <= TOL[torch.float16], f"S={s}"
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

@@ -94,7 +94,8 @@ def correctness(hq, hkv, d, m, block_size, dtype, s=48):
     except Exception:
         return None
     out = torch.empty_like(q)
-    module.decode_attn(q, kv, bt, out, acc, smax, ssum, arrivals, s, d**-0.5)
+    seq_lens = torch.tensor([s], device=dev, dtype=torch.int32)
+    module.decode_attn(q, kv, bt, out, acc, smax, ssum, arrivals, seq_lens, d**-0.5)
     torch.accelerator.synchronize()
     ref = reference(q, kv, s, hq, hkv, d, m)
     got = out.float()

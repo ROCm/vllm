@@ -85,6 +85,12 @@ def main() -> None:
         help="force DSPL on every configuration, overriding the heuristics",
     )
     p.add_argument(
+        "--rspl",
+        type=int,
+        default=None,
+        help="force RSPL on every configuration, overriding the heuristics",
+    )
+    p.add_argument(
         "--no-triton",
         dest="triton",
         action="store_false",
@@ -116,6 +122,7 @@ def main() -> None:
             ("minb", args.minb),
             ("nw", args.nw),
             ("dspl", args.dspl),
+            ("rspl", args.rspl),
         )
         if v is not None
     }

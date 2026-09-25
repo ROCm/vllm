@@ -61,6 +61,7 @@ def space(hq, hkv, d, start):
         "nw": [2, 4, 8],
         "dspl": [0, 2 * default_dspl] if d >= 128 else [0],
         "rg": sorted(r for r in rgs if gqa % r == 0),
+        "rspl": [1, 2, 4],
         "target": list(TARGETS),
         "minb": [1, 2, 4],
     }
@@ -76,6 +77,8 @@ def knobs_of(hkv, cand):
     }
     if cand["dspl"]:
         k["dspl"] = cand["dspl"]
+    if cand["rspl"] > 1:
+        k["rspl"] = cand["rspl"]
     return k
 
 
@@ -171,6 +174,7 @@ def main() -> None:
                 "nw": base.get("nw", 8),
                 "dspl": base.get("dspl", 0),
                 "rg": base.get("rg", 1),
+                "rspl": base.get("rspl", 1),
                 "target": 16,
                 "minb": base.get("minb", 1),
             }
@@ -228,8 +232,16 @@ def main() -> None:
             best = dict(start)
             evaluate([best])
             for _ in range(args.rounds):
-                for knob in ("nw", "dspl", "rg", "target", "minb"):
+                for knob in ("nw", "dspl", "rg", "rspl", "target", "minb"):
                     cands = [dict(best, **{knob: v}) for v in values[knob]]
+                    if knob == "rspl":
+                        # rspl splits rows inside the workgroup that rg splits
+                        # across workgroups; trade one for the other too.
+                        cands += [
+                            dict(best, rspl=v, rg=best["rg"] // v)
+                            for v in values["rspl"]
+                            if v > 1 and best["rg"] % v == 0
+                        ]
                     evaluate(cands)
                     for c in cands:
                         if scores[key(c)][0] > scores[key(best)][0]:

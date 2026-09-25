@@ -58,6 +58,9 @@ class KernelVariant:
     # Waves sharing one key tile, each owning 1/dspl of the head dim.  0 keeps
     # the kernel's rule.
     dspl: int = 0
+    # Waves sharing one key tile, each carrying 1/rspl of the row tiles: the
+    # in-workgroup form of rg, with the tile loaded once and shared in LDS.
+    rspl: int = 1
     mutate: int = 0
     # Measurement only: skips blocks of work and returns wrong numbers.  See
     # the ABLATE comment in the kernel.
@@ -76,6 +79,7 @@ class KernelVariant:
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
             f"_n{self.nseg}_rg{self.rg}_mb{self.minb}_w{self.nw}"
             f"{'' if not self.dspl else f'_ds{self.dspl}'}"
+            f"{'' if self.rspl == 1 else f'_rs{self.rspl}'}"
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
             f"{'_bf16' if self.dtype == torch.bfloat16 else ''}"
@@ -220,6 +224,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DMINB={variant.minb}",
         f"-DNW={variant.nw}",
         *([f"-DDSPL={variant.dspl}"] if variant.dspl else []),
+        f"-DRSPL={variant.rspl}",
         f"-DMUTATE={variant.mutate}",
         f"-DABLATE={variant.ablate}",
         f"-DKV_BF16={int(variant.dtype == torch.bfloat16)}",

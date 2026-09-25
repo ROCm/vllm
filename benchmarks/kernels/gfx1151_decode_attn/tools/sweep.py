@@ -10,7 +10,7 @@ metadata and the timer are identical; only the kernel launch differs.
         PYTHONPATH=$PWD amd-gpu-lock <venv>/bin/python \\
         benchmarks/kernels/gfx1151_decode_attn/tools/sweep.py --hq 8 --hkv 4
 
-Pass --nseg/--rg/--minb/--nw/--dspl to override what the backend would pick,
+Pass --nseg/--rg/--minb/--nw/--dspl/--rspl to override what the backend would pick,
 which is how the tuning sweeps are run.
 """
 
@@ -82,6 +82,13 @@ def main() -> None:
         help="waves sharing a key tile, each owning 1/dspl of the head dim",
     )
     p.add_argument(
+        "--rspl",
+        type=int,
+        nargs="+",
+        default=[None],
+        help="waves sharing a key tile, each carrying 1/rspl of the row tiles",
+    )
+    p.add_argument(
         "--ablate",
         type=int,
         nargs="+",
@@ -105,7 +112,7 @@ def main() -> None:
         seal,
     )
 
-    knobs = ("nseg", "rg", "minb", "nw", "dspl", "ablate")
+    knobs = ("nseg", "rg", "minb", "nw", "dspl", "rspl", "ablate")
     combos = [
         {k: v for k, v in zip(knobs, vals, strict=True) if v is not None}
         for vals in itertools.product(*(getattr(args, k) for k in knobs))

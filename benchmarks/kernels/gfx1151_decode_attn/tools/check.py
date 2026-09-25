@@ -50,6 +50,7 @@ def main() -> None:
     p.add_argument("--minb", type=int, nargs="+", default=[None])
     p.add_argument("--nw", type=int, default=None)
     p.add_argument("--dspl", type=int, default=None)
+    p.add_argument("--rspl", type=int, default=None)
     p.add_argument("--ablate", type=int, default=None)
     p.add_argument(
         "--repeat",
@@ -97,6 +98,7 @@ def main() -> None:
             ("minb", minb),
             ("nw", args.nw),
             ("dspl", args.dspl),
+            ("rspl", args.rspl),
             ("ablate", args.ablate),
         ):
             if val is not None:
@@ -136,6 +138,7 @@ def main() -> None:
             kv[-1, :, args.block_size - tail :, :] = float("nan")
         q = torch.randn(args.m, args.hq, args.head_dim, device=dev, dtype=dtype) * 0.5
         bt = torch.arange(blocks, device=dev, dtype=torch.int32)
+        seq_lens = torch.tensor([s], device=dev, dtype=torch.int32)
 
         variant = variant_for(layout, nseg, rg, minb)
         module = load(variant)
@@ -147,7 +150,7 @@ def main() -> None:
         for _ in range(args.repeat):
             out.zero_()
             module.decode_attn(
-                q, kv, bt, out, acc, smax, ssum, arrivals, s, args.head_dim**-0.5
+                q, kv, bt, out, acc, smax, ssum, arrivals, seq_lens, args.head_dim**-0.5
             )
             torch.accelerator.synchronize()
             got = out.float()

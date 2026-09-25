@@ -51,7 +51,8 @@
 #endif
 // Most KV segments a (kv head, row group) is split over.  The number active
 // is clamp(nblocks / MINB, 1, NSEG), decided at run time from S: the grid is
-// fixed when a CUDA graph is captured, S is not.
+// fixed when a CUDA graph is captured, S is not -- the kernel reads it from
+// the device, since a host argument would be frozen into the graph too.
 #ifndef NSEG
   #define NSEG 8
 #endif
@@ -76,6 +77,13 @@
 #ifndef DSPL
   #define DSPL (HEAD_DIM >= 256 ? HEAD_DIM / 128 : 1)
 #endif
+// Waves sharing one key tile, each carrying 1/RSPL of the workgroup's row
+// tiles over its whole d part.  The in-workgroup form of RG: the waves read
+// the same tile at nearly the same time, so its KV comes from DRAM once
+// without depending on how separate workgroups drift.
+#ifndef RSPL
+  #define RSPL 1
+#endif
 
 // Measurement only, wrong answers: 1 skips the V loads, 2 thins P@V to one
 // WMMA per tile, 4 skips the K loads, 16 thins Q@K to one WMMA per tile, 32
@@ -99,7 +107,13 @@
 #define ROWS_W (ROWS / RG)
 #define RTILES ((ROWS_W + 15) / 16)
 #define ROWPAD (RTILES * 16)
-#define TILES (NW / DSPL)
+#define TILES (NW / (DSPL * RSPL))
+// Row tiles per wave; wave rs of a tile carries row tiles rs, rs + RSPL, ...
+#define RTW (RTILES / RSPL)
+// With RSPL > 1 the tile is shared: each of its RSPL waves loads EPW of the
+// eight key pairs, stages them in LDS, and all read the whole tile back.
+#define SHT (RSPL > 1)
+#define EPW (8 / RSPL)
 #define KBLK (16 * TILES)
 #define DPART (HEAD_DIM / DSPL)
 // d per lane of a K or V row: lane l16 owns DPART/16 consecutive d.
@@ -135,7 +149,7 @@
 #define RV (ROWS_W < 16 ? ROWS_W : 16)
 #define MSLOT (RV * MROW)
 #define MBUDGET (36 * 1024)
-#define SLOTS_FIT(t) ((t) * DSPL * MSLOT * 4 <= MBUDGET)
+#define SLOTS_FIT(t) ((t) * DSPL * RSPL * MSLOT * 4 <= MBUDGET)
 // Live tiles after the merge's tree rounds: the most that fit the budget.
 #define TFIN                          \
   (SLOTS_FIT(TILES)       ? TILES     \
@@ -145,8 +159,17 @@
                           : 1)
 #define MRG_SLOTS \
   (TFIN == TILES ? TILES : (TFIN > TILES / 2 ? TFIN : TILES / 2))
-#define MRG_BYTES (TILES == 1 ? 0 : MRG_SLOTS * DSPL * MSLOT * 4)
-#define LOOP_BYTES (QS_BYTES + KT_BYTES)
+#define MRG_BYTES \
+  (TILES == 1 && RSPL == 1 ? 0 : MRG_SLOTS * DSPL * RSPL * MSLOT * 4)
+#if SHT
+  // Per (tile, d part) a K and a V tile, double-buffered, and the score
+  // exchange apart from them: partners may still read the shared K.
+  #define TB_BYTES (2 * TILES * DSPL * 2 * 16 * KT_ROW)
+  #define SX_BYTES (DSPL > 1 ? NW * RTW * 1024 : 0)
+  #define LOOP_BYTES (QS_BYTES + TB_BYTES + SX_BYTES)
+#else
+  #define LOOP_BYTES (QS_BYTES + KT_BYTES)
+#endif
 #define LDS_RAW (LOOP_BYTES > MRG_BYTES ? LOOP_BYTES : MRG_BYTES)
 // Split KV: a single workgroup merging every segment's partials is bound by
 // its own CU's bandwidth once they reach 64 KiB -- 2 us at 256 KiB.  Past
@@ -156,11 +179,13 @@
 static_assert(NUM_Q_HEADS % NUM_KV_HEADS == 0, "GQA must be integral");
 static_assert(GQA % RG == 0, "row groups split whole q heads");
 static_assert(BS % 16 == 0, "a 16-key tile must sit inside one page");
-static_assert(NW % DSPL == 0, "whole tiles per workgroup");
+static_assert(NW % (DSPL * RSPL) == 0, "whole tiles per workgroup");
+static_assert(RTILES % RSPL == 0, "whole row tiles per wave");
+static_assert(8 % RSPL == 0, "whole key pairs per wave of a shared tile");
 static_assert(NCHUNK % DSPL == 0, "whole chunks per d part");
 static_assert(VD == 4 || VD == 8, "a lane's K and V slice is one b64 or b128");
 static_assert(TILES <= WAVE, "one lane per tile loads its page index");
-static_assert(DSPL == 1 || RTILES * 1024 <= 16 * KT_ROW,
+static_assert(DSPL == 1 || SHT || RTW * 1024 <= 16 * KT_ROW,
               "the score exchange must fit a wave's K tile");
 
 #if TIMING
@@ -202,8 +227,8 @@ typedef u2v vrow_t;
 // exchanging halves with one permlanex16 per dword halves both the registers
 // and the loads.
 struct Tile {
-  vrow_t k[8];
-  vrow_t v[8];
+  vrow_t k[8 / RSPL];
+  vrow_t v[8 / RSPL];
 };
 
 // Element offset of (page, slot) for this kv head.
@@ -308,6 +333,15 @@ __device__ __forceinline__ int block_pages(const int* __restrict__ bt, int b,
   return bt[(unsigned)min(key, S - 1) / BS];
 }
 
+// The same before S is known: clamped to the block table's width instead.
+// Every entry of the table names an allocated page, so the address stays in
+// the cache, and the keys past S are masked like any others.
+__device__ __forceinline__ int block_pages_w(const int* __restrict__ bt, int b,
+                                             int lane, int width) {
+  const int blk = (b * KBLK + (lane % TILES) * 16) / BS;
+  return bt[min(blk, width - 1)];
+}
+
 // WMMA's k index is free as long as A and B agree on it -- and each half of
 // the wave may order it differently: measured on gfx1151, the lower half
 // produces the even output rows from its own copy of A (only its even rows
@@ -379,20 +413,29 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     const elem_t* __restrict__ q, const elem_t* __restrict__ kv,
     const int* __restrict__ bt, float* __restrict__ p_acc,
     float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
-    OutT* __restrict__ out, int S, float scale, int coop) {
+    OutT* __restrict__ out, const int* __restrict__ seq_lens, int bt_width,
+    float scale, int coop) {
   const int tid = threadIdx.x;
   const int lane = tid & (WAVE - 1);
   const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE);
   const int l16 = lane & 15;
   const int hi = lane >> 4;
-  const int tw = wave / DSPL;  // this wave's tile within the block
-  const int dp = wave % DSPL;  // and its part of the head dim
+  const int tw = wave / (DSPL * RSPL);  // this wave's tile within the block
+  const int rs = (wave / DSPL) % RSPL;  // its share of the row tiles
+  const int dp = wave % DSPL;           // and its part of the head dim
+  // Workgroup row tile of this wave's row tile rt.
+#define RT(rt) ((rt) * RSPL + rs)
 
   const int bid = blockIdx.x;
   const int rg = bid % RG;
   const int kvh = (bid / RG) % NUM_KV_HEADS;
   const int seg = bid / (RG * NUM_KV_HEADS);
 
+  // S and the first block's page indices go out together: neither waits for
+  // the other.
+  const int S = __builtin_amdgcn_readfirstlane(*seq_lens);
+  // Every KV address depends on the page table.
+  int pages = block_pages_w(bt, seg, lane, bt_width);
   __builtin_assume(S > 0);
   const int nblk = (S + KBLK - 1) / KBLK;
   const int nseg = max(1, min(NSEG, nblk / MINB));
@@ -403,8 +446,6 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     return;
   }
 
-  // Every KV address depends on the page table.
-  int pages = block_pages(bt, seg, lane, S);
   // Q goes out before the KV.  Load completion is counted in order, so a Q
   // load issued behind the KV tiles would hold its LDS store, and the barrier
   // behind it, until the last KV byte landed.
@@ -434,13 +475,21 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   __shared__ __attribute__((aligned(16))) char lds_raw[LDS_RAW];
   auto q_s = reinterpret_cast<elem_t(*)[HEAD_DIM + QPAD]>(lds_raw);
   float* mrg_s = reinterpret_cast<float*>(lds_raw);
+#if SHT
+  // This wave's tile group's K tile in buffer `buf`; its V tile follows.
+  char* const tb_s = lds_raw + QS_BYTES + (tw * DSPL + dp) * 2 * 16 * KT_ROW;
+  #define KT_BUF(buf) (tb_s + (buf) * (TB_BYTES / 2))
+  float* sx_s = reinterpret_cast<float*>(lds_raw + QS_BYTES + TB_BYTES);
+  #define SX_SLOT(w) ((w) * RTW * 256)
+#else
   char* kt_s = lds_raw + QS_BYTES + wave * 16 * KT_ROW;
   // Wave w's partial scores go in wave w's own K tile.  It writes them only
   // after its own Q@K has read that tile, its partners read them between the
   // two barriers of the exchange, and it refills the tile with the next K
   // only after the second barrier.
   float* sx_s = reinterpret_cast<float*>(lds_raw + QS_BYTES);
-#define SX_SLOT(w) ((w) * (16 * KT_ROW / 4))
+  #define SX_SLOT(w) ((w) * (16 * KT_ROW / 4))
+#endif
   __shared__ float m_s[NW][ROWPAD];
   __shared__ float l_s[NW][ROWPAD];
   __shared__ float gm_s[ROWPAD];
@@ -461,15 +510,17 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
                        (size_t)hi * KEY_STRIDE + col;
     // All of V, then all of K.  Interleaving them row by row measured 1.7 to
     // 3.3 us slower to land at S=128 (32/32/128), same bytes, same addresses.
+    // A shared tile's wave loads only its EPW key pairs.
+    const elem_t* tw_p = tp + (size_t)(SHT ? 2 * rs * EPW : 0) * KEY_STRIDE;
 #pragma unroll
-    for (int e = 0; e < 8; ++e)
+    for (int e = 0; e < 8 / RSPL; ++e)
       t.v[e] = (ABLATE & 1)
                    ? vrow_t{}
-                   : *(const vrow_t*)(tp + 2 * e * KEY_STRIDE + HEAD_DIM);
+                   : *(const vrow_t*)(tw_p + 2 * e * KEY_STRIDE + HEAD_DIM);
 #pragma unroll
-    for (int e = 0; e < 8; ++e)
+    for (int e = 0; e < 8 / RSPL; ++e)
       t.k[e] =
-          (ABLATE & 4) ? vrow_t{} : *(const vrow_t*)(tp + 2 * e * KEY_STRIDE);
+          (ABLATE & 4) ? vrow_t{} : *(const vrow_t*)(tw_p + 2 * e * KEY_STRIDE);
     // The scheduler must neither sink these to their first use nor hoist
     // work above them: left alone under VGPR pressure it issued a tile's K
     // two loads at a time with a wait after each.
@@ -488,20 +539,20 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   const float scale2 = scale * LOG2E;
   const int ctx = S - MAXM;
 
-  float m_run[RTILES], l_run[RTILES];
-  f8 acc[RTILES][VD];
+  float m_run[RTW], l_run[RTW];
+  f8 acc[RTW][VD];
 #pragma unroll
-  for (int rt = 0; rt < RTILES; ++rt) {
+  for (int rt = 0; rt < RTW; ++rt) {
     m_run[rt] = -INFINITY;
     l_run[rt] = 0.f;
 #pragma unroll
     for (int j = 0; j < VD; ++j) acc[rt][j] = f8{};
   }
   // Token index of this lane's row in each row tile, for the causal mask.
-  int mrow[RTILES];
+  int mrow[RTW];
 #pragma unroll
-  for (int rt = 0; rt < RTILES; ++rt) {
-    const int r = rt * 16 + l16;
+  for (int rt = 0; rt < RTW; ++rt) {
+    const int r = RT(rt) * 16 + l16;
     mrow[rt] = (r < ROWS_W) ? (r % MAXM) : (MAXM - 1);
   }
 
@@ -512,20 +563,34 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // complete in order, so no barrier.
   // Stored as integers and read back as halves, which type-based alias
   // analysis would let pass each other without the asm.
+#if SHT
+  // A shared tile: this wave's key pairs of K and V into buffer kb.
+  auto stage = [&](const Tile& t, char* kb) {
+  #pragma unroll
+    for (int i = 0; i < EPW; ++i) {
+      const int row = (2 * (rs * EPW + i) + hi) * KT_ROW + VD * l16 * 2;
+      *(vrow_t*)(kb + row) = t.k[i];
+      *(vrow_t*)(kb + 16 * KT_ROW + row) = t.v[i];
+    }
+    asm volatile("" ::: "memory");
+  };
+#else
   auto stage_k = [&](const Tile& t) {
-#pragma unroll
+  #pragma unroll
     for (int e = 0; e < 8; ++e)
       *(vrow_t*)(kt_s + (2 * e + hi) * KT_ROW + VD * l16 * 2) = t.k[e];
     asm volatile("" ::: "memory");
   };
+#endif
 
-  // Q@K, the softmax update and P@V for one tile whose K is already staged.
-  auto process = [&](Tile& t, int b) {
+  // Q@K, the softmax update and P@V for one tile whose K is staged at kb.
+  // v is the tile's V in registers; a shared tile reads it from after K.
+  auto process = [&](Tile& t, vrow_t* v, const char* kb, int b) {
     const int kt = b * KBLK + tw * 16;
 #if ABLATE & 64
     unsigned x = 0;
   #pragma unroll
-    for (int e = 0; e < 8; ++e)
+    for (int e = 0; e < 8 / RSPL; ++e)
   #pragma unroll
       for (int w = 0; w < VD / 2; ++w) x ^= t.v[e][w] ^ t.k[e][w];
     acc[0][0][0] += __builtin_bit_cast(float, x & 0x3f800000u);
@@ -537,15 +602,15 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       TS(10);
     }
 #endif
-    f8 s[RTILES];
+    f8 s[RTW];
 #pragma unroll
-    for (int rt = 0; rt < RTILES; ++rt) s[rt] = f8{};
+    for (int rt = 0; rt < RTW; ++rt) s[rt] = f8{};
 #pragma unroll
     for (int c = 0; c < NCP; ++c) {
-      const e16 a = *(const e16*)(kt_s + l16 * KT_ROW + c * 32);
+      const e16 a = *(const e16*)(kb + l16 * KT_ROW + c * 32);
 #pragma unroll
-      for (int rt = 0; rt < RTILES; ++rt) {
-        const e16 bq = *(const e16*)&q_s[rt * 16 + l16][(c0 + c) * 16];
+      for (int rt = 0; rt < RTW; ++rt) {
+        const e16 bq = *(const e16*)&q_s[RT(rt) * 16 + l16][(c0 + c) * 16];
         if (!(ABLATE & 16) || c == 0) s[rt] = wmma(a, bq, s[rt]);
       }
     }
@@ -556,28 +621,39 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // bit-identical S and agree on the softmax.
     asm volatile("" ::: "memory");
   #pragma unroll
-    for (int rt = 0; rt < RTILES; ++rt)
+    for (int rt = 0; rt < RTW; ++rt)
       *(f8*)&sx_s[SX_SLOT(wave) + rt * 256 + lane * 8] = s[rt];
     lds_barrier();
   #pragma unroll
-    for (int rt = 0; rt < RTILES; ++rt) {
-      f8 sum = *(const f8*)&sx_s[SX_SLOT(tw * DSPL) + rt * 256 + lane * 8];
+    for (int rt = 0; rt < RTW; ++rt) {
+      f8 sum = *(const f8*)&sx_s[SX_SLOT(wave - dp) + rt * 256 + lane * 8];
   #pragma unroll
       for (int q2 = 1; q2 < DSPL; ++q2)
-        sum += *(const f8*)&sx_s[SX_SLOT(tw * DSPL + q2) + rt * 256 + lane * 8];
+        sum += *(const f8*)&sx_s[SX_SLOT(wave - dp + q2) + rt * 256 + lane * 8];
       s[rt] = sum;
     }
-    // Partners are done reading before anyone refills its K tile.
+  #if !SHT
+    // Partners are done reading before anyone refills its K tile.  A shared
+    // tile's barrier before the next Q@K already orders it.
     lds_barrier();
+  #endif
 #endif
     if (b == seg) TS(2);
+#if SHT
+    vrow_t vs[8];
+  #pragma unroll
+    for (int e = 0; e < 8; ++e)
+      vs[e] = *(const vrow_t*)(kb + 16 * KT_ROW + (2 * e + hi) * KT_ROW +
+                               VD * l16 * 2);
+    v = vs;
+#endif
 
     // A tile that reaches past S: its keys are masked below, and their V is
     // zeroed so that a NaN in an unused slot cannot reach P@V as 0 * NaN.
     if (__builtin_expect(kt + 16 > S, 0)) {
 #pragma unroll
       for (int e = 0; e < 8; ++e)
-        if (kt + 2 * e + hi >= S) t.v[e] = vrow_t{};
+        if (kt + 2 * e + hi >= S) v[e] = vrow_t{};
     }
 
     // Lane holds row l16, keys kt + 2e + hi.  Only a tile that reaches past
@@ -585,7 +661,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // applied inside the exponent: it is positive, so the max commutes.
     const bool tail = kt + 16 > ctx + 1;
 #pragma unroll
-    for (int rt = 0; rt < RTILES; ++rt) {
+    for (int rt = 0; rt < RTW; ++rt) {
       if (__builtin_expect(tail, 0)) {
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
@@ -644,7 +720,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       for (int j = 0; j < VD; ++j) {
         acc[rt][j] *= ascale;
         if ((ABLATE & 2) && j) continue;
-        const e16 a = v_frag(t.v, j);
+        const e16 a = v_frag(v, j);
         acc[rt][j] = wmma(a, bp, acc[rt][j]);
 #if !PPACK
         acc[rt][j] = wmma(a, bl, acc[rt][j]);
@@ -658,11 +734,29 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // as well (two register sets, or the next K and V held until the current
   // P@V is done) needs 60-100 VGPRs more than a wave has without spilling,
   // and spilled it measured 59 % against 77 % of roof on 32/4/128.
+#if SHT
+  // Stage, put the next tile's loads in flight, then compute this one: the
+  // registers a shared tile frees pay for the prefetch.  The LDS wait goes
+  // before the loads, so the barrier does not wait for a page-table s_load
+  // counted with LDS.  Two buffers: a wave refills one only after the
+  // barrier that every wave reaches after reading it.
+  int buf = 0;
+  for (int b = seg; b < nblk; b += nseg) {
+    char* const kb = KT_BUF(buf);
+    stage(ta, kb);
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    if (b + nseg < nblk) issue(ta, b + nseg);
+    asm volatile("s_barrier" ::: "memory");
+    process(ta, nullptr, kb, b);
+    buf ^= 1;
+  }
+#else
   for (int b = seg; b < nblk; b += nseg) {
     stage_k(ta);
-    process(ta, b);
+    process(ta, ta.v, kt_s, b);
     if (b + nseg < nblk) issue(ta, b + nseg);
   }
+#endif
   TS(3);
 #if PPACK
   // Fold the low half's columns onto the rows they belong to.
@@ -680,25 +774,26 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // a row tile carries.  Lane holds row l16 and, for element e of slice j,
   // output d = dp*DPART + VD*(2e + hi) + j.
 #pragma unroll
-  for (int rt = 0; rt < RTILES; ++rt)
+  for (int rt = 0; rt < RTW; ++rt)
     if (hi == 0) {
-      m_s[wave][rt * 16 + l16] = m_run[rt];
-      l_s[wave][rt * 16 + l16] = l_run[rt];
+      m_s[wave][RT(rt) * 16 + l16] = m_run[rt];
+      l_s[wave][RT(rt) * 16 + l16] = l_run[rt];
     }
   lds_barrier();
-  float gsum[RTILES];
+  float gsum[RTW];
 #pragma unroll
-  for (int rt = 0; rt < RTILES; ++rt) {
-    const int r = rt * 16 + l16;
+  for (int rt = 0; rt < RTW; ++rt) {
+    const int r = RT(rt) * 16 + l16;
     float mx = -INFINITY;
 #pragma unroll
-    for (int w = dp; w < NW; w += DSPL) mx = fmaxf(mx, m_s[w][r]);
+    for (int w = rs * DSPL + dp; w < NW; w += DSPL * RSPL)
+      mx = fmaxf(mx, m_s[w][r]);
     float sm = 0.f;
 #pragma unroll
-    for (int w = dp; w < NW; w += DSPL)
+    for (int w = rs * DSPL + dp; w < NW; w += DSPL * RSPL)
       sm += weight_of(m_s[w][r], mx) * l_s[w][r];
     gsum[rt] = sm;
-    if (wave == 0 && hi == 0) {
+    if (tw == 0 && dp == 0 && hi == 0) {
       gm_s[r] = mx;
       gl_s[r] = sm;
     }
@@ -713,24 +808,26 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   const bool publish = nseg > 1;
 
 #pragma unroll
-  for (int rt = 0; rt < RTILES; ++rt) {
+  for (int rt = 0; rt < RTW; ++rt) {
     // Real rows in this row tile.
-    const int rv = min(16, ROWS_W - rt * 16);
+    const int rv = min(16, ROWS_W - RT(rt) * 16);
     // The previous row tile's readers must be done with the region.
     if (rt) lds_barrier();
 #pragma unroll
     for (int st = TILES / 2; st >= TFIN; st >>= 1) {
       if (tw >= st && tw < 2 * st && l16 < rv)
-        store_rows(mrg_s + ((tw - st) * DSPL + dp) * MSLOT, acc[rt], l16, hi);
+        store_rows(mrg_s + (((tw - st) * RSPL + rs) * DSPL + dp) * MSLOT,
+                   acc[rt], l16, hi);
       lds_barrier();
       if (tw < st && l16 < rv)
-        add_rows(acc[rt], mrg_s + (tw * DSPL + dp) * MSLOT, l16, hi);
+        add_rows(acc[rt], mrg_s + ((tw * RSPL + rs) * DSPL + dp) * MSLOT, l16,
+                 hi);
       lds_barrier();
     }
 #if TFIN == 1
     // One live tile: its waves write straight from registers.
     if (tw == 0 && l16 < rv) {
-      const int r = rt * 16 + l16;
+      const int r = RT(rt) * 16 + l16;
       if (!publish) {
         const int h = kvh * GQA + rg * (GQA / RG) + r / MAXM;
         const int m = r % MAXM;
@@ -744,24 +841,29 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
           *(vrow_t*)(o + VD * (2 * e + hi)) = *(const vrow_t*)x;
         }
       } else {
-        store_rows(p_acc + (pb + rt * 16) * HEAD_DIM + dp * DPART, acc[rt], l16,
-                   hi, HEAD_DIM);
+        store_rows(p_acc + (pb + RT(rt) * 16) * HEAD_DIM + dp * DPART, acc[rt],
+                   l16, hi, HEAD_DIM);
       }
     }
 #else
     if (tw < TFIN && l16 < rv)
-      store_rows(mrg_s + (tw * DSPL + dp) * MSLOT, acc[rt], l16, hi);
+      store_rows(mrg_s + ((tw * RSPL + rs) * DSPL + dp) * MSLOT, acc[rt], l16,
+                 hi);
     lds_barrier();
-    // Eight consecutive d of one real row per thread.
-    for (int i = tid * 8; i < rv * HEAD_DIM; i += BLOCK * 8) {
+    // Eight consecutive d of one real row per thread, over the RSPL row
+    // tiles this round's waves stored.
+    const int r0 = rt * RSPL * 16;
+    const int nr = min(RSPL * 16, ROWS_W - r0);
+    for (int i = tid * 8; i < nr * HEAD_DIM; i += BLOCK * 8) {
       const int rl = i / HEAD_DIM, d = i % HEAD_DIM;
-      const int r = rt * 16 + rl;
-      const float* src = mrg_s + (d / DPART) * MSLOT + rl * MROW + d % DPART;
+      const int r = r0 + rl;
+      const float* src = mrg_s + ((rl / 16) * DSPL + d / DPART) * MSLOT +
+                         (rl % 16) * MROW + d % DPART;
       f4 lo4 = *(const f4*)src, hi4 = *(const f4*)(src + 4);
   #pragma unroll
       for (int t = 1; t < TFIN; ++t) {
-        lo4 += *(const f4*)(src + t * DSPL * MSLOT);
-        hi4 += *(const f4*)(src + t * DSPL * MSLOT + 4);
+        lo4 += *(const f4*)(src + t * RSPL * DSPL * MSLOT);
+        hi4 += *(const f4*)(src + t * RSPL * DSPL * MSLOT + 4);
       }
       if (!publish) {
         const float inv = __builtin_amdgcn_rcpf(gl_s[r]);
@@ -794,6 +896,10 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // Counting arrivals first and letting only the non-last segments fence
   // their partials out measured 0.5-1.6 % worse: their fence then sits on
   // the last one's path instead of ahead of its atomic.
+#if RSPL > 1
+  // gm_s holds every wave's rows; with one tile no merge barrier ordered it.
+  lds_barrier();
+#endif
   if (tid < ROWS_W) {
     p_m[pb + tid] = gm_s[tid];
     p_l[pb + tid] = gl_s[tid];
@@ -867,7 +973,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 // Instantiated for ISA inspection when built without the torch op.
 template __global__ void decode_attn<elem_t>(const elem_t*, const elem_t*,
                                              const int*, float*, float*, float*,
-                                             int*, elem_t*, int, float, int);
+                                             int*, elem_t*, const int*, int,
+                                             float, int);
 #else
   #include <ATen/cuda/CUDAContext.h>
   #include <c10/cuda/CUDAGuard.h>
@@ -878,11 +985,17 @@ template __global__ void decode_attn<elem_t>(const elem_t*, const elem_t*,
 void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
                     torch::Tensor& block_table, torch::Tensor& out,
                     torch::Tensor& acc, torch::Tensor& m, torch::Tensor& l,
-                    torch::Tensor& cnt, int64_t seq_len, double scale) {
+                    torch::Tensor& cnt, torch::Tensor& seq_lens, double scale) {
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
-  TORCH_CHECK(block_table.scalar_type() == torch::kInt32,
-              "block table must be int32");
+  TORCH_CHECK(block_table.scalar_type() == torch::kInt32 &&
+                  block_table.dim() == 1 && block_table.is_contiguous(),
+              "block table must be one contiguous int32 row");
+  // A tensor, not an int: under CUDA-graph capture a host argument is frozen
+  // at its capture-time value, and every replay would attend over that many
+  // keys whatever the sequence has grown to.
+  TORCH_CHECK(seq_lens.scalar_type() == torch::kInt32 && seq_lens.numel() >= 1,
+              "seq_lens must be an int32 tensor holding the sequence length");
   TORCH_CHECK(q.size(0) == MAXM, "q has ", q.size(0), " tokens, kernel built ",
               "for MAXM=", MAXM);
   TORCH_CHECK(q.size(1) == NUM_Q_HEADS && q.size(2) == HEAD_DIM,
@@ -926,14 +1039,14 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
     }
     return (int)(per * wgps >= (int)grid.x);
   }();
-  hipLaunchKernelGGL(decode_attn<elem_t>, grid, block, 0, stream,
-                     reinterpret_cast<const elem_t*>(q.data_ptr()),
-                     reinterpret_cast<const elem_t*>(kv_cache.data_ptr()),
-                     block_table.data_ptr<int>(), acc.data_ptr<float>(),
-                     m.data_ptr<float>(), l.data_ptr<float>(),
-                     cnt.data_ptr<int>(),
-                     reinterpret_cast<elem_t*>(out.data_ptr()), (int)seq_len,
-                     (float)scale, coop);
+  hipLaunchKernelGGL(
+      decode_attn<elem_t>, grid, block, 0, stream,
+      reinterpret_cast<const elem_t*>(q.data_ptr()),
+      reinterpret_cast<const elem_t*>(kv_cache.data_ptr()),
+      block_table.data_ptr<int>(), acc.data_ptr<float>(), m.data_ptr<float>(),
+      l.data_ptr<float>(), cnt.data_ptr<int>(),
+      reinterpret_cast<elem_t*>(out.data_ptr()), seq_lens.data_ptr<int>(),
+      (int)block_table.size(0), (float)scale, coop);
 }
 
   #if TIMING

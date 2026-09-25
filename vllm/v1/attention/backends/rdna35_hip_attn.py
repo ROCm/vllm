@@ -95,6 +95,7 @@ class _Knobs(TypedDict, total=False):
     minb: int
     nw: int
     dspl: int
+    rspl: int
 
 
 # Every shipped configuration, measured: coordinate descent over (nw, dspl,
@@ -349,9 +350,9 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             softmax_max,
             softmax_sum,
             arrivals,
-            # max_seqlen_k, not seqused_k[0]: reading the tensor would be a
-            # device-to-host copy, which invalidates a CUDA-graph capture. With
-            # the single sequence _prepare insists on, the two are equal.
-            kwargs["max_seqlen_k"],
+            # The device tensor, not max_seqlen_k: this runs under full
+            # CUDA-graph capture, where a host int would be frozen at its
+            # capture-time value for every replay.
+            kwargs["seqused_k"],
             kwargs["softmax_scale"],
         )
