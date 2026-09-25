@@ -23,11 +23,6 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-# Mirrors the kernel's own defines; NWAVE sizes the per-wave partials.
-_WAVE = 32
-_BLOCK = 256
-_NWAVE = _BLOCK // _WAVE
-
 # resolve() matters: ninja re-expands the path through a shell, so a symlinked
 # checkout whose name contains '$' would be mangled into a missing file.
 _CSRC = Path(__file__).resolve().parents[4] / "csrc" / "rocm"
@@ -36,7 +31,12 @@ _SOURCE = _CSRC / "rdna35_decode_attn.cu"
 
 @dataclass(frozen=True)
 class KernelVariant:
-    """The compile-time shape tuple a single build is specialised for."""
+    """The compile-time shape tuple a single build is specialised for.
+
+    One workgroup serves one (kv head, row group, KV segment): every query
+    row that reads a kv head -- GQA heads times max_m tokens -- is packed into
+    it, so the KV cache is read once per kv head rather than once per q head.
+    """
 
     head_size: int
     num_q_heads: int
@@ -44,82 +44,34 @@ class KernelVariant:
     max_m: int
     block_size: int
     layout: int  # 0 = NHD, 1 = HND
+    # Most KV segments a (kv head, row group) is split over.  The kernel
+    # activates clamp(nblocks // minb, 1, nseg) of them at run time, so short
+    # contexts do not pay for the cross-workgroup merge a long one needs.
     nseg: int = 1
-    kpw: int = 4
+    # Row groups per kv head: its GQA*max_m rows split over rg workgroups that
+    # each read the whole of its KV, sharing it through L2.
+    rg: int = 1
+    # Least KV blocks an active segment is given.
+    minb: int = 1
+    # Waves per workgroup.
+    nw: int = 8
+    # Waves sharing one key tile, each owning 1/dspl of the head dim.  0 keeps
+    # the kernel's rule.
+    dspl: int = 0
     mutate: int = 0
-    # Threads per workgroup; block // 32 waves cooperate on one head-segment.
-    block: int = _BLOCK
-    # How many waves share the query-token dimension. 1 gives every wave all
-    # max_m tokens over its own KV slice; max_m gives every wave one token and
-    # a slice shared with its neighbours.
-    msplit: int = 1
-    # 1 strides each wave across the whole context; 0 gives each segment a
-    # contiguous run of it.  Only ever run at 1.
-    ilv: int = 1
-    # Which cross-lane mechanism carries the score butterfly: 0 = ds_bpermute
-    # on the LDS pipe, 1 = v_permlane16/x16 on the VALU.
-    bfly: int = 0
-    # 1 dispatches the grid as (num_q_heads, nseg) instead of (nseg,
-    # num_q_heads), so the q head is the fastest axis. Every q head of one kv
-    # head reads byte-identical addresses, so this decides whether adjacent
-    # workgroups share lines or merely neighbour them.
-    gridt: int = 0
-    # Measurement only: thins one VALU block and returns wrong numbers. See the
-    # ABLATE comment in the kernel.
+    # Measurement only: skips blocks of work and returns wrong numbers.  See
+    # the ABLATE comment in the kernel.
     ablate: int = 0
-    # fp16 per lane of a row. 0 keeps the kernel's own rule. Lowering LPR =
-    # head_size/dpl shortens the butterfly's dependency chain by a stage, at
-    # the cost of registers and of SUB rows of LDS partials.
-    dpl: int = 0
-    # Passes the epilogue cuts the head dimension into before reducing in LDS.
-    # An enabler: neutral on its own, it lifts the ceiling that would otherwise
-    # forbid a configuration outright.
-    ldsplit: int = 1
-    # Finish the cross-workgroup reduction inside decode_attn instead of
-    # launching reduce_segments for it.  On by default: worth ~1.2 us flat, and
-    # a no-op at nseg == 1 where no second kernel runs anyway.
-    fusedred: bool = True
-
-    def __post_init__(self) -> None:
-        # Raise msplit until the partials fit LDS.  Mirrors the kernel's
-        # LDS_FOR() exactly -- the per-lane-slice pad, the sub grouping and the
-        # ldsplit chunking -- because the kernel static_asserts on the same
-        # bound, so an approximation here is a build failure rather than a
-        # slower choice.  Resolved here rather than in the kernel so the
-        # variant name, and therefore the compiled symbol, matches what is
-        # actually built.
-        waves = self.block // _WAVE
-        dpl = self.dpl or (8 if self.head_size == 128 else self.head_size // _WAVE)
-        lpr = self.head_size // dpl
-        sub = _WAVE // lpr
-        row = (lpr // self.ldsplit) * (dpl + 1) * 4 + 8
-        ms = self.msplit
-        while (
-            ms < self.max_m
-            and (self.max_m // ms) * waves * sub * row > 65536
-            and self.max_m % (ms * 2) == 0
-            and waves % (ms * 2) == 0
-        ):
-            ms *= 2
-        object.__setattr__(self, "msplit", ms)
-
-    # Merge the per-wave partials in LDS inside the main kernel rather than in
-    # a second pass over global memory. Only valid with nseg == 1.
-    fused: bool = True
 
     @property
     def suffix(self) -> str:
         return (
             f"d{self.head_size}_q{self.num_q_heads}_kv{self.num_kv_heads}"
             f"_m{self.max_m}_bs{self.block_size}_l{self.layout}"
-            f"_n{self.nseg}_k{self.kpw}_mut{self.mutate}"
-            f"_b{self.block}_ms{self.msplit}_i{self.ilv}_bf{self.bfly}"
-            f"{'_gt' if self.gridt else ''}"
+            f"_n{self.nseg}_rg{self.rg}_mb{self.minb}_w{self.nw}"
+            f"{'' if not self.dspl else f'_ds{self.dspl}'}"
+            f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
-            f"{'' if not self.dpl else f'_dpl{self.dpl}'}"
-            f"{'' if self.ldsplit == 1 else f'_ls{self.ldsplit}'}"
-            f"{'' if self.fusedred else '_nofr'}"
-            f"_f{int(self.fused)}"
         )
 
     @property
@@ -127,19 +79,16 @@ class KernelVariant:
         return f"rdna35_decode_{self.suffix}"
 
     @property
-    def partials_per_head(self) -> int:
-        """How many partials the global reduction merges.
-
-        The fused epilogue collapses a workgroup's NWAVE partials in LDS, so
-        only the NSEG cross-workgroup ones survive.
-        """
-        waves = self.block // _WAVE
-        return self.nseg if self.fused else self.nseg * waves
+    def rows_padded(self) -> int:
+        """Query rows one workgroup carries, rounded up to whole WMMA tiles."""
+        gqa = self.num_q_heads // self.num_kv_heads
+        rows = gqa * self.max_m // self.rg
+        return -(-rows // 16) * 16
 
     def scratch_shapes(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Shapes of the (acc, m/l) partials the kernel writes."""
-        segments = self.num_q_heads * self.partials_per_head * self.max_m
-        return (segments, self.head_size), (segments,)
+        """Shapes of the (acc, m/l) partials the split-KV merge goes through."""
+        rows = self.num_kv_heads * self.rg * self.nseg * self.rows_padded
+        return (rows, self.head_size), (rows,)
 
 
 _loaded: dict[KernelVariant, Any] = {}
@@ -186,6 +135,16 @@ class UnexpectedBuildError(RuntimeError):
     """A variant was requested that precompilation did not cover."""
 
 
+class VariantBuildError(RuntimeError):
+    """A variant does not compile -- a static_assert refused its shape."""
+
+
+# Variants that already failed to build.  A shape the kernel refuses fails the
+# same way every time, and a rebuild costs ~20 s, so the first failure is
+# remembered and every later request fails at once.
+_failed: dict[KernelVariant, str] = {}
+
+
 _sealed = False
 
 
@@ -208,9 +167,17 @@ def seal(on: bool = True) -> None:
 
 
 def load(variant: KernelVariant) -> Any:
-    """Compile (or fetch) the extension for ``variant``."""
+    """Compile (or fetch) the extension for ``variant``.
+
+    Raises:
+        VariantBuildError: The kernel refuses this shape.
+        UnexpectedBuildError: The loader is sealed and the variant is not
+            built yet.
+    """
     if variant in _loaded:
         return _loaded[variant]
+    if variant in _failed:
+        raise VariantBuildError(_failed[variant])
     if _sealed:
         raise UnexpectedBuildError(
             f"{variant.name} was not precompiled, and building it now would "
@@ -229,14 +196,12 @@ def load(variant: KernelVariant) -> Any:
 
     flags = [
         "-O3",
-        "-DDECODE_ATTN_NO_MAIN",
         "-DRDNA35_TORCH_EXT",
         # HIP resolves device functions by name across the whole process, so two
         # variants sharing the symbol `decode_attn` would both dispatch to
         # whichever registered first — returning plausible, wrong numbers. Give
         # each build its own symbols so variants can coexist.
         f"-Ddecode_attn=decode_attn_{variant.suffix}",
-        f"-Dreduce_segments=reduce_segments_{variant.suffix}",
         f"-DHEAD_DIM={variant.head_size}",
         f"-DNUM_Q_HEADS={variant.num_q_heads}",
         f"-DNUM_KV_HEADS={variant.num_kv_heads}",
@@ -244,26 +209,24 @@ def load(variant: KernelVariant) -> Any:
         f"-DBS={variant.block_size}",
         f"-DLAYOUT={variant.layout}",
         f"-DNSEG={variant.nseg}",
-        f"-DKPW={variant.kpw}",
+        f"-DRG={variant.rg}",
+        f"-DMINB={variant.minb}",
+        f"-DNW={variant.nw}",
+        *([f"-DDSPL={variant.dspl}"] if variant.dspl else []),
         f"-DMUTATE={variant.mutate}",
-        f"-DFUSED={int(variant.fused)}",
-        f"-DBLOCK={variant.block}",
-        f"-DMSPLIT={variant.msplit}",
-        f"-DILV={variant.ilv}",
-        f"-DBFLY={variant.bfly}",
-        f"-DGRIDT={variant.gridt}",
         f"-DABLATE={variant.ablate}",
-        f"-DLDSPLIT={variant.ldsplit}",
-        *([f"-DDPL={variant.dpl}"] if variant.dpl else []),
-        f"-DFUSEDRED={int(variant.fusedred)}",
     ]
     logger.info("Compiling %s", variant.name)
-    module = load_extension(
-        name=variant.name,
-        sources=[str(source)],
-        extra_cuda_cflags=flags,
-        extra_ldflags=_hip_runtime_ldflags(),
-    )
+    try:
+        module = load_extension(
+            name=variant.name,
+            sources=[str(source)],
+            extra_cuda_cflags=flags,
+            extra_ldflags=_hip_runtime_ldflags(),
+        )
+    except RuntimeError as exc:
+        _failed[variant] = f"{variant.name} does not build: {exc}"
+        raise VariantBuildError(_failed[variant]) from exc
     _loaded[variant] = module
     return module
 
@@ -356,11 +319,13 @@ def make_scratch(
         torch.empty(acc_shape, **opts),
         torch.empty(ml_shape, **opts),
         torch.empty(ml_shape, **opts),
-        # Arrival counters, one per q head.  Zeroed once: the kernel resets
-        # them as it consumes them, so every later launch starts clean without
-        # the host writing here -- which it could not do under graph capture
-        # anyway.
-        torch.zeros(variant.num_q_heads, dtype=torch.int32, device=device),
+        # Arrival counters, one per (kv head, row group).  Zeroed once: the
+        # kernel resets them as it consumes them, so every later launch starts
+        # clean without the host writing here -- which it could not do under
+        # graph capture anyway.
+        torch.zeros(
+            variant.num_kv_heads * variant.rg, dtype=torch.int32, device=device
+        ),
     )
 
 

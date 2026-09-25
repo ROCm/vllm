@@ -10,7 +10,7 @@ metadata and the timer are identical; only the kernel launch differs.
         PYTHONPATH=$PWD amd-gpu-lock <venv>/bin/python \\
         benchmarks/kernels/gfx1151_decode_attn/tools/sweep.py --hq 8 --hkv 4
 
-Pass --nseg/--block/--msplit/--kpw to override what the backend would pick,
+Pass --nseg/--rg/--minb/--nw/--dspl to override what the backend would pick,
 which is how the tuning sweeps are run.
 """
 
@@ -58,55 +58,35 @@ def main() -> None:
         "dominates and the two longest where bandwidth does.  A knob has to "
         "serve the whole range with one value, so what matters is the ends",
     )
-    p.add_argument("--nseg", type=int, nargs="+", default=[None], help="override NSEG")
     p.add_argument(
-        "--block", type=int, nargs="+", default=[None], help="override threads/WG"
+        "--nseg", type=int, nargs="+", default=[None], help="most KV segments"
     )
     p.add_argument(
-        "--kpw", type=int, nargs="+", default=[None], help="override keys/wave/tile"
+        "--rg", type=int, nargs="+", default=[None], help="row groups per kv head"
     )
     p.add_argument(
-        "--msplit", type=int, nargs="+", default=[None], help="waves sharing MAXM"
-    )
-    p.add_argument(
-        "--ilv", type=int, nargs="+", default=[None], help="0 = contiguous KV runs"
-    )
-    p.add_argument(
-        "--bfly", type=int, nargs="+", default=[None], help="1 = permlane butterfly"
-    )
-    p.add_argument(
-        "--ldsplit",
+        "--minb",
         type=int,
         nargs="+",
         default=[None],
-        help="passes the epilogue cuts HEAD_DIM into; >1 lifts the LDS ceiling",
+        help="least KV blocks per active segment",
     )
     p.add_argument(
-        "--dpl",
+        "--nw", type=int, nargs="+", default=[None], help="waves per workgroup"
+    )
+    p.add_argument(
+        "--dspl",
         type=int,
         nargs="+",
         default=[None],
-        help="fp16 per lane of a row; sets LPR and so the butterfly depth",
+        help="waves sharing a key tile, each owning 1/dspl of the head dim",
     )
     p.add_argument(
         "--ablate",
         type=int,
         nargs="+",
         default=[None],
-        help="MEASUREMENT ONLY, wrong numbers: thin 1=PV 2=bfly 4=QK",
-    )
-    p.add_argument(
-        "--gridt",
-        type=int,
-        nargs="+",
-        default=[None],
-        help="1 = dispatch the grid head-fastest instead of segment-fastest",
-    )
-    p.add_argument(
-        "--no-fusedred",
-        dest="fusedred",
-        action="store_false",
-        help="launch reduce_segments instead of finishing in-kernel",
+        help="MEASUREMENT ONLY, wrong numbers; see ABLATE in the kernel",
     )
     p.add_argument("--triton", action="store_true", help="also measure Triton")
     args = p.parse_args()
@@ -123,25 +103,11 @@ def main() -> None:
         seal,
     )
 
-    knobs = (
-        "nseg",
-        "block",
-        "kpw",
-        "msplit",
-        "ilv",
-        "bfly",
-        "gridt",
-        "ablate",
-        "dpl",
-        "ldsplit",
-    )
+    knobs = ("nseg", "rg", "minb", "nw", "dspl", "ablate")
     combos = [
         {k: v for k, v in zip(knobs, vals, strict=True) if v is not None}
         for vals in itertools.product(*(getattr(args, k) for k in knobs))
     ]
-    if not args.fusedred:
-        for c in combos:
-            c["fusedred"] = False
 
     # One row per combination, one column per context.  Passing several values
     # per knob builds the matrix here rather than in a shell loop: a loop pays
@@ -165,13 +131,8 @@ def main() -> None:
     def patched(self, kv_cache, **kw):
         built = original(self, kv_cache, **kw)
         if built is not None and current:
-            # Rebuild from the heuristic knobs, not from self._variant.  The
-            # variant _prepare produced has already been through __post_init__,
-            # which raises MSPLIT until the partials fit LDS -- and replace()
-            # carries that raised value forward, so overriding BLOCK would keep
-            # the MSPLIT that BLOCK=256 needed instead of re-deriving the one
-            # BLOCK=128 allows.  precompile() starts from the heuristic, so
-            # this has to as well or the two disagree.
+            # Rebuild from the heuristic knobs, not from self._variant, so the
+            # override lands on the same base precompile() started from.
             want = replace(self._variant, **{**base, **current})
             if self._variant != want:
                 self._variant = want
@@ -201,11 +162,7 @@ def main() -> None:
                         args.m,
                         args.block_size,
                         layout,
-                        **{
-                            **base,
-                            **{k: v for k, v in combo.items() if k != "fusedred"},
-                        },
-                        **({"fusedred": False} if not args.fusedred else {}),
+                        **{**base, **combo},
                     )
                 )
     # The base variant too: `patched` calls the unpatched _prepare first, which

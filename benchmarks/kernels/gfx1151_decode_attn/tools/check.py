@@ -47,16 +47,11 @@ def main() -> None:
     p.add_argument("--contexts", type=int, nargs="+", default=[48, 1024])
     p.add_argument("--layouts", type=int, nargs="+", default=[0, 1])
     p.add_argument("--nseg", type=int, nargs="+", default=[None])
-    p.add_argument("--block", type=int, nargs="+", default=[None])
-    p.add_argument("--kpw", type=int, nargs="+", default=[None])
-    p.add_argument("--msplit", type=int, nargs="+", default=[None])
-    p.add_argument("--ilv", type=int, default=None)
-    p.add_argument("--bfly", type=int, default=None)
-    p.add_argument("--gridt", type=int, default=None)
+    p.add_argument("--rg", type=int, nargs="+", default=[None])
+    p.add_argument("--minb", type=int, nargs="+", default=[None])
+    p.add_argument("--nw", type=int, default=None)
+    p.add_argument("--dspl", type=int, default=None)
     p.add_argument("--ablate", type=int, default=None)
-    p.add_argument("--ldsplit", type=int, default=None)
-    p.add_argument("--dpl", type=int, default=None)
-    p.add_argument("--no-fusedred", dest="fusedred", action="store_false")
     p.add_argument(
         "--repeat",
         type=int,
@@ -88,25 +83,18 @@ def main() -> None:
     # of builds at ~19.6 s each -- serially that is minutes of nothing before
     # the first result.  Failures are left for the loop, which reports them
     # against the shape that asked for them.
-    def variant_for(layout, nseg, block, kpw, msplit):
-        kw = {"mutate": args.mutate, "fusedred": args.fusedred}
-        if args.ilv is not None:
-            kw["ilv"] = args.ilv
-        if args.bfly is not None:
-            kw["bfly"] = args.bfly
-        if args.gridt is not None:
-            kw["gridt"] = args.gridt
-        if args.ablate is not None:
-            kw["ablate"] = args.ablate
-        if args.ldsplit is not None:
-            kw["ldsplit"] = args.ldsplit
-        if args.dpl is not None:
-            kw["dpl"] = args.dpl
+    def variant_for(layout, nseg, rg, minb):
+        from vllm.v1.attention.backends.rdna35_hip_attn import _knobs_for
+
+        kw = dict(_knobs_for(args.hq, args.hkv, args.head_dim, args.m))
+        kw["mutate"] = args.mutate
         for name, val in (
             ("nseg", nseg),
-            ("block", block),
-            ("kpw", kpw),
-            ("msplit", msplit),
+            ("rg", rg),
+            ("minb", minb),
+            ("nw", args.nw),
+            ("dspl", args.dspl),
+            ("ablate", args.ablate),
         ):
             if val is not None:
                 kw[name] = val
@@ -117,13 +105,11 @@ def main() -> None:
     precompile(
         [
             variant_for(*combo)
-            for combo in itertools.product(
-                args.layouts, args.nseg, args.block, args.kpw, args.msplit
-            )
+            for combo in itertools.product(args.layouts, args.nseg, args.rg, args.minb)
         ]
     )
-    for s, layout, nseg, block, kpw, msplit in itertools.product(
-        args.contexts, args.layouts, args.nseg, args.block, args.kpw, args.msplit
+    for s, layout, nseg, rg, minb in itertools.product(
+        args.contexts, args.layouts, args.nseg, args.rg, args.minb
     ):
         torch.manual_seed(0)
         # Round up, so S need not be a multiple of the page: a tile that runs
@@ -151,7 +137,7 @@ def main() -> None:
         )
         bt = torch.arange(blocks, device=dev, dtype=torch.int32)
 
-        variant = variant_for(layout, nseg, block, kpw, msplit)
+        variant = variant_for(layout, nseg, rg, minb)
         module = load(variant)
         acc, smax, ssum, arrivals = make_scratch(variant, dev)
         out = torch.empty_like(q)
@@ -171,7 +157,7 @@ def main() -> None:
         if args.mutate:
             ok = not ok  # the negative control must be detected
         failures += not ok
-        label = f"S={s} l={layout} nseg={nseg} blk={block} kpw={kpw} ms={msplit}"
+        label = f"S={s} l={layout} nseg={nseg} rg={rg} minb={minb}"
         print(f"{label:<44} max_rel={max_rel:.3e}  {'PASS' if ok else 'FAIL'}")
 
     sys.exit(1 if failures else 0)

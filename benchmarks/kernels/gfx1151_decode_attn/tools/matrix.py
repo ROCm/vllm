@@ -55,28 +55,40 @@ def main() -> None:
         default=[128, 512, 1024, 4096, 8192, 16384, 32768],
     )
     p.add_argument(
-        "--gridt",
+        "--nseg",
         type=int,
         default=None,
-        help="force GRIDT on every configuration, overriding the heuristics",
+        help="force NSEG on every configuration, overriding the heuristics",
     )
     p.add_argument(
-        "--kpw",
+        "--rg",
         type=int,
         default=None,
-        help="force KPW on every configuration, overriding the heuristics",
+        help="force RG on every configuration, overriding the heuristics",
     )
     p.add_argument(
-        "--dpl",
+        "--minb",
         type=int,
         default=None,
-        help="force DPL on every configuration, overriding the heuristics",
+        help="force MINB on every configuration, overriding the heuristics",
     )
     p.add_argument(
-        "--ldsplit",
+        "--nw",
         type=int,
         default=None,
-        help="force LDSPLIT on every configuration, overriding the heuristics",
+        help="force NW on every configuration, overriding the heuristics",
+    )
+    p.add_argument(
+        "--dspl",
+        type=int,
+        default=None,
+        help="force DSPL on every configuration, overriding the heuristics",
+    )
+    p.add_argument(
+        "--no-triton",
+        dest="triton",
+        action="store_false",
+        help="skip the Triton column; %%roof does not need it and it is half the run",
     )
     args = p.parse_args()
 
@@ -97,10 +109,11 @@ def main() -> None:
     forced = {
         k: v
         for k, v in (
-            ("gridt", args.gridt),
-            ("kpw", args.kpw),
-            ("dpl", args.dpl),
-            ("ldsplit", args.ldsplit),
+            ("nseg", args.nseg),
+            ("rg", args.rg),
+            ("minb", args.minb),
+            ("nw", args.nw),
+            ("dspl", args.dspl),
         )
         if v is not None
     }
@@ -225,14 +238,17 @@ def main() -> None:
                 ran = any(i.kernel_calls for i in impls) and not any(
                     i.fallback_calls for i in impls
                 )
-                tri, _ = timeit("TRITON_ATTN", hq, hkv, d, s, m)
+                tri = None
+                if args.triton:
+                    tri, _ = timeit("TRITON_ATTN", hq, hkv, d, s, m)
                 mark = "" if ran else " (fallback)"
                 label = (
                     models[0] if len(models) == 1 else f"{models[0]} +{len(models) - 1}"
                 )
                 print(
                     f"| {label}{mark} | {s} | {m} | {hq} | {hkv} | {d} | "
-                    f"{roof:.2f} | {tri:.2f} | {ours:.2f} | {tri / ours:.2f}x | "
+                    f"{roof:.2f} | {'-' if tri is None else f'{tri:.2f}'} | "
+                    f"{ours:.2f} | {'-' if tri is None else f'{tri / ours:.2f}x'} | "
                     f"{roof / ours * 100:.1f} % | {spread:.1f} % |",
                     flush=True,
                 )

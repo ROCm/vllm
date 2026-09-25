@@ -54,11 +54,19 @@ def _build_variants():
     if not on_gfx1151():
         return
     rdna35.precompile(
-        [_variant(layout=0), _variant(layout=1), _variant(layout=1, mutate=1)]
+        [
+            _variant(layout=0),
+            _variant(layout=1),
+            _variant(layout=0, nseg=4),
+            _variant(layout=1, nseg=4),
+            _variant(layout=1, mutate=1),
+        ]
     )
 
 
-def _variant(layout: int = 1, mutate: int = 0):
+def _variant(layout: int = 1, mutate: int = 0, nseg: int = 1):
+    # nseg > 1 with minb = 1 splits even a short context over several
+    # workgroups, which is the only way to reach the cross-workgroup merge.
     return rdna35.KernelVariant(
         head_size=HEAD_DIM,
         num_q_heads=HQ,
@@ -66,6 +74,8 @@ def _variant(layout: int = 1, mutate: int = 0):
         max_m=M,
         block_size=BLOCK_SIZE,
         layout=layout,
+        nseg=nseg,
+        minb=1,
         mutate=mutate,
     )
 
@@ -105,16 +115,18 @@ def _reference(q, kv, seq_len):
     return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
 
 
-def _run(seq_len, layout=1, dtype=torch.float16, mutate=0):
+def _run(seq_len, layout=1, dtype=torch.float16, mutate=0, nseg=1, repeat=1):
     _skip_unless_gfx1151()
     q, kv, block_table = _paged_inputs(seq_len, layout, dtype)
-    variant = _variant(layout, mutate)
+    variant = _variant(layout, mutate, nseg)
     module = rdna35.load(variant)
     acc, m, ln, arrivals = rdna35.make_scratch(variant, q.device)
     out = torch.empty_like(q)
-    module.decode_attn(
-        q, kv, block_table, out, acc, m, ln, arrivals, seq_len, HEAD_DIM**-0.5
-    )
+    for _ in range(repeat):
+        out.zero_()
+        module.decode_attn(
+            q, kv, block_table, out, acc, m, ln, arrivals, seq_len, HEAD_DIM**-0.5
+        )
     torch.accelerator.synchronize()
     return out.float(), _reference(q, kv, seq_len)
 
@@ -130,18 +142,29 @@ def _max_rel(got, ref) -> float:
 
 @pytest.mark.parametrize("seq_len", [48, 1024])
 @pytest.mark.parametrize("layout", [0, 1])
-def test_matches_reference(seq_len, layout):
-    got, ref = _run(seq_len, layout=layout)
+@pytest.mark.parametrize("nseg", [1, 4])
+def test_matches_reference(seq_len, layout, nseg):
+    got, ref = _run(seq_len, layout=layout, nseg=nseg)
     assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= 1e-3
+
+
+def test_split_merge_survives_relaunch():
+    """The arrival counters must be back at zero after every launch.
+
+    The last workgroup to arrive resets them; if it did not, the second launch
+    would elect no merger and leave the output unwritten.
+    """
+    got, ref = _run(1024, nseg=4, repeat=3)
     assert _max_rel(got, ref) <= 1e-3
 
 
 def test_bfloat16_is_refused_not_miscomputed():
     """bf16 must raise, not return nonsense.
 
-    The inner product is __builtin_amdgcn_fdot2 and the loads reinterpret the
-    cache as _Float16, so bf16 input reads the same bits as fp16: the output
-    stays finite and is wrong by three orders of magnitude.
+    The products are fp16 WMMAs and the loads reinterpret the cache as
+    _Float16, so bf16 input would read the same bits as fp16: the output stays
+    finite and is wrong by three orders of magnitude.
     """
     with pytest.raises(RuntimeError, match="fp16 only"):
         _run(1024, dtype=torch.bfloat16)
