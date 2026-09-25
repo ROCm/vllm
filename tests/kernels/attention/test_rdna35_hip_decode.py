@@ -28,6 +28,10 @@ pytestmark = pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm onl
 rdna35 = pytest.importorskip("vllm.v1.attention.ops.rdna35_hip_decode")
 
 HQ, HKV, HEAD_DIM, M, BLOCK_SIZE = 32, 16, 256, 4, 16
+# Partials big enough (256 KiB per group) for the segments to share the merge,
+# on a grid small enough (32 workgroups) to be resident at once, which the
+# host requires before it lets them wait for each other.
+SHARED = dict(hq=16, hkv=2, hd=512, rg=2, nseg=8)
 
 
 def _skip_unless_gfx1151():
@@ -60,27 +64,45 @@ def _build_variants():
             _variant(layout=0, nseg=4),
             _variant(layout=1, nseg=4),
             _variant(layout=1, mutate=1),
+            _variant(**SHARED),
         ]
     )
 
 
-def _variant(layout: int = 1, mutate: int = 0, nseg: int = 1):
+def _variant(
+    layout: int = 1,
+    mutate: int = 0,
+    nseg: int = 1,
+    hq: int = HQ,
+    hkv: int = HKV,
+    hd: int = HEAD_DIM,
+    rg: int = 1,
+):
     # nseg > 1 with minb = 1 splits even a short context over several
     # workgroups, which is the only way to reach the cross-workgroup merge.
     return rdna35.KernelVariant(
-        head_size=HEAD_DIM,
-        num_q_heads=HQ,
-        num_kv_heads=HKV,
+        head_size=hd,
+        num_q_heads=hq,
+        num_kv_heads=hkv,
         max_m=M,
         block_size=BLOCK_SIZE,
         layout=layout,
         nseg=nseg,
+        rg=rg,
         minb=1,
         mutate=mutate,
     )
 
 
-def _paged_inputs(seq_len: int, layout: int, dtype: torch.dtype, seed: int = 0):
+def _paged_inputs(
+    seq_len: int,
+    layout: int,
+    dtype: torch.dtype,
+    seed: int = 0,
+    hq: int = HQ,
+    hkv: int = HKV,
+    hd: int = HEAD_DIM,
+):
     """Build a KV cache whose physical order matches the layout, then present
     it in the logical (num_blocks, num_kv_heads, block_size, 2*hs) order the
     backend passes down."""
@@ -88,44 +110,42 @@ def _paged_inputs(seq_len: int, layout: int, dtype: torch.dtype, seed: int = 0):
     dev = torch.device("cuda")
     num_blocks = seq_len // BLOCK_SIZE
     if layout == 0:  # NHD
-        kv = torch.randn(
-            num_blocks, BLOCK_SIZE, HKV, 2 * HEAD_DIM, device=dev, dtype=dtype
-        )
+        kv = torch.randn(num_blocks, BLOCK_SIZE, hkv, 2 * hd, device=dev, dtype=dtype)
         kv = kv.transpose(1, 2)
     else:  # HND
-        kv = torch.randn(
-            num_blocks, HKV, BLOCK_SIZE, 2 * HEAD_DIM, device=dev, dtype=dtype
-        )
+        kv = torch.randn(num_blocks, hkv, BLOCK_SIZE, 2 * hd, device=dev, dtype=dtype)
     kv = kv * 0.5
-    q = torch.randn(M, HQ, HEAD_DIM, device=dev, dtype=dtype) * 0.5
+    q = torch.randn(M, hq, hd, device=dev, dtype=dtype) * 0.5
     return q, kv, torch.arange(num_blocks, device=dev, dtype=torch.int32)
 
 
 def _reference(q, kv, seq_len):
-    flat = kv.transpose(1, 2).reshape(seq_len, HKV, 2 * HEAD_DIM)
-    k, v = flat[..., :HEAD_DIM], flat[..., HEAD_DIM:]
-    gqa = HQ // HKV
+    hq, hkv, hd = q.shape[1], kv.shape[1], q.shape[2]
+    flat = kv.transpose(1, 2).reshape(seq_len, hkv, 2 * hd)
+    k, v = flat[..., :hd], flat[..., hd:]
+    gqa = hq // hkv
     qf = q.float().permute(1, 0, 2)
     kf = k.float().permute(1, 0, 2).repeat_interleave(gqa, 0)
     vf = v.float().permute(1, 0, 2).repeat_interleave(gqa, 0)
-    scores = torch.bmm(qf, kf.transpose(1, 2)) * (HEAD_DIM**-0.5)
+    scores = torch.bmm(qf, kf.transpose(1, 2)) * (hd**-0.5)
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
     lim = (seq_len - M + torch.arange(M, device=q.device)).view(M, 1)
     scores = scores.masked_fill((pos > lim).view(1, M, seq_len), float("-inf"))
     return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
 
 
-def _run(seq_len, layout=1, dtype=torch.float16, mutate=0, nseg=1, repeat=1):
+def _run(seq_len, layout=1, dtype=torch.float16, mutate=0, nseg=1, repeat=1, **shape):
     _skip_unless_gfx1151()
-    q, kv, block_table = _paged_inputs(seq_len, layout, dtype)
-    variant = _variant(layout, mutate, nseg)
+    dims = {k: v for k, v in shape.items() if k != "rg"}
+    q, kv, block_table = _paged_inputs(seq_len, layout, dtype, **dims)
+    variant = _variant(layout, mutate, nseg, **shape)
     module = rdna35.load(variant)
     acc, m, ln, arrivals = rdna35.make_scratch(variant, q.device)
     out = torch.empty_like(q)
     for _ in range(repeat):
         out.zero_()
         module.decode_attn(
-            q, kv, block_table, out, acc, m, ln, arrivals, seq_len, HEAD_DIM**-0.5
+            q, kv, block_table, out, acc, m, ln, arrivals, seq_len, q.shape[2] ** -0.5
         )
     torch.accelerator.synchronize()
     return out.float(), _reference(q, kv, seq_len)
@@ -156,6 +176,19 @@ def test_split_merge_survives_relaunch():
     would elect no merger and leave the output unwritten.
     """
     got, ref = _run(1024, nseg=4, repeat=3)
+    assert _max_rel(got, ref) <= 1e-3
+
+
+@pytest.mark.parametrize("seq_len", [48, 1024])
+def test_shared_split_merge(seq_len):
+    """Segments that wait for each other and merge a slice each.
+
+    Relaunched, because the wait is on a generation that must keep advancing:
+    one stuck at the value a later launch reads first would release nobody.
+    """
+    shape = {k: v for k, v in SHARED.items() if k != "nseg"}
+    got, ref = _run(seq_len, nseg=SHARED["nseg"], repeat=3, **shape)
+    assert torch.isfinite(got).all()
     assert _max_rel(got, ref) <= 1e-3
 
 

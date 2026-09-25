@@ -319,12 +319,13 @@ def make_scratch(
         torch.empty(acc_shape, **opts),
         torch.empty(ml_shape, **opts),
         torch.empty(ml_shape, **opts),
-        # Arrival counters, one per (kv head, row group).  Zeroed once: the
-        # kernel resets them as it consumes them, so every later launch starts
-        # clean without the host writing here -- which it could not do under
-        # graph capture anyway.
+        # Arrival counters, then merge generations, one each per (kv head,
+        # row group).  Zeroed once: the kernel resets the counters as it
+        # consumes them and only compares generations for change, so every
+        # later launch starts clean without the host writing here -- which it
+        # could not do under graph capture anyway.
         torch.zeros(
-            variant.num_kv_heads * variant.rg, dtype=torch.int32, device=device
+            2 * variant.num_kv_heads * variant.rg, dtype=torch.int32, device=device
         ),
     )
 

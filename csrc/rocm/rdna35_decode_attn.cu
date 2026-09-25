@@ -143,6 +143,10 @@
 #define MRG_BYTES (TILES == 1 ? 0 : MRG_SLOTS * DSPL * MSLOT * 4)
 #define LOOP_BYTES (QS_BYTES + KT_BYTES)
 #define LDS_RAW (LOOP_BYTES > MRG_BYTES ? LOOP_BYTES : MRG_BYTES)
+// Split KV: a single workgroup merging every segment's partials is bound by
+// its own CU's bandwidth once they reach 64 KiB -- 2 us at 256 KiB.  Past
+// that the segments wait for each other and each merges a slice instead.
+#define SHARED_MERGE (ROWS_W * HEAD_DIM * NSEG * 4 >= 64 * 1024)
 
 static_assert(NUM_Q_HEADS % NUM_KV_HEADS == 0, "GQA must be integral");
 static_assert(GQA % RG == 0, "row groups split whole q heads");
@@ -324,7 +328,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     const _Float16* __restrict__ q, const _Float16* __restrict__ kv,
     const int* __restrict__ bt, float* __restrict__ p_acc,
     float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
-    OutT* __restrict__ out, int S, float scale) {
+    OutT* __restrict__ out, int S, float scale, int coop) {
   const int tid = threadIdx.x;
   const int lane = tid & (WAVE - 1);
   const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE);
@@ -367,6 +371,12 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     qx[it] = *(const h8*)(q + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d);
     if (i / HEAD_DIM >= ROWS_W) qx[it] = h8{};
   }
+  // The group's merge generation cannot move before this segment arrives, so
+  // it is read now rather than on the way to the arrival.
+  int* const gen = p_cnt + NUM_KV_HEADS * RG + kvh * RG + rg;
+  const int g0 = SHARED_MERGE ? __hip_atomic_load(gen, __ATOMIC_RELAXED,
+                                                  __HIP_MEMORY_SCOPE_AGENT)
+                              : 0;
 
   // q_s and the K tiles are dead once the main loop ends; the merge reuses
   // their storage.
@@ -730,6 +740,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // Split KV: publish (acc, m, l), and the last segment to arrive merges.
   // Nobody waits: the late arriver is already resident when it does the
   // atomic, and it resets the counter, so a CUDA-graph replay starts clean.
+  // With a shared merge (`coop`: the host has checked the whole grid can be
+  // resident at once, so waiting cannot deadlock) the others wait for it to
+  // bump the group's generation, and every segment merges its slice.
   // Counting arrivals first and letting only the non-last segments fence
   // their partials out measured 0.5-1.6 % worse: their fence then sits on
   // the last one's path instead of ahead of its atomic.
@@ -738,20 +751,39 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     p_l[pb + tid] = gl_s[tid];
   }
   __threadfence();
-  __shared__ int lds_last;
+  coop = SHARED_MERGE && coop;
+  __shared__ int lds_go;
   lds_barrier();
-  if (tid == 0) lds_last = (atomicAdd(&p_cnt[grp], 1) == nseg - 1);
+  if (tid == 0) {
+    const bool last = atomicAdd(&p_cnt[grp], 1) == nseg - 1;
+    if (last) {
+      // The generation first: the counter only has to be clean by the next
+      // launch, and a release store behind it would wait for its ack.
+      if (coop)
+        __hip_atomic_store(gen, g0 + 1, __ATOMIC_RELEASE,
+                           __HIP_MEMORY_SCOPE_AGENT);
+      p_cnt[grp] = 0;
+    } else if (coop) {
+      while (__hip_atomic_load(gen, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT) == g0)
+        __builtin_amdgcn_s_sleep(1);
+    }
+    lds_go = last || coop;
+  }
   lds_barrier();
   TS(6);
-  if (!lds_last) return;
-  if (tid == 0) p_cnt[grp] = 0;
+  if (!lds_go) return;
   __threadfence();
+  constexpr int NEL = ROWS_W * HEAD_DIM;
+  const int chunk = coop ? (NEL / 4 + nseg - 1) / nseg * 4 : NEL;
+  const int i0 = coop ? seg * chunk : 0;
+  const int i1 = min(NEL, i0 + chunk);
 
   // Every load of the merge goes out at once -- each thread's rows' m and l
   // and its slice of every segment's partial, NSEG unrolled -- so the last
   // arriver pays one L2 round trip, not one for the running max, one for the
   // weights and one for the partials.
-  for (int i = tid * 4; i < ROWS_W * HEAD_DIM; i += BLOCK * 4) {
+  for (int i = i0 + tid * 4; i < i1; i += BLOCK * 4) {
     const int r = i / HEAD_DIM, d = i % HEAD_DIM;
     float pm[NSEG], pl[NSEG];
     f4 pa[NSEG];
@@ -788,7 +820,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 template __global__ void decode_attn<_Float16>(const _Float16*, const _Float16*,
                                                const int*, float*, float*,
                                                float*, int*, _Float16*, int,
-                                               float);
+                                               float, int);
 #else
   #include <ATen/cuda/CUDAContext.h>
   #include <c10/cuda/CUDAGuard.h>
@@ -819,13 +851,40 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
   // Row group fastest, then kv head, then segment: the row groups of one kv
   // head read the same KV and are dispatched side by side to share it in L2.
   dim3 grid(NSEG * NUM_KV_HEADS * RG), block(BLOCK);
-  hipLaunchKernelGGL(
-      decode_attn<_Float16>, grid, block, 0, stream,
-      reinterpret_cast<const _Float16*>(q.data_ptr()),
-      reinterpret_cast<const _Float16*>(kv_cache.data_ptr()),
-      block_table.data_ptr<int>(), acc.data_ptr<float>(), m.data_ptr<float>(),
-      l.data_ptr<float>(), cnt.data_ptr<int>(),
-      reinterpret_cast<_Float16*>(out.data_ptr()), (int)seq_len, (float)scale);
+  static const int coop = [&] {
+    if (!SHARED_MERGE) return 0;
+    int dev, wgps, per = 0;
+    (void)hipGetDevice(&dev);
+    (void)hipDeviceGetAttribute(&wgps, hipDeviceAttributeMultiprocessorCount,
+                                dev);
+    (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
+        &per, decode_attn<_Float16>, BLOCK, 0);
+    // The runtime assumes 64 KiB of LDS where a gfx1151 WGP has 128, and
+    // reports one workgroup per WGP for anything over 32 KiB.  Count what
+    // fits, rounding every way down: 1536 VGPRs per SIMD in blocks of 24,
+    // and no workgroup spanning the WGP's two CUs.
+    hipFuncAttributes fa;
+    hipDeviceProp_t prop;
+    if (hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(
+                                      decode_attn<_Float16>)) == hipSuccess &&
+        hipGetDeviceProperties(&prop, dev) == hipSuccess &&
+        strstr(prop.gcnArchName, "gfx1151")) {
+      const int wps = std::min(16, 1536 / ((fa.numRegs + 23) / 24 * 24));
+      const int by_waves = 2 * (2 * wps / NW);
+      const int by_lds =
+          fa.sharedSizeBytes ? 128 * 1024 / (int)fa.sharedSizeBytes : by_waves;
+      per = std::max(per, std::min(by_waves, by_lds));
+    }
+    return (int)(per * wgps >= (int)grid.x);
+  }();
+  hipLaunchKernelGGL(decode_attn<_Float16>, grid, block, 0, stream,
+                     reinterpret_cast<const _Float16*>(q.data_ptr()),
+                     reinterpret_cast<const _Float16*>(kv_cache.data_ptr()),
+                     block_table.data_ptr<int>(), acc.data_ptr<float>(),
+                     m.data_ptr<float>(), l.data_ptr<float>(),
+                     cnt.data_ptr<int>(),
+                     reinterpret_cast<_Float16*>(out.data_ptr()), (int)seq_len,
+                     (float)scale, coop);
 }
 
   #if TIMING
