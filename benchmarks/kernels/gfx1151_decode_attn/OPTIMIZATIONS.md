@@ -1277,3 +1277,106 @@ Under the NHD layout (vLLM's default), with shuffled pages, 010-011 are 4-7 %
 slower than before at S >= 16384 on `8/4/256` and `16/8/256` M=4; knobs do not
 recover them. HND, which every number here uses, does not show it. Not
 bisected.
+
+---
+
+## 013 — bf16
+
+**Status:** landed, `88fb3dc37b`.
+
+### Motivation, from our case
+
+The kernel took fp16 only: the host op refused bf16 and the backend sent every
+bf16 model to Triton. Most of `tools/shapes.csv` ships in bf16, so for them
+none of 009-012 applied.
+
+### What changed
+
+The element type is a compile-time define, `KV_BF16`, like every other shape
+parameter: one build serves one dtype, `KernelVariant.dtype` names it (`_bf16`
+suffix) and the backend picks it from the query, refusing a KV cache of
+another type. fp16 builds compile to the same ISA as before, byte for byte, on
+six variants covering D=64 to 512, PPACK and DSPL.
+
+What moves is bits, so loads, LDS staging and every permlane stay as they
+were. Three places depend on the type:
+
+- **The products.** `wmma()` wraps `v_wmma_f32_16x16x16_bf16` (operands as
+  16 x `short`, the builtin's canonical type) or the f16 one.
+- **P.** P keeps its high + low split (PPACK or the second WMMA): ~16 bits in
+  bf16 against 8 for one bf16 P. gfx1151 has no f32 -> bf16 conversion, so the
+  high half **truncates**: two values pack in one `v_perm_b32`, and the low
+  half, `p - (p & 0xffff0000)`, is exact in fp32 and carries what truncation
+  drops. Rounding would cost ~5 VALU per value in the loop; the truncated
+  pair is
+
+      v_and_b32_e32 v175, 0xffff0000, v76          ; high half, as a float
+      v_perm_b32    v188, v89, v81, 0x7060302      ; two of them, packed
+
+- **The output.** Round to nearest even. The compiler's `(__bf16)` cast also
+  keeps a NaN a NaN, a compare and a select more per value:
+
+      ; (__bf16)x                          ; to_elem(x)
+      v_bfe_u32   v2, v0, 16, 1            v_bfe_u32  v10, v1, 16, 1
+      v_or_b32    v9, 0x400000, v0         v_add3_u32 v0, v1, v10, 0x7fff
+      v_cmp_u_f32 vcc_lo, v0, v0
+      v_add3_u32  v2, v2, v0, 0x7fff
+      v_cndmask_b32 ...
+
+  `to_elem` drops the NaN branch; a NaN may come out as Inf, still not
+  finite, which is all the tests ask of it. Epilogue only: 1083 against 1112
+  instructions on `32/8/128` M=1, 1851 against 2048 on `16/2/512` M=1.
+
+### Precision
+
+The reference sees the same rounded inputs, so what differs is the kernel's
+arithmetic and the output rounding, which alone is up to 2^-8 = 3.9e-3
+relative. The bound is 8e-3 for bf16 (1e-3 stays for fp16).
+
+`check.py --dtype bf16`, all 52 `_TUNED` configuration/M pairs, S = 48, 1000
+(partial tile, NaN past the sequence) and 4096, both layouts, two launches:
+worst max_rel **4.4e-3**; most cells sit at 3.8-3.9e-3, the output rounding.
+S=5 reaches 5.3e-3 on `16/1/512` M=4. The `--mutate 1` control at M=4 is
+detected on all 26 configurations, the smallest max_rel 23.
+
+### Measured
+
+Interleaved A/B against the fp16 build of the same configuration (same knobs,
+HND, shuffled pages, KV rotated over >= 96 MiB, `do_bench_cudagraph`, five
+rounds alternating), all 52 pairs. bf16 speed-up over fp16, median (worst):
+
+| output conversion | S=128 | S=1024 | S=8192 | S=32768 |
+| --- | --- | --- | --- | --- |
+| `(__bf16)` cast | 0.995 (0.989) | 0.999 (0.993) | 1.000 (0.982) | 1.001 (0.996) |
+| `to_elem` | 0.997 (0.989) | 0.999 (0.986) | | 1.000 (0.992) |
+
+`to_elem` against the cast, same configuration and context: +0.25 % median at
+S=128, better on 39 of 52; neutral at long context. What is left at S=128 is
+the conversion itself; the loop costs nothing.
+
+`matrix.py --dtype bf16`, HND, all 52 pairs with Triton in bf16 too
+(`golden/bf16.md`); the fp16 column is `golden/d*.md`, a different run:
+
+| D | M | configs | vs Triton | median configuration %roof | fp16 (`golden/d*.md`) | >= 90 % roof | S=128 median %roof |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 | 1 | 4 | 1.27x | 84.0 % | 83.7 % | 1 | 55.5 % |
+| 64 | 4 | 4 | 1.29x | 83.5 % | 83.8 % | 1 | 56.6 % |
+| 128 | 1 | 10 | 1.21x | 88.8 % | 89.0 % | 1 | 69.2 % |
+| 128 | 4 | 10 | 1.28x | 88.3 % | 87.7 % | 1 | 63.8 % |
+| 256 | 1 | 7 | 1.32x | 81.2 % | 81.4 % | 1 | 51.6 % |
+| 256 | 4 | 7 | 1.53x | 79.6 % | 79.6 % | 0 | 51.4 % |
+| 512 | 1 | 5 | 2.88x | 82.0 % | 82.2 % | 0 | 54.7 % |
+| 512 | 4 | 5 | 3.87x | 77.0 % | 77.2 % | 0 | 46.5 % |
+
+Per configuration, bf16 minus fp16 %roof: median -0.13 points (-0.91 to
++0.58), inside what two separate runs differ by. 5 of 52 pairs reach 90 % of
+roof, the same five as fp16. Four cells of 364 are slower than Triton, 0.99x,
+all D=128 at S=32768, as in fp16.
+
+### Traps
+
+- A define named `BF16` breaks the torch build of *every* variant, fp16
+  included: `ATen/Context.h` declares `enum class Float32Precision { ..., BF16 }`.
+- `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32` accepts `__bf16` vectors only
+  through lax vector conversion; with `-flax-vector-conversions=none` it wants
+  16 x `short`.

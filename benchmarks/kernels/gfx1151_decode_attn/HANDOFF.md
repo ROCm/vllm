@@ -5,14 +5,14 @@ reports: it says where things stand, what is still open, and which of the open
 items is actually worth doing.
 
 Everything here was measured on a Radeon 8060S (gfx1151), batch = 1 sequence,
-fp16, **HND** (see §5.1). Nothing is estimated.
+fp16 unless it says bf16, **HND** (see §5.1). Nothing is estimated.
 
 | file | what it is |
 | --- | --- |
 | this one | state, open work, traps |
 | `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-012 the commits below |
 | `reference/` | the previous per-q-head dot kernel and its D=512 golden, kept for comparison only |
-| `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten |
+| `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten. `bf16.md` is the same for bf16 |
 | `reports/` | the original investigation record, about the dot kernel. Its `%roof` numbers are superseded |
 
 ---
@@ -20,14 +20,15 @@ fp16, **HND** (see §5.1). Nothing is estimated.
 ## 1. Where things stand
 
 `RDNA35_HIP_ATTN` serves 49 of the 50 shapes in `tools/shapes.csv` with one
-kernel, `csrc/rocm/rdna35_decode_attn.cu`; it refuses D=96 (three fp16 per
-lane) and falls back to Triton. The nine sliding-window rows are skipped by
-every tool.
+kernel, `csrc/rocm/rdna35_decode_attn.cu`, in fp16 and in bf16; it refuses
+D=96 (three elements per lane) and falls back to Triton. The nine
+sliding-window rows are skipped by every tool.
 
 The kernel is the WMMA rewrite of OPTIMIZATIONS 009: one workgroup per
 `(kv head, row group, KV segment)`, both products on
-`v_wmma_f32_16x16x16_f16`, knobs `NSEG / RG / MINB / NW / DSPL` per
-configuration in `_TUNED` (`vllm/v1/attention/backends/rdna35_hip_attn.py`).
+`v_wmma_f32_16x16x16_f16` (`_bf16` in bf16), knobs
+`NSEG / RG / MINB / NW / DSPL` per configuration in `_TUNED`
+(`vllm/v1/attention/backends/rdna35_hip_attn.py`).
 Commits on top of it, 2026-09-25:
 
 | commit | what |
@@ -35,6 +36,7 @@ Commits on top of it, 2026-09-25:
 | `e79bc3cb18` (010) | preamble and softmax: LDS-only barriers, unconditional Q load, permlane fetch-inactive, causal mask only on the tail tile. S=128 +1 to +10 % |
 | `c17a8bda13` (011) | split-KV merge shared across the segments when a group's partials reach 64 KiB. D=512 S=128 up to +56 % |
 | `16621e4856` (012) | `16/2/512` M=1 re-tuned to `rg=1` (§5.2) |
+| `88fb3dc37b` (013) | bf16: a compile-time dtype, bf16 WMMAs, `--dtype` in the tools (§1, bf16) |
 
 ### The performance picture
 
@@ -67,6 +69,30 @@ read, under the same harness. Its score is the ceiling for any kernel: 19 of
 the 52 pairs have a ceiling under 90 %, mostly few-kv-head shapes whose short
 contexts are all dispatch and latency.
 
+### bf16
+
+Same kernel, same `_TUNED` knobs, bf16 WMMAs (OPTIMIZATIONS 013). An
+interleaved A/B against the fp16 build of every pair puts it at fp16's speed
+at long context and 0.3 % behind at S=128 (median; worst 1.1 %), the cost of
+rounding the output. Correctness is bounded at 8e-3 relative, not 1e-3:
+rounding the output to bf16 alone costs up to 3.9e-3.
+
+`matrix.py --dtype bf16`, all 52 pairs, Triton in bf16 too (`golden/bf16.md`):
+
+| D | M | configs | vs Triton | median configuration %roof | fp16 (`golden/d*.md`) | >= 90 % roof | S=128 median %roof |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 | 1 | 4 | 1.27x | 84.0 % | 83.7 % | 1 | 55.5 % |
+| 64 | 4 | 4 | 1.29x | 83.5 % | 83.8 % | 1 | 56.6 % |
+| 128 | 1 | 10 | 1.21x | 88.8 % | 89.0 % | 1 | 69.2 % |
+| 128 | 4 | 10 | 1.28x | 88.3 % | 87.7 % | 1 | 63.8 % |
+| 256 | 1 | 7 | 1.32x | 81.2 % | 81.4 % | 1 | 51.6 % |
+| 256 | 4 | 7 | 1.53x | 79.6 % | 79.6 % | 0 | 51.4 % |
+| 512 | 1 | 5 | 2.88x | 82.0 % | 82.2 % | 0 | 54.7 % |
+| 512 | 4 | 5 | 3.87x | 77.0 % | 77.2 % | 0 | 46.5 % |
+
+The same five pairs reach 90 % of roof; four cells of 364 trail Triton by
+1 %, D=128 at S=32768, as in fp16.
+
 ---
 
 ## 2. The loop
@@ -88,7 +114,7 @@ matrix.py  ->  worst shape  ->  timeline (TIMING), ISA, counters
 | `tools/dump_asm.sh` | ISA for one variant |
 
 All share `shapeset.py`, so `--hq/--hkv/--head-dim/--gqa/--filter` select the
-same rows everywhere. The full matrix with Triton takes about an hour.
+same rows everywhere, and `--dtype fp16|bf16` the element type (default fp16). The full matrix with Triton takes about an hour.
 
 ### Measurement protocol
 
@@ -124,7 +150,7 @@ floor alone is 65-85 % of roof depending on bytes (`floor.py`).
 
 ### 4.1 Keep the record current
 
-OPTIMIZATIONS 010-012 and `golden/` describe the state above. `golden/` holds
+OPTIMIZATIONS 010-013 and `golden/` describe the state above. `golden/` holds
 the 2026-09-25 result; replace it after the re-tune in §4.2 if that beats it.
 
 ### 4.2 Re-tune everything
@@ -135,6 +161,11 @@ obsolete now. The merge change in particular moves the NSEG/MINB optimum on
 D=512 and D=256. One configuration takes about 3.5 minutes on two contexts,
 so all 52 are ~3 hours plus a validating matrix. Validate every new row at
 all seven contexts.
+
+`_TUNED` is keyed without the dtype: bf16 moves the same bytes and measured
+within 1 % of fp16 everywhere, so one table serves both. Tune in fp16 and
+confirm with `matrix.py --dtype bf16`; key the table on the dtype only if a
+row ever disagrees.
 
 ### 4.3 Decide the KV layout, then fix what it exposes
 
@@ -187,7 +218,7 @@ ahead over the seven-context geomean, the idea is closed.
 
 ### 4.6 D=96, and the batch axis
 
-Unchanged: D=96 is three fp16 per lane; batch > 1 falls back to Triton.
+Unchanged: D=96 is three elements per lane; batch > 1 falls back to Triton.
 
 ---
 
@@ -256,10 +287,16 @@ Stale lock files under `~/.cache/torch_extensions` block builds; delete them.
 
 ### 5.10 `max_abs` is not a correctness criterion
 
-Use `max_rel <= 1e-3` with a short S, the partial tile, repeated launches and
+Use `max_rel <= 1e-3` (8e-3 in bf16, §1) with a short S, the partial tile, repeated launches and
 the `--mutate 1` negative control. The control is vacuous at M=1; validate
 masking at M=4. A test for a new path must fail when that path is broken on
 purpose, or it is not reaching it.
+
+### 5.11 A define named `BF16` breaks every build
+
+`ATen/Context.h` declares `enum class Float32Precision { ..., BF16 }`, so
+`-DBF16=...` fails the torch build of every variant, fp16 included. The
+kernel's dtype define is `KV_BF16`; pick names torch does not use.
 
 ---
 
@@ -322,6 +359,16 @@ export PATH=/scratch/rogarcia/vllm/.venv/bin:$PATH PYTHONPATH=$PWD \
 
 # what we ship
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py
+
+# the same in bf16 (Triton column in bf16 too)
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py \
+    --dtype bf16
+
+# bf16 correctness, with the negative control
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/check.py \
+    --dtype bf16 --hq 16 --hkv 1 --head-dim 512 --m 4 --repeat 2
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/check.py \
+    --dtype bf16 --hq 16 --hkv 1 --head-dim 512 --m 4 --mutate 1
 
 # one configuration
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py \
