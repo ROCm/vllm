@@ -1276,13 +1276,13 @@ set(VLLM_MOE_EXT_SRC
   "csrc/libtorch_stable/moe/torch_bindings.cpp"
   "csrc/libtorch_stable/moe/moe_align_sum_kernels.cu"
   "csrc/libtorch_stable/moe/moe_permute_unpermute_op.cu"
-  "csrc/libtorch_stable/moe/moe_wna16.cu"
   "csrc/libtorch_stable/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu"
   "csrc/libtorch_stable/moe/topk_softmax_kernels.cu"
   "csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
+    "csrc/libtorch_stable/moe/moe_wna16.cu"
     "csrc/libtorch_stable/moe/grouped_topk_kernels.cu")
 endif()
 

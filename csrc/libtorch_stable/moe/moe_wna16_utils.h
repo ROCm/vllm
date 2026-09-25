@@ -1,14 +1,6 @@
 
-#ifndef USE_ROCM
-  #include <cuda_fp16.h>
-  #include <cuda_bf16.h>
-#else
-  #include <hip/hip_fp16.h>
-  #include <hip/hip_bf16.h>
-
-using nv_bfloat16 = __hip_bfloat16;
-using nv_bfloat162 = __hip_bfloat162;
-#endif
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 template <typename scalar_t>
 class ScalarType {};
@@ -88,16 +80,11 @@ class ScalarType<nv_bfloat16> {
 
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
-#ifdef USE_ROCM
-  static_assert(lut == 0xEA, "Only LUT 0xEA is implemented for ROCm");
-  return (a & b) | c;
-#else
   int res;
   asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
                : "=r"(res)
                : "r"(a), "r"(b), "r"(c), "n"(lut));
   return res;
-#endif
 }
 
 template <int start_byte, int mask>
@@ -141,27 +128,13 @@ __device__ inline void dequant<half2, 4>(int q, half2* res) {
 
 template <>
 __device__ inline void dequant<half2, 8>(int q, half2* res) {
-#ifdef USE_ROCM
-  #if __has_builtin(__builtin_amdgcn_perm)
-  static constexpr uint32_t mask_for_elt_01 = 0x05020500u;
-  static constexpr uint32_t mask_for_elt_23 = 0x05030501u;
-  static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
-
-  uint32_t lo = __builtin_amdgcn_perm(start_byte_for_fp16, q, mask_for_elt_01);
-  uint32_t hi = __builtin_amdgcn_perm(start_byte_for_fp16, q, mask_for_elt_23);
-  #else
-  uint32_t lo = ((q & 0xFF) | 0x6400) | (((q >> 16) & 0xFF) << 16 | 0x64000000);
-  uint32_t hi =
-      (((q >> 8) & 0xFF) | 0x6400) | (((q >> 24) & 0xFF) << 16 | 0x64000000);
-  #endif
-#else
   static constexpr uint32_t mask_for_elt_01 = 0x5250;
   static constexpr uint32_t mask_for_elt_23 = 0x5351;
   static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
 
   uint32_t lo = prmt<start_byte_for_fp16, mask_for_elt_01>(q);
   uint32_t hi = prmt<start_byte_for_fp16, mask_for_elt_23>(q);
-#endif
+
   static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64006400;
 
   res[0] = __hsub2(*reinterpret_cast<half2*>(&lo),

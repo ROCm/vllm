@@ -1456,10 +1456,7 @@ def should_moe_wna16_use_cuda(
     num_valid_tokens: int, group_size: int, num_experts: int, bit: int
 ):
     return (
-        (
-            current_platform.is_cuda()
-            or (current_platform.is_rocm() and envs.VLLM_ROCM_USE_MOE_WNA16_CUDA_KERNEL)
-        )
+        current_platform.is_cuda()
         and bit == 4
         and group_size in [32, 64, 128]
         and num_valid_tokens / num_experts <= 6

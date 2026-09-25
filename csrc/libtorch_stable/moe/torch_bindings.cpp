@@ -64,7 +64,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "                     Tensor !adapter_enabled,"
       "                     Tensor !lora_ids,"
       "                     Tensor? maybe_expert_map) -> () ");
-
+#ifndef USE_ROCM
   m.def(
       "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
       "Tensor b_scales, Tensor? b_qzeros, "
@@ -72,6 +72,22 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "Tensor expert_ids, Tensor num_tokens_post_pad, "
       "int top_k, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, "
       "int bit) -> Tensor");
+
+  m.def(
+      "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
+      "Tensor! b_q_weight, Tensor? b_bias_or_none,"
+      "Tensor! b_scales, Tensor? a_scales, Tensor? global_scale, Tensor? "
+      "b_zeros_or_none,"
+      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
+      "Tensor sorted_token_ids,"
+      "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
+      "Tensor! topk_weights, int moe_block_size, int top_k, "
+      "bool mul_topk_weights, int b_type_id,"
+      "int size_m, int size_n, int size_k,"
+      "bool is_full_k, bool use_atomic_add,"
+      "bool use_fp32_reduce, bool is_zp_float,"
+      "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
+#endif
 
   m.def(
       "moe_permute(Tensor input, Tensor topk_ids,"
@@ -106,21 +122,6 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
       "output_tensor) -> ()");
 
 #ifndef USE_ROCM
-  m.def(
-      "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
-      "Tensor! b_q_weight, Tensor? b_bias_or_none,"
-      "Tensor! b_scales, Tensor? a_scales, Tensor? global_scale, Tensor? "
-      "b_zeros_or_none,"
-      "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
-      "Tensor sorted_token_ids,"
-      "Tensor! expert_ids, Tensor! num_tokens_past_padded,"
-      "Tensor! topk_weights, int moe_block_size, int top_k, "
-      "bool mul_topk_weights, int b_type_id,"
-      "int size_m, int size_n, int size_k,"
-      "bool is_full_k, bool use_atomic_add,"
-      "bool use_fp32_reduce, bool is_zp_float,"
-      "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
-
   // Apply grouped topk routing to select experts.
   m.def(
       "grouped_topk(Tensor scores, int n_group, int "
@@ -143,9 +144,9 @@ STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
   m.impl("batched_moe_align_block_size",
          TORCH_BOX(&batched_moe_align_block_size));
   m.impl("moe_lora_align_block_size", TORCH_BOX(&moe_lora_align_block_size));
-  m.impl("moe_wna16_gemm", TORCH_BOX(&moe_wna16_gemm));
   m.impl("shuffle_rows", TORCH_BOX(&shuffle_rows));
 #ifndef USE_ROCM
+  m.impl("moe_wna16_gemm", TORCH_BOX(&moe_wna16_gemm));
   m.impl("grouped_topk", TORCH_BOX(&grouped_topk));
 #endif
 }
