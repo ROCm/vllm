@@ -1075,3 +1075,205 @@ path.  From S=8192 the two are level.
   jobs polling together both start. Measurements taken while another job ran
   scattered by +-2 % at long context; serialised with `flock` they repeat to
   0.1 %.
+
+---
+
+## 010 — Trim the preamble and the softmax
+
+**Status:** landed, `e79bc3cb18`.
+
+### Motivation, from our case
+
+At S=128 the effective work is one or two 16-key tiles per wave; the rest of
+the ~3.4 us inside the kernel is preamble, waits and epilogue. The ISA showed
+four costs that did no work.
+
+### What changed, and what each measured
+
+Interleaved A/B against the previous kernel, dev harness (HND), S=128 unless
+stated.
+
+**Barriers order LDS only.** `__syncthreads()` compiles to
+`s_waitcnt vmcnt(0) lgkmcnt(0)`, `s_barrier`, `buffer_gl0_inv`: it waits for
+every outstanding global load and invalidates L0. Every barrier in this kernel
+orders LDS only (global visibility for the merge is `__threadfence`'s job),
+and the one that publishes Q therefore waited for the whole first KV tile to
+land before any wave could start Q@K. All eleven became
+
+    s_waitcnt lgkmcnt(0)
+    s_barrier
+
+**Q loaded unconditionally, from a clamped row.** Under `if (r < ROWS_W)` the
+compiler waited `vmcnt(0)` -- Q and the page table -- before it issued the
+first KV load; unconditional, it waits `vmcnt(1)` for the page table only.
+Padding rows are zeroed after the load.
+
+Together: `32/8/128` M=1 +9.9 %, M=4 +5.5 %, `16/1/512` M=4 +4.9 %, the other
+case studies +0.8 to +1.4 %. Correctness unchanged (max_rel 4.9e-4).
+
+**permlane with fetch-inactive.** `v_permlane16_b32` / `v_permlanex16_b32`
+with `fi=0` must preserve the destination in inactive lanes, so the compiler
+tied the destination to a copy of the source: one `v_mov` per permute. Every
+source lane is active in every use, so `fi=1` (`op_sel:[1,0]` in the ISA)
+changes nothing but the copies: `v_mov` 207 -> 141 on `32/8/128`, VGPRs
+unchanged at 237. `32/8/128` +1.0 %, the rest within noise.
+
+**Causal mask on the tail tile only; the scale inside the exponent.** Only a
+tile that reaches past the first query token's keys can hold a masked key,
+so the per-element compare and select moved under a uniform branch. The
+scale multiplies inside the exponent as `fma(s, scale2, -m)` (it is
+positive, so the max commutes): one FMA replaces a multiply and a subtract.
++0.3 to +0.8 %.
+
+### Rejected in the same pass
+
+| idea | result |
+| --- | --- |
+| lazy rescale: move the running max only when a row grows by > 2^8 (skips 64 `v_mul` per tile) | neutral at S=128, -1 to +1 % at S=4096-16384 on M=4: the loop is not VALU-bound |
+| one select for rows with every key masked (`mref`), instead of one per element | neutral to -2.7 % at S=8192 |
+
+---
+
+## 011 — Share the split-KV merge across the segments
+
+**Status:** landed, `c17a8bda13`.
+
+### Motivation, from our case
+
+`TIMING=3` on `16/1/512` M=4, S=128 (NSEG=8, RG=4, NW=8): the loop ended at
+~2.8 us, and the kernel at 6.8 us. The last segment to arrive then read every
+segment's partial alone -- 16 rows x 512 d x 8 segments x 4 B = 256 KiB into
+one workgroup, ~2 us, bound by one CU's bandwidth. Unrolling the merge loop
+so more loads are in flight changed nothing (0.97-1.03x), which is what a
+bandwidth limit looks like.
+
+### What it does
+
+When a group's partials reach 64 KiB (`SHARED_MERGE`, compile time), the
+segments wait for each other and each merges its own slice of rows x D:
+
+- the last to arrive bumps a per-group **generation** word, then resets the
+  arrival counter (the order matters: a release store behind the counter
+  reset would wait for its ack);
+- the others spin on the generation (`s_sleep 1` between polls);
+- every segment then merges `ROWS_W x D / nseg` elements.
+
+The generation is read at kernel start: it cannot move before this segment
+arrives, so the read costs nothing on the way to the arrival (+2 to +3 % at
+S=128 against reading it there). The counter buffer doubles to hold the
+generations; they are compared for change, never reset.
+
+Waiting is only safe if every workgroup of the grid is resident at once. The
+host checks it (`coop`) and falls back to the last-arriver merge otherwise.
+HIP's `hipOccupancyMaxActiveBlocksPerMultiprocessor` reports 1 workgroup per
+WGP for anything over 32 KiB of LDS -- it assumes 64 KiB per WGP, gfx1151 has
+128 -- so the host also counts `floor(128 KiB / LDS)` and the wave limit from
+the kernel's VGPRs (1536 per SIMD in blocks of 24), rounding every way down,
+and takes the larger. `16/1/512` M=4 (52.6 KB LDS, 206 VGPRs): API 1,
+counted 2, grid 32 against 40.
+
+### Measured
+
+Interleaved A/B against 010, dev harness:
+
+| configuration | S=128 | S=1024 | S=8192 |
+| --- | --- | --- | --- |
+| `16/1/512` M=1 | **1.49x** | 1.31x | 1.06x |
+| `8/1/512` M=1 | 1.20x | 1.13x | 1.03x |
+| `8/1/512` M=4 | 1.16x | 1.14x | 1.03x |
+| `16/1/512` M=4 | 1.15x | 1.11x | |
+| `8/2/512` M=4 | 1.14x | 1.10x | 1.01x |
+| `8/2/512` M=1 | 1.11x | 1.04x | 1.01x |
+| `32/4/512` M=1 | 1.09x | 1.02x | 1.00x |
+| `16/2/512` M=4 | 1.09x | 1.04x | 1.01x |
+| `16/2/512` M=1 | 1.06x | 1.03x | |
+
+After it, the same timeline ends at 5.6 us: the merge takes ~0.7 us, and the
+fence, atomic and wait before it ~1-1.3 us.
+
+### Why a threshold
+
+Below ~64 KiB the lone merger is faster: the wait costs a round trip the
+merge no longer repays. With the shared merge forced on, `16/2/64` M=1 (16
+KiB of partials) measured -4 %, `8/1/256` M=1 (32 KiB) -2 to -3 %,
+`16/8/256` M=1 (4 KiB) -1 %. At 64 KiB (`16/2/512` M=1, `32/4/512` M=1)
+it already wins.
+
+### Rejected
+
+| idea | result |
+| --- | --- |
+| unroll the merge loop 2 or 4 times | 0.97-1.03x: bandwidth-bound, not latency-bound |
+| order the grid segment-fastest, so a group's segments dispatch together (would make the wait safe for any grid under in-order dispatch) | -2 to -3 % on `16/2/512` M=1 at S=128; rg-fastest-then-segment likewise |
+
+### ISA
+
+The wait, as the last-arriving workgroup's peers run it:
+
+    .LBB0_41:
+        s_sleep 1
+        global_load_b32 v3, v2, s[16:17] offset:4 glc
+        s_waitcnt vmcnt(0)
+        v_cmp_eq_u32_e32 vcc_lo, v3, v1
+        s_cbranch_vccnz .LBB0_41
+
+### Tests
+
+`test_shared_split_merge` (16/2/512, M=4, nseg=8, three launches) reaches the
+shared path: shifting each segment's slice by four elements on purpose makes
+it fail at S=48 and S=1024.
+
+---
+
+## 012 — `16/2/512` M=1 to one row group, and why RG > 1 is fragile
+
+**Status:** landed, `16621e4856` (knobs only).
+
+### Motivation, from our case
+
+After 010, `16/2/512` M=1 lost at long context: 0.93x at S=8192, 0.87x at
+16384, **0.78x at 32768** against the previous kernel. It was the only
+configuration measured that did.
+
+### What it was
+
+Bisected by barrier: any one `__syncthreads()` in place of `lds_barrier()`
+before or inside the main loop restores it; one in the epilogue does not;
+`vmcnt(0)` or `buffer_gl0_inv` written in `asm` at the same place does not
+either. So it was not what the barrier waits for, but how its presence
+changed the rest of the kernel's code -- and through it, timing.
+
+The counters showed what timing changed. `16/2/512` M=1 at S=32768:
+
+| | `GL2C_EA_RDREQ_DRAM` | `GL2C_HIT` | `GL2C_MISS` |
+| --- | --- | --- | --- |
+| LDS-only barriers | 1.68 M | 0.44 M | 1.68 M |
+| `__syncthreads` at the Q barrier | 1.05 M | 1.07 M | 1.05 M |
+
+1.05 M reads of 128 B is exactly the 128 MiB of KV. With `RG=2` the two row
+groups of a kv head read the same KV and rely on L2 to fetch it once; with
+LDS-only barriers they drifted apart and read it 1.6 times. Six other RG>1
+configurations stayed at 1.00-1.04x either way. Whether the row groups share
+depends on how their workgroups drift, which nothing in the kernel controls.
+
+### What changed
+
+`RG=1`, which does not depend on the sharing: `nseg 8, rg 1, minb 1, nw 4`.
+`matrix.py`, HND, against the golden run before 010: S=128 48.7 -> 55.2 %roof,
+S=32768 94.2 -> 96.3 %, better at every context.
+
+### Rejected
+
+| idea | result |
+| --- | --- |
+| `__syncthreads` back at the Q barrier, for every configuration | fixes `16/2/512` M=1 (1.29x at S=32768) and costs 3-8 % at S=128 elsewhere (`32/8/128` -8 %, `32/2/128` M=4 -6 %) |
+| force the page-table load to VMEM (a uniform address had become `s_load`, counted in `lgkmcnt` with LDS, so the loop's barriers waited for it) | removes that wait, not the regression |
+| a `__builtin_amdgcn_s_waitcnt(vmcnt(0))` before the loop (the waitcnt pass merged the preamble's load order into the loop header and waited `vmcnt(0)` every iteration; it cannot see a wait in `asm`) | loop waits identical to the good build, regression unchanged |
+| issue K before V | neutral |
+
+### Open
+
+Under the NHD layout (vLLM's default), with shuffled pages, 010-011 are 4-7 %
+slower than before at S >= 16384 on `8/4/256` and `16/8/256` M=4; knobs do not
+recover them. HND, which every number here uses, does not show it. Not
+bisected.
