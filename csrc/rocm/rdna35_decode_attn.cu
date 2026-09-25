@@ -201,10 +201,22 @@ __device__ __forceinline__ size_t tile_off(int page, unsigned slot, int kvh) {
 #endif
 }
 
+// Every barrier in this kernel orders LDS only; global visibility, where the
+// split-KV merge needs it, is __threadfence's job.  __syncthreads() also
+// waits for every outstanding global load (vmcnt(0)) and invalidates L0, so
+// the barrier that publishes Q waited for the whole first KV tile to land.
+__device__ __forceinline__ void lds_barrier() {
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
+// The cross-lane moves below all read lanes that are active, so fetch-
+// inactive changes nothing -- except that with it set the compiler no longer
+// ties the destination to a copy of the source: 66 of 207 v_mov gone.
+//
 // The other 16-lane half's value for this lane: lane l <-> l ^ 16.
 __device__ __forceinline__ unsigned xhalf_u(unsigned v) {
   return (unsigned)__builtin_amdgcn_permlanex16((int)v, (int)v, 0x76543210u,
-                                                0xFEDCBA98u, false, false);
+                                                0xFEDCBA98u, true, false);
 }
 
 __device__ __forceinline__ float xhalf(float v) {
@@ -214,14 +226,14 @@ __device__ __forceinline__ float xhalf(float v) {
 // Within each 16-lane row: lane i takes lane i & 7's value, or lane i | 8's.
 __device__ __forceinline__ unsigned lower8(unsigned v) {
   return (unsigned)__builtin_amdgcn_permlane16((int)v, (int)v, 0x76543210u,
-                                               0x76543210u, false, false);
+                                               0x76543210u, true, false);
 }
 
 __device__ __forceinline__ float upper8f(float v) {
   return __builtin_bit_cast(
       float, __builtin_amdgcn_permlane16(
                  __builtin_bit_cast(int, v), __builtin_bit_cast(int, v),
-                 0xFEDCBA98u, 0xFEDCBA98u, false, false));
+                 0xFEDCBA98u, 0xFEDCBA98u, true, false));
 }
 
 __device__ __forceinline__ float weight_of(float m, float gmax) {
@@ -346,13 +358,14 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 #pragma unroll
   for (int it = 0; it < QITER; ++it) {
     const int i = (it * BLOCK + tid) * 8;
-    const int r = i / HEAD_DIM, d = i % HEAD_DIM;
-    qx[it] = h8{};
-    if (i < ROWPAD * HEAD_DIM && r < ROWS_W) {
-      const int h = kvh * GQA + rg * (GQA / RG) + r / MAXM;
-      const int m = r % MAXM;
-      qx[it] = *(const h8*)(q + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d);
-    }
+    // Unconditional, from a clamped row: a load under a branch made the
+    // compiler wait vmcnt(0) -- for Q as well as the page table -- before it
+    // could issue the first KV load.
+    const int r = min(i / HEAD_DIM, ROWS_W - 1), d = i % HEAD_DIM;
+    const int h = kvh * GQA + rg * (GQA / RG) + r / MAXM;
+    const int m = r % MAXM;
+    qx[it] = *(const h8*)(q + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d);
+    if (i / HEAD_DIM >= ROWS_W) qx[it] = h8{};
   }
 
   // q_s and the K tiles are dead once the main loop ends; the merge reuses
@@ -431,7 +444,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     mrow[rt] = (r < ROWS_W) ? (r % MAXM) : (MAXM - 1);
   }
 
-  __syncthreads();
+  lds_barrier();
   TS(1);
 
   // Stage a tile's K for Q@K: rows in, keys out.  LDS ops of one wave
@@ -485,7 +498,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   #pragma unroll
     for (int rt = 0; rt < RTILES; ++rt)
       *(f8*)&sx_s[SX_SLOT(wave) + rt * 256 + lane * 8] = s[rt];
-    __syncthreads();
+    lds_barrier();
   #pragma unroll
     for (int rt = 0; rt < RTILES; ++rt) {
       f8 sum = *(const f8*)&sx_s[SX_SLOT(tw * DSPL) + rt * 256 + lane * 8];
@@ -495,7 +508,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       s[rt] = sum;
     }
     // Partners are done reading before anyone refills its K tile.
-    __syncthreads();
+    lds_barrier();
 #endif
     if (b == seg) TS(2);
 
@@ -507,22 +520,28 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
         if (kt + 2 * e + hi >= S) t.v[e] = vrow_t{};
     }
 
-    // Lane holds row l16, keys kt + 2e + hi.
+    // Lane holds row l16, keys kt + 2e + hi.  Only a tile that reaches past
+    // the first query token's keys needs the causal mask.  The scale is
+    // applied inside the exponent: it is positive, so the max commutes.
+    const bool tail = kt + 16 > ctx + 1;
 #pragma unroll
     for (int rt = 0; rt < RTILES; ++rt) {
-      float mx = -INFINITY;
+      if (__builtin_expect(tail, 0)) {
 #pragma unroll
-      for (int e = 0; e < 8; ++e) {
-        const int key = kt + 2 * e + hi;
+        for (int e = 0; e < 8; ++e) {
+          const int key = kt + 2 * e + hi;
 #if MUTATE == 1
-        const bool valid = key <= ctx + mrow[rt] + 1 && key < S;
+          const bool valid = key <= ctx + mrow[rt] + 1 && key < S;
 #else
-        const bool valid = key <= ctx + mrow[rt];
+          const bool valid = key <= ctx + mrow[rt];
 #endif
-        s[rt][e] = valid ? s[rt][e] * scale2 : -INFINITY;
-        mx = fmaxf(mx, s[rt][e]);
+          if (!valid) s[rt][e] = -INFINITY;
+        }
       }
-      mx = fmaxf(mx, xhalf(mx));
+      float mx = s[rt][0];
+#pragma unroll
+      for (int e = 1; e < 8; ++e) mx = fmaxf(mx, s[rt][e]);
+      mx = fmaxf(mx, xhalf(mx)) * scale2;
       const float mnew = fmaxf(m_run[rt], mx);
       const float alpha =
           (mnew == -INFINITY) ? 1.f : __builtin_amdgcn_exp2f(m_run[rt] - mnew);
@@ -530,8 +549,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       float p[8], lo[8], sum = 0.f;
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
-        p[e] =
-            (mnew == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(s[rt][e] - mnew);
+        p[e] = (mnew == -INFINITY) ? 0.f
+                                   : __builtin_amdgcn_exp2f(__builtin_fmaf(
+                                         s[rt][e], scale2, -mnew));
         lo[e] = p[e] - (float)(_Float16)p[e];
         sum += p[e];
       }
@@ -607,7 +627,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       m_s[wave][rt * 16 + l16] = m_run[rt];
       l_s[wave][rt * 16 + l16] = l_run[rt];
     }
-  __syncthreads();
+  lds_barrier();
   float gsum[RTILES];
 #pragma unroll
   for (int rt = 0; rt < RTILES; ++rt) {
@@ -639,15 +659,15 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     // Real rows in this row tile.
     const int rv = min(16, ROWS_W - rt * 16);
     // The previous row tile's readers must be done with the region.
-    if (rt) __syncthreads();
+    if (rt) lds_barrier();
 #pragma unroll
     for (int st = TILES / 2; st >= TFIN; st >>= 1) {
       if (tw >= st && tw < 2 * st && l16 < rv)
         store_rows(mrg_s + ((tw - st) * DSPL + dp) * MSLOT, acc[rt], l16, hi);
-      __syncthreads();
+      lds_barrier();
       if (tw < st && l16 < rv)
         add_rows(acc[rt], mrg_s + (tw * DSPL + dp) * MSLOT, l16, hi);
-      __syncthreads();
+      lds_barrier();
     }
 #if TFIN == 1
     // One live tile: its waves write straight from registers.
@@ -673,7 +693,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 #else
     if (tw < TFIN && l16 < rv)
       store_rows(mrg_s + (tw * DSPL + dp) * MSLOT, acc[rt], l16, hi);
-    __syncthreads();
+    lds_barrier();
     // Eight consecutive d of one real row per thread.
     for (int i = tid * 8; i < rv * HEAD_DIM; i += BLOCK * 8) {
       const int rl = i / HEAD_DIM, d = i % HEAD_DIM;
@@ -719,9 +739,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   }
   __threadfence();
   __shared__ int lds_last;
-  __syncthreads();
+  lds_barrier();
   if (tid == 0) lds_last = (atomicAdd(&p_cnt[grp], 1) == nseg - 1);
-  __syncthreads();
+  lds_barrier();
   TS(6);
   if (!lds_last) return;
   if (tid == 0) p_cnt[grp] = 0;
