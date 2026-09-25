@@ -89,6 +89,13 @@ def main() -> None:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--contexts", type=int, nargs="+", default=CONTEXTS)
+    p.add_argument(
+        "--split",
+        type=int,
+        default=0,
+        help="tune a first decomposition on the contexts below this and a "
+        "second on the rest; the kernel switches between them at this S",
+    )
     shapeset.add_dtype_argument(p)
     args = p.parse_args()
     dtype = shapeset.torch_dtype(args.dtype)
@@ -186,9 +193,17 @@ def main() -> None:
             scores: dict[tuple, tuple[float, list[float]]] = {}
 
             def evaluate(
-                cands, hq=hq, hkv=hkv, d=d, m=m, base=base, roof=roof, scores=scores
+                cands,
+                ctxs,
+                hq=hq,
+                hkv=hkv,
+                d=d,
+                m=m,
+                base=base,
+                roof=roof,
+                scores=scores,
             ):
-                todo = [c for c in cands if key(c) not in scores]
+                todo = [c for c in cands if (ctxs, key(c)) not in scores]
                 variants = {}
                 for c in todo:
                     with contextlib.suppress(Exception):
@@ -217,36 +232,66 @@ def main() -> None:
                 time.sleep(5)  # clocks settle after a parallel build
                 for c in todo:
                     if key(c) not in variants:
-                        scores[key(c)] = (0.0, [])
+                        scores[(ctxs, key(c))] = (0.0, [])
                         continue
                     override.clear()
                     override.update(knobs_of(hkv, c))
                     try:
-                        r = [roof[s] / timeit(hq, hkv, d, m, s) for s in args.contexts]
+                        r = [roof[s] / timeit(hq, hkv, d, m, s) for s in ctxs]
                     except Exception:  # noqa: BLE001 - a point may not build
-                        scores[key(c)] = (0.0, [])
+                        scores[(ctxs, key(c))] = (0.0, [])
                         continue
-                    scores[key(c)] = (geomean(r), r)
+                    scores[(ctxs, key(c))] = (geomean(r), r)
                 override.clear()
 
-            best = dict(start)
-            evaluate([best])
-            for _ in range(args.rounds):
-                for knob in ("nw", "dspl", "rg", "rspl", "target", "minb"):
-                    cands = [dict(best, **{knob: v}) for v in values[knob]]
-                    if knob == "rspl":
-                        # rspl splits rows inside the workgroup that rg splits
-                        # across workgroups; trade one for the other too.
-                        cands += [
-                            dict(best, rspl=v, rg=best["rg"] // v)
-                            for v in values["rspl"]
-                            if v > 1 and best["rg"] % v == 0
-                        ]
-                    evaluate(cands)
-                    for c in cands:
-                        if scores[key(c)][0] > scores[key(best)][0]:
-                            best = c
-            g, cells = scores[key(best)]
+            def descend(ctxs, start=start, values=values, scores=scores):
+                best = dict(start)
+                evaluate([best], ctxs)
+                for _ in range(args.rounds):
+                    for knob in ("nw", "dspl", "rg", "rspl", "target", "minb"):
+                        cands = [dict(best, **{knob: v}) for v in values[knob]]
+                        if knob == "rspl":
+                            # rspl splits rows inside the workgroup that rg
+                            # splits across workgroups; trade one for the other.
+                            cands += [
+                                dict(best, rspl=v, rg=best["rg"] // v)
+                                for v in values["rspl"]
+                                if v > 1 and best["rg"] % v == 0
+                            ]
+                        evaluate(cands, ctxs)
+                        for c in cands:
+                            if scores[(ctxs, key(c))][0] > scores[(ctxs, key(best))][0]:
+                                best = c
+                return best, scores[(ctxs, key(best))]
+
+            if args.split:
+                short = tuple(s for s in args.contexts if s < args.split)
+                long_ = tuple(s for s in args.contexts if s >= args.split)
+                best_a, (g_a, cells_a) = descend(short)
+                best_b, (g_b, cells_b) = descend(long_)
+                knobs = knobs_of(hkv, best_a)
+                kb = knobs_of(hkv, best_b)
+                # A mode-B knob left out means mode A's value, not the default:
+                # spell out the defaults where the two differ.
+                if "dspl" in knobs and "dspl" not in kb:
+                    kb["dspl"] = d // 128 if d >= 256 else 1
+                if "rspl" in knobs and "rspl" not in kb:
+                    kb["rspl"] = 1
+                if kb != knobs:
+                    knobs.update({"sw": args.split})
+                    knobs.update({f"{k}2": v for k, v in kb.items()})
+                row = ", ".join(f'"{k}": {v}' for k, v in knobs.items())
+                cells = list(cells_a) + list(cells_b)
+                g = geomean(cells) if cells else 0.0
+                print(
+                    f"    ({hq}, {hkv}, {d}, {m}): {{{row}}},  "
+                    f"# {g * 100:.1f} % geomean; below {args.split} "
+                    f"{g_a * 100:.1f} %, from it {g_b * 100:.1f} % "
+                    f"(worst {min(cells_b) * 100 if cells_b else 0:.1f} %)",
+                    flush=True,
+                )
+                continue
+            best, (g, cells) = descend(tuple(args.contexts))
             row = ", ".join(f'"{k}": {v}' for k, v in knobs_of(hkv, best).items())
             worst = min(cells) * 100 if cells else 0.0
             print(

@@ -67,6 +67,16 @@ class KernelVariant:
     ablate: int = 0
     # Element type of Q, the KV cache and the output.
     dtype: torch.dtype = torch.float16
+    # A second decomposition the kernel switches to at S >= sw, chosen on the
+    # device so one captured graph serves both.  Its knobs default (0) to the
+    # first's; sw 0 builds the first alone.
+    sw: int = 0
+    nseg2: int = 0
+    rg2: int = 0
+    minb2: int = 0
+    dspl2: int = 0
+    rspl2: int = 0
+    nw2: int = 0
 
     def __post_init__(self) -> None:
         if self.dtype not in (torch.float16, torch.bfloat16):
@@ -83,23 +93,57 @@ class KernelVariant:
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
             f"{'_bf16' if self.dtype == torch.bfloat16 else ''}"
+            + (
+                f"_sw{self.sw}_n{self.nseg_b}_rg{self.rg_b}_mb{self.minb_b}"
+                f"_ds{self.dspl2}_rs{self.rspl_b}_w{self.nw2 or self.nw}"
+                if self.sw
+                else ""
+            )
         )
+
+    @property
+    def nseg_b(self) -> int:
+        return self.nseg2 or self.nseg
+
+    @property
+    def rg_b(self) -> int:
+        return self.rg2 or self.rg
+
+    @property
+    def minb_b(self) -> int:
+        return self.minb2 or self.minb
+
+    @property
+    def rspl_b(self) -> int:
+        return self.rspl2 or self.rspl
+
+    def _modes(self) -> list[tuple[int, int]]:
+        """(nseg, rg) of each decomposition the build carries."""
+        modes = [(self.nseg, self.rg)]
+        if self.sw:
+            modes.append((self.nseg_b, self.rg_b))
+        return modes
 
     @property
     def name(self) -> str:
         return f"rdna35_decode_{self.suffix}"
 
-    @property
-    def rows_padded(self) -> int:
+    def rows_padded(self, rg: int | None = None) -> int:
         """Query rows one workgroup carries, rounded up to whole WMMA tiles."""
         gqa = self.num_q_heads // self.num_kv_heads
-        rows = gqa * self.max_m // self.rg
+        rows = gqa * self.max_m // (rg or self.rg)
         return -(-rows // 16) * 16
 
-    def scratch_shapes(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Shapes of the (acc, m/l) partials the split-KV merge goes through."""
-        rows = self.num_kv_heads * self.rg * self.nseg * self.rows_padded
-        return (rows, self.head_size), (rows,)
+    def scratch_shapes(self) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+        """Shapes of the (acc, m/l) partials the split-KV merge goes through,
+        and the number of counters.  The modes run one per launch, so they
+        share the partials; each keeps its own counters."""
+        rows = max(
+            self.num_kv_heads * rg * nseg * self.rows_padded(rg)
+            for nseg, rg in self._modes()
+        )
+        cnt = sum(2 * self.num_kv_heads * rg for _, rg in self._modes())
+        return (rows, self.head_size), (rows,), cnt
 
 
 _loaded: dict[KernelVariant, Any] = {}
@@ -229,6 +273,16 @@ def load(variant: KernelVariant) -> Any:
         f"-DABLATE={variant.ablate}",
         f"-DKV_BF16={int(variant.dtype == torch.bfloat16)}",
     ]
+    if variant.sw:
+        flags += [
+            f"-DSW={variant.sw}",
+            f"-DNSEG2={variant.nseg_b}",
+            f"-DRG2={variant.rg_b}",
+            f"-DMINB2={variant.minb_b}",
+            f"-DRSPL2={variant.rspl_b}",
+            f"-DNW2={variant.nw2 or variant.nw}",
+            *([f"-DDSPL2={variant.dspl2}"] if variant.dspl2 else []),
+        ]
     logger.info("Compiling %s", variant.name)
     try:
         module = load_extension(
@@ -326,7 +380,7 @@ def make_scratch(
     They are passed into the op rather than allocated inside it because the op
     runs under CUDA-graph capture, where an allocation would break the graph.
     """
-    acc_shape, ml_shape = variant.scratch_shapes()
+    acc_shape, ml_shape, cnt = variant.scratch_shapes()
     opts = {"dtype": torch.float32, "device": device}
     return (
         torch.empty(acc_shape, **opts),
@@ -337,9 +391,7 @@ def make_scratch(
         # consumes them and only compares generations for change, so every
         # later launch starts clean without the host writing here -- which it
         # could not do under graph capture anyway.
-        torch.zeros(
-            2 * variant.num_kv_heads * variant.rg, dtype=torch.int32, device=device
-        ),
+        torch.zeros(cnt, dtype=torch.int32, device=device),
     )
 
 

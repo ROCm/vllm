@@ -96,6 +96,13 @@ class _Knobs(TypedDict, total=False):
     nw: int
     dspl: int
     rspl: int
+    sw: int
+    nseg2: int
+    rg2: int
+    minb2: int
+    dspl2: int
+    rspl2: int
+    nw2: int
 
 
 # Every shipped configuration, measured: coordinate descent over (nw, dspl,

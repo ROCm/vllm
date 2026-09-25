@@ -40,6 +40,23 @@ RSPL = {
     "two tiles": dict(hq=32, hkv=2, hd=128, rspl=4, nw=8, nseg=4),
     "with dspl": dict(hq=32, hkv=2, hd=128, rspl=2, nw=8, dspl=2, rg=2, nseg=4),
 }
+# Two decompositions in one build, switched on the device at S >= 512: row
+# groups across workgroups below, rows split inside a four-wave workgroup and
+# sixteen segments above, out of a block launched with eight waves.
+DUAL = dict(
+    hq=32,
+    hkv=2,
+    hd=128,
+    rg=4,
+    nw=8,
+    nseg=2,
+    sw=512,
+    nseg2=16,
+    rg2=1,
+    minb2=1,
+    rspl2=4,
+    nw2=4,
+)
 # Relative error bound per dtype.  The reference sees the same rounded inputs,
 # so what differs is the kernel's arithmetic and its output rounding -- the
 # latter alone up to 2^-8 relative in bf16.
@@ -81,6 +98,7 @@ def _build_variants():
             _variant(layout=1, mutate=1, dtype=dtype),
             _variant(**SHARED, dtype=dtype),
             *(_variant(**shape, dtype=dtype) for shape in RSPL.values()),
+            _variant(**DUAL, dtype=dtype),
         )
     )
 
@@ -97,6 +115,7 @@ def _variant(
     rspl: int = 1,
     nw: int = 8,
     dspl: int = 0,
+    **mode_b,
 ):
     # nseg > 1 with minb = 1 splits even a short context over several
     # workgroups, which is the only way to reach the cross-workgroup merge.
@@ -115,6 +134,7 @@ def _variant(
         rspl=rspl,
         nw=nw,
         dspl=dspl,
+        **mode_b,
     )
 
 
@@ -241,6 +261,17 @@ def test_row_tiles_split_over_waves(name, seq_len, dtype):
     assert _max_rel(got, ref) <= TOL[dtype]
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seq_len", [48, 1024])
+def test_two_modes(seq_len, dtype):
+    """Both decompositions of one build: S=48 runs the first, 1024 the second."""
+    shape = dict(DUAL)
+    nseg = shape.pop("nseg")
+    got, ref = _run(seq_len, nseg=nseg, repeat=2, dtype=dtype, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
 def test_graph_replay_follows_seq_lens():
     """S is read on the device, so a captured graph serves a longer sequence.
 
@@ -249,8 +280,10 @@ def test_graph_replay_follows_seq_lens():
     """
     _skip_unless_gfx1151()
     long_s = 1024
-    q, kv, block_table = _paged_inputs(long_s, 1, torch.float16)
-    variant = _variant(layout=1, nseg=4)
+    dims = {k: v for k, v in DUAL.items() if k in ("hq", "hkv", "hd")}
+    q, kv, block_table = _paged_inputs(long_s, 1, torch.float16, **dims)
+    # The two-mode build, so the replays also cross its switch at S=512.
+    variant = _variant(layout=1, **DUAL)
     module = rdna35.load(variant)
     scratch = rdna35.make_scratch(variant, q.device)
     out = torch.empty_like(q)
