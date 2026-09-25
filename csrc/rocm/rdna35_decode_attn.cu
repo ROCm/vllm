@@ -85,6 +85,10 @@
   #ifndef RSPL
     #define RSPL 1
   #endif
+  // 1 keeps a second tile's loads in flight per wave (unshared tiles).
+  #ifndef PF
+    #define PF 0
+  #endif
 
   // A second decomposition for long sequences: at S >= SW the kernel runs
   // mode B with the knobs below instead of mode A's.  The grid and the block
@@ -112,6 +116,9 @@
   #endif
   #ifndef NW2
     #define NW2 NW
+  #endif
+  #ifndef PF2
+    #define PF2 PF
   #endif
 
   // Measurement only, wrong answers: 1 skips the V loads, 2 thins P@V to one
@@ -300,6 +307,7 @@ __device__ __forceinline__ e16 p_frag(const float* p) {
   #define M_DSPL DSPL
   #define M_RSPL RSPL
   #define M_NW NW
+  #define M_PF PF
 namespace mode_a {
   #include __FILE_NAME__
 }  // namespace mode_a
@@ -309,6 +317,7 @@ namespace mode_a {
   #undef M_DSPL
   #undef M_RSPL
   #undef M_NW
+  #undef M_PF
   #if SW
     #define M_NSEG NSEG2
     #define M_RG RG2
@@ -316,6 +325,7 @@ namespace mode_a {
     #define M_DSPL DSPL2
     #define M_RSPL RSPL2
     #define M_NW NW2
+    #define M_PF PF2
 namespace mode_b {
     #include __FILE_NAME__
 }  // namespace mode_b
@@ -325,6 +335,7 @@ namespace mode_b {
     #undef M_DSPL
     #undef M_RSPL
     #undef M_NW
+    #undef M_PF
   #else
 namespace mode_b = mode_a;
   #endif
@@ -984,6 +995,19 @@ __device__ __forceinline__ void body(
     asm volatile("s_barrier" ::: "memory");
     process(ta, nullptr, kb, b);
     buf ^= 1;
+  }
+  #elif M_PF
+  // Two tiles per wave in flight: the next one's loads go out before this
+  // one is computed.  Only where a second tile's registers fit (small D).
+  Tile tb;
+  for (int b = seg; b < nblk; b += 2 * nseg) {
+    stage_k(ta);
+    if (b + nseg < nblk) issue(tb, b + nseg);
+    process(ta, ta.v, kt_s, b);
+    if (b + nseg >= nblk) break;
+    stage_k(tb);
+    if (b + 2 * nseg < nblk) issue(ta, b + 2 * nseg);
+    process(tb, tb.v, kt_s, b + nseg);
   }
   #else
   for (int b = seg; b < nblk; b += nseg) {

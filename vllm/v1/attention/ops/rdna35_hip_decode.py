@@ -61,6 +61,9 @@ class KernelVariant:
     # Waves sharing one key tile, each carrying 1/rspl of the row tiles: the
     # in-workgroup form of rg, with the tile loaded once and shared in LDS.
     rspl: int = 1
+    # 1 keeps a second tile's loads in flight per wave (unshared tiles only;
+    # it needs a second tile's registers).
+    pf: int = 0
     mutate: int = 0
     # Measurement only: skips blocks of work and returns wrong numbers.  See
     # the ABLATE comment in the kernel.
@@ -77,6 +80,7 @@ class KernelVariant:
     dspl2: int = 0
     rspl2: int = 0
     nw2: int = 0
+    pf2: int = -1
 
     def __post_init__(self) -> None:
         if self.dtype not in (torch.float16, torch.bfloat16):
@@ -90,12 +94,14 @@ class KernelVariant:
             f"_n{self.nseg}_rg{self.rg}_mb{self.minb}_w{self.nw}"
             f"{'' if not self.dspl else f'_ds{self.dspl}'}"
             f"{'' if self.rspl == 1 else f'_rs{self.rspl}'}"
+            f"{'' if not self.pf else '_pf'}"
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
             f"{'_bf16' if self.dtype == torch.bfloat16 else ''}"
             + (
                 f"_sw{self.sw}_n{self.nseg_b}_rg{self.rg_b}_mb{self.minb_b}"
                 f"_ds{self.dspl2}_rs{self.rspl_b}_w{self.nw2 or self.nw}"
+                f"_pf{self.pf_b}"
                 if self.sw
                 else ""
             )
@@ -116,6 +122,10 @@ class KernelVariant:
     @property
     def rspl_b(self) -> int:
         return self.rspl2 or self.rspl
+
+    @property
+    def pf_b(self) -> int:
+        return self.pf if self.pf2 < 0 else self.pf2
 
     def _modes(self) -> list[tuple[int, int]]:
         """(nseg, rg) of each decomposition the build carries."""
@@ -269,6 +279,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DNW={variant.nw}",
         *([f"-DDSPL={variant.dspl}"] if variant.dspl else []),
         f"-DRSPL={variant.rspl}",
+        f"-DPF={variant.pf}",
         f"-DMUTATE={variant.mutate}",
         f"-DABLATE={variant.ablate}",
         f"-DKV_BF16={int(variant.dtype == torch.bfloat16)}",
@@ -281,6 +292,7 @@ def load(variant: KernelVariant) -> Any:
             f"-DMINB2={variant.minb_b}",
             f"-DRSPL2={variant.rspl_b}",
             f"-DNW2={variant.nw2 or variant.nw}",
+            f"-DPF2={variant.pf_b}",
             *([f"-DDSPL2={variant.dspl2}"] if variant.dspl2 else []),
         ]
     logger.info("Compiling %s", variant.name)

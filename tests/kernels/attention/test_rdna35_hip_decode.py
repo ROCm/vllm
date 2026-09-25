@@ -39,6 +39,8 @@ RSPL = {
     "one tile, shared merge": dict(hq=32, hkv=2, hd=128, rspl=4, nw=4, nseg=16),
     "two tiles": dict(hq=32, hkv=2, hd=128, rspl=4, nw=8, nseg=4),
     "with dspl": dict(hq=32, hkv=2, hd=128, rspl=2, nw=8, dspl=2, rg=2, nseg=4),
+    # Not a row split: unshared tiles with the next tile's loads in flight.
+    "prefetch": dict(hq=16, hkv=2, hd=64, rg=2, nw=4, pf=1, nseg=8),
 }
 # Two decompositions in one build, switched on the device at S >= 512: row
 # groups across workgroups below, rows split inside a four-wave workgroup and
@@ -115,6 +117,7 @@ def _variant(
     rspl: int = 1,
     nw: int = 8,
     dspl: int = 0,
+    pf: int = 0,
     **mode_b,
 ):
     # nseg > 1 with minb = 1 splits even a short context over several
@@ -134,6 +137,7 @@ def _variant(
         rspl=rspl,
         nw=nw,
         dspl=dspl,
+        pf=pf,
         **mode_b,
     )
 

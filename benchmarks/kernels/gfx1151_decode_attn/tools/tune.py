@@ -62,6 +62,7 @@ def space(hq, hkv, d, start):
         "dspl": [0, 2 * default_dspl] if d >= 128 else [0],
         "rg": sorted(r for r in rgs if gqa % r == 0),
         "rspl": [1, 2, 4],
+        "pf": [0, 1],
         "target": list(TARGETS),
         "minb": [1, 2, 4],
     }
@@ -79,6 +80,8 @@ def knobs_of(hkv, cand):
         k["dspl"] = cand["dspl"]
     if cand["rspl"] > 1:
         k["rspl"] = cand["rspl"]
+    if cand["pf"]:
+        k["pf"] = 1
     return k
 
 
@@ -182,6 +185,7 @@ def main() -> None:
                 "dspl": base.get("dspl", 0),
                 "rg": base.get("rg", 1),
                 "rspl": base.get("rspl", 1),
+                "pf": base.get("pf", 0),
                 "target": 16,
                 "minb": base.get("minb", 1),
             }
@@ -244,11 +248,25 @@ def main() -> None:
                     scores[(ctxs, key(c))] = (geomean(r), r)
                 override.clear()
 
-            def descend(ctxs, start=start, values=values, scores=scores):
+            # A second start with every row tile split inside one workgroup:
+            # reaching it from the backend's rg needs several knobs to move
+            # at once, which one-knob descent does not do.
+            gqa_m = hq // hkv * m
+            rt = -(-gqa_m // 16)
+            rs_max = max(r for r in (1, 2, 4) if rt % r == 0)
+            starts = [start]
+            if rs_max > 1:
+                starts.append(dict(start, rg=1, rspl=rs_max, nw=4, target=32))
+
+            def descend(ctxs, starts=starts, scores=scores):
+                found = [descend_from(ctxs, s) for s in starts]
+                return max(found, key=lambda f: f[1][0])
+
+            def descend_from(ctxs, start, values=values, scores=scores):
                 best = dict(start)
                 evaluate([best], ctxs)
                 for _ in range(args.rounds):
-                    for knob in ("nw", "dspl", "rg", "rspl", "target", "minb"):
+                    for knob in ("nw", "dspl", "rg", "rspl", "pf", "target", "minb"):
                         cands = [dict(best, **{knob: v}) for v in values[knob]]
                         if knob == "rspl":
                             # rspl splits rows inside the workgroup that rg
@@ -277,6 +295,8 @@ def main() -> None:
                     kb["dspl"] = d // 128 if d >= 256 else 1
                 if "rspl" in knobs and "rspl" not in kb:
                     kb["rspl"] = 1
+                if "pf" in knobs and "pf" not in kb:
+                    kb["pf"] = 0
                 if kb != knobs:
                     knobs.update({"sw": args.split})
                     knobs.update({f"{k}2": v for k, v in kb.items()})
