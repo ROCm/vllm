@@ -32,6 +32,11 @@ HQ, HKV, HEAD_DIM, M, BLOCK_SIZE = 32, 16, 256, 4, 16
 # on a grid small enough (32 workgroups) to be resident at once, which the
 # host requires before it lets them wait for each other.
 SHARED = dict(hq=16, hkv=2, hd=512, rg=2, nseg=8)
+# Relative error bound per dtype.  The reference sees the same rounded inputs,
+# so what differs is the kernel's arithmetic and its output rounding -- the
+# latter alone up to 2^-8 relative in bf16.
+TOL = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
+DTYPES = list(TOL)
 
 
 def _skip_unless_gfx1151():
@@ -43,7 +48,7 @@ def _skip_unless_gfx1151():
 
 @pytest.fixture(scope="session", autouse=True)
 def _build_variants():
-    """Build the three variants this module needs before any test runs.
+    """Build the variants this module needs before any test runs.
 
     They are independent builds of ~19.6 s each, almost all of it torch's
     headers rather than the kernel, so serially they were the whole runtime of
@@ -58,14 +63,16 @@ def _build_variants():
     if not on_gfx1151():
         return
     rdna35.precompile(
-        [
-            _variant(layout=0),
-            _variant(layout=1),
-            _variant(layout=0, nseg=4),
-            _variant(layout=1, nseg=4),
-            _variant(layout=1, mutate=1),
-            _variant(**SHARED),
-        ]
+        v
+        for dtype in DTYPES
+        for v in (
+            _variant(layout=0, dtype=dtype),
+            _variant(layout=1, dtype=dtype),
+            _variant(layout=0, nseg=4, dtype=dtype),
+            _variant(layout=1, nseg=4, dtype=dtype),
+            _variant(layout=1, mutate=1, dtype=dtype),
+            _variant(**SHARED, dtype=dtype),
+        )
     )
 
 
@@ -77,6 +84,7 @@ def _variant(
     hkv: int = HKV,
     hd: int = HEAD_DIM,
     rg: int = 1,
+    dtype: torch.dtype = torch.float16,
 ):
     # nseg > 1 with minb = 1 splits even a short context over several
     # workgroups, which is the only way to reach the cross-workgroup merge.
@@ -91,6 +99,7 @@ def _variant(
         rg=rg,
         minb=1,
         mutate=mutate,
+        dtype=dtype,
     )
 
 
@@ -134,11 +143,20 @@ def _reference(q, kv, seq_len):
     return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
 
 
-def _run(seq_len, layout=1, dtype=torch.float16, mutate=0, nseg=1, repeat=1, **shape):
+def _run(
+    seq_len,
+    layout=1,
+    dtype=torch.float16,
+    mutate=0,
+    nseg=1,
+    repeat=1,
+    build_dtype=None,
+    **shape,
+):
     _skip_unless_gfx1151()
     dims = {k: v for k, v in shape.items() if k != "rg"}
     q, kv, block_table = _paged_inputs(seq_len, layout, dtype, **dims)
-    variant = _variant(layout, mutate, nseg, **shape)
+    variant = _variant(layout, mutate, nseg, dtype=build_dtype or dtype, **shape)
     module = rdna35.load(variant)
     acc, m, ln, arrivals = rdna35.make_scratch(variant, q.device)
     out = torch.empty_like(q)
@@ -160,53 +178,59 @@ def _max_rel(got, ref) -> float:
     return ((got - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seq_len", [48, 1024])
 @pytest.mark.parametrize("layout", [0, 1])
 @pytest.mark.parametrize("nseg", [1, 4])
-def test_matches_reference(seq_len, layout, nseg):
-    got, ref = _run(seq_len, layout=layout, nseg=nseg)
+def test_matches_reference(seq_len, layout, nseg, dtype):
+    got, ref = _run(seq_len, layout=layout, nseg=nseg, dtype=dtype)
     assert torch.isfinite(got).all()
-    assert _max_rel(got, ref) <= 1e-3
+    assert _max_rel(got, ref) <= TOL[dtype]
 
 
-def test_split_merge_survives_relaunch():
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_split_merge_survives_relaunch(dtype):
     """The arrival counters must be back at zero after every launch.
 
     The last workgroup to arrive resets them; if it did not, the second launch
     would elect no merger and leave the output unwritten.
     """
-    got, ref = _run(1024, nseg=4, repeat=3)
-    assert _max_rel(got, ref) <= 1e-3
+    got, ref = _run(1024, nseg=4, repeat=3, dtype=dtype)
+    assert _max_rel(got, ref) <= TOL[dtype]
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("seq_len", [48, 1024])
-def test_shared_split_merge(seq_len):
+def test_shared_split_merge(seq_len, dtype):
     """Segments that wait for each other and merge a slice each.
 
     Relaunched, because the wait is on a generation that must keep advancing:
     one stuck at the value a later launch reads first would release nobody.
     """
     shape = {k: v for k, v in SHARED.items() if k != "nseg"}
-    got, ref = _run(seq_len, nseg=SHARED["nseg"], repeat=3, **shape)
+    got, ref = _run(seq_len, nseg=SHARED["nseg"], repeat=3, dtype=dtype, **shape)
     assert torch.isfinite(got).all()
-    assert _max_rel(got, ref) <= 1e-3
+    assert _max_rel(got, ref) <= TOL[dtype]
 
 
-def test_bfloat16_is_refused_not_miscomputed():
-    """bf16 must raise, not return nonsense.
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_other_dtype_is_refused_not_miscomputed(dtype):
+    """A build must refuse the other 16-bit type, not return nonsense.
 
-    The products are fp16 WMMAs and the loads reinterpret the cache as
-    _Float16, so bf16 input would read the same bits as fp16: the output stays
-    finite and is wrong by three orders of magnitude.
+    The loads reinterpret the tensors as the element type the variant was
+    built for, so fp16 read as bf16 or the reverse stays finite and is wrong
+    by orders of magnitude.
     """
-    with pytest.raises(RuntimeError, match="fp16 only"):
-        _run(1024, dtype=torch.bfloat16)
+    other = next(d for d in DTYPES if d != dtype)
+    with pytest.raises(RuntimeError, match="kernel built for"):
+        _run(1024, dtype=dtype, build_dtype=other)
 
 
-def test_negative_control_is_detected():
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_negative_control_is_detected(dtype):
     """A kernel mutated to admit one key too many must fail the comparison."""
-    got, ref = _run(48, mutate=1)
-    assert _max_rel(got, ref) > 1e-3, (
+    got, ref = _run(48, mutate=1, dtype=dtype)
+    assert _max_rel(got, ref) > TOL[dtype], (
         "the mutated kernel passed, so this comparison cannot detect a causal "
         "off-by-one and proves nothing about the real kernel"
     )
@@ -232,7 +256,7 @@ def test_unsupported_head_size_falls_back_to_triton():
     impl.head_size, impl.num_heads, impl.num_kv_heads = 96, HQ, HKV
 
     fits = impl._prepare(
-        kv_cache=torch.empty(0),
+        kv_cache=torch.empty(0, dtype=torch.float16),
         q=torch.empty(0, dtype=torch.float16),
         alibi_slopes=None,
         sinks=None,

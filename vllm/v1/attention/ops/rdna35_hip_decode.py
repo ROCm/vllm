@@ -62,6 +62,12 @@ class KernelVariant:
     # Measurement only: skips blocks of work and returns wrong numbers.  See
     # the ABLATE comment in the kernel.
     ablate: int = 0
+    # Element type of Q, the KV cache and the output.
+    dtype: torch.dtype = torch.float16
+
+    def __post_init__(self) -> None:
+        if self.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"kernel is built for fp16 or bf16, not {self.dtype}")
 
     @property
     def suffix(self) -> str:
@@ -72,6 +78,7 @@ class KernelVariant:
             f"{'' if not self.dspl else f'_ds{self.dspl}'}"
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
+            f"{'_bf16' if self.dtype == torch.bfloat16 else ''}"
         )
 
     @property
@@ -215,6 +222,7 @@ def load(variant: KernelVariant) -> Any:
         *([f"-DDSPL={variant.dspl}"] if variant.dspl else []),
         f"-DMUTATE={variant.mutate}",
         f"-DABLATE={variant.ablate}",
+        f"-DKV_BF16={int(variant.dtype == torch.bfloat16)}",
     ]
     logger.info("Compiling %s", variant.name)
     try:

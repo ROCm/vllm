@@ -18,9 +18,8 @@ import argparse
 import itertools
 import sys
 
+import shapeset
 import torch
-
-RTOL = 1e-3
 
 
 def reference(q, kv, s, hq, hkv, head_dim, m):
@@ -66,7 +65,10 @@ def main() -> None:
         default=0,
         help="1 admits one key too many; the check MUST then fail",
     )
+    shapeset.add_dtype_argument(p)
     args = p.parse_args()
+    dtype = shapeset.torch_dtype(args.dtype)
+    rtol = shapeset.RTOL[args.dtype]
 
     from vllm.v1.attention.ops.rdna35_hip_decode import (
         KernelVariant,
@@ -88,6 +90,7 @@ def main() -> None:
 
         kw = dict(_knobs_for(args.hq, args.hkv, args.head_dim, args.m))
         kw["mutate"] = args.mutate
+        kw["dtype"] = dtype
         for name, val in (
             ("nseg", nseg),
             ("rg", rg),
@@ -122,7 +125,7 @@ def main() -> None:
             if layout == 0
             else (blocks, args.hkv, args.block_size, 2 * args.head_dim)
         )
-        kv = torch.randn(shape, device=dev, dtype=torch.float16) * 0.5
+        kv = torch.randn(shape, device=dev, dtype=dtype) * 0.5
         if layout == 0:
             kv = kv.transpose(1, 2)
         # Slots past the sequence carry NaN, not plausible data.  A kernel that
@@ -131,10 +134,7 @@ def main() -> None:
         tail = blocks * args.block_size - s
         if tail:
             kv[-1, :, args.block_size - tail :, :] = float("nan")
-        q = (
-            torch.randn(args.m, args.hq, args.head_dim, device=dev, dtype=torch.float16)
-            * 0.5
-        )
+        q = torch.randn(args.m, args.hq, args.head_dim, device=dev, dtype=dtype) * 0.5
         bt = torch.arange(blocks, device=dev, dtype=torch.int32)
 
         variant = variant_for(layout, nseg, rg, minb)
@@ -153,7 +153,7 @@ def main() -> None:
             got = out.float()
             rel = ((got - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
             max_rel = max(max_rel, rel)
-            ok = ok and rel <= RTOL and torch.isfinite(got).all()
+            ok = ok and rel <= rtol and torch.isfinite(got).all()
         if args.mutate:
             ok = not ok  # the negative control must be detected
         failures += not ok

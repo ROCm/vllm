@@ -89,7 +89,9 @@ def main() -> None:
         help="MEASUREMENT ONLY, wrong numbers; see ABLATE in the kernel",
     )
     p.add_argument("--triton", action="store_true", help="also measure Triton")
+    shapeset.add_dtype_argument(p)
     args = p.parse_args()
+    dtype = shapeset.torch_dtype(args.dtype)
 
     from common import BenchmarkConfig
     from runner import run_attention_benchmark
@@ -163,6 +165,7 @@ def main() -> None:
                         args.block_size,
                         layout,
                         **{**base, **combo},
+                        dtype=dtype,
                     )
                 )
     # The base variant too: `patched` calls the unpatched _prepare first, which
@@ -181,6 +184,7 @@ def main() -> None:
                     args.block_size,
                     layout,
                     **base,
+                    dtype=dtype,
                 )
             )
     precompile(wanted)
@@ -206,6 +210,7 @@ def main() -> None:
             num_kv_heads=args.hkv,
             block_size=args.block_size,
             device="cuda:0",
+            dtype=dtype,
         )
         rs = [run_attention_benchmark(cfg) for _ in range(args.reps)]
         # do_bench's own dispersion over its iterations, worst of the reps.  A
@@ -214,7 +219,7 @@ def main() -> None:
         return statistics.median(r.median_time for r in rs) * 1e6, spread
 
     label_w = max(24, *(len(_label(c)) for c in combos))
-    print(f"Hq={args.hq} Hkv={args.hkv} D={args.head_dim} M={args.m}")
+    print(f"Hq={args.hq} Hkv={args.hkv} D={args.head_dim} M={args.m} {args.dtype}")
     print(
         f"{'':<{label_w}} "
         + " ".join(f"{s:>9}" for s in args.contexts)

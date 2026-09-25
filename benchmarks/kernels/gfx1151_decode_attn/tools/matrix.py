@@ -90,7 +90,9 @@ def main() -> None:
         action="store_false",
         help="skip the Triton column; %%roof does not need it and it is half the run",
     )
+    shapeset.add_dtype_argument(p)
     args = p.parse_args()
+    dtype = shapeset.torch_dtype(args.dtype)
 
     from common import BenchmarkConfig
     from runner import run_attention_benchmark
@@ -170,6 +172,7 @@ def main() -> None:
                             args.block_size,
                             layout,
                             **_knobs_for(hq, hkv, d, m),
+                            dtype=dtype,
                         )
                     )
     precompile(wanted)
@@ -195,6 +198,7 @@ def main() -> None:
             num_kv_heads=hkv,
             block_size=args.block_size,
             device="cuda:0",
+            dtype=dtype,
         )
         rs = [run_attention_benchmark(cfg) for _ in range(args.reps)]
         spread = max(r.std_time / r.median_time for r in rs) * 100
@@ -204,7 +208,7 @@ def main() -> None:
     print(
         f"<!-- {len(rows)} configuraciones cubren "
         f"{sum(len(m) for m, *_ in rows)} modelos; "
-        f"{windowed} filas con ventana deslizante omitidas"
+        f"{windowed} filas con ventana deslizante omitidas; {args.dtype}"
         f"{'; filtros: ' + active if active else ''} -->"
     )
     print(

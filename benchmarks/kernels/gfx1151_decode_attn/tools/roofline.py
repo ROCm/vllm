@@ -54,7 +54,7 @@ def reference(q, kv, s, hq, hkv, head_dim, m):
     return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
 
 
-def correctness(hq, hkv, d, m, block_size, s=48):
+def correctness(hq, hkv, d, m, block_size, dtype, s=48):
     """max_rel against a float reference, or None if the shape does not build.
 
     S=48 rather than 128: a causal off-by-one moves the softmax by ~1/S while
@@ -71,9 +71,9 @@ def correctness(hq, hkv, d, m, block_size, s=48):
     dev = torch.device("cuda")
     torch.manual_seed(0)
     blocks = -(-s // block_size)
-    kv = torch.randn(blocks, hkv, block_size, 2 * d, device=dev, dtype=torch.float16)
+    kv = torch.randn(blocks, hkv, block_size, 2 * d, device=dev, dtype=dtype)
     kv *= 0.5
-    q = torch.randn(m, hq, d, device=dev, dtype=torch.float16) * 0.5
+    q = torch.randn(m, hq, d, device=dev, dtype=dtype) * 0.5
     bt = torch.arange(blocks, device=dev, dtype=torch.int32)
     try:
         variant = KernelVariant(
@@ -84,6 +84,7 @@ def correctness(hq, hkv, d, m, block_size, s=48):
             block_size,
             1,
             **_knobs_for(hq, hkv, d, m),
+            dtype=dtype,
         )
         module = load(variant)
         acc, smax, ssum, arrivals = make_scratch(variant, dev)
@@ -117,7 +118,9 @@ def main() -> None:
     )
     p.add_argument("--triton", action="store_true", help="also time TRITON_ATTN")
     p.add_argument("--skip-check", action="store_true", help="timings only")
+    shapeset.add_dtype_argument(p)
     args = p.parse_args()
+    dtype = shapeset.torch_dtype(args.dtype)
 
     from common import BenchmarkConfig
     from runner import run_attention_benchmark
@@ -166,6 +169,7 @@ def main() -> None:
                         args.block_size,
                         layout,
                         **_knobs_for(hq, hkv, d, args.m),
+                        dtype=dtype,
                     )
                 )
     precompile(wanted)
@@ -200,7 +204,7 @@ def main() -> None:
         rel = (
             None
             if args.skip_check
-            else correctness(hq, hkv, d, args.m, args.block_size, s=48)
+            else correctness(hq, hkv, d, args.m, args.block_size, dtype, s=48)
         )
         roof = shapeset.roofline_us(
             hq, hkv, d, args.m, args.s, block_size=args.block_size
@@ -217,6 +221,7 @@ def main() -> None:
                 num_kv_heads=hkv,
                 block_size=args.block_size,
                 device="cuda:0",
+                dtype=dtype,
             )
             rs = [run_attention_benchmark(cfg) for _ in range(args.reps)]
             spread = max(r.std_time / r.median_time for r in rs) * 100

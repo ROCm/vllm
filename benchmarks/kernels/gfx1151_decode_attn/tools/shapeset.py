@@ -90,6 +90,27 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gqa", type=int, nargs="+", help="keep only these Hq/Hkv")
 
 
+def add_dtype_argument(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--dtype",
+        choices=("fp16", "bf16"),
+        default="fp16",
+        help="element type of Q, the KV cache and the output",
+    )
+
+
+def torch_dtype(name: str):
+    """The torch dtype for a `--dtype` value."""
+    import torch
+
+    return {"fp16": torch.float16, "bf16": torch.bfloat16}[name]
+
+
+# Relative error bound check.py applies per dtype; bf16 output rounding alone
+# is up to 2^-8 relative.
+RTOL = {"fp16": 1e-3, "bf16": 8e-3}
+
+
 def load(args: argparse.Namespace) -> tuple[list[Shape], int]:
     """The shapes the kernel can serve, after the filters in `args`.
 

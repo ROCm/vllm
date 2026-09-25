@@ -86,7 +86,9 @@ def main() -> None:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--contexts", type=int, nargs="+", default=CONTEXTS)
+    shapeset.add_dtype_argument(p)
     args = p.parse_args()
+    dtype = shapeset.torch_dtype(args.dtype)
 
     from common import BenchmarkConfig
     from runner import run_attention_benchmark
@@ -134,6 +136,7 @@ def main() -> None:
                 v.block_size,
                 v.layout,
                 **override,
+                dtype=v.dtype,
             )
             if self._variant != want:
                 self._variant = want
@@ -154,6 +157,7 @@ def main() -> None:
             num_kv_heads=hkv,
             block_size=args.block_size,
             device="cuda:0",
+            dtype=dtype,
         )
         return run_attention_benchmark(cfg).median_time * 1e6
 
@@ -185,7 +189,14 @@ def main() -> None:
                 for c in todo:
                     with contextlib.suppress(Exception):
                         variants[key(c)] = KernelVariant(
-                            d, hq, hkv, m, args.block_size, 1, **knobs_of(hkv, c)
+                            d,
+                            hq,
+                            hkv,
+                            m,
+                            args.block_size,
+                            1,
+                            **knobs_of(hkv, c),
+                            dtype=dtype,
                         )
                 # The unpatched _prepare builds the backend's own choice before
                 # the override replaces it, so that variant is needed too.
@@ -193,7 +204,9 @@ def main() -> None:
                 precompile(
                     [
                         *variants.values(),
-                        KernelVariant(d, hq, hkv, m, args.block_size, 1, **base),
+                        KernelVariant(
+                            d, hq, hkv, m, args.block_size, 1, **base, dtype=dtype
+                        ),
                     ]
                 )
                 seal()

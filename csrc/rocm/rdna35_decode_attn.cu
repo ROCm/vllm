@@ -19,7 +19,7 @@
 // owning 1/DSPL of the head dim: they split Q@K over d and sum their partial
 // scores through LDS, then each runs P@V for its own d.  Every wave keeps its
 // own online softmax, so the waves merge only once, at the end.  Both
-// products are WMMA 16x16x16 f16 -> f32:
+// products are WMMA 16x16x16 fp16 (or bf16, with KV_BF16=1) -> f32:
 //
 //   S^T[key][row] = K[key][:] . Q[row][:]        A = K tile, B = Q^T
 //   O^T[d][row]  += V[key][d] . P[row][key]      A = V^T,    B = P^T
@@ -44,6 +44,10 @@
 #endif
 #ifndef LAYOUT
   #define LAYOUT 1  // 0 = NHD, 1 = HND
+#endif
+// Element type of Q, the KV cache and the output: 0 = fp16, 1 = bf16.
+#ifndef KV_BF16
+  #define KV_BF16 0
 #endif
 // Most KV segments a (kv head, row group) is split over.  The number active
 // is clamp(nblocks / MINB, 1, NSEG), decided at run time from S: the grid is
@@ -111,10 +115,11 @@
 #endif
 #define LOG2E 1.44269504088896340736f
 #define QPAD 8
-// P reaches P@V as fp16 high plus fp16 low half, ~22 bits rather than 11:
-// with one fp16 P the output misses the 1e-3 relative bound wherever it is
-// near zero.  When a row tile has at most 8 real rows the low half rides in
-// the padding columns of the same WMMA; otherwise it takes a second one.
+// P reaches P@V as a high plus a low half, ~22 bits rather than 11 in fp16
+// and ~16 rather than 8 in bf16: with one fp16 P the output misses the 1e-3
+// relative bound wherever it is near zero.  When a row tile has at most 8 real
+// rows the low half rides in the padding columns of the same WMMA; otherwise
+// it takes a second one.
 #define PPACK (ROWS_W <= 8)
 
 // Per-wave K tile: 16 keys of DPART halves.  K is read row-wise, like V, and
@@ -171,9 +176,15 @@ __device__ unsigned long long g_ts[8 * 16];
     } while (0)
 #endif
 
-typedef _Float16 h16 __attribute__((ext_vector_type(16)));
-typedef _Float16 h8 __attribute__((ext_vector_type(8)));
-typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+#if KV_BF16
+typedef __bf16 elem_t;
+#else
+typedef _Float16 elem_t;
+#endif
+typedef elem_t e16 __attribute__((ext_vector_type(16)));
+typedef elem_t e8 __attribute__((ext_vector_type(8)));
+typedef elem_t e2 __attribute__((ext_vector_type(2)));
+typedef short s16 __attribute__((ext_vector_type(16)));
 typedef float f8 __attribute__((ext_vector_type(8)));
 typedef float f4 __attribute__((ext_vector_type(4)));
 typedef unsigned u8v __attribute__((ext_vector_type(8)));
@@ -244,8 +255,48 @@ __device__ __forceinline__ float weight_of(float m, float gmax) {
   return (gmax == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(m - gmax);
 }
 
+// P's high half as an element, and as the float it stands for.  bf16
+// truncates: gfx1151 has no f32 -> bf16 conversion, so rounding would be
+// several VALU ops per value where truncation packs two in one v_perm, and
+// the low half carries whatever truncation drops.
 __device__ __forceinline__ unsigned pack2(float a, float b) {
-  return __builtin_bit_cast(unsigned, h2{(_Float16)a, (_Float16)b});
+#if KV_BF16
+  return __builtin_amdgcn_perm(__builtin_bit_cast(unsigned, b),
+                               __builtin_bit_cast(unsigned, a), 0x07060302u);
+#else
+  return __builtin_bit_cast(unsigned, e2{(elem_t)a, (elem_t)b});
+#endif
+}
+
+__device__ __forceinline__ float elem_part(float p) {
+#if KV_BF16
+  return __builtin_bit_cast(float,
+                            __builtin_bit_cast(unsigned, p) & 0xFFFF0000u);
+#else
+  return (float)(elem_t)p;
+#endif
+}
+
+// An output value, rounded to nearest even.  The bf16 cast also keeps NaN a
+// NaN, which costs a compare and a select per value; here a NaN may come out
+// as Inf, still not finite.
+__device__ __forceinline__ elem_t to_elem(float x) {
+#if KV_BF16
+  const unsigned u = __builtin_bit_cast(unsigned, x);
+  return __builtin_bit_cast(
+      elem_t, (unsigned short)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16));
+#else
+  return (elem_t)x;
+#endif
+}
+
+__device__ __forceinline__ f8 wmma(e16 a, e16 b, f8 c) {
+#if KV_BF16
+  return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+      __builtin_bit_cast(s16, a), __builtin_bit_cast(s16, b), c);
+#else
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
 }
 
 // Page index of every 16-key tile of block b: lane t holds tile t's.  Tiles
@@ -267,20 +318,20 @@ __device__ __forceinline__ int block_pages(const int* __restrict__ bt, int b,
 // then (own, other half's) in every lane, with no select on the half.
 //
 // B = P^T: lane l (row l16) has P for keys 2e + hi in p[e].
-__device__ __forceinline__ h16 p_frag(const float* p) {
+__device__ __forceinline__ e16 p_frag(const float* p) {
   u8v r;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
     r[i] = pack2(p[2 * i], p[2 * i + 1]);
     r[4 + i] = xhalf_u(r[i]);
   }
-  return __builtin_bit_cast(h16, r);
+  return __builtin_bit_cast(e16, r);
 }
 
 // A = V^T for output element j of this lane's slice: row d = base + VD*l16 +
 // j, keys in the order above.  Half hi holds keys 2e + hi in v[e]; it packs
 // its four dwords and receives the other half's four.
-__device__ __forceinline__ h16 v_frag(const vrow_t* v, int j) {
+__device__ __forceinline__ e16 v_frag(const vrow_t* v, int j) {
   const int w = j >> 1;
   // v_perm_b32(hi_src, lo_src, sel): half j&1 of each source dword, lo_src
   // into the low half of the result.
@@ -291,7 +342,7 @@ __device__ __forceinline__ h16 v_frag(const vrow_t* v, int j) {
     r[a] = __builtin_amdgcn_perm(v[2 * a + 1][w], v[2 * a][w], sel);
     r[4 + a] = xhalf_u(r[a]);
   }
-  return __builtin_bit_cast(h16, r);
+  return __builtin_bit_cast(e16, r);
 }
 
 // A wave's real rows of one row tile, rows `stride` floats apart.  Lane l16
@@ -325,7 +376,7 @@ __device__ __forceinline__ void add_rows(f8* acc, const float* src, int l16,
 
 template <typename OutT>
 __global__ __launch_bounds__(BLOCK) void decode_attn(
-    const _Float16* __restrict__ q, const _Float16* __restrict__ kv,
+    const elem_t* __restrict__ q, const elem_t* __restrict__ kv,
     const int* __restrict__ bt, float* __restrict__ p_acc,
     float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
     OutT* __restrict__ out, int S, float scale, int coop) {
@@ -358,7 +409,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // load issued behind the KV tiles would hold its LDS store, and the barrier
   // behind it, until the last KV byte landed.
   constexpr int QITER = (ROWPAD * HEAD_DIM + BLOCK * 8 - 1) / (BLOCK * 8);
-  h8 qx[QITER];
+  e8 qx[QITER];
 #pragma unroll
   for (int it = 0; it < QITER; ++it) {
     const int i = (it * BLOCK + tid) * 8;
@@ -368,8 +419,8 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     const int r = min(i / HEAD_DIM, ROWS_W - 1), d = i % HEAD_DIM;
     const int h = kvh * GQA + rg * (GQA / RG) + r / MAXM;
     const int m = r % MAXM;
-    qx[it] = *(const h8*)(q + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d);
-    if (i / HEAD_DIM >= ROWS_W) qx[it] = h8{};
+    qx[it] = *(const e8*)(q + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d);
+    if (i / HEAD_DIM >= ROWS_W) qx[it] = e8{};
   }
   // The group's merge generation cannot move before this segment arrives, so
   // it is read now rather than on the way to the arrival.
@@ -381,7 +432,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   // q_s and the K tiles are dead once the main loop ends; the merge reuses
   // their storage.
   __shared__ __attribute__((aligned(16))) char lds_raw[LDS_RAW];
-  auto q_s = reinterpret_cast<_Float16 (*)[HEAD_DIM + QPAD]>(lds_raw);
+  auto q_s = reinterpret_cast<elem_t(*)[HEAD_DIM + QPAD]>(lds_raw);
   float* mrg_s = reinterpret_cast<float*>(lds_raw);
   char* kt_s = lds_raw + QS_BYTES + wave * 16 * KT_ROW;
   // Wave w's partial scores go in wave w's own K tile.  It writes them only
@@ -395,7 +446,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   __shared__ float gm_s[ROWPAD];
   __shared__ float gl_s[ROWPAD];
 
-  const _Float16* kvh_base = kv + tile_off(0, 0, kvh);
+  const elem_t* kvh_base = kv + tile_off(0, 0, kvh);
   // This wave's slice of a K or V row, and its chunks of the head dim.
   const int col = dp * DPART + VD * l16;
   const int c0 = dp * NCP;
@@ -405,9 +456,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   auto issue = [&](Tile& t, int b) {
     const int page = __builtin_amdgcn_readlane(pages, tw);
     if (b + nseg < nblk) pages = block_pages(bt, b + nseg, lane, S);
-    const _Float16* tp = kvh_base + (size_t)page * PAGE_ELEMS +
-                         (size_t)((b * KBLK + tw * 16) % BS) * KEY_STRIDE +
-                         (size_t)hi * KEY_STRIDE + col;
+    const elem_t* tp = kvh_base + (size_t)page * PAGE_ELEMS +
+                       (size_t)((b * KBLK + tw * 16) % BS) * KEY_STRIDE +
+                       (size_t)hi * KEY_STRIDE + col;
     // All of V, then all of K.  Interleaving them row by row measured 1.7 to
     // 3.3 us slower to land at S=128 (32/32/128), same bytes, same addresses.
 #pragma unroll
@@ -431,7 +482,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 #pragma unroll
   for (int it = 0; it < QITER; ++it) {
     const int i = (it * BLOCK + tid) * 8;
-    if (i < ROWPAD * HEAD_DIM) *(h8*)&q_s[i / HEAD_DIM][i % HEAD_DIM] = qx[it];
+    if (i < ROWPAD * HEAD_DIM) *(e8*)&q_s[i / HEAD_DIM][i % HEAD_DIM] = qx[it];
   }
 
   const float scale2 = scale * LOG2E;
@@ -491,12 +542,11 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     for (int rt = 0; rt < RTILES; ++rt) s[rt] = f8{};
 #pragma unroll
     for (int c = 0; c < NCP; ++c) {
-      const h16 a = *(const h16*)(kt_s + l16 * KT_ROW + c * 32);
+      const e16 a = *(const e16*)(kt_s + l16 * KT_ROW + c * 32);
 #pragma unroll
       for (int rt = 0; rt < RTILES; ++rt) {
-        const h16 bq = *(const h16*)&q_s[rt * 16 + l16][(c0 + c) * 16];
-        if (!(ABLATE & 16) || c == 0)
-          s[rt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bq, s[rt]);
+        const e16 bq = *(const e16*)&q_s[rt * 16 + l16][(c0 + c) * 16];
+        if (!(ABLATE & 16) || c == 0) s[rt] = wmma(a, bq, s[rt]);
       }
     }
 #if DSPL > 1 && !(ABLATE & 128)
@@ -562,7 +612,7 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
         p[e] = (mnew == -INFINITY) ? 0.f
                                    : __builtin_amdgcn_exp2f(__builtin_fmaf(
                                          s[rt][e], scale2, -mnew));
-        lo[e] = p[e] - (float)(_Float16)p[e];
+        lo[e] = p[e] - elem_part(p[e]);
         sum += p[e];
       }
       l_run[rt] = l_run[rt] * alpha + sum + xhalf(sum);
@@ -581,25 +631,23 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
   #pragma unroll
       for (int i = 0; i < 8; ++i)
         pk[i] = (ph[i] & ~upper) | (lower8(pl[i]) & upper);
-      const h16 bp = __builtin_bit_cast(h16, pk);
+      const e16 bp = __builtin_bit_cast(e16, pk);
       const float ascale = __builtin_bit_cast(
           float, (__builtin_bit_cast(unsigned, alpha) & ~upper) |
                      (lower8(__builtin_bit_cast(unsigned, alpha)) & upper));
 #else
-      const h16 bp = p_frag(p);
-      const h16 bl = p_frag(lo);
+      const e16 bp = p_frag(p);
+      const e16 bl = p_frag(lo);
       const float ascale = alpha;
 #endif
 #pragma unroll
       for (int j = 0; j < VD; ++j) {
         acc[rt][j] *= ascale;
         if ((ABLATE & 2) && j) continue;
-        const h16 a = v_frag(t.v, j);
-        acc[rt][j] =
-            __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bp, acc[rt][j]);
+        const e16 a = v_frag(t.v, j);
+        acc[rt][j] = wmma(a, bp, acc[rt][j]);
 #if !PPACK
-        acc[rt][j] =
-            __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, bl, acc[rt][j]);
+        acc[rt][j] = wmma(a, bl, acc[rt][j]);
 #endif
       }
     }
@@ -690,9 +738,9 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
         OutT* o = out + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + dp * DPART;
   #pragma unroll
         for (int e = 0; e < 8; ++e) {
-          _Float16 x[VD];
+          elem_t x[VD];
   #pragma unroll
-          for (int j = 0; j < VD; ++j) x[j] = (_Float16)(acc[rt][j][e] * inv);
+          for (int j = 0; j < VD; ++j) x[j] = to_elem(acc[rt][j][e] * inv);
           *(vrow_t*)(o + VD * (2 * e + hi)) = *(const vrow_t*)x;
         }
       } else {
@@ -717,15 +765,15 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
       }
       if (!publish) {
         const float inv = __builtin_amdgcn_rcpf(gl_s[r]);
-        h8 o;
+        e8 o;
   #pragma unroll
         for (int k = 0; k < 4; ++k) {
-          o[k] = (_Float16)(lo4[k] * inv);
-          o[4 + k] = (_Float16)(hi4[k] * inv);
+          o[k] = to_elem(lo4[k] * inv);
+          o[4 + k] = to_elem(hi4[k] * inv);
         }
         const int h = kvh * GQA + rg * (GQA / RG) + r / MAXM;
         const int m = r % MAXM;
-        *(h8*)(out + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d) = o;
+        *(e8*)(out + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d) = o;
       } else {
         float* dst = p_acc + (pb + r) * HEAD_DIM + d;
         *(f4*)dst = lo4;
@@ -810,17 +858,16 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     const int m = r % MAXM;
     OutT* o = out + ((size_t)m * NUM_Q_HEADS + h) * HEAD_DIM + d;
 #pragma unroll
-    for (int k = 0; k < 4; ++k) o[k] = (OutT)(num[k] * inv);
+    for (int k = 0; k < 4; ++k) o[k] = to_elem(num[k] * inv);
   }
   TS(7);
 }
 
 #ifndef RDNA35_TORCH_EXT
 // Instantiated for ISA inspection when built without the torch op.
-template __global__ void decode_attn<_Float16>(const _Float16*, const _Float16*,
-                                               const int*, float*, float*,
-                                               float*, int*, _Float16*, int,
-                                               float, int);
+template __global__ void decode_attn<elem_t>(const elem_t*, const elem_t*,
+                                             const int*, float*, float*, float*,
+                                             int*, elem_t*, int, float, int);
 #else
   #include <ATen/cuda/CUDAContext.h>
   #include <c10/cuda/CUDAGuard.h>
@@ -840,12 +887,14 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
               "for MAXM=", MAXM);
   TORCH_CHECK(q.size(1) == NUM_Q_HEADS && q.size(2) == HEAD_DIM,
               "q shape does not match the compiled variant");
-  // fp16 only: the products are fp16 WMMAs and the loads reinterpret the
-  // cache as _Float16.  bf16 would read the same bits as fp16 and return
+  // The loads reinterpret every tensor as the element type the variant was
+  // built for.  The other 16-bit type would read the same bits and return
   // finite nonsense, so refuse it here rather than downstream.
-  TORCH_CHECK(q.scalar_type() == at::kHalf && out.scalar_type() == at::kHalf,
-              "kernel is fp16 only, got q=", q.scalar_type(),
-              " out=", out.scalar_type());
+  constexpr auto dtype = KV_BF16 ? at::kBFloat16 : at::kHalf;
+  TORCH_CHECK(q.scalar_type() == dtype && kv_cache.scalar_type() == dtype &&
+                  out.scalar_type() == dtype,
+              "kernel built for ", dtype, ", got q=", q.scalar_type(),
+              " kv_cache=", kv_cache.scalar_type(), " out=", out.scalar_type());
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   // Row group fastest, then kv head, then segment: the row groups of one kv
@@ -858,7 +907,7 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
     (void)hipDeviceGetAttribute(&wgps, hipDeviceAttributeMultiprocessorCount,
                                 dev);
     (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
-        &per, decode_attn<_Float16>, BLOCK, 0);
+        &per, decode_attn<elem_t>, BLOCK, 0);
     // The runtime assumes 64 KiB of LDS where a gfx1151 WGP has 128, and
     // reports one workgroup per WGP for anything over 32 KiB.  Count what
     // fits, rounding every way down: 1536 VGPRs per SIMD in blocks of 24,
@@ -866,7 +915,7 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
     hipFuncAttributes fa;
     hipDeviceProp_t prop;
     if (hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(
-                                      decode_attn<_Float16>)) == hipSuccess &&
+                                      decode_attn<elem_t>)) == hipSuccess &&
         hipGetDeviceProperties(&prop, dev) == hipSuccess &&
         strstr(prop.gcnArchName, "gfx1151")) {
       const int wps = std::min(16, 1536 / ((fa.numRegs + 23) / 24 * 24));
@@ -877,13 +926,13 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
     }
     return (int)(per * wgps >= (int)grid.x);
   }();
-  hipLaunchKernelGGL(decode_attn<_Float16>, grid, block, 0, stream,
-                     reinterpret_cast<const _Float16*>(q.data_ptr()),
-                     reinterpret_cast<const _Float16*>(kv_cache.data_ptr()),
+  hipLaunchKernelGGL(decode_attn<elem_t>, grid, block, 0, stream,
+                     reinterpret_cast<const elem_t*>(q.data_ptr()),
+                     reinterpret_cast<const elem_t*>(kv_cache.data_ptr()),
                      block_table.data_ptr<int>(), acc.data_ptr<float>(),
                      m.data_ptr<float>(), l.data_ptr<float>(),
                      cnt.data_ptr<int>(),
-                     reinterpret_cast<_Float16*>(out.data_ptr()), (int)seq_len,
+                     reinterpret_cast<elem_t*>(out.data_ptr()), (int)seq_len,
                      (float)scale, coop);
 }
 

@@ -201,9 +201,6 @@ _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 
 
 class Rdna35HipAttentionBackend(TritonAttentionBackend):
-    # bfloat16 stays listed so a bf16 model can still select this backend and
-    # be served by the Triton fallback; the kernel itself takes fp16 only,
-    # because its products are fp16 WMMAs.
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
@@ -285,8 +282,12 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         if seqused_k.shape[0] != 1:
             self._reject(f"kernel handles one sequence, got {seqused_k.shape[0]}")
             return None
-        if kwargs["q"].dtype is not torch.float16:
-            self._reject(f"kernel is fp16 only, got {kwargs['q'].dtype}")
+        dtype = kwargs["q"].dtype
+        if dtype not in (torch.float16, torch.bfloat16):
+            self._reject(f"kernel is fp16 or bf16 only, got {dtype}")
+            return None
+        if kv_cache.dtype != dtype:
+            self._reject(f"KV cache is {kv_cache.dtype}, query is {dtype}")
             return None
         if self.head_size not in _SUPPORTED_HEAD_SIZES:
             self._reject(f"head_size {self.head_size} not built")
@@ -309,6 +310,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             max_m=q.shape[0],
             block_size=block_size,
             layout=0 if kv_cache.stride(1) < kv_cache.stride(2) else 1,
+            dtype=dtype,
         )
         expected = expected_kv_cache_strides(variant)
         actual = (kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2))
