@@ -153,7 +153,7 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     (16, 1, 512, 4): {"nseg": 8, "rg": 4, "minb": 1, "nw": 8, "dspl": 0},
     (8, 2, 512, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
     (8, 2, 512, 4): {"nseg": 8, "rg": 1, "minb": 2, "nw": 8, "dspl": 8},
-    (16, 2, 512, 1): {"nseg": 8, "rg": 2, "minb": 2, "nw": 4, "dspl": 0},
+    (16, 2, 512, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
     (16, 2, 512, 4): {"nseg": 4, "rg": 2, "minb": 1, "nw": 8, "dspl": 0},
     (32, 4, 512, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
     (32, 4, 512, 4): {"nseg": 2, "rg": 2, "minb": 2, "nw": 8, "dspl": 0},
