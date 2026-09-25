@@ -28,7 +28,7 @@ __global__ void moe_wna16_gemm_kernel(
     uint32_t size_n, uint32_t size_k, uint16_t BLOCK_SIZE_M,
     uint16_t BLOCK_SIZE_N, uint16_t BLOCK_SIZE_K, bool has_zp,
     bool mul_topk_weight) {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800 && !defined(USE_ROCM)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
   if constexpr (std::is_same<scalar_t, nv_bfloat16>::value) {
     return;
   } else {
@@ -193,7 +193,7 @@ __global__ void moe_wna16_gemm_kernel(
       dequant<scalar_t2, bit>(expert_qweight_tmp[tmp_k % 4], weight_half2);
 
       for (int m = 0; m < num_valid_tokens; m++) {
-        res2 = scalar_t2{};
+        res2 = {};
 
 #pragma unroll
         for (int i = 0; i < 16 / bit; i++) {
@@ -216,15 +216,8 @@ __global__ void moe_wna16_gemm_kernel(
       if (mul_topk_weight) {
         res[m] *= topk_weights[token_index];
       }
-#ifdef USE_ROCM
-      // ROCM has no atomicAdd for half2 unless it is unsafe. The other
-      // possibility is to call atomicAdd from csrc/quantization/gptq/compat.cuh
-      unsafeAtomicAdd(&output[token_index * size_n + offset_n],
-                      Dtype::float2num(res[m]));
-#else
-    atomicAdd(&output[token_index * size_n + offset_n],
-              Dtype::float2num(res[m]));
-#endif
+      atomicAdd(&output[token_index * size_n + offset_n],
+                Dtype::float2num(res[m]));
     }
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
@@ -337,11 +330,6 @@ torch::stable::Tensor moe_wna16_gemm(
         num_token_blocks, top_k, size_m, size_n, size_k, BLOCK_SIZE_M,
         BLOCK_SIZE_N, BLOCK_SIZE_K, bit, b_qzeros.has_value(),
         topk_weights.has_value());
-#ifdef USE_ROCM
-  } else {
-    STD_TORCH_CHECK(false, "moe_wna16_gemm on ROCM only supports float16");
-  }
-#else
   } else if (input.scalar_type() == torch::headeronly::ScalarType::BFloat16) {
     run_moe_wna16_gemm<nv_bfloat16>(
         reinterpret_cast<const nv_bfloat16*>(input.const_data_ptr()),
@@ -358,6 +346,5 @@ torch::stable::Tensor moe_wna16_gemm(
   } else {
     STD_TORCH_CHECK(false, "moe_wna16_gemm only supports bfloat16 and float16");
   }
-#endif
   return output;
 }
