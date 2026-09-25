@@ -927,3 +927,151 @@ builds were cached. An earlier attempt at `--reps 5` was abandoned: reps
 resample allocation and graph placement, not `do_bench`'s within-cell
 dispersion, so they cost 5x and do not resolve what a second independent run
 resolves for 45 s. See HANDOFF §2.
+
+---
+
+## 009 — Rewrite: one workgroup per kv head, WMMA for both products
+
+**Status:** landed. Replaces the kernel entries 001-008 describe; their knobs
+(`BFLY`, `GRIDT`, `DPL`, `LDSPLIT`, `KPW`, `MSPLIT`, `ILV`) no longer exist.
+Those entries stay as the record of what that kernel learned.
+
+### Motivation, from our case
+
+The old grid was `(NSEG, Hq)`: one workgroup per *q* head, each streaming its
+kv head's KV and relying on L2 to absorb the GQA-fold re-read. Its `%roof` fell
+as `1/GQA` (HANDOFF §6, golden d512) and the matrix before this entry had
+**2 of 52** rows at a 90 % geomean of roof; `32/2/128` sat at 28.9 % (M=1) and
+23.8 % (M=4), `16/1/512` at 40.5 % (M=4). At M=4 the per-q-head VALU work --
+Q@K, a five-stage score butterfly and P@V per row -- was the limit, not bytes.
+
+### What it does
+
+One workgroup per `(kv head, row group, KV segment)`. All `GQA x M` rows that
+read a kv head go through the same workgroup, so the KV is read from memory
+once. Both products are `v_wmma_f32_16x16x16_f16`:
+
+    S^T[key][row] = K[key][:] . Q[row][:]      A = K tile, B = Q^T
+    O^T[d][row]  += V[key][d] . P[row][key]    A = V^T,    B = P^T
+
+Each wave owns 16-key tiles and runs its own online softmax, so the loop has
+no barrier; the waves merge once at the end. `DSPL` waves may share a tile,
+each owning `D/DSPL` of the head dim (needed at D>=256 to keep a wave's
+accumulator and K/V slice in registers); they sum their partial scores
+through LDS. `NSEG` is a maximum: the kernel activates
+`clamp(nblocks/MINB, 1, NSEG)` segments from S at run time, so short contexts
+skip the cross-workgroup merge that long ones need, with a grid fixed at
+graph capture.
+
+### What each piece is worth, measured
+
+`32/8/128` M=1 unless stated, dev harness (same method as matrix.py: HIP
+graph, >=96 MiB rotated working set, arange block table), geomean %roof over
+the seven contexts.
+
+| step | geomean | note |
+| --- | --- | --- |
+| old kernel | 69.5 % | matrix before this entry |
+| first cut: V^T gathered with b16 loads | 53.6 % | 128 VMEM instructions per wave per block |
+| each wave owns its tiles, V^T built with v_perm from b128 rows | 36.2 % | LDS float atomics in the merge, see below |
+| merge by tree instead of `ds_add_f32` | 63.7 % | |
+| loads forced ahead of use (`asm volatile("" ::: "memory")`) | 76.7 % | the scheduler had issued K two loads at a time |
+| merge stores real rows only, one round | 80.0 % | LDS 56 KB -> 18 KB |
+| `NSEG` for 16 workgroups, `MINB=4` | 80.8 % | |
+| K read row-wise, transposed through LDS | 82.7 % | 96.7 % of roof at S=32768 |
+| V then K, not interleaved | 83.8 % | |
+| `NW=4`, `RG=2` | 85.6 % | |
+
+`32/32/128` M=1 reaches **93.2 %** at `NW=2`, the first configuration over 90.
+
+### Findings worth keeping
+
+**`ds_add_f32` costs ~17 us per call.** The first merge had every wave add its
+scaled accumulator into LDS with float atomics, 64 per lane. Replacing them
+with plain stores (wrong answers, timing only) took S=128 from 24.0 us to
+7.0 us. Removing the 16-way bank conflict first changed nothing, so it is the
+atomic path itself. Never use LDS float atomics in this kernel.
+
+**The compiler serialises loads under VGPR pressure.** At 250 VGPRs it issued
+a tile's K as two `global_load_b128`, `s_waitcnt vmcnt(0)`, one WMMA, repeat:
+eight round trips per tile, and V only after Q@K. An empty `asm volatile`
+with a memory clobber after the loads pins them: 53.6 -> 76.7 %.
+
+**K lane-per-key costs ~5 % of DRAM efficiency.** The WMMA A operand wants
+lane = key, 16 consecutive d in-lane, so a direct load touches 16 rows per
+instruction. Loads only (`ABLATE=64`), `NSEG=2`, S=32768: 92.8 % of roof that
+way, **97.0 %** reading K row-wise like V. The kernel now reads K row-wise and
+transposes it through a 4.3 KB per-wave LDS tile (no barrier: one wave's LDS
+ops complete in order).
+
+**Fewer, longer streams.** A tile-structured stream with this kernel's access
+order: 97.9 % of peak at 16 workgroups, 96.4 % at 40, 90-94 % at 64 and up.
+Hence `_TARGET_WORKGROUPS = 16`.
+
+**Issue order within a tile matters.** All of V then all of K, or the
+reverse: S=128 on `32/32/128` at 70.7 %. Interleaved row by row, same bytes,
+same addresses: 60.3 % -- the last KV byte landed 1.7-3.3 us later.
+
+**Each half of a wave reads its own copy of the WMMA operands.** Measured
+with garbage in chosen lanes: the lower half computes the even output rows
+from its own A (only the even rows of it) and its own B, the upper half the
+odd rows from its own. So the two halves may order the k index differently
+as long as each half's A and B agree. The kernel uses "this half's keys
+first": every operand becomes (own, other half's) in every lane with no select
+on the half. `v_cndmask` per tile 122 -> 48; interleaved A/B on `32/32/128`
+92.7/92.3 % against 90.7/91.5 %.
+
+**The split-KV merge in one L2 round trip.** The last segment to arrive
+used to read a running max, then weights, then partials: three dependent L2
+round trips.  Issuing every segment's m, l and partial at once (NSEG
+unrolled): `8/1/256` M=1 55.6 -> 63.7 %, `32/4/128` 76.3 -> 78.7 %.
+
+**P needs more than fp16.** One fp16 P misses the 1e-3 relative bound where
+the output is near zero (7.9e-2 at S=5). P goes as fp16 high plus fp16 low
+half, two WMMAs -- or one, when a row tile has at most 8 real rows: the low
+half rides in the padding columns and is folded back once at the end
+(`PPACK`). The error is then 4.8e-4, the fp16 output rounding floor, as
+before.
+
+**Row groups and d splits for large GQA x M.** An accumulator of 16 rows at
+128 d is 64 VGPRs; 64 rows spilled (`32/2/128` M=4: 18.1 %). `RG` splits rows
+over workgroups that share the KV in L2 (57.5 % at `RG=4`); where GQA has no
+fitting divisor (7, 5) `DSPL=2` halves each wave's d instead (28/4 M=4: 63.0 %
+against 47.9 % at `RG=7`).
+
+### Rejected
+
+| idea | result |
+| --- | --- |
+| two tiles in flight per wave (double buffer) | 70.7 % against 80.0 % at S=128 on `32/32/128`; 256 VGPRs and spills at D=128 |
+| next tile's K and V held until the current P@V is done | 59.2 % against 77.4 % (`32/4/128`); still spills |
+| next tile's K issued right after Q@K | neutral |
+| both halves load all 16 V rows (no exchange) | 92.0 % against 93.2 %, and 79.3 % against 85.6 % |
+| Q loaded before the page table | neutral |
+| split-KV merge with weights precomputed once | neutral, kept for the independent loads |
+| `NW=16` | does not fit: the per-wave K tiles alone are 69 KB |
+| count arrivals first, fence only the non-last segments | 78.2 against 78.6 %, 62.1 against 63.7 %: their fence lands on the last one's path |
+| `RG = GQA` (one q head per workgroup, the old decomposition) | 29-36 % at D=256/512 M=1 |
+| skip the DSPL score exchange (wrong answers, bound) | no gain: the barriers are not the cost |
+
+### Against the old kernel
+
+D=512 from `matrix.py`, against `reference/golden_d512_dot.md`, geomean of
+roof: M=4 59.7 -> 71.1 % (`16/1` 1.53x faster, `32/4` 1.43x), M=1
+82.9 -> 73.3 %.  At M=1 it loses on four of five configurations, 0.76-0.93x,
+nearly all at S=128-1024, where few real rows (GQA x M <= 16) leave most of
+each WMMA as padding and its latency, and the merges, sit on the critical
+path.  From S=8192 the two are level.
+
+### Traps met on the way
+
+- A `?:` between a lane's own value and a `permlane16` of it compiled to a
+  branch: the value was computed only in the lanes that took it and read
+  from the lanes that did not. Select with a mask.
+- The K tile is stored as integers and read as halves; type-based alias
+  analysis let the reads move above the stores. An `asm` memory clobber
+  between them.
+- `amd-gpu-lock` is not a mutex: it polls for other GPU processes, so two
+  jobs polling together both start. Measurements taken while another job ran
+  scattered by +-2 % at long context; serialised with `flock` they repeat to
+  0.1 %.
