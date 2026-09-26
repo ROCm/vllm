@@ -9,7 +9,8 @@ argument, so one choice has to serve 128 and 32768 alike. Tuning per context
 would be easy and unshippable.
 
 So the objective is the whole range: the geomean of the fraction of roofline
-over the seven contexts matrix.py reports, with the worst context alongside.
+over the seven contexts matrix.py reports -- after the worst long-context cell
+(S >= 16384) has reached 90 % of roof, which comes first.
 A candidate that wins the long contexts by starving the short ones scores
 badly on both.
 
@@ -49,6 +50,20 @@ TARGETS = (8, 16, 32)
 
 def geomean(xs):
     return math.exp(sum(math.log(x) for x in xs) / len(xs))
+
+
+# Long contexts must reach this fraction of roof before anything else counts.
+LONG_S, LONG_TARGET = 16384, 0.90
+
+
+def rank(ctxs, entry):
+    """How a measured point compares: first its worst long-context cell, up to
+    the target, then the geomean over every context.  A point that trades
+    long-context throughput below the target for short-context gains loses."""
+    g, cells = entry
+    long_ = [c for s, c in zip(ctxs, cells) if s >= LONG_S]
+    floor_ = min(min(long_), LONG_TARGET) if long_ else LONG_TARGET
+    return (floor_, g)
 
 
 def space(hq, hkv, d, start):
@@ -271,7 +286,7 @@ def main() -> None:
                 found = [descend_from(ctxs, s) for s in starts]
                 if dot:
                     found.append(descend_from(ctxs, dot_start))
-                return max(found, key=lambda f: f[1][0])
+                return max(found, key=lambda f: rank(ctxs, f[1]))
 
             def descend_from(ctxs, start, values=values, scores=scores):
                 best = dict(start)
@@ -294,7 +309,9 @@ def main() -> None:
                             ]
                         evaluate(cands, ctxs)
                         for c in cands:
-                            if scores[(ctxs, key(c))][0] > scores[(ctxs, key(best))][0]:
+                            if rank(ctxs, scores[(ctxs, key(c))]) > rank(
+                                ctxs, scores[(ctxs, key(best))]
+                            ):
                                 best = c
                 return best, scores[(ctxs, key(best))]
 
