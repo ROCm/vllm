@@ -74,6 +74,8 @@ def space(hq, hkv, d, start):
 
 def knobs_of(hkv, cand):
     """KernelVariant keyword arguments for a search point."""
+    if "_knobs" in cand:  # a finished row, measured as is
+        return dict(cand["_knobs"])
     if cand.get("dot"):
         k = {"dot": 1, "nw": cand["nw"], "nseg": cand["dnseg"]}
         if cand["bfly"]:
@@ -320,17 +322,31 @@ def main() -> None:
                     kb["rspl"] = 1
                 if "pf" in knobs and "pf" not in kb:
                     kb["pf"] = 0
+                two = dict(knobs)
                 if kb != knobs:
-                    knobs.update({"sw": args.split})
-                    knobs.update({f"{k}2": v for k, v in kb.items()})
+                    two.update({"sw": args.split})
+                    two.update({f"{k}2": v for k, v in kb.items()})
+                # The modes were measured as builds of their own; in one
+                # kernel they share its VGPRs and block, which can starve the
+                # smaller one (a dot short mode lost 30 % that way).  So the
+                # two-mode build is measured as a whole, against either mode
+                # alone, over every context, and the best of the three wins.
+                every = tuple(args.contexts)
+                rows_ = {"both": two, "a": knobs, "b": kb}
+                cands_ = {
+                    n: {"_knobs": tuple(sorted(r.items()))} for n, r in rows_.items()
+                }
+                evaluate(list(cands_.values()), every)
+                got = {n: scores[(every, key(c))] for n, c in cands_.items()}
+                pick = max(got, key=lambda n: got[n][0])
+                knobs = rows_[pick]
+                g, cells = got[pick]
                 row = ", ".join(f'"{k}": {v}' for k, v in knobs.items())
-                cells = list(cells_a) + list(cells_b)
-                g = geomean(cells) if cells else 0.0
                 print(
                     f"    ({hq}, {hkv}, {d}, {m}): {{{row}}},  "
-                    f"# {g * 100:.1f} % geomean; below {args.split} "
-                    f"{g_a * 100:.1f} %, from it {g_b * 100:.1f} % "
-                    f"(worst {min(cells_b) * 100 if cells_b else 0:.1f} %)",
+                    f"# {g * 100:.1f} % geomean ({pick}); mode A alone below "
+                    f"{args.split} {g_a * 100:.1f} %, mode B from it "
+                    f"{g_b * 100:.1f} %",
                     flush=True,
                 )
                 continue
