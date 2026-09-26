@@ -101,46 +101,6 @@
     #define GT 0
   #endif
 
-  // A second decomposition for long sequences: at S >= SW the kernel runs
-  // mode B with the knobs below instead of mode A's.  The grid and the block
-  // are fixed at graph capture, S is not, so the choice is made on the device;
-  // short and long sequences want different splits of the same configuration
-  // (row groups and no merge, against rows split inside the workgroup and many
-  // segments).  SW 0 builds mode A alone.
-  #ifndef SW
-    #define SW 0
-  #endif
-  #ifndef NSEG2
-    #define NSEG2 NSEG
-  #endif
-  #ifndef RG2
-    #define RG2 RG
-  #endif
-  #ifndef MINB2
-    #define MINB2 MINB
-  #endif
-  #ifndef DSPL2
-    #define DSPL2 DSPL
-  #endif
-  #ifndef RSPL2
-    #define RSPL2 RSPL
-  #endif
-  #ifndef NW2
-    #define NW2 NW
-  #endif
-  #ifndef PF2
-    #define PF2 PF
-  #endif
-  #ifndef DOT2
-    #define DOT2 DOT
-  #endif
-  #ifndef BFLY2
-    #define BFLY2 BFLY
-  #endif
-  #ifndef GT2
-    #define GT2 GT
-  #endif
-
   // Measurement only, wrong answers: 1 skips the V loads, 2 thins P@V to one
   // WMMA per tile, 4 skips the K loads, 16 thins Q@K to one WMMA per tile, 32
   // returns at once, 64 loads each tile and does nothing else, 128 skips the
@@ -157,8 +117,7 @@
   #endif
 
   #define WAVE 32
-  // Launched with the larger mode's waves.
-  #define BLOCK ((SW && NW2 > NW ? NW2 : NW) * WAVE)
+  #define BLOCK (NW * WAVE)
   #define GQA (NUM_Q_HEADS / NUM_KV_HEADS)
   #define ROWS (GQA * MAXM)
   #define NCHUNK (HEAD_DIM / 16)
@@ -332,51 +291,9 @@ __device__ __forceinline__ e16 p_frag(const float* p) {
   #define M_DOT DOT
   #define M_BFLY BFLY
   #define M_GT GT
-namespace mode_a {
+namespace decomp {
   #include __FILE_NAME__
-}  // namespace mode_a
-  #undef M_NSEG
-  #undef M_RG
-  #undef M_MINB
-  #undef M_DSPL
-  #undef M_RSPL
-  #undef M_NW
-  #undef M_PF
-  #undef M_DOT
-  #undef M_BFLY
-  #undef M_GT
-  #if SW
-    #define M_NSEG NSEG2
-    #define M_RG RG2
-    #define M_MINB MINB2
-    #define M_DSPL DSPL2
-    #define M_RSPL RSPL2
-    #define M_NW NW2
-    #define M_PF PF2
-    #define M_DOT DOT2
-    #define M_BFLY BFLY2
-    #define M_GT GT2
-namespace mode_b {
-    #include __FILE_NAME__
-}  // namespace mode_b
-    #undef M_NSEG
-    #undef M_RG
-    #undef M_MINB
-    #undef M_DSPL
-    #undef M_RSPL
-    #undef M_NW
-    #undef M_PF
-    #undef M_DOT
-    #undef M_BFLY
-    #undef M_GT
-  #else
-namespace mode_b = mode_a;
-  #endif
-
-constexpr int kLdsMax =
-    mode_a::kLds > mode_b::kLds ? mode_a::kLds : mode_b::kLds;
-constexpr int kGridMax =
-    mode_a::kGrid > mode_b::kGrid ? mode_a::kGrid : mode_b::kGrid;
+}  // namespace decomp
 
 template <typename OutT>
 __global__ __launch_bounds__(BLOCK) void decode_attn(
@@ -385,27 +302,13 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
     float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
     OutT* __restrict__ out, const int* __restrict__ seq_lens, int bt_width,
     float scale, int coop) {
-  __shared__ __attribute__((aligned(16))) char lds[kLdsMax];
-  // S and the first page indices (both modes', with two) go out together:
-  // neither waits for the other.  Every KV address depends on the page table.
+  __shared__ __attribute__((aligned(16))) char lds[decomp::kLds];
+  // S and the first page indices go out together: neither waits for the
+  // other.  Every KV address depends on the page table.
   const int S = __builtin_amdgcn_readfirstlane(*seq_lens);
-  const int pa = mode_a::first_pages(bt, bt_width);
-  #if SW
-  const int pb = mode_b::first_pages(bt, bt_width);
-  // Mode B, the long-sequence one, falls through: whichever body sits inside
-  // the branch is compiled worse (measured 2-4 % on mode A there, 15 % on
-  // mode B).
-  if (S < SW) {
-    mode_a::body<OutT>(q, kv, bt, p_acc, p_m, p_l, p_cnt, out, S, pa, bt_width,
-                       scale, coop, lds);
-    return;
-  }
-  mode_b::body<OutT>(q, kv, bt, p_acc, p_m, p_l, p_cnt + mode_a::kCnt, out, S,
-                     pb, bt_width, scale, coop, lds);
-  #else
-  mode_a::body<OutT>(q, kv, bt, p_acc, p_m, p_l, p_cnt, out, S, pa, bt_width,
+  const int pages = decomp::first_pages(bt, bt_width);
+  decomp::body<OutT>(q, kv, bt, p_acc, p_m, p_l, p_cnt, out, S, pages, bt_width,
                      scale, coop, lds);
-  #endif
 }
 
   #ifndef RDNA35_TORCH_EXT
@@ -451,9 +354,9 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   // Row group fastest, then kv head, then segment: the row groups of one kv
   // head read the same KV and are dispatched side by side to share it in L2.
-  dim3 grid(kGridMax), block(BLOCK);
+  dim3 grid(decomp::kGrid), block(BLOCK);
   static const int coop = [&] {
-    if (!mode_a::kSharedMerge && !mode_b::kSharedMerge) return 0;
+    if (!decomp::kSharedMerge) return 0;
     int dev, wgps, per = 0;
     (void)hipGetDevice(&dev);
     (void)hipDeviceGetAttribute(&wgps, hipDeviceAttributeMultiprocessorCount,
@@ -507,7 +410,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, mod) {
 #else
   // ---------------------------------------------------------------- body ----
   // Everything below depends on the decomposition knobs, read through their
-  // M_ names; the outer pass instantiates it once per mode.
+  // M_ names; the outer pass instantiates it in namespace decomp.  DOT picks
+  // the per-q-head dot-product decomposition instead of WMMA, for the whole
+  // configuration.
   #if M_DOT
     // ------------------------------------------------------- dot body ----
     // The per-q-head dot-product decomposition (OPTIMIZATIONS 001-008, kept in
@@ -619,7 +524,6 @@ __device__ __forceinline__ void body(
   if (blockIdx.x >= kGrid) return;
   const int tid = threadIdx.x;
   const int wave = __builtin_amdgcn_readfirstlane(tid / WAVE);
-  if (M_NW < BLOCK / WAVE && wave >= M_NW) return;
   int seg, h;
   dot_coords(seg, h);
   const int lane = tid & (WAVE - 1);
@@ -1050,9 +954,6 @@ __device__ __forceinline__ void body(
   const int dp = wave % M_DSPL;             // and its part of the head dim
     // Workgroup row tile of this wave's row tile rt.
     #define RT(rt) ((rt) * M_RSPL + rs)
-  // A mode may use fewer waves than the block was launched with; the rest
-  // leave now, and a finished wave no longer counts at a barrier.
-  if (M_NW < BLOCK / WAVE && wave >= M_NW) return;
 
   const int bid = blockIdx.x;
   const int rg = bid % M_RG;

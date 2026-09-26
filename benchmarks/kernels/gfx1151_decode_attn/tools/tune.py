@@ -74,8 +74,6 @@ def space(hq, hkv, d, start):
 
 def knobs_of(hkv, cand):
     """KernelVariant keyword arguments for a search point."""
-    if "_knobs" in cand:  # a finished row, measured as is
-        return dict(cand["_knobs"])
     if cand.get("dot"):
         k = {"dot": 1, "nw": cand["nw"], "nseg": cand["dnseg"]}
         if cand["bfly"]:
@@ -105,13 +103,6 @@ def main() -> None:
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--rounds", type=int, default=1)
     p.add_argument("--contexts", type=int, nargs="+", default=CONTEXTS)
-    p.add_argument(
-        "--split",
-        type=int,
-        default=0,
-        help="tune a first decomposition on the contexts below this and a "
-        "second on the rest; the kernel switches between them at this S",
-    )
     shapeset.add_dtype_argument(p)
     args = p.parse_args()
     dtype = shapeset.torch_dtype(args.dtype)
@@ -272,8 +263,8 @@ def main() -> None:
                 starts.append(dict(start, rg=1, rspl=rs_max, nw=4, target=32))
 
             # The dot decomposition, a start of its own: it shares no knob
-            # with WMMA but the waves.  Only for short contexts, where it can
-            # win (reference/: never past ~4k keys).
+            # with WMMA but the waves.  Scored like any other point, over the
+            # whole context range.
             dot_start = dict(start, dot=1, nw=8, dnseg=2, bfly=0, gt=0)
 
             def descend(ctxs, starts=starts, dot_start=dot_start, dot=False):
@@ -307,50 +298,7 @@ def main() -> None:
                                 best = c
                 return best, scores[(ctxs, key(best))]
 
-            if args.split:
-                short = tuple(s for s in args.contexts if s < args.split)
-                long_ = tuple(s for s in args.contexts if s >= args.split)
-                best_a, (g_a, cells_a) = descend(short, dot=True)
-                best_b, (g_b, cells_b) = descend(long_)
-                knobs = knobs_of(hkv, best_a)
-                kb = knobs_of(hkv, best_b)
-                # A mode-B knob left out means mode A's value, not the default:
-                # spell out the defaults where the two differ.
-                if "dspl" in knobs and "dspl" not in kb:
-                    kb["dspl"] = d // 128 if d >= 256 else 1
-                if "rspl" in knobs and "rspl" not in kb:
-                    kb["rspl"] = 1
-                if "pf" in knobs and "pf" not in kb:
-                    kb["pf"] = 0
-                two = dict(knobs)
-                if kb != knobs:
-                    two.update({"sw": args.split})
-                    two.update({f"{k}2": v for k, v in kb.items()})
-                # The modes were measured as builds of their own; in one
-                # kernel they share its VGPRs and block, which can starve the
-                # smaller one (a dot short mode lost 30 % that way).  So the
-                # two-mode build is measured as a whole, against either mode
-                # alone, over every context, and the best of the three wins.
-                every = tuple(args.contexts)
-                rows_ = {"both": two, "a": knobs, "b": kb}
-                cands_ = {
-                    n: {"_knobs": tuple(sorted(r.items()))} for n, r in rows_.items()
-                }
-                evaluate(list(cands_.values()), every)
-                got = {n: scores[(every, key(c))] for n, c in cands_.items()}
-                pick = max(got, key=lambda n: got[n][0])
-                knobs = rows_[pick]
-                g, cells = got[pick]
-                row = ", ".join(f'"{k}": {v}' for k, v in knobs.items())
-                print(
-                    f"    ({hq}, {hkv}, {d}, {m}): {{{row}}},  "
-                    f"# {g * 100:.1f} % geomean ({pick}); mode A alone below "
-                    f"{args.split} {g_a * 100:.1f} %, mode B from it "
-                    f"{g_b * 100:.1f} %",
-                    flush=True,
-                )
-                continue
-            best, (g, cells) = descend(tuple(args.contexts))
+            best, (g, cells) = descend(tuple(args.contexts), dot=True)
             row = ", ".join(f'"{k}": {v}' for k, v in knobs_of(hkv, best).items())
             worst = min(cells) * 100 if cells else 0.0
             print(

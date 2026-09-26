@@ -76,20 +76,6 @@ class KernelVariant:
     ablate: int = 0
     # Element type of Q, the KV cache and the output.
     dtype: torch.dtype = torch.float16
-    # A second decomposition the kernel switches to at S >= sw, chosen on the
-    # device so one captured graph serves both.  Its knobs default (0) to the
-    # first's; sw 0 builds the first alone.
-    sw: int = 0
-    nseg2: int = 0
-    rg2: int = 0
-    minb2: int = 0
-    dspl2: int = 0
-    rspl2: int = 0
-    nw2: int = 0
-    pf2: int = -1
-    dot2: int = 0
-    bfly2: int = 0
-    gt2: int = 0
 
     def __post_init__(self) -> None:
         if self.dtype not in (torch.float16, torch.bfloat16):
@@ -108,67 +94,28 @@ class KernelVariant:
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
             f"{'_bf16' if self.dtype == torch.bfloat16 else ''}"
-            + (
-                f"_sw{self.sw}_n{self.nseg_b}_rg{self.rg_b}_mb{self.minb_b}"
-                f"_ds{self.dspl2}_rs{self.rspl_b}_w{self.nw2 or self.nw}"
-                f"_pf{self.pf_b}"
-                f"{'' if not self.dot2 else f'_dot_bf{self.bfly2}_gt{self.gt2}'}"
-                if self.sw
-                else ""
-            )
         )
-
-    @property
-    def nseg_b(self) -> int:
-        return self.nseg2 or self.nseg
-
-    @property
-    def rg_b(self) -> int:
-        return self.rg2 or self.rg
-
-    @property
-    def minb_b(self) -> int:
-        return self.minb2 or self.minb
-
-    @property
-    def rspl_b(self) -> int:
-        return self.rspl2 or self.rspl
-
-    @property
-    def pf_b(self) -> int:
-        return self.pf if self.pf2 < 0 else self.pf2
-
-    def _modes(self) -> list[tuple[int, int, int]]:
-        """(nseg, rg, dot) of each decomposition the build carries."""
-        modes = [(self.nseg, self.rg, self.dot)]
-        if self.sw:
-            modes.append((self.nseg_b, self.rg_b, self.dot2))
-        return modes
 
     @property
     def name(self) -> str:
         return f"rdna35_decode_{self.suffix}"
 
-    def rows_padded(self, rg: int | None = None) -> int:
+    @property
+    def rows_padded(self) -> int:
         """Query rows one workgroup carries, rounded up to whole WMMA tiles."""
         gqa = self.num_q_heads // self.num_kv_heads
-        rows = gqa * self.max_m // (rg or self.rg)
+        rows = gqa * self.max_m // self.rg
         return -(-rows // 16) * 16
 
     def scratch_shapes(self) -> tuple[tuple[int, ...], tuple[int, ...], int]:
         """Shapes of the (acc, m/l) partials the split-KV merge goes through,
-        and the number of counters.  The modes run one per launch, so they
-        share the partials; each keeps its own counters."""
-        rows = max(
-            self.num_q_heads * nseg * self.max_m
-            if dot
-            else self.num_kv_heads * rg * nseg * self.rows_padded(rg)
-            for nseg, rg, dot in self._modes()
-        )
-        cnt = sum(
-            self.num_q_heads if dot else 2 * self.num_kv_heads * rg
-            for _, rg, dot in self._modes()
-        )
+        and the number of counters."""
+        if self.dot:
+            rows = self.num_q_heads * self.nseg * self.max_m
+            cnt = self.num_q_heads
+        else:
+            rows = self.num_kv_heads * self.rg * self.nseg * self.rows_padded
+            cnt = 2 * self.num_kv_heads * self.rg
         return (rows, self.head_size), (rows,), cnt
 
 
@@ -303,20 +250,6 @@ def load(variant: KernelVariant) -> Any:
         f"-DABLATE={variant.ablate}",
         f"-DKV_BF16={int(variant.dtype == torch.bfloat16)}",
     ]
-    if variant.sw:
-        flags += [
-            f"-DSW={variant.sw}",
-            f"-DNSEG2={variant.nseg_b}",
-            f"-DRG2={variant.rg_b}",
-            f"-DMINB2={variant.minb_b}",
-            f"-DRSPL2={variant.rspl_b}",
-            f"-DNW2={variant.nw2 or variant.nw}",
-            f"-DPF2={variant.pf_b}",
-            f"-DDOT2={variant.dot2}",
-            f"-DBFLY2={variant.bfly2}",
-            f"-DGT2={variant.gt2}",
-            *([f"-DDSPL2={variant.dspl2}"] if variant.dspl2 else []),
-        ]
     logger.info("Compiling %s", variant.name)
     try:
         module = load_extension(
