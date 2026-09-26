@@ -53,7 +53,7 @@ Commits on top of it, 2026-09-25:
 | `2c7b87b6e8` (021, 022) | full-range re-tune (dot rows at D=256/512 M=1, PF at D=64), `_TUNED_BF16`, sliding window in kernel/backend/tests |
 | `82ef301b1d` (022) | `_TUNED_SWA` rows; the harness allocates only a window's blocks |
 | `6f8a9c9f6c` (025) | CPUB: split-KV partials staged in LDS and written a line at a time |
-| (026) | the backend requires HND; gemma-4-E2B end to end |
+| `29feb4a997` (026) | the backend requires HND; gemma-4-E2B end to end |
 
 ### The performance picture
 
