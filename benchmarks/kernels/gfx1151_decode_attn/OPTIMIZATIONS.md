@@ -1579,3 +1579,19 @@ up to 2^-12 of the partial, not of the output, and where segments cancel
 that is ~1e-2 of an output element near the 1e-3 floor of `max_rel`,
 against the 1e-3 the kernel is held to.  A decision for the owner, not a
 tuning.
+
+## 024 — The split-KV tail in the ISA, and 32/2/128 M=4: measured, not landed
+
+| idea | result |
+| --- | --- |
+| release-only fence before the arrival, bare `buffer_gl1_inv; buffer_gl0_inv` instead of the fence before the merge (the ISA showed the last arriver's merge waiting `vscnt(0)` on its own generation and counter stores; LLVM's agent-scope acquire fence still emits that wait) | 0.991-1.009x on six configurations: the acks are not on the critical path |
+| NW=16 on the small windows (half the segments, half the partials) | does not fit: 177 KiB of LDS per workgroup at D=256 against 64 |
+| `32/2/128` M=4 with RSPL 2-4 instead of RG 4 | RSPL=4 16k/32k 79.7 / 83.1 % against 84.8 / 88.0 %; RSPL=2 does not build at that row count |
+| `32/2/128` M=4, RG 2-8, NSEG 2-8, MINB 1-4 around the row | none better at 16k or 32k |
+
+`GL2C_EA_RDREQ_DRAM` on `32/2/128` M=4: RG=4 reads the KV 1.00x at 16k and
+1.17-1.23x at 32k; RG=1 reads it 4.15x (the waves of one workgroup load the
+same tile for their row tiles, and it does not survive in L2).  RSPL reads
+it once and is slower, so the extra reads of RG=4 are not what holds the
+cell under 90 %; the 16 MiB ceiling of 019 (92.4 %) and the per-tile
+barriers are.
