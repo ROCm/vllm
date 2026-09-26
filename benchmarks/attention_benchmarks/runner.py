@@ -91,11 +91,41 @@ def log_warnings_and_errors_only():
 # ============================================================================
 
 
+def _block_rows(
+    q_lens: list[int],
+    kv_lens: list[int],
+    block_size: int,
+    sliding_window: int | None,
+) -> tuple[list[list[int]], int]:
+    """Block table rows and the number of KV blocks to allocate.
+
+    A windowed layer, as vLLM's sliding-window manager keeps it, holds only
+    the blocks some query's window reaches; the earlier entries name the null
+    block 0.  Allocating the whole sequence instead would spread the few
+    blocks read over a buffer many times larger than what is touched.
+    """
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    if sliding_window is None:
+        rows = [
+            list(range(r * max_blocks, (r + 1) * max_blocks))
+            for r in range(len(kv_lens))
+        ]
+        return rows, len(kv_lens) * max_blocks
+    rows, nxt = [], 1
+    for q, kv in zip(q_lens, kv_lens):
+        first = max(0, kv - q - (sliding_window - 1)) // block_size
+        live = max_blocks - first
+        rows.append([0] * first + list(range(nxt, nxt + live)))
+        nxt += live
+    return rows, nxt
+
+
 def _build_common_attn_metadata(
     q_lens: list[int],
     kv_lens: list[int],
     block_size: int,
     device: torch.device,
+    sliding_window: int | None = None,
 ) -> CommonAttentionMetadata:
     """Build CommonAttentionMetadata from query/kv lengths."""
     batch_size = len(q_lens)
@@ -110,11 +140,8 @@ def _build_common_attn_metadata(
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
     max_seq_len = int(seq_lens.max().item())
 
-    max_blocks = (max(kv_lens) + block_size - 1) // block_size
-    num_blocks = batch_size * max_blocks
-    block_table_tensor = torch.arange(
-        num_blocks, dtype=torch.int32, device=device
-    ).view(batch_size, max_blocks)
+    rows, _ = _block_rows(q_lens, kv_lens, block_size, sliding_window)
+    block_table_tensor = torch.tensor(rows, dtype=torch.int32, device=device)
     slot_mapping = torch.arange(total_tokens, dtype=torch.int64, device=device)
 
     max_query_len = max(q_lens)
@@ -510,12 +537,11 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
-    max_kv = max(kv_lens)
-    batch_size = len(q_lens)
 
-    # Calculate total blocks needed: batch_size * max_blocks_per_request
-    max_blocks_per_request = (max_kv + config.block_size - 1) // config.block_size
-    max_num_blocks = batch_size * max_blocks_per_request
+    # KV blocks to allocate: every request's whole sequence, or its window.
+    _, max_num_blocks = _block_rows(
+        q_lens, kv_lens, config.block_size, config.sliding_window
+    )
 
     # One KV cache per layer, so the layer loop is also a rotation over
     # disjoint KV; grow it when asked, to push the working set out of cache.
@@ -556,7 +582,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 get_kv_cache_layout.cache_clear()
 
             common_metadata = _build_common_attn_metadata(
-                q_lens, kv_lens, config.block_size, device
+                q_lens, kv_lens, config.block_size, device, config.sliding_window
             )
 
             kv_cache_spec = FullAttentionSpec(

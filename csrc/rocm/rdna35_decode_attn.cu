@@ -145,11 +145,16 @@ static_assert(NUM_Q_HEADS % NUM_KV_HEADS == 0, "GQA must be integral");
 static_assert(BS % 16 == 0, "a 16-key tile must sit inside one page");
 
   #if TIMING
+    // Workgroups TS_WG0..TS_WG0+7 are recorded.
+    #ifndef TS_WG0
+      #define TS_WG0 0
+    #endif
 __device__ unsigned long long g_ts[8 * 16];
-    #define TS(i)                                                              \
-      do {                                                                     \
-        if (tid == 0 && blockIdx.x < 8)                                        \
-          g_ts[blockIdx.x * 16 + (i)] = __builtin_amdgcn_s_sendmsg_rtnl(0x83); \
+    #define TS(i)                                                      \
+      do {                                                             \
+        const unsigned w_ = blockIdx.x - TS_WG0;                       \
+        if (tid == 0 && w_ < 8)                                        \
+          g_ts[w_ * 16 + (i)] = __builtin_amdgcn_s_sendmsg_rtnl(0x83); \
       } while (0)
   #else
     #define TS(i) \

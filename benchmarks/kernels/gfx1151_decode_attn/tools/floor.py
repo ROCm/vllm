@@ -169,21 +169,23 @@ def main() -> None:
         print(f"| {kib} | {us:.2f} | {roof:.2f} | {roof / us * 100:.1f} % |")
 
     shapes, _ = shapeset.load(args)
-    configs = sorted({(s.d, s.hq, s.hkv) for s in shapes if s.d != 96})
-    print("\n| D | Hq | Hkv | M | ceiling geomean | ceiling @128 |")
-    print("| --- | --- | --- | --- | --- | --- |")
-    for d, hq, hkv in configs:
+    configs = sorted({(s.d, s.hq, s.hkv, s.window) for s in shapes if s.d != 96})
+    win = "window | " if args.windowed else ""
+    print(f"\n| D | Hq | Hkv | {win}M | ceiling geomean | ceiling @128 |")
+    print("| --- " * (6 + bool(win)) + "|")
+    for d, hq, hkv, w in configs:
         for m in (1, 4):
             r = []
             for s in CONTEXTS:
-                roof = shapeset.roofline_us(hq, hkv, d, m, s)
+                roof = shapeset.roofline_us(hq, hkv, d, m, s, window=w)
                 nbytes = (
                     (roof - shapeset.DISPATCH_US) * 1e-6 * shapeset.PEAK_GIBS * 1024**3
                 )
                 r.append(roof / floor_us(floor, nbytes))
             g = math.exp(sum(map(math.log, r)) / len(r)) * 100
             first = r[0] * 100
-            print(f"| {d} | {hq} | {hkv} | {m} | {g:.1f} % | {first:.1f} % |")
+            wc = f"{w} | " if win else ""
+            print(f"| {d} | {hq} | {hkv} | {wc}{m} | {g:.1f} % | {first:.1f} % |")
 
 
 if __name__ == "__main__":

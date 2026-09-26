@@ -182,7 +182,34 @@ _TUNED_BF16: dict[tuple[int, int, int, int], _Knobs] = {
 # Sliding-window layers, keyed on (Hq, Hkv, D, M, window).  They read only the
 # window's keys whatever the sequence length, so they are tuned apart from the
 # full-attention layers that share their shape (gemma interleaves the two).
-_TUNED_SWA: dict[tuple[int, int, int, int, int], _Knobs] = {}
+_TUNED_SWA: dict[tuple[int, int, int, int, int], _Knobs] = {
+    (8, 1, 256, 1, 512): {"dot": 1, "nw": 8, "nseg": 4, "bfly": 4},
+    (8, 1, 256, 4, 512): {
+        "nw": 4,
+        "rg": 1,
+        "minb": 1,
+        "nseg": 16,
+        "rspl": 2,
+        "pf": 1,
+    },
+    (8, 2, 256, 1, 512): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 4, "gt": 1},
+    (8, 2, 256, 4, 512): {
+        "nw": 4,
+        "rg": 1,
+        "minb": 1,
+        "nseg": 8,
+        "dspl": 4,
+        "pf": 1,
+    },
+    (8, 4, 256, 1, 1024): {"dot": 1, "nw": 8, "nseg": 4, "bfly": 4, "gt": 1},
+    (8, 4, 256, 4, 1024): {"dot": 1, "nw": 8, "nseg": 4, "bfly": 4, "gt": 1},
+    (8, 4, 256, 1, 4096): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 2},
+    (8, 4, 256, 4, 4096): {"nw": 8, "rg": 1, "minb": 2, "nseg": 4},
+    (16, 8, 256, 1, 1024): {"dot": 1, "nw": 8, "nseg": 1, "bfly": 4, "gt": 1},
+    (16, 8, 256, 4, 1024): {"nw": 4, "rg": 2, "minb": 2, "nseg": 1},
+    (32, 16, 256, 1, 1024): {"dot": 1, "nw": 4, "nseg": 1, "bfly": 4},
+    (32, 16, 256, 4, 1024): {"nw": 2, "rg": 1, "minb": 2, "nseg": 1},
+}
 
 
 def _knobs_for(
