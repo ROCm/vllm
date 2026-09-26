@@ -1622,3 +1622,29 @@ tile in LDS and has every thread write eight consecutive floats, as the
 | every other full-attention and window pair | within +-0.5 % of golden geomean |
 
 A knob searched by `tune.py`, landed on the one row it wins.
+
+## 026 — HND required by the backend; end to end
+
+vLLM's default KV layout is NHD, and nothing made this backend get HND
+unless `VLLM_KV_CACHE_LAYOUT` was set -- every number here is HND.  The
+backend now returns `"HND"` from `get_required_kv_cache_layout`, as
+FlashInfer does on SM100.  The Triton paths it keeps are faster on HND as
+well (`benchmark.py --backends TRITON_ATTN`, NHD -> HND):
+
+| D, Hq/Hkv | q512 | q2k | q1ks4k | 8q1s4k | 2q1k_16q1s4k |
+| --- | --- | --- | --- | --- | --- |
+| 128, 32/8 | 1.03x | 1.05x | 1.04x | 1.27x | 1.30x |
+| 256, 8/4 | 1.04x | 1.05x | 1.04x | 1.13x | 1.07x |
+| 256, 16/8 | 1.03x | 1.05x | 1.06x | 1.13x | 1.05x |
+
+End to end, no layout variable set: gemma-4-E2B-it (windowed 8/1/256 w512
+and global 8/1/512 layers) and Qwen3-0.6B, bf16, compiled with CUDA graphs:
+the log shows HND chosen for the backend, the windowed and global variants
+built and run, and greedy output identical to TRITON_ATTN on gemma-4-E2B
+(both backends), and on Qwen3-0.6B identical on two of three prompts, the
+third diverging after ~15 tokens (bf16 rounding between two kernels).
+
+Found on the way: in gemma-4 vLLM gives the windowed D=256 layers 32-key
+pages (so their page matches the D=512 layers' 16-key one).  `_TUNED_SWA`
+was tuned at 16; at 32 the same rows measure within 1 % except 8/1 M=4 and
+32/16 M=4 (0.98x), so the table is not keyed on the block size.

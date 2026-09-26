@@ -22,6 +22,7 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
 )
+from vllm.v1.attention.backends.utils import KVCacheLayoutType
 from vllm.v1.attention.ops.rdna35_hip_decode import (
     KernelVariant,
     VariantBuildError,
@@ -288,6 +289,13 @@ class Rdna35HipAttentionBackend(TritonAttentionBackend):
     @classmethod
     def supports_sliding_window(cls) -> bool:
         return True
+
+    @classmethod
+    def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
+        # Keys of one head contiguous in a page.  The decode kernel is tuned
+        # on it, and the Triton paths this backend keeps (prefill, batch > 1)
+        # run faster on it too: 3-5 % prefill, 13-27 % batched decode.
+        return "HND"
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:

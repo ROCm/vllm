@@ -53,6 +53,7 @@ Commits on top of it, 2026-09-25:
 | `2c7b87b6e8` (021, 022) | full-range re-tune (dot rows at D=256/512 M=1, PF at D=64), `_TUNED_BF16`, sliding window in kernel/backend/tests |
 | `82ef301b1d` (022) | `_TUNED_SWA` rows; the harness allocates only a window's blocks |
 | `6f8a9c9f6c` (025) | CPUB: split-KV partials staged in LDS and written a line at a time |
+| (026) | the backend requires HND; gemma-4-E2B end to end |
 
 ### The performance picture
 
@@ -199,14 +200,14 @@ contexts; land a row only if a `matrix.py` run beats golden/ on it (the
 tuner's single sample picks within noise), and confirm it in bf16 -- the dot
 rows did not hold there (`_TUNED_BF16`).
 
-### 4.3 Decide the KV layout, then fix what it exposes
+### 4.3 The KV layout is decided: HND
 
-All the numbers here are HND. vLLM's default is NHD, and under NHD with
-shuffled pages the current kernel is 4-8 % slower than the pre-commit one at
-S >= 16384 on some D=256 configurations. Re-tuning recovers the M=1 ones
-(`8/4`, `16/4`, `16/8` at `nw=4, dspl=4, minb=2`: +4-5 points), but not
-`8/4/256` and `16/8/256` at M=4, so a kernel change is responsible there. It
-has not been bisected. Nothing NHD-specific has been applied.
+The backend requires HND (`get_required_kv_cache_layout`, 026), so vLLM
+allocates it for this backend whatever `VLLM_KV_CACHE_LAYOUT` says.  The
+Triton paths it keeps are faster on HND too (prefill 3-5 %, batched decode
+13-27 %).  NHD is still accepted by the kernel (a tensor handed in by other
+code), untuned: under NHD with shuffled pages it was 4-8 % slower than the
+pre-commit kernel at S >= 16384 on some D=256 configurations, never bisected.
 
 ### 4.4 The ISA work that is still open
 
@@ -261,13 +262,14 @@ What is left would remove a round trip, not shrink one.
 
 ## 5. Traps that cost us time
 
-### 5.1 The KV layout is an environment variable
+### 5.1 The KV layout was an environment variable
 
-`matrix.py` goes through the backend, which reads the layout vLLM chose.
-Without `VLLM_KV_CACHE_LAYOUT=HND` it measures NHD, and both our kernel and
-Triton come out 10-28 % slower on many shapes. One full session of
-"regressions" was a matrix taken without it compared against one taken with
-it. Check the variable before comparing any two tables.
+Before 026 the backend took the layout vLLM chose, and without
+`VLLM_KV_CACHE_LAYOUT=HND` a matrix measured NHD, 10-28 % slower for both our
+kernel and Triton.  One full session of "regressions" was a matrix taken
+without it compared against one taken with it.  The backend now forces HND,
+but the Triton column of `matrix.py` still follows the variable: keep
+`VLLM_KV_CACHE_LAYOUT=HND` so both columns see the same cache.
 
 ### 5.2 RG > 1 shares its KV through L2, and that sharing is fragile
 
