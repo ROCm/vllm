@@ -1648,3 +1648,50 @@ Found on the way: in gemma-4 vLLM gives the windowed D=256 layers 32-key
 pages (so their page matches the D=512 layers' 16-key one).  `_TUNED_SWA`
 was tuned at 16; at 32 the same rows measure within 1 % except 8/1 M=4 and
 32/16 M=4 (0.98x), so the table is not keyed on the block size.
+
+## 027 — Batched decode
+
+**Status:** landed, `813f1f5b95`.
+
+End to end, every decode step with more than one sequence fell back to
+Triton.  `BATCH=1` builds put the sequence on `grid.y`; the wrapper moves
+`q`, `out`, the block-table row, `seq_lens` and the scratch to that sequence
+and runs the body unchanged.  `BATCH=0` stays the single-sequence kernel byte
+for byte: a first version with the batch addressing always compiled in lost
+0.1-2.6 % at one sequence (waiting for S before an early exit, and the
+pointer arithmetic), so B -- a shape, fixed per CUDA graph, not S -- selects
+the build.  S=0, a graph batch padded past its sequences, returns at once;
+without that exit the windowed body faults on it.
+
+The backend serves batches whose sequences share a query length up to 8.
+Past 8 a single prompt used to reach the kernel too, compiling one variant
+per prompt length.  Scratch is shared by the layers of a variant (they run
+one after another) and sized for `max_num_seqs` within 64 MiB.  Two
+batch-only choices, both on B:
+
+- segments per sequence capped so the batch lands near `BTARGET` = 64
+  workgroups (32, 64 and 128 measured the same on 32/8/128 and 8/4/256);
+- dot rows give way to their WMMA rows: 16/2/512 at 8 x 4k 827 -> 600 us,
+  8/1/256 169 -> 152 us.
+
+`benchmark.py --backends RDNA35_HIP_ATTN TRITON_ATTN`, HND, speed-up over
+Triton:
+
+| D, Hq/Hkv | 2 x 4k | 8 x 4k | 8 x 4k, M=4 | 32 x 1k | 64 x 1k |
+| --- | --- | --- | --- | --- | --- |
+| 64, 32/8 | 1.16x | 1.12x | 1.48x | 1.02x | 1.04x |
+| 64, 16/2 | 1.14x | 1.05x | 1.09x | 1.13x | 1.12x |
+| 128, 32/8 | 1.04x (1k: 1.12x) | 1.01x | 1.02x | 1.02x | 0.96x |
+| 128, 16/4 | 1.04x | 1.04x | 1.08x | 1.12x | 1.02x |
+| 128, 32/2 | 1.28x | 1.12x | 1.38x | 1.25x | 1.75x |
+| 256, 8/1 | 1.25x | 1.18x | 1.34x | 1.21x | 1.58x |
+| 256, 8/4 | 1.15x | 1.13x | 1.08x | 1.15x | 1.21x |
+| 256, 16/8 | 1.20x | 1.08x | 1.20x | 1.28x | 1.19x |
+| 512, 16/2 | 2.59x | 2.21x | 2.88x | 2.21x | 2.12x |
+
+(32/8/128 at 2 x 1k; 8/1/256 and 16/2/512 after the WMMA-row change, the
+others before it, which does not touch them.)  The one loss, 32/8/128 at
+64 x 1k, is 256 MiB where both are near roof (90 against 94 %); its row
+splits rows over two workgroups sharing KV through L2 (RG=2, §5.2 of
+HANDOFF), which a batch of 1024 workgroups may not keep.  Untuned: every
+batch runs the single-sequence row.

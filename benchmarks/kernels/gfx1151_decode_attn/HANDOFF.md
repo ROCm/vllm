@@ -19,8 +19,8 @@ fp16 unless it says bf16, **HND** (see §5.1). Nothing is estimated.
 
 ## 1. Where things stand
 
-`RDNA35_HIP_ATTN` serves 49 of the 50 shapes in `tools/shapes.csv` with one
-kernel, `csrc/rocm/rdna35_decode_attn.cu`, in fp16 and in bf16; it refuses
+`RDNA35_HIP_ATTN` serves 49 of the 50 shapes in `tools/shapes.csv`, one
+sequence or a batch of them (027), with one kernel, `csrc/rocm/rdna35_decode_attn.cu`, in fp16 and in bf16; it refuses
 D=96 (three elements per lane) and falls back to Triton.  The nine
 sliding-window rows (Gemma 3/4, PaliGemma 2; six distinct configurations)
 are served too, with rows of their own keyed by window (`_TUNED_SWA`, 022);
@@ -54,6 +54,7 @@ Commits on top of it, 2026-09-25:
 | `82ef301b1d` (022) | `_TUNED_SWA` rows; the harness allocates only a window's blocks |
 | `6f8a9c9f6c` (025) | CPUB: split-KV partials staged in LDS and written a line at a time |
 | `29feb4a997` (026) | the backend requires HND; gemma-4-E2B end to end |
+| `813f1f5b95` (027) | batched decode: grid.y per sequence, uniform query lengths up to 8 |
 
 ### The performance picture
 
@@ -243,7 +244,12 @@ The dot-against-WMMA comparison this section used to propose is done (018): dot 
 
 ### 4.6 D=96, and the batch axis
 
-Unchanged: D=96 is three elements per lane; batch > 1 falls back to Triton.
+D=96 is three elements per lane, still Triton.  Batches of equal query
+length up to 8 run the kernel (027), 1.02-2.9x Triton except 32/8/128 at
+64 x 1k (0.96x).  Open: the batch runs the single-sequence row -- a row
+tuned per batch size (B is a shape, allowed to select knobs) is the next
+step, starting with RG for 32/8/128; mixed batches (a prefill with decodes)
+still go to Triton whole.
 
 ### 4.7 The fixed cost of split KV at short context
 
