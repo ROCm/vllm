@@ -1600,3 +1600,25 @@ scales with the partial, not with the output element it ends in.  And not
 faster: 0.92-0.93x on 8/1/256 M=4 w512, 0.94-1.00x on 16/2/256 M=4,
 0.97-1.00x on 32/2/128 M=4, 1.00-1.02x on 16/1/512 M=4.  The 1.26x of the
 ablation in 023 is the publish and merge not happening, not their bytes.
+
+## 025 — CPUB: split-KV partials written a line at a time
+
+**Status:** landed, `6f8a9c9f6c`, on `8/1/256` M=4 w512.
+
+Splitting 023's ablation: skipping only the partial stores is 1.12-1.19x on
+8/1/256 M=4 w512, only the merge's loads 1.03-1.05x.  And 16-bit partials,
+half the bytes, were slower (024) -- so the store pattern, not the volume.
+The ISA of that row (TFIN == 1: the merge's tree ends in one live tile,
+because two tiles' slots exceed the LDS budget) writes the partials straight
+from registers: each `global_store_b128` covers 32 bytes of 16 different
+rows, and a 128-byte line takes four partial writes.  `CPUB=1` stages the
+tile in LDS and has every thread write eight consecutive floats, as the
+`TFIN > 1` path already did.
+
+| configuration | result |
+| --- | --- |
+| 8/1/256 M=4 w512 | 1.019-1.06x every cell, fp16 and bf16 (geomean 1.033x / 1.030x) |
+| 16/1/512 M=4 | 0.985x at S=128, 0.996-0.997x beyond |
+| every other full-attention and window pair | within +-0.5 % of golden geomean |
+
+A knob searched by `tune.py`, landed on the one row it wins.

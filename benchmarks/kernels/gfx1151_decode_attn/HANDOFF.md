@@ -29,7 +29,7 @@ the tools select them with `--windowed`.
 The kernel is the WMMA rewrite of OPTIMIZATIONS 009: one workgroup per
 `(kv head, row group, KV segment)`, both products on
 `v_wmma_f32_16x16x16_f16` (`_bf16` in bf16), knobs
-`NSEG / RG / MINB / NW / DSPL / RSPL / PF` per configuration in `_TUNED`
+`NSEG / RG / MINB / NW / DSPL / RSPL / PF / CPUB` per configuration in `_TUNED`
 (`vllm/v1/attention/backends/rdna35_hip_attn.py`).
 
 **One configuration per `(Hq, Hkv, D, M)`, chosen for the whole context
@@ -52,6 +52,7 @@ Commits on top of it, 2026-09-25:
 | `c219ce6083`, `5d1204997f` (018) | the dot decomposition as a mode; short mode of all twelve D=256/512 M=1 rows (S=128 1.12-1.34x); D=64 PF rows |
 | `2c7b87b6e8` (021, 022) | full-range re-tune (dot rows at D=256/512 M=1, PF at D=64), `_TUNED_BF16`, sliding window in kernel/backend/tests |
 | `82ef301b1d` (022) | `_TUNED_SWA` rows; the harness allocates only a window's blocks |
+| `6f8a9c9f6c` (025) | CPUB: split-KV partials staged in LDS and written a line at a time |
 
 ### The performance picture
 
@@ -124,7 +125,7 @@ long conversation sees; `ceiling` is `floor.py --windowed` at those bytes.
 | 8/4/256 | 4096 | 90.4 % | 87.6 % | 92.4 % | 1.32x / 1.31x |
 | 8/4/256 | 1024 | 88.3 % | 81.5 % | 93.9 % | 1.72x / 1.83x |
 | 8/2/256 | 512 | 75.6 % | 64.2 % | 84.6 % | 2.84x / 3.50x |
-| 8/1/256 | 512 | 64.0 % | 46.7 % | 80.8 % | 3.76x / 3.15x |
+| 8/1/256 | 512 | 64.0 % | 48.1 % | 80.8 % | 3.76x / 3.25x |
 
 The small windows are short contexts forever: their gap is the fixed cost of
 §4.7, not the window.
@@ -246,14 +247,15 @@ Unchanged: D=96 is three elements per lane; batch > 1 falls back to Triton.
 ### 4.7 The fixed cost of split KV at short context
 
 What is left at short context, and all of what is left on the small windows
-(8/1 and 8/2 at w512: 64-76 % at M=1, 47-64 % at M=4, ceilings 81-85 %), is
+(8/1 and 8/2 at w512: 64-76 % at M=1, 48-64 % at M=4, ceilings 81-85 %), is
 the split-KV tail: publishing the partials, seeing the last arrival, merging
 -- ~2 us of a 5 us kernel on 8/1/256 M=4 w512 (023).  An ablation that
 skips the partials is 1.26x, but it is their round trip that costs, not
 their bytes: 16-bit partials are no faster and 25-120x less accurate (024).
 More segments, balanced segments, RG instead of RSPL, polling the arrival
 counter, lighter fences and 16-wave workgroups were measured and lose
-(023, 024).  What is left would remove a round trip, not shrink one.
+(023, 024).  The write pattern of the partials did matter: CPUB (025).
+What is left would remove a round trip, not shrink one.
 
 ---
 
