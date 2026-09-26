@@ -30,14 +30,11 @@ The kernel is the WMMA rewrite of OPTIMIZATIONS 009: one workgroup per
 `NSEG / RG / MINB / NW / DSPL / RSPL / PF` per configuration in `_TUNED`
 (`vllm/v1/attention/backends/rdna35_hip_attn.py`).
 
-Since 016 a build can carry **two decompositions** of its configuration and
-run the second when the S it reads on the device is `>= SW`.  The
-configuration -- grid, block, both knob sets, `SW` -- is still one per
-`(Hq, Hkv, D, M)`, fixed at graph capture; S only picks the code path inside
-the launch, as it already picked the number of active segments.  The short
-mode can be the **dot decomposition** of reference/ (`DOT=1`, 018), which
-wins below ~4k keys at D=256/512 M=1.  A row with `sw` in `_TUNED` is a
-two-mode build; its `...2` knobs are mode B's.
+**One configuration per `(Hq, Hkv, D, M)`, chosen for the whole context
+range.**  S is a runtime value: it may bound the work (active segments,
+masking) but never select knobs or a decomposition.  `DOT=1` picks the
+per-q-head dot-product decomposition of reference/ (018) instead of WMMA,
+for the whole configuration, when it wins over the full range.
 
 Commits on top of it, 2026-09-25:
 
@@ -48,8 +45,8 @@ Commits on top of it, 2026-09-25:
 | `16621e4856` (012) | `16/2/512` M=1 re-tuned to `rg=1` (§5.2) |
 | `88fb3dc37b` (013) | bf16: a compile-time dtype, bf16 WMMAs, `--dtype` in the tools (§1, bf16) |
 | `83415bcc26` (014, 015) | S read on the device (a host S was frozen into full CUDA graphs); RSPL, rows split inside the workgroup over a shared tile |
-| `9ae12f67da` (016) | two decompositions per build, switched on the device by S; `tune.py --split` |
-| `8cd55c5497` (017) | PF, a second tile in flight where it fits; six two-mode rows |
+| `9ae12f67da` (016) | two decompositions per build switched by S -- **removed** in `1e3e0ade83` (020): knobs may not depend on S |
+| `8cd55c5497` (017) | PF, a second tile in flight where it fits |
 | `c219ce6083`, `5d1204997f` (018) | the dot decomposition as a mode; short mode of all twelve D=256/512 M=1 rows (S=128 1.12-1.34x); D=64 PF rows |
 
 ### The performance picture
@@ -168,16 +165,16 @@ OPTIMIZATIONS 010-019 describe the state above.  `golden/` still holds the
 2026-09-25 fp16 result from before 014; regenerate it (and `golden/bf16.md`)
 from a full matrix once §4.2 is done.
 
-### 4.2 Re-tune everything with `--split`
+### 4.2 Re-tune everything
 
-Two-mode rows exist for D=256/512 M=1 (all twelve, dot below 4096), six
-low-kv-head configurations and five at D=64 (OPTIMIZATIONS 017-018).  The rest
-of `_TUNED` is still single-mode.  `tune.py --split 4096 --contexts 128 512
-2048 4096 16384 32768` takes ~25 minutes per configuration; land a row only
-if a `matrix.py` run beats golden/ on it (the tuner's single sample picks
-within noise: three of nine rows lost 1-5 % in the first pass).  The switch
-point is fixed at 4096; where the two modes cross earlier (`32/4/512`, 0.93x
-at S=1024) a per-configuration `--split` would recover it.
+`tune.py` now searches RSPL, PF and the dot decomposition as well, scored
+by the geomean over the whole context range.  The 29 rows that were
+two-mode went back to their earlier values in 020 and are being re-tuned
+that way; the rest of `_TUNED` predates RSPL, PF and DOT.  ~25 minutes per
+configuration on five contexts; land a row only if a `matrix.py` run beats
+golden/ on it (the tuner's single sample picks within noise).  golden/ and
+the table in §1 were taken with the two-mode rows and must be regenerated
+after this re-tune.
 
 `_TUNED` is keyed without the dtype: bf16 moves the same bytes and measured
 within 1 % of fp16 everywhere, so one table serves both. Tune in fp16 and
@@ -222,7 +219,7 @@ After 014-018, all at M=4 with one or two kv heads, most of them exactly
 - the fixed tail: wave skew at the loop end (0.4-1.3 us), the split-KV
   publish, atomic and merge (~1.5-2 us) -- 2-4 % of an 80 us call.
 
-The dot-against-WMMA comparison this section used to propose is done (018).
+The dot-against-WMMA comparison this section used to propose is done (018): dot wins short contexts at D=256/512 M=1 and loses long ones, so over the full range it rarely wins.
 
 ### 4.6 D=96, and the batch axis
 
@@ -322,12 +319,6 @@ can no longer count what is outstanding: it waits `vmcnt(0)`, which drains
 whatever prefetch was meant to stay in flight (015, 019).  Loads meant to
 overlap must be unconditional (clamp the address instead).
 
-### 5.14 Two bodies in one kernel do not compile alike
-
-The body inside the mode branch is compiled worse than the one after it
-(2-4 % and 15 % measured, 016); the long mode falls through.  A new mode
-body should be measured both ways.
-
 ---
 
 ## 6. Refuted on the WMMA kernel — do not re-derive
@@ -407,11 +398,6 @@ amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py \
 # tune one configuration
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py \
     --hq 32 --hkv 8 --head-dim 128 --m 1
-
-# tune it as a two-mode build switching at S=4096
-amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py \
-    --hq 32 --hkv 8 --head-dim 128 --m 1 --split 4096 \
-    --contexts 128 512 2048 4096 16384 32768
 
 # the ceiling
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/floor.py

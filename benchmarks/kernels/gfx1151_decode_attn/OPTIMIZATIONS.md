@@ -1422,7 +1422,7 @@ does.  Loads-only (`ABLATE=64`) on it reaches 88.4 % at 16k, 93.5 % at 32k.
 
 ## 016 — Two decompositions per build, switched on the device
 
-**Status:** landed, `9ae12f67da`.
+**Status:** landed `9ae12f67da`, removed in 020 (`1e3e0ade83`).
 
 Short and long sequences want different splits of one configuration: row
 groups and no merge below ~4k keys, many segments (and RSPL where it applies)
@@ -1488,3 +1488,16 @@ The ceiling behind the remaining long cells: a pure stream (`floor.py`) is at
 reproducibly, whatever the buffer's alignment.  Most cells still under 90 %
 are exactly 16 MiB of KV (Hkv=2 D=128 or Hkv=1 D=256 at 16k, Hkv=2 D=64 at
 32k), where a kernel has 2.4 % for everything that is not streaming.
+
+## 020 — The S switch removed
+
+**Status:** landed, `1e3e0ade83`; reverts 016's switch and the two-mode rows.
+
+A configuration is chosen for the whole context range.  016 kept the grid
+and block fixed and let the kernel read S, but each side of the switch had
+knobs tuned only for its side, so the tuning depended on S -- which the
+project's rule excludes.  The kernel builds one decomposition again; `DOT`
+remains a knob of the whole configuration.  What 016-018 measured stays
+true and is the reason the re-tune now searches RSPL, PF and DOT: the
+short-context wins of the dot mode (S=128 1.12-1.34x at D=256/512 M=1) are
+only available where the dot decomposition also holds up at long context.
