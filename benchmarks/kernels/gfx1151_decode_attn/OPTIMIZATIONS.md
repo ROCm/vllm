@@ -1573,12 +1573,8 @@ is publish, arrival and merge.
 | waiters poll the arrival counter instead of a generation the last one writes | 1.3-1.7 % faster at S=128 on full-attention shapes, 5-6 % slower on 8/1 M=4 w512 whatever the poll interval |
 | no partial acc written or read (ablation, wrong answers) | 1.26x on 8/1 M=4 w512, 1.17x on 16/1/512 M=4 at S=128, 1.00x where the partials are small |
 
-The last line bounds what 16-bit partials could give: roughly half of it.
-They were not tried, because they change precision: rounding a partial costs
-up to 2^-12 of the partial, not of the output, and where segments cancel
-that is ~1e-2 of an output element near the 1e-3 floor of `max_rel`,
-against the 1e-3 the kernel is held to.  A decision for the owner, not a
-tuning.
+The last line bounds what 16-bit partials could give.  They were tried in
+024 and lose on both counts.
 
 ## 024 — The split-KV tail in the ISA, and 32/2/128 M=4: measured, not landed
 
@@ -1595,3 +1591,12 @@ same tile for their row tiles, and it does not survive in L2).  RSPL reads
 it once and is slower, so the extra reads of RG=4 are not what holds the
 cell under 90 %; the 16 MiB ceiling of 019 (92.4 %) and the per-tile
 barriers are.
+
+16-bit partials (`PH`, the partial divided by its row sum and rounded to
+fp16, merged with the row sums as weights; not landed): `max_rel`
+1.2e-2 to 5.8e-2 against 4.9e-4 with fp32 partials, on 8/1/256, 16/1/512,
+32/2/128 M=4 and 16/4/128 M=1 up to S=16384 -- a partial's rounding error
+scales with the partial, not with the output element it ends in.  And not
+faster: 0.92-0.93x on 8/1/256 M=4 w512, 0.94-1.00x on 16/2/256 M=4,
+0.97-1.00x on 32/2/128 M=4, 1.00-1.02x on 16/1/512 M=4.  The 1.26x of the
+ablation in 023 is the publish and merge not happening, not their bytes.

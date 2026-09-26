@@ -248,12 +248,12 @@ Unchanged: D=96 is three elements per lane; batch > 1 falls back to Triton.
 What is left at short context, and all of what is left on the small windows
 (8/1 and 8/2 at w512: 64-76 % at M=1, 47-64 % at M=4, ceilings 81-85 %), is
 the split-KV tail: publishing the partials, seeing the last arrival, merging
--- ~2 us of a 5 us kernel on 8/1/256 M=4 w512 (023).  The partials are as
-large as the KV there (32 rows x 256 x 4 B x 16 segments = 512 KiB), and an
-ablation that skips them is 1.26x.  16-bit partials would take about half of
-that, at a precision cost the owner has to accept first (023).  More
-segments, balanced segments, RG instead of RSPL, and polling the arrival
-counter were measured and lose (023).
+-- ~2 us of a 5 us kernel on 8/1/256 M=4 w512 (023).  An ablation that
+skips the partials is 1.26x, but it is their round trip that costs, not
+their bytes: 16-bit partials are no faster and 25-120x less accurate (024).
+More segments, balanced segments, RG instead of RSPL, polling the arrival
+counter, lighter fences and 16-wave workgroups were measured and lose
+(023, 024).  What is left would remove a round trip, not shrink one.
 
 ---
 
