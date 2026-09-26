@@ -27,8 +27,18 @@ sliding-window rows are skipped by every tool.
 The kernel is the WMMA rewrite of OPTIMIZATIONS 009: one workgroup per
 `(kv head, row group, KV segment)`, both products on
 `v_wmma_f32_16x16x16_f16` (`_bf16` in bf16), knobs
-`NSEG / RG / MINB / NW / DSPL` per configuration in `_TUNED`
+`NSEG / RG / MINB / NW / DSPL / RSPL / PF` per configuration in `_TUNED`
 (`vllm/v1/attention/backends/rdna35_hip_attn.py`).
+
+Since 016 a build can carry **two decompositions** of its configuration and
+run the second when the S it reads on the device is `>= SW`.  The
+configuration -- grid, block, both knob sets, `SW` -- is still one per
+`(Hq, Hkv, D, M)`, fixed at graph capture; S only picks the code path inside
+the launch, as it already picked the number of active segments.  The short
+mode can be the **dot decomposition** of reference/ (`DOT=1`, 018), which
+wins below ~4k keys at D=256/512 M=1.  A row with `sw` in `_TUNED` is a
+two-mode build; its `...2` knobs are mode B's.
+
 Commits on top of it, 2026-09-25:
 
 | commit | what |
@@ -37,6 +47,10 @@ Commits on top of it, 2026-09-25:
 | `c17a8bda13` (011) | split-KV merge shared across the segments when a group's partials reach 64 KiB. D=512 S=128 up to +56 % |
 | `16621e4856` (012) | `16/2/512` M=1 re-tuned to `rg=1` (§5.2) |
 | `88fb3dc37b` (013) | bf16: a compile-time dtype, bf16 WMMAs, `--dtype` in the tools (§1, bf16) |
+| `83415bcc26` (014, 015) | S read on the device (a host S was frozen into full CUDA graphs); RSPL, rows split inside the workgroup over a shared tile |
+| `9ae12f67da` (016) | two decompositions per build, switched on the device by S; `tune.py --split` |
+| `8cd55c5497` (017) | PF, a second tile in flight where it fits; six two-mode rows |
+| `c219ce6083`, `5d1204997f` (018) | the dot decomposition as a mode; short mode of all twelve D=256/512 M=1 rows (S=128 1.12-1.34x); D=64 PF rows |
 
 ### The performance picture
 
@@ -150,17 +164,20 @@ floor alone is 65-85 % of roof depending on bytes (`floor.py`).
 
 ### 4.1 Keep the record current
 
-OPTIMIZATIONS 010-013 and `golden/` describe the state above. `golden/` holds
-the 2026-09-25 result; replace it after the re-tune in §4.2 if that beats it.
+OPTIMIZATIONS 010-019 describe the state above.  `golden/` still holds the
+2026-09-25 fp16 result from before 014; regenerate it (and `golden/bf16.md`)
+from a full matrix once §4.2 is done.
 
-### 4.2 Re-tune everything
+### 4.2 Re-tune everything with `--split`
 
-`_TUNED` is still the first tuning pass, made before the three commits. A
-second pass was run on the pre-commit kernel and never integrated; it is
-obsolete now. The merge change in particular moves the NSEG/MINB optimum on
-D=512 and D=256. One configuration takes about 3.5 minutes on two contexts,
-so all 52 are ~3 hours plus a validating matrix. Validate every new row at
-all seven contexts.
+Two-mode rows exist for D=256/512 M=1 (all twelve, dot below 4096), six
+low-kv-head configurations and five at D=64 (OPTIMIZATIONS 017-018).  The rest
+of `_TUNED` is still single-mode.  `tune.py --split 4096 --contexts 128 512
+2048 4096 16384 32768` takes ~25 minutes per configuration; land a row only
+if a `matrix.py` run beats golden/ on it (the tuner's single sample picks
+within noise: three of nine rows lost 1-5 % in the first pass).  The switch
+point is fixed at 4096; where the two modes cross earlier (`32/4/512`, 0.93x
+at S=1024) a per-configuration `--split` would recover it.
 
 `_TUNED` is keyed without the dtype: bf16 moves the same bytes and measured
 within 1 % of fp16 everywhere, so one table serves both. Tune in fp16 and
@@ -191,30 +208,21 @@ Measured but not landed, in rough order of expected value:
 The loop is **not** VALU-bound: lazy rescaling removed 64 multiplies per tile
 and measured neutral even at S=16384 on M=4.
 
-### 4.5 Dispatch dot or WMMA by model configuration
+### 4.5 The long cells still under 90 % of roof
 
-To explore. The two kernels win in different places: the WMMA kernel reads
-the KV once per kv head and wins wherever GQA x M fills its 16-row tiles
-(D=512 M=4 went 59.7 -> 71.1 %roof over the dot kernel), while the dot
-kernel, one workgroup per q head, still beat it on D=512 M=1 at S=128-1024
-before 010-012 (geomean 82.9 against 73.3 %, `reference/golden_d512_dot.md`),
-where few real rows leave most of each WMMA as padding. The shared merge
-closed part of that gap and the comparison has not been redone since.
+After 014-018, all at M=4 with one or two kv heads, most of them exactly
+16 MiB of KV -- where even a pure stream reaches only 92.2 % of roof (019):
+`32/2/128` 16k (~85 %), `16/2/128` 16k, `16/1/512` 16k/32k, `14/2/64` 32k,
+`8/1/256` M=1 16k (88.9 %).  What is known about them:
 
-The idea is to keep both and let the backend pick per configuration -- `(Hq,
-Hkv, D, M)`, fixed at graph capture like the other knobs -- rather than to
-grow a dot path inside the WMMA kernel. What it needs:
+- not P@V (dropping P's low half is neutral), not memory parallelism (more
+  segments or waves make loads-only worse);
+- on the RSPL path, loads alone reach 88.4 % at 16k: the per-tile barrier of
+  the shared tile, not bytes in flight (a second tile in flight is neutral);
+- the fixed tail: wave skew at the loop end (0.4-1.3 us), the split-KV
+  publish, atomic and merge (~1.5-2 us) -- 2-4 % of an 80 us call.
 
-- the comparison redone per configuration and context with the current
-  kernel, `reference/rdna35_decode_attn_dot.cu` built as a second variant;
-- the rule, or a `_TUNED`-style table, saying which kernel serves which
-  configuration -- one choice per configuration, since S is not known at
-  capture;
-- both kernels' variants precompiled and sealed, and the scratch shapes of
-  both allocated.
-
-The first step is the measurement: if no configuration has the dot kernel
-ahead over the seven-context geomean, the idea is closed.
+The dot-against-WMMA comparison this section used to propose is done (018).
 
 ### 4.6 D=96, and the batch axis
 
@@ -261,9 +269,11 @@ workgroups must be sure the whole grid is resident.
 
 The same shape measured alone came out 1117 us, and 1404 us inside the full
 NHD matrix; starting a run at a large context without walking up from S=128
-measures the allocator, not the kernel (up to 10x on the first cell). The
-dev harness used contiguous pages and HND, `matrix.py` uses shuffled pages
-and whatever layout vLLM picked. Compare only runs made the same way, and
+measures the allocator, not the kernel (up to 10x on the first cell). `matrix.py`
+goes through `benchmarks/attention_benchmarks`, whose block table is
+`arange`: **contiguous** pages (earlier revisions of this file said
+shuffled).  Shuffled pages cost the loads-only kernel 2-4 % at 16 MiB, so a
+dev harness must use contiguous pages to agree with the matrix. Compare only runs made the same way, and
 prefer interleaved A/B for any decision.
 
 ### 5.6 Profiling on a hot cache
@@ -297,6 +307,26 @@ purpose, or it is not reaching it.
 `ATen/Context.h` declares `enum class Float32Precision { ..., BF16 }`, so
 `-DBF16=...` fails the torch build of every variant, fp16 included. The
 kernel's dtype define is `KV_BF16`; pick names torch does not use.
+
+### 5.12 Killing a tuner leaves build locks
+
+A `tune.py` stopped mid-build leaves `lock` files under
+`~/.cache/torch_extensions`, and the next run of the same variants waits on
+them forever (GPU at 0 %, no output).  Delete the locks when no `ninja`
+runs.
+
+### 5.13 The waitcnt pass needs to count every load
+
+A load under a branch, or a loop with an exit in the middle, and the pass
+can no longer count what is outstanding: it waits `vmcnt(0)`, which drains
+whatever prefetch was meant to stay in flight (015, 019).  Loads meant to
+overlap must be unconditional (clamp the address instead).
+
+### 5.14 Two bodies in one kernel do not compile alike
+
+The body inside the mode branch is compiled worse than the one after it
+(2-4 % and 15 % measured, 016); the long mode falls through.  A new mode
+body should be measured both ways.
 
 ---
 
@@ -377,6 +407,11 @@ amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py \
 # tune one configuration
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py \
     --hq 32 --hkv 8 --head-dim 128 --m 1
+
+# tune it as a two-mode build switching at S=4096
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py \
+    --hq 32 --hkv 8 --head-dim 128 --m 1 --split 4096 \
+    --contexts 128 512 2048 4096 16384 32768
 
 # the ceiling
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/floor.py

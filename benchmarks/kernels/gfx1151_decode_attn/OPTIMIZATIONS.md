@@ -1380,3 +1380,111 @@ all D=128 at S=32768, as in fp16.
 - `__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32` accepts `__bf16` vectors only
   through lax vector conversion; with `-flax-vector-conversions=none` it wants
   16 x `short`.
+
+---
+
+## 014 — S read on the device
+
+**Status:** landed, `83415bcc26`.
+
+The op took S as a host int.  The backend inherits Triton's
+`AttentionCGSupport.ALWAYS`, so under full CUDA-graph decode that int was
+frozen at its capture-time value and every replay attended over the captured
+length.  The kernel now reads `seq_lens[0]`.  To keep S off the critical path
+the first block's page indices are clamped to the block table's width instead
+of S, so the S load and the page-table load go out together.  Cost at S=128:
+1-2 % (interleaved A/B, five configurations); none at 32k.  Issuing Q ahead of
+the S-dependent early exit measured neutral.  `test_graph_replay_follows_seq_lens`
+replays one graph at three lengths.
+
+## 015 — RSPL: row tiles split inside the workgroup
+
+**Status:** landed, `83415bcc26`.
+
+RG splits a kv head's rows over workgroups that each read all of its KV and
+rely on L2 to fetch it once.  On `32/2/128` M=4 (rg=4) `GL2C_EA_RDREQ_DRAM`
+counts the KV read 1.68 times at S=32768 (calibrated: 1.001x on an rg=1
+configuration).  RSPL splits the row tiles over the waves that share a key
+tile instead: each loads 1/RSPL of the tile, stages it in LDS
+(double-buffered, one barrier per tile), and all read it back; the registers
+that frees pay for issuing the next tile before computing this one.  Dev
+harness, `32/2/128` M=4, S=32768: 80.1 % (rg=4) -> 91.7 % (rspl=4, nw=4,
+nseg=16).  It made a latent race visible: with one tile per workgroup no
+merge barrier ordered the waves' rows before `gm_s` was published.
+
+Measured and rejected on the shared tile: two tiles in flight (`PF` on the
+shared path) -- 0.74-0.86x as first written, because the conditional issues
+and a mid-loop `break` left the waitcnt pass unable to count the pending
+loads, so it waited `vmcnt(0)` and drained the prefetch; with unconditional
+issues and no break the waits are right (`vmcnt(4)`) and it is still
+0.93-1.00x.  Bytes in flight do not limit this path; the per-tile barrier
+does.  Loads-only (`ABLATE=64`) on it reaches 88.4 % at 16k, 93.5 % at 32k.
+
+## 016 — Two decompositions per build, switched on the device
+
+**Status:** landed, `9ae12f67da`.
+
+Short and long sequences want different splits of one configuration: row
+groups and no merge below ~4k keys, many segments (and RSPL where it applies)
+above.  The configuration stays one per `(Hq, Hkv, D, M)`, fixed at graph
+capture; the build carries two decompositions and the kernel runs mode B when
+the S it reads is `>= SW`.  The source includes itself once per mode
+(`mode_a`, `mode_b`; knobs `NSEG RG MINB DSPL RSPL NW PF DOT BFLY GT` and their
+`2` versions); the block is launched with the larger mode's waves and a mode
+using fewer ends the rest on entry.  `SW=0` builds mode A alone, same
+resources as before.
+
+Codegen trap: whichever body sits inside the branch is compiled worse --
+2-4 % on mode A there, 15 % on mode B (extra `v_mov` copies; the page-table
+load became a vector load behind a `vmcnt(0)`).  Mode B, the long one, falls
+through.
+
+`tune.py --split S` descends each mode on its side of S (single-mode builds),
+with extra starts one-knob descent cannot reach (rg=1 with every row tile in
+RSPL; the dot mode for the short side).
+
+## 017 — PF: a second tile in flight on the unshared path
+
+**Status:** landed, `8cd55c5497`.
+
+Where a second tile's registers fit (small D, small accumulators), the next
+tile's loads go out before this one is computed.  Dev harness, contiguous
+pages: `16/2/64` M=4 +6.7 % at S=128, +4.7 % at 16k (86.9 -> 91.0 %), +3.4 %
+at 32k; `32/8/64` M=4 +4.6 % at S=128.  Where it does not fit it spills and
+collapses (`14/2/64` M=4 rg=1: 0.46x; D=128 M=1 needs 53 VGPRs more than
+exist), so it is a tuned knob.
+
+Rejected while freeing registers for it: a `sched_barrier` per Q@K chunk
+stops the compiler hoisting every LDS operand of the tile (237 -> 220 VGPRs
+at D=128 M=1) and costs 1.5-5 %: those loads are what hides LDS latency.
+
+## 018 — The dot decomposition as the short mode
+
+**Status:** landed, `c219ce6083` and `5d1204997f` (rows).
+
+The reference per-q-head dot kernel, measured against the current kernel
+(interleaved A/B): 1.04-1.29x at S <= 1024 on all nine D=256/512 M=1
+configurations, 0.81-0.96x at 32k.  It is now a mode body (`DOT=1`, with
+`BFLY` and `GT`), used as mode A of two-mode builds.  Against the reference:
+S and a wave's first block come from the device ahead of time, each later
+block is read a tile ahead instead of in front of its own loads, bf16 goes
+through `fdot2_f32_bf16`, and only the shipped path is kept (KPW=4, fused
+epilogue, last-arriver merge, MSPLIT=1).
+
+matrix.py on the twelve D=256/512 M=1 configurations with their
+`--split 4096` rows, against golden/: S=128 1.12-1.34x, S=512 1.01-1.21x,
+long contexts unchanged; per configuration 1.013-1.091x.
+
+## 019 — Measured and rejected, same session
+
+| idea | result |
+| --- | --- |
+| next block's page load after the KV loads (unshared path) | the waitcnt pass then waited for a KV load before storing Q (the load was conditional, so it could not be counted); made unconditional and pinned behind Q it is still 1-3 % slower -- the page-table wait was an L2 hit |
+| P@V without P's low half (one WMMA fewer per tile at M=4) | max_rel up to 9.5e-2, and 0.996-1.006x: P@V does not bound the M=4 cells |
+| more segments or waves on `16/2/64` M=4, loads only | 84-89 %, worse than fewer: not memory parallelism |
+
+The ceiling behind the remaining long cells: a pure stream (`floor.py`) is at
+92.2 % of roof at 16 MiB against 97-98 % at 8-12 MiB and 95.6 % at 32 MiB,
+reproducibly, whatever the buffer's alignment.  Most cells still under 90 %
+are exactly 16 MiB of KV (Hkv=2 D=128 or Hkv=1 D=256 at 16k, Hkv=2 D=64 at
+32k), where a kernel has 2.4 % for everything that is not streaming.
