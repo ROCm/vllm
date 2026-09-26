@@ -55,27 +55,27 @@ Commits on top of it, 2026-09-25:
 ### The performance picture
 
 `matrix.py`, HND, all 52 configuration/M pairs, geomean over the seven
-contexts, measured 2026-09-25 after the three commits (`golden/`; the
-16/2/512 M=1 rows come from the run that verified its re-tune):
+contexts, measured 2026-09-26 at `6166414bf6` (`golden/`):
 
 | D | M | configs | vs Triton | median configuration %roof | >= 90 % roof | S=128 median %roof |
 | --- | --- | --- | --- | --- | --- | --- |
-| 64 | 1 | 4 | 1.27x | 83.7 % | 1 | 55.6 % |
-| 64 | 4 | 4 | 1.29x | 83.8 % | 1 | 56.6 % |
-| 128 | 1 | 10 | 1.21x | 89.0 % | 1 | 69.0 % |
-| 128 | 4 | 10 | 1.27x | 87.7 % | 1 | 64.0 % |
-| 256 | 1 | 7 | 1.32x | 81.4 % | 1 | 52.2 % |
-| 256 | 4 | 7 | 1.52x | 79.6 % | 0 | 51.5 % |
-| 512 | 1 | 5 | 2.84x | 82.2 % | 0 | 55.3 % |
-| 512 | 4 | 5 | 3.91x | 77.2 % | 0 | 46.7 % |
+| 64 | 1 | 4 | 1.29x | 86.2 % | 1 | 58.8 % |
+| 64 | 4 | 4 | 1.34x | 86.5 % | 1 | 58.0 % |
+| 128 | 1 | 10 | 1.21x | 88.7 % | 2 | 69.1 % |
+| 128 | 4 | 10 | 1.28x | 88.0 % | 1 | 64.1 % |
+| 256 | 1 | 7 | 1.41x | 86.2 % | 1 | 63.0 % |
+| 256 | 4 | 7 | 1.55x | 81.8 % | 0 | 54.2 % |
+| 512 | 1 | 5 | 2.99x | 86.1 % | 0 | 66.5 % |
+| 512 | 4 | 5 | 3.93x | 78.4 % | 0 | 48.5 % |
 
-5 of 52 pairs reach 90 % of roof (`32/32` at D=64 and D=128, both M, and
-`16/8/256` M=1). Five cells of 364 are slower than Triton, all by under 2 %
-(D=128 at S=32768), which is inside the harness noise.
-
-Against the matrix taken right before these commits (same harness, HND),
-S=128 is better on all 52 pairs (median +7 % at M=1, +9 % at M=4) and long
-contexts are unchanged (median +0.7 %).
+Against the previous golden (the table this one replaced, taken before
+014-018): median cell 1.002x, the D=256/512 M=1 short contexts 1.12-1.34x,
+`16/2/64` and `28/4/128` and `40/8/128` M=4 about 1.05x.  Seven long cells
+(S >= 16k) are under 90 % of roof, against thirteen: `32/2/128` M=4 16k
+(85.9 %), `14/2/64` M=4 32k (88.0 %), `16/1/512` M=4 16k (88.0 %) and 32k
+(89.9 %), `8/1/256` M=4 16k (88.7 %), `16/2/128` M=4 16k (88.8 %),
+`8/1/256` M=1 16k (89.0 %) -- see §4.5.  Seven cells of 364 are 0.99-1.00x
+of Triton, all at 16k-32k.
 
 **90 % of roof is not reachable everywhere.** `tools/floor.py` times a kernel
 that does nothing but stream the same bytes after one dependent page-table
