@@ -10,9 +10,9 @@ fp16 unless it says bf16, **HND** (see §5.1). Nothing is estimated.
 | file | what it is |
 | --- | --- |
 | this one | state, open work, traps |
-| `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-012 the commits below |
+| `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-023 the commits below |
 | `reference/` | the previous per-q-head dot kernel and its D=512 golden, kept for comparison only |
-| `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten. `bf16.md` is the same for bf16 |
+| `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten. `bf16.md` is the same for bf16, `swa.md` for the sliding-window configurations |
 | `reports/` | the original investigation record, about the dot kernel. Its `%roof` numbers are superseded |
 
 ---
@@ -21,8 +21,10 @@ fp16 unless it says bf16, **HND** (see §5.1). Nothing is estimated.
 
 `RDNA35_HIP_ATTN` serves 49 of the 50 shapes in `tools/shapes.csv` with one
 kernel, `csrc/rocm/rdna35_decode_attn.cu`, in fp16 and in bf16; it refuses
-D=96 (three elements per lane) and falls back to Triton. The nine
-sliding-window rows are skipped by every tool.
+D=96 (three elements per lane) and falls back to Triton.  The nine
+sliding-window rows (Gemma 3/4, PaliGemma 2; six distinct configurations)
+are served too, with rows of their own keyed by window (`_TUNED_SWA`, 022);
+the tools select them with `--windowed`.
 
 The kernel is the WMMA rewrite of OPTIMIZATIONS 009: one workgroup per
 `(kv head, row group, KV segment)`, both products on
@@ -48,6 +50,8 @@ Commits on top of it, 2026-09-25:
 | `9ae12f67da` (016) | two decompositions per build switched by S -- **removed** in `1e3e0ade83` (020): knobs may not depend on S |
 | `8cd55c5497` (017) | PF, a second tile in flight where it fits |
 | `c219ce6083`, `5d1204997f` (018) | the dot decomposition as a mode; short mode of all twelve D=256/512 M=1 rows (S=128 1.12-1.34x); D=64 PF rows |
+| `2c7b87b6e8` (021, 022) | full-range re-tune (dot rows at D=256/512 M=1, PF at D=64), `_TUNED_BF16`, sliding window in kernel/backend/tests |
+| `82ef301b1d` (022) | `_TUNED_SWA` rows; the harness allocates only a window's blocks |
 
 ### The performance picture
 
@@ -89,21 +93,41 @@ at long context and 0.3 % behind at S=128 (median; worst 1.1 %), the cost of
 rounding the output. Correctness is bounded at 8e-3 relative, not 1e-3:
 rounding the output to bf16 alone costs up to 3.9e-3.
 
-`matrix.py --dtype bf16`, all 52 pairs, Triton in bf16 too (`golden/bf16.md`):
+`matrix.py --dtype bf16`, all 52 pairs, Triton in bf16 too (`golden/bf16.md`).
+The nine D=256/512 M=1 shapes whose fp16 row is the dot decomposition run
+their WMMA row in bf16 (`_TUNED_BF16`, 021): the dot rows lose up to 0.73x at
+32k in bf16.
 
 | D | M | configs | vs Triton | median configuration %roof | fp16 (`golden/d*.md`) | >= 90 % roof | S=128 median %roof |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 64 | 1 | 4 | 1.27x | 84.0 % | 83.7 % | 1 | 55.5 % |
-| 64 | 4 | 4 | 1.29x | 83.5 % | 83.8 % | 1 | 56.6 % |
-| 128 | 1 | 10 | 1.21x | 88.8 % | 89.0 % | 1 | 69.2 % |
-| 128 | 4 | 10 | 1.28x | 88.3 % | 87.7 % | 1 | 63.8 % |
-| 256 | 1 | 7 | 1.32x | 81.2 % | 81.4 % | 1 | 51.6 % |
-| 256 | 4 | 7 | 1.53x | 79.6 % | 79.6 % | 0 | 51.4 % |
-| 512 | 1 | 5 | 2.88x | 82.0 % | 82.2 % | 0 | 54.7 % |
-| 512 | 4 | 5 | 3.87x | 77.0 % | 77.2 % | 0 | 46.5 % |
+| 64 | 1 | 4 | 1.28x | 86.9 % | 87.1 % | 1 | 55.9 % |
+| 64 | 4 | 4 | 1.30x | 87.4 % | 87.2 % | 1 | 57.5 % |
+| 128 | 1 | 10 | 1.20x | 88.2 % | 88.5 % | 1 | 68.9 % |
+| 128 | 4 | 10 | 1.27x | 87.9 % | 88.0 % | 1 | 63.0 % |
+| 256 | 1 | 7 | 1.32x | 80.9 % | 86.0 % | 0 | 50.9 % |
+| 256 | 4 | 7 | 1.53x | 81.2 % | 81.2 % | 0 | 53.2 % |
+| 512 | 1 | 5 | 2.89x | 81.9 % | 85.0 % | 0 | 54.0 % |
+| 512 | 4 | 5 | 3.89x | 78.4 % | 78.5 % | 0 | 48.2 % |
 
-The same five pairs reach 90 % of roof; four cells of 364 trail Triton by
-1 %, D=128 at S=32768, as in fp16.
+Four cells of 364 trail Triton by 1-2 %, D=128 M=1 at S=32768.
+
+### Sliding window
+
+`matrix.py --windowed` (`golden/swa.md`), fp16; bf16 within 0.6 %.  Past
+S = window every context reads the same bytes, so the plateau is what a
+long conversation sees; `ceiling` is `floor.py --windowed` at those bytes.
+
+| configuration | window | M=1 plateau | M=4 plateau | ceiling | vs Triton (M=1 / M=4) |
+| --- | --- | --- | --- | --- | --- |
+| 32/16/256 | 1024 | 91.9 % | 91.7 % | 92.4 % | 1.40x / 1.49x |
+| 16/8/256 | 1024 | 95.2 % | 91.5 % | 97.1 % | 1.62x / 1.73x |
+| 8/4/256 | 4096 | 90.4 % | 87.6 % | 92.4 % | 1.32x / 1.31x |
+| 8/4/256 | 1024 | 88.3 % | 81.5 % | 93.9 % | 1.72x / 1.83x |
+| 8/2/256 | 512 | 75.6 % | 64.2 % | 84.6 % | 2.84x / 3.50x |
+| 8/1/256 | 512 | 64.0 % | 46.7 % | 80.8 % | 3.76x / 3.15x |
+
+The small windows are short contexts forever: their gap is the fixed cost of
+§4.7, not the window.
 
 ---
 
@@ -162,25 +186,17 @@ floor alone is 65-85 % of roof depending on bytes (`floor.py`).
 
 ### 4.1 Keep the record current
 
-OPTIMIZATIONS 010-019 describe the state above.  `golden/` still holds the
-2026-09-25 fp16 result from before 014; regenerate it (and `golden/bf16.md`)
-from a full matrix once §4.2 is done.
+OPTIMIZATIONS 010-023 describe the state above, and `golden/` (fp16, bf16,
+sliding window) was measured on it.
 
-### 4.2 Re-tune everything
+### 4.2 Re-tune what is left
 
-`tune.py` now searches RSPL, PF and the dot decomposition as well, scored
-by the geomean over the whole context range.  The 29 rows that were
-two-mode went back to their earlier values in 020 and are being re-tuned
-that way; the rest of `_TUNED` predates RSPL, PF and DOT.  ~25 minutes per
-configuration on five contexts; land a row only if a `matrix.py` run beats
-golden/ on it (the tuner's single sample picks within noise).  golden/ and
-the table in §1 were taken with the two-mode rows and must be regenerated
-after this re-tune.
-
-`_TUNED` is keyed without the dtype: bf16 moves the same bytes and measured
-within 1 % of fp16 everywhere, so one table serves both. Tune in fp16 and
-confirm with `matrix.py --dtype bf16`; key the table on the dtype only if a
-row ever disagrees.
+The 29 formerly two-mode rows were re-tuned over the full range (021); ten of
+them kept their earlier values because the tuned point lost a cell.  The rest
+of `_TUNED` predates RSPL, PF and DOT.  ~25 minutes per configuration on five
+contexts; land a row only if a `matrix.py` run beats golden/ on it (the
+tuner's single sample picks within noise), and confirm it in bf16 -- the dot
+rows did not hold there (`_TUNED_BF16`).
 
 ### 4.3 Decide the KV layout, then fix what it exposes
 
@@ -208,10 +224,11 @@ and measured neutral even at S=16384 on M=4.
 
 ### 4.5 The long cells still under 90 % of roof
 
-After 014-018, all at M=4 with one or two kv heads, most of them exactly
-16 MiB of KV -- where even a pure stream reaches only 92.2 % of roof (019):
-`32/2/128` 16k (~85 %), `16/2/128` 16k, `16/1/512` 16k/32k, `14/2/64` 32k,
-`8/1/256` M=1 16k (88.9 %).  What is known about them:
+Eleven cells, 85.0-89.8 %, all but one at M=4 with one or two kv heads and
+most of them exactly 16 MiB of KV -- where even a pure stream reaches only
+92.2 % of roof (019): `32/2/128` M=4 16k/32k, `8/1/256` M=4 16k, `16/2/64`
+M=4 16k/32k, `14/2/64` M=4 16k/32k, `16/1/512` M=4 16k, `16/2/256` M=4 16k,
+`16/2/128` M=4 16k and M=1 16k.  What is known about them:
 
 - not P@V (dropping P's low half is neutral), not memory parallelism (more
   segments or waves make loads-only worse);
@@ -225,6 +242,18 @@ The dot-against-WMMA comparison this section used to propose is done (018): dot 
 ### 4.6 D=96, and the batch axis
 
 Unchanged: D=96 is three elements per lane; batch > 1 falls back to Triton.
+
+### 4.7 The fixed cost of split KV at short context
+
+What is left at short context, and all of what is left on the small windows
+(8/1 and 8/2 at w512: 64-76 % at M=1, 47-64 % at M=4, ceilings 81-85 %), is
+the split-KV tail: publishing the partials, seeing the last arrival, merging
+-- ~2 us of a 5 us kernel on 8/1/256 M=4 w512 (023).  The partials are as
+large as the KV there (32 rows x 256 x 4 B x 16 segments = 512 KiB), and an
+ablation that skips them is 1.26x.  16-bit partials would take about half of
+that, at a precision cost the owner has to accept first (023).  More
+segments, balanced segments, RG instead of RSPL, and polling the arrival
+counter were measured and lose (023).
 
 ---
 
@@ -402,6 +431,11 @@ amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py \
 
 # the ceiling
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/floor.py
+
+# the sliding-window configurations: matrix, tuning, ceiling (golden/swa.md)
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py --windowed
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py --windowed --hq 8 --hkv 1 --head-dim 256
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/floor.py --windowed
 
 amd-gpu-lock python -m pytest tests/kernels/attention/test_rdna35_hip_decode.py
 ```

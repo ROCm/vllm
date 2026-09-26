@@ -1501,3 +1501,81 @@ remains a knob of the whole configuration.  What 016-018 measured stays
 true and is the reason the re-tune now searches RSPL, PF and DOT: the
 short-context wins of the dot mode (S=128 1.12-1.34x at D=256/512 M=1) are
 only available where the dot decomposition also holds up at long context.
+
+## 021 — Full-range re-tune; bf16 rows of their own
+
+**Status:** landed, `2c7b87b6e8`; golden `af6022836d`.
+
+`tune.py` over 128..32768 for the 29 formerly two-mode shapes, each row
+landed only when a full `matrix.py` beat the golden from before 014 on its
+geomean without losing more than 2.5 % in any cell: the dot decomposition on
+nine D=256/512 M=1 shapes (8/1/256 1.127x, 8/1/512 1.091x, S=128 up to
+1.25x), PF at D=64 (32/8/64 1.034-1.037x) and re-tuned WMMA rows
+(1.011-1.044x).  Ten rows that lost a cell stayed as they were.
+
+In bf16 the dot rows lose at long context (32/4/512 0.73x at 32k, the others
+0.90-0.97x).  `_TUNED_BF16` keeps the WMMA rows for those nine shapes, and
+`_knobs_for` takes the dtype.
+
+## 022 — Sliding window
+
+**Status:** landed, `2c7b87b6e8` (kernel, backend, tests), `82ef301b1d`
+(rows, harness); golden `golden/swa.md`.
+
+`WIN` is the window in keys, 0 builds the previous kernel unchanged (ISA
+identical on four variants).  The WMMA body splits only the blocks from the
+first one a query can see, `b0 = max(0, S - M - (W - 1)) / 16`, masks the
+lower edge on the tiles that reach below it, and zeroes V for keys before
+every query's window: vLLM frees those pages, and a freed page may hold NaN,
+which `0 * NaN` would let into the output (the test with NaN pages fails
+without it).  A window wider than S starts at key 0, so nothing below the
+table is read.  The dot body starts at the window rounded down to its
+4-key group.  The backend accepts causal windows `(w - 1, 0)` and keys the
+rows by window in `_TUNED_SWA`.
+
+Rows from `tune.py --windowed`, shared by fp16 and bf16 (within 0.6 %).
+Plateau (S >= window) against the stream ceiling at the same bytes:
+
+| configuration | window | M=1 | M=4 | ceiling |
+| --- | --- | --- | --- | --- |
+| 32/16/256 | 1024 | 91.9 % | 91.7 % | 92.4 % (16 MiB) |
+| 16/8/256 | 1024 | 95.2 % | 91.5 % | 97.1 % (8 MiB) |
+| 8/4/256 | 4096 | 90.4 % | 87.6 % | 92.4 % (16 MiB) |
+| 8/4/256 | 1024 | 88.3 % | 81.5 % | 93.9 % (4 MiB) |
+| 8/2/256 | 512 | 75.6 % | 64.2 % | 84.6 % (1 MiB) |
+| 8/1/256 | 512 | 64.0 % | 46.7 % | 80.8 % (512 KiB) |
+
+A windowed call costs what full attention costs at S = window: 8/1/256 M=1
+5.68 against 5.64 us at S=512.  M=4 pays 2-7 % more, because its window
+spans window + 3 keys, one page more.  S whose window edge is not aligned to
+a page (15 of 16 decode steps) measured 1-3 % slower than the aligned S of
+the matrix.
+
+The harness had to change for these numbers to mean anything: it allocated
+the whole sequence and read a window of it, spreading 64 blocks over a
+buffer 32 times larger (16/8 M=1 at 32k read 70.5 % of roof, 89.4 % with
+only the live blocks allocated, as vLLM's sliding-window manager keeps them).
+
+## 023 — The fixed cost of the small windows: measured, not landed
+
+The small windows are short contexts that never grow, so they expose the
+fixed cost.  `TIMING=1` over all sixteen segments of 8/1/256 M=4 w512: KV
+lands ~0.9 us after the start, the loop ends at 2.1-2.3 us (3.1 us for the
+segment with the 33rd page), partials are out at ~2.8 us, the last arrival
+is seen at ~4.2 us and the merge ends at ~5.1 us: ~2 us of the 5 us kernel
+is publish, arrival and merge.
+
+| idea | result |
+| --- | --- |
+| more segments (dot 8-32, WMMA 32-64 on 8/1 and 8/2 w512) | slower every time; 64 on 8/1 M=4 spills the merge's unrolled `pa[M_NSEG]` (171 us) |
+| nseg 11 or 17 so 33 pages split evenly | 8.59 / 8.10 against 8.02 us |
+| RG 2-8 with RSPL 1 on 8/1 M=4 | 11.6-26 us against 8.0: RSPL=2 is what makes that shape work |
+| waiters poll the arrival counter instead of a generation the last one writes | 1.3-1.7 % faster at S=128 on full-attention shapes, 5-6 % slower on 8/1 M=4 w512 whatever the poll interval |
+| no partial acc written or read (ablation, wrong answers) | 1.26x on 8/1 M=4 w512, 1.17x on 16/1/512 M=4 at S=128, 1.00x where the partials are small |
+
+The last line bounds what 16-bit partials could give: roughly half of it.
+They were not tried, because they change precision: rounding a partial costs
+up to 2^-12 of the partial, not of the output, and where segments cancel
+that is ~1e-2 of an output element near the 1e-3 floor of `max_rel`,
+against the 1e-3 the kernel is held to.  A decision for the owner, not a
+tuning.
