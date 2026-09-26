@@ -98,6 +98,15 @@ def _build_variants():
                 _variant(**{k: v for k, v in shape.items()}, dtype=dtype)
                 for shape in WINDOWED.values()
             ),
+            *(
+                _variant(
+                    **{k: v for k, v in shape.items() if k != "nseg"},
+                    nseg=shape["nseg"],
+                    dtype=dtype,
+                    batch=1,
+                )
+                for shape in BATCHED.values()
+            ),
         )
     )
 
@@ -119,6 +128,7 @@ def _variant(
     dot: int = 0,
     bfly: int = 0,
     window: int = 0,
+    batch: int = 0,
 ):
     # nseg > 1 with minb = 1 splits even a short context over several
     # workgroups, which is the only way to reach the cross-workgroup merge.
@@ -142,6 +152,7 @@ def _variant(
         dot=dot,
         bfly=bfly,
         window=window,
+        batch=batch,
     )
 
 
@@ -346,6 +357,55 @@ def test_graph_replay_follows_seq_lens():
         assert _max_rel(out.float(), ref) <= TOL[torch.float16], f"S={s}"
 
 
+# One launch over several sequences (grid.y), each with its own length, table
+# row, query rows, output rows and scratch.  S=0 is a CUDA-graph batch padded
+# past its real sequences.
+BATCHED = {
+    "split, last arriver merges": dict(hq=HQ, hkv=HKV, hd=HEAD_DIM, nseg=4),
+    "shared merge": dict(SHARED),
+    "dot": dict(RSPL["dot"]),
+    "window": dict(WINDOWED["wmma segments"]),
+}
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("name", list(BATCHED))
+def test_batch_of_sequences(name, dtype):
+    """Every sequence of a batch matches its own reference, and a padded
+    sequence (S=0) reads nothing and disturbs none of them."""
+    _skip_unless_gfx1151()
+    shape = dict(BATCHED[name])
+    nseg = shape.pop("nseg")
+    dims = {k: v for k, v in shape.items() if k in ("hq", "hkv", "hd")}
+    window = shape.get("window", 0)
+    lens = [1008, 48, 0, 2016]
+    width = max(lens) // BLOCK_SIZE + 1
+    parts = [
+        _paged_inputs(max(s, 16), 1, dtype, seed=i, **dims) for i, s in enumerate(lens)
+    ]
+    kv = torch.cat([p[1] for p in parts])
+    first = torch.tensor([0] + [p[1].shape[0] for p in parts]).cumsum(0)
+    bt = torch.zeros(len(lens), width, device=kv.device, dtype=torch.int32)
+    for i, p in enumerate(parts):
+        bt[i, : p[1].shape[0]] = p[2] + int(first[i])
+    q = torch.cat([p[0] for p in parts])
+    variant = _variant(1, 0, nseg, dtype=dtype, batch=1, **shape)
+    module = rdna35.load(variant)
+    scratch = rdna35.make_scratch(variant, q.device, max_seqs=len(lens))
+    seq_lens = torch.tensor(lens, device=q.device, dtype=torch.int32)
+    out = torch.full_like(q, 7.0)
+    for _ in range(2):
+        module.decode_attn(q, kv, bt, out, *scratch, seq_lens, q.shape[2] ** -0.5)
+    torch.accelerator.synchronize()
+    for i, s in enumerate(lens):
+        rows = out[i * M : (i + 1) * M].float()
+        if s == 0:
+            assert (rows == 7.0).all(), "a padded sequence must not be written"
+            continue
+        ref = _reference(parts[i][0], parts[i][1], s, window)
+        assert _max_rel(rows, ref) <= TOL[dtype], f"sequence {i}, S={s}"
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_other_dtype_is_refused_not_miscomputed(dtype):
     """A build must refuse the other 16-bit type, not return nonsense.
@@ -398,6 +458,38 @@ def test_unsupported_head_size_falls_back_to_triton():
         window_size=None,
         kv_quant_mode=KVQuantMode.NONE,
         seqused_k=torch.zeros(1),
+        max_seqlen_q=0,
     )
     assert not fits
     assert "head_size 96" in impl._rejected
+
+
+@pytest.mark.parametrize(
+    "nseq, tokens, max_q, reason",
+    [
+        (3, 5, 4, "unequal query length"),  # a prefill mixed with decodes
+        (1, 64, 64, "more than"),  # a prompt: one build per length otherwise
+    ],
+)
+def test_non_decode_batches_fall_back_to_triton(nseq, tokens, max_q, reason):
+    """Only batches of equal, decode-sized query lengths reach the kernel."""
+    from vllm.v1.attention.backends.rdna35_hip_attn import Rdna35HipAttentionImpl
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    impl = Rdna35HipAttentionImpl.__new__(Rdna35HipAttentionImpl)
+    impl._rejected = None
+    impl.head_size, impl.num_heads, impl.num_kv_heads = HEAD_DIM, HQ, HKV
+    fits = impl._prepare(
+        kv_cache=torch.empty(0, dtype=torch.float16),
+        q=torch.empty(tokens, HQ, HEAD_DIM, dtype=torch.float16),
+        alibi_slopes=None,
+        sinks=None,
+        softcap=0,
+        causal=True,
+        window_size=None,
+        kv_quant_mode=KVQuantMode.NONE,
+        seqused_k=torch.zeros(nseq),
+        max_seqlen_q=max_q,
+    )
+    assert not fits
+    assert reason in impl._rejected

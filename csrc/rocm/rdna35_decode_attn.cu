@@ -121,6 +121,15 @@
   #ifndef CPUB
     #define CPUB 0
   #endif
+  // 1 builds for a batch of sequences, one per grid.y; 0 for one sequence,
+  // without the per-sequence addressing.
+  #ifndef BATCH
+    #define BATCH 0
+  #endif
+  // Workgroups a batch aims for when the host caps its segments.
+  #ifndef BTARGET
+    #define BTARGET 128
+  #endif
   // Measurement only: records the 100 MHz realtime counter at phase boundaries
   // of thread 0 of workgroups 0..7 into g_ts, read back by the timings() op.
   // 1 marks the phases, 3 also waits for the first tile's data to separate
@@ -313,18 +322,48 @@ namespace decomp {
   #include __FILE_NAME__
 }  // namespace decomp
 
+// Per-sequence strides of the batch: grid.y is the sequence, and every
+// pointer is moved to that sequence's rows before the body runs, so the body
+// sees one sequence exactly as it did before batching.
+struct Batch {
+  int bt_stride, acc_stride, ml_stride, cnt_stride;
+};
+
 template <typename OutT>
 __global__ __launch_bounds__(BLOCK) void decode_attn(
     const elem_t* __restrict__ q, const elem_t* __restrict__ kv,
     const int* __restrict__ bt, float* __restrict__ p_acc,
     float* __restrict__ p_m, float* __restrict__ p_l, int* __restrict__ p_cnt,
     OutT* __restrict__ out, const int* __restrict__ seq_lens, int bt_width,
-    float scale, int coop) {
+    float scale, int coop
+  #if BATCH
+    ,
+    Batch bs
+  #endif
+) {
   __shared__ __attribute__((aligned(16))) char lds[decomp::kLds];
+  #if BATCH
+  const int b = blockIdx.y;
+  constexpr int kTok = MAXM * NUM_Q_HEADS * HEAD_DIM;
+  q += (size_t)b * kTok;
+  out += (size_t)b * kTok;
+  bt += (size_t)b * bs.bt_stride;
+  p_acc += (size_t)b * bs.acc_stride;
+  p_m += (size_t)b * bs.ml_stride;
+  p_l += (size_t)b * bs.ml_stride;
+  p_cnt += (size_t)b * bs.cnt_stride;
+  seq_lens += b;
+  #endif
   // S and the first page indices go out together: neither waits for the
   // other.  Every KV address depends on the page table.
   const int S = __builtin_amdgcn_readfirstlane(*seq_lens);
   const int pages = decomp::first_pages(bt, bt_width);
+  #if BATCH
+  // A CUDA-graph batch padded past its real sequences: S = 0, nothing to
+  // read or write.  Only in batch builds: waiting for S before the body's
+  // first loads costs 1-3 % at one sequence.
+  if (S <= 0) return;
+  #endif
   decomp::body<OutT>(q, kv, bt, p_acc, p_m, p_l, p_cnt, out, S, pages, bt_width,
                      scale, coop, lds);
 }
@@ -334,7 +373,12 @@ __global__ __launch_bounds__(BLOCK) void decode_attn(
 template __global__ void decode_attn<elem_t>(const elem_t*, const elem_t*,
                                              const int*, float*, float*, float*,
                                              int*, elem_t*, const int*, int,
-                                             float, int);
+                                             float, int
+    #if BATCH
+                                             ,
+                                             Batch
+    #endif
+);
   #else
     #include <ATen/cuda/CUDAContext.h>
     #include <c10/cuda/CUDAGuard.h>
@@ -349,15 +393,34 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
   TORCH_CHECK(block_table.scalar_type() == torch::kInt32 &&
-                  block_table.dim() == 1 && block_table.is_contiguous(),
-              "block table must be one contiguous int32 row");
+                  (block_table.dim() == 1 || block_table.dim() == 2) &&
+                  block_table.stride(-1) == 1,
+              "block table must be int32 rows, contiguous within a row");
   // A tensor, not an int: under CUDA-graph capture a host argument is frozen
   // at its capture-time value, and every replay would attend over that many
   // keys whatever the sequence has grown to.
   TORCH_CHECK(seq_lens.scalar_type() == torch::kInt32 && seq_lens.numel() >= 1,
               "seq_lens must be an int32 tensor holding the sequence length");
-  TORCH_CHECK(q.size(0) == MAXM, "q has ", q.size(0), " tokens, kernel built ",
-              "for MAXM=", MAXM);
+  // A batch of sequences with MAXM query tokens each.
+  TORCH_CHECK(q.size(0) % MAXM == 0 && q.size(0) > 0, "q has ", q.size(0),
+              " tokens, not a multiple of MAXM=", MAXM);
+  const int nseq = q.size(0) / MAXM;
+  TORCH_CHECK(seq_lens.numel() >= nseq, "seq_lens has ", seq_lens.numel(),
+              " entries for ", nseq, " sequences");
+  TORCH_CHECK(block_table.dim() == 2 ? block_table.size(0) >= nseq : nseq == 1,
+              "block table has too few rows for ", nseq, " sequences");
+  // Scratch is (sequences, ...) or, for one sequence, without that dim.
+  const bool batched = acc.dim() == 3;
+  TORCH_CHECK(batched ? acc.size(0) >= nseq && m.size(0) >= nseq &&
+                            l.size(0) >= nseq && cnt.size(0) >= nseq
+                      : nseq == 1,
+              "scratch holds fewer sequences than the ", nseq, " launched");
+  TORCH_CHECK(BATCH || nseq == 1, "one-sequence build launched for ", nseq,
+              " sequences");
+  const Batch bs{block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
+                 batched ? (int)acc.stride(0) : 0,
+                 batched ? (int)m.stride(0) : 0,
+                 batched ? (int)cnt.stride(0) : 0};
   TORCH_CHECK(q.size(1) == NUM_Q_HEADS && q.size(2) == HEAD_DIM,
               "q shape does not match the compiled variant");
   // The loads reinterpret every tensor as the element type the variant was
@@ -372,8 +435,8 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   // Row group fastest, then kv head, then segment: the row groups of one kv
   // head read the same KV and are dispatched side by side to share it in L2.
-  dim3 grid(decomp::kGrid), block(BLOCK);
-  static const int coop = [&] {
+  dim3 grid(decomp::kGrid, nseq), block(BLOCK);
+  static const int resident = [&] {
     if (!decomp::kSharedMerge) return 0;
     int dev, wgps, per = 0;
     (void)hipGetDevice(&dev);
@@ -397,8 +460,16 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
           fa.sharedSizeBytes ? 128 * 1024 / (int)fa.sharedSizeBytes : by_waves;
       per = std::max(per, std::min(by_waves, by_lds));
     }
-    return (int)(per * wgps >= (int)grid.x);
+    return per * wgps;
   }();
+  // The shared merge waits across workgroups: only when all of them fit.
+  int coop = (int)(resident >= (int)(grid.x * grid.y));
+    #if BATCH
+  // Segments per sequence, capped so the batch lands near BTARGET
+  // workgroups (the WMMA body reads it from coop's upper bits).
+  const int groups = decomp::kGrid / NSEG;
+  coop |= std::max(1, (BTARGET + nseq * groups - 1) / (nseq * groups)) << 1;
+    #endif
   hipLaunchKernelGGL(
       decode_attn<elem_t>, grid, block, 0, stream,
       reinterpret_cast<const elem_t*>(q.data_ptr()),
@@ -406,7 +477,13 @@ void decode_attn_op(torch::Tensor& q, torch::Tensor& kv_cache,
       block_table.data_ptr<int>(), acc.data_ptr<float>(), m.data_ptr<float>(),
       l.data_ptr<float>(), cnt.data_ptr<int>(),
       reinterpret_cast<elem_t*>(out.data_ptr()), seq_lens.data_ptr<int>(),
-      (int)block_table.size(0), (float)scale, coop);
+      (int)block_table.size(-1), (float)scale, coop
+    #if BATCH
+      ,
+      bs
+    #endif
+  );
+  (void)bs;
 }
 
     #if TIMING
@@ -1006,7 +1083,15 @@ __device__ __forceinline__ void body(
     #else
   constexpr int b0 = 0;
     #endif
+    #if BATCH
+  // A batch brings its own parallelism: the host caps the segments so the
+  // whole grid does not pay a merge per sequence it no longer needs.
+  const int ncap = coop >> 1;
+  coop &= 1;
+  const int nseg = max(1, min(min(M_NSEG, ncap), (nblk - b0) / M_MINB));
+    #else
   const int nseg = max(1, min(M_NSEG, (nblk - b0) / M_MINB));
+    #endif
   if (seg >= nseg) return;
     #if WIN
   // The page indices that came in with S were for block seg, not b0 + seg.

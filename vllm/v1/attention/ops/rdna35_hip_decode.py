@@ -67,6 +67,9 @@ class KernelVariant:
     # 1 stages split-KV partials in LDS and writes them a line at a time
     # instead of from registers.
     cpub: int = 0
+    # 1 builds for a batch of sequences (grid.y), with scratch from
+    # make_scratch(max_seqs=...); 0 serves exactly one sequence.
+    batch: int = 0
     # 1 runs the per-q-head dot-product decomposition instead of WMMA: nseg
     # segments per q head, nw waves, bfly its butterfly split, gt 1 to
     # dispatch heads fastest.  rg, minb, dspl, rspl, pf and cpub do not apply.
@@ -97,6 +100,7 @@ class KernelVariant:
             f"{'' if self.rspl == 1 else f'_rs{self.rspl}'}"
             f"{'' if not self.pf else '_pf'}"
             f"{'' if not self.cpub else '_cp'}"
+            f"{'' if not self.batch else '_batch'}"
             f"{'' if not self.dot else f'_dot_bf{self.bfly}_gt{self.gt}'}"
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
@@ -252,6 +256,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DRSPL={variant.rspl}",
         f"-DPF={variant.pf}",
         f"-DCPUB={variant.cpub}",
+        f"-DBATCH={variant.batch}",
         f"-DDOT={variant.dot}",
         f"-DBFLY={variant.bfly}",
         f"-DGT={variant.gt}",
@@ -350,26 +355,35 @@ def precompile(variants: "Iterable[KernelVariant]", workers: int | None = None) 
 
 
 def make_scratch(
-    variant: KernelVariant, device: torch.device
+    variant: KernelVariant, device: torch.device, max_seqs: int = 0
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Allocate the partials once.
 
     They are passed into the op rather than allocated inside it because the op
     runs under CUDA-graph capture, where an allocation would break the graph.
+    ``max_seqs`` > 0 gives every tensor a leading sequence dimension, for
+    batches of up to that many sequences; 0 is one sequence without it.
     """
     acc_shape, ml_shape, cnt = variant.scratch_shapes()
+    lead = (max_seqs,) if max_seqs else ()
     opts = {"dtype": torch.float32, "device": device}
     return (
-        torch.empty(acc_shape, **opts),
-        torch.empty(ml_shape, **opts),
-        torch.empty(ml_shape, **opts),
+        torch.empty(lead + acc_shape, **opts),
+        torch.empty(lead + ml_shape, **opts),
+        torch.empty(lead + ml_shape, **opts),
         # Arrival counters, then merge generations, one each per (kv head,
         # row group).  Zeroed once: the kernel resets the counters as it
         # consumes them and only compares generations for change, so every
         # later launch starts clean without the host writing here -- which it
         # could not do under graph capture anyway.
-        torch.zeros(cnt, dtype=torch.int32, device=device),
+        torch.zeros(lead + (cnt,), dtype=torch.int32, device=device),
     )
+
+
+def scratch_bytes(variant: KernelVariant) -> int:
+    """Bytes of scratch one sequence needs."""
+    acc_shape, ml_shape, cnt = variant.scratch_shapes()
+    return 4 * (acc_shape[0] * acc_shape[1] + 2 * ml_shape[0] + cnt)
 
 
 def expected_kv_cache_strides(variant: KernelVariant) -> tuple[int, int, int]:

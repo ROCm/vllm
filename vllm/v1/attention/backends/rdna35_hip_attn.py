@@ -29,6 +29,7 @@ from vllm.v1.attention.ops.rdna35_hip_decode import (
     expected_kv_cache_strides,
     load,
     make_scratch,
+    scratch_bytes,
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
 
@@ -222,6 +223,7 @@ def _knobs_for(
     max_m: int,
     window: int = 0,
     dtype: torch.dtype = torch.float16,
+    batch: bool = False,
 ) -> _Knobs:
     """Launch knobs for one configuration: the heuristics, then the measured
     overrides on top.
@@ -233,6 +235,10 @@ def _knobs_for(
         max_m: Query tokens per sequence.
         window: Sliding window in keys, 0 for full attention.
         dtype: Element type; bf16 rows may differ (`_TUNED_BF16`).
+        batch: More than one sequence.  The dot decomposition buys latency for
+            one sequence and loses to WMMA once a batch fills the machine, so
+            a dot row gives way to its WMMA row (`_TUNED_BF16`) or the
+            heuristics.
 
     Returns:
         Keyword arguments for `KernelVariant`.
@@ -244,8 +250,10 @@ def _knobs_for(
     else:
         key = (num_q_heads, num_kv_heads, head_size, max_m)
         tuned = _TUNED.get(key, {})
-        if dtype == torch.bfloat16:
+        if dtype == torch.bfloat16 or (batch and tuned.get("dot")):
             tuned = _TUNED_BF16.get(key, tuned)
+    if batch and tuned.get("dot"):
+        tuned = {}
     rg, dspl = _rows_split(num_q_heads // num_kv_heads, max_m, head_size)
     rg = tuned.get("rg", rg)
     knobs: _Knobs = {
@@ -268,6 +276,15 @@ def _knobs_for(
 # The JIT-compiled module plus the scratch buffers sized for it.  The module is
 # a pybind extension built at runtime, so it has no static type.
 _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+
+# Split-KV scratch, one set per variant and device, shared by every layer that
+# runs it: layers launch one after another on one stream, and the counters are
+# left clean by each launch.  Sized for the scheduler's batch, up to a budget;
+# a larger batch falls back to Triton.
+_SCRATCH: dict[tuple[KernelVariant, torch.device], tuple[int, Any]] = {}
+_SCRATCH_BUDGET = 64 * 1024**2
+# Query tokens per sequence the kernel serves: decode and speculative decode.
+_MAX_M = 8
 
 
 class Rdna35HipAttentionBackend(TritonAttentionBackend):
@@ -315,6 +332,14 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         # backend, which is worse than an error.
         self.kernel_calls = 0
         self.fallback_calls = 0
+        try:
+            from vllm.config import get_current_vllm_config
+
+            max_seqs = get_current_vllm_config().scheduler_config.max_num_seqs
+        except Exception:
+            max_seqs = 1
+        self._max_seqs = max(1, max_seqs)
+        self._cap = 0
 
     def _reject(self, reason: str) -> None:
         """Record why this shape falls back.
@@ -369,9 +394,17 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             self._reject(f"KV quant mode {kwargs['kv_quant_mode']!r} unsupported")
             return None
 
-        seqused_k = kwargs["seqused_k"]
-        if seqused_k.shape[0] != 1:
-            self._reject(f"kernel handles one sequence, got {seqused_k.shape[0]}")
+        # Every sequence with the same number of query tokens: decode, or
+        # speculative decode.  Mixed batches (prefill in them) go to Triton.
+        nseq = kwargs["seqused_k"].shape[0]
+        max_m = kwargs["max_seqlen_q"]
+        if kwargs["q"].shape[0] != nseq * max_m:
+            self._reject("sequences of unequal query length")
+            return None
+        # A decode kernel: every distinct M is a build of its own, so a
+        # prompt served here would compile a variant per prompt length.
+        if max_m > _MAX_M:
+            self._reject(f"{max_m} query tokens per sequence, more than {_MAX_M}")
             return None
         dtype = kwargs["q"].dtype
         if dtype not in (torch.float16, torch.bfloat16):
@@ -398,18 +431,20 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_size,
-                q.shape[0],
+                max_m,
                 win,
                 dtype,
+                nseq > 1,
             ),
             head_size=self.head_size,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
-            max_m=q.shape[0],
+            max_m=max_m,
             block_size=block_size,
             layout=0 if kv_cache.stride(1) < kv_cache.stride(2) else 1,
             dtype=dtype,
             window=win,
+            batch=int(nseq > 1),
         )
         expected = expected_kv_cache_strides(variant)
         actual = (kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2))
@@ -423,8 +458,20 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             except VariantBuildError as exc:
                 self._reject(str(exc).splitlines()[0])
                 return None
-            self._built = (module, make_scratch(variant, q.device))
+            key = (variant, q.device)
+            if key not in _SCRATCH:
+                if variant.batch:
+                    per_seq = scratch_bytes(variant)
+                    cap = min(self._max_seqs, max(1, _SCRATCH_BUDGET // per_seq))
+                    _SCRATCH[key] = (cap, make_scratch(variant, q.device, cap))
+                else:
+                    _SCRATCH[key] = (1, make_scratch(variant, q.device))
+            self._cap, scratch = _SCRATCH[key]
+            self._built = (module, scratch)
             self._variant = variant
+        if nseq > self._cap:
+            self._reject(f"{nseq} sequences, scratch holds {self._cap}")
+            return None
         return self._built
 
     def _run_attention(self, *, kv_cache: torch.Tensor, **kwargs) -> None:
@@ -442,7 +489,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         module.decode_attn(
             kwargs["q"],
             kv_cache,
-            kwargs["block_table"][0],
+            kwargs["block_table"],
             kwargs["out"],
             acc,
             softmax_max,
