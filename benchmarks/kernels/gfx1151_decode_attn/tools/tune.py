@@ -61,6 +61,8 @@ def rank(ctxs, entry):
     the target, then the geomean over every context.  A point that trades
     long-context throughput below the target for short-context gains loses."""
     g, cells = entry
+    if not cells:  # did not build or run
+        return (-1.0, 0.0)
     long_ = [c for s, c in zip(ctxs, cells) if s >= LONG_S]
     floor_ = min(min(long_), LONG_TARGET) if long_ else LONG_TARGET
     return (floor_, g)
@@ -135,7 +137,7 @@ def main() -> None:
     )
 
     shapes, _windowed = shapeset.load(args)
-    configs = sorted({(s.hq, s.hkv, s.d) for s in shapes if s.d != 96})
+    configs = sorted({(s.hq, s.hkv, s.d, s.window) for s in shapes if s.d != 96})
     if not configs:
         print(f"no shapes match {shapeset.describe(args) or 'the given filters'}")
         return
@@ -169,6 +171,7 @@ def main() -> None:
                 v.layout,
                 **override,
                 dtype=v.dtype,
+                window=v.window,
             )
             if self._variant != want:
                 self._variant = want
@@ -178,7 +181,7 @@ def main() -> None:
 
     backend_mod.Rdna35HipAttentionImpl._prepare = patched
 
-    def timeit(hq, hkv, d, m, s):
+    def timeit(hq, hkv, d, m, s, window):
         cfg = BenchmarkConfig(
             backend="RDNA35_HIP_ATTN",
             batch_spec=f"q{m}s{s}",
@@ -190,15 +193,16 @@ def main() -> None:
             block_size=args.block_size,
             device="cuda:0",
             dtype=dtype,
+            sliding_window=window or None,
         )
         return run_attention_benchmark(cfg).median_time * 1e6
 
     def key(c):
         return tuple(sorted(c.items()))
 
-    for hq, hkv, d in configs:
+    for hq, hkv, d, window in configs:
         for m in args.m:
-            base = dict(_knobs_for(hq, hkv, d, m))
+            base = dict(_knobs_for(hq, hkv, d, m, window, dtype))
             start = {
                 "nw": base.get("nw", 8),
                 "dspl": base.get("dspl", 0),
@@ -210,7 +214,9 @@ def main() -> None:
             }
             values = space(hq, hkv, d, start)
             roof = {
-                s: shapeset.roofline_us(hq, hkv, d, m, s, block_size=args.block_size)
+                s: shapeset.roofline_us(
+                    hq, hkv, d, m, s, block_size=args.block_size, window=window
+                )
                 for s in args.contexts
             }
             scores: dict[tuple, tuple[float, list[float]]] = {}
@@ -222,6 +228,7 @@ def main() -> None:
                 hkv=hkv,
                 d=d,
                 m=m,
+                window=window,
                 base=base,
                 roof=roof,
                 scores=scores,
@@ -239,6 +246,7 @@ def main() -> None:
                             1,
                             **knobs_of(hkv, c),
                             dtype=dtype,
+                            window=window,
                         )
                 # The unpatched _prepare builds the backend's own choice before
                 # the override replaces it, so that variant is needed too.
@@ -247,7 +255,15 @@ def main() -> None:
                     [
                         *variants.values(),
                         KernelVariant(
-                            d, hq, hkv, m, args.block_size, 1, **base, dtype=dtype
+                            d,
+                            hq,
+                            hkv,
+                            m,
+                            args.block_size,
+                            1,
+                            **base,
+                            dtype=dtype,
+                            window=window,
                         ),
                     ]
                 )
@@ -260,7 +276,7 @@ def main() -> None:
                     override.clear()
                     override.update(knobs_of(hkv, c))
                     try:
-                        r = [roof[s] / timeit(hq, hkv, d, m, s) for s in ctxs]
+                        r = [roof[s] / timeit(hq, hkv, d, m, s, window) for s in ctxs]
                     except Exception:  # noqa: BLE001 - a point may not build
                         scores[(ctxs, key(c))] = (0.0, [])
                         continue
@@ -318,8 +334,9 @@ def main() -> None:
             best, (g, cells) = descend(tuple(args.contexts), dot=True)
             row = ", ".join(f'"{k}": {v}' for k, v in knobs_of(hkv, best).items())
             worst = min(cells) * 100 if cells else 0.0
+            key_ = f"{hq}, {hkv}, {d}, {m}" + (f", {window}" if window else "")
             print(
-                f"    ({hq}, {hkv}, {d}, {m}): {{{row}}},  "
+                f"    ({key_}): {{{row}}},  "
                 f"# {g * 100:.1f} % geomean, worst {worst:.1f} %",
                 flush=True,
             )

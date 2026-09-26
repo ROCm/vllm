@@ -101,6 +101,12 @@
     #define GT 0
   #endif
 
+  // Sliding window: a query at position p attends to keys p-WIN+1 .. p.  0 is
+  // full causal attention.  Only the window's blocks are read, whatever S is.
+  #ifndef WIN
+    #define WIN 0
+  #endif
+
   // Measurement only, wrong answers: 1 skips the V loads, 2 thins P@V to one
   // WMMA per tile, 4 skips the K loads, 16 thins Q@K to one WMMA per tile, 32
   // returns at once, 64 loads each tile and does nothing else, 128 skips the
@@ -556,11 +562,25 @@ __device__ __forceinline__ void body(
   // wave-uniform and guards the loop with an exec mask, so a wave with no
   // tiles reached the LDS stores with exec = 0 (reference kernel, NSEG > 1).
   const int gw = __builtin_amdgcn_readfirstlane(seg * M_NW + wave);
-  const int jstart = gw * D_KPWE * D_SUB;
+    #if WIN
+  // Tiles start at the first key some query can see, on a tile boundary so no
+  // tile straddles two pages; a window wider than S starts at 0.
+  const int kbase =
+      max(0, S - MAXM - (WIN - 1)) / (D_KPWE * D_SUB) * (D_KPWE * D_SUB);
+    #else
+  constexpr int kbase = 0;
+    #endif
+  const int jstart = kbase + gw * D_KPWE * D_SUB;
   const int jstep = M_NSEG * M_NW * D_KPWE * D_SUB;
-  // The first tile's block came in with S; each later one is read a tile
-  // ahead, so no tile's loads wait on the block table.
+    // The first tile's block came in with S; each later one is read a tile
+    // ahead, so no tile's loads wait on the block table.  With a window the
+    // first tile depends on S, so its block is read now.
+    #if WIN
+  int blk = __builtin_amdgcn_readfirstlane(bt[min(jstart / BS, bt_width - 1)]);
+  (void)pages;
+    #else
   int blk = __builtin_amdgcn_readfirstlane(pages);
+    #endif
 
   for (int jb = jstart; jb < S; jb += jstep) {
     fvec kr[D_KPWE], vr[D_KPWE];
@@ -625,6 +645,9 @@ __device__ __forceinline__ void body(
         const bool valid = (jj <= ctx + t + 1);
     #else
         const bool valid = (jj <= ctx + t);
+    #endif
+    #if WIN
+        s[c][t] = (jj < ctx + t - (WIN - 1)) ? -INFINITY : s[c][t];
     #endif
         s[c][t] = valid ? s[c][t] * scale2 : -INFINITY;
       }
@@ -962,8 +985,19 @@ __device__ __forceinline__ void body(
 
   __builtin_assume(S > 0);
   const int nblk = (S + KBLK - 1) / KBLK;
-  const int nseg = max(1, min(M_NSEG, nblk / M_MINB));
+    #if WIN
+  // The first block holding a key some query can see.  Clamped at 0: a window
+  // wider than the sequence reads it all and nothing before it.
+  const int b0 = max(0, S - MAXM - (WIN - 1)) / KBLK;
+    #else
+  constexpr int b0 = 0;
+    #endif
+  const int nseg = max(1, min(M_NSEG, (nblk - b0) / M_MINB));
   if (seg >= nseg) return;
+    #if WIN
+  // The page indices that came in with S were for block seg, not b0 + seg.
+  pages = block_pages(bt, b0 + seg, lane, S);
+    #endif
   TS(0);
   if (ABLATE & 32) {
     if (S == -1) out[0] = (OutT)0;
@@ -1062,7 +1096,7 @@ __device__ __forceinline__ void body(
   };
 
   Tile ta;
-  issue(ta, seg);
+  issue(ta, b0 + seg);
 
     #pragma unroll
   for (int it = 0; it < QITER; ++it) {
@@ -1131,7 +1165,7 @@ __device__ __forceinline__ void body(
     return;
     #endif
     #if TIMING == 3
-    if (b == seg) {
+    if (b == b0 + seg) {
       asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
       TS(10);
     }
@@ -1172,7 +1206,7 @@ __device__ __forceinline__ void body(
     lds_barrier();
       #endif
     #endif
-    if (b == seg) TS(2);
+    if (b == b0 + seg) TS(2);
     #if SHT
     vrow_t vs[8];
       #pragma unroll
@@ -1189,14 +1223,30 @@ __device__ __forceinline__ void body(
       for (int e = 0; e < 8; ++e)
         if (kt + 2 * e + hi >= S) v[e] = vrow_t{};
     }
+    #if WIN
+    // Likewise keys before every query's window: vLLM may have freed their
+    // pages, and the table then names a block whose contents are anyone's.
+    if (__builtin_expect(kt < ctx - (WIN - 1), 0)) {
+      #pragma unroll
+      for (int e = 0; e < 8; ++e)
+        if (kt + 2 * e + hi < ctx - (WIN - 1)) v[e] = vrow_t{};
+    }
+    #endif
 
     // Lane holds row l16, keys kt + 2e + hi.  Only a tile that reaches past
     // the first query token's keys needs the causal mask.  The scale is
     // applied inside the exponent: it is positive, so the max commutes.
     const bool tail = kt + 16 > ctx + 1;
+    #if WIN
+    // And only a tile reaching below the last query's window needs its
+    // lower edge.
+    const bool head = kt < ctx + MAXM - WIN;
+    #else
+    constexpr bool head = false;
+    #endif
     #pragma unroll
     for (int rt = 0; rt < RTW; ++rt) {
-      if (__builtin_expect(tail, 0)) {
+      if (__builtin_expect(tail || head, 0)) {
     #pragma unroll
         for (int e = 0; e < 8; ++e) {
           const int key = kt + 2 * e + hi;
@@ -1204,6 +1254,9 @@ __device__ __forceinline__ void body(
           const bool valid = key <= ctx + mrow[rt] + 1 && key < S;
     #else
           const bool valid = key <= ctx + mrow[rt];
+    #endif
+    #if WIN
+          if (key < ctx + mrow[rt] - (WIN - 1)) s[rt][e] = -INFINITY;
     #endif
           if (!valid) s[rt][e] = -INFINITY;
         }
@@ -1275,7 +1328,7 @@ __device__ __forceinline__ void body(
   // counted with LDS.  Two buffers: a wave refills one only after the
   // barrier that every wave reaches after reading it.
   int buf = 0;
-  for (int b = seg; b < nblk; b += nseg) {
+  for (int b = b0 + seg; b < nblk; b += nseg) {
     char* const kb = KT_BUF(buf);
     stage(ta, kb);
     asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
@@ -1288,7 +1341,7 @@ __device__ __forceinline__ void body(
   // Two tiles per wave in flight: the next one's loads go out before this
   // one is computed.  Only where a second tile's registers fit (small D).
   Tile tb;
-  for (int b = seg; b < nblk; b += 2 * nseg) {
+  for (int b = b0 + seg; b < nblk; b += 2 * nseg) {
     stage_k(ta);
     if (b + nseg < nblk) issue(tb, b + nseg);
     process(ta, ta.v, kt_s, b);
@@ -1298,7 +1351,7 @@ __device__ __forceinline__ void body(
     process(tb, tb.v, kt_s, b + nseg);
   }
     #else
-  for (int b = seg; b < nblk; b += nseg) {
+  for (int b = b0 + seg; b < nblk; b += nseg) {
     stage_k(ta);
     process(ta, ta.v, kt_s, b);
     if (b + nseg < nblk) issue(ta, b + nseg);

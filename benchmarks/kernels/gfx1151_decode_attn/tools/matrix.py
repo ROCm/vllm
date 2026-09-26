@@ -129,8 +129,8 @@ def main() -> None:
     if forced:
         _heuristic = _knobs_for
 
-        def _knobs_for(hq, hkv, d, m):  # noqa: F811
-            return {**_heuristic(hq, hkv, d, m), **forced}
+        def _knobs_for(hq, hkv, d, m, window=0, dtype=torch.float16):  # noqa: F811
+            return {**_heuristic(hq, hkv, d, m, window, dtype), **forced}
 
         backend_mod._knobs_for = _knobs_for
 
@@ -166,7 +166,7 @@ def main() -> None:
     backend_mod.make_scratch = cached
 
     wanted = []
-    for hq, hkv, d, _window in seen:
+    for hq, hkv, d, window in seen:
         for m in args.m:
             for layout in (0, 1):
                 with contextlib.suppress(Exception):
@@ -178,8 +178,9 @@ def main() -> None:
                             m,
                             args.block_size,
                             layout,
-                            **_knobs_for(hq, hkv, d, m),
+                            **_knobs_for(hq, hkv, d, m, window, dtype),
                             dtype=dtype,
+                            window=window,
                         )
                     )
     precompile(wanted)
@@ -194,7 +195,7 @@ def main() -> None:
     seal()
     time.sleep(5)  # clocks settle after a parallel build; see 00-protocol.md
 
-    def timeit(backend, hq, hkv, d, s, m):
+    def timeit(backend, hq, hkv, d, s, m, window):
         cfg = BenchmarkConfig(
             backend=backend,
             batch_spec=f"q{m}s{s}",
@@ -206,6 +207,7 @@ def main() -> None:
             block_size=args.block_size,
             device="cuda:0",
             dtype=dtype,
+            sliding_window=window or None,
         )
         rs = [run_attention_benchmark(cfg) for _ in range(args.reps)]
         spread = max(r.std_time / r.median_time for r in rs) * 100
@@ -230,9 +232,9 @@ def main() -> None:
     # large context reads its first cell per configuration up to 10x slow.
     for s in args.contexts:
         for m in args.m:
-            for models, hq, hkv, d, _window in rows:
+            for models, hq, hkv, d, window in rows:
                 roof = shapeset.roofline_us(
-                    hq, hkv, d, m, s, block_size=args.block_size
+                    hq, hkv, d, m, s, block_size=args.block_size, window=window
                 )
                 impls: list[Any] = []
                 orig_init = backend_mod.Rdna35HipAttentionImpl.__init__
@@ -243,7 +245,7 @@ def main() -> None:
 
                 backend_mod.Rdna35HipAttentionImpl.__init__ = spy
                 try:
-                    ours, spread = timeit("RDNA35_HIP_ATTN", hq, hkv, d, s, m)
+                    ours, spread = timeit("RDNA35_HIP_ATTN", hq, hkv, d, s, m, window)
                 finally:
                     backend_mod.Rdna35HipAttentionImpl.__init__ = orig_init
                 ran = any(i.kernel_calls for i in impls) and not any(
@@ -251,11 +253,11 @@ def main() -> None:
                 )
                 tri = None
                 if args.triton:
-                    tri, _ = timeit("TRITON_ATTN", hq, hkv, d, s, m)
+                    tri, _ = timeit("TRITON_ATTN", hq, hkv, d, s, m, window)
                 mark = "" if ran else " (fallback)"
                 label = (
                     models[0] if len(models) == 1 else f"{models[0]} +{len(models) - 1}"
-                )
+                ) + (f" w={window}" if window else "")
                 print(
                     f"| {label}{mark} | {s} | {m} | {hq} | {hkv} | {d} | "
                     f"{roof:.2f} | {'-' if tri is None else f'{tri:.2f}'} | "

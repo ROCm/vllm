@@ -315,6 +315,10 @@ class BenchmarkConfig:
     # "auto" or "fp8"
     kv_cache_dtype: str = "auto"
 
+    # Sliding window in keys (None: full attention).  Set on the impl and the
+    # KV cache spec, so every backend sees the same windowed layer.
+    sliding_window: int | None = None
+
     # MLA-specific
     prefill_backend: str | None = None
     kv_lora_rank: int | None = None

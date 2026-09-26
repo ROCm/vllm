@@ -111,8 +111,8 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     (14, 2, 64, 4): {"nseg": 8, "rg": 1, "minb": 2, "nw": 4, "dspl": 0},
     (16, 2, 64, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
     (16, 2, 64, 4): {"nseg": 8, "rg": 2, "minb": 2, "nw": 4, "dspl": 0},
-    (32, 8, 64, 1): {"nseg": 2, "rg": 1, "minb": 2, "nw": 4, "dspl": 0},
-    (32, 8, 64, 4): {"nseg": 2, "rg": 1, "minb": 2, "nw": 4, "dspl": 0},
+    (32, 8, 64, 1): {"nw": 4, "rg": 1, "minb": 2, "nseg": 1, "pf": 1},
+    (32, 8, 64, 4): {"nw": 4, "rg": 1, "minb": 1, "nseg": 1, "pf": 1},
     (32, 32, 64, 1): {"nseg": 1, "rg": 1, "minb": 2, "nw": 2, "dspl": 0},
     (32, 32, 64, 4): {"nseg": 1, "rg": 1, "minb": 4, "nw": 2, "dspl": 0},
     # D=128
@@ -122,7 +122,7 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     (32, 2, 128, 4): {"nseg": 4, "rg": 4, "minb": 2, "nw": 8, "dspl": 0},
     (28, 4, 128, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 4, "dspl": 2},
     (28, 4, 128, 4): {"nseg": 4, "rg": 1, "minb": 1, "nw": 8, "dspl": 2},
-    (32, 4, 128, 1): {"nseg": 4, "rg": 2, "minb": 1, "nw": 4, "dspl": 0},
+    (32, 4, 128, 1): {"nw": 4, "rg": 2, "minb": 4, "nseg": 2},
     (32, 4, 128, 4): {"nseg": 2, "rg": 2, "minb": 4, "nw": 4, "dspl": 0},
     (16, 8, 128, 1): {"nseg": 1, "rg": 2, "minb": 2, "nw": 4, "dspl": 0},
     (16, 8, 128, 4): {"nseg": 1, "rg": 2, "minb": 2, "nw": 4, "dspl": 0},
@@ -137,36 +137,61 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     (32, 32, 128, 1): {"nseg": 1, "rg": 1, "minb": 2, "nw": 2, "dspl": 0},
     (32, 32, 128, 4): {"nseg": 1, "rg": 1, "minb": 1, "nw": 2, "dspl": 0},
     # D=256
-    (8, 1, 256, 1): {"nseg": 8, "rg": 2, "minb": 1, "nw": 8, "dspl": 0},
+    (8, 1, 256, 1): {"dot": 1, "nw": 8, "nseg": 4, "bfly": 4},
     (8, 1, 256, 4): {"nseg": 8, "rg": 2, "minb": 1, "nw": 8, "dspl": 0},
-    (8, 2, 256, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 4},
-    (8, 2, 256, 4): {"nw": 4, "rg": 1, "minb": 1, "nseg": 8},
+    (8, 2, 256, 1): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 4},
+    (8, 2, 256, 4): {"nseg": 4, "rg": 2, "minb": 1, "nw": 8, "dspl": 0},
     (16, 2, 256, 1): {"nseg": 8, "rg": 2, "minb": 2, "nw": 8, "dspl": 0},
     (16, 2, 256, 4): {"nseg": 4, "rg": 2, "minb": 1, "nw": 4, "dspl": 0},
-    (8, 4, 256, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 2, "dspl": 0},
+    (8, 4, 256, 1): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 4, "gt": 1},
     (8, 4, 256, 4): {"nw": 4, "rg": 1, "minb": 2, "nseg": 2, "dspl": 4, "pf": 1},
-    (16, 4, 256, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 2, "dspl": 0},
-    (16, 4, 256, 4): {"nseg": 4, "rg": 2, "minb": 2, "nw": 8, "dspl": 0},
-    (24, 4, 256, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 8, "dspl": 0},
-    (24, 4, 256, 4): {"nseg": 4, "rg": 2, "minb": 2, "nw": 4, "dspl": 0},
+    (16, 4, 256, 1): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 2, "gt": 1},
+    (16, 4, 256, 4): {"nw": 4, "rg": 2, "minb": 1, "nseg": 2},
+    (24, 4, 256, 1): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 2},
+    (24, 4, 256, 4): {"nw": 4, "rg": 1, "minb": 1, "nseg": 4, "rspl": 2, "pf": 1},
     (16, 8, 256, 1): {"nseg": 2, "rg": 1, "minb": 2, "nw": 2, "dspl": 0},
     (16, 8, 256, 4): {"nseg": 2, "rg": 1, "minb": 4, "nw": 4, "dspl": 4},
     # D=512
-    (8, 1, 512, 1): {"nseg": 16, "rg": 1, "minb": 1, "nw": 8, "dspl": 8},
+    (8, 1, 512, 1): {"dot": 1, "nw": 8, "nseg": 4, "bfly": 4},
     (8, 1, 512, 4): {"nseg": 8, "rg": 2, "minb": 1, "nw": 8, "dspl": 0},
-    (16, 1, 512, 1): {"nseg": 16, "rg": 1, "minb": 1, "nw": 8, "dspl": 8},
+    (16, 1, 512, 1): {"nw": 8, "rg": 1, "minb": 1, "nseg": 16, "dspl": 8},
     (16, 1, 512, 4): {"nseg": 8, "rg": 4, "minb": 1, "nw": 8, "dspl": 0},
-    (8, 2, 512, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
+    (8, 2, 512, 1): {"dot": 1, "nw": 8, "nseg": 2},
     (8, 2, 512, 4): {"nw": 8, "rg": 1, "minb": 2, "nseg": 4, "dspl": 8, "pf": 1},
-    (16, 2, 512, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
+    (16, 2, 512, 1): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 4},
     (16, 2, 512, 4): {"nseg": 4, "rg": 2, "minb": 1, "nw": 8, "dspl": 0},
-    (32, 4, 512, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
+    (32, 4, 512, 1): {"dot": 1, "nw": 4, "nseg": 2, "bfly": 4},
     (32, 4, 512, 4): {"nseg": 2, "rg": 2, "minb": 2, "nw": 8, "dspl": 0},
 }
 
+# bf16 rows that differ from _TUNED.  The dot decomposition's bf16 products
+# (v_dot2_f32_bf16) fall behind at long context -- 0.73-0.97x of the WMMA
+# rows at 32k -- so in bf16 these shapes keep their WMMA configuration.
+_TUNED_BF16: dict[tuple[int, int, int, int], _Knobs] = {
+    (8, 1, 256, 1): {"nseg": 8, "rg": 2, "minb": 1, "nw": 8, "dspl": 0},
+    (8, 2, 256, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 4},
+    (8, 4, 256, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 2, "dspl": 0},
+    (16, 4, 256, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 2, "dspl": 0},
+    (24, 4, 256, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 8, "dspl": 0},
+    (8, 1, 512, 1): {"nseg": 16, "rg": 1, "minb": 1, "nw": 8, "dspl": 8},
+    (8, 2, 512, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
+    (16, 2, 512, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
+    (32, 4, 512, 1): {"nseg": 4, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
+}
+
+# Sliding-window layers, keyed on (Hq, Hkv, D, M, window).  They read only the
+# window's keys whatever the sequence length, so they are tuned apart from the
+# full-attention layers that share their shape (gemma interleaves the two).
+_TUNED_SWA: dict[tuple[int, int, int, int, int], _Knobs] = {}
+
 
 def _knobs_for(
-    num_q_heads: int, num_kv_heads: int, head_size: int, max_m: int
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    max_m: int,
+    window: int = 0,
+    dtype: torch.dtype = torch.float16,
 ) -> _Knobs:
     """Launch knobs for one configuration: the heuristics, then the measured
     overrides on top.
@@ -176,11 +201,21 @@ def _knobs_for(
         num_kv_heads: KV heads.
         head_size: Head dimension.
         max_m: Query tokens per sequence.
+        window: Sliding window in keys, 0 for full attention.
+        dtype: Element type; bf16 rows may differ (`_TUNED_BF16`).
 
     Returns:
         Keyword arguments for `KernelVariant`.
     """
-    tuned = _TUNED.get((num_q_heads, num_kv_heads, head_size, max_m), {})
+    if window:
+        tuned = _TUNED_SWA.get(
+            (num_q_heads, num_kv_heads, head_size, max_m, window), {}
+        )
+    else:
+        key = (num_q_heads, num_kv_heads, head_size, max_m)
+        tuned = _TUNED.get(key, {})
+        if dtype == torch.bfloat16:
+            tuned = _TUNED_BF16.get(key, tuned)
     rg, dspl = _rows_split(num_q_heads // num_kv_heads, max_m, head_size)
     rg = tuned.get("rg", rg)
     knobs: _Knobs = {
@@ -223,7 +258,7 @@ class Rdna35HipAttentionBackend(TritonAttentionBackend):
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
@@ -273,9 +308,23 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         if kwargs["softcap"] or not kwargs["causal"]:
             self._reject("softcap or non-causal unsupported")
             return None
+        # vLLM passes a causal window of w keys as (w - 1, 0).
         window = kwargs["window_size"]
+        win = 0
         if window is not None and window[0] >= 0:
-            self._reject("sliding window unsupported")
+            if window[1] != 0:
+                self._reject(f"only causal sliding windows, got {window}")
+                return None
+            win = window[0] + 1
+        # Features the kernel does not implement must not reach it silently.
+        if kwargs.get("mm_prefix_range") is not None:
+            self._reject("multimodal bidirectional prefix unsupported")
+            return None
+        if kwargs.get("rswa_prefix_lens") is not None:
+            self._reject("rswa unsupported")
+            return None
+        if kwargs.get("chunk_lookback", -1) >= 0:
+            self._reject("chunk lookback unsupported")
             return None
         # Not the descale tensors: on the unquantized path k_descale is still a
         # broadcast of a 1.0 scale, so testing it for None never fires.
@@ -308,7 +357,14 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         q = kwargs["q"]
         block_size = kv_cache.shape[2]
         variant = KernelVariant(
-            **_knobs_for(self.num_heads, self.num_kv_heads, self.head_size, q.shape[0]),
+            **_knobs_for(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                q.shape[0],
+                win,
+                dtype,
+            ),
             head_size=self.head_size,
             num_q_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
@@ -316,6 +372,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             block_size=block_size,
             layout=0 if kv_cache.stride(1) < kv_cache.stride(2) else 1,
             dtype=dtype,
+            window=win,
         )
         expected = expected_kv_cache_strides(variant)
         actual = (kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2))

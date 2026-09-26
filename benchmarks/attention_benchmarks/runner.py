@@ -252,7 +252,7 @@ def _create_backend_impl(
         scale=scale,
         num_kv_heads=config.num_kv_heads,
         alibi_slopes=None,
-        sliding_window=None,
+        sliding_window=config.sliding_window,
         kv_cache_dtype=config.kv_cache_dtype,
     )
 
@@ -261,6 +261,7 @@ def _create_backend_impl(
         num_kv_heads=config.num_kv_heads,
         head_size=config.head_dim,
         dtype=dtype,
+        sliding_window=config.sliding_window,
     )
 
     layer = MockLayer(device, kv_cache_spec=kv_cache_spec)
@@ -518,8 +519,14 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     # One KV cache per layer, so the layer loop is also a rotation over
     # disjoint KV; grow it when asked, to push the working set out of cache.
+    # A windowed layer reads only its window, so that is what must outgrow the
+    # cache; counting the whole sequence would leave the read part resident.
+    read_lens = [
+        kv if config.sliding_window is None else min(kv, config.sliding_window + q - 1)
+        for kv, q in zip(kv_lens, q_lens)
+    ]
     kv_bytes_per_layer = (
-        2 * sum(kv_lens) * config.num_kv_heads * config.head_dim * dtype_size(config)
+        2 * sum(read_lens) * config.num_kv_heads * config.head_dim * dtype_size(config)
     )
     config = replace(
         config,
@@ -557,6 +564,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 num_kv_heads=config.num_kv_heads,
                 head_size=config.head_dim,
                 dtype=dtype,
+                sliding_window=config.sliding_window,
             )
 
             builder = _create_metadata_builder(

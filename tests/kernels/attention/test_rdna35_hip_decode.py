@@ -44,6 +44,13 @@ RSPL = {
     # Not WMMA at all: the per-q-head dot-product decomposition.
     "dot": dict(hq=16, hkv=2, hd=256, nw=8, dot=1, bfly=4, nseg=2),
 }
+# Sliding windows: the WMMA path with and without segments, and the dot path.
+# 1000 keys starts the window off any tile and page boundary.
+WINDOWED = {
+    "wmma": dict(hq=16, hkv=8, hd=256, nw=4, window=1000, nseg=1),
+    "wmma segments": dict(hq=8, hkv=1, hd=256, nw=4, rg=2, window=512, nseg=8),
+    "dot": dict(hq=8, hkv=2, hd=256, nw=8, dot=1, bfly=4, window=1000, nseg=2),
+}
 # Relative error bound per dtype.  The reference sees the same rounded inputs,
 # so what differs is the kernel's arithmetic and its output rounding -- the
 # latter alone up to 2^-8 relative in bf16.
@@ -85,6 +92,10 @@ def _build_variants():
             _variant(layout=1, mutate=1, dtype=dtype),
             _variant(**SHARED, dtype=dtype),
             *(_variant(**shape, dtype=dtype) for shape in RSPL.values()),
+            *(
+                _variant(**{k: v for k, v in shape.items()}, dtype=dtype)
+                for shape in WINDOWED.values()
+            ),
         )
     )
 
@@ -104,6 +115,7 @@ def _variant(
     pf: int = 0,
     dot: int = 0,
     bfly: int = 0,
+    window: int = 0,
 ):
     # nseg > 1 with minb = 1 splits even a short context over several
     # workgroups, which is the only way to reach the cross-workgroup merge.
@@ -125,6 +137,7 @@ def _variant(
         pf=pf,
         dot=dot,
         bfly=bfly,
+        window=window,
     )
 
 
@@ -153,7 +166,7 @@ def _paged_inputs(
     return q, kv, torch.arange(num_blocks, device=dev, dtype=torch.int32)
 
 
-def _reference(q, kv, seq_len):
+def _reference(q, kv, seq_len, window=0):
     hq, hkv, hd = q.shape[1], kv.shape[1], q.shape[2]
     flat = kv.transpose(1, 2).reshape(seq_len, hkv, 2 * hd)
     k, v = flat[..., :hd], flat[..., hd:]
@@ -164,7 +177,10 @@ def _reference(q, kv, seq_len):
     scores = torch.bmm(qf, kf.transpose(1, 2)) * (hd**-0.5)
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
     lim = (seq_len - M + torch.arange(M, device=q.device)).view(M, 1)
-    scores = scores.masked_fill((pos > lim).view(1, M, seq_len), float("-inf"))
+    masked = pos > lim
+    if window:
+        masked |= pos < lim - (window - 1)
+    scores = scores.masked_fill(masked.view(1, M, seq_len), float("-inf"))
     return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
 
 
@@ -176,12 +192,24 @@ def _run(
     nseg=1,
     repeat=1,
     build_dtype=None,
+    free_before_window=False,
     **shape,
 ):
     _skip_unless_gfx1151()
     dims = {k: v for k, v in shape.items() if k in ("hq", "hkv", "hd")}
     q, kv, block_table = _paged_inputs(seq_len, layout, dtype, **dims)
     variant = _variant(layout, mutate, nseg, dtype=build_dtype or dtype, **shape)
+    window = shape.get("window", 0)
+    ref = _reference(q, kv, seq_len, window)
+    if free_before_window:
+        # vLLM frees the pages no query's window reaches and points their
+        # table entries elsewhere: here, at a page of NaN the kernel must never
+        # let into the output.
+        assert layout == 1
+        first = max(0, seq_len - M - (window - 1)) // BLOCK_SIZE
+        kv = torch.cat([kv, torch.full_like(kv[:1], float("nan"))])
+        block_table = block_table.clone()
+        block_table[:first] = kv.shape[0] - 1
     module = rdna35.load(variant)
     acc, m, ln, arrivals = rdna35.make_scratch(variant, q.device)
     out = torch.empty_like(q)
@@ -192,7 +220,7 @@ def _run(
             q, kv, block_table, out, acc, m, ln, arrivals, seq_lens, q.shape[2] ** -0.5
         )
     torch.accelerator.synchronize()
-    return out.float(), _reference(q, kv, seq_len)
+    return out.float(), ref
 
 
 def _max_rel(got, ref) -> float:
@@ -249,6 +277,35 @@ def test_row_tiles_split_over_waves(name, seq_len, dtype):
     got, ref = _run(seq_len, nseg=nseg, repeat=2, dtype=dtype, **shape)
     assert torch.isfinite(got).all()
     assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seq_len", [48, 512, 1024, 2000])
+@pytest.mark.parametrize("name", list(WINDOWED))
+def test_sliding_window(name, seq_len, dtype):
+    """Keys before the window are masked; a window wider than S (48, 512 at
+    1000) reads everything and nothing before it."""
+    shape = dict(WINDOWED[name])
+    nseg = shape.pop("nseg")
+    got, ref = _run(seq_len, nseg=nseg, repeat=2, dtype=dtype, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("name", list(WINDOWED))
+def test_sliding_window_never_reads_freed_pages(name):
+    """Pages wholly before the window may be freed; their contents must not
+    reach the output even as 0 * NaN.
+
+    S=2016 puts the window's first key late in its WMMA block, so that block's
+    first tile is a whole freed page: with the V zeroing removed the WMMA
+    cases fail.  (The dot path's tiles never leave the first key's page.)
+    """
+    shape = dict(WINDOWED[name])
+    nseg = shape.pop("nseg")
+    got, ref = _run(2016, nseg=nseg, free_before_window=True, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[torch.float16]
 
 
 def test_graph_replay_follows_seq_lens():

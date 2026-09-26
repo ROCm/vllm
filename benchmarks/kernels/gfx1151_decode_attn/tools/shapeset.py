@@ -35,6 +35,7 @@ def roofline_us(
     s: int,
     itemsize: int = 2,
     block_size: int = 16,
+    window: int = 0,
 ) -> float:
     """The floor for one decode-attention call, in microseconds.
 
@@ -60,15 +61,18 @@ def roofline_us(
         s: Context length.
         itemsize: Bytes per element of Q, K, V and the output.
         block_size: KV cache page size, for the block table.
+        window: Sliding window in keys, 0 for full attention.  A windowed layer
+            needs only the keys some query can see: min(s, window + m - 1).
 
     Returns:
         One dispatch plus the time those bytes take at peak bandwidth, in
         microseconds.
     """
+    keys = s if not window else min(s, window + m - 1)
     query = m * hq * d * itemsize
-    kv = s * hkv * 2 * d * itemsize
+    kv = keys * hkv * 2 * d * itemsize
     out = m * hq * d * itemsize
-    table = -(-s // block_size) * 4
+    table = -(-keys // block_size) * 4
     moved = (query + kv + out + table) / (PEAK_GIBS * 1024**3) * 1e6
     return DISPATCH_US + moved
 
@@ -88,6 +92,11 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--hkv", type=int, nargs="+", help="keep only these Hkv")
     p.add_argument("--head-dim", type=int, nargs="+", help="keep only these D")
     p.add_argument("--gqa", type=int, nargs="+", help="keep only these Hq/Hkv")
+    p.add_argument(
+        "--windowed",
+        action="store_true",
+        help="the sliding-window rows instead of the full-attention ones",
+    )
 
 
 def add_dtype_argument(p: argparse.ArgumentParser) -> None:
@@ -147,8 +156,8 @@ def load(args: argparse.Namespace) -> tuple[list[Shape], int]:
             # is the wanted answer rather than a rounding decision.
             if args.gqa and (s.hq % s.hkv or s.hq // s.hkv not in args.gqa):
                 continue
-            if s.window:
-                windowed += 1
+            if bool(s.window) != getattr(args, "windowed", False):
+                windowed += bool(s.window)
                 continue
             shapes.append(s)
     return shapes, windowed

@@ -89,7 +89,7 @@ def main() -> None:
     def variant_for(layout, nseg, rg, minb):
         from vllm.v1.attention.backends.rdna35_hip_attn import _knobs_for
 
-        kw = dict(_knobs_for(args.hq, args.hkv, args.head_dim, args.m))
+        kw = dict(_knobs_for(args.hq, args.hkv, args.head_dim, args.m, 0, dtype))
         kw["mutate"] = args.mutate
         kw["dtype"] = dtype
         for name, val in (

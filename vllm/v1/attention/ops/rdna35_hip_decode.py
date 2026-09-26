@@ -76,6 +76,9 @@ class KernelVariant:
     ablate: int = 0
     # Element type of Q, the KV cache and the output.
     dtype: torch.dtype = torch.float16
+    # Sliding window in keys (a query at p sees p-window+1 .. p); 0 is full
+    # causal attention.  Only the window's pages are read.
+    window: int = 0
 
     def __post_init__(self) -> None:
         if self.dtype not in (torch.float16, torch.bfloat16):
@@ -94,6 +97,7 @@ class KernelVariant:
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
             f"{'_bf16' if self.dtype == torch.bfloat16 else ''}"
+            f"{'' if not self.window else f'_win{self.window}'}"
         )
 
     @property
@@ -246,6 +250,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DDOT={variant.dot}",
         f"-DBFLY={variant.bfly}",
         f"-DGT={variant.gt}",
+        f"-DWIN={variant.window}",
         f"-DMUTATE={variant.mutate}",
         f"-DABLATE={variant.ablate}",
         f"-DKV_BF16={int(variant.dtype == torch.bfloat16)}",
