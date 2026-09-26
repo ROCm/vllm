@@ -64,9 +64,12 @@ class KernelVariant:
     # 1 keeps a second tile's loads in flight per wave (unshared tiles only;
     # it needs a second tile's registers).
     pf: int = 0
+    # 1 stages split-KV partials in LDS and writes them a line at a time
+    # instead of from registers.
+    cpub: int = 0
     # 1 runs the per-q-head dot-product decomposition instead of WMMA: nseg
     # segments per q head, nw waves, bfly its butterfly split, gt 1 to
-    # dispatch heads fastest.  rg, minb, dspl, rspl and pf do not apply.
+    # dispatch heads fastest.  rg, minb, dspl, rspl, pf and cpub do not apply.
     dot: int = 0
     bfly: int = 0
     gt: int = 0
@@ -93,6 +96,7 @@ class KernelVariant:
             f"{'' if not self.dspl else f'_ds{self.dspl}'}"
             f"{'' if self.rspl == 1 else f'_rs{self.rspl}'}"
             f"{'' if not self.pf else '_pf'}"
+            f"{'' if not self.cpub else '_cp'}"
             f"{'' if not self.dot else f'_dot_bf{self.bfly}_gt{self.gt}'}"
             f"_mut{self.mutate}"
             f"{'' if not self.ablate else f'_ab{self.ablate}'}"
@@ -247,6 +251,7 @@ def load(variant: KernelVariant) -> Any:
         *([f"-DDSPL={variant.dspl}"] if variant.dspl else []),
         f"-DRSPL={variant.rspl}",
         f"-DPF={variant.pf}",
+        f"-DCPUB={variant.cpub}",
         f"-DDOT={variant.dot}",
         f"-DBFLY={variant.bfly}",
         f"-DGT={variant.gt}",

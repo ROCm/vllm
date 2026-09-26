@@ -91,6 +91,12 @@ def main() -> None:
         help="force RSPL on every configuration, overriding the heuristics",
     )
     p.add_argument(
+        "--cpub",
+        type=int,
+        default=None,
+        help="force CPUB on every configuration, overriding the heuristics",
+    )
+    p.add_argument(
         "--no-triton",
         dest="triton",
         action="store_false",
@@ -123,6 +129,7 @@ def main() -> None:
             ("nw", args.nw),
             ("dspl", args.dspl),
             ("rspl", args.rspl),
+            ("cpub", args.cpub),
         )
         if v is not None
     }

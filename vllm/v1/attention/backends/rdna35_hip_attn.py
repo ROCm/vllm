@@ -97,6 +97,7 @@ class _Knobs(TypedDict, total=False):
     dspl: int
     rspl: int
     pf: int
+    cpub: int
     dot: int
     bfly: int
     gt: int
@@ -191,6 +192,7 @@ _TUNED_SWA: dict[tuple[int, int, int, int, int], _Knobs] = {
         "nseg": 16,
         "rspl": 2,
         "pf": 1,
+        "cpub": 1,
     },
     (8, 2, 256, 1, 512): {"dot": 1, "nw": 8, "nseg": 2, "bfly": 4, "gt": 1},
     (8, 2, 256, 4, 512): {

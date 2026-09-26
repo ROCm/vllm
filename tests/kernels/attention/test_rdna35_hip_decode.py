@@ -41,6 +41,8 @@ RSPL = {
     "with dspl": dict(hq=32, hkv=2, hd=128, rspl=2, nw=8, dspl=2, rg=2, nseg=4),
     # Not a row split: unshared tiles with the next tile's loads in flight.
     "prefetch": dict(hq=16, hkv=2, hd=64, rg=2, nw=4, pf=1, nseg=8),
+    # One live tile after the merge's tree, its partials staged in LDS.
+    "staged publish": dict(hq=8, hkv=1, hd=256, rspl=2, nw=4, pf=1, cpub=1, nseg=16),
     # Not WMMA at all: the per-q-head dot-product decomposition.
     "dot": dict(hq=16, hkv=2, hd=256, nw=8, dot=1, bfly=4, nseg=2),
 }
@@ -113,6 +115,7 @@ def _variant(
     nw: int = 8,
     dspl: int = 0,
     pf: int = 0,
+    cpub: int = 0,
     dot: int = 0,
     bfly: int = 0,
     window: int = 0,
@@ -135,6 +138,7 @@ def _variant(
         nw=nw,
         dspl=dspl,
         pf=pf,
+        cpub=cpub,
         dot=dot,
         bfly=bfly,
         window=window,

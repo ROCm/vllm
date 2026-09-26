@@ -80,6 +80,7 @@ def space(hq, hkv, d, start):
         "rg": sorted(r for r in rgs if gqa % r == 0),
         "rspl": [1, 2, 4],
         "pf": [0, 1],
+        "cpub": [0, 1],
         "target": list(TARGETS),
         "minb": [1, 2, 4],
         # The dot decomposition's own knobs.
@@ -110,6 +111,8 @@ def knobs_of(hkv, cand):
         k["rspl"] = cand["rspl"]
     if cand["pf"]:
         k["pf"] = 1
+    if cand.get("cpub"):
+        k["cpub"] = 1
     return k
 
 
@@ -209,6 +212,7 @@ def main() -> None:
                 "rg": base.get("rg", 1),
                 "rspl": base.get("rspl", 1),
                 "pf": base.get("pf", 0),
+                "cpub": base.get("cpub", 0),
                 "target": 16,
                 "minb": base.get("minb", 1),
             }
@@ -311,7 +315,16 @@ def main() -> None:
                     knobs_ = (
                         ("nw", "dnseg", "bfly", "gt")
                         if best.get("dot")
-                        else ("nw", "dspl", "rg", "rspl", "pf", "target", "minb")
+                        else (
+                            "nw",
+                            "dspl",
+                            "rg",
+                            "rspl",
+                            "pf",
+                            "cpub",
+                            "target",
+                            "minb",
+                        )
                     )
                     for knob in knobs_:
                         cands = [dict(best, **{knob: v}) for v in values[knob]]

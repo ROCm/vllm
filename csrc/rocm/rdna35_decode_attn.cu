@@ -114,6 +114,13 @@
   #ifndef ABLATE
     #define ABLATE 0
   #endif
+  // 1 stages a split-KV partial in LDS before writing it, so that each store
+  // covers whole lines, where the merge's tree would otherwise end in one
+  // live tile writing its rows straight from registers, 32 bytes a row per
+  // store (OPTIMIZATIONS 025).
+  #ifndef CPUB
+    #define CPUB 0
+  #endif
   // Measurement only: records the 100 MHz realtime counter at phase boundaries
   // of thread 0 of workgroups 0..7 into g_ts, read back by the timings() op.
   // 1 marks the phases, 3 also waits for the first tile's data to separate
@@ -836,8 +843,10 @@ __device__ __forceinline__ void body(
                               : 1)
     #define MRG_SLOTS \
       (TFIN == TILES ? TILES : (TFIN > TILES / 2 ? TFIN : TILES / 2))
-    #define MRG_BYTES \
-      (TILES == 1 && M_RSPL == 1 ? 0 : MRG_SLOTS * M_DSPL * M_RSPL * MSLOT * 4)
+    #define MRG_BYTES                     \
+      (TILES == 1 && M_RSPL == 1 && !CPUB \
+           ? 0                            \
+           : MRG_SLOTS * M_DSPL * M_RSPL * MSLOT * 4)
     #if SHT
       // Per (tile, d part) a K and a V tile, double-buffered, and the score
       // exchange apart from them: partners may still read the shared K.
@@ -1429,7 +1438,7 @@ __device__ __forceinline__ void body(
                  l16, hi);
       lds_barrier();
     }
-    #if TFIN == 1
+    #if TFIN == 1 && !CPUB
     // One live tile: its waves write straight from registers.
     if (tw == 0 && l16 < rv) {
       const int r = RT(rt) * 16 + l16;
