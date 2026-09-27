@@ -1901,3 +1901,8 @@ picks 4 at D=256) gains 1.027x fp16 / 1.030x bf16, cells >= 0.984x, 16k
 88.2 -> 93.4 %, 32k 95.1 % -- landed, `70c6310bfa74824215e85e5a9a7f6ec3e90c69d3`.  The tuner never pairs an
 explicit DSPL with more segments.  16/1/512 M=4: RG 2-4, NSEG 8-16, NW 4-8,
 DSPL 2-8: nothing better than its row.
+8/1/256 M=4 back off VINLDS on the same row: 1.014-1.015x, 1.07x at 1k,
+long unchanged -- `903235f4fa1fb1992b1b5894aa6aab1e778b7c76`.  32/2/128 M=4 with explicit DSPL 2 (8 or 4
+waves, 4 or 8 segments, with and without VINLDS): nothing better at 16k.
+Explicit DSPL 2, 4 or 8 forced on every D=256/512 row at its own NSEG:
+no row gains.

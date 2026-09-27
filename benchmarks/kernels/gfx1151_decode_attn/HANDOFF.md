@@ -62,7 +62,7 @@ Commits on top of it, 2026-09-25:
 
 `matrix.py`, HND, all 52 configuration/M pairs, geomean over the seven
 contexts, measured 2026-09-26 at `2c7b87b6e8`, the VINLDS rows (031)
-re-measured at `70c6310bfa74824215e85e5a9a7f6ec3e90c69d3` (`golden/`; bf16 in `golden/bf16.md`, whose
+re-measured at `903235f4fa1fb1992b1b5894aa6aab1e778b7c76` (`golden/`; bf16 in `golden/bf16.md`, whose
 nine dot shapes use their WMMA rows):
 
 | D | M | configs | vs Triton | median configuration %roof | >= 90 % roof | S=128 median %roof |
