@@ -29,7 +29,7 @@ the tools select them with `--windowed`.
 The kernel is the WMMA rewrite of OPTIMIZATIONS 009: one workgroup per
 `(kv head, row group, KV segment)`, both products on
 `v_wmma_f32_16x16x16_f16` (`_bf16` in bf16), knobs
-`NSEG / RG / MINB / NW / DSPL / RSPL / PF / CPUB` per configuration in `_TUNED`
+`NSEG / RG / MINB / NW / DSPL / RSPL / PF / CPUB / VINLDS` per configuration in `_TUNED`
 (`vllm/v1/attention/backends/rdna35_hip_attn.py`).
 
 **One configuration per `(Hq, Hkv, D, M)`, chosen for the whole context
@@ -56,6 +56,7 @@ Commits on top of it, 2026-09-25:
 | `29feb4a997` (026) | the backend requires HND; gemma-4-E2B end to end |
 | `813f1f5b95` (027) | batched decode: grid.y per sequence, uniform query lengths up to 8 |
 | `23751209a2` (028) | mixed batches: decodes on the kernel, prefills on Triton |
+| `f7c00e52d0` (031) | VINLDS: V in LDS, next tile issued before this one's compute |
 
 ### The performance picture
 
@@ -248,6 +249,10 @@ spilling at those row counts.
 030 tried to hide them: producer/consumer waves feeding an LDS ring
 (loads were never the limit: 1.00-1.04x long, 0.74-0.86x short) and two
 Q@K accumulators (no gain on the matrix's contiguous pages).
+031 did: VINLDS stages V in the wave's LDS so the next tile's loads go out
+before this tile's compute -- 1.01-1.035x on eight rows, and 32/2/128 M=4
+32k, 16/2/64 M=4 16k and 16/2/128 M=4 16k now over 90 %.  The rows it has
+not reached are being re-tuned with it in the search space.
 
 The dot-against-WMMA comparison this section used to propose is done (018): dot wins short contexts at D=256/512 M=1 and loses long ones, so over the full range it rarely wins.
 
@@ -353,7 +358,9 @@ purpose, or it is not reaching it.
 
 `ATen/Context.h` declares `enum class Float32Precision { ..., BF16 }`, so
 `-DBF16=...` fails the torch build of every variant, fp16 included. The
-kernel's dtype define is `KV_BF16`; pick names torch does not use.
+kernel's dtype define is `KV_BF16`; pick names torch does not use.  `VL`
+broke the same way (a hipsolver prototype has a parameter named `VL`), which
+is why V-in-LDS is `VINLDS`: short all-caps knob names are risky.
 
 ### 5.12 Killing a tuner leaves build locks
 

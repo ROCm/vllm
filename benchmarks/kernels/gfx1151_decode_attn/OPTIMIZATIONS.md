@@ -1817,3 +1817,36 @@ exaggerate what the loop's latency costs; 5.5 of HANDOFF applies.
 Found on the way: `matrix.py`'s forced-knob wrapper did not take the
 batch argument 027 added to `_knobs_for`, so every `--nseg/--rg/...`
 override had failed since; fixed.
+
+## 031 — VINLDS: V in LDS, the next tile's loads before this tile's compute
+
+**Status:** landed, `f7c00e52d0`, on eight rows.
+
+029 found the long M=4 cells waiting on their products with one tile in
+flight, and 030 that the loads were never short.  The unshared path held a
+tile's V in registers until P@V, so the next tile could only be issued
+after it; PF's second register set spills there.  `VINLDS=1` stages V into
+the wave's own LDS buffer beside K.  Once staged the tile's registers are
+free, the next tile goes out before this one is computed, and no barrier is
+needed -- the buffer belongs to one wave.  It needs 2 x 16 rows of K and V
+per wave in LDS: four waves at D=128, not eight.
+
+`matrix.py`, fp16 and bf16, against the golden:
+
+| configuration | fp16 | bf16 | worst cell |
+| --- | --- | --- | --- |
+| 32/2/128 M=4 | 1.034x | 1.032x | 0.982x (S=512) |
+| 16/2/64 M=4 | 1.035x | 1.034x | 0.995x |
+| 32/4/128 M=4 | 1.021x | 1.021x | 0.993x |
+| 16/2/128 M=4 | 1.016x | 1.016x | 0.993x |
+| 32/4/128 M=1 | 1.012x | 1.014x | 0.994x |
+| 10/10/128 M=1 / M=4 | 1.012x | 1.011-1.015x | 1.004x |
+| 32/2/128 M=1 | 1.009x | 1.020x | 0.989x |
+
+Long cells: 32/2/128 M=4 32k 87.9 -> 91.9 %, 16/2/64 M=4 16k 87.3 ->
+91.1 %, 16/2/128 M=4 16k 88.8 -> 90.0 %; 32/2/128 M=4 16k 85.0 -> 86.9 %,
+16/2/64 M=4 32k 86.4 -> 89.3 %.
+
+The dev harness (shuffled pages) showed the same direction (+2-7 % on
+32/2/128 M=4), unlike 030's QK2.  A define named `VL` broke every build: a
+hipsolver header has a parameter of that name (5.11 again).
