@@ -299,6 +299,8 @@ _SCRATCH_BUDGET = 64 * 1024**2
 _SPLIT_MIN_HEAD_SIZE = 256
 _SPLIT_MIN_DECODES = 16
 _SPLIT_MIN_PREFILL = 256
+_SPLIT_NEEDS_LONG_PREFILL = {(2, 256)}
+_SPLIT_SMALL_WINDOW = 512
 # Query tokens per sequence the kernel serves: decode and speculative decode.
 _MAX_M = 8
 
@@ -377,6 +379,8 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         # backend, which is worse than an error.
         self.kernel_calls = 0
         self.fallback_calls = 0
+        # Mixed batches served as decodes on the kernel plus the rest on Triton.
+        self.split_calls = 0
         try:
             from vllm.config import get_current_vllm_config
 
@@ -551,6 +555,21 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
         # than the kernel saves on the decodes (0.79-0.85x measured).
         if nd < _SPLIT_MIN_DECODES and kwargs["q"].shape[0] - ndt < _SPLIT_MIN_PREFILL:
             return False
+        # Two kv heads at D=256: Triton's short extend alone costs more than
+        # the kernel saves even on 16-32 decodes (0.73-0.93x, golden/batch.md).
+        prefill_tokens = kwargs["q"].shape[0] - ndt
+        pair = (self.num_kv_heads, self.head_size)
+        if pair in _SPLIT_NEEDS_LONG_PREFILL and prefill_tokens < _SPLIT_MIN_PREFILL:
+            return False
+        # A small window leaves a decode little KV to save on: a few of them
+        # do not pay for the prefill's own launch (0.95-0.98x at w512).
+        window = kwargs["window_size"]
+        if (
+            window is not None
+            and 0 <= window[0] < _SPLIT_SMALL_WINDOW
+            and nd < _SPLIT_MIN_DECODES
+        ):
+            return False
         dec = dict(kwargs)
         for k in ("q", "out"):
             dec[k] = kwargs[k][:ndt]
@@ -595,6 +614,7 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
     def _run_attention(self, *, kv_cache: torch.Tensor, **kwargs) -> None:
         if self._split_mixed(kv_cache, kwargs):
             self.kernel_calls += 1
+            self.split_calls += 1
             return
         built = self._prepare(kv_cache, **kwargs)
         if built is None:
