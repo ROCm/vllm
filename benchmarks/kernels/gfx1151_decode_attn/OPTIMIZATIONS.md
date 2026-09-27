@@ -1885,3 +1885,9 @@ Re-searching RG x NSEG x MINB with VINLDS on the rows still under 90 %:
 cells >= 0.992x, 16k 90.9 % -- landed, `9daa5ca6253ca3bd416d1a84b449d04dff0e59d3`.  Five long cells
 left under 90 %: 8/1/256, 32/2/128, 16/1/512, 16/2/256 M=4 at 16k (the
 16 MiB step), 14/2/64 M=4 at 32k.
+At D=256 with DSPL 2: 8/1/256 M=4 (nseg 16, four waves) 1.019x fp16 /
+1.023x bf16, cells >= 0.981x, 16k 85.5 -> 87.1 % -- landed,
+`37200188687749b226407b45cd93e02195331f31`.  16/2/256 M=4 (nseg 8) takes
+16k/32k to 92.2 / 92.8 % but loses 3.1 % at S=512; nseg 6-8 with MINB 1-4
+trade that for up to 10 % at S=128.  Not landed.  16/1/512 M=4: no VINLDS
+variant within 5 % of its row.

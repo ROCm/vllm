@@ -62,7 +62,7 @@ Commits on top of it, 2026-09-25:
 
 `matrix.py`, HND, all 52 configuration/M pairs, geomean over the seven
 contexts, measured 2026-09-26 at `2c7b87b6e8`, the VINLDS rows (031)
-re-measured at `9daa5ca6253ca3bd416d1a84b449d04dff0e59d3` (`golden/`; bf16 in `golden/bf16.md`, whose
+re-measured at `37200188687749b226407b45cd93e02195331f31` (`golden/`; bf16 in `golden/bf16.md`, whose
 nine dot shapes use their WMMA rows):
 
 | D | M | configs | vs Triton | median configuration %roof | >= 90 % roof | S=128 median %roof |
@@ -81,9 +81,10 @@ the dot rows at D=256/512 M=1 1.03-1.13x (S=128 up to 1.25x), the PF and
 re-tuned WMMA rows 1.01-1.04x; unchanged rows 0.99x, the device-side S of
 014 (1-2 % at S=128) and noise.  Five long cells (S >= 16k) are under
 90 % of roof, all of them already under it before: `8/1/256` M=4 16k
-(85.5 %), `32/2/128` M=4 16k (86.9 %), `16/1/512` M=4 16k (88.1 %),
+(87.1 %), `32/2/128` M=4 16k (86.9 %), `16/1/512` M=4 16k (88.1 %),
 `16/2/256` M=4 16k (88.2 %), `14/2/64` M=4 32k (88.6 %); see §4.5.  VINLDS
-(031, 032) took six over 90 %.
+(031, 032) took six over 90 %.  16/2/256 M=4 reaches 92 % with it too, but
+only by losing 3-10 % at S <= 512.
 
 **90 % of roof is not reachable everywhere.** `tools/floor.py` times a kernel
 that does nothing but stream the same bytes after one dependent page-table
