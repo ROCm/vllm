@@ -1145,15 +1145,14 @@ __device__ __forceinline__ void body(
   float* sx_s = reinterpret_cast<float*>(lds_raw + QS_BYTES + TB_BYTES);
       #define SX_SLOT(w) ((w) * RTW * 256)
     #else
-  static_assert(!VINLDS || (M_DSPL == 1 && !M_PF),
-                "VINLDS: whole head dim, no PF");
+  static_assert(!VINLDS || !M_PF, "VINLDS replaces PF's second tile");
   char* kt_s = lds_raw + QS_BYTES + wave * (VINLDS ? 2 : 1) * 16 * KT_ROW;
   // Wave w's partial scores go in wave w's own K tile.  It writes them only
   // after its own Q@K has read that tile, its partners read them between the
   // two barriers of the exchange, and it refills the tile with the next K
   // only after the second barrier.
   float* sx_s = reinterpret_cast<float*>(lds_raw + QS_BYTES);
-      #define SX_SLOT(w) ((w) * (16 * KT_ROW / 4))
+      #define SX_SLOT(w) ((w) * (VINLDS ? 2 : 1) * (16 * KT_ROW / 4))
     #endif
   auto m_s = reinterpret_cast<float (*)[ROWPAD]>(lds + LDS_MS);
   auto l_s =

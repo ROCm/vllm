@@ -46,6 +46,9 @@ RSPL = {
     # Unshared tiles with V staged in LDS, the next tile's loads before this
     # one's compute (VINLDS).
     "v in lds": dict(hq=32, hkv=2, hd=128, rg=4, nw=4, vinlds=1, nseg=4),
+    # ... and with the head dim split over waves, whose score exchange writes
+    # into the K half of each wave's buffer.
+    "v in lds, dspl": dict(hq=16, hkv=8, hd=256, nw=4, dspl=2, vinlds=1, nseg=2),
     # Not WMMA at all: the per-q-head dot-product decomposition.
     "dot": dict(hq=16, hkv=2, hd=256, nw=8, dot=1, bfly=4, nseg=2),
 }
