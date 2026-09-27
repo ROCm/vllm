@@ -91,6 +91,18 @@ def main() -> None:
         help="force RSPL on every configuration, overriding the heuristics",
     )
     p.add_argument(
+        "--dot",
+        type=int,
+        default=None,
+        help="force DOT (the per-q-head dot decomposition) on every configuration",
+    )
+    p.add_argument(
+        "--bfly",
+        type=int,
+        default=None,
+        help="force BFLY on every configuration (dot decomposition only)",
+    )
+    p.add_argument(
         "--vinlds",
         type=int,
         default=None,
@@ -137,6 +149,8 @@ def main() -> None:
             ("rspl", args.rspl),
             ("cpub", args.cpub),
             ("vinlds", args.vinlds),
+            ("dot", args.dot),
+            ("bfly", args.bfly),
         )
         if v is not None
     }

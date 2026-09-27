@@ -1919,3 +1919,8 @@ Neither the allocation (vLLM's KV is one allocation) nor the order of
 access moves it.  The four long cells left under 90 % -- 32/2/128,
 8/1/256, 16/1/512 M=4 at 16k and 14/2/64 M=4 at 32k -- are all 16 MiB of
 KV, at 94-96 % of that ceiling; 90 % of roof there needs 97.4 % of it.
+
+The dot decomposition on those four rows (`matrix.py --dot 1`, NW 4-8,
+NSEG 4-16, BFLY 2-4), 16k: 32/2/128 M=4 25-29 %, 8/1/256 M=4 44-53 %,
+16/1/512 M=4 16-28 %, 14/2/64 M=4 27-28 % -- against 87-89 % on WMMA.  Per
+q head it reads the kv head's KV again for every head of the group.
