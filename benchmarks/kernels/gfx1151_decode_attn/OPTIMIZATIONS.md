@@ -1857,3 +1857,21 @@ long -- 14/2/64 M=4 (rspl=2) 0.88x at S=128, 16/2/256 M=4 (rspl=2, cpub)
 0.87x at S=128 though 1.05x at 16k-32k, 8/1/256 M=4 17.8 % of roof at
 S=128.  None landed.  golden/ (fp16, bf16) regenerated at `f7c00e52d0`
 with the eight VINLDS rows.
+
+## 032 — VINLDS with DSPL; two window rows
+
+**Status:** landed, `81d69bd464`.
+
+VINLDS now takes DSPL > 1 (its score exchange writes into the K half of each
+wave's K+V buffer, so the slot stride doubles), which opens it to D=256
+with four waves.  Forced over D=256 with DSPL 2 or 4 it loses long contexts
+on most rows (0.69-0.95x: at D=256 four waves with the head dim split are
+not what those rows want); 16/8/256 M=4 gains 1.01x but has a cell at
+0.974x and was not landed.  On the windows:
+
+| row | change | fp16 | bf16 |
+| --- | --- | --- | --- |
+| 8/4/256 M=4 w4096 (PaliGemma 2) | nw 8 -> 4, DSPL 2, VINLDS | 1.018x, cells >= 1.009x | 1.017x, >= 1.006x |
+| 16/8/256 M=1 w1024 (Gemma 3 12B, Gemma 4) | dot on 4 waves instead of 8 | 1.019x | 1.023x |
+
+golden/swa.md regenerated at `81d69bd464`.
