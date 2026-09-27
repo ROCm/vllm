@@ -1880,3 +1880,8 @@ Re-searching RG x NSEG x MINB with VINLDS on the rows still under 90 %:
 16/2/64 M=4 at nseg 4 (was 8) gains another 1.040-1.043x, no cell below
 1.00x, 16k/32k to 94.1 / 90.9 % -- landed, `6ecab03da9`.  32/2/128 M=4 and
 14/2/64 M=4 (GQA 7: RG > 1 does not divide it) found nothing better.
+14/2/64 M=4 (nseg 8 -> 4, VINLDS) 1.056x fp16 / 1.060x bf16, cells >=
+1.005x, 16k 90.1 %; 16/2/128 M=1 (minb 1 -> 2, VINLDS) 1.012x / 1.009x,
+cells >= 0.992x, 16k 90.9 % -- landed, `9daa5ca6253ca3bd416d1a84b449d04dff0e59d3`.  Five long cells
+left under 90 %: 8/1/256, 32/2/128, 16/1/512, 16/2/256 M=4 at 16k (the
+16 MiB step), 14/2/64 M=4 at 32k.
