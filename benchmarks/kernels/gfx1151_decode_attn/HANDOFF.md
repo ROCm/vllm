@@ -4,13 +4,14 @@ Written for whoever picks this up next, human or agent. Read this before the
 reports: it says where things stand, what is still open, and which of the open
 items is actually worth doing.
 
-Everything here was measured on a Radeon 8060S (gfx1151), batch = 1 sequence,
-fp16 unless it says bf16, **HND** (see §5.1). Nothing is estimated.
+Everything here was measured on a Radeon 8060S (gfx1151), fp16 unless it says
+bf16, **HND** (see §5.1), one sequence unless it says batch (§4.6,
+`golden/batch.md`). Nothing is estimated.
 
 | file | what it is |
 | --- | --- |
 | this one | state, open work, traps |
-| `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-023 the commits below |
+| `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-033 the commits below |
 | `reference/` | the previous per-q-head dot kernel and its D=512 golden, kept for comparison only |
 | `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten. `bf16.md` is the same for bf16, `swa.md` for the sliding-window configurations, `batch.md` for batches of sequences and mixed batches |
 | `reports/` | the original investigation record, about the dot kernel. Its `%roof` numbers are superseded |
@@ -57,6 +58,8 @@ Commits on top of it, 2026-09-25:
 | `813f1f5b95` (027) | batched decode: grid.y per sequence, uniform query lengths up to 8 |
 | `23751209a2` (028) | mixed batches: decodes on the kernel, prefills on Triton |
 | `f7c00e52d0` (031) | VINLDS: V in LDS, next tile issued before this one's compute |
+| `81d69bd464` (032) | VINLDS with DSPL > 1; two window rows |
+| `6ecab03da9`, `9daa5ca6253ca3bd416d1a84b449d04dff0e59d3`, `70c6310bfa`, `903235f4fa` (032) | rows searched around VINLDS: 16/2/64 and 14/2/64 M=4, 16/2/128 M=1, 16/2/256 M=4 (nseg 8, DSPL 2), 8/1/256 M=4 |
 | `e2c7a309e1` (033) | `tools/batch.py`, `golden/batch.md`; two more limits on the split |
 
 ### The performance picture
@@ -148,7 +151,8 @@ matrix.py  ->  worst shape  ->  timeline (TIMING), ISA, counters
 
 | tool | what it answers |
 | --- | --- |
-| `tools/matrix.py` | what we ship: every configuration x context x M vs Triton. `--nseg/--rg/--minb/--nw/--dspl` force a knob across the run, `--no-triton` halves it |
+| `tools/matrix.py` | what we ship, one sequence: every configuration x context x M vs Triton. `--nseg/--rg/--minb/--nw/--dspl/--rspl/--cpub/--vinlds/--dot/--bfly` force a knob across the run, `--no-triton` halves it |
+| `tools/batch.py` | batches: decode and spec-decode batches (CUDA graphs) and mixed batches (eager) vs Triton, naming the path each cell took |
 | `tools/tune.py` | coordinate descent over the knobs for one configuration, scored by geomean over the seven contexts; prints `_TUNED` rows |
 | `tools/sweep.py` | one configuration, knobs x contexts |
 | `tools/floor.py` | the ceiling per configuration (§1) |
@@ -193,17 +197,27 @@ floor alone is 65-85 % of roof depending on bytes (`floor.py`).
 
 ### 4.1 Keep the record current
 
-OPTIMIZATIONS 010-023 describe the state above, and `golden/` (fp16, bf16,
-sliding window) was measured on it.
+OPTIMIZATIONS 010-033 describe the state above, and `golden/` was measured on
+it: `d*.md` and `bf16.md` are the full matrix of the re-tune (021) with every
+row changed since re-measured (Triton included, both dtypes) and spliced in --
+the rows left untouched run byte-identical code.  One full `matrix.py` pass
+(fp16 and bf16, ~1.5 h) would make them a single photograph.  `swa.md` and
+`batch.md` are single passes, `batch.md` with the cells two rule fixes
+changed re-measured.  Cite commits by their full hash in golden/ and here:
+`typos` reads some short hashes as misspellings (one starting `9d`, then `aa5`, did).
 
 ### 4.2 Re-tune what is left
 
-The 29 formerly two-mode rows were re-tuned over the full range (021); ten of
-them kept their earlier values because the tuned point lost a cell.  The rest
-of `_TUNED` predates RSPL, PF and DOT.  ~25 minutes per configuration on five
-contexts; land a row only if a `matrix.py` run beats golden/ on it (the
-tuner's single sample picks within noise), and confirm it in bf16 -- the dot
-rows did not hold there (`_TUNED_BF16`).
+`tune.py` searches every knob now, CPUB and VINLDS included, but ranks the
+long cells first and so proposes rows that give 12-13 % at S=128 for them
+(OPTIMIZATIONS 031); with the larger space it takes ~2 h per configuration.
+What found the rows of 032 was cheaper: `matrix.py` with forced knobs over a
+small RG x NSEG x MINB x DSPL grid around the row, four contexts, then all
+seven with Triton in both dtypes.  The tuner never pairs an explicit DSPL
+with more segments -- that is where 16/2/256 M=4 found 93 %.  Most of
+`_TUNED` has not had that grid.  Land a row only if a `matrix.py` run beats
+golden/ with no cell below 0.975x, and confirm it in bf16 (the dot rows did
+not hold there: `_TUNED_BF16`).
 
 ### 4.3 The KV layout is decided: HND
 
@@ -223,53 +237,95 @@ Measured but not landed, in rough order of expected value:
 - At D=512 M=4 (16/1/512, S=128): ~600 ns from KV landing to the first Q@K
   (the DSPL exchange's two barriers wait on the slowest wave), ~500-700 ns
   writing the partials, ~700 ns in the merge.
-- The PPACK fold at the loop exit (64 permlane16), the loop-exit waitcnt
-  chain.
+- The loop-exit waitcnt chain.  (The PPACK fold at the loop exit is bounded:
+  skipping it is 1.004-1.016x at S=128, not worth a redesign.)
 
 The loop is **not** VALU-bound: lazy rescaling removed 64 multiplies per tile
 and measured neutral even at S=16384 on M=4.
 
 ### 4.5 The long cells still under 90 % of roof
 
-Eleven cells, 85.0-89.8 %, all but one at M=4 with one or two kv heads and
-most of them exactly 16 MiB of KV -- where even a pure stream reaches only
-92.2 % of roof (019): `32/2/128` M=4 16k/32k, `8/1/256` M=4 16k, `16/2/64`
-M=4 16k/32k, `14/2/64` M=4 16k/32k, `16/1/512` M=4 16k, `16/2/256` M=4 16k,
-`16/2/128` M=4 16k and M=1 16k.  What is known about them:
+Four, from eleven: `32/2/128` M=4 16k (86.9 %), `8/1/256` M=4 16k (87.1 %),
+`16/1/512` M=4 16k (88.1 %), `14/2/64` M=4 32k (88.6 %).  All four are
+exactly 16 MiB of KV, where a pure stream stops at 92.4 % of roof -- a
+hardware step, the same with separate buffers or slices of one 1 GiB
+allocation, grid-stride or contiguous access (019, 029, 032).  The kernel is
+at 94-96 % of that ceiling; 90 % of roof needs 97.4 % of it.
 
-- not P@V (dropping P's low half is neutral), not memory parallelism (more
-  segments or waves make loads-only worse);
-- on the RSPL path, loads alone reach 88.4 % at 16k: the per-tile barrier of
-  the shared tile, not bytes in flight (a second tile in flight is neutral);
-- the fixed tail: wave skew at the loop end (0.4-1.3 us), the split-KV
-  publish, atomic and merge (~1.5-2 us) -- 2-4 % of an 80 us call.
+What is known and measured (029-032):
 
-029 settles both halves: the 16 MiB step is in a pure stream whatever the
-working set, and on `32/2/128` M=4 loads alone reach it while each of Q@K
-and P@V costs ~5 % -- exposed WMMA latency, one tile in flight, with PF
-spilling at those row counts.
-030 tried to hide them: producer/consumer waves feeding an LDS ring
-(loads were never the limit: 1.00-1.04x long, 0.74-0.86x short) and two
-Q@K accumulators (no gain on the matrix's contiguous pages).
-031 did: VINLDS stages V in the wave's LDS so the next tile's loads go out
-before this tile's compute -- 1.01-1.035x on eight rows, and 32/2/128 M=4
-32k, 16/2/64 M=4 16k and 16/2/128 M=4 16k now over 90 %.  The rows it has
-not reached are being re-tuned with it in the search space.
+- loads alone reach the ceiling; each of Q@K and P@V costs ~5 %: exposed
+  WMMA latency with one tile in flight.  VINLDS (031) hides part of it and
+  took seven cells over 90 %;
+- a second tile in flight does not fit: PF spills at these row counts, and
+  two tiles on top of VINLDS spill 56-156 VGPRs;
+- the shared tile (RSPL) pays a barrier per tile; producer/consumer waves
+  (030) showed the loads were never short; two Q@K accumulators gain nothing
+  on the matrix's contiguous pages; CPUB and the dot decomposition (25-53 %
+  of roof there: it re-reads KV per q head) do nothing for them;
+- grids of RG x NSEG x MINB x NW x DSPL, with and without VINLDS, found
+  nothing better for these four.
 
-The dot-against-WMMA comparison this section used to propose is done (018): dot wins short contexts at D=256/512 M=1 and loses long ones, so over the full range it rarely wins.
+Nothing measured points at a way through for these four.  A new idea would
+have to hide the products without registers or a per-tile barrier.
 
 ### 4.6 D=96, and the batch axis
 
-D=96 is three elements per lane, still Triton.  Batches of equal query
-length up to 8 run the kernel (027), 1.02-2.9x Triton except 32/8/128 at
-64 x 1k (0.96x).  Open: the batch runs the single-sequence row -- a row
-tuned per batch size (B is a shape, allowed to select knobs) is the next
-step (not RG: 027).  Mixed batches split at D >= 256 (028, 033): decodes
-on the kernel, prefills on Triton; below D=256, few decodes beside a short
-extend, two kv heads at D=256 with a short extend, or a small window with
-few decodes, the batch stays whole on Triton.  `tools/batch.py` and
-`golden/batch.md` measure all of it: decode batches 1.35x Triton geomean
-(windows 1.50x), split mixed batches 1.62x (windows 1.18x).
+D=96 is three elements per lane, still Triton.
+
+**Batch, as the code stands (027, 028, 033):**
+
+- *Kernel.* `BATCH=1` builds put the sequence on `grid.y`; the wrapper moves
+  `q`, `out`, the block-table row, `seq_lens` and the scratch by the
+  per-sequence strides of `struct Batch`; the body is unchanged.  `BATCH=0`,
+  for one sequence, is the previous kernel byte for byte.  S=0 (a CUDA-graph
+  batch padded past its sequences) returns at once, batch builds only.  The
+  host caps segments per sequence so the batch lands near `BTARGET`
+  workgroups -- **128 in the code**; 027 measured 32, 64 and 128 alike and the
+  sweep left 128, which golden/batch.md was measured with.  The shared merge
+  runs only if the whole grid (`grid.x x grid.y`) is resident.
+- *Backend.*  Any batch whose sequences share a query length up to 8
+  (`_MAX_M`: decode, speculative decode) runs the kernel; unequal lengths or
+  more than 8 go to Triton.  Batches reuse the single-sequence rows, except
+  that dot rows give way to their WMMA row (`_TUNED_BF16`) or the
+  heuristics.  Scratch is shared by the layers of a variant, sized
+  `min(max_num_seqs, 64 MiB / per-sequence scratch)`; larger batches fall
+  back.
+- *Mixed batches.*  The builder asks vLLM for decodes first and counts the
+  leading uniform decodes; `_split_mixed` sends them to the kernel and the
+  rest to Triton, never under CUDA-graph capture, and only when D >= 256,
+  with >= 16 decodes or >= 256 prefill tokens, >= 256 prefill tokens for
+  (Hkv=2, D=256), and >= 16 decodes under a window of less than 512 keys.
+- *Tests.*  One launch of sequences 1008/48/0/2016 in four decompositions,
+  fp16 and bf16, the padded one untouched; mixed and long-query batches fall
+  back.  The split itself has no unit test, only gemma-4-E2B end to end
+  (greedy output identical to Triton).
+- *Numbers* (`golden/batch.md`, fp16): decode batches 1.35x Triton geomean,
+  median 92.7 % of roof (windows 1.50x); split mixed batches 1.62x (windows
+  1.18x); no cell under 0.97x.
+
+**How realistic that is.**  Uniform decode and speculative-decode batches,
+per-sequence context lengths, CUDA-graph padding, windows and hybrid page
+sizes are what vLLM runs in steady state, and batch 1-4 -- the kernel's
+strongest case -- is the usual local use of this GPU.  The gaps:
+
+- mixed batches at D <= 128 (Llama, Qwen, Mistral: most models) stay whole
+  on Triton, decodes included; with chunked prefill and steady arrivals that
+  can be a large share of the steps;
+- the scratch cap is 63-254 sequences depending on the row (63 on 16/1/512
+  M=4, 127 on most D=512); vLLM defaults `max_num_seqs` to 256, and to 1024
+  when the device reports >= 70 GiB, which unified memory can;
+- an fp8 KV cache always goes to Triton;
+- batches run single-sequence rows (no tuning per batch size);
+- the harness is more generous than a server: contiguous pages (shuffled
+  cost 2-4 % at 16 MiB, §5.5), every sequence of a batch at the same S,
+  fp16 only in golden/batch.md.
+
+**Next step:** `vllm bench serve` with steady arrivals on a D=128 model
+(e.g. Qwen3) and a D=256 one (Gemma), RDNA35_HIP_ATTN against TRITON_ATTN,
+counting with the impl's `kernel_calls / split_calls / fallback_calls` which
+path the steps take.  That tells whether the D <= 128 mixed-batch gap and the
+scratch cap matter, which no microbenchmark here can.
 
 ### 4.7 The fixed cost of split KV at short context
 
@@ -281,8 +337,9 @@ skips the partials is 1.26x, but it is their round trip that costs, not
 their bytes: 16-bit partials are no faster and 25-120x less accurate (024).
 More segments, balanced segments, RG instead of RSPL, polling the arrival
 counter, lighter fences and 16-wave workgroups were measured and lose
-(023, 024).  The write pattern of the partials did matter: CPUB (025).
-What is left would remove a round trip, not shrink one.
+(023, 024).  The write pattern of the partials did matter: CPUB (025), and
+VINLDS (031) gains up to 7 % at S=128 on its rows.  What is left would
+remove a round trip, not shrink one.
 
 ---
 

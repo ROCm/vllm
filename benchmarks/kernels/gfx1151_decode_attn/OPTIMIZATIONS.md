@@ -1669,8 +1669,10 @@ per prompt length.  Scratch is shared by the layers of a variant (they run
 one after another) and sized for `max_num_seqs` within 64 MiB.  Two
 batch-only choices, both on B:
 
-- segments per sequence capped so the batch lands near `BTARGET` = 64
-  workgroups (32, 64 and 128 measured the same on 32/8/128 and 8/4/256);
+- segments per sequence capped so the batch lands near `BTARGET`
+  workgroups: 32, 64 and 128 measured the same on 32/8/128 and 8/4/256, and
+  the code shipped with 128 (the value the sweep left; this entry first
+  said 64);
 - dot rows give way to their WMMA rows: 16/2/512 at 8 x 4k 827 -> 600 us,
   8/1/256 169 -> 152 us.
 
