@@ -1891,3 +1891,7 @@ At D=256 with DSPL 2: 8/1/256 M=4 (nseg 16, four waves) 1.019x fp16 /
 16k/32k to 92.2 / 92.8 % but loses 3.1 % at S=512; nseg 6-8 with MINB 1-4
 trade that for up to 10 % at S=128.  Not landed.  16/1/512 M=4: no VINLDS
 variant within 5 % of its row.
+
+Two tiles in flight on top of VINLDS (V no longer held through the
+compute, so perhaps room for PF's second tile): 256 VGPRs with 156 spilled
+on 32/2/128 M=4, 94 on 8/1/256 M=4, 56 on 14/2/64 M=4.  Not built further.
