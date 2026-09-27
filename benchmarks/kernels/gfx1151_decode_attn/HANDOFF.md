@@ -245,6 +245,9 @@ M=4 16k/32k, `14/2/64` M=4 16k/32k, `16/1/512` M=4 16k, `16/2/256` M=4 16k,
 working set, and on `32/2/128` M=4 loads alone reach it while each of Q@K
 and P@V costs ~5 % -- exposed WMMA latency, one tile in flight, with PF
 spilling at those row counts.
+030 tried to hide them: producer/consumer waves feeding an LDS ring
+(loads were never the limit: 1.00-1.04x long, 0.74-0.86x short) and two
+Q@K accumulators (no gain on the matrix's contiguous pages).
 
 The dot-against-WMMA comparison this section used to propose is done (018): dot wins short contexts at D=256/512 M=1 and loses long ones, so over the full range it rarely wins.
 

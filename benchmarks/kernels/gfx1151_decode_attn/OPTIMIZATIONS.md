@@ -1781,3 +1781,39 @@ shape of answer at a smaller scale.  Hiding the products needs registers
 the wave does not have at these row counts: a P@V that keeps P in LDS
 instead of registers, or fewer rows per wave with the tile shared (RSPL)
 without its barrier, are what is left to try.
+
+## 030 — Hiding the products: producer/consumer waves and split Q@K
+
+Both measured, neither landed; 029's gap on the long M=4 cells stays.
+
+Producer/consumer (`WS`, prototype, not landed; source kept outside the
+tree).  WS extra waves per workgroup load whole tiles into a ring of WSR
+LDS slots, WSD tiles in flight each; the RSPL waves compute from the ring;
+slots change hands through LDS counters instead of a barrier per tile, and
+producers exit when done (a finished wave no longer counts at `s_barrier`).
+Feasible on bandwidth -- a stream kernel with 2 loader waves in each of 32
+workgroups reaches 92.0 % at 16 MiB, the ceiling -- and correct first time
+(`max_rel` <= 5.1e-4 to S=4100).  On `32/2/128` M=4 against the shipped row:
+
+| build | 1k | 16k | 32k |
+| --- | --- | --- | --- |
+| WS=2, 2 in flight, 4 slots, nseg 16 | 0.84x | 1.00x | 1.03x |
+| WS=1 | 0.86x | 1.01x | 1.03x |
+| WS=2, 3-4 in flight, 5 slots | 0.74-0.78x | 0.98-0.99x | 1.01-1.03x |
+| WS=2, nseg 32 | 0.31x | 0.80x | 0.89x |
+| WS=2 + QK2 | 0.84x | 1.00x | 1.04x (89.0 %) |
+
+More in flight does nothing: the loads were never what limited these
+cells.  Short contexts lose the merge of 16 segments of 64 rows.
+
+Two Q@K accumulators (`QK2`, even and odd head-dim chunks): a wave with
+one row tile otherwise waits on a chain of NCP dependent WMMAs.  Dev
+harness (shuffled pages) on `32/2/128` M=4: 1.016x at 16k, 1.037x at
+32k (88.4 %).  `matrix.py --qk2 1` over all 52 pairs and the windows
+(contiguous pages, as golden/): 0.98-1.01x on that row, and 0.94-0.99x on
+17 others -- no configuration gains.  The dev harness's shuffled pages
+exaggerate what the loop's latency costs; 5.5 of HANDOFF applies.
+
+Found on the way: `matrix.py`'s forced-knob wrapper did not take the
+batch argument 027 added to `_knobs_for`, so every `--nseg/--rg/...`
+override had failed since; fixed.

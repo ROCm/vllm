@@ -136,8 +136,8 @@ def main() -> None:
     if forced:
         _heuristic = _knobs_for
 
-        def _knobs_for(hq, hkv, d, m, window=0, dtype=torch.float16):  # noqa: F811
-            return {**_heuristic(hq, hkv, d, m, window, dtype), **forced}
+        def _knobs_for(*args, **kwargs):  # noqa: F811
+            return {**_heuristic(*args, **kwargs), **forced}
 
         backend_mod._knobs_for = _knobs_for
 
