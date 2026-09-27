@@ -116,7 +116,7 @@ class _Knobs(TypedDict, total=False):
 _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     # D=64
     (14, 2, 64, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
-    (14, 2, 64, 4): {"nseg": 8, "rg": 1, "minb": 2, "nw": 4, "dspl": 0},
+    (14, 2, 64, 4): {"nseg": 4, "rg": 1, "minb": 2, "nw": 4, "vinlds": 1},
     (16, 2, 64, 1): {"nseg": 8, "rg": 1, "minb": 1, "nw": 4, "dspl": 0},
     (16, 2, 64, 4): {"nseg": 4, "rg": 2, "minb": 2, "nw": 4, "vinlds": 1},
     (32, 8, 64, 1): {"nw": 4, "rg": 1, "minb": 2, "nseg": 1, "pf": 1},
@@ -124,7 +124,7 @@ _TUNED: dict[tuple[int, int, int, int], _Knobs] = {
     (32, 32, 64, 1): {"nseg": 1, "rg": 1, "minb": 2, "nw": 2, "dspl": 0},
     (32, 32, 64, 4): {"nseg": 1, "rg": 1, "minb": 4, "nw": 2, "dspl": 0},
     # D=128
-    (16, 2, 128, 1): {"nseg": 4, "rg": 2, "minb": 1, "nw": 4, "dspl": 0},
+    (16, 2, 128, 1): {"nseg": 4, "rg": 2, "minb": 2, "nw": 4, "vinlds": 1},
     (16, 2, 128, 4): {"nseg": 4, "rg": 2, "minb": 2, "nw": 4, "vinlds": 1},
     (32, 2, 128, 1): {"nseg": 4, "rg": 2, "minb": 2, "nw": 4, "vinlds": 1},
     (32, 2, 128, 4): {"nseg": 4, "rg": 4, "minb": 2, "nw": 4, "vinlds": 1},
