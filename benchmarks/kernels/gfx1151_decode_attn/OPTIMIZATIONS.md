@@ -1875,3 +1875,8 @@ not what those rows want); 16/8/256 M=4 gains 1.01x but has a cell at
 | 16/8/256 M=1 w1024 (Gemma 3 12B, Gemma 4) | dot on 4 waves instead of 8 | 1.019x | 1.023x |
 
 golden/swa.md regenerated at `81d69bd464`.
+
+Re-searching RG x NSEG x MINB with VINLDS on the rows still under 90 %:
+16/2/64 M=4 at nseg 4 (was 8) gains another 1.040-1.043x, no cell below
+1.00x, 16k/32k to 94.1 / 90.9 % -- landed, `6ecab03da9`.  32/2/128 M=4 and
+14/2/64 M=4 (GQA 7: RG > 1 does not divide it) found nothing better.
