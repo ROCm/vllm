@@ -61,15 +61,16 @@ Commits on top of it, 2026-09-25:
 ### The performance picture
 
 `matrix.py`, HND, all 52 configuration/M pairs, geomean over the seven
-contexts, measured 2026-09-26 at `2c7b87b6e8` (`golden/`; bf16 in
-`golden/bf16.md`, whose nine dot shapes use their WMMA rows):
+contexts, measured 2026-09-26 at `2c7b87b6e8`, the VINLDS rows (031)
+re-measured at `f7c00e52d0` (`golden/`; bf16 in `golden/bf16.md`, whose
+nine dot shapes use their WMMA rows):
 
 | D | M | configs | vs Triton | median configuration %roof | >= 90 % roof | S=128 median %roof |
 | --- | --- | --- | --- | --- | --- | --- |
-| 64 | 1 | 4 | 1.27x | 87.1 % | 1 | 56.0 % |
-| 64 | 4 | 4 | 1.29x | 87.2 % | 1 | 57.6 % |
+| 64 | 1 | 4 | 1.28x | 87.1 % | 1 | 56.0 % |
+| 64 | 4 | 4 | 1.31x | 87.2 % | 1 | 57.6 % |
 | 128 | 1 | 10 | 1.20x | 88.5 % | 1 | 69.0 % |
-| 128 | 4 | 10 | 1.26x | 88.0 % | 1 | 63.1 % |
+| 128 | 4 | 10 | 1.27x | 88.0 % | 1 | 63.1 % |
 | 256 | 1 | 7 | 1.39x | 86.0 % | 1 | 62.5 % |
 | 256 | 4 | 7 | 1.53x | 81.2 % | 0 | 53.5 % |
 | 512 | 1 | 5 | 2.95x | 85.0 % | 1 | 58.0 % |
@@ -78,11 +79,12 @@ contexts, measured 2026-09-26 at `2c7b87b6e8` (`golden/`; bf16 in
 Against the golden from before 014 (same harness): median cell 0.998x;
 the dot rows at D=256/512 M=1 1.03-1.13x (S=128 up to 1.25x), the PF and
 re-tuned WMMA rows 1.01-1.04x; unchanged rows 0.99x, the device-side S of
-014 (1-2 % at S=128) and noise.  Eleven long cells (S >= 16k) are under
-90 % of roof, all of them already under it before: `32/2/128` M=4 16k/32k,
-`8/1/256` M=4 16k, `16/2/64` M=4 16k/32k, `14/2/64` M=4 16k/32k,
-`16/1/512` M=4 16k, `16/2/256` M=4 16k, `16/2/128` M=4 16k and M=1 16k --
-85.0-89.8 %, see §4.5.
+014 (1-2 % at S=128) and noise.  Eight long cells (S >= 16k) are under
+90 % of roof, all of them already under it before: `8/1/256` M=4 16k
+(85.5 %), `32/2/128` M=4 16k (86.9 %), `14/2/64` M=4 16k/32k (89.6 /
+87.9 %), `16/1/512` M=4 16k (88.1 %), `16/2/256` M=4 16k (88.2 %),
+`16/2/64` M=4 32k (89.3 %), `16/2/128` M=1 16k (89.4 %); see §4.5.  VINLDS
+(031) took three over 90 %.
 
 **90 % of roof is not reachable everywhere.** `tools/floor.py` times a kernel
 that does nothing but stream the same bytes after one dependent page-table

@@ -1850,3 +1850,10 @@ Long cells: 32/2/128 M=4 32k 87.9 -> 91.9 %, 16/2/64 M=4 16k 87.3 ->
 The dev harness (shuffled pages) showed the same direction (+2-7 % on
 32/2/128 M=4), unlike 030's QK2.  A define named `VL` broke every build: a
 hipsolver header has a parameter of that name (5.11 again).
+
+`tune.py` with VINLDS (and CPUB) in its space on the rows still under 90 %:
+~2 h per configuration, and what it ranks first trades short contexts for
+long -- 14/2/64 M=4 (rspl=2) 0.88x at S=128, 16/2/256 M=4 (rspl=2, cpub)
+0.87x at S=128 though 1.05x at 16k-32k, 8/1/256 M=4 17.8 % of roof at
+S=128.  None landed.  golden/ (fp16, bf16) regenerated at `f7c00e52d0`
+with the eight VINLDS rows.
