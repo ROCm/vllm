@@ -1924,3 +1924,26 @@ The dot decomposition on those four rows (`matrix.py --dot 1`, NW 4-8,
 NSEG 4-16, BFLY 2-4), 16k: 32/2/128 M=4 25-29 %, 8/1/256 M=4 44-53 %,
 16/1/512 M=4 16-28 %, 14/2/64 M=4 27-28 % -- against 87-89 % on WMMA.  Per
 q head it reads the kv head's KV again for every head of the group.
+
+## 033 — Golden for batches; two more limits on the split
+
+**Status:** landed, `e2c7a309e1be2215d80e76d232cbe4a041006083`; golden
+`golden/batch.md`.
+
+`tools/batch.py` runs every configuration of `shapes.csv` (and `--windowed`)
+through `benchmark.py`'s runner on six decode batches (2-64 sequences,
+512-8k keys, M=1 and 4, CUDA graphs) and four mixed ones (4-32 decodes
+beside a q512 prefill, two q1k prefills or a q64 extend, eager), naming the
+path each cell took.  Its first full run found two holes in 028's rule, both
+now closed:
+
+| case | before | rule | after |
+| --- | --- | --- | --- |
+| Hkv=2, D=256, 16-32 decodes + q64 extend | 0.73-0.93x (0.35-0.42x at w512) | split only with >= 256 prefill tokens for (2, 256) | 1.00-1.01x |
+| window < 512 keys, 4 decodes + q512 | 0.95-0.98x | small windows need >= 16 decodes | 1.00x |
+
+Summary (golden/batch.md): full attention, 156 decode cells at 1.35x Triton
+geomean, median 92.7 % of roof; 44 of 104 mixed cells split, at 1.62x.
+Windows: 36 decode cells at 1.50x, median 93.1 %; 20 of 24 mixed split, at
+1.18x.  No cell under 0.97x, and those under 1.00x are Triton against
+Triton (eager noise) or within 2 % near roof.

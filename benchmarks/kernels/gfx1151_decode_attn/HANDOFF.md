@@ -12,7 +12,7 @@ fp16 unless it says bf16, **HND** (see §5.1). Nothing is estimated.
 | this one | state, open work, traps |
 | `OPTIMIZATIONS.md` | one entry per optimisation landed **or rejected**, with the numbers. 001-008 describe the previous (dot) kernel; 009 is the rewrite, 010-023 the commits below |
 | `reference/` | the previous per-q-head dot kernel and its D=512 golden, kept for comparison only |
-| `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten. `bf16.md` is the same for bf16, `swa.md` for the sliding-window configurations |
+| `golden/` | best measured result per head size for the WMMA kernel, with each configuration's ceiling; replace only when beaten. `bf16.md` is the same for bf16, `swa.md` for the sliding-window configurations, `batch.md` for batches of sequences and mixed batches |
 | `reports/` | the original investigation record, about the dot kernel. Its `%roof` numbers are superseded |
 
 ---
@@ -57,6 +57,7 @@ Commits on top of it, 2026-09-25:
 | `813f1f5b95` (027) | batched decode: grid.y per sequence, uniform query lengths up to 8 |
 | `23751209a2` (028) | mixed batches: decodes on the kernel, prefills on Triton |
 | `f7c00e52d0` (031) | VINLDS: V in LDS, next tile issued before this one's compute |
+| `e2c7a309e1` (033) | `tools/batch.py`, `golden/batch.md`; two more limits on the split |
 
 ### The performance picture
 
@@ -263,9 +264,12 @@ D=96 is three elements per lane, still Triton.  Batches of equal query
 length up to 8 run the kernel (027), 1.02-2.9x Triton except 32/8/128 at
 64 x 1k (0.96x).  Open: the batch runs the single-sequence row -- a row
 tuned per batch size (B is a shape, allowed to select knobs) is the next
-step (not RG: 027).  Mixed batches split at D >= 256 (028): decodes on
-the kernel, prefills on Triton, 1.07-4.6x; below D=256, or with few
-decodes beside a short extend, the batch stays whole on Triton.
+step (not RG: 027).  Mixed batches split at D >= 256 (028, 033): decodes
+on the kernel, prefills on Triton; below D=256, few decodes beside a short
+extend, two kv heads at D=256 with a short extend, or a small window with
+few decodes, the batch stays whole on Triton.  `tools/batch.py` and
+`golden/batch.md` measure all of it: decode batches 1.35x Triton geomean
+(windows 1.50x), split mixed batches 1.62x (windows 1.18x).
 
 ### 4.7 The fixed cost of split KV at short context
 
@@ -459,6 +463,10 @@ amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/tune.py \
 
 # the ceiling
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/floor.py
+
+# batches of sequences and mixed batches (golden/batch.md)
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/batch.py
+amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/batch.py --windowed
 
 # the sliding-window configurations: matrix, tuning, ceiling (golden/swa.md)
 amd-gpu-lock python benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py --windowed
