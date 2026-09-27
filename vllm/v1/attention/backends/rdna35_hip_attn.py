@@ -21,8 +21,12 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
+    TritonAttentionMetadataBuilder,
 )
-from vllm.v1.attention.backends.utils import KVCacheLayoutType
+from vllm.v1.attention.backends.utils import (
+    KVCacheLayoutType,
+    split_decodes_and_prefills,
+)
 from vllm.v1.attention.ops.rdna35_hip_decode import (
     KernelVariant,
     VariantBuildError,
@@ -283,8 +287,37 @@ _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 # a larger batch falls back to Triton.
 _SCRATCH: dict[tuple[KernelVariant, torch.device], tuple[int, Any]] = {}
 _SCRATCH_BUDGET = 64 * 1024**2
+# Mixed batches are split only from this head size up (OPTIMIZATIONS 028).
+_SPLIT_MIN_HEAD_SIZE = 256
+_SPLIT_MIN_DECODES = 16
+_SPLIT_MIN_PREFILL = 256
 # Query tokens per sequence the kernel serves: decode and speculative decode.
 _MAX_M = 8
+
+
+class Rdna35HipAttentionMetadataBuilder(TritonAttentionMetadataBuilder):
+    """Triton's metadata, with the batch ordered decodes first and the
+    number of leading uniform decodes counted, so that a batch mixing
+    prefills and decodes can send its decodes to the kernel."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        if self.reorder_batch_threshold is not None:
+            self.reorder_batch_threshold = min(self.reorder_batch_threshold, _MAX_M)
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        num_decodes, num_decode_tokens = 0, 0
+        if self.reorder_batch_threshold is not None:
+            num_decodes, _, num_decode_tokens, _ = split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=True,
+            )
+        md.num_decodes = num_decodes  # type: ignore[attr-defined]
+        md.num_decode_tokens = num_decode_tokens  # type: ignore[attr-defined]
+        return md
 
 
 class Rdna35HipAttentionBackend(TritonAttentionBackend):
@@ -302,6 +335,10 @@ class Rdna35HipAttentionBackend(TritonAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["Rdna35HipAttentionImpl"]:
         return Rdna35HipAttentionImpl
+
+    @staticmethod
+    def get_builder_cls() -> type["Rdna35HipAttentionMetadataBuilder"]:
+        return Rdna35HipAttentionMetadataBuilder
 
     @classmethod
     def supports_sliding_window(cls) -> bool:
@@ -474,14 +511,59 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             return None
         return self._built
 
-    def _run_attention(self, *, kv_cache: torch.Tensor, **kwargs) -> None:
-        built = self._prepare(kv_cache, **kwargs)
-        if built is None:
-            self.fallback_calls += 1
-            super()._run_attention(kv_cache=kv_cache, **kwargs)
-            return
-        self.kernel_calls += 1
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata, *a, **kw):
+        # The split of a mixed batch needs the metadata, which Triton's forward
+        # does not hand down to _run_attention.
+        self._metadata = attn_metadata
+        return super().forward(
+            layer, query, key, value, kv_cache, attn_metadata, *a, **kw
+        )
 
+    def _split_mixed(self, kv_cache: torch.Tensor, kwargs: dict) -> bool:
+        """Serve a batch of decodes followed by prefills in two launches: the
+        decodes on the kernel, the prefills on Triton.  Returns False, having
+        done nothing, when the batch is not like that or the kernel cannot
+        take its decodes.
+
+        Not under CUDA-graph capture: the split is host arithmetic on this
+        step's batch, and a captured graph would replay one step's split.
+        """
+        md = getattr(self, "_metadata", None)
+        nd = getattr(md, "num_decodes", 0)
+        ndt = getattr(md, "num_decode_tokens", 0)
+        nreq = kwargs["seqused_k"].shape[0]
+        if not 0 < nd < nreq or torch.cuda.is_current_stream_capturing():
+            return False
+        # The prefills leave the launch they shared with the decodes, and a
+        # short one alone is latency-bound in Triton.  Below D=256 the
+        # kernel's decode gain over Triton (1.0-1.1x) does not pay for that.
+        if self.head_size < _SPLIT_MIN_HEAD_SIZE:
+            return False
+        # A few decodes beside a short extend: the extend, alone, costs more
+        # than the kernel saves on the decodes (0.79-0.85x measured).
+        if nd < _SPLIT_MIN_DECODES and kwargs["q"].shape[0] - ndt < _SPLIT_MIN_PREFILL:
+            return False
+        dec = dict(kwargs)
+        for k in ("q", "out"):
+            dec[k] = kwargs[k][:ndt]
+        for k in ("seqused_k", "block_table"):
+            dec[k] = kwargs[k][:nd]
+        dec["max_seqlen_q"] = ndt // nd
+        built = self._prepare(kv_cache, **dec)
+        if built is None:
+            return False
+        self._launch(built, kv_cache, dec)
+        pre = dict(kwargs)
+        for k in ("q", "out"):
+            pre[k] = kwargs[k][ndt:]
+        for k in ("seqused_k", "block_table", "k_descale", "v_descale"):
+            if pre.get(k) is not None:
+                pre[k] = kwargs[k][nd:]
+        pre["cu_seqlens_q"] = kwargs["cu_seqlens_q"][nd:] - ndt
+        super()._run_attention(kv_cache=kv_cache, **pre)
+        return True
+
+    def _launch(self, built: _Built, kv_cache: torch.Tensor, kwargs: dict) -> None:
         module, (acc, softmax_max, softmax_sum, arrivals) = built
         # Called directly rather than through a registered custom op: this path
         # is exercised under CUDA-graph capture, not torch.compile, so the op
@@ -501,3 +583,15 @@ class Rdna35HipAttentionImpl(TritonAttentionImpl):
             kwargs["seqused_k"],
             kwargs["softmax_scale"],
         )
+
+    def _run_attention(self, *, kv_cache: torch.Tensor, **kwargs) -> None:
+        if self._split_mixed(kv_cache, kwargs):
+            self.kernel_calls += 1
+            return
+        built = self._prepare(kv_cache, **kwargs)
+        if built is None:
+            self.fallback_calls += 1
+            super()._run_attention(kv_cache=kv_cache, **kwargs)
+            return
+        self.kernel_calls += 1
+        self._launch(built, kv_cache, kwargs)
