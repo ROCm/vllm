@@ -55,6 +55,7 @@ Commits on top of it, 2026-09-25:
 | `6f8a9c9f6c` (025) | CPUB: split-KV partials staged in LDS and written a line at a time |
 | `29feb4a997` (026) | the backend requires HND; gemma-4-E2B end to end |
 | `813f1f5b95` (027) | batched decode: grid.y per sequence, uniform query lengths up to 8 |
+| `23751209a2` (028) | mixed batches: decodes on the kernel, prefills on Triton |
 
 ### The performance picture
 
@@ -248,8 +249,9 @@ D=96 is three elements per lane, still Triton.  Batches of equal query
 length up to 8 run the kernel (027), 1.02-2.9x Triton except 32/8/128 at
 64 x 1k (0.96x).  Open: the batch runs the single-sequence row -- a row
 tuned per batch size (B is a shape, allowed to select knobs) is the next
-step (not RG: 027); mixed batches (a prefill with decodes)
-still go to Triton whole.
+step (not RG: 027).  Mixed batches split at D >= 256 (028): decodes on
+the kernel, prefills on Triton, 1.07-4.6x; below D=256, or with few
+decodes beside a short extend, the batch stays whole on Triton.
 
 ### 4.7 The fixed cost of split KV at short context
 

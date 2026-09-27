@@ -1695,3 +1695,46 @@ others before it, which does not touch them.)  The one loss, 32/8/128 at
 RG=2 L2 sharing: RG=1 for batches measured 0.99-1.02x on 32/8/128 and
 8/1/256, and 0.54x on 32/2/128 at 8 x 4k M=4.  Untuned: every batch runs
 the single-sequence row.
+
+## 028 — Mixed batches split: decodes on the kernel, prefills on Triton
+
+**Status:** landed, `23751209a2`.
+
+A batch holding a prefill or a chunked-prefill extend went to Triton whole.
+`Rdna35HipAttentionMetadataBuilder` asks vLLM for decodes first
+(`reorder_batch_threshold`, raised for speculative decode, capped at 8) and
+counts the leading uniform decodes (`split_decodes_and_prefills`,
+`require_uniform`); the impl launches the kernel on those and Triton on the
+rest.  Not under CUDA-graph capture, where a step's host split would be
+replayed.
+
+`benchmark.py --no-cuda-graphs` (mixed batches are not graphed), against
+Triton on the whole batch:
+
+| D, Hq/Hkv | 4 x 8k + q512 | 16 x 4k + 2 x q1k | 16 x 2k + q64 | 32 x 1k + q64 | 8 x 2k + q64 | 4 x 1k + q32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256, 8/1 | 4.60x | 1.36x | 1.07x | 1.34x | (1.00x) | (1.00x) |
+| 256, 8/4 | 2.57x | 1.79x | 1.00x | 1.15x | (1.00x) | (1.00x) |
+| 256, 16/8 | 2.45x | 1.84x | 1.13x | 1.24x | (1.00x) | (1.00x) |
+| 512, 16/2 | 2.95x | 1.31x | 1.20x | 1.00x | (1.00x) | (1.00x) |
+| 128, any | (1.00x) | (1.00x) | (1.00x) | (1.00x) | (1.00x) | (1.00x) |
+
+In parentheses: not split, by the rule below.  Where the split lost:
+
+- the prefills leave the launch they shared with the decodes, and a short
+  extend alone is latency-bound in Triton: q64 at 2k on 16/4/128 takes
+  161 us for 4 MiB of KV, the decodes beside it 168 us, split 331 us against
+  216 us together.  At D <= 128 the kernel's decode gain (1.0-1.1x) never
+  pays for that: 0.65-0.93x measured.  So D >= 256 only.
+- 4-8 decodes beside a q32-q64 extend at D >= 256: 0.79-0.85x.  So at least
+  16 decodes, or at least 256 prefill tokens.
+
+Both rules read the batch's shape (head size, how many decodes, how many
+prefill tokens), never a context length.  A side stream for the prefills
+was tried: two streams do overlap on this GPU (a GEMM beside a chain of
+small kernels, 3.6 against 5.0 ms), but these two did not (331 us either
+way), and it was dropped.
+
+End to end, gemma-4-E2B-it with a 1k-token prompt chunked at 320 tokens
+beside decodes: the split ran 105 times, greedy output identical to
+TRITON_ATTN.
