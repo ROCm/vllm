@@ -1906,3 +1906,16 @@ long unchanged -- `903235f4fa1fb1992b1b5894aa6aab1e778b7c76`.  32/2/128 M=4 with
 waves, 4 or 8 segments, with and without VINLDS): nothing better at 16k.
 Explicit DSPL 2, 4 or 8 forced on every D=256/512 row at its own NSEG:
 no row gains.
+
+The 16 MiB step, two more ways (stream kernel, best of grid x unroll):
+
+| per call | separate tensors | slices of one 1 GiB allocation | grid-stride | contiguous chunk per workgroup |
+| --- | --- | --- | --- | --- |
+| 12 MiB | 97.8 % | 97.6 % | 98.3 % | 96.3 % |
+| 16 MiB | 92.2 % | 92.3 % | 92.7 % | 90.3 % |
+| 20 MiB | 93.8 % | 93.3 % | 94.1 % | 93.9 % |
+
+Neither the allocation (vLLM's KV is one allocation) nor the order of
+access moves it.  The four long cells left under 90 % -- 32/2/128,
+8/1/256, 16/1/512 M=4 at 16k and 14/2/64 M=4 at 32k -- are all 16 MiB of
+KV, at 94-96 % of that ceiling; 90 % of roof there needs 97.4 % of it.
