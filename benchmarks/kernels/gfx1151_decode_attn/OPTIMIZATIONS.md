@@ -1738,3 +1738,46 @@ way), and it was dropped.
 End to end, gemma-4-E2B-it with a 1k-token prompt chunked at 320 tokens
 beside decodes: the split ran 105 times, greedy output identical to
 TRITON_ATTN.
+
+## 029 — The long cells under 90 %: where the rest goes
+
+Not landed; a diagnosis for §4.5 of HANDOFF.
+
+**The 16 MiB ceiling is physical.**  `floor.py`'s stream kernel across
+12-24 MiB with 96, 192 and 384 MiB working sets:
+
+| working set | 12 MiB | 14 MiB | 16 MiB | 18 MiB | 20 MiB | 24 MiB |
+| --- | --- | --- | --- | --- | --- | --- |
+| 96 MiB | 97.8 % | 97.9 % | 92.4 % | 93.3 % | 93.8 % | 94.5 % |
+| 192 MiB | 98.0 % | 98.2 % | 92.3 % | 93.3 % | 93.9 % | 94.3 % |
+| 384 MiB | 98.0 % | 98.1 % | 92.3 % | 93.3 % | 93.8 % | 94.4 % |
+
+A step at 16 MiB, then a slow recovery -- a fixed ~5 us once one call's
+footprint reaches 16 MiB, whatever the rotation.  Not the harness.
+
+**The rest is exposed WMMA work.**  `32/2/128` M=4 (64 rows per kv head,
+16 per workgroup at RG=4) against its own ablations:
+
+| build | 16k | 32k |
+| --- | --- | --- |
+| as shipped | 83.1-83.4 % | 85.1-86.4 % |
+| Q@K thinned to one WMMA per tile | 87.6 % | 91.3 % |
+| P@V thinned | 87.2 % | 91.5 % |
+| both | 89.1 % | 93.5 % |
+| loads only | 89.9 % | 93.9 % |
+
+Loads alone reach the stream ceiling; each product costs ~5 %.  019 read
+"not P@V" from dropping P's low half at M=4, which halves one of them only.
+With one tile in flight a wave waits Q@K -> softmax -> P@V before its next
+loads land.  What would hide it:
+
+- PF (a second tile per wave): at D=128 and 16 rows it spills (256 VGPRs,
+  27 spilled) and runs 0.2-0.58x, with 4 or 8 waves, RG 1-4;
+- RSPL 2-4 (024): 79.7 / 83.1 %, the per-tile barrier;
+- more segments or row groups (024): worse.
+
+16/2/64 M=4: loads only 92.6 / 90.3 %, shipped 87.3 / 86.3 %, the same
+shape of answer at a smaller scale.  Hiding the products needs registers
+the wave does not have at these row counts: a P@V that keeps P in LDS
+instead of registers, or fewer rows per wave with the tile shared (RSPL)
+without its barrier, are what is left to try.

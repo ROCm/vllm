@@ -241,6 +241,11 @@ M=4 16k/32k, `14/2/64` M=4 16k/32k, `16/1/512` M=4 16k, `16/2/256` M=4 16k,
 - the fixed tail: wave skew at the loop end (0.4-1.3 us), the split-KV
   publish, atomic and merge (~1.5-2 us) -- 2-4 % of an 80 us call.
 
+029 settles both halves: the 16 MiB step is in a pure stream whatever the
+working set, and on `32/2/128` M=4 loads alone reach it while each of Q@K
+and P@V costs ~5 % -- exposed WMMA latency, one tile in flight, with PF
+spilling at those row counts.
+
 The dot-against-WMMA comparison this section used to propose is done (018): dot wins short contexts at D=256/512 M=1 and loses long ones, so over the full range it rarely wins.
 
 ### 4.6 D=96, and the batch axis
