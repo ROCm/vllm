@@ -1691,7 +1691,7 @@ Triton:
 
 (32/8/128 at 2 x 1k; 8/1/256 and 16/2/512 after the WMMA-row change, the
 others before it, which does not touch them.)  The one loss, 32/8/128 at
-64 x 1k, is 256 MiB where both are near roof (90 against 94 %); its row
-splits rows over two workgroups sharing KV through L2 (RG=2, §5.2 of
-HANDOFF), which a batch of 1024 workgroups may not keep.  Untuned: every
-batch runs the single-sequence row.
+64 x 1k, is 256 MiB where both are near roof (90 against 94 %).  Not its
+RG=2 L2 sharing: RG=1 for batches measured 0.99-1.02x on 32/8/128 and
+8/1/256, and 0.54x on 32/2/128 at 8 x 4k M=4.  Untuned: every batch runs
+the single-sequence row.

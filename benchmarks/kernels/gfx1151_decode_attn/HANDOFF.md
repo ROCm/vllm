@@ -248,7 +248,7 @@ D=96 is three elements per lane, still Triton.  Batches of equal query
 length up to 8 run the kernel (027), 1.02-2.9x Triton except 32/8/128 at
 64 x 1k (0.96x).  Open: the batch runs the single-sequence row -- a row
 tuned per batch size (B is a shape, allowed to select knobs) is the next
-step, starting with RG for 32/8/128; mixed batches (a prefill with decodes)
+step (not RG: 027); mixed batches (a prefill with decodes)
 still go to Triton whole.
 
 ### 4.7 The fixed cost of split KV at short context
