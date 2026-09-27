@@ -91,6 +91,12 @@ def main() -> None:
         help="force RSPL on every configuration, overriding the heuristics",
     )
     p.add_argument(
+        "--vinlds",
+        type=int,
+        default=None,
+        help="force VINLDS on every configuration, overriding the heuristics",
+    )
+    p.add_argument(
         "--cpub",
         type=int,
         default=None,
@@ -130,6 +136,7 @@ def main() -> None:
             ("dspl", args.dspl),
             ("rspl", args.rspl),
             ("cpub", args.cpub),
+            ("vinlds", args.vinlds),
         )
         if v is not None
     }

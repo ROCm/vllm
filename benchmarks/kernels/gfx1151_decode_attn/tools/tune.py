@@ -81,6 +81,7 @@ def space(hq, hkv, d, start):
         "rspl": [1, 2, 4],
         "pf": [0, 1],
         "cpub": [0, 1],
+        "vinlds": [0, 1],
         "target": list(TARGETS),
         "minb": [1, 2, 4],
         # The dot decomposition's own knobs.
@@ -113,6 +114,8 @@ def knobs_of(hkv, cand):
         k["pf"] = 1
     if cand.get("cpub"):
         k["cpub"] = 1
+    if cand.get("vinlds"):
+        k["vinlds"] = 1
     return k
 
 
@@ -213,6 +216,7 @@ def main() -> None:
                 "rspl": base.get("rspl", 1),
                 "pf": base.get("pf", 0),
                 "cpub": base.get("cpub", 0),
+                "vinlds": base.get("vinlds", 0),
                 "target": 16,
                 "minb": base.get("minb", 1),
             }
@@ -322,6 +326,7 @@ def main() -> None:
                             "rspl",
                             "pf",
                             "cpub",
+                            "vinlds",
                             "target",
                             "minb",
                         )

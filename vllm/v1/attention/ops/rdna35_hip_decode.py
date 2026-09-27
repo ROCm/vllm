@@ -67,6 +67,9 @@ class KernelVariant:
     # 1 stages split-KV partials in LDS and writes them a line at a time
     # instead of from registers.
     cpub: int = 0
+    # 1 stages unshared tiles' V in LDS beside K, freeing the tile's
+    # registers so the next tile's loads go out before this one's compute.
+    vinlds: int = 0
     # 1 builds for a batch of sequences (grid.y), with scratch from
     # make_scratch(max_seqs=...); 0 serves exactly one sequence.
     batch: int = 0
@@ -100,6 +103,7 @@ class KernelVariant:
             f"{'' if self.rspl == 1 else f'_rs{self.rspl}'}"
             f"{'' if not self.pf else '_pf'}"
             f"{'' if not self.cpub else '_cp'}"
+            f"{'' if not self.vinlds else '_vl'}"
             f"{'' if not self.batch else '_batch'}"
             f"{'' if not self.dot else f'_dot_bf{self.bfly}_gt{self.gt}'}"
             f"_mut{self.mutate}"
@@ -256,6 +260,7 @@ def load(variant: KernelVariant) -> Any:
         f"-DRSPL={variant.rspl}",
         f"-DPF={variant.pf}",
         f"-DCPUB={variant.cpub}",
+        f"-DVINLDS={variant.vinlds}",
         f"-DBATCH={variant.batch}",
         f"-DDOT={variant.dot}",
         f"-DBFLY={variant.bfly}",

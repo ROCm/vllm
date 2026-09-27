@@ -121,6 +121,12 @@
   #ifndef CPUB
     #define CPUB 0
   #endif
+  // 1 stages each unshared tile's V in LDS beside its K, so the tile's
+  // registers are free once staged and the next tile's loads go out before
+  // this one is computed -- PF's overlap without PF's second register set.
+  #ifndef VINLDS
+    #define VINLDS 0
+  #endif
   // 1 builds for a batch of sequences, one per grid.y; 0 for one sequence,
   // without the per-sequence addressing.
   #ifndef BATCH
@@ -905,7 +911,7 @@ __device__ __forceinline__ void body(
     // and transposed to the lane-per-key WMMA operand through it; the 16-byte
     // pad puts the sixteen keys one operand read touches on distinct banks.
     #define KT_ROW (DPART * 2 + 16)
-    #define KT_BYTES (M_NW * 16 * KT_ROW)
+    #define KT_BYTES (M_NW * (VINLDS ? 2 : 1) * 16 * KT_ROW)
     #define QS_BYTES (ROWPAD * (HEAD_DIM + QPAD) * 2)
     #define MROW (DPART + PADM)
     #define RV (ROWS_W < 16 ? ROWS_W : 16)
@@ -1139,7 +1145,9 @@ __device__ __forceinline__ void body(
   float* sx_s = reinterpret_cast<float*>(lds_raw + QS_BYTES + TB_BYTES);
       #define SX_SLOT(w) ((w) * RTW * 256)
     #else
-  char* kt_s = lds_raw + QS_BYTES + wave * 16 * KT_ROW;
+  static_assert(!VINLDS || (M_DSPL == 1 && !M_PF),
+                "VINLDS: whole head dim, no PF");
+  char* kt_s = lds_raw + QS_BYTES + wave * (VINLDS ? 2 : 1) * 16 * KT_ROW;
   // Wave w's partial scores go in wave w's own K tile.  It writes them only
   // after its own Q@K has read that tile, its partners read them between the
   // two barriers of the exchange, and it refills the tile with the next K
@@ -1242,6 +1250,17 @@ __device__ __forceinline__ void body(
     asm volatile("" ::: "memory");
   };
     #else
+      #if VINLDS
+  auto stage_kv = [&](const Tile& t) {
+        #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int row = (2 * e + hi) * KT_ROW + VD * l16 * 2;
+      *(vrow_t*)(kt_s + row) = t.k[e];
+      *(vrow_t*)(kt_s + 16 * KT_ROW + row) = t.v[e];
+    }
+    asm volatile("" ::: "memory");
+  };
+      #endif
   auto stage_k = [&](const Tile& t) {
       #pragma unroll
     for (int e = 0; e < 8; ++e)
@@ -1306,7 +1325,7 @@ __device__ __forceinline__ void body(
       #endif
     #endif
     if (b == b0 + seg) TS(2);
-    #if SHT
+    #if SHT || VINLDS
     vrow_t vs[8];
       #pragma unroll
     for (int e = 0; e < 8; ++e)
@@ -1448,6 +1467,14 @@ __device__ __forceinline__ void body(
     stage_k(tb);
     if (b + 2 * nseg < nblk) issue(ta, b + 2 * nseg);
     process(tb, tb.v, kt_s, b + nseg);
+  }
+    #elif VINLDS
+  // The tile's registers are free once staged: the next tile's loads go out
+  // before this one is computed.  Its own buffer, so no barrier.
+  for (int b = b0 + seg; b < nblk; b += nseg) {
+    stage_kv(ta);
+    if (b + nseg < nblk) issue(ta, b + nseg);
+    process(ta, nullptr, kt_s, b);
   }
     #else
   for (int b = b0 + seg; b < nblk; b += nseg) {
