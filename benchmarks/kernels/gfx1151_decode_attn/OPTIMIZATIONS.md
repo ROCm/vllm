@@ -1895,3 +1895,9 @@ variant within 5 % of its row.
 Two tiles in flight on top of VINLDS (V no longer held through the
 compute, so perhaps room for PF's second tile): 256 VGPRs with 156 spilled
 on 32/2/128 M=4, 94 on 8/1/256 M=4, 56 on 14/2/64 M=4.  Not built further.
+
+16/2/256 M=4 without VINLDS: nseg 4 -> 8 with DSPL 2 explicit (the rule
+picks 4 at D=256) gains 1.027x fp16 / 1.030x bf16, cells >= 0.984x, 16k
+88.2 -> 93.4 %, 32k 95.1 % -- landed, `70c6310bfa74824215e85e5a9a7f6ec3e90c69d3`.  The tuner never pairs an
+explicit DSPL with more segments.  16/1/512 M=4: RG 2-4, NSEG 8-16, NW 4-8,
+DSPL 2-8: nothing better than its row.
