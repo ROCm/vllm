@@ -24,6 +24,11 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
 )
 from vllm.platforms import current_platform
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import _ON_GFX1250
+else:
+    _ON_GFX1250 = False
 from vllm.platforms.rocm import _ON_GFX950, on_gfx1250
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -61,8 +66,17 @@ def _trust_dsv4_extra_cache_nan_free(
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     lengths = lengths.to(dtype=torch.int32).contiguous()
-    indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
-    torch.cumsum(lengths, dim=0, out=indptr[1:])
+    n = lengths.shape[0]
+    if 0 < n <= _INDPTR_MAX_BLOCK and lengths.is_cuda:
+        # One scan kernel instead of a fill plus a device-wide scan.
+        indptr = torch.empty(n + 1, dtype=torch.int32, device=lengths.device)
+        _build_indptr_kernel[(1,)](
+            lengths, indptr, n, BLOCK=triton.next_power_of_2(n)
+        )
+        return indptr
+    indptr = torch.zeros(n + 1, dtype=torch.int32, device=lengths.device)
+    if n:
+        torch.cumsum(lengths, dim=0, out=indptr[1:])
     return indptr
 
 
@@ -241,6 +255,32 @@ def _compute_topk_lens_kernel(
         count += tl.sum((local_idx >= 0).to(tl.int32), axis=0)
 
     tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
+
+
+# One block is enough: `lengths` carries one entry per decode token, which is
+# bounded by max_num_seqs. Beyond that bound the caller falls back to torch.
+_INDPTR_MAX_BLOCK = 8192
+
+
+@triton.jit
+def _build_indptr_kernel(
+    lens_ptr,
+    indptr_ptr,
+    n,
+    BLOCK: tl.constexpr,
+):
+    """lengths -> exclusive prefix sum, written as indptr[0..n].
+
+    Replaces a torch.zeros + torch.cumsum pair. indptr[0] is 0 and
+    indptr[i + 1] is the inclusive scan at i, so the whole thing is one
+    tl.cumsum plus one scalar store -- no fill, no device-wide scan.
+    """
+    offs = tl.arange(0, BLOCK)
+    m = offs < n
+    v = tl.load(lens_ptr + offs, mask=m, other=0).to(tl.int32)
+    c = tl.cumsum(v, axis=0)
+    tl.store(indptr_ptr + offs + 1, c, mask=m)
+    tl.store(indptr_ptr, 0)
 
 
 @triton.jit
@@ -520,8 +560,12 @@ def _use_aiter_sparse_decode() -> bool:
     One knob, not two: aiter's 2buff kernel reads the ALIGNED 640-byte record
     (448 NoPE | 14 duplicated UE8M0 | 50 pad | 128 RoPE) and nothing else
     reads it, so the layout and the kernel have to move together.
+
+    Always on for gfx1250 -- this is the a8w8 sparse-MLA decode path there, not
+    an opt-in. Other architectures keep the packed 576/584 record and their own
+    decode.
     """
-    return os.environ.get("VLLM_DSV4_AITER_SPARSE_DECODE") == "1"
+    return _ON_GFX1250
 
 
 class DeepseekV4ROCMAiterSWACache(DeepseekV4SWACache):
@@ -554,12 +598,87 @@ class DeepseekV4ROCMAiterSWACache(DeepseekV4SWACache):
         )
 
 
+def _dsv4_qpack_fusion_enabled() -> bool:
+    """Fold the fp8 Q pack into the producer instead of a second pass.
+
+    Off by default: the first version of this faulted the MoE prefill GEMM
+    intermittently (plan section 32). It allocated the packed buffers inside
+    the producer and stashed them across the step boundary, so under
+    FULL_AND_PIECEWISE they came from the shared CUDA graph pool and were held
+    or released on a schedule that pool does not model. This version uses
+    persistent buffers instead; the switch stays until a bench confirms it.
+    """
+    return os.environ.get("VLLM_DSV4_QPACK_FUSION", "0") == "1"
+
+
+_DSV4_QPACK_BUFS: dict = {}
+
+
+def _dsv4_qpack_buffers(rows: int, heads: int, dim: int, rope: int, device):
+    """Persistent packed-Q buffers, shared by every layer.
+
+    Layers run sequentially within a step, so one pair serves all of them.
+    They are never freed and only ever grow: a captured graph records these
+    addresses, and handing the memory back would let a later allocation land
+    underneath a replay -- the failure mode section 32 diagnosed.
+
+    Allocate on the profile run, which uses the largest token count and runs
+    before any capture, so the first touch is never inside a graph.
+    """
+    key = (rows, heads, dim, rope, device.index)
+    cur = _DSV4_QPACK_BUFS.get("key")
+    if cur == key:
+        return _DSV4_QPACK_BUFS["packed"], _DSV4_QPACK_BUFS["rope"]
+    have = _DSV4_QPACK_BUFS.get("rows", 0)
+    if rows > have or _DSV4_QPACK_BUFS.get("heads") != heads:
+        _DSV4_QPACK_BUFS.setdefault("retired", []).extend(
+            b for b in (_DSV4_QPACK_BUFS.get("packed_full"),
+                        _DSV4_QPACK_BUFS.get("rope_full")) if b is not None
+        )
+        _DSV4_QPACK_BUFS["packed_full"] = torch.empty(
+            rows, heads, dim, dtype=torch.uint8, device=device
+        )
+        _DSV4_QPACK_BUFS["rope_full"] = torch.empty(
+            rows, heads, rope, dtype=torch.bfloat16, device=device
+        )
+        _DSV4_QPACK_BUFS["rows"] = rows
+        _DSV4_QPACK_BUFS["heads"] = heads
+    p = _DSV4_QPACK_BUFS["packed_full"][:rows]
+    r = _DSV4_QPACK_BUFS["rope_full"][:rows]
+    _DSV4_QPACK_BUFS.update(key=key, packed=p, rope=r)
+    return p, r
+
+
+def _aiter_compress_fns():
+    """aiter's compress launchers, or None if this build lacks them."""
+    try:
+        from aiter.ops.triton.quant.fused_mxfp8_quant import (
+            compress_norm_rope_store_triton,
+            compress_norm_rope_store_two_stage_triton,
+        )
+    except ImportError:
+        return None
+    return compress_norm_rope_store_triton, compress_norm_rope_store_two_stage_triton
+
+
+_AITER_COMPRESS = _aiter_compress_fns()
+
+
 class DeepseekV4ROCMAiterCompressor(DeepseekCompressor):
     """The compressor, writing the aligned record when aiter decodes.
 
     The aligned record interleaves each token's scales, so the token stride is
     the whole record; the packed layout strides by data only.
+
+    The kernels come from aiter rather than vLLM's own
+    fused_compress_quant_cache: they are the same kernels, but owning them on
+    the aiter side is what lets that shared vLLM file stay upstream. Falls back
+    to the base class's when the aiter build does not carry them.
     """
+
+    if _AITER_COMPRESS is not None:
+        compress_fn = staticmethod(_AITER_COMPRESS[0])
+        compress_two_stage_fn = staticmethod(_AITER_COMPRESS[1])
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -645,22 +764,61 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         )
 
         assert positions.dtype == torch.int64
-        # pack_q is off here: the decode dispatch still packs Q as its own
-        # pass, and folding that in means plumbing the packed tensor down to
-        # it rather than just asking for it.
-        return fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
-            q,
-            kv,
-            swa_kv_cache,
-            swa_metadata.slot_mapping,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            swa_metadata.block_size,
-            self.eps,
-            self.padded_heads,
-            apply_q_norm=True,
-            pack_q=False,
+        # pack_q=True: the fp8 pack comes off the same registers as the
+        # RMSNorm and RoPE, so it costs no second pass over Q. The pair is
+        # stashed rather than returned, because this method's contract with
+        # attention.py is one bf16 tensor and every other backend relies on
+        # that; _forward_decode picks it up on the way to the aiter kernel.
+        # On a pure-decode step the decode reads only the packed pair, so the
+        # bf16 Q is written and never read -- T * padded_heads * 512 * 2
+        # bytes. Skip it, but ONLY when the aiter decode is certain to run:
+        # its fallback, and prefill, both read Q as bf16.
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            _dsv4_aiter_sparse_decode_fns,
         )
+
+        # [A/B] forced True -- isolating the uninitialised-q_out skip from an
+        # intermittent GPU memory fault. Restore by removing this line.
+        write_q = True
+        _unused_skip = (
+            swa_metadata.num_prefills == 0
+            and swa_metadata.num_decodes > 0
+            and _dsv4_aiter_sparse_decode_fns() is not None
+        )
+        fuse = _dsv4_qpack_fusion_enabled()
+        if fuse:
+            qp_buf, qr_buf = _dsv4_qpack_buffers(
+                q.shape[0], self.padded_heads, q.shape[-1], 64, q.device
+            )
+        else:
+            qp_buf = qr_buf = None
+        res = (
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_aligned(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                swa_metadata.block_size,
+                self.eps,
+                self.padded_heads,
+                apply_q_norm=True,
+                pack_q=fuse,
+                write_q=write_q,
+                q_packed_out=qp_buf,
+                q_rope_out=qr_buf,
+            )
+        )
+        if fuse:
+            q_out, q_packed, q_rope = res
+            # Storage-keyed, not identity: forward_mqa passes
+            # q[:num_decode_tokens], so `is` would never match.
+            self._dsv4_packed_q = (q_out, q_packed, q_rope)
+        else:
+            q_out = res
+            self._dsv4_packed_q = None
+        return q_out
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -1012,8 +1170,29 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
+        # The pack the producer made, if this q is really that q. forward_mqa
+        # passes q[:num_decode_tokens], so `is` would never match -- compare
+        # storage, and take the same prefix of the packed pair. Decode tokens
+        # lead the batch, so a prefix is the right slice.
+        q_packed = q_rope = None
+        packed = getattr(self, "_dsv4_packed_q", None)
+        if packed is not None:
+            q_full, qp_full, qr_full = packed
+            same = (
+                q_full.untyped_storage().data_ptr()
+                == q.untyped_storage().data_ptr()
+                and q.storage_offset() == q_full.storage_offset()
+                and q.shape[1:] == q_full.shape[1:]
+                and q.shape[0] <= q_full.shape[0]
+            )
+            if same:
+                n = q.shape[0]
+                q_packed, q_rope = qp_full[:n], qr_full[:n]
+
         rocm_sparse_attn_decode(
             q=q,
+            q_packed=q_packed,
+            q_rope=q_rope,
             kv_cache=kv_cache,
             swa_k_cache=self.swa_cache_layer.kv_cache,
             swa_only=swa_only,

@@ -2907,11 +2907,15 @@ def _decode_gfx950_num_splits(
     return num_splits
 
 
-_DSV4_AITER_SPARSE_DECODE_ENV = "VLLM_DSV4_AITER_SPARSE_DECODE"
 
 
 def _dsv4_aiter_sparse_decode_enabled() -> bool:
-    return os.environ.get(_DSV4_AITER_SPARSE_DECODE_ENV, "0") == "1"
+    """Always on for gfx1250 -- this IS the a8w8 sparse-MLA decode path there.
+
+    _dsv4_aiter_sparse_decode still returns None if the aiter build lacks the
+    kernels, and the caller falls through to the incumbent.
+    """
+    return True
 
 
 @functools.cache
@@ -2942,6 +2946,254 @@ def _dsv4_aiter_sparse_decode_fns():
     return pa_decode_sparse, fused_deepseek_v4_mxfp8_quant_q_pack
 
 
+
+# ---------------------------------------------------------------------------
+# Single-stream decode: one index stream over one flat record grid
+# ---------------------------------------------------------------------------
+_DSV4_REC_BYTES = 640
+_DSV4_SINGLE_STREAM_STATE: dict[str, object] = {}
+
+
+@triton.jit
+def _dsv4_merge_streams_kernel(
+    out_ptr,
+    out_indptr_ptr,
+    a_idx_ptr,
+    a_indptr_ptr,
+    b_idx_ptr,
+    b_indptr_ptr,
+    a_base,
+    a_blk_rows,
+    b_base,
+    b_blk_rows,
+    A_PAGE: tl.constexpr,
+    B_PAGE: tl.constexpr,
+    HAS_B: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Both streams' slots -> global record indices, concatenated per token.
+
+    Stream A (SWA) occupies the first a_len output columns, stream B (top-k)
+    the next b_len. A slot is converted with the same mapping the kernel used
+    to do per tile -- page number times the rows its block stride spans, plus
+    the position inside the page -- offset by where that cache starts in the
+    shared allocation.
+    """
+    t = tl.program_id(0)
+    blk = tl.program_id(1)
+    off = blk * BLOCK + tl.arange(0, BLOCK)
+
+    a_start = tl.load(a_indptr_ptr + t)
+    a_len = tl.load(a_indptr_ptr + t + 1) - a_start
+    if HAS_B:
+        b_start = tl.load(b_indptr_ptr + t)
+        b_len = tl.load(b_indptr_ptr + t + 1) - b_start
+    else:
+        b_start = 0
+        b_len = 0
+    total = a_len + b_len
+    if blk * BLOCK >= total:
+        return
+
+    out_start = tl.load(out_indptr_ptr + t)
+    in_a = off < a_len
+    mask = off < total
+
+    # one gather per stream, then select -- branchless, both streams' loads are
+    # masked to their own range so neither reads out of bounds
+    a_pos = tl.where(in_a, off, 0)
+    slot_a = tl.load(a_idx_ptr + a_start + a_pos, mask=mask & in_a, other=0)
+    if HAS_B:
+        b_pos = tl.where(in_a, 0, off - a_len)
+        slot_b = tl.load(b_idx_ptr + b_start + b_pos, mask=mask & (~in_a), other=0)
+    else:
+        slot_b = tl.zeros_like(slot_a)
+
+    rec_a = a_base + (slot_a // A_PAGE) * a_blk_rows + (slot_a % A_PAGE)
+    rec_b = b_base + (slot_b // B_PAGE) * b_blk_rows + (slot_b % B_PAGE)
+    rec = tl.where(in_a, rec_a, rec_b)
+    # A negative slot must not become a negative record. Nothing upstream
+    # should produce one (the packers copy dense prefixes only), so this is a
+    # backstop, not an expectation -- and it keeps the kernel's own guard from
+    # being the only thing standing between a bad index and a fault.
+    rec = tl.where(rec < 0, 0, rec)
+    tl.store(out_ptr + out_start + off, rec.to(tl.int32), mask=mask)
+
+
+def _dsv4_record_grid(caches, why=None):
+    """The shared backing allocation as a flat 640-byte record grid.
+
+    Returns ``(flat_uint8 [N, 640], [record_base per cache], [rows_per_block],
+    [page])`` or None when the caches are not one allocation on a 640 grid.
+    ``why`` collects the reason, so the caller can report which check failed
+    and with what geometry rather than a bare "not a grid".
+    """
+
+    def no(reason):
+        if why is not None:
+            why.append(reason)
+        return None
+
+    if any(c is None for c in caches):
+        return no("a cache is None")
+    first = caches[0]
+    storage = first.untyped_storage()
+    bases, blk_rows, pages = [], [], []
+    for n, c in enumerate(caches):
+        tag = "main" if n == 0 else "extra"
+        if c.untyped_storage().data_ptr() != storage.data_ptr():
+            return no(
+                f"{tag} is a separate allocation "
+                f"(0x{c.untyped_storage().data_ptr():x} vs "
+                f"0x{storage.data_ptr():x}) -- no common index space"
+            )
+        if c.dim() != 3 or c.shape[-1] != _DSV4_REC_BYTES:
+            return no(
+                f"{tag} shape {tuple(c.shape)} is not [nb, page, "
+                f"{_DSV4_REC_BYTES}]"
+            )
+        es = c.element_size()
+        byte_off = c.storage_offset() * es
+        blk_stride = c.stride(0) * es
+        row_stride = c.stride(1) * es
+        if row_stride != _DSV4_REC_BYTES:
+            return no(
+                f"{tag} row stride {row_stride} B != {_DSV4_REC_BYTES} -- "
+                f"records are not adjacent inside a page "
+                f"(strides {tuple(c.stride())}, elem {es} B)"
+            )
+        if byte_off % _DSV4_REC_BYTES or blk_stride % _DSV4_REC_BYTES:
+            return no(
+                f"{tag} not on the record grid: storage offset {byte_off} B "
+                f"and block stride {blk_stride} B must both be multiples of "
+                f"{_DSV4_REC_BYTES} (remainders {byte_off % _DSV4_REC_BYTES}, "
+                f"{blk_stride % _DSV4_REC_BYTES})"
+            )
+        bases.append(byte_off // _DSV4_REC_BYTES)
+        blk_rows.append(blk_stride // _DSV4_REC_BYTES)
+        pages.append(c.shape[1])
+
+    nbytes = storage.nbytes()
+    # Whole records only. The allocation is rounded up to a 4 KiB page and
+    # 4096 is not a multiple of 640, so the tail is normally a partial record
+    # -- it holds no data and is simply not part of the grid.
+    n_rec = nbytes // _DSV4_REC_BYTES
+    for n, (b, br, pg, c) in enumerate(zip(bases, blk_rows, pages, caches)):
+        last = b + (c.shape[0] - 1) * br + (pg - 1)
+        if last >= n_rec:
+            return no(
+                f"{'main' if n == 0 else 'extra'}'s last record is row {last} "
+                f"but the allocation only holds {n_rec} whole records "
+                f"({nbytes} B)"
+            )
+    # The view aliases the allocation and never changes, so build it once.
+    key = (storage.data_ptr(), nbytes)
+    cached = _DSV4_SINGLE_STREAM_STATE.get("grid")
+    if cached is None or cached[0] != key:
+        flat = torch.empty(0, dtype=torch.uint8, device=first.device)
+        flat.set_(storage, 0, (n_rec * _DSV4_REC_BYTES,), (1,))
+        cached = (key, flat.view(-1, _DSV4_REC_BYTES))
+        _DSV4_SINGLE_STREAM_STATE["grid"] = cached
+    return cached[1], bases, blk_rows, pages
+
+
+def _dsv4_merge_to_single_stream(
+    main_cache, main_indices, main_indptr,
+    extra_cache, extra_indices, extra_indptr,
+):
+    """Two streams over two caches -> one stream over one flat record grid.
+
+    Returns ``(kv, kv_rope, indices, indptr)`` or None to decline, in which
+    case the caller keeps the two-stream path.
+    """
+    caches = [main_cache] + ([extra_cache] if extra_cache is not None else [])
+    why: list[str] = []
+    grid = _dsv4_record_grid(caches, why)
+    if grid is None:
+        _DSV4_SINGLE_STREAM_STATE["why"] = why[0] if why else "unknown"
+        return None
+    flat, bases, blk_rows, pages = grid
+    has_b = extra_cache is not None
+    if any(p & (p - 1) for p in pages):
+        return None  # the // and % fold to shifts only for powers of two
+
+    num_tokens = main_indptr.numel() - 1
+    total = main_indices.numel() + (extra_indices.numel() if has_b else 0)
+
+    # Persistent buffers, grown on demand. Allocating ~100 KB per decode step
+    # does not merely cost the allocation: it evicts the decode kernel's
+    # working set and measured 18 us ON THE DECODE ITSELF, more than the merge
+    # kernel costs. Same reason vLLM keeps `*_ragged_*_buffer` around.
+    dev = main_indices.device
+    # RETIRED, never freed. A CUDA graph captures the buffer's ADDRESS, so a
+    # replay reads whatever lives there now. Dropping the last reference to a
+    # buffer a captured graph still points at would hand that graph freed
+    # memory, so growing keeps the old one alive instead of releasing it.
+    retired = _DSV4_SINGLE_STREAM_STATE.setdefault("retired", [])
+
+    def _grow(key, need):
+        t = _DSV4_SINGLE_STREAM_STATE.get(key)
+        if t is not None and t.numel() >= need and t.device == dev:
+            return t
+        if t is not None:
+            retired.append(t)
+        t = torch.empty(max(need, 1), dtype=torch.int32, device=dev)
+        _DSV4_SINGLE_STREAM_STATE[key] = t
+        return t
+
+    out_idx = _grow("buf", total)[:total]
+
+    # The merged indptr is the elementwise SUM of the two stream indptrs:
+    #   merged[t] = sum_{i<t} (main_len[i] + extra_len[i])
+    #             = main_indptr[t] + extra_indptr[t]
+    # so the per-token lengths never have to be recovered by differencing and
+    # rescanned, and [0] comes out 0 + 0 on its own. This replaced two strided
+    # subtractions, an add, a fill and a rocprim scan -- 11.7 us of the
+    # merge's 14.2 -- with one add. One stream needs no add at all.
+    if has_b:
+        out_indptr = _grow("indptr", num_tokens + 1)[: num_tokens + 1]
+        torch.add(main_indptr, extra_indptr, out=out_indptr)
+    else:
+        out_indptr = main_indptr
+
+    # The grid bound must NOT come from lens.max(): that is a device->host sync
+    # in the decode path. The streams' dense widths bound it exactly.
+    width = 0
+    if num_tokens:
+        width = main_indices.numel() // num_tokens
+        if has_b:
+            width += extra_indices.numel() // num_tokens
+    if width:
+        block = 128
+        _dsv4_merge_streams_kernel[(num_tokens, triton.cdiv(width, block))](
+            out_idx, out_indptr,
+            main_indices, main_indptr,
+            extra_indices if has_b else main_indices,
+            extra_indptr if has_b else main_indptr,
+            bases[0], blk_rows[0],
+            bases[1] if has_b else 0, blk_rows[1] if has_b else 1,
+            A_PAGE=pages[0],
+            B_PAGE=pages[1] if has_b else 1,
+            HAS_B=has_b,
+            BLOCK=block,
+        )
+
+    kv = flat[:, :512].view(torch.float8_e4m3fn)
+    kv_rope = flat[:, 512:].view(torch.bfloat16)
+    if not _DSV4_SINGLE_STREAM_STATE.get("logged"):
+        _DSV4_SINGLE_STREAM_STATE["logged"] = True
+        # First-run confirmation that the real allocator output is one
+        # 640-byte record grid -- the precondition plan section 29.7 rests on
+        # and which until now was only checked against a synthetic layout.
+        logger.info(
+            "DSV4 single-stream: grid %d records (%.1f GiB), bases=%s "
+            "rows_per_block=%s page=%s, merged stream %d indices",
+            flat.shape[0], flat.numel() / 2**30, bases, blk_rows, pages,
+            out_idx.numel(),
+        )
+    return kv, kv_rope, out_idx, out_indptr
+
+
 def _dsv4_aiter_sparse_decode(
     q,
     main_cache,
@@ -2953,6 +3205,8 @@ def _dsv4_aiter_sparse_decode(
     attn_sink,
     scale,
     out,
+    q_packed=None,
+    q_rope=None,
 ):
     """aiter's two-stream sparse decode. Returns None to decline the work.
 
@@ -2963,10 +3217,49 @@ def _dsv4_aiter_sparse_decode(
     if fns is None:
         return None
     decode, pack_q = fns
+    # The producer already packed Q off the same registers it normed and
+    # roped, so the usual second pass over Q is skipped. Only a caller that
+    # cannot supply the pair (a non-aiter producer, or a profile run) pays for
+    # _fused_deepseek_v4_mxfp8_quant_q_pack here.
+    if q_packed is None or q_rope is None:
+        q_packed, q_rope = pack_q(q)
 
-    # Q arrives bf16; the kernel reads packed fp8 + a bf16 RoPE plane. This pass
-    # is what plan section 17 folds into the fused producer.
-    q_packed, q_rope = pack_q(q)
+    # One stream over one flat record grid. The two caches already share one
+    # allocation, so this is an index-space change, not a copy; it also lets
+    # the kernel drop the per-tile column mask a second stream forces
+    # (measured 449 -> 59 us at T=512 H=128). _dsv4_merge_to_single_stream
+    # declines if the allocator ever stops handing us one 640-byte grid.
+    if True:
+        merged = _dsv4_merge_to_single_stream(
+            main_cache, main_indices, main_indptr,
+            extra_cache, extra_indices, extra_indptr,
+        )
+        if merged is not None:
+            kv, kv_rope, idx, indptr = merged
+            return decode(
+                q_packed,
+                kv,
+                idx,
+                indptr,
+                attn_sink,
+                scale,
+                q_rope=q_rope,
+                unified_kv_rope=kv_rope,
+                has_invalid=False,
+                use_lru_cache_partials=True,
+                out=out,
+            )
+        if not _DSV4_SINGLE_STREAM_STATE.get("warned"):
+            _DSV4_SINGLE_STREAM_STATE["warned"] = True
+            logger.warning(
+                "DSV4: single-stream decode unavailable -- %s. Falling back "
+                "to the two-stream path; expect ~7x slower sparse-MLA decode. "
+                "main=%s stride=%s | extra=%s stride=%s",
+                _DSV4_SINGLE_STREAM_STATE.get("why", "unknown"),
+                tuple(main_cache.shape), tuple(main_cache.stride()),
+                None if extra_cache is None else tuple(extra_cache.shape),
+                None if extra_cache is None else tuple(extra_cache.stride()),
+            )
 
     kw = {}
     if extra_cache is not None:
@@ -3004,6 +3297,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
     out: torch.Tensor | None = None,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    q_packed: torch.Tensor | None = None,
+    q_rope: torch.Tensor | None = None
 ) -> torch.Tensor:
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert main_cache.ndim == 3, (
@@ -3171,6 +3466,8 @@ def _rocm_sparse_attn_decode_ragged_triton(
     if _ON_GFX1250 and _dsv4_aiter_sparse_decode_enabled():
         aiter_out = _dsv4_aiter_sparse_decode(
             q=q,
+            q_packed=q_packed,
+            q_rope=q_rope,
             main_cache=main_cache,
             main_indices=main_indices,
             main_indptr=main_indptr,
@@ -3322,6 +3619,8 @@ def _rocm_sparse_attn_decode_triton(
     out: torch.Tensor | None = None,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    q_packed: torch.Tensor | None = None,
+    q_rope: torch.Tensor | None = None
 ) -> torch.Tensor:
     if main_ragged_indices is None or main_ragged_indptr is None:
         main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
@@ -3360,6 +3659,8 @@ def _rocm_sparse_attn_decode_triton(
         out=out,
         extra_cache_nan_free=extra_cache_nan_free,
         adaptive_splits=adaptive_splits,
+        q_packed=q_packed,
+        q_rope=q_rope
     )
 
 
@@ -3461,6 +3762,8 @@ def rocm_sparse_attn_decode(
     output: torch.Tensor,
     extra_cache_nan_free: bool = False,
     adaptive_splits: bool = False,
+    q_packed: torch.Tensor | None = None,
+    q_rope: torch.Tensor | None = None,
 ) -> None:
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
@@ -3514,6 +3817,8 @@ def rocm_sparse_attn_decode(
         extra_indices=extra_indices,
         main_lengths=swa_lens,
         extra_lengths=topk_lens,
+        q_packed=q_packed,
+        q_rope=q_rope,
         main_ragged_indices=swa_ragged_indices,
         main_ragged_indptr=swa_ragged_indptr,
         extra_ragged_indices=topk_ragged_indices,
