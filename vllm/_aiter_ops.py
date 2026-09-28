@@ -1826,7 +1826,6 @@ class rocm_aiter_ops:
     _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
     _CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
-    _RMSNORM_ENABLED = envs.VLLM_ROCM_USE_AITER_RMSNORM
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
@@ -1860,7 +1859,6 @@ class rocm_aiter_ops:
         cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
         cls._CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
         cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
-        cls._RMSNORM_ENABLED = envs.VLLM_ROCM_USE_AITER_RMSNORM
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
         cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
@@ -1972,11 +1970,6 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_linear_fp8_enabled(cls) -> bool:
         return cls.is_linear_enabled()
-
-    @classmethod
-    @if_aiter_supported
-    def is_rmsnorm_enabled(cls) -> bool:
-        return cls._AITER_ENABLED and cls._RMSNORM_ENABLED
 
     @classmethod
     @if_aiter_supported
