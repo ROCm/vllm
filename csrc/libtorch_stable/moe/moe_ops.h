@@ -54,7 +54,7 @@ void moe_lora_align_block_size(
     torch::stable::Tensor num_tokens_post_pad,
     torch::stable::Tensor adapter_enabled, torch::stable::Tensor lora_ids,
     std::optional<torch::stable::Tensor> maybe_expert_map);
-
+#ifndef USE_ROCM
 torch::stable::Tensor moe_wna16_gemm(
     torch::stable::Tensor input, torch::stable::Tensor output,
     torch::stable::Tensor b_qweight, torch::stable::Tensor b_scales,
@@ -65,7 +65,6 @@ torch::stable::Tensor moe_wna16_gemm(
     int64_t BLOCK_SIZE_M, int64_t BLOCK_SIZE_N, int64_t BLOCK_SIZE_K,
     int64_t bit);
 
-#ifndef USE_ROCM
 std::tuple<torch::stable::Tensor, torch::stable::Tensor> grouped_topk(
     const torch::stable::Tensor& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,
