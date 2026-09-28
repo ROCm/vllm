@@ -594,6 +594,10 @@ def _reference_decode_index_score(
     )
     for req_id, seq_len in enumerate(seq_lens.tolist()):
         num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        if num_blocks == 0:
+            # A cudagraph padding row: nothing is visible, so the whole score
+            # row stays -inf, which is also what the kernels leave behind.
+            continue
         token_start = req_id * decode_query_len
         q = idx_q[token_start : token_start + decode_query_len].float()
         pages = block_table[req_id, :num_blocks]
@@ -1502,6 +1506,117 @@ def test_decode_index_score_cutedsl_correctness(
         score_block_stride,
     )
     torch.testing.assert_close(score, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="The AITER FlyDSL index scorer is a ROCm kernel.",
+)
+@pytest.mark.parametrize(
+    "cache_dtype,num_idx_heads,decode_query_len,max_decode_query_len",
+    [
+        (torch.bfloat16, 1, 1, 1),
+        (torch.bfloat16, 4, 1, 1),
+        (torch.bfloat16, 4, 2, 4),
+        (torch.float8_e4m3fn, 1, 1, 1),
+        (torch.float8_e4m3fn, 4, 2, 4),
+    ],
+)
+def test_decode_index_score_flydsl_correctness(
+    cache_dtype: torch.dtype,
+    num_idx_heads: int,
+    decode_query_len: int,
+    max_decode_query_len: int,
+):
+    from vllm.models.minimax_m3.amd.ops.index_score_flydsl import (
+        FlydslDecodeWorkMap,
+        decode_index_score,
+        decode_index_score_supported,
+        flydsl_ops,
+    )
+
+    if flydsl_ops() is None:
+        pytest.skip("AITER FlyDSL index scorer unavailable.")
+
+    torch.manual_seed(0)
+    # A zero-length row is what a full-cudagraph decode replay pads with, and
+    # the kernel has to leave its whole score row untouched.
+    active_seq_lens = torch.tensor((1025, 4097, 0), device="cuda", dtype=torch.int32)
+    batch = active_seq_lens.numel()
+    total_q = batch * decode_query_len
+    max_seq_len = int(active_seq_lens.max())
+    max_blocks = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    score_block_stride = ((max_blocks + 15) // 16) * 16
+    num_pages = batch * max_blocks
+    block_table = torch.randperm(num_pages, device="cuda", dtype=torch.int32).reshape(
+        batch, max_blocks
+    )
+    # Q is bf16 on every path; only the index cache may be fp8.
+    idx_q = torch.randn(total_q, num_idx_heads, HEAD_DIM, device="cuda").to(
+        torch.bfloat16
+    )
+    index_kv_cache = torch.randn(num_pages, BLOCK_SIZE, HEAD_DIM, device="cuda").to(
+        cache_dtype
+    )
+
+    # Pin the block bound the way the metadata builder does, and build the map
+    # against it -- a map chunked for another bound is the one way this kernel
+    # goes wrong quietly.
+    work_map_owner = FlydslDecodeWorkMap(
+        max_batch=batch,
+        max_model_len=max_seq_len,
+        max_decode_query_len=max_decode_query_len,
+        num_index_heads=num_idx_heads,
+        device=idx_q.device,
+    )
+    assert work_map_owner.max_block == max_blocks
+    work_map = work_map_owner.build(active_seq_lens, decode_query_len)
+
+    score = torch.full(
+        (num_idx_heads, total_q, score_block_stride),
+        -float("inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    kernel_args = dict(
+        decode_query_len=decode_query_len,
+        num_idx_heads=num_idx_heads,
+        max_block=max_blocks,
+    )
+    if not decode_index_score_supported(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        active_seq_lens,
+        score[:, :, :max_blocks],
+        work_map,
+        **kernel_args,
+    ):
+        pytest.skip(
+            f"AITER declined S={decode_query_len} H={num_idx_heads} "
+            f"cache={cache_dtype} on this arch."
+        )
+
+    decode_index_score(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        active_seq_lens,
+        score[:, :, :max_blocks],
+        work_map,
+        **kernel_args,
+    )
+    expected = _reference_decode_index_score(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        active_seq_lens,
+        decode_query_len,
+        score_block_stride,
+    )
+    # bf16 inputs widened to fp32 by both sides; only the accumulation order
+    # differs, so this is tighter than a bf16 tolerance would be.
+    torch.testing.assert_close(score, expected, rtol=1e-3, atol=1e-3)
 
 
 # Sparse attention kernels.

@@ -30,6 +30,10 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 
 if current_platform.is_rocm():
+    from vllm.models.minimax_m3.amd.ops.index_score_flydsl import (
+        FlydslDecodeWorkMap,
+        make_decode_work_map,
+    )
     from vllm.models.minimax_m3.amd.ops.index_topk import (
         minimax_m3_index_decode,
         minimax_m3_index_score,
@@ -181,6 +185,12 @@ class MiniMaxM3IndexerDecodeMetadata:
     decode_query_len: int
     max_decode_query_len: int
 
+    # ROCm only: the step's AITER FlyDSL index-score work map and the block
+    # bound it was chunked for, hoisted here because every layer of a step sees
+    # the same lengths. None -> the layers run the Triton decode scorers.
+    index_score_work_map: torch.Tensor | None = None
+    index_score_max_block: int = 0
+
 
 @dataclass
 class MiniMaxM3IndexerMetadata(AttentionMetadata):
@@ -255,6 +265,27 @@ class MiniMaxM3IndexerMetadataBuilder(
 class MiniMaxM3IndexerTritonMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
     """Triton indexer metadata: no SM100 fmha_sm100 plan."""
 
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # One work map per step for the AITER FlyDSL decode scorer, shared by
+        # every layer. None when AITER cannot serve this envelope, which is also
+        # what switches the layers back to the Triton decode scorers.
+        self.index_score_map: FlydslDecodeWorkMap | None = None
+        if current_platform.is_rocm():
+            self.index_score_map = make_decode_work_map(
+                max_batch=vllm_config.scheduler_config.max_num_seqs,
+                max_model_len=vllm_config.model_config.max_model_len,
+                max_decode_query_len=self.max_decode_query_len,
+                num_index_heads=self.num_index_heads,
+                device=device,
+            )
+
     def build(
         self,
         common_prefix_len: int,
@@ -306,12 +337,21 @@ class MiniMaxM3IndexerTritonMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 (query_lens_cpu == decode_query_len) | (query_lens_cpu == 0)
             )
             assert num_decode_tokens == num_decodes * decode_query_len
+            index_score_work_map = None
+            index_score_max_block = 0
+            if self.index_score_map is not None:
+                index_score_work_map = self.index_score_map.build(
+                    seq_lens[:num_decodes], decode_query_len
+                )
+                index_score_max_block = self.index_score_map.max_block
             decode_metadata = MiniMaxM3IndexerDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
                 max_seq_len=common_attn_metadata.max_seq_len,
                 decode_query_len=decode_query_len,
                 max_decode_query_len=self.max_decode_query_len,
+                index_score_work_map=index_score_work_map,
+                index_score_max_block=index_score_max_block,
             )
 
         return MiniMaxM3IndexerMetadata(
@@ -449,6 +489,8 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 decode_backend_kwargs["completion_counter"] = (
                     self.topk_completion_counter
                 )
+                decode_backend_kwargs["index_score_work_map"] = d.index_score_work_map
+                decode_backend_kwargs["index_score_max_block"] = d.index_score_max_block
             decode_topk = minimax_m3_index_decode(
                 iq[:nd],
                 kv,

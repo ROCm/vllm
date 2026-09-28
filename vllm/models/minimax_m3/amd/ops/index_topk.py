@@ -18,6 +18,10 @@ head selects its own block ids for the block-sparse attention kernels in
 
 import torch
 
+from vllm.models.minimax_m3.amd.ops.index_score_flydsl import (
+    decode_index_score,
+    decode_index_score_supported,
+)
 from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     PAGES_PER_SPARSE_BLOCK,
     _write_sparse_block_table_row_from_values,
@@ -1313,6 +1317,8 @@ def minimax_m3_index_decode(
     sparse_context_lens_out: torch.Tensor | None = None,
     block_page_stride: int | None = None,
     completion_counter: torch.Tensor | None = None,
+    index_score_work_map: torch.Tensor | None = None,
+    index_score_max_block: int = 0,
 ) -> torch.Tensor:
     """Decode index block-score followed by fused adaptive top-k selection.
 
@@ -1324,6 +1330,11 @@ def minimax_m3_index_decode(
     provides stable per-query synchronization storage for CUDA graphs. It must
     be zero before its first launch and must not be shared by overlapping
     selector invocations; every completed launch resets its active entries.
+    ``index_score_work_map`` is the step's AITER FlyDSL work map, hoisted out of
+    the per-layer path by the metadata builder; when it is given the FlyDSL
+    scorer replaces the Triton ones, sized by ``index_score_max_block`` rather
+    than by this step's ``max_seq_len`` (the two must agree -- see
+    ``index_score_flydsl.FlydslDecodeWorkMap``).
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert num_idx_heads == num_kv_heads, (
@@ -1438,8 +1449,26 @@ def minimax_m3_index_decode(
     if num_idx_heads > 1 and max_decode_query_len > 1:
         score_kwargs.update({"num_warps": 4, "num_stages": 2})
 
+    # The AITER FlyDSL scorer runs only when the metadata builder hoisted a work
+    # map for this step. It writes none of the force-select sentinels below, so
+    # a forced init/local selection stays on the Triton scorers.
+    flydsl_work_map = index_score_work_map
+    if init_blocks or local_blocks or index_score_max_block <= 0:
+        flydsl_work_map = None
+    # The work map's chunking and the FlyDSL grid come from the same bound, and
+    # the builder pinned it, so the launch takes it rather than this step's
+    # max_block. The Triton scorers and the selector keep the step's own, which
+    # the score buffer therefore has to stay wide enough for -- the builder pins
+    # to the model's maximum, so a narrower bound is a bug rather than a shape
+    # to fall back from, and falling back would hide an out-of-bounds selector.
+    if flydsl_work_map is not None and index_score_max_block < max_block:
+        raise ValueError(
+            "MiniMax-M3 decode index-score work map is bound to "
+            f"{index_score_max_block} blocks, short of this step's {max_block}"
+        )
+    score_max_block = max_block if flydsl_work_map is None else index_score_max_block
     # Keep score strides 16-divisible to avoid Triton recompiles.
-    score_block_stride = round_up(max_block, 16)
+    score_block_stride = round_up(score_max_block, 16)
     score = torch.empty(
         (num_idx_heads, total_q, score_block_stride),
         dtype=torch.float32,
@@ -1456,8 +1485,33 @@ def minimax_m3_index_decode(
         index_kv_cache.dtype,
         is_gfx950=is_gfx950,
     )
+    flydsl_score = score[:, :, :score_max_block]
+    use_flydsl = flydsl_work_map is not None and decode_index_score_supported(
+        idx_q,
+        index_kv_cache,
+        block_table,
+        seq_lens,
+        flydsl_score,
+        flydsl_work_map,
+        decode_query_len=decode_query_len,
+        num_idx_heads=num_idx_heads,
+        max_block=score_max_block,
+    )
     grid_score: tuple[int, ...]
-    if score_program_budget is not None:
+    if use_flydsl:
+        assert flydsl_work_map is not None
+        decode_index_score(
+            idx_q,
+            index_kv_cache,
+            block_table,
+            seq_lens,
+            flydsl_score,
+            flydsl_work_map,
+            decode_query_len=decode_query_len,
+            num_idx_heads=num_idx_heads,
+            max_block=score_max_block,
+        )
+    elif score_program_budget is not None:
         grid_score = (score_program_budget + num_reqs - 1,)
         _decode_index_score_balanced_kernel[grid_score](
             idx_q,
