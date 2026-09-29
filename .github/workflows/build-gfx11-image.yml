@@ -5,9 +5,12 @@ name: Docker build gfx11 vLLM image
 # image this repo's wheel CI runs inside.
 #
 # Manual only -- workflow_dispatch is the sole trigger. Unlike
-# build-rocm-wheels.yml this has no sccache, so every run is a cache-cold
-# compile of vLLM's HIP kernels (hours, not minutes); running it on push or on
-# a schedule would burn a runner for most of a day per commit.
+# build-rocm-wheels.yml this has no sccache, so a from-source run is a
+# cache-cold compile of vLLM's HIP kernels (hours, not minutes); running it on
+# push or on a schedule would burn a runner for most of a day per commit.
+#
+# By default the image installs a prebuilt wheel (vllm_wheel_version) instead
+# of compiling; blank that input to build from source.
 #
 # A dispatch publishes to GHCR by default; untick `push_image` for a
 # build-only dry run. The env fallback below stays false on purpose, so that
@@ -31,6 +34,10 @@ on:
       max_jobs:
         description: 'Compile parallelism (see note in the build step)'
         default: '2'
+        required: false
+      vllm_wheel_version:
+        description: 'Prebuilt vLLM wheel from the vllm-gfx11-dev index. Blank = compile from source (vllm_ref / remote_vllm)'
+        default: '0.26.1rc1.dev1701+gc84454ff4.rocm101.rdna3.prototype'
         required: false
       vllm_ref:
         description: 'vLLM commit to build. Blank = the pin in Dockerfile.gfx11'
@@ -76,6 +83,8 @@ jobs:
       IN_MAX_JOBS: ${{ inputs.max_jobs || '2' }}
       IN_REMOTE_VLLM: ${{ inputs.remote_vllm || '1' }}
       IN_VLLM_REF: ${{ inputs.vllm_ref || '' }}
+      IN_VLLM_WHEEL_VERSION: ${{ inputs.vllm_wheel_version || '' }}
+      IN_VLLM_SOURCE: ${{ inputs.vllm_wheel_version && 'wheel' || 'build' }}
       IN_PUSH_IMAGE: ${{ inputs.push_image || false }}
 
     steps:
@@ -89,7 +98,7 @@ jobs:
           fetch-tags: true
 
       - name: Fetch upstream tags for versioning
-        if: env.IN_REMOTE_VLLM == '0'
+        if: env.IN_VLLM_SOURCE == 'build' && env.IN_REMOTE_VLLM == '0'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git remote add upstream https://github.com/vllm-project/vllm.git || true
@@ -104,6 +113,7 @@ jobs:
       # mid-compile twice (runs 33010389974 at MAX_JOBS=2, 33016302061 at 1).
       # Spend the surplus disk on swap instead.
       - name: Enlarge swap
+        if: env.IN_VLLM_SOURCE == 'build'
         run: |
           sudo swapoff -a || true
           sudo rm -f /mnt/swapfile
@@ -126,25 +136,38 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # The image is normally built from the pin in Dockerfile.gfx11, not from
-      # this checkout, so github.sha would be the wrong thing to tag it with.
+      # The image is normally built from a wheel or the pin in Dockerfile.gfx11,
+      # not from this checkout, so github.sha would be the wrong thing to tag it
+      # with. Docker tags cannot contain '+', which every wheel version has.
       - name: Resolve vLLM source ref
         id: src
         run: |
-          if [ "$IN_REMOTE_VLLM" = "0" ]; then
-            REF="${{ github.sha }}"
+          if [ "$IN_VLLM_SOURCE" = "wheel" ]; then
+            REF=$(printf '%s' "$IN_VLLM_WHEEL_VERSION" | sed -n 's/.*+g\([0-9a-f]*\).*/\1/p')
+            TAG=$(printf '%s' "$IN_VLLM_WHEEL_VERSION" | tr '+' '-')
+            [ -n "$REF" ] || REF="$TAG"
           else
-            REF="$IN_VLLM_REF"
-            [ -n "$REF" ] || REF=$(grep -m1 '^ARG VLLM_REF=' docker/Dockerfile.gfx11 | cut -d= -f2)
+            if [ "$IN_REMOTE_VLLM" = "0" ]; then
+              REF="${{ github.sha }}"
+            else
+              REF="$IN_VLLM_REF"
+              [ -n "$REF" ] || REF=$(grep -m1 '^ARG VLLM_REF=' docker/Dockerfile.gfx11 | cut -d= -f2)
+            fi
+            TAG="$REF"
           fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Report build plan
         run: |
           echo "runner:     $IN_RUNS_ON"
           echo "max_jobs:   $IN_MAX_JOBS"
           echo "arch:       $IN_ROCM_ARCH (device: $IN_DEVICE_ARCH)"
-          echo "source:     ${{ steps.src.outputs.ref }} (remote_vllm=$IN_REMOTE_VLLM)"
+          if [ "$IN_VLLM_SOURCE" = "wheel" ]; then
+            echo "source:     wheel $IN_VLLM_WHEEL_VERSION"
+          else
+            echo "source:     ${{ steps.src.outputs.ref }} (remote_vllm=$IN_REMOTE_VLLM)"
+          fi
           echo "push_image: $IN_PUSH_IMAGE"
           nproc; free -g; df -h / /mnt
 
@@ -165,10 +188,12 @@ jobs:
             DEVICE_ARCH=${{ env.IN_DEVICE_ARCH }}
             MAX_JOBS=${{ env.IN_MAX_JOBS }}
             REMOTE_VLLM=${{ env.IN_REMOTE_VLLM }}
-            ${{ env.IN_REMOTE_VLLM != '0' && format('VLLM_REF={0}', steps.src.outputs.ref) || '' }}
+            VLLM_SOURCE=${{ env.IN_VLLM_SOURCE }}
+            VLLM_WHEEL_VERSION=${{ env.IN_VLLM_WHEEL_VERSION }}
+            ${{ env.IN_VLLM_SOURCE == 'build' && env.IN_REMOTE_VLLM != '0' && format('VLLM_REF={0}', steps.src.outputs.ref) || '' }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.src.outputs.ref }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.src.outputs.tag }}
           labels: |
             org.opencontainers.image.revision=${{ steps.src.outputs.ref }}
           # Registry cache rather than type=gha: the GitHub Actions cache is
@@ -199,9 +224,13 @@ jobs:
             echo "## gfx11 vLLM image"
             echo ""
             echo "- runner: \`$IN_RUNS_ON\`, MAX_JOBS=\`$IN_MAX_JOBS\`"
-            echo "- vLLM source: \`${{ steps.src.outputs.ref }}\`"
+            if [ "$IN_VLLM_SOURCE" = "wheel" ]; then
+              echo "- vLLM source: wheel \`$IN_VLLM_WHEEL_VERSION\`"
+            else
+              echo "- vLLM source: \`${{ steps.src.outputs.ref }}\`"
+            fi
             if [ "$IN_PUSH_IMAGE" = "true" ]; then
-              echo "- **Pushed**: \`${IMAGE}:latest\`, \`${IMAGE}:${{ steps.src.outputs.ref }}\`"
+              echo "- **Pushed**: \`${IMAGE}:latest\`, \`${IMAGE}:${{ steps.src.outputs.tag }}\`"
             else
               echo "- **Not pushed** (push_image was off); image was built and discarded."
             fi

@@ -7,9 +7,10 @@
 # image does not inherit from rocm/vllm-dev like docker/Dockerfile.rocm does.
 #
 # Stages:
-#   rocm-base -- system deps + uv + pinned ROCm SDK / PyTorch / Triton wheels
-#   builder   -- compiles the vLLM wheel into /dist
-#   runtime   -- rocm-base + the built wheel (no ~15 GB of HIP objects)
+#   rocm-base       -- system deps + uv + pinned ROCm SDK / PyTorch / Triton wheels
+#   builder         -- compiles the vLLM wheel into /dist
+#   vllm_dist_wheel -- alternative to builder: downloads a prebuilt wheel into /dist
+#   runtime         -- rocm-base + the vLLM wheel (no ~15 GB of HIP objects)
 #
 # Build (pinned vLLM commit, the default -- reproducible, ignores your HEAD):
 #   docker build -f docker/Dockerfile.gfx11 --target runtime -t vllm-gfx11 .
@@ -18,7 +19,15 @@
 #   docker build -f docker/Dockerfile.gfx11 --build-arg REMOTE_VLLM=0 \
 #       --target runtime -t vllm-gfx11 .
 #
-# vLLM's HIP kernels are compiled from source: expect ~30-75 min cold and
+# Skip the compile and install a published wheel (version as listed in
+# VLLM_WHEEL_INDEX_URL/vllm/, without the -cp312-... tags). The wheel's
+# .rocmXYZ tag must match ROCM_BUILD, so override the torch/ROCm pins too when
+# picking a wheel built against a different ROCm:
+#   docker build -f docker/Dockerfile.gfx11 --build-arg VLLM_SOURCE=wheel \
+#       --build-arg VLLM_WHEEL_VERSION=0.26.1rc1.dev1701+gc84454ff4.rocm101.rdna3.prototype \
+#       --target runtime -t vllm-gfx11 .
+#
+# Building from source compiles vLLM's HIP kernels: expect ~30-75 min cold and
 # ~40 GB free under /var/lib/docker. ccache and the uv download cache are
 # BuildKit cache mounts, so a rebuild after a version bump is far cheaper.
 
@@ -28,6 +37,10 @@ ARG BASE_IMAGE=python:3.12-bookworm
 # REMOTE_VLLM=0: build the local source in the Docker context (ONBUILD COPY ./)
 ARG REMOTE_VLLM=1
 
+# VLLM_SOURCE=build: compile vLLM (see REMOTE_VLLM)
+# VLLM_SOURCE=wheel: install VLLM_WHEEL_VERSION from VLLM_WHEEL_INDEX_URL
+ARG VLLM_SOURCE=build
+
 # ---------------------------------------------------------------------------
 # Stage 1: rocm-base -- shared ROCm + PyTorch layer
 # ---------------------------------------------------------------------------
@@ -35,16 +48,16 @@ FROM ${BASE_IMAGE} AS rocm-base
 
 ARG PYTORCH_ROCM_ARCH=gfx1151
 ARG DEVICE_ARCH=gfx1151
-ARG PYTORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
+ARG PYTORCH_INDEX_URL=https://nightly.repo.amd.com/rocm/whl-next/
 
 # Pinned wheel versions, all from the same ROCm nightly date so the stack is
 # self-consistent. torch and torchvision must share the +rocm build-date suffix
 # or they ABI-mismatch at import.
-ARG ROCM_BUILD=10.1.0a20260806
-ARG TORCH_VERSION=2.12.0
-ARG TORCHVISION_VERSION=0.27.0
+ARG ROCM_BUILD=10.1.0a20260903
+ARG TORCH_VERSION=2.13.0
+ARG TORCHVISION_VERSION=0.28.0
 ARG TORCHAUDIO_VERSION=2.11.0
-ARG TRITON_VERSION=3.8.0+git4cff872c.rocm10.1.0a20260806
+ARG TRITON_VERSION=3.8.0+git4cff872c.rocm10.1.0a20260903
 
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
         git curl ca-certificates cmake ninja-build gcc g++ ccache libdrm-dev \
@@ -99,7 +112,7 @@ ONBUILD COPY ./ /src/vllm/
 
 FROM rocm-base AS fetch_vllm_1
 ARG VLLM_REPO=https://github.com/ROCm/vllm.git
-ARG VLLM_REF=ddd378cfb1e9e9232ae5af18657bc8f99587666c
+ARG VLLM_REF=c84454ff40357ea1c869cdb1b958b682b6ff3540
 ENV VLLM_REPO=${VLLM_REPO}
 ENV VLLM_REF=${VLLM_REF}
 ONBUILD RUN set -eux; \
@@ -114,8 +127,6 @@ ONBUILD RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM fetch_vllm_${REMOTE_VLLM} AS builder
 
-ARG PYTORCH_ROCM_ARCH=gfx1151
-ARG PYTORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
 # Empty falls back to $(nproc) at build time; lower it if the compile OOMs.
 ARG MAX_JOBS=
 
@@ -154,16 +165,36 @@ FROM scratch AS export_wheel
 COPY --from=builder /dist /
 
 # ---------------------------------------------------------------------------
-# Stage 5: runtime
+# Stage 5: vLLM wheel source -- /dist from the builder, or downloaded
 # ---------------------------------------------------------------------------
-FROM rocm-base AS runtime
+# Selecting the stage by name (rather than COPY --from=builder in runtime) is
+# what lets BuildKit skip the multi-hour compile in wheel mode.
+FROM rocm-base AS vllm_dist_build
+COPY --from=builder /dist /dist
+
+FROM rocm-base AS vllm_dist_wheel
+ARG VLLM_WHEEL_INDEX_URL=https://rocm.frameworks-nightlies.amd.com/whl-multi-arch-staging/vllm-gfx11-dev/
+ARG VLLM_WHEEL_VERSION=
+# Downloaded into /dist rather than installed here so runtime's install step,
+# with its constraints and device extras, is identical for both sources.
+RUN set -eux; \
+    test -n "${VLLM_WHEEL_VERSION}" \
+      || { echo "VLLM_SOURCE=wheel requires --build-arg VLLM_WHEEL_VERSION=..." >&2; exit 1; }; \
+    index="${VLLM_WHEEL_INDEX_URL%/}/vllm/"; \
+    pattern=$(printf '%s' "vllm-${VLLM_WHEEL_VERSION}-" | sed 's/+/%2B/g; s/[.]/\\./g'); \
+    href=$(curl -fsSL "${index}" | grep -o "href=\"${pattern}[^\"]*\.whl\"" | head -n1 | cut -d'"' -f2); \
+    test -n "${href}" \
+      || { echo "vllm ${VLLM_WHEEL_VERSION} not found in ${index}" >&2; exit 1; }; \
+    mkdir -p /dist; \
+    curl -fsSL -o "/dist/$(printf '%s' "${href}" | sed 's/%2B/+/g')" "${index}${href}"; \
+    ls -la /dist
+
+# ---------------------------------------------------------------------------
+# Stage 6: runtime
+# ---------------------------------------------------------------------------
+FROM vllm_dist_${VLLM_SOURCE} AS runtime
 
 ARG DEVICE_ARCH=gfx1151
-ARG PYTORCH_INDEX_URL=https://rocm.nightlies.amd.com/whl-multi-arch/
-# transformers 5.15+ raises AmbiguousGlobalPerLayerAttributeError on Gemma-4.
-ARG TRANSFORMERS_VERSION=5.14.1
-
-COPY --from=builder /dist /dist
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     set -eux; \
@@ -171,7 +202,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -c /constraints.txt \
         "$(echo /dist/vllm-*.whl)[device-${DEVICE_ARCH}]" \
         "huggingface_hub" \
-        "transformers==${TRANSFORMERS_VERSION}" \
+        "transformers" \
         --index-url "${PYTORCH_INDEX_URL}" \
         --extra-index-url https://pypi.org/simple/ \
         --index-strategy unsafe-first-match \
