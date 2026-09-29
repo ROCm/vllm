@@ -910,19 +910,6 @@ class RocmPlatform(Platform):
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         from vllm._aiter_ops import rocm_aiter_ops
 
-        # BLAS backend selection for ROCm.
-        #
-        # Historically, we relied on PyTorch defaults. For some models/shapes
-        # (notably AWQ prefill where `vllm.awq_gemm` can fall back to fp16
-        # dequantize+matmul for large M), forcing hipBLASLt can regress TTFT on
-        # certain ROCm/GPU combinations. Allow opting in explicitly.
-        #
-        # Set `VLLM_ROCM_PREFERRED_BLAS=hipblaslt` (or another supported backend)
-        # to force a backend. Set it to `default` to keep PyTorch defaults.
-        preferred_blas = os.environ.get("VLLM_ROCM_PREFERRED_BLAS", "default")
-        if preferred_blas.lower() not in ("", "default", "none"):
-            torch.backends.cuda.preferred_blas_library(preferred_blas)
-
         compilation_config = vllm_config.compilation_config
         use_aiter_fused_moe = rocm_aiter_ops.is_fused_moe_enabled()
         use_aiter_fp8_linear = rocm_aiter_ops.is_linear_fp8_enabled()
