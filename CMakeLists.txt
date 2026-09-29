@@ -370,8 +370,7 @@ endif()
 if(VLLM_GPU_LANG STREQUAL "HIP")
   set(VLLM_EXT_SRC
     "csrc/torch_bindings.cpp"
-    "csrc/custom_quickreduce.cu"
-    "csrc/libtorch_stable/cuda_utils_kernels.cu")
+    "csrc/custom_quickreduce.cu")
 
   message(STATUS "Enabling C extension.")
   define_extension_target(
