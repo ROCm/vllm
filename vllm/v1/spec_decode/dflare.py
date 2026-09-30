@@ -80,6 +80,7 @@ class DFlareProposer(DFlashProposer):
             pass_hidden_states_to_model=True,
             runner=runner,
         )
+        self.runner = runner
 
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         self.max_padded_query_tokens = max(
@@ -113,6 +114,11 @@ class DFlareProposer(DFlashProposer):
             dtype=torch.int32,
         )
         self.parallel_drafting_hidden_state_tensor = None
+        # M-RoPE targets (Qwen3-VL / Qwen3.5): (3, tokens) context positions
+        # and the draft query positions that continue them.
+        self._mrope_context: torch.Tensor | None = None
+        self._query_mrope: torch.Tensor | None = None
+        self._mrope_query_buffer: torch.Tensor | None = None
 
         from vllm.model_executor.models.qwen3_dflash import (
             dflash_has_any_non_causal,
@@ -122,6 +128,40 @@ class DFlareProposer(DFlashProposer):
             cast(Qwen3Config, self.draft_model_config.hf_config)
         )
         self._has_rejected_context = False
+
+    @override
+    def load_model(self, target_model: torch.nn.Module) -> None:
+        text_config = self.vllm_config.model_config.hf_text_config
+        rope_parameters = dict(getattr(text_config, "rope_parameters", None) or {})
+        if rope_parameters.get("mrope_section"):
+            # The draft rotates like the target: same sections, same partial
+            # rotary dimension.
+            draft_config = self.speculative_config.draft_model_config.hf_config
+            if "partial_rotary_factor" not in rope_parameters:
+                rope_parameters["partial_rotary_factor"] = getattr(
+                    text_config, "partial_rotary_factor", 1.0
+                )
+            draft_config.rope_parameters = rope_parameters
+            draft_config.partial_rotary_factor = rope_parameters[
+                "partial_rotary_factor"
+            ]
+            # Compiled and CUDA-graph draft forwards read positions from a
+            # fixed address, so query M-RoPE lives in one persistent buffer.
+            # The extra column keeps row slices non-contiguous like the
+            # target's M-RoPE buffer.
+            self._mrope_query_buffer = torch.zeros(
+                (3, self.max_padded_query_tokens + 1),
+                dtype=torch.int64,
+                device=self.positions.device,
+            )
+        super().load_model(target_model)
+
+    def _get_positions(self, num_tokens: int) -> torch.Tensor:
+        if self._mrope_query_buffer is not None:
+            return self._mrope_query_buffer[:, :num_tokens]
+        if self._query_mrope is not None:
+            return self._query_mrope[:, :num_tokens]
+        return super()._get_positions(num_tokens)
 
     @override
     def set_inputs_first_pass(
@@ -135,15 +175,51 @@ class DFlareProposer(DFlashProposer):
         num_rejected_tokens_gpu: torch.Tensor | None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
         self._has_rejected_context = num_rejected_tokens_gpu is not None
-        return super().set_inputs_first_pass(
+        self._mrope_context = None
+        self._query_mrope = None
+        num_context = target_token_ids.shape[0]
+        runner = getattr(self, "runner", None)
+        mrope_buffer = getattr(runner, "mrope_positions", None)
+        # KV slots are indexed by token position; only RoPE uses M-RoPE.
+        slot_positions = target_positions
+        if mrope_buffer is not None:
+            mrope = mrope_buffer.gpu[:, :num_context]
+            if mrope.shape[0] != 3 and mrope.shape[-1] == 3:
+                mrope = mrope.transpose(0, 1)
+            self._mrope_context = mrope.contiguous()
+            slot_positions = runner.positions[:num_context].contiguous()
+        elif target_positions.ndim == 2 and target_positions.shape[0] == 3:
+            self._mrope_context = target_positions[:, :num_context].contiguous()
+            slot_positions = torch.arange(
+                num_context, device=target_positions.device, dtype=torch.int64
+            )
+        result = super().set_inputs_first_pass(
             target_token_ids=target_token_ids,
             next_token_ids=next_token_ids,
-            target_positions=target_positions,
+            target_positions=slot_positions,
             target_hidden_states=target_hidden_states,
             token_indices_to_sample=token_indices_to_sample,
             cad=cad,
             num_rejected_tokens_gpu=num_rejected_tokens_gpu,
         )
+        if self._mrope_context is not None:
+            query_per_req = 1 + self.num_speculative_tokens
+            batch_size = cad.batch_size()
+            ends = cad.query_start_loc[1 : batch_size + 1].to(torch.long)
+            if num_rejected_tokens_gpu is not None:
+                # Rejected draft tokens stay at the end of each request's
+                # context; the bonus token follows the last accepted one.
+                ends = ends - num_rejected_tokens_gpu[:batch_size].to(torch.long)
+            last = self._mrope_context[:, ends - 1]
+            offsets = torch.arange(query_per_req, device=last.device, dtype=last.dtype)
+            query_mrope = (last[:, :, None] + 1 + offsets).reshape(
+                3, batch_size * query_per_req
+            )
+            if self._mrope_query_buffer is not None:
+                self._mrope_query_buffer[:, : query_mrope.shape[1]].copy_(query_mrope)
+            else:
+                self._query_mrope = query_mrope
+        return result
 
     @override
     def build_model_inputs_first_pass(
@@ -158,12 +234,24 @@ class DFlareProposer(DFlashProposer):
         context_slots: torch.Tensor | list[torch.Tensor | None] | None = (
             self._context_slot_mapping_buffer[:num_context]
         )
+        if self._mrope_context is not None:
+            context_positions = self._mrope_context
         if self._has_rejected_context:
-            context_states, context_positions, context_slots = compact_dflare_context(
-                context_states,
-                context_positions,
-                context_slots,
-            )
+            if self._mrope_context is not None and isinstance(
+                context_slots, torch.Tensor
+            ):
+                valid_context = context_slots != PADDING_SLOT_ID
+                context_states = context_states[valid_context]
+                context_positions = context_positions[:, valid_context]
+                context_slots = context_slots[valid_context]
+            else:
+                context_states, context_positions, context_slots = (
+                    compact_dflare_context(
+                        context_states,
+                        context_positions,
+                        context_slots,
+                    )
+                )
         model = cast(_ContextKVModel, self.model)
         model.precompute_and_store_context_kv(
             context_states,

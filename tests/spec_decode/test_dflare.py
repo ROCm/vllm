@@ -24,7 +24,7 @@ from vllm.transformers_utils.configs.dflare import (
     dflash_config_from_dflare,
 )
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
-from vllm.v1.spec_decode.dflare import compact_dflare_context
+from vllm.v1.spec_decode.dflare import DFlareProposer, compact_dflare_context
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 
 
@@ -127,6 +127,99 @@ def test_angelslim_rope_cache_matches_computed_frequencies(layout):
     computed = _apply_angelslim_rope(hidden, positions, theta, layout)
 
     torch.testing.assert_close(cached, computed)
+
+
+def _partial_neox_rope(hidden, positions, theta, rotary_dim):
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+    )
+    frequencies = torch.einsum("n,d->nd", positions.float(), inv_freq)
+    cos = torch.cat((frequencies.cos(), frequencies.cos()), dim=-1)[:, None, :]
+    sin = torch.cat((frequencies.sin(), frequencies.sin()), dim=-1)[:, None, :]
+    rotated = hidden[..., :rotary_dim]
+    first, second = rotated.chunk(2, dim=-1)
+    rotated = rotated * cos + torch.cat((-second, first), dim=-1) * sin
+    return torch.cat((rotated, hidden[..., rotary_dim:]), dim=-1)
+
+
+def test_qwen_mrope_text_positions_match_partial_rope():
+    # Text tokens carry t == h == w, so interleaved M-RoPE reduces to 1D RoPE
+    # on the first partial_rotary_factor of each head.
+    torch.manual_seed(0)
+    hidden = torch.randn(3, 2, 16)
+    positions = torch.tensor([4, 9, 30])
+    theta = 1e7
+    actual = _apply_angelslim_rope(
+        hidden,
+        positions.expand(3, -1),
+        theta,
+        "neox",
+        mrope_section=[2, 1, 1],
+        partial_rotary_factor=0.5,
+    )
+    expected = _partial_neox_rope(hidden, positions, theta, rotary_dim=8)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual[..., 8:], hidden[..., 8:])
+
+
+def test_qwen_mrope_image_positions_use_height_and_width():
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 2, 16)
+    text = torch.tensor([[5, 5], [5, 5], [5, 5]])
+    image = torch.tensor([[5, 5], [5, 7], [5, 9]])
+    kwargs = dict(
+        theta=1e7, layout="neox", mrope_section=[2, 1, 1], partial_rotary_factor=0.5
+    )
+    assert not torch.allclose(
+        _apply_angelslim_rope(hidden, text, **kwargs),
+        _apply_angelslim_rope(hidden, image, **kwargs),
+    )
+
+
+def test_partial_rotary_cache_leaves_remainder_unrotated():
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 2, 16)
+    positions = torch.tensor([1, 7])
+    theta = 10000.0
+    inv_freq = 1.0 / (theta ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+    frequencies = torch.einsum("n,d->nd", torch.arange(8.0), inv_freq)
+    cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
+    actual = _apply_angelslim_rope(hidden, positions, theta, "neox", cache)
+    expected = _partial_neox_rope(hidden, positions, theta, rotary_dim=8)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_mrope_query_positions_follow_last_accepted_token(monkeypatch):
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+
+    proposer = object.__new__(DFlareProposer)
+    proposer.runner = None
+    proposer.num_speculative_tokens = 3
+    proposer._mrope_query_buffer = torch.zeros((3, 9), dtype=torch.int64)
+    seen = {}
+
+    def fake_first_pass(self, **kwargs):
+        seen["slots"] = kwargs["target_positions"]
+        return 0, None, None
+
+    monkeypatch.setattr(DFlashProposer, "set_inputs_first_pass", fake_first_pass)
+    # Two requests: 5 and 4 context tokens, with 1 and 2 rejected drafts.
+    mrope = torch.stack((torch.arange(9), torch.arange(9) + 100, torch.arange(9) + 200))
+    cad = SimpleNamespace(batch_size=lambda: 2, query_start_loc=torch.tensor([0, 5, 9]))
+    proposer.set_inputs_first_pass(
+        target_token_ids=torch.zeros(9, dtype=torch.long),
+        next_token_ids=torch.zeros(2, dtype=torch.long),
+        target_positions=mrope,
+        target_hidden_states=torch.zeros(9, 4),
+        token_indices_to_sample=None,
+        cad=cad,
+        num_rejected_tokens_gpu=torch.tensor([1, 2]),
+    )
+
+    torch.testing.assert_close(seen["slots"], torch.arange(9))
+    last = mrope[:, [3, 6]]
+    expected = (last[:, :, None] + 1 + torch.arange(4)).reshape(3, 8)
+    torch.testing.assert_close(proposer._get_positions(8), expected)
 
 
 def test_compact_dflare_context_removes_rejected_rows():

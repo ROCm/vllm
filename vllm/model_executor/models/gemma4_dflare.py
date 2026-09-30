@@ -13,6 +13,7 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -35,14 +36,56 @@ def _rotate_half(hidden_states: torch.Tensor) -> torch.Tensor:
     return torch.cat((-second, first), dim=-1)
 
 
+def _apply_qwen_mrope(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    theta: float,
+    mrope_section: list[int],
+    partial_rotary_factor: float,
+) -> torch.Tensor:
+    """Interleaved Qwen M-RoPE; ``positions`` is ``(3, tokens)`` (t, h, w)."""
+    head_dim = hidden_states.shape[-1]
+    rotary_dim = int(head_dim * partial_rotary_factor)
+    rotary_dim -= rotary_dim % 2
+    inv_freq = 1.0 / (
+        theta
+        ** (
+            torch.arange(0, rotary_dim, 2, device=positions.device, dtype=torch.float32)
+            / rotary_dim
+        )
+    )
+    freqs = torch.einsum("cn,d->cnd", positions.float(), inv_freq)
+    cos = apply_interleaved_rope(freqs.cos(), mrope_section)
+    sin = apply_interleaved_rope(freqs.sin(), mrope_section)
+    cos = torch.cat((cos, cos), dim=-1).to(hidden_states.dtype)
+    sin = torch.cat((sin, sin), dim=-1).to(hidden_states.dtype)
+    while cos.dim() < hidden_states.dim():
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+    rotated = hidden_states[..., :rotary_dim]
+    remainder = hidden_states[..., rotary_dim:]
+    rotated = rotated * cos + _rotate_half(rotated) * sin
+    return torch.cat((rotated, remainder), dim=-1)
+
+
 def _apply_angelslim_rope(
     hidden_states: torch.Tensor,
     positions: torch.Tensor,
     theta: float,
     layout: str = "legacy",
     cos_sin_cache: torch.Tensor | None = None,
+    mrope_section: list[int] | None = None,
+    partial_rotary_factor: float = 1.0,
 ) -> torch.Tensor:
     """Apply the rotary layout used by AngelSlim DFlare training."""
+    if positions.ndim == 2 and mrope_section is not None:
+        return _apply_qwen_mrope(
+            hidden_states,
+            positions,
+            theta,
+            mrope_section,
+            partial_rotary_factor,
+        )
     if cos_sin_cache is None:
         head_dim = hidden_states.shape[-1]
         inv_freq = 1.0 / (
@@ -77,6 +120,12 @@ def _apply_angelslim_rope(
     while cos.dim() < hidden_states.dim():
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
+    rotary_dim = cos.shape[-1]
+    if rotary_dim != hidden_states.shape[-1]:
+        rotated = hidden_states[..., :rotary_dim]
+        remainder = hidden_states[..., rotary_dim:]
+        rotated = rotated * cos + _rotate_half(rotated) * sin
+        return torch.cat((rotated, remainder), dim=-1)
     return hidden_states * cos + _rotate_half(hidden_states) * sin
 
 
@@ -132,6 +181,10 @@ class DFlareGemma4Attention(DFlashQwen3Attention):
         )
         self.dflare_rope_theta = float(rope_parameters.get("rope_theta", 10000.0))
         self.dflare_rope_layout = rope_layout
+        self.mrope_section = rope_parameters.get("mrope_section")
+        self.partial_rotary_factor = float(
+            rope_parameters.get("partial_rotary_factor", 1.0)
+        )
 
     def forward(
         self,
@@ -147,19 +200,24 @@ class DFlareGemma4Attention(DFlashQwen3Attention):
         k = self.k_norm(
             k.view(*k_shape[:-1], k_shape[-1] // self.head_dim, self.head_dim)
         )
+        cos_sin_cache = None if positions.ndim == 2 else self.rotary_emb.cos_sin_cache
         q = _apply_angelslim_rope(
             q,
             positions,
             self.dflare_rope_theta,
             self.dflare_rope_layout,
-            self.rotary_emb.cos_sin_cache,
+            cos_sin_cache,
+            self.mrope_section,
+            self.partial_rotary_factor,
         ).view(q_shape)
         k = _apply_angelslim_rope(
             k,
             positions,
             self.dflare_rope_theta,
             self.dflare_rope_layout,
-            self.rotary_emb.cos_sin_cache,
+            cos_sin_cache,
+            self.mrope_section,
+            self.partial_rotary_factor,
         ).view(k_shape)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -254,7 +312,9 @@ class DFlareGemma4DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-@support_torch_compile
+@support_torch_compile(
+    dynamic_arg_dims={"input_ids": 0, "positions": -1, "input_embeds": 0}
+)
 class DFlareGemma4Model(DFlashQwen3Model):
     """DFlash execution shell with DFlare context fusion and projections."""
 
@@ -267,12 +327,18 @@ class DFlareGemma4Model(DFlashQwen3Model):
     ) -> None:
         nn.Module.__init__(self)
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-        self._dflare_rope_theta = float(
-            self.config.rope_parameters.get("rope_theta", 10000.0)
-        )
+        rope_parameters = getattr(self.config, "rope_parameters", None) or {}
+        self._dflare_rope_theta = float(rope_parameters.get("rope_theta", 10000.0))
         self._dflare_rope_layout = (
             getattr(self.config, "dflare_config", None) or {}
         ).get("rope_layout", "legacy")
+        self._mrope_section = rope_parameters.get("mrope_section")
+        self._partial_rotary_factor = float(
+            rope_parameters.get(
+                "partial_rotary_factor",
+                getattr(self.config, "partial_rotary_factor", 1.0),
+            )
+        )
         self.vocab_size = self.config.vocab_size
         self.quant_config = get_draft_quant_config(vllm_config)
         self.use_aux_hidden_state = False
@@ -420,7 +486,9 @@ class DFlareGemma4Model(DFlashQwen3Model):
             context_positions,
             self._dflare_rope_theta,
             self._dflare_rope_layout,
-            self._rope_cos_sin_cache,
+            None if context_positions.ndim == 2 else self._rope_cos_sin_cache,
+            self._mrope_section,
+            self._partial_rotary_factor,
         )
         return (
             token_major.view(
