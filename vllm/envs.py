@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
+    VLLM_MOE_MAX_SKINNY_BATCH_SIZE: int = 5
     VLLM_MOE_HIP: str | None = None
     VLLM_GDN_HIP: bool = True
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1233,6 +1234,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Converts weights to skinny layout [E, N, K//8] int32 (ExLlama shuffle).
     "VLLM_MOE_HYBRID_W4A16": lambda: (
         os.getenv("VLLM_MOE_HYBRID_W4A16", "true").lower() in ("true", "1")
+    ),
+    # Largest token count the hybrid W4A16 MoE runs on the HIP wvSplitK
+    # kernel; above it the Triton/WMMA prefill path is used. Speculative
+    # verify batches (K+1 tokens) above 5 can be faster on wvSplitK.
+    "VLLM_MOE_MAX_SKINNY_BATCH_SIZE": lambda: int(
+        os.getenv("VLLM_MOE_MAX_SKINNY_BATCH_SIZE", "5")
     ),
     # rdna_moe_gemm gfx11 W4A16 MoE prefill WMMA GEMM. Tri-state: unset =
     # default-on wherever the kernel is built (gfx11), "1" forces on, "0" forces
