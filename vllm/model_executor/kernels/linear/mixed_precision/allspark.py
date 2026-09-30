@@ -23,9 +23,6 @@ class AllSparkLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        ok, err = cls._validate_config_invariants(c)
-        if not ok:
-            return False, err
         if c.has_g_idx:
             return False, "Act reordering currently not supported by AllSpark"
 
@@ -44,7 +41,6 @@ class AllSparkLinearKernel(MPLinearKernel):
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `weight_scale` is: {input_dim = 0, output_dim = 1}
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self._validate_layer_invariants(layer)
         device = getattr(layer, self.w_q_name).device
         c = self.config
 
