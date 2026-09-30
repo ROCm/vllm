@@ -24,9 +24,6 @@ class CPUWNA16LinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        ok, err = cls._validate_config_invariants(c)
-        if not ok:
-            return False, err
         if not current_platform.is_cpu():
             return False, "CPUWNA16 only supported on CPU"
 
@@ -144,7 +141,6 @@ class CPUWNA16LinearKernel(MPLinearKernel):
         packed_zp.data = blocked_zp
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        self._validate_layer_invariants(layer)
         if (not self.config.zero_points) and (self.w_zp_name is not None):
             setattr(layer, self.w_zp_name, None)
 

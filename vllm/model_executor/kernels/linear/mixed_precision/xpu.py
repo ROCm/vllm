@@ -24,9 +24,6 @@ class XPUwNa16LinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        ok, err = cls._validate_config_invariants(c)
-        if not ok:
-            return False, err
         if not current_platform.is_xpu():
             return False, "XPUwNa16 only supported on XPU"
 

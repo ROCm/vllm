@@ -28,9 +28,6 @@ class MacheteLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        ok, err = cls._validate_config_invariants(c)
-        if not ok:
-            return False, err
         # Machete uses CUTLASS, so it can only be compatible with Nvidia
         if not current_platform.is_cuda():
             return False, "Machete only supported on CUDA"
@@ -71,7 +68,6 @@ class MacheteLinearKernel(MPLinearKernel):
     #  `weight_scale`  is: {input_dim = 0, output_dim = 1}
     #  `weight_zp`     is: {input_dim = 0, output_dim = 1, packed_dim = 1}
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        self._validate_layer_invariants(layer)
         c = self.config
 
         if c.has_g_idx:
