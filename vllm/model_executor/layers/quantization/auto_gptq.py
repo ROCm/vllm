@@ -426,6 +426,7 @@ class AutoGPTQLinearMethod(LinearMethodBase):
                 packed_factor=self.quant_config.pack_factor,
                 **qzeros_args,
             )
+
         else:
             scales = GroupQuantScaleParameter(
                 output_dim=1, input_dim=0, **weight_scale_args
@@ -452,6 +453,10 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # w_zp_param_name=None above keeps RDNAHybrid from seeing the
+        # redundant symmetric qzeros.  vllm-project/vllm#52637 fixes
+        # it here instead (and frees qzeros); when it (or similar)
+        # lands, discard this branch's workaround.
         self.kernel.process_weights_after_loading(layer)
 
     def apply(
