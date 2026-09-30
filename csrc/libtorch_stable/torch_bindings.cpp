@@ -873,38 +873,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cuda_utils, CompositeExplicitAutograd,
                   TORCH_BOX(&get_max_shared_memory_per_block_device_attribute));
 }
 
-#ifdef USE_ROCM
-STABLE_TORCH_LIBRARY_IMPL(_C, HIP, ops) {
-  // Activation kernels
-  ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
-  ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
-  ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));
-  ops.impl("gelu_tanh_and_mul", TORCH_BOX(&gelu_tanh_and_mul));
-  ops.impl("fatrelu_and_mul", TORCH_BOX(&fatrelu_and_mul));
-  ops.impl("swigluoai_and_mul", TORCH_BOX(&swigluoai_and_mul));
-  ops.impl("gelu_new", TORCH_BOX(&gelu_new));
-  ops.impl("gelu_fast", TORCH_BOX(&gelu_fast));
-  ops.impl("gelu_quick", TORCH_BOX(&gelu_quick));
-  ops.impl("silu_and_mul_with_clamp", TORCH_BOX(&silu_and_mul_clamp));
-
-  // INT8 quantization kernels
-  ops.impl("static_scaled_int8_quant", TORCH_BOX(&static_scaled_int8_quant));
-  ops.impl("dynamic_scaled_int8_quant", TORCH_BOX(&dynamic_scaled_int8_quant));
-
-  // FP8 quantization kernels
-  ops.impl("static_scaled_fp8_quant", TORCH_BOX(&static_scaled_fp8_quant));
-  ops.impl("dynamic_scaled_fp8_quant", TORCH_BOX(&dynamic_scaled_fp8_quant));
-  ops.impl("dynamic_per_token_scaled_fp8_quant",
-           TORCH_BOX(&dynamic_per_token_scaled_fp8_quant));
-
-  // GPTQ kernels
-  ops.impl("gptq_gemm", TORCH_BOX(&gptq_gemm));
-  ops.impl("gptq_shuffle", TORCH_BOX(&gptq_shuffle));
-
-  ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
-}
-#endif
-
 // These capability-check functions take only primitive args (no tensors), so
 // there is no device to dispatch on. CompositeExplicitAutograd makes them
 // available for all backends. This is the stable ABI equivalent of calling
