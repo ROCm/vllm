@@ -153,7 +153,13 @@ jobs:
           sccache --show-stats || true
           echo ""
           echo "=== Building wheel ==="
-          python setup.py bdist_wheel --dist-dir=dist
+          # Disable ASLR to produce deterministic compiler output.
+          # The LLVM instruction scheduler's behavior depends on hash table
+          # iteration order, which varies with memory layout. Without this,
+          # identical source can produce binaries with up to 15% performance
+          # variance on small GEMM kernels.
+          SET_ADDR_NO_RANDOMIZE_FLAG="setarch $(uname -m) -R"
+          $SET_ADDR_NO_RANDOMIZE_FLAG python setup.py bdist_wheel --dist-dir=dist
           echo ""
           sccache --show-stats || true
           ls -la dist/
