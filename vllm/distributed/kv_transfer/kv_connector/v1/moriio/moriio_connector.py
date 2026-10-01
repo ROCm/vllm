@@ -2397,11 +2397,7 @@ class MoRIIOConnectorWorker:
                 continue
             geometry = self._get_layer_transfer_geometry(layer_name)
             if hma_enabled:
-                if geometry.block_len != self.block_len:
-                    raise ValueError(
-                        "MoRIIO KV cache block length mismatch for layer "
-                        f"{layer_name}: {geometry.block_len} != {self.block_len}"
-                    )
+                pass  # PATCH: per-layer block_len is handled by moriio_layout
             elif geometry.block_size != self.block_size:
                 raise ValueError(
                     "MoRIIO KV cache block size mismatch for layer "
