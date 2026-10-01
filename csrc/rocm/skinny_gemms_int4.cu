@@ -33,35 +33,78 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
       "Activation must be float16 or bfloat16");
   TORCH_CHECK(in_scale.dtype() == in_x.dtype(),
               "Scale dtype must match activation dtype");
-  TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
-              "group_size must be 32, 64, or 128, got ", group_size);
-  TORCH_CHECK(K_in % group_size == 0,
-              "K must be divisible by group_size=", group_size);
-  int64_t num_groups = K_in / group_size;
-  TORCH_CHECK(in_scale.dim() == 2,
-              "Scale must be 2D [M, K/group_size], got shape ",
-              in_scale.sizes());
-  TORCH_CHECK(in_scale.size(0) == M_in && in_scale.size(1) == num_groups,
-              "Scale must be [M, K/group_size] = [", M_in, ", ", num_groups,
-              "] but got [", in_scale.size(0), ", ", in_scale.size(1), "]");
-  if (in_zero_points.has_value()) {
-    // Row m's nibble sits at word[m/8] bits 4*(m%8).  The kernel reads the
-    // words as uint32, so either signedness of 32-bit integer is accepted.
-    TORCH_CHECK(in_zero_points->dtype() == at::kInt ||
-                    in_zero_points->dtype() == at::kUInt32,
-                "Zero points must be int32 or uint32 (packed 8x uint4 along "
-                "dim 0), got ",
-                in_zero_points->dtype());
-    TORCH_CHECK(in_zero_points->dim() == 2,
-                "Zero points must be 2D [M/8, K/group_size], got shape ",
-                in_zero_points->sizes());
-    TORCH_CHECK(M_in % 8 == 0,
-                "M must be divisible by 8 for packed zero points, got ", M_in);
-    TORCH_CHECK(in_zero_points->size(0) == M_in / 8 &&
-                    in_zero_points->size(1) == num_groups,
-                "Zero points must be [M/8, K/group_size] = [", M_in / 8, ", ",
-                num_groups, "] but got [", in_zero_points->size(0), ", ",
-                in_zero_points->size(1), "]");
+  // group_size == -1 is the per-channel sentinel: one scale per output row.
+  // Mirrors skinny_gemms_int8.cu's wvSplitK_int8, which takes the same -1
+  // sentinel at the op boundary (checks at skinny_gemms_int8.cu:367-389) and
+  // only maps it to the kernel's internal GROUP_SIZE=0 template parameter
+  // inside its launch macro (skinny_gemms_int8.cu:417) -- Python never learns
+  // about the 0 template sentinel, and int8/int4 share one meaning for
+  // "group_size" at the op level.
+  int64_t num_groups;
+  if (group_size == -1) {
+    num_groups = 1;
+    // Unlike wvSplitK_int8, do NOT squeeze this to 1-D [M]: the same scale
+    // tensor is also handed to the Triton prefill path, which asserts a 2-D
+    // [N, num_groups] layout with stride(1) == 1.  Squeezing here would
+    // break prefill.
+    TORCH_CHECK(in_scale.dim() == 2,
+                "Per-channel (group_size=-1) scale must be 2D [M, 1], got "
+                "shape ",
+                in_scale.sizes());
+    TORCH_CHECK(in_scale.size(0) == M_in && in_scale.size(1) == 1,
+                "Per-channel scale must be [M, 1] = [", M_in, ", 1] but got [",
+                in_scale.size(0), ", ", in_scale.size(1), "]");
+    // The GROUP_SIZE==0 epilogue indexes scale[m + i] directly -- it ignores
+    // group_stride entirely and assumes a flat [N] layout.  That is only
+    // correct while stride(0) == 1.  The layer never pads a 1-group row
+    // today, so this is a guard, not a behaviour change; if a future pad
+    // makes it non-1, the fallback is to change the epilogue to
+    // scale[(m + i) * group_stride] instead.
+    TORCH_CHECK(in_scale.stride(0) == 1,
+                "Per-channel scale rows must be contiguous (stride(0) == 1), "
+                "got stride ",
+                in_scale.stride(0));
+    // There is no GROUP_SIZE==0 && HAS_ZERO_POINTS kernel arm: in the fp16
+    // compute body the BIAS_LO/BIAS_HI bias constants are selected on
+    // HAS_ZERO_POINTS while the zero-point lookup itself is gated on
+    // GROUP_SIZE > 0, so a GS==0 && HAS_ZP instantiation would compile and
+    // silently produce wrong numbers.  Reject it here instead.
+    TORCH_CHECK(!in_zero_points.has_value(),
+                "per-channel (group_size=-1) W4A16 is symmetric-only; "
+                "asymmetric zero points are not supported");
+  } else {
+    TORCH_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
+                "group_size must be -1 (per-channel), 32, 64, or 128, got ",
+                group_size);
+    TORCH_CHECK(K_in % group_size == 0,
+                "K must be divisible by group_size=", group_size);
+    num_groups = K_in / group_size;
+    TORCH_CHECK(in_scale.dim() == 2,
+                "Scale must be 2D [M, K/group_size], got shape ",
+                in_scale.sizes());
+    TORCH_CHECK(in_scale.size(0) == M_in && in_scale.size(1) == num_groups,
+                "Scale must be [M, K/group_size] = [", M_in, ", ", num_groups,
+                "] but got [", in_scale.size(0), ", ", in_scale.size(1), "]");
+    if (in_zero_points.has_value()) {
+      // Row m's nibble sits at word[m/8] bits 4*(m%8).  The kernel reads the
+      // words as uint32, so either signedness of 32-bit integer is accepted.
+      TORCH_CHECK(in_zero_points->dtype() == at::kInt ||
+                      in_zero_points->dtype() == at::kUInt32,
+                  "Zero points must be int32 or uint32 (packed 8x uint4 "
+                  "along dim 0), got ",
+                  in_zero_points->dtype());
+      TORCH_CHECK(in_zero_points->dim() == 2,
+                  "Zero points must be 2D [M/8, K/group_size], got shape ",
+                  in_zero_points->sizes());
+      TORCH_CHECK(M_in % 8 == 0,
+                  "M must be divisible by 8 for packed zero points, got ",
+                  M_in);
+      TORCH_CHECK(in_zero_points->size(0) == M_in / 8 &&
+                      in_zero_points->size(1) == num_groups,
+                  "Zero points must be [M/8, K/group_size] = [", M_in / 8, ", ",
+                  num_groups, "] but got [", in_zero_points->size(0), ", ",
+                  in_zero_points->size(1), "]");
+    }
   }
   TORCH_CHECK(K_in % 16 == 0, "K must be divisible by 16");
   // load_act_into_lds walks the activation as one flat K*N run, i.e. it
@@ -155,6 +198,16 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   int64_t group_size, torch::Tensor zero_points,
                                   torch::Tensor sorted_token_ids,
                                   int64_t top_k) {
+  // The new group_size=-1 (per-channel) sentinel from wvSplitK_int4_g must
+  // never leak in here: the MoE dispatch macros (MOE_WVSPLIT_INT4G_GS /
+  // _W_AC) are a 2-way 32-vs-128 demux with no per-channel arm, and the MoE
+  // kernels pass K/GROUP_SIZE as a function argument (division by zero at
+  // GROUP_SIZE=0) -- so this would be a hard compile-time-shaped landmine,
+  // not just a silent misdispatch.  Reject it at the host instead.
+  TORCH_CHECK(group_size > 0,
+              "fused_moe_wvSplitK_int4_gemm does not support per-channel "
+              "(group_size=-1) weights");
+
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 

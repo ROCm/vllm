@@ -1227,13 +1227,34 @@ static int mindiv_int4(int N, int div1, int div2) {
     }                                                                       \
   }
 
-#define WVSPLIT_INT4G_GS_CHUNKED(_YTILE, _UNRL, _N, _HAS_ZP) \
-  if (group_size == 32)                                      \
-    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 32, _HAS_ZP)   \
-  else if (group_size == 64)                                 \
-    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 64, _HAS_ZP)   \
-  else                                                       \
-    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 128, _HAS_ZP)
+// group_size == -1 (per-channel) maps to the GS=0 template sentinel, gated
+// on !_HAS_ZP: there is no GROUP_SIZE==0 && HAS_ZERO_POINTS kernel arm (see
+// skinny_gemms_int4.cu's per-channel host checks for why), and the host
+// already rejects per-channel + zero points, so the TORCH_CHECK(false) below
+// is unreachable -- it exists only to keep the compiler from emitting the
+// unsafe instantiation.  Braced throughout (matching WVSPLITK_INT4G /
+// WVSPLITK_INT4G_CHUNKED's style) because this macro is itself spliced into
+// an enclosing if/else-if chain (WVSPLIT_INT4G_TILE): an unbraced dangling
+// else here would silently re-bind to that outer chain instead of to the
+// branch below, and still compile.
+#define WVSPLIT_INT4G_GS_CHUNKED(_YTILE, _UNRL, _N, _HAS_ZP)              \
+  if (group_size == -1) {                                                 \
+    if constexpr (!(_HAS_ZP)) {                                           \
+      WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 0, _HAS_ZP)               \
+    } else {                                                              \
+      TORCH_CHECK(false,                                                  \
+                  "per-channel (group_size=-1) W4A16 is symmetric-only; " \
+                  "zero points are rejected at the host");                \
+    }                                                                     \
+  } else if (group_size == 32) {                                          \
+    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 32, _HAS_ZP)                \
+  } else if (group_size == 64) {                                          \
+    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 64, _HAS_ZP)                \
+  } else if (group_size == 128) {                                         \
+    WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, 128, _HAS_ZP)               \
+  } else {                                                                \
+    TORCH_CHECK(false, "Unsupported group_size=", group_size);            \
+  }
 
 #define WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS, _HAS_ZP)                     \
   {                                                                         \
@@ -1251,26 +1272,53 @@ static int mindiv_int4(int N, int div1, int div2) {
     }                                                                       \
   }
 
-#define WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP) \
-  if (group_size == 32)                              \
-    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 32, _HAS_ZP)   \
-  else if (group_size == 64)                         \
-    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 64, _HAS_ZP)   \
-  else                                               \
-    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 128, _HAS_ZP)
+// See WVSPLIT_INT4G_GS_CHUNKED above for the per-channel gating and the
+// dangling-else rationale for the explicit braces -- same reasoning applies
+// here.
+#define WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP)                      \
+  if (group_size == -1) {                                                 \
+    if constexpr (!(_HAS_ZP)) {                                           \
+      WVSPLITK_INT4G(_YTILE, _UNRL, _N, 0, _HAS_ZP)                       \
+    } else {                                                              \
+      TORCH_CHECK(false,                                                  \
+                  "per-channel (group_size=-1) W4A16 is symmetric-only; " \
+                  "zero points are rejected at the host");                \
+    }                                                                     \
+  } else if (group_size == 32) {                                          \
+    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 32, _HAS_ZP)                        \
+  } else if (group_size == 64) {                                          \
+    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 64, _HAS_ZP)                        \
+  } else if (group_size == 128) {                                         \
+    WVSPLITK_INT4G(_YTILE, _UNRL, _N, 128, _HAS_ZP)                       \
+  } else {                                                                \
+    TORCH_CHECK(false, "Unsupported group_size=", group_size);            \
+  }
 
 // Like WVSPLIT_INT4G_GS but the caller also picks WvPrGrp and A_CHUNK.
-// Mirrors WVSPLIT_INT4G_GS's 3-way group_size demux so a tuned dispatch
+// Mirrors WVSPLIT_INT4G_GS's 4-way group_size demux so a tuned dispatch
 // branch can supply its (YT, UN, W, AC) tuple in one line without
 // re-implementing the group_size switch.  gfx11 only (THRDS=32 hard-
 // coded -- other arches fall through the default WVSPLIT_INT4G_GS path).
-#define WVSPLITK_INT4G_GS_W_AC(_YTILE, _UNRL, _W, _AC, _N, _HAS_ZP)         \
-  if (group_size == 32)                                                     \
-    WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 32, _HAS_ZP) \
-  else if (group_size == 64)                                                \
-    WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 64, _HAS_ZP) \
-  else                                                                      \
-    WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 128, _HAS_ZP)
+// Same per-channel gating and dangling-else rationale as WVSPLIT_INT4G_GS
+// above.
+#define WVSPLITK_INT4G_GS_W_AC(_YTILE, _UNRL, _W, _AC, _N, _HAS_ZP)          \
+  if (group_size == -1) {                                                    \
+    if constexpr (!(_HAS_ZP)) {                                              \
+      WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 0, _HAS_ZP) \
+    } else {                                                                 \
+      TORCH_CHECK(false,                                                     \
+                  "per-channel (group_size=-1) W4A16 is symmetric-only; "    \
+                  "zero points are rejected at the host");                   \
+    }                                                                        \
+  } else if (group_size == 32) {                                             \
+    WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 32, _HAS_ZP)  \
+  } else if (group_size == 64) {                                             \
+    WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 64, _HAS_ZP)  \
+  } else if (group_size == 128) {                                            \
+    WVSPLITK_INT4G_LAUNCH_W_AC(32, _YTILE, _W, _AC, _UNRL, _N, 128, _HAS_ZP) \
+  } else {                                                                   \
+    TORCH_CHECK(false, "Unsupported group_size=", group_size);               \
+  }
 
 #define WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                               \
   {                                                                          \
