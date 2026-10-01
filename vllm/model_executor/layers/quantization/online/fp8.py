@@ -19,7 +19,6 @@ from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.kernels.linear import init_fp8_linear_kernel
 from vllm.model_executor.kernels.linear.scaled_mm import (
-    CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -277,7 +276,7 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
     ) -> torch.Tensor:
         # if batch invariant mode is enabled, use BF16 dequant
         if envs.VLLM_BATCH_INVARIANT:
-            if isinstance(self.fp8_linear, CutlassFP8ScaledMMLinearKernel):
+            if self.fp8_linear.is_batch_invariant():
                 return self.fp8_linear.apply_weights(layer, x, bias)
 
             weight_fp8 = layer.weight.to(torch.bfloat16)
@@ -465,7 +464,7 @@ class Fp8PtpcOnlineLinearMethod(OnlineLinearBase):
         # if batch invariant mode is enabled dequant
         if (
             envs.VLLM_BATCH_INVARIANT
-            and not isinstance(self.fp8_linear, CutlassFP8ScaledMMLinearKernel)
+            and not self.fp8_linear.is_batch_invariant()
             and not isinstance(x, QuantizedActivation)
         ):
             weight_dequant = (

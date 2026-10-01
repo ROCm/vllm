@@ -12,7 +12,6 @@ from vllm.model_executor.kernels.linear import (
     init_fp8_linear_kernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm import (
-    CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.attention import Attention
@@ -432,7 +431,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias,
                 )
             else:
-                if isinstance(self.fp8_linear, CutlassFP8ScaledMMLinearKernel):
+                if self.fp8_linear.is_batch_invariant():
                     return self.fp8_linear.apply_weights(layer, x, bias)
 
                 # per-tensor/channel: dequant to BF16 and run GEMM

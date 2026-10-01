@@ -155,6 +155,8 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
 
 
 class CutlassFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
+    batch_invariant_gemm = True
+
     def __init__(
         self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
     ) -> None:
