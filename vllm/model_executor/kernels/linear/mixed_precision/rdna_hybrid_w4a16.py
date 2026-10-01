@@ -16,6 +16,7 @@ from contextlib import nullcontext
 
 import torch
 
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
@@ -469,6 +470,9 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         if not _on_gfx1x():
             return False, "RDNAHybridW4A16LinearKernel only targets gfx11/gfx12"
+
+        if envs.VLLM_BATCH_INVARIANT:
+            return False, "batch invariance not supported"
 
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
             return (

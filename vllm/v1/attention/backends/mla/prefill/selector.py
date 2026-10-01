@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backends.mla.prefill.base import MLADimensions
@@ -62,6 +63,10 @@ def _get_mla_prefill_backend_priorities(
     from vllm.platforms import current_platform
 
     if current_platform.is_rocm():
+        # aiter's varlen prefill takes a different kernel path for a single
+        # sequence than for a batch of them, so it is not batch invariant.
+        if envs.VLLM_BATCH_INVARIANT:
+            return [MLAPrefillBackendEnum.FLASH_ATTN]
         return [
             MLAPrefillBackendEnum.ROCM_AITER_FA,
             MLAPrefillBackendEnum.FLASH_ATTN,
