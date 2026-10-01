@@ -38,6 +38,30 @@ def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
         return (0, 0, 0)
 
 
+def layers_for_working_set(
+    num_layers: int,
+    kv_bytes_per_layer: int,
+    min_working_set_mb: float | None,
+) -> int:
+    """Raise the layer count until the KV working set outgrows the cache.
+
+    ``benchmark_fn`` walks one KV cache per layer and the result is divided by
+    the layer count, so the layer loop doubles as a rotation over disjoint KV
+    regions.  Whether a measurement reads DRAM or a last-level cache therefore
+    depends on ``num_layers * kv_bytes_per_layer``, not on the size of a single
+    layer's cache.
+
+    Left at the default this is a no-op.  Set it on parts with a large
+    last-level cache (for example the 32 MiB MALL on Strix Halo), where a small
+    model at a short context otherwise stays resident across replays and
+    reports bandwidth the memory system cannot sustain.
+    """
+    if not min_working_set_mb or kv_bytes_per_layer <= 0:
+        return num_layers
+    needed = int(min_working_set_mb * 1024**2)
+    return max(num_layers, -(-needed // kv_bytes_per_layer))
+
+
 def run_do_bench(
     benchmark_fn,
     use_cuda_graphs: bool,
@@ -284,6 +308,9 @@ class BenchmarkConfig:
     torch_profile_dir: str | None = None
     torch_profile_iters: int = 3
     warmup_ms: int | None = None
+    # Grow num_layers until the KV working set reaches this, so the timed
+    # kernel reads DRAM instead of a resident last-level cache.
+    min_working_set_mb: float | None = None
 
     # "auto" or "fp8"
     kv_cache_dtype: str = "auto"
