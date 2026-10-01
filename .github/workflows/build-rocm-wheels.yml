@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/rocm/vllm/gfx11-ci:latest
+      # Allow setarch -R for deterministic builds (requires personality syscall)
+      options: --security-opt seccomp=unconfined
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -153,7 +155,7 @@ jobs:
           sccache --show-stats || true
           echo ""
           echo "=== Building wheel ==="
-          # Disable ASLR to produce deterministic compiler output.
+          # AIESW-45531: Disable ASLR to produce deterministic compiler output.
           # The LLVM instruction scheduler's behavior depends on hash table
           # iteration order, which varies with memory layout. Without this,
           # identical source can produce binaries with up to 15% performance
