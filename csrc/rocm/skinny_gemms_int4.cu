@@ -198,15 +198,20 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   int64_t group_size, torch::Tensor zero_points,
                                   torch::Tensor sorted_token_ids,
                                   int64_t top_k) {
-  // The new group_size=-1 (per-channel) sentinel from wvSplitK_int4_g must
-  // never leak in here: the MoE dispatch macros (MOE_WVSPLIT_INT4G_GS /
-  // _W_AC) are a 2-way 32-vs-128 demux with no per-channel arm, and the MoE
-  // kernels pass K/GROUP_SIZE as a function argument (division by zero at
-  // GROUP_SIZE=0) -- so this would be a hard compile-time-shaped landmine,
-  // not just a silent misdispatch.  Reject it at the host instead.
-  TORCH_CHECK(group_size > 0,
-              "fused_moe_wvSplitK_int4_gemm does not support per-channel "
-              "(group_size=-1) weights");
+  // The MoE dispatch macros (MOE_WVSPLIT_INT4G_GS / _W_AC) are a 2-way
+  // 32-vs-else demux whose else arm is the 128 template, so any other value
+  // -- group_size=64 in particular -- selects the 128 kernel.  That kernel
+  // derives num_groups from its own GROUP_SIZE, giving the scale rows half
+  // their true stride: every read stays inside the allocation, so nothing
+  // faults and no shape check fires, and the weights simply dequantize
+  // against the wrong scales.  Per-channel cannot be supported here at all:
+  // the MoE kernels pass K/GROUP_SIZE as an argument, which is a
+  // compile-time division by zero at GROUP_SIZE=0.  Validate explicitly so
+  // an unsupported group size is an error rather than silent corruption.
+  TORCH_CHECK(group_size == 32 || group_size == 128,
+              "fused_moe_wvSplitK_int4_gemm supports group_size 32 or 128, "
+              "got ",
+              group_size);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
