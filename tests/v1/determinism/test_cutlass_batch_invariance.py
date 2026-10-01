@@ -8,6 +8,7 @@ process after tests that intentionally exercise non-batch-invariant NVFP4
 scaled-mm kernels.
 """
 
+import functools
 from typing import Any
 
 import pytest
@@ -22,6 +23,9 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    TritonFP8ScaledMMLinearKernel,
+)
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -31,7 +35,9 @@ from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
     CutlassExpertsFp4,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
+    kFp8StaticChannelSym,
     kFp8StaticTensorSym,
 )
 from vllm.platforms import current_platform
@@ -87,16 +93,41 @@ _NVFP4_MOE_BATCH_INVARIANT_CASES = (
 
 @pytest.fixture(autouse=True)
 def setup_cuda():
-    if not current_platform.is_cuda():
-        pytest.skip("CUTLASS FP8 kernels require CUDA.")
+    if not current_platform.is_cuda_alike():
+        pytest.skip("Requires CUDA or ROCm.")
     torch.set_default_device("cuda")
 
 
 @requires_fp8
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        pytest.param(
+            CutlassFP8ScaledMMLinearKernel,
+            marks=pytest.mark.skipif(
+                not current_platform.is_cuda(), reason="CUTLASS requires CUDA."
+            ),
+        ),
+        TritonFP8ScaledMMLinearKernel,
+    ],
+)
+@pytest.mark.parametrize(
+    "act_key,weight_key",
+    [
+        (kFp8DynamicTokenSym, kFp8StaticTensorSym),
+        (kFp8DynamicTokenSym, kFp8StaticChannelSym),
+        (kFp8StaticTensorSym, kFp8StaticTensorSym),
+        # An amax over the whole batch: the GEMM is invariant, the layer is not.
+        (kFp8DynamicTensorSym, kFp8StaticTensorSym),
+    ],
+)
 @pytest.mark.parametrize("weight_shape", [(1024, 2048), (4608, 4096)])
 @pytest.mark.parametrize("batch_size", [1, 16, 17, 32, 64, 65, 256, 257])
 @torch.inference_mode()
-def test_cutlass_fp8_batch_invariant_fixed_config(
+def test_fp8_scaled_mm_batch_invariant_fixed_config(
+    kernel: type,
+    act_key,
+    weight_key,
     weight_shape: tuple[int, int],
     batch_size: int,
     default_vllm_config,
@@ -108,14 +139,16 @@ def test_cutlass_fp8_batch_invariant_fixed_config(
     torch.manual_seed(0)
     layer = TestFP8Layer(
         weight_shape=weight_shape,
-        activation_quant_key=kFp8DynamicTokenSym,
-        weight_quant_key=kFp8StaticTensorSym,
+        activation_quant_key=act_key,
+        weight_quant_key=weight_key,
         input_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
         device=torch.device("cuda"),
-        force_kernel=CutlassFP8ScaledMMLinearKernel,
+        force_kernel=kernel,
     )
-    assert isinstance(layer.kernel, CutlassFP8ScaledMMLinearKernel)
+    assert isinstance(layer.kernel, kernel)
+    dynamic_per_tensor = act_key == kFp8DynamicTensorSym
+    assert layer.kernel.is_batch_invariant() != dynamic_per_tensor
 
     in_features = weight_shape[1]
     needle = torch.randn((1, in_features), device="cuda", dtype=torch.bfloat16)
@@ -124,6 +157,12 @@ def test_cutlass_fp8_batch_invariant_fixed_config(
     filler = torch.randn(
         (max(batch_size - 1, 0), in_features), device="cuda", dtype=torch.bfloat16
     )
+    if dynamic_per_tensor:
+        if batch_size == 1:
+            pytest.skip("no other rows to move the scale")
+        front_output = layer(torch.cat([needle, 100 * filler], dim=0))[0]
+        assert not torch.equal(front_output, baseline)
+        return
 
     front_batch = torch.cat([needle, filler], dim=0)
     back_batch = torch.cat([filler, needle], dim=0)
@@ -133,6 +172,47 @@ def test_cutlass_fp8_batch_invariant_fixed_config(
 
     torch.testing.assert_close(front_output, baseline, rtol=0, atol=0)
     torch.testing.assert_close(back_output, baseline, rtol=0, atol=0)
+
+
+@requires_fp8
+@torch.inference_mode()
+def test_block_fp8_batch_invariant_across_tuned_block_size_k(monkeypatch):
+    """The block-FP8 kernel applies the block scales once per K tile, so a tuned
+    BLOCK_SIZE_K below the 128-wide scale group reorders the sum. MI300X's
+    shipped table for this shape drops BLOCK_SIZE_K from 128 to 64 between
+    M=256 and M=512; borrow it so the test runs on any device."""
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+    monkeypatch.setattr(
+        fp8_utils, "get_device_name_as_file_name", lambda: "AMD_Instinct_MI300X"
+    )
+    # A fresh cache, so neither the real nor the borrowed table leaks.
+    lookup = fp8_utils.get_w8a8_block_fp8_configs.__wrapped__
+    monkeypatch.setattr(
+        fp8_utils, "get_w8a8_block_fp8_configs", functools.lru_cache(lookup)
+    )
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", True)
+    N, K, block = 12288, 2048, [128, 128]
+    table = fp8_utils.get_w8a8_block_fp8_configs(N, K, *block)
+    assert table is not None
+    assert table[256]["BLOCK_SIZE_K"] != table[512]["BLOCK_SIZE_K"]
+
+    set_random_seed(0)
+    fp8 = current_platform.fp8_dtype()
+    A = torch.randn(512, K).to(fp8)
+    B = torch.randn(N, K).to(fp8)
+    As = torch.rand(512, K // 128) / 100
+    Bs = torch.rand(N // 128, K // 128) / 100
+
+    def run(m):
+        return fp8_utils.w8a8_triton_block_scaled_mm(
+            A[:m], B, As[:m], Bs, block, torch.bfloat16
+        )[:256]
+
+    assert torch.equal(run(256), run(512))
+    # Positive control: with the mode off the tuned table must break it.
+    monkeypatch.setattr(envs, "VLLM_BATCH_INVARIANT", False)
+    assert not torch.equal(run(256), run(512))
 
 
 @_NVFP4_REQUIRES_SM100

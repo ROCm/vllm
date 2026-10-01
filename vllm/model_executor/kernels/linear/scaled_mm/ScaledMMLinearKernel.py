@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import ClassVar, Generic, TypeVar
 
 import torch
 
@@ -119,6 +119,16 @@ class FP8ScaledMMLinearKernel(
         )
         self.fp8_dtype = current_platform.fp8_dtype()
         super().__init__(c, layer_param_names)
+
+    # Kernels whose GEMM does not depend on the other rows opt in.
+    batch_invariant_gemm: ClassVar[bool] = False
+
+    def is_batch_invariant(self) -> bool:
+        # A dynamic per-tensor activation scale is an amax over every row.
+        scale = self.config.activation_quant_key.scale
+        return self.batch_invariant_gemm and (
+            scale.static or not scale.group_shape.is_per_tensor()
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         pass

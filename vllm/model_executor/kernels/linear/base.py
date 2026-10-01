@@ -167,6 +167,10 @@ class MMLinearKernel(ABC, Generic[_ConfigT, _ParamsT]):
 
     """
 
+    def is_batch_invariant(self) -> bool:
+        """Whether a row's output is independent of the other rows."""
+        return False
+
     @classmethod
     @abstractmethod
     def is_supported(
