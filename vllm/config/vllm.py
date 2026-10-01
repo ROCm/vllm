@@ -1822,6 +1822,14 @@ class VllmConfig:
             if "-quant_fp8" not in custom_ops:
                 custom_ops.append("+quant_fp8")
 
+        # Only RMSNorm's custom op reaches rms_norm_batch_invariant. Inductor
+        # lowers the native one to a reduction whose block size it picks by
+        # benchmarking, so the summation order varies with the batch and run.
+        if envs.VLLM_BATCH_INVARIANT:
+            custom_ops = self.compilation_config.custom_ops
+            if "-rms_norm" not in custom_ops:
+                custom_ops.append("+rms_norm")
+
         current_platform.apply_config_platform_defaults(self)
 
         if self.compilation_config.mode is None:
