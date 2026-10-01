@@ -179,6 +179,7 @@ def test_logprobs_bitwise_batch_invariance_bs1_vs_bsN(
     llm = LLM(
         model=TEST_MODEL,
         tensor_parallel_size=tp_size,
+        disable_custom_all_reduce=os.getenv("VLLM_TEST_DISABLE_CUSTOM_AR") == "1",
         max_num_seqs=128,
         max_model_len=8192,
         dtype="auto",  # not everything is supported
@@ -527,6 +528,7 @@ def test_logprobs_without_batch_invariance_should_fail(
     llm = LLM(
         model=TEST_MODEL,
         tensor_parallel_size=tp_size,
+        disable_custom_all_reduce=os.getenv("VLLM_TEST_DISABLE_CUSTOM_AR") == "1",
         max_num_seqs=32,
         max_model_len=8192,
         dtype="auto",
@@ -736,6 +738,7 @@ def test_decode_logprobs_match_prefill_logprobs(
     llm = LLM(
         model=TEST_MODEL,
         tensor_parallel_size=tp_size,
+        disable_custom_all_reduce=os.getenv("VLLM_TEST_DISABLE_CUSTOM_AR") == "1",
         max_num_seqs=32,
         max_model_len=8192,
         dtype="auto",
