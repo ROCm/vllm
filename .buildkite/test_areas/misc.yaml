@@ -656,6 +656,8 @@ steps:
     - vllm/v1/attention
     - vllm/model_executor/layers
     - vllm/lora/ops/triton_ops
+    - vllm/model_executor/kernels/linear
+    - vllm/model_executor/determinism
     - tests/v1/determinism/
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
@@ -676,6 +678,8 @@ steps:
       source_file_dependencies:
       - vllm/v1/attention
       - vllm/model_executor/layers
+      - vllm/model_executor/kernels/linear
+      - vllm/model_executor/determinism
       - tests/v1/determinism/
       - vllm/_aiter_ops.py
       - vllm/platforms/rocm.py
@@ -693,6 +697,8 @@ steps:
     - vllm/v1/attention
     - vllm/model_executor/layers
     - vllm/lora/ops/triton_ops
+    - vllm/model_executor/kernels/linear
+    - vllm/model_executor/determinism
     - tests/v1/determinism/
   commands:
     - export VLLM_WORKER_MULTIPROC_METHOD=spawn
