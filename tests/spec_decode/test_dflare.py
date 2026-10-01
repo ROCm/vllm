@@ -189,24 +189,18 @@ def test_partial_rotary_cache_leaves_remainder_unrotated():
     torch.testing.assert_close(actual, expected)
 
 
-def test_mrope_query_positions_follow_last_accepted_token(monkeypatch):
-    from vllm.v1.spec_decode.dflash import DFlashProposer
-
+def _mrope_proposer(runner):
     proposer = object.__new__(DFlareProposer)
-    proposer.runner = None
+    proposer.runner = runner
     proposer.num_speculative_tokens = 3
     proposer._mrope_query_buffer = torch.zeros((3, 9), dtype=torch.int64)
-    seen = {}
+    return proposer
 
-    def fake_first_pass(self, **kwargs):
-        seen["slots"] = kwargs["target_positions"]
-        return 0, None, None
 
-    monkeypatch.setattr(DFlashProposer, "set_inputs_first_pass", fake_first_pass)
+def _mrope_first_pass(proposer, mrope):
     # Two requests: 5 and 4 context tokens, with 1 and 2 rejected drafts.
-    mrope = torch.stack((torch.arange(9), torch.arange(9) + 100, torch.arange(9) + 200))
     cad = SimpleNamespace(batch_size=lambda: 2, query_start_loc=torch.tensor([0, 5, 9]))
-    proposer.set_inputs_first_pass(
+    return proposer.set_inputs_first_pass(
         target_token_ids=torch.zeros(9, dtype=torch.long),
         next_token_ids=torch.zeros(2, dtype=torch.long),
         target_positions=mrope,
@@ -216,10 +210,47 @@ def test_mrope_query_positions_follow_last_accepted_token(monkeypatch):
         num_rejected_tokens_gpu=torch.tensor([1, 2]),
     )
 
-    torch.testing.assert_close(seen["slots"], torch.arange(9))
+
+def test_mrope_query_positions_follow_last_accepted_token(monkeypatch):
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+
+    seen = {}
+
+    def fake_first_pass(self, **kwargs):
+        seen["slots"] = kwargs["target_positions"]
+        return 0, None, None
+
+    monkeypatch.setattr(DFlashProposer, "set_inputs_first_pass", fake_first_pass)
+    # Absolute token positions: request 0 at 20-24, request 1 at 40-43.
+    token_positions = torch.cat((torch.arange(20, 25), torch.arange(40, 44)))
+    padding = torch.zeros(7, dtype=torch.long)
+    runner = SimpleNamespace(positions=torch.cat((token_positions, padding)))
+    proposer = _mrope_proposer(runner)
+    mrope = torch.stack((torch.arange(9), torch.arange(9) + 100, torch.arange(9) + 200))
+    _mrope_first_pass(proposer, mrope)
+
+    torch.testing.assert_close(seen["slots"], token_positions)
+    torch.testing.assert_close(proposer._mrope_context, mrope)
     last = mrope[:, [3, 6]]
     expected = (last[:, :, None] + 1 + torch.arange(4)).reshape(3, 8)
     torch.testing.assert_close(proposer._get_positions(8), expected)
+
+
+def test_mrope_positions_require_runner_token_positions():
+    mrope = torch.zeros((3, 9), dtype=torch.long)
+    with pytest.raises(RuntimeError, match="V1 GPU model runner"):
+        _mrope_first_pass(_mrope_proposer(None), mrope)
+
+
+def test_mrope_target_rejects_unpadded_drafter_batch():
+    proposer = object.__new__(DFlareProposer)
+    text_config = SimpleNamespace(rope_parameters={"mrope_section": [2, 1, 1]})
+    proposer.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=text_config)
+    )
+    proposer.speculative_config = SimpleNamespace(disable_padded_drafter_batch=True)
+    with pytest.raises(NotImplementedError, match="padded drafter batch"):
+        proposer.load_model(nn.Module())
 
 
 def test_compact_dflare_context_removes_rejected_rows():
