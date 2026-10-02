@@ -101,6 +101,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
     scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
     zp_ptr,  # [N//8, K//G]  int32 zero-points (when HAS_ZP=True)
+    scale_zp_ptr,  # [N, K//G]  int32 scale/zero-point carrier (when SCALE_ZP=True)
     c_ptr,  # [M, N]  fp16/bf16 output
     # Dimensions
     M,
@@ -114,6 +115,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     group_size,
     ZP_BIAS: tl.constexpr,
     HAS_ZP: tl.constexpr,
+    SCALE_ZP: tl.constexpr,
     PACKED_DEQUANT: tl.constexpr,
     # Block sizes
     BLOCK_M: tl.constexpr,
@@ -132,6 +134,9 @@ def _triton_w4a16_skinny_fmt_kernel(
     zero-point at word[n//8] bits 4*(n%8), and dequant is
     (nibble - zp_raw) * scale.
     When HAS_ZP=False, only the constant ZP_BIAS is subtracted (symmetric).
+    When SCALE_ZP=True (asymmetric only), scale and zero-point come from one
+    int32 per (n, group) in scale_zp_ptr instead (see ``pack_scale_zp``), and
+    scales_ptr and zp_ptr are not read.
 
     With PACKED_DEQUANT the nibble arrives as ``b_raw`` = 1024 + nibble (the
     magic-constant unpack), so the subtrahend absorbs the 1024: the arithmetic
@@ -194,11 +199,21 @@ def _triton_w4a16_skinny_fmt_kernel(
             b = (b >> shifts_full) & 0xF  # [BLOCK_N, BLOCK_K]
 
         group_idx = (k_start * BLOCK_K) // group_size
-        scale_ptrs = scales_ptr + offs_n * num_groups + group_idx
         scale_mask = offs_n < N
-        scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
+        if SCALE_ZP:
+            # low16 = scale bits; high16 = fp16 bias_eff bits or bf16 raw zp.
+            scale_zp = tl.load(
+                scale_zp_ptr + offs_n * num_groups + group_idx,
+                mask=scale_mask,
+                other=0,
+            )
+            scales = (scale_zp & 0xFFFF).to(tl.uint16).to(a.dtype, bitcast=True)
+            zp_hi = (scale_zp >> 16) & 0xFFFF
+        else:
+            scale_ptrs = scales_ptr + offs_n * num_groups + group_idx
+            scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
 
-        if HAS_ZP:
+        if HAS_ZP and not SCALE_ZP:
             # Zero points stay in their packed 4-bit form: row n's nibble lives
             # at word[n//8], bits 4*(n%8).
             zp_ptrs = zp_ptr + (offs_n // 8) * num_groups + group_idx
@@ -210,7 +225,11 @@ def _triton_w4a16_skinny_fmt_kernel(
             # into the subtrahend: (b_raw - (1024 + zp)) == (nibble - zp),
             # exactly, and the multiply that follows rounds once as before.
             c1024 = tl.full((), 1024.0, tl.float16)
-            if HAS_ZP:
+            if SCALE_ZP:
+                # bias_eff = -zp * scale, so the affine is one v_pk_fma_f16.
+                bias_eff = zp_hi.to(tl.uint16).to(tl.float16, bitcast=True)
+                b_fp = (b_raw - c1024) * scales[:, None] + bias_eff[:, None]
+            elif HAS_ZP:
                 zp_off = (c1024 + zp_raw.to(tl.float16))[:, None]
                 b_fp = (b_raw - zp_off) * scales[:, None]
             else:
@@ -219,7 +238,12 @@ def _triton_w4a16_skinny_fmt_kernel(
             # bf16 keeps the subtract in the int domain and casts once: zp_raw is
             # an int32 nibble, so casting b first would promote the whole
             # expression to fp32 and break the tl.dot dtype match.
-            if HAS_ZP:
+            if SCALE_ZP and scales.dtype == tl.float16:
+                bias_eff = zp_hi.to(tl.uint16).to(tl.float16, bitcast=True)
+                b_fp = b.to(tl.float16) * scales[:, None] + bias_eff[:, None]
+            elif SCALE_ZP:
+                b_fp = (b - zp_hi[:, None]).to(scales.dtype) * scales[:, None]
+            elif HAS_ZP:
                 b_fp = (b - zp_raw[:, None]).to(scales.dtype) * scales[:, None]
             else:
                 b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
@@ -369,6 +393,7 @@ def triton_w4a16_skinny_fmt_gemm(
     group_size: int,
     zp_bias: int = 8,
     zp: torch.Tensor | None = None,  # [N//8, K//G] int32 zero-points
+    scale_zp: torch.Tensor | None = None,  # [N, K//G] int32 carrier
 ) -> torch.Tensor:
     """Fused W4A16 GEMM reading from skinny weight format [N, K//8].
 
@@ -381,6 +406,9 @@ def triton_w4a16_skinny_fmt_gemm(
         zp:         Raw per-group zero-points [N//8, K//G] int32, row n at
                     word[n//8] bits 4*(n%8) (asymmetric). When provided,
                     dequant is (nibble - zp_raw) * scale.
+        scale_zp:   Scale/zero-point carrier from ``pack_scale_zp`` (asymmetric
+                    only). When provided, replaces the ``scales`` and ``zp``
+                    loads in the kernel.
 
     Returns:
         Output matrix [M, N], same dtype as a.
@@ -408,6 +436,12 @@ def triton_w4a16_skinny_fmt_gemm(
             f"zp shape mismatch: {zp.shape} vs ({N // 8}, {num_groups})"
         )
     has_zp = zp is not None
+    if scale_zp is not None:
+        assert has_zp, "scale_zp is only built for asymmetric layers"
+        assert scale_zp.dtype == torch.int32 and scale_zp.is_contiguous()
+        assert scale_zp.shape == (N, num_groups), (
+            f"scale_zp shape mismatch: {scale_zp.shape} vs ({N}, {num_groups})"
+        )
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
@@ -482,6 +516,7 @@ def triton_w4a16_skinny_fmt_gemm(
         b_q,
         scales,
         zp if has_zp else scales,  # dummy pointer when no zp (unused)
+        scale_zp if scale_zp is not None else scales,  # dummy when unused
         c,
         M,
         N,
@@ -493,6 +528,7 @@ def triton_w4a16_skinny_fmt_gemm(
         group_size=group_size,
         ZP_BIAS=zp_bias,
         HAS_ZP=has_zp,
+        SCALE_ZP=scale_zp is not None,
         PACKED_DEQUANT=packed_dequant,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
@@ -574,6 +610,36 @@ def pack_skinny_int4(unpacked: torch.Tensor) -> torch.Tensor:
     return padded.view(torch.int8)[:, : k8 * 4]
 
 
+def pack_scale_zp(scales: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
+    """Fold per-group scales and packed zero-points into one int32 per (n, group).
+
+    Lets the Triton prefill kernel replace its scale and zero-point loads with
+    one. The low 16 bits hold the scale. The high 16 bits hold, for fp16,
+    ``bias_eff = -zp * scale`` so dequant is a single FMA on the magic-constant
+    unpack; for bf16 (no ``v_pk_fma_bf16`` on RDNA3), the raw zero-point.
+
+    Args:
+        scales: [N, K//G] fp16/bf16 per-group scales.
+        zp: [N//8, K//G] int32 zero-points, row n at word[n//8] bits 4*(n%8).
+
+    Returns:
+        [N, K//G] int32 carrier.
+
+    """
+    n_rows, num_groups = scales.shape
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=zp.device)
+    zp_raw = ((zp[:, None, :] >> shifts[None, :, None]) & 0xF).reshape(
+        n_rows, num_groups
+    )
+    if scales.dtype == torch.float16:
+        bias_eff = -(zp_raw.to(torch.float32) * scales.to(torch.float32))
+        hi = bias_eff.to(torch.float16).view(torch.int16).to(torch.int32)
+    else:
+        hi = zp_raw
+    lo = scales.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    return ((hi << 16) | lo).contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Hybrid dispatch logic
 # ---------------------------------------------------------------------------
@@ -607,10 +673,13 @@ def _rdna_hybrid_w4a16_apply_impl(
     bias: torch.Tensor | None,
     cu_count: int,
     group_size: int,
+    w_scale_zp: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
     ``w_zp`` is [N//8, K//G] int32 for asymmetric layers, None for symmetric.
+    ``w_scale_zp`` is the optional ``pack_scale_zp`` carrier for the Triton
+    path.
     """
     import vllm._custom_ops as ops
 
@@ -641,6 +710,7 @@ def _rdna_hybrid_w4a16_apply_impl(
             scales=w_s,
             group_size=group_size,
             zp=w_zp,
+            scale_zp=w_scale_zp,
         )
         if bias is not None:
             output.add_(bias)
@@ -655,6 +725,7 @@ def _rdna_hybrid_w4a16_apply_fake(
     bias: torch.Tensor | None,
     cu_count: int,
     group_size: int,
+    w_scale_zp: torch.Tensor | None = None,
 ) -> torch.Tensor:
     M = x_2d.size(0)
     N = w_q.size(0)
@@ -751,6 +822,12 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             permute_param_layout_(w_zp_raw, input_dim=1, output_dim=0, packed_dim=0)
             w_zp = w_zp_raw.data.contiguous()
             self._transform_param(layer, self.w_zp_name, lambda x: w_zp)
+            layer.register_parameter(
+                "_hybrid_w_scale_zp",
+                torch.nn.Parameter(
+                    pack_scale_zp(w_s_skinny, w_zp), requires_grad=False
+                ),
+            )
 
         self._transform_param(layer, self.w_q_name, lambda x: w_q_skinny)
         self._transform_param(layer, self.w_s_name, lambda x: w_s_skinny)
@@ -779,5 +856,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             bias,
             cu_count,
             c.group_size,
+            getattr(layer, "_hybrid_w_scale_zp", None),
         )
         return output.reshape(out_shape)

@@ -28,6 +28,7 @@ hybrid_module = importlib.import_module(
 )
 RDNAHybridW4A16LinearKernel = hybrid_module.RDNAHybridW4A16LinearKernel
 pack_int4_exllama_shuffle = hybrid_module.pack_int4_exllama_shuffle
+pack_scale_zp = hybrid_module.pack_scale_zp
 SUPPORTED_GROUP_SIZES = hybrid_module.SUPPORTED_GROUP_SIZES
 MAX_SKINNY_BATCH_SIZE = hybrid_module.MAX_SKINNY_BATCH_SIZE
 LDS_CAPACITY_ELEMENTS = hybrid_module.LDS_CAPACITY_ELEMENTS
@@ -220,39 +221,60 @@ def _make_prefill_case(M, K, N, G, dtype, has_zp):
     return x, w_int4, b_q, scales, zp_raw, zp_packed
 
 
+PREFILL_SHAPES = [
+    (17, 256, 512, 32),
+    (32, 512, 256, 64),
+    (33, 512, 512, 128),
+    (64, 1024, 256, 128),
+    (129, 256, 512, 32),
+    (256, 512, 512, 128),
+    (257, 512, 512, 128),
+]
+
+
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("has_zp", [False, True])
-@pytest.mark.parametrize(
-    "M,K,N,G",
-    [
-        (17, 256, 512, 32),
-        (32, 512, 256, 64),
-        (33, 512, 512, 128),
-        (64, 1024, 256, 128),
-        (129, 256, 512, 32),
-        (256, 512, 512, 128),
-        (257, 512, 512, 128),
-    ],
-)
-def test_triton_prefill_gemm_matches_reference(dtype, has_zp, M, K, N, G):
-    """The Triton prefill GEMM matches a float32 dequantize-then-matmul reference.
-
-    Covers fp16 and bf16, with and without zero points, at M values on both
-    sides of where gfx1151 switches fp16 to the packed dequant.
-    """
+@pytest.mark.parametrize("zp_mode", ["sym", "zp", "scale_zp"])
+@pytest.mark.parametrize("M,K,N,G", PREFILL_SHAPES)
+def test_triton_prefill_gemm_matches_reference(dtype, zp_mode, M, K, N, G):
+    """Prefill GEMM against a float32 oracle, over the symmetric, packed
+    zero-point and scale/zero-point carrier dequants, at M values on both sides
+    of where gfx1151 switches fp16 to the packed dequant."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP device not available")
     set_random_seed(0)
 
     x, w_int4, b_q, scales, zp_raw, zp_packed = _make_prefill_case(
-        M, K, N, G, dtype, has_zp
+        M, K, N, G, dtype, has_zp=zp_mode != "sym"
     )
+    scale_zp = pack_scale_zp(scales, zp_packed) if zp_mode == "scale_zp" else None
     out = triton_w4a16_skinny_fmt_gemm(
-        a=x, b_q=b_q, scales=scales, group_size=G, zp=zp_packed
+        a=x, b_q=b_q, scales=scales, group_size=G, zp=zp_packed, scale_zp=scale_zp
     )
     ref = _rdna_hybrid_w4a16_reference(x, w_int4, scales, zp_raw, G, bias=None)
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M,K,N,G", PREFILL_SHAPES)
+def test_triton_prefill_scale_zp_matches_packed_zp(dtype, M, K, N, G):
+    """The carrier must not change bf16 output at all. fp16 rounds bias_eff to
+    fp16 and fuses it into an FMA, so it may differ by a rounding step."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP device not available")
+    set_random_seed(0)
+
+    x, _, b_q, scales, _, zp_packed = _make_prefill_case(M, K, N, G, dtype, has_zp=True)
+    kwargs = dict(a=x, b_q=b_q, scales=scales, group_size=G, zp=zp_packed)
+    base = triton_w4a16_skinny_fmt_gemm(**kwargs)
+    out = triton_w4a16_skinny_fmt_gemm(
+        **kwargs, scale_zp=pack_scale_zp(scales, zp_packed)
+    )
+    if dtype == torch.bfloat16:
+        torch.testing.assert_close(out, base, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(out, base, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
