@@ -33,20 +33,13 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
       "Activation must be float16 or bfloat16");
   TORCH_CHECK(in_scale.dtype() == in_x.dtype(),
               "Scale dtype must match activation dtype");
-  // group_size == -1 is the per-channel sentinel: one scale per output row.
-  // Mirrors skinny_gemms_int8.cu's wvSplitK_int8, which takes the same -1
-  // sentinel at the op boundary (checks at skinny_gemms_int8.cu:367-389) and
-  // only maps it to the kernel's internal GROUP_SIZE=0 template parameter
-  // inside its launch macro (skinny_gemms_int8.cu:417) -- Python never learns
-  // about the 0 template sentinel, and int8/int4 share one meaning for
-  // "group_size" at the op level.
+  // group_size == -1 is the per-channel sentinel: one scale per output row,
+  // mapped to the kernel's internal GROUP_SIZE=0 template parameter below.
   int64_t num_groups;
   if (group_size == -1) {
     num_groups = 1;
-    // Unlike wvSplitK_int8, do NOT squeeze this to 1-D [M]: the same scale
-    // tensor is also handed to the Triton prefill path, which asserts a 2-D
-    // [N, num_groups] layout with stride(1) == 1.  Squeezing here would
-    // break prefill.
+    // Squeezing this to 1-D would break prefill: the same scale tensor is
+    // also handed to the Triton prefill path, which requires a 2-D layout.
     TORCH_CHECK(in_scale.dim() == 2,
                 "Per-channel (group_size=-1) scale must be 2D [M, 1], got "
                 "shape ",
@@ -198,16 +191,11 @@ void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   int64_t group_size, torch::Tensor zero_points,
                                   torch::Tensor sorted_token_ids,
                                   int64_t top_k) {
-  // The MoE dispatch macros (MOE_WVSPLIT_INT4G_GS / _W_AC) are a 2-way
-  // 32-vs-else demux whose else arm is the 128 template, so any other value
-  // -- group_size=64 in particular -- selects the 128 kernel.  That kernel
-  // derives num_groups from its own GROUP_SIZE, giving the scale rows half
-  // their true stride: every read stays inside the allocation, so nothing
-  // faults and no shape check fires, and the weights simply dequantize
-  // against the wrong scales.  Per-channel cannot be supported here at all:
-  // the MoE kernels pass K/GROUP_SIZE as an argument, which is a
-  // compile-time division by zero at GROUP_SIZE=0.  Validate explicitly so
-  // an unsupported group size is an error rather than silent corruption.
+  // MOE_WVSPLIT_INT4G_GS[_W_AC] is a 2-way 32-vs-else demux, so group_size=64
+  // would silently dequantize with the 128 kernel's (wrong) scale stride --
+  // every read stays in-bounds, so nothing faults.  Per-channel isn't
+  // supportable here either: K/GROUP_SIZE is a compile-time div-by-zero at
+  // GROUP_SIZE=0.  Validate explicitly so a bad group size is a hard error.
   TORCH_CHECK(group_size == 32 || group_size == 128,
               "fused_moe_wvSplitK_int4_gemm supports group_size 32 or 128, "
               "got ",

@@ -1228,15 +1228,7 @@ static int mindiv_int4(int N, int div1, int div2) {
   }
 
 // group_size == -1 (per-channel) maps to the GS=0 template sentinel, gated
-// on !_HAS_ZP: there is no GROUP_SIZE==0 && HAS_ZERO_POINTS kernel arm (see
-// skinny_gemms_int4.cu's per-channel host checks for why), and the host
-// already rejects per-channel + zero points, so the TORCH_CHECK(false) below
-// is unreachable -- it exists only to keep the compiler from emitting the
-// unsafe instantiation.  Braced throughout (matching WVSPLITK_INT4G /
-// WVSPLITK_INT4G_CHUNKED's style) because this macro is itself spliced into
-// an enclosing if/else-if chain (WVSPLIT_INT4G_TILE): an unbraced dangling
-// else here would silently re-bind to that outer chain instead of to the
-// branch below, and still compile.
+// on !_HAS_ZP: there is no GROUP_SIZE==0 && HAS_ZERO_POINTS kernel arm.
 #define WVSPLIT_INT4G_GS_CHUNKED(_YTILE, _UNRL, _N, _HAS_ZP)              \
   if (group_size == -1) {                                                 \
     if constexpr (!(_HAS_ZP)) {                                           \
@@ -1272,9 +1264,7 @@ static int mindiv_int4(int N, int div1, int div2) {
     }                                                                       \
   }
 
-// See WVSPLIT_INT4G_GS_CHUNKED above for the per-channel gating and the
-// dangling-else rationale for the explicit braces -- same reasoning applies
-// here.
+// See WVSPLIT_INT4G_GS_CHUNKED above for the per-channel gating.
 #define WVSPLIT_INT4G_GS(_YTILE, _UNRL, _N, _HAS_ZP)                      \
   if (group_size == -1) {                                                 \
     if constexpr (!(_HAS_ZP)) {                                           \
@@ -1299,8 +1289,7 @@ static int mindiv_int4(int N, int div1, int div2) {
 // branch can supply its (YT, UN, W, AC) tuple in one line without
 // re-implementing the group_size switch.  gfx11 only (THRDS=32 hard-
 // coded -- other arches fall through the default WVSPLIT_INT4G_GS path).
-// Same per-channel gating and dangling-else rationale as WVSPLIT_INT4G_GS
-// above.
+// Same per-channel gating as WVSPLIT_INT4G_GS above.
 #define WVSPLITK_INT4G_GS_W_AC(_YTILE, _UNRL, _W, _AC, _N, _HAS_ZP)          \
   if (group_size == -1) {                                                    \
     if constexpr (!(_HAS_ZP)) {                                              \

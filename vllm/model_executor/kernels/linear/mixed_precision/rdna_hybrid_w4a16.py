@@ -78,7 +78,12 @@ def _on_gfx1151() -> bool:
 
 
 def _resolved_group_size(group_size: int, K: int) -> int:
-    """Per-channel is expressed to the Triton path as a single group of size K."""
+    """Resolve the -1 per-channel sentinel to K for the Triton prefill path.
+
+    The HIP op keeps -1 as-is and resolves it internally. Triton has no such
+    sentinel, so one group spanning all of K is how per-channel is expressed
+    to it -- a group size of K *is* per-channel.
+    """
     return K if group_size == PER_CHANNEL_GROUP_SIZE else group_size
 
 
@@ -650,13 +655,13 @@ def _group_stride_pad(num_groups: int, elem_bytes: int) -> int:
 def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
     """Re-lay-out ``t`` so each row is ``pad_groups`` columns further apart."""
     if not pad_groups:
-        t = t.contiguous()
-        if t.stride(1) != 1:
-            # A per-channel scale arrives as a transposed [1, N] view, i.e.
-            # [N, 1] with stride(1) == N. is_contiguous() ignores size-1
-            # dims, so .contiguous() is a no-op here; force a real copy.
-            t = t.clone(memory_format=torch.contiguous_format)
-        return t
+        # is_contiguous() ignores a size-1 dim's stride, so a per-channel
+        # scale (a transposed [1, N] view, i.e. [N, 1] with stride(1) == N)
+        # reports contiguous and .contiguous() no-ops. Routing through a 1-D
+        # reshape forces a real row-major layout -- free for [N, 1], since
+        # reshape's view check (unlike is_contiguous()) treats a size-1 dim
+        # as imposing no stride constraint.
+        return t.flatten().reshape(t.shape).contiguous()
     rows, cols = t.shape
     buf = torch.empty((rows, cols + pad_groups), dtype=t.dtype, device=t.device)
     buf[:, :cols].copy_(t)
