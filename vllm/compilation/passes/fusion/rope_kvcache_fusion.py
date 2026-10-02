@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 import torch._inductor.pattern_matcher as pm
 from torch import fx
@@ -94,6 +96,74 @@ direct_register_custom_op(
     op_func=fused_rope_and_unified_kv_cache_update_impl,
     mutates_args=["query", "key"],
     fake_impl=fused_rope_and_unified_kv_cache_update_fake,
+)
+
+
+def fused_rope_out_and_unified_kv_cache_update_impl(
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """
+    As fused_rope_and_unified_kv_cache_update, with the rotated query and key
+    written to separate buffers, for impls whose attention kernel takes a
+    contiguous query (`fused_rope_kvcache_q_out`): rotated in place, the query
+    stays a strided view of qkv.  The key goes to its own buffer too: an
+    in-place mutation of a view of qkv, which q and v also read, makes
+    Inductor copy qkv first, a kernel per layer.
+    """
+    layer_name = _resolve_layer_name(layer_name)
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    if layer_slot_mapping is not None:
+        # Only impls declaring fused_rope_kvcache_q_out are matched with this
+        # op; their hook takes q_out and k_out, which the base signature lacks.
+        impl: Any = attn_layer.impl
+        impl.do_rope_and_kv_cache_update(
+            attn_layer,
+            query,
+            key,
+            value,
+            positions,
+            cos_sin_cache,
+            is_neox,
+            kv_cache,
+            layer_slot_mapping,
+            q_out=q_out,
+            k_out=k_out,
+        )
+    else:
+        # Profiling/dummy run: define q_out and k_out (consumed by attention).
+        q_out.zero_()
+        k_out.zero_()
+
+    return query.new_empty(0)
+
+
+def fused_rope_out_and_unified_kv_cache_update_fake(
+    q_out: torch.Tensor,
+    k_out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty(0, device=query.device, dtype=query.dtype)
+
+
+direct_register_custom_op(
+    op_name="fused_rope_out_and_unified_kv_cache_update",
+    op_func=fused_rope_out_and_unified_kv_cache_update_impl,
+    mutates_args=["q_out", "k_out"],
+    fake_impl=fused_rope_out_and_unified_kv_cache_update_fake,
 )
 
 
@@ -289,13 +359,17 @@ class RopeReshapeKVCachePattern:
     """
 
     FUSED_OP = torch.ops.vllm.fused_rope_and_unified_kv_cache_update.default
+    FUSED_OUT_OP = torch.ops.vllm.fused_rope_out_and_unified_kv_cache_update.default
 
     def __init__(
         self,
         layer: Attention,
         is_neox: bool,
+        q_out: bool = False,
     ) -> None:
         self.layer_name = layer.layer_name
+        # Write the rotated query to a contiguous buffer instead of in place.
+        self.q_out = q_out
         self.num_heads = layer.num_heads
         self.num_kv_heads = layer.num_kv_heads
         self.head_size = layer.head_size
@@ -325,6 +399,51 @@ class RopeReshapeKVCachePattern:
             inputs.append(_encode_layer_name(self.layer_name))
         return inputs
 
+    def _replacement(self, qkv, positions, cos_sin_cache, layer_name):
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q = q.view(-1, self.num_heads, self.head_size)
+        k = k.view(-1, self.num_kv_heads, self.head_size)
+        v = v.view(-1, self.num_kv_heads, self.head_size_v)
+        if not self.q_out:
+            results = auto_functionalized(
+                self.FUSED_OP,
+                query=q,
+                key=k,
+                value=v,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=self.is_neox,
+                layer_name=layer_name,
+            )
+            return results[0], results[1], results[2], v
+        q_out = torch.empty(
+            qkv.shape[0],
+            self.num_heads,
+            self.head_size,
+            device=qkv.device,
+            dtype=qkv.dtype,
+        )
+        k_out = torch.empty(
+            qkv.shape[0],
+            self.num_kv_heads,
+            self.head_size,
+            device=qkv.device,
+            dtype=qkv.dtype,
+        )
+        results = auto_functionalized(
+            self.FUSED_OUT_OP,
+            q_out=q_out,
+            k_out=k_out,
+            query=q,
+            key=k,
+            value=v,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=self.is_neox,
+            layer_name=layer_name,
+        )
+        return results[0], results[1], results[2], v
+
     def _mk_pattern_with_layer_name_input(self, _ln):
         """Pattern/replacement with layer_name as an explicit input."""
 
@@ -337,21 +456,7 @@ class RopeReshapeKVCachePattern:
             return torch.ops.vllm.unified_kv_cache_update(k, v, layer_name), q, k, v
 
         def replacement(qkv, positions, cos_sin_cache, layer_name):
-            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-            q = q.view(-1, self.num_heads, self.head_size)
-            k = k.view(-1, self.num_kv_heads, self.head_size)
-            v = v.view(-1, self.num_kv_heads, self.head_size_v)
-            results = auto_functionalized(
-                self.FUSED_OP,
-                query=q,
-                key=k,
-                value=v,
-                positions=positions,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=self.is_neox,
-                layer_name=layer_name,
-            )
-            return results[0], results[1], results[2], v
+            return self._replacement(qkv, positions, cos_sin_cache, layer_name)
 
         return pattern, replacement
 
@@ -367,21 +472,7 @@ class RopeReshapeKVCachePattern:
             return torch.ops.vllm.unified_kv_cache_update(k, v, _ln), q, k, v
 
         def replacement(qkv, positions, cos_sin_cache):
-            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-            q = q.view(-1, self.num_heads, self.head_size)
-            k = k.view(-1, self.num_kv_heads, self.head_size)
-            v = v.view(-1, self.num_kv_heads, self.head_size_v)
-            results = auto_functionalized(
-                self.FUSED_OP,
-                query=q,
-                key=k,
-                value=v,
-                positions=positions,
-                cos_sin_cache=cos_sin_cache,
-                is_neox=self.is_neox,
-                layer_name=_ln,
-            )
-            return results[0], results[1], results[2], v
+            return self._replacement(qkv, positions, cos_sin_cache, _ln)
 
         return pattern, replacement
 
@@ -435,21 +526,43 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
 
         attn_layers = get_layers_from_vllm_config(config, Attention)
         # When _USE_LAYERNAME is enabled, layer_name is a wildcard so all
-        # layers produce the same pattern — register once then break.
+        # layers of a shape produce the same pattern — register it once.
+        registered: set[tuple[int, ...]] = set()
         for _, layer in attn_layers.items():
-            if layer.impl.fused_rope_kvcache_supported():
-                for is_neox in [True, False]:
-                    if _supports_static_q_fp8_quant_fusion():
-                        RopeStaticQQuantKVCachePattern(
-                            layer=layer,
-                            is_neox=is_neox,
-                        ).register(self.patterns)
-                    RopeReshapeKVCachePattern(
+            if not layer.impl.fused_rope_kvcache_supported():
+                continue
+            if layer.head_size_v != layer.head_size:
+                # The hooks split a packed cache of 2 * head_size.
+                logger.warning_once(
+                    "RoPE+KVCache fusion not enabled for a layer: "
+                    "head_size_v=%d differs from head_size=%d. "
+                    "Falling back to the unfused path.",
+                    layer.head_size_v,
+                    layer.head_size,
+                )
+                continue
+            shape = (
+                layer.num_heads,
+                layer.num_kv_heads,
+                layer.head_size,
+                layer.head_size_v,
+            )
+            if _USE_LAYERNAME:
+                if shape in registered:
+                    continue
+                registered.add(shape)
+            q_out = getattr(layer.impl, "fused_rope_kvcache_q_out", False)
+            for is_neox in [True, False]:
+                if _supports_static_q_fp8_quant_fusion() and not q_out:
+                    RopeStaticQQuantKVCachePattern(
                         layer=layer,
                         is_neox=is_neox,
                     ).register(self.patterns)
-                if _USE_LAYERNAME:
-                    break
+                RopeReshapeKVCachePattern(
+                    layer=layer,
+                    is_neox=is_neox,
+                    q_out=q_out,
+                ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 

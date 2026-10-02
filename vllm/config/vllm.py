@@ -201,6 +201,17 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
     )
 
 
+def _uses_rdna35_rope_cache(cfg: "VllmConfig") -> bool:
+    """ROCM_ATTN on gfx1151 fuses with its own kernel, without AITER."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import RocmPlatform
+
+    return RocmPlatform.uses_rdna35_rope_cache(cfg)
+
+
 def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     """Enable if rotary embedding custom op is active and
     use_inductor_graph_partition is enabled.
@@ -208,7 +219,7 @@ def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     from vllm._aiter_ops import rocm_aiter_ops
 
     return (
-        rocm_aiter_ops.is_enabled()
+        (rocm_aiter_ops.is_enabled() or _uses_rdna35_rope_cache(cfg))
         and cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
         and (
             cfg.compilation_config.use_inductor_graph_partition
@@ -244,10 +255,11 @@ def enable_mla_dual_rms_norm_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
-    """Enable fused QK-norm + RoPE + KV cache update on ROCm with AITER."""
+    """Enable fused QK-norm + RoPE + KV cache update on ROCm with AITER, or
+    with ROCM_ATTN on gfx1151."""
     from vllm._aiter_ops import rocm_aiter_ops
 
-    if not rocm_aiter_ops.is_enabled():
+    if not (rocm_aiter_ops.is_enabled() or _uses_rdna35_rope_cache(cfg)):
         return False
     return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
 
