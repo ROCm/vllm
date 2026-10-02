@@ -48,6 +48,24 @@ def get_kv_connector_cache_layout():
         logger.info_once(
             "Connectors do not specify a kv cache layout, defaulting to NHD."
         )
+
+    # gfx1151 (Strix Halo): HND keeps each KV head's tokens in one contiguous
+    # run, so a decode workgroup walks its own head instead of striding over
+    # the others.  Measured 1.05-1.07x on the Triton decode kernel across
+    # S=1k..32k, and it is a permutation: page_size_bytes is unchanged, so no
+    # KV cache blocks are lost.  The win scales with the KV head count and is
+    # flat below 8, hence the threshold.
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1151
+
+        if not on_gfx1151():
+            return "NHD"
+        model_config = vllm_config.model_config
+        if model_config is not None:
+            num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+            if num_kv_heads >= 8:
+                return "HND"
+
     return "NHD"
 
 
