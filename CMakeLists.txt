@@ -1591,6 +1591,17 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/gdn_chunked.cu")
   endif()
 
+  # RDNA3.5 decode attention: the variants of csrc/rocm/rdna35_attn/variants.def.
+  # Their code is emitted for gfx1151 only, where they were tuned; other shapes
+  # and devices are served by Triton.
+  set(VLLM_ROCM_HAS_RDNA35_ATTN OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx1151")
+    set(VLLM_ROCM_HAS_RDNA35_ATTN ON)
+    include(cmake/rdna35_attn.cmake)
+    rdna35_attn_sources(VLLM_RDNA35_ATTN_SRC)
+    list(APPEND VLLM_ROCM_EXT_SRC ${VLLM_RDNA35_ATTN_SRC})
+  endif()
+
   define_extension_target(
     _rocm_C
     DESTINATION vllm
@@ -1638,6 +1649,9 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(VLLM_ROCM_HAS_GDN_CHUNKED)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GDN_CHUNKED)
+  endif()
+  if(VLLM_ROCM_HAS_RDNA35_ATTN)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_RDNA35_ATTN)
   endif()
 endif()
 

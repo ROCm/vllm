@@ -142,6 +142,15 @@ void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                  torch::Tensor& cu_seqlens, torch::Tensor& out,
                  torch::Tensor& final_state, double scale);
 
+// RDNA3.5 decode attention, the variants of rdna35_attn/variants.def: the
+// index of a variant's key (-1 if not built), and a launch by that index.
+int64_t rdna35_decode_variant(torch::IntArrayRef key);
+void rdna35_decode_attn(int64_t variant, torch::Tensor& q,
+                        torch::Tensor& kv_cache, torch::Tensor& block_table,
+                        torch::Tensor& out, torch::Tensor& acc,
+                        torch::Tensor& m, torch::Tensor& l, torch::Tensor& cnt,
+                        torch::Tensor& seq_lens, double scale);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
