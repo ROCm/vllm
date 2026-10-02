@@ -151,6 +151,20 @@ void rdna35_decode_attn(int64_t variant, torch::Tensor& q,
                         torch::Tensor& m, torch::Tensor& l, torch::Tensor& cnt,
                         torch::Tensor& seq_lens, double scale);
 
+// RDNA3.5 decode: optional q/k RMSNorm, NeoX RoPE, optional weightless V norm
+// and the K/V write into the packed paged cache, in one launch.  Q and K are
+// rotated in place unless q_out / k_out are given.
+void rdna35_rope_cache(
+    torch::Tensor& positions, torch::Tensor& q, std::optional<torch::Tensor> k,
+    std::optional<torch::Tensor> v, std::optional<torch::Tensor> cos_sin_cache,
+    std::optional<torch::Tensor> q_weight,
+    std::optional<torch::Tensor> k_weight, bool v_norm, double eps,
+    int64_t pos_offset, double q_scale_beta, int64_t q_scale_orig_max,
+    std::optional<torch::Tensor> kv_cache,
+    std::optional<torch::Tensor> slot_mapping,
+    std::optional<torch::Tensor> q_out, std::optional<torch::Tensor> k_out,
+    std::optional<torch::Tensor> v_out);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,

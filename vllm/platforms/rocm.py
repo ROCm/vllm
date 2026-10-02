@@ -943,6 +943,8 @@ class RocmPlatform(Platform):
         # Default dispatch to rocm's sparse_attn_indexer implementation
         compilation_config.custom_ops.append("+sparse_attn_indexer")
 
+        cls._rdna35_rope_kvcache_defaults(vllm_config)
+
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
         from vllm.config.compilation import CUDAGraphMode
@@ -970,6 +972,88 @@ class RocmPlatform(Platform):
 
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
+    @classmethod
+    def uses_rdna35_rope_cache(cls, vllm_config: "VllmConfig") -> bool:
+        """Whether the RoPE + KV cache fusion passes would hand this model's
+        attention to rdna35_rope_cache: the build has it, the activations and
+        the KV cache are fp16 or bf16, and ROCM_ATTN (on gfx1151, the RDNA3.5
+        kernel) is the backend the model's attention resolves to."""
+        from vllm.v1.attention.ops.rdna35_rope_cache import (
+            rdna35_rope_cache_available,
+        )
+        from vllm.v1.attention.selector import AttentionSelectorConfig
+
+        model_config = vllm_config.model_config
+        if not on_gfx1151() or model_config is None or model_config.use_mla:
+            return False
+        if not rdna35_rope_cache_available():
+            logger.warning_once(
+                "_rocm_C has no rdna35_rope_cache (built for another arch?); "
+                "RoPE + KV cache fusion not enabled on gfx1151."
+            )
+            return False
+        cache_config = vllm_config.cache_config
+        if model_config.dtype not in (torch.float16, torch.bfloat16) or (
+            cache_config.cache_dtype not in ("auto", "float16", "bfloat16")
+        ):
+            return False
+        kv_transfer = vllm_config.kv_transfer_config
+        selector = AttentionSelectorConfig(
+            head_size=model_config.get_head_size(),
+            dtype=model_config.dtype,
+            kv_cache_dtype=cache_config.cache_dtype,
+            block_size=(
+                cache_config.block_size
+                if cache_config.user_specified_block_size
+                else None
+            ),
+            use_kv_connector=(
+                kv_transfer is not None and kv_transfer.is_kv_transfer_instance
+            ),
+        )
+        rocm_attn = AttentionBackendEnum.ROCM_ATTN
+        capability = cls.get_device_capability()
+        assert capability is not None
+        selected = vllm_config.attention_config.backend
+        if selected is not None:
+            return selected == rocm_attn and not (
+                rocm_attn.get_class().validate_configuration(
+                    device_capability=capability, **selector._asdict()
+                )
+            )
+        valid, _ = cls.get_valid_backends(capability, selector)
+        return bool(valid) and min(valid, key=lambda b: b[1])[0] == rocm_attn
+
+    @classmethod
+    def _rdna35_rope_kvcache_defaults(cls, vllm_config: "VllmConfig") -> None:
+        """What the fusion passes need to reach rdna35_rope_cache: the rotary
+        custom op, which is what they match, and the cache update inside the
+        compiled graph rather than a split point.  The passes themselves are
+        turned on by the optimization-level defaults (config/vllm.py); any of
+        these settings the user gave is kept."""
+        from vllm.config.compilation import CompilationMode
+        from vllm.config.vllm import OptimizationLevel
+
+        cc = vllm_config.compilation_config
+        pc = cc.pass_config
+        # Explicitly on, or left to defaults that turn it on (O2 and up).
+        by_default = vllm_config.optimization_level >= OptimizationLevel.O2
+        flags = (pc.fuse_rope_kvcache, pc.fuse_qk_norm_rope_kvcache)
+        if not any(f or (f is None and by_default) for f in flags):
+            return
+        if cc.mode not in (None, CompilationMode.VLLM_COMPILE):
+            return
+        if "-rotary_embedding" in cc.custom_ops:
+            return
+        if not cls.uses_rdna35_rope_cache(vllm_config):
+            return
+        if "+rotary_embedding" not in cc.custom_ops:
+            cc.custom_ops.append("+rotary_embedding")
+        if cc.splitting_ops is None and not cc.use_inductor_graph_partition:
+            # Split at attention only: the default also splits at the cache
+            # update, which leaves RoPE and the write in different graphs.
+            cc.splitting_ops = list(cc._attention_ops)
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:

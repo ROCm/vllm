@@ -1599,7 +1599,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     set(VLLM_ROCM_HAS_RDNA35_ATTN ON)
     include(cmake/rdna35_attn.cmake)
     rdna35_attn_sources(VLLM_RDNA35_ATTN_SRC)
-    list(APPEND VLLM_ROCM_EXT_SRC ${VLLM_RDNA35_ATTN_SRC})
+    list(APPEND VLLM_ROCM_EXT_SRC ${VLLM_RDNA35_ATTN_SRC}
+      "csrc/rocm/rdna35_rope_cache.cu")
   endif()
 
   define_extension_target(

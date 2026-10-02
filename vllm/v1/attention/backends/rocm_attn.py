@@ -12,9 +12,11 @@ from typing import Any, ClassVar
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
+from vllm.ir import ops as ir_ops
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -57,6 +59,10 @@ from vllm.v1.attention.ops.rdna35_hip_decode import (
     make_scratch,
     scratch_bytes,
     variant_for,
+)
+from vllm.v1.attention.ops.rdna35_rope_cache import (
+    rdna35_rope_cache,
+    rdna35_rope_cache_available,
 )
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash,
@@ -902,6 +908,174 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
         self._launch(built, kv_cache, args)
         return output
 
+    # The fusion passes (fuse_rope_kvcache, fuse_qk_norm_rope_kvcache) hand
+    # RoPE, the q/k RMSNorm and the cache write to rdna35_rope_cache, one
+    # launch instead of Inductor's norm/RoPE kernels plus the Triton writer.
+    # Head sizes the kernel is built for, read by the qk-norm pass.
+    fused_qk_norm_rope_kvcache_head_sizes: ClassVar[tuple[int, ...]] = (
+        64,
+        96,
+        128,
+        256,
+        512,
+    )
+    # The kernel applies Gemma 4's weightless V norm before the write, and
+    # writes the normalised V to the v_out the pass hands attention.
+    fused_qk_norm_rope_kvcache_v_norm: ClassVar[bool] = True
+    # The decode kernel reads a contiguous query: RoPE writes it to a buffer of
+    # its own rather than back into the strided qkv view.
+    fused_rope_kvcache_q_out: ClassVar[bool] = True
+
+    def _fused_rope_cache_supported(self) -> bool:
+        return (
+            rdna35_rope_cache_available()
+            and self.attn_type == AttentionType.DECODER
+            and self._kv_quant_mode == KVQuantMode.NONE
+            and self.head_size in self.fused_qk_norm_rope_kvcache_head_sizes
+        )
+
+    def fused_rope_kvcache_supported(self) -> bool:
+        return self._fused_rope_cache_supported()
+
+    def fused_qk_norm_rope_kvcache_supported(self) -> bool:
+        return self._fused_rope_cache_supported()
+
+    @staticmethod
+    def _fused_rejection(
+        x: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        q_weight: torch.Tensor | None = None,
+        k_weight: torch.Tensor | None = None,
+    ) -> str | None:
+        """Why rdna35_rope_cache cannot take this call, or None.  It runs NeoX
+        RoPE and reads one element type for activations, cache and cos/sin,
+        with norm weights in that type (RMSNorm) or fp32 (GemmaRMSNorm's
+        1 + w), both the same."""
+        if not is_neox:
+            return "GPT-J (non-NeoX) RoPE"
+        if kv_cache.dtype != x.dtype or cos_sin_cache.dtype != x.dtype:
+            return (
+                f"a {kv_cache.dtype} cache or {cos_sin_cache.dtype} cos/sin "
+                f"with {x.dtype} activations"
+            )
+        if (
+            q_weight is not None
+            and k_weight is not None
+            and (
+                q_weight.dtype not in (x.dtype, torch.float32)
+                or k_weight.dtype != q_weight.dtype
+            )
+        ):
+            return f"{q_weight.dtype}/{k_weight.dtype} norm weights"
+        return None
+
+    @staticmethod
+    def _warn_unfused(reason: str) -> None:
+        logger.warning_once(
+            "ROCM_ATTN (gfx1151): rdna35_rope_cache does not take %s; running the "
+            "unfused RoPE and KV cache write.",
+            reason,
+        )
+
+    def do_rope_and_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+        q_out: torch.Tensor | None = None,
+        k_out: torch.Tensor | None = None,
+    ) -> None:
+        t, d = query.shape[0], self.head_size
+        q, k, v = query.view(t, -1, d), key.view(t, -1, d), value.view(t, -1, d)
+        if q_out is not None:
+            q_out = q_out.view(t, -1, d)
+        if k_out is not None:
+            k_out = k_out.view(t, -1, d)
+        reason = self._fused_rejection(query, is_neox, kv_cache, cos_sin_cache)
+        if reason is not None:
+            self._warn_unfused(reason)
+            ops.rotary_embedding(positions, query, key, d, cos_sin_cache, is_neox)
+            self.do_kv_cache_update(layer, key, value, kv_cache, layer_slot_mapping)
+            if q_out is not None:
+                q_out.copy_(q)
+            if k_out is not None:
+                k_out.copy_(k)
+            return
+        rdna35_rope_cache(
+            positions,
+            q,
+            k,
+            v,
+            kv_cache,
+            layer_slot_mapping,
+            cos_sin_cache,
+            q_out=q_out,
+            k_out=k_out,
+        )
+
+    def do_qk_norm_rope_kvcache_update(
+        self,
+        layer: torch.nn.Module,
+        qkv: torch.Tensor,
+        q_out: torch.Tensor,
+        k_out: torch.Tensor,
+        positions: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        rms_norm_eps: float,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        kv_cache: torch.Tensor,
+        layer_slot_mapping: torch.Tensor,
+        v_norm: bool = False,
+        v_out: torch.Tensor | None = None,
+    ) -> None:
+        t, d = qkv.shape[0], self.head_size
+        hq, hkv = self.num_heads, self.num_kv_heads
+        q, k, v = (
+            x.view(t, -1, d) for x in qkv.split([hq * d, hkv * d, hkv * d], dim=-1)
+        )
+        q_out, k_out = q_out.view(t, hq, d), k_out.view(t, hkv, d)
+        reason = self._fused_rejection(
+            qkv, is_neox, kv_cache, cos_sin_cache, q_weight, k_weight
+        )
+        if reason is not None:
+            self._warn_unfused(reason)
+            # The unfused ops, in the order the model applies them.
+            q_out.copy_(ir_ops.rms_norm(q, q_weight, rms_norm_eps))
+            k_out.copy_(ir_ops.rms_norm(k, k_weight, rms_norm_eps))
+            ops.rotary_embedding(positions, q_out, k_out, d, cos_sin_cache, is_neox)
+            if v_norm:
+                v = ir_ops.rms_norm(v, None, rms_norm_eps)
+            self.do_kv_cache_update(layer, k_out, v, kv_cache, layer_slot_mapping)
+            if v_out is not None:
+                v_out.copy_(v)
+            return
+        rdna35_rope_cache(
+            positions,
+            q,
+            k,
+            v,
+            kv_cache,
+            layer_slot_mapping,
+            cos_sin_cache,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            v_norm=v_norm,
+            eps=rms_norm_eps,
+            q_out=q_out,
+            k_out=k_out,
+            v_out=None if v_out is None else v_out.view(t, hkv, d),
+        )
+
     def _split_mixed(
         self,
         layer: torch.nn.Module,
@@ -973,11 +1147,17 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
 
     def _launch(self, built: _Built, kv_cache: torch.Tensor, kwargs: dict) -> None:
         module, (acc, softmax_max, softmax_sum, arrivals) = built
+        # The kernel reads a contiguous query.  The rotary custom op rotates
+        # the qkv view in place, so without the RoPE+cache fusion (or past its
+        # token range) the query arrives strided.
+        q = kwargs["q"]
+        if not q.is_contiguous():
+            q = q.contiguous()
         # Called directly rather than through a registered custom op: this path
         # is exercised under CUDA-graph capture, not torch.compile, so the op
         # wrapper would only add indirection inside the region being measured.
         module.decode_attn(
-            kwargs["q"],
+            q,
             kv_cache,
             kwargs["block_table"],
             kwargs["out"],

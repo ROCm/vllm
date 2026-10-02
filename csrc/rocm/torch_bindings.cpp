@@ -188,6 +188,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor block_table, Tensor! out, Tensor! acc, Tensor! m, Tensor! l, "
       "Tensor! cnt, Tensor seq_lens, float scale) -> ()");
   rocm_ops.impl("rdna35_decode_attn", torch::kCUDA, &rdna35_decode_attn);
+
+  // Decode Q/K norm + RoPE + K/V cache write, fused (RDNA3.5).
+  rocm_ops.def(
+      "rdna35_rope_cache(Tensor positions, Tensor(a!) q, Tensor(b!)? k, "
+      "Tensor? v, Tensor? cos_sin_cache, Tensor? q_weight, "
+      "Tensor? k_weight, bool v_norm, float eps, int pos_offset, "
+      "float q_scale_beta, int q_scale_orig_max, Tensor(c!)? kv_cache, "
+      "Tensor? slot_mapping, Tensor(d!)? q_out, Tensor(e!)? k_out, "
+      "Tensor(f!)? v_out=None) -> ()");
+  rocm_ops.impl("rdna35_rope_cache", torch::kCUDA, &rdna35_rope_cache);
 #endif
 
   // W4A16 MoE prefill WMMA GEMM for AMD RDNA3 (gfx11). Always registered; the
