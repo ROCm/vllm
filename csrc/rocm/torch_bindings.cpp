@@ -179,6 +179,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gdn_chunked", torch::kCUDA, &gdn_chunked);
 #endif
 
+#ifdef VLLM_ROCM_RDNA35_ATTN
+  // RDNA3.5 decode attention (gfx1151): the variants built into the wheel.
+  rocm_ops.def("rdna35_decode_variant(int[] key) -> int",
+               &rdna35_decode_variant);
+  rocm_ops.def(
+      "rdna35_decode_attn(int variant, Tensor q, Tensor kv_cache, "
+      "Tensor block_table, Tensor! out, Tensor! acc, Tensor! m, Tensor! l, "
+      "Tensor! cnt, Tensor seq_lens, float scale) -> ()");
+  rocm_ops.impl("rdna35_decode_attn", torch::kCUDA, &rdna35_decode_attn);
+#endif
+
   // W4A16 MoE prefill WMMA GEMM for AMD RDNA3 (gfx11). Always registered; the
   // kernel body is gfx11-only (stub elsewhere) and Python gates calls on
   // on_gfx1x(). Mutates c in place; an unsupported shape raises via TORCH_CHECK

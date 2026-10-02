@@ -146,9 +146,10 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
         )
 
     def _create_draft_vllm_config(self) -> VllmConfig:
-        """Preserve the target's forced TRITON_ATTN backend for draft layers.
+        """Preserve the target's forced backend for draft layers.
 
-        Gemma4 forces TRITON_ATTN due to heterogeneous head dimensions
+        Gemma4 forces TRITON_ATTN (ROCM_ATTN on gfx1151) due to
+        heterogeneous head dimensions
         (head_dim=256 sliding, global_head_dim=512 full). The base class
         resets attention_config.backend to None for draft models, causing
         sliding layers to fall back to FLASH_ATTN which cannot handle

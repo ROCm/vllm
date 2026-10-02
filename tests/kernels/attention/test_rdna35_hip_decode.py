@@ -1,0 +1,634 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""RDNA3.5 HIP decode attention: agreement with a reference, and honest fallback.
+
+The kernel walks the paged KV cache with its own address arithmetic rather than
+reading the tensor's strides, so a layout it did not expect yields finite,
+wrong numbers instead of an error. These tests therefore cover three things a
+plain tolerance check would miss:
+
+- a short context, where a causal off-by-one is visible. The error from one
+  masked-off-by-one key falls off as ~1/S while the tolerance is fixed, so long
+  contexts hide the bug most likely to be present.
+- a deliberately mutated kernel, which the comparison *must* fail. A test that
+  passes a known-broken kernel proves nothing about the working one. It also
+  exercises two variants in one process, which only works because each build
+  gets its own device-function symbols.
+- that an unsupported shape falls back to Triton rather than being served
+  wrong.
+"""
+
+import pytest
+import torch
+
+from vllm.platforms import current_platform
+
+pytestmark = pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
+
+rdna35 = pytest.importorskip("vllm.v1.attention.ops.rdna35_hip_decode")
+
+HQ, HKV, HEAD_DIM, M, BLOCK_SIZE = 32, 16, 256, 4, 16
+# Partials big enough (256 KiB per group) for the segments to share the merge,
+# on a grid small enough (32 workgroups) to be resident at once, which the
+# host requires before it lets them wait for each other.
+SHARED = dict(hq=16, hkv=2, hd=512, rg=2, nseg=8)
+# Four row tiles per kv head, split over the waves that share each key tile
+# (RSPL).  With nw=4 there is one tile per workgroup, so no merge round orders
+# the waves' rows before they are published; nseg=16 makes the merge shared.
+RSPL = {
+    "one tile, shared merge": dict(hq=32, hkv=2, hd=128, rspl=4, nw=4, nseg=16),
+    "two tiles": dict(hq=32, hkv=2, hd=128, rspl=4, nw=8, nseg=4),
+    "with dspl": dict(hq=32, hkv=2, hd=128, rspl=2, nw=8, dspl=2, rg=2, nseg=4),
+    # Not a row split: unshared tiles with the next tile's loads in flight.
+    "prefetch": dict(hq=16, hkv=2, hd=64, rg=2, nw=4, pf=1, nseg=8),
+    # One live tile after the merge's tree, its partials staged in LDS.
+    "staged publish": dict(hq=8, hkv=1, hd=256, rspl=2, nw=4, pf=1, cpub=1, nseg=16),
+    # Unshared tiles with V staged in LDS, the next tile's loads before this
+    # one's compute (VINLDS).
+    "v in lds": dict(hq=32, hkv=2, hd=128, rg=4, nw=4, vinlds=1, nseg=4),
+    # ... and with the head dim split over waves, whose score exchange writes
+    # into the K half of each wave's buffer.
+    "v in lds, dspl": dict(hq=16, hkv=8, hd=256, nw=4, dspl=2, vinlds=1, nseg=2),
+    # Not WMMA at all: the per-q-head dot-product decomposition.
+    "dot": dict(hq=16, hkv=2, hd=256, nw=8, dot=1, bfly=4, nseg=2),
+}
+# Sliding windows: the WMMA path with and without segments, and the dot path.
+# 1000 keys starts the window off any tile and page boundary.
+WINDOWED = {
+    "wmma": dict(hq=16, hkv=8, hd=256, nw=4, window=1000, nseg=1),
+    "wmma segments": dict(hq=8, hkv=1, hd=256, nw=4, rg=2, window=512, nseg=8),
+    "dot": dict(hq=8, hkv=2, hd=256, nw=8, dot=1, bfly=4, window=1000, nseg=2),
+}
+# Relative error bound per dtype.  The reference sees the same rounded inputs,
+# so what differs is the kernel's arithmetic and its output rounding -- the
+# latter alone up to 2^-8 relative in bf16.
+TOL = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
+DTYPES = list(TOL)
+
+
+def _skip_unless_gfx1151():
+    from vllm.platforms.rocm import on_gfx1151
+
+    if not on_gfx1151():
+        pytest.skip("kernel is built for gfx1151")
+
+
+@pytest.fixture(scope="session")
+def _jit():
+    """The kernel tests build variants of their own -- layouts, segment
+    counts, a mutated kernel -- which only the JIT loader does.  The tests of
+    the variants built into _rocm_C turn it back off."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("VLLM_RDNA35_ATTN_JIT", "1")
+        yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _build_variants(_jit):
+    """Build the variants this module needs before any test runs.
+
+    They are independent builds of ~19.6 s each, almost all of it torch's
+    headers rather than the kernel, so serially they were the whole runtime of
+    the suite on a cold cache. Built together it is one build's worth.
+
+    Not a correctness concern: a build that fails here fails again in the test
+    that needs it, where it is reported against that test rather than as a
+    collection error.
+    """
+    from vllm.platforms.rocm import on_gfx1151
+
+    if not on_gfx1151():
+        return
+    rdna35.precompile(
+        v
+        for dtype in DTYPES
+        for v in (
+            _variant(layout=0, dtype=dtype),
+            _variant(layout=1, dtype=dtype),
+            _variant(layout=0, nseg=4, dtype=dtype),
+            _variant(layout=1, nseg=4, dtype=dtype),
+            _variant(layout=1, mutate=1, dtype=dtype),
+            _variant(**SHARED, dtype=dtype),
+            *(_variant(**shape, dtype=dtype) for shape in RSPL.values()),
+            *(
+                _variant(**{k: v for k, v in shape.items()}, dtype=dtype)
+                for shape in WINDOWED.values()
+            ),
+            *(
+                _variant(
+                    **{k: v for k, v in shape.items() if k != "nseg"},
+                    nseg=shape["nseg"],
+                    dtype=dtype,
+                    batch=1,
+                )
+                for shape in BATCHED.values()
+            ),
+        )
+    )
+
+
+def _variant(
+    layout: int = 1,
+    mutate: int = 0,
+    nseg: int = 1,
+    hq: int = HQ,
+    hkv: int = HKV,
+    hd: int = HEAD_DIM,
+    rg: int = 1,
+    dtype: torch.dtype = torch.float16,
+    rspl: int = 1,
+    nw: int = 8,
+    dspl: int = 0,
+    pf: int = 0,
+    cpub: int = 0,
+    vinlds: int = 0,
+    dot: int = 0,
+    bfly: int = 0,
+    window: int = 0,
+    batch: int = 0,
+):
+    # nseg > 1 with minb = 1 splits even a short context over several
+    # workgroups, which is the only way to reach the cross-workgroup merge.
+    return rdna35.KernelVariant(
+        head_size=hd,
+        num_q_heads=hq,
+        num_kv_heads=hkv,
+        max_m=M,
+        block_size=BLOCK_SIZE,
+        layout=layout,
+        nseg=nseg,
+        rg=rg,
+        minb=1,
+        mutate=mutate,
+        dtype=dtype,
+        rspl=rspl,
+        nw=nw,
+        dspl=dspl,
+        pf=pf,
+        cpub=cpub,
+        vinlds=vinlds,
+        dot=dot,
+        bfly=bfly,
+        window=window,
+        batch=batch,
+    )
+
+
+def _paged_inputs(
+    seq_len: int,
+    layout: int,
+    dtype: torch.dtype,
+    seed: int = 0,
+    hq: int = HQ,
+    hkv: int = HKV,
+    hd: int = HEAD_DIM,
+    m: int = M,
+    bs: int = BLOCK_SIZE,
+):
+    """Build a KV cache whose physical order matches the layout, then present
+    it in the logical (num_blocks, num_kv_heads, block_size, 2*hs) order the
+    backend passes down.  The last page may be partly filled."""
+    torch.manual_seed(seed)
+    dev = torch.device("cuda")
+    num_blocks = -(-seq_len // bs)
+    if layout == 0:  # NHD
+        kv = torch.randn(num_blocks, bs, hkv, 2 * hd, device=dev, dtype=dtype)
+        kv = kv.transpose(1, 2)
+    else:  # HND
+        kv = torch.randn(num_blocks, hkv, bs, 2 * hd, device=dev, dtype=dtype)
+    kv = kv * 0.5
+    q = torch.randn(m, hq, hd, device=dev, dtype=dtype) * 0.5
+    return q, kv, torch.arange(num_blocks, device=dev, dtype=torch.int32)
+
+
+def _reference(q, kv, seq_len, window=0):
+    m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
+    flat = kv.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len]
+    k, v = flat[..., :hd], flat[..., hd:]
+    gqa = hq // hkv
+    qf = q.float().permute(1, 0, 2)
+    kf = k.float().permute(1, 0, 2).repeat_interleave(gqa, 0)
+    vf = v.float().permute(1, 0, 2).repeat_interleave(gqa, 0)
+    scores = torch.bmm(qf, kf.transpose(1, 2)) * (hd**-0.5)
+    pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
+    lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
+    masked = pos > lim
+    if window:
+        masked |= pos < lim - (window - 1)
+    scores = scores.masked_fill(masked.view(1, m, seq_len), float("-inf"))
+    return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
+
+
+def _run(
+    seq_len,
+    layout=1,
+    dtype=torch.float16,
+    mutate=0,
+    nseg=1,
+    repeat=1,
+    build_dtype=None,
+    free_before_window=False,
+    **shape,
+):
+    _skip_unless_gfx1151()
+    dims = {k: v for k, v in shape.items() if k in ("hq", "hkv", "hd")}
+    q, kv, block_table = _paged_inputs(seq_len, layout, dtype, **dims)
+    variant = _variant(layout, mutate, nseg, dtype=build_dtype or dtype, **shape)
+    window = shape.get("window", 0)
+    ref = _reference(q, kv, seq_len, window)
+    if free_before_window:
+        # vLLM frees the pages no query's window reaches and points their
+        # table entries elsewhere: here, at a page of NaN the kernel must never
+        # let into the output.
+        assert layout == 1
+        first = max(0, seq_len - M - (window - 1)) // BLOCK_SIZE
+        kv = torch.cat([kv, torch.full_like(kv[:1], float("nan"))])
+        block_table = block_table.clone()
+        block_table[:first] = kv.shape[0] - 1
+    module = rdna35.load(variant)
+    acc, m, ln, arrivals = rdna35.make_scratch(variant, q.device)
+    out = torch.empty_like(q)
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+    for _ in range(repeat):
+        out.zero_()
+        module.decode_attn(
+            q, kv, block_table, out, acc, m, ln, arrivals, seq_lens, q.shape[2] ** -0.5
+        )
+    torch.accelerator.synchronize()
+    return out.float(), ref
+
+
+def _max_rel(got, ref) -> float:
+    """Relative error with a floor, which is what catches a causal off-by-one.
+
+    max_abs alone does not: one key masked wrongly gives max_abs=1.2e-03 at S=2048
+    and slips past a 2e-2 absolute threshold.
+    """
+    return ((got - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seq_len", [48, 1024])
+@pytest.mark.parametrize("layout", [0, 1])
+@pytest.mark.parametrize("nseg", [1, 4])
+def test_matches_reference(seq_len, layout, nseg, dtype):
+    got, ref = _run(seq_len, layout=layout, nseg=nseg, dtype=dtype)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_split_merge_survives_relaunch(dtype):
+    """The arrival counters must be back at zero after every launch.
+
+    The last workgroup to arrive resets them; if it did not, the second launch
+    would elect no merger and leave the output unwritten.
+    """
+    got, ref = _run(1024, nseg=4, repeat=3, dtype=dtype)
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seq_len", [48, 1024])
+def test_shared_split_merge(seq_len, dtype):
+    """Segments that wait for each other and merge a slice each.
+
+    Relaunched, because the wait is on a generation that must keep advancing:
+    one stuck at the value a later launch reads first would release nobody.
+    """
+    shape = {k: v for k, v in SHARED.items() if k != "nseg"}
+    got, ref = _run(seq_len, nseg=SHARED["nseg"], repeat=3, dtype=dtype, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seq_len", [48, 1024])
+@pytest.mark.parametrize("name", list(RSPL))
+def test_row_tiles_split_over_waves(name, seq_len, dtype):
+    """Waves that share a key tile through LDS and split its rows."""
+    shape = dict(RSPL[name])
+    nseg = shape.pop("nseg")
+    got, ref = _run(seq_len, nseg=nseg, repeat=2, dtype=dtype, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seq_len", [48, 512, 1024, 2000])
+@pytest.mark.parametrize("name", list(WINDOWED))
+def test_sliding_window(name, seq_len, dtype):
+    """Keys before the window are masked; a window wider than S (48, 512 at
+    1000) reads everything and nothing before it."""
+    shape = dict(WINDOWED[name])
+    nseg = shape.pop("nseg")
+    got, ref = _run(seq_len, nseg=nseg, repeat=2, dtype=dtype, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[dtype]
+
+
+@pytest.mark.parametrize("name", list(WINDOWED))
+def test_sliding_window_never_reads_freed_pages(name):
+    """Pages wholly before the window may be freed; their contents must not
+    reach the output even as 0 * NaN.
+
+    S=2016 puts the window's first key late in its WMMA block, so that block's
+    first tile is a whole freed page: with the V zeroing removed the WMMA
+    cases fail.  (The dot path's tiles never leave the first key's page.)
+    """
+    shape = dict(WINDOWED[name])
+    nseg = shape.pop("nseg")
+    got, ref = _run(2016, nseg=nseg, free_before_window=True, **shape)
+    assert torch.isfinite(got).all()
+    assert _max_rel(got, ref) <= TOL[torch.float16]
+
+
+def test_graph_replay_follows_seq_lens():
+    """S is read on the device, so a captured graph serves a longer sequence.
+
+    A host int is frozen into the graph at capture: every replay would attend
+    over the capture-time length, which is what full CUDA-graph decode does.
+    """
+    _skip_unless_gfx1151()
+    long_s = 1024
+    q, kv, block_table = _paged_inputs(long_s, 1, torch.float16)
+    variant = _variant(layout=1, nseg=4)
+    module = rdna35.load(variant)
+    scratch = rdna35.make_scratch(variant, q.device)
+    out = torch.empty_like(q)
+    seq_lens = torch.tensor([48], device=q.device, dtype=torch.int32)
+
+    def launch():
+        module.decode_attn(
+            q, kv, block_table, out, *scratch, seq_lens, q.shape[2] ** -0.5
+        )
+
+    launch()  # warm-up outside the capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for s in (48, 208, long_s):
+        seq_lens.fill_(s)
+        out.zero_()
+        graph.replay()
+        torch.accelerator.synchronize()
+        n = s // BLOCK_SIZE
+        ref = _reference(q, kv[:n], s)
+        assert _max_rel(out.float(), ref) <= TOL[torch.float16], f"S={s}"
+
+
+# One launch over several sequences (grid.y), each with its own length, table
+# row, query rows, output rows and scratch.  S=0 is a CUDA-graph batch padded
+# past its real sequences.
+BATCHED = {
+    "split, last arriver merges": dict(hq=HQ, hkv=HKV, hd=HEAD_DIM, nseg=4),
+    "shared merge": dict(SHARED),
+    "dot": dict(RSPL["dot"]),
+    "window": dict(WINDOWED["wmma segments"]),
+}
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("name", list(BATCHED))
+def test_batch_of_sequences(name, dtype):
+    """Every sequence of a batch matches its own reference, and a padded
+    sequence (S=0) reads nothing and disturbs none of them."""
+    _skip_unless_gfx1151()
+    shape = dict(BATCHED[name])
+    nseg = shape.pop("nseg")
+    _check_batch(
+        _variant(1, 0, nseg, dtype=dtype, batch=1, **shape), [1008, 48, 0, 2016]
+    )
+
+
+def _check_batch(variant, lens):
+    """Launch a batch build over sequences of these lengths and check each
+    against its own reference, twice, a padded one (S=0) left unwritten."""
+    v = variant
+    dims = dict(
+        hq=v.num_q_heads, hkv=v.num_kv_heads, hd=v.head_size, m=v.max_m, bs=v.block_size
+    )
+    width = max(lens) // v.block_size + 1
+    parts = [
+        _paged_inputs(max(s, 16), 1, v.dtype, seed=i, **dims)
+        for i, s in enumerate(lens)
+    ]
+    kv = torch.cat([p[1] for p in parts])
+    first = torch.tensor([0] + [p[1].shape[0] for p in parts]).cumsum(0)
+    bt = torch.zeros(len(lens), width, device=kv.device, dtype=torch.int32)
+    for i, p in enumerate(parts):
+        bt[i, : p[1].shape[0]] = p[2] + int(first[i])
+    q = torch.cat([p[0] for p in parts])
+    module = rdna35.load(v)
+    scratch = rdna35.make_scratch(v, q.device, max_seqs=len(lens))
+    seq_lens = torch.tensor(lens, device=q.device, dtype=torch.int32)
+    out = torch.full_like(q, 7.0)
+    for _ in range(2):
+        module.decode_attn(q, kv, bt, out, *scratch, seq_lens, q.shape[2] ** -0.5)
+    torch.accelerator.synchronize()
+    for i, s in enumerate(lens):
+        rows = out[i * v.max_m : (i + 1) * v.max_m].float()
+        if s == 0:
+            assert (rows == 7.0).all(), f"{v.name}: a padded sequence was written"
+            continue
+        ref = _reference(parts[i][0], parts[i][1], s, v.window)
+        assert _max_rel(rows, ref) <= TOL[v.dtype], f"{v.name}: sequence {i}, S={s}"
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_other_dtype_is_refused_not_miscomputed(dtype):
+    """A build must refuse the other 16-bit type, not return nonsense.
+
+    The loads reinterpret the tensors as the element type the variant was
+    built for, so fp16 read as bf16 or the reverse stays finite and is wrong
+    by orders of magnitude.
+    """
+    other = next(d for d in DTYPES if d != dtype)
+    with pytest.raises(RuntimeError, match="kernel built for"):
+        _run(1024, dtype=dtype, build_dtype=other)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_negative_control_is_detected(dtype):
+    """A kernel mutated to admit one key too many must fail the comparison."""
+    got, ref = _run(48, mutate=1, dtype=dtype)
+    assert _max_rel(got, ref) > TOL[dtype], (
+        "the mutated kernel passed, so this comparison cannot detect a causal "
+        "off-by-one and proves nothing about the real kernel"
+    )
+
+
+def test_layouts_disagree_when_data_differs():
+    """NHD and HND must be distinct code paths, not the same one twice."""
+    assert rdna35.expected_kv_cache_strides(
+        _variant(layout=0)
+    ) != rdna35.expected_kv_cache_strides(_variant(layout=1))
+
+
+def test_unsupported_head_size_falls_back_to_triton():
+    """An unbuilt shape must be served by Triton, not served wrong."""
+    from vllm.v1.attention.backends.rocm_attn import RocmAttentionRdna35Impl
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    impl = RocmAttentionRdna35Impl.__new__(RocmAttentionRdna35Impl)
+    impl._rejected = None
+    # 96 is a real shipped head size (Phi-3.5-vision) and is deliberately not
+    # built: 96/32 is 3 fp16 per lane, which is not a power of two and so has
+    # no single load width. It must fall back, not be served wrong.
+    impl.head_size, impl.num_heads, impl.num_kv_heads = 96, HQ, HKV
+
+    fits = impl._prepare(
+        kv_cache=torch.empty(0, dtype=torch.float16),
+        q=torch.empty(0, dtype=torch.float16),
+        alibi_slopes=None,
+        sinks=None,
+        softcap=0,
+        causal=True,
+        window_size=None,
+        kv_quant_mode=KVQuantMode.NONE,
+        seqused_k=torch.zeros(1),
+        max_seqlen_q=0,
+    )
+    assert not fits
+    assert "head_size 96" in impl._rejected
+
+
+@pytest.mark.parametrize(
+    "nseq, tokens, max_q, reason",
+    [
+        (3, 5, 4, "unequal query length"),  # a prefill mixed with decodes
+        (1, 64, 64, "more than"),  # a prompt: one build per length otherwise
+    ],
+)
+def test_non_decode_batches_fall_back_to_triton(nseq, tokens, max_q, reason):
+    """Only batches of equal, decode-sized query lengths reach the kernel."""
+    from vllm.v1.attention.backends.rocm_attn import RocmAttentionRdna35Impl
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    impl = RocmAttentionRdna35Impl.__new__(RocmAttentionRdna35Impl)
+    impl._rejected = None
+    impl.head_size, impl.num_heads, impl.num_kv_heads = HEAD_DIM, HQ, HKV
+    fits = impl._prepare(
+        kv_cache=torch.empty(0, dtype=torch.float16),
+        q=torch.empty(tokens, HQ, HEAD_DIM, dtype=torch.float16),
+        alibi_slopes=None,
+        sinks=None,
+        softcap=0,
+        causal=True,
+        window_size=None,
+        kv_quant_mode=KVQuantMode.NONE,
+        seqused_k=torch.zeros(nseq),
+        max_seqlen_q=max_q,
+    )
+    assert not fits
+    assert reason in impl._rejected
+
+
+def _built_variants():
+    return rdna35.built_variants()
+
+
+def test_variants_def_matches_the_tables(tmp_path):
+    """variants.def is what _rocm_C is built from.  A table row changed without
+    regenerating it would leave the backend asking for a variant that was
+    never built, and every call of that shape silently on Triton."""
+    path = tmp_path / "variants.def"
+    rdna35.write_variants_def(_built_variants(), path)
+    assert path.read_text() == rdna35.VARIANTS_DEF.read_text(), (
+        "variants.def is stale: python -m vllm.v1.attention.ops.rdna35_hip_decode"
+    )
+
+
+def test_every_listed_variant_is_built_in(monkeypatch):
+    _skip_unless_gfx1151()
+    monkeypatch.delenv("VLLM_RDNA35_ATTN_JIT")
+    missing = [v.name for v in _built_variants() if rdna35._builtin_index(v) < 0]
+    assert not missing, f"{len(missing)} variants not in _rocm_C, e.g. {missing[0]}"
+
+
+@pytest.mark.parametrize(
+    "group", sorted({rdna35.variant_group(v) for v in _built_variants()})
+)
+def test_built_in_variants_match_reference(group, monkeypatch):
+    """Every variant built into _rocm_C, launched through the registry: one
+    sequence past a partial tile, and a batch with a padded sequence.  Windows
+    run past the window, so that it masks; large pages end partly filled."""
+    _skip_unless_gfx1151()
+    monkeypatch.delenv("VLLM_RDNA35_ATTN_JIT")
+    for v in _built_variants():
+        if rdna35.variant_group(v) != group:
+            continue
+        s = max(1024, v.window + 64, v.block_size + 1000)
+        if v.batch:
+            _check_batch(v, [s, 48, 0])
+            continue
+        dims = dict(
+            hq=v.num_q_heads,
+            hkv=v.num_kv_heads,
+            hd=v.head_size,
+            m=v.max_m,
+            bs=v.block_size,
+        )
+        q, kv, block_table = _paged_inputs(s, 1, v.dtype, **dims)
+        module = rdna35.load(v)
+        assert isinstance(module, rdna35._Builtin), v.name
+        out = torch.empty_like(q)
+        module.decode_attn(
+            q,
+            kv,
+            block_table,
+            out,
+            *rdna35.make_scratch(v, q.device),
+            torch.tensor([s], device=q.device, dtype=torch.int32),
+            q.shape[2] ** -0.5,
+        )
+        torch.accelerator.synchronize()
+        ref = _reference(q, kv, s, v.window)
+        assert _max_rel(out.float(), ref) <= TOL[v.dtype], v.name
+
+
+@pytest.mark.parametrize("gfx1151", [True, False])
+def test_rocm_attn_ahead_of_triton_only_on_gfx1151(gfx1151, monkeypatch):
+    """On gfx1151 ROCM_ATTN is this kernel, ahead of Triton, which serves what
+    it does not; the other RDNA targets keep Triton first."""
+    import vllm.platforms.rocm as rocm
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum as B
+
+    monkeypatch.setattr(rocm, "on_gfx1x", lambda: True)
+    monkeypatch.setattr(rocm, "on_gfx1151", lambda: gfx1151)
+    order = rocm._get_backend_priorities(use_mla=False, use_sparse=False)
+    assert (order.index(B.ROCM_ATTN) < order.index(B.TRITON_ATTN)) == gfx1151
+
+
+@pytest.mark.parametrize("gfx1151", [True, False])
+def test_rocm_attn_layout_and_impl_only_on_gfx1151(gfx1151, monkeypatch):
+    """On gfx1151 ROCM_ATTN runs this kernel on Triton's packed HND cache;
+    elsewhere it keeps its own cache and impl.  ROCM_AITER_UNIFIED_ATTN, its
+    subclass, keeps its own on both."""
+    import vllm.platforms.rocm as rocm
+    from vllm.v1.attention.backends import rocm_attn
+    from vllm.v1.attention.backends.rocm_aiter_unified_attn import (
+        RocmAiterUnifiedAttentionBackend as Aiter,
+    )
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+    monkeypatch.setattr(rocm, "on_gfx1151", lambda: gfx1151)
+    backend = rocm_attn.RocmAttentionBackend
+    shape = backend.get_kv_cache_shape(8, 16, HKV, HEAD_DIM)
+    if gfx1151:
+        assert backend.get_impl_cls() is rocm_attn.RocmAttentionRdna35Impl
+        assert backend.get_builder_cls() is rocm_attn.RocmAttentionRdna35MetadataBuilder
+        assert shape == TritonAttentionBackend.get_kv_cache_shape(8, 16, HKV, HEAD_DIM)
+        assert backend.get_required_kv_cache_layout() == "HND"
+        assert 512 in backend.get_supported_head_sizes()
+    else:
+        assert backend.get_impl_cls() is rocm_attn.RocmAttentionImpl
+        assert shape == (2, 8, 16, HKV, HEAD_DIM)
+        assert backend.get_required_kv_cache_layout() is None
+        assert 512 not in backend.get_supported_head_sizes()
+        with pytest.raises(NotImplementedError):
+            backend.get_kv_cache_stride_order()
+    assert Aiter.get_required_kv_cache_layout() is None
+    assert 512 not in Aiter.get_supported_head_sizes()
+    with pytest.raises(NotImplementedError):
+        Aiter.get_kv_cache_stride_order()

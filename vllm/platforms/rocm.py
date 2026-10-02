@@ -515,7 +515,13 @@ def _get_backend_priorities(
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     allow_rocm_attn = not use_kv_connector
-    if on_gfx1x():
+    if on_gfx1151():
+        # ROCM_ATTN on gfx1151 is the RDNA3.5 HIP decode kernel, with
+        # TRITON_ATTN's kernels for every call it does not cover.
+        if allow_rocm_attn:
+            backends.append(AttentionBackendEnum.ROCM_ATTN)
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
+    elif on_gfx1x():
         # On RDNA (gfx11/gfx12), TRITON_ATTN is faster than ROCM_ATTN
         # because ROCM_ATTN's custom paged attention kernel falls back
         # to Triton internally with extra overhead.
