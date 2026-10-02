@@ -35,6 +35,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import torch
 import yaml
 from rich.console import Console
 from tqdm import tqdm
@@ -688,6 +689,25 @@ def main():
 
     # Model config
     parser.add_argument("--num-layers", type=int, default=10, help="Number of layers")
+    parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+        help="Q/K/V and output dtype.",
+    )
+    parser.add_argument(
+        "--min-working-set-mb",
+        type=float,
+        default=None,
+        help=(
+            "Grow --num-layers until the KV working set reaches this many MB. "
+            "The layer loop walks one KV cache per layer, so it doubles as a "
+            "rotation over disjoint KV; without this a small model at a short "
+            "context can stay resident in a large last-level cache and report "
+            "bandwidth the memory system cannot sustain. Suggested value on "
+            "Strix Halo (32 MiB MALL): 96."
+        ),
+    )
     parser.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     parser.add_argument("--num-q-heads", type=int, default=32, help="Query heads")
     parser.add_argument("--num-kv-heads", type=int, default=8, help="KV heads")
@@ -1087,6 +1107,8 @@ def main():
                         backend=decode_backend,
                         batch_spec=spec,
                         num_layers=args.num_layers,
+                        dtype=getattr(torch, args.dtype),
+                        min_working_set_mb=args.min_working_set_mb,
                         head_dim=args.head_dim,
                         num_q_heads=args.num_q_heads,
                         num_kv_heads=args.num_kv_heads,
@@ -1157,6 +1179,8 @@ def main():
                         backend=backend,  # Will be overridden later
                         batch_spec=batch_spec,
                         num_layers=args.num_layers,
+                        dtype=getattr(torch, args.dtype),
+                        min_working_set_mb=args.min_working_set_mb,
                         head_dim=args.head_dim,
                         num_q_heads=args.num_q_heads,
                         num_kv_heads=args.num_kv_heads,
@@ -1426,6 +1450,8 @@ def main():
                             backend=f"{backend}_{variant_label}",
                             batch_spec=spec,
                             num_layers=args.num_layers,
+                            dtype=getattr(torch, args.dtype),
+                            min_working_set_mb=args.min_working_set_mb,
                             head_dim=args.head_dim,
                             num_q_heads=args.num_q_heads,
                             num_kv_heads=args.num_kv_heads,
@@ -1500,6 +1526,8 @@ def main():
         # Model parameter sweep
         base_config_args = {
             "num_layers": args.num_layers,
+            "dtype": getattr(torch, args.dtype),
+            "min_working_set_mb": args.min_working_set_mb,
             "head_dim": args.head_dim,
             "v_head_dim": args.v_head_dim,
             "num_q_heads": args.num_q_heads,
@@ -1532,6 +1560,8 @@ def main():
         # Unified parameter sweep
         base_config_args = {
             "num_layers": args.num_layers,
+            "dtype": getattr(torch, args.dtype),
+            "min_working_set_mb": args.min_working_set_mb,
             "head_dim": args.head_dim,
             "v_head_dim": args.v_head_dim,
             "num_q_heads": args.num_q_heads,
@@ -1573,6 +1603,8 @@ def main():
                             backend=backend,
                             batch_spec=spec,
                             num_layers=args.num_layers,
+                            dtype=getattr(torch, args.dtype),
+                            min_working_set_mb=args.min_working_set_mb,
                             head_dim=args.head_dim,
                             v_head_dim=getattr(args, "v_head_dim", None),
                             num_q_heads=args.num_q_heads,
@@ -1649,6 +1681,8 @@ def main():
                             backend=decode_backend,
                             batch_spec=spec,
                             num_layers=args.num_layers,
+                            dtype=getattr(torch, args.dtype),
+                            min_working_set_mb=args.min_working_set_mb,
                             head_dim=args.head_dim,
                             num_q_heads=args.num_q_heads,
                             num_kv_heads=args.num_kv_heads,
