@@ -1230,6 +1230,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 f"n_shared_experts == 1, got {self.config.n_shared_experts}"
             )
 
+        # 95.8% of this loop's wall clock is the two expert_data.copy_ calls
+        # it reaches through param.weight_loader. The pool sizes itself from
+        # OMP_NUM_THREADS and declines under expert parallelism.
+        from vllm.model_executor.layers.fused_moe.rocm_multi_thread_moe_loader import (
+            make_pool as _make_moe_loader_pool,
+        )
+
+        _moe_pool = _make_moe_loader_pool(self)
+
         for name, loaded_weight in weights:
             # Shared-expert fusion: redirect ``.ffn.shared_experts.w{1,2,3}``
             # into appended routed-expert slot ``.ffn.experts.{n_routed}``
@@ -1284,6 +1293,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         weight_loader = typing.cast(
                             Callable[..., bool], param.weight_loader
                         )
+                        if _moe_pool.active:
+                            # The call runs on a worker, so its return value
+                            # cannot steer this loop; it is checked at drain
+                            # instead. Sound only without EP, where every
+                            # expert is local and a name-matched mapping
+                            # always succeeds -- make_pool refuses otherwise.
+                            _moe_pool.submit(
+                                weight_loader,
+                                param,
+                                loaded_weight,
+                                name_mapped,
+                                shard_id=expert_shard_id,
+                                expert_id=expert_id,
+                                return_success=True,
+                            )
+                            name = name_mapped
+                            break
                         success = weight_loader(
                             param,
                             loaded_weight,
@@ -1316,6 +1342,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     weight_loader(param, loaded_weight)
                     loaded_params.add(param_name)
                     continue
+
+        # Every staged expert load has to land before the caller reads any
+        # parameter back. Re-raises whatever a worker raised.
+        _moe_pool.drain()
 
         return loaded_params
 
