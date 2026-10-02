@@ -34,6 +34,7 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 logger = init_logger(__name__)
 
 SUPPORTED_GROUP_SIZES = [32, 64, 128]
+PER_CHANNEL_GROUP_SIZE = -1
 
 
 def _on_gfx12x() -> bool:
@@ -74,6 +75,16 @@ def _on_gfx1151() -> bool:
     from vllm.platforms.rocm import on_gfx1151
 
     return on_gfx1151()
+
+
+def _resolved_group_size(group_size: int, K: int) -> int:
+    """Resolve the -1 per-channel sentinel to K for the Triton prefill path.
+
+    The HIP op keeps -1 as-is and resolves it internally. Triton has no such
+    sentinel, so one group spanning all of K is how per-channel is expressed
+    to it -- a group size of K *is* per-channel.
+    """
+    return K if group_size == PER_CHANNEL_GROUP_SIZE else group_size
 
 
 # Maximum batch size M for the HIP skinny kernel path (C++ supports N_in
@@ -644,7 +655,13 @@ def _group_stride_pad(num_groups: int, elem_bytes: int) -> int:
 def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
     """Re-lay-out ``t`` so each row is ``pad_groups`` columns further apart."""
     if not pad_groups:
-        return t.contiguous()
+        # is_contiguous() ignores a size-1 dim's stride, so a per-channel
+        # scale (a transposed [1, N] view, i.e. [N, 1] with stride(1) == N)
+        # reports contiguous and .contiguous() no-ops. Routing through a 1-D
+        # reshape forces a real row-major layout -- free for [N, 1], since
+        # reshape's view check (unlike is_contiguous()) treats a size-1 dim
+        # as imposing no stride constraint.
+        return t.flatten().reshape(t.shape).contiguous()
     rows, cols = t.shape
     buf = torch.empty((rows, cols + pad_groups), dtype=t.dtype, device=t.device)
     buf[:, :cols].copy_(t)
@@ -781,7 +798,7 @@ def _rdna_hybrid_w4a16_apply_impl(
             x_2d,
             w_q_i32,
             w_s,
-            group_size,
+            _resolved_group_size(group_size, K),
             packed_scale_zp=packed_scale_zp,
         )
         if bias is not None:
@@ -864,17 +881,21 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             return False, "does not support g_idx reordering"
 
         gs = c.group_size
-        if gs not in SUPPORTED_GROUP_SIZES:
+        if gs != PER_CHANNEL_GROUP_SIZE and gs not in SUPPORTED_GROUP_SIZES:
             return (
                 False,
-                f"Group size {gs} not supported; supported: {SUPPORTED_GROUP_SIZES}",
+                f"Group size {gs} not supported; supported: {SUPPORTED_GROUP_SIZES} "
+                f"(or {PER_CHANNEL_GROUP_SIZE} for per-channel)",
             )
+
+        if gs == PER_CHANNEL_GROUP_SIZE and c.zero_points:
+            return False, "per-channel (group_size=-1) is symmetric-only"
 
         K = c.partition_weight_shape[0]
         if K % 16 != 0:
             return False, f"K={K} must be divisible by 16"
 
-        if K % gs != 0:
+        if gs > 0 and K % gs != 0:
             return (
                 False,
                 f"K={K} must be divisible by group_size={gs}",
@@ -883,6 +904,10 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Never divides by group_size -- the group count comes from the
+        # loaded scale tensor's shape, so per-channel needs no special case
+        # here. The resulting [N, 1] scale's stride(1) is corrected below in
+        # _pad_group_rows.
         c = self.config
 
         w_q_raw = getattr(layer, self.w_q_name)
@@ -1065,7 +1090,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             )
             return
 
-        G = c.group_size
+        G = _resolved_group_size(c.group_size, K)
         u = unpacked.to(torch.float32)  # [N, K] natural order, nibble 0..15
         scale_exp = w_s_skinny.to(torch.float32).repeat_interleave(G, dim=1)
         if w_zp is not None:
