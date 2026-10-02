@@ -201,6 +201,14 @@ class DeepseekCompressor(nn.Module):
     (``compress_norm_rope_store_cutedsl``) for better performance.
     """
 
+    # Which compress->norm->RoPE->store implementation to launch. Class
+    # attributes so a backend can substitute its own without reimplementing
+    # forward(); the ROCm layer points these at aiter.
+    compress_fn: ClassVar[Any] = staticmethod(compress_norm_rope_store_triton)
+    compress_two_stage_fn: ClassVar[Any] = staticmethod(
+        compress_norm_rope_store_two_stage_triton
+    )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -429,14 +437,14 @@ class DeepseekCompressor(nn.Module):
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
             assert state_metadata.num_decode_tokens is not None
-            compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
+            compress_norm_rope_store_fn = self.compress_two_stage_fn
             extra_kwargs = {
                 "num_decode_tokens": state_metadata.num_decode_tokens,
                 "compress_scratch": self._compress_scratch,
             }
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
-            compress_norm_rope_store_fn = compress_norm_rope_store_triton
+            compress_norm_rope_store_fn = self.compress_fn
             extra_kwargs = {}
 
         compress_norm_rope_store_fn(
