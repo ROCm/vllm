@@ -27,6 +27,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_dispatchers_ = num_dispatchers
         self.max_tokens_per_rank = max_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
+        self._original_topk_ids: torch.Tensor | None = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -91,6 +92,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 )
                 # mori expects one scale slot per token; broadcast.
                 scale = scale.expand(a1.shape[0], 1).contiguous()
+        self._original_topk_ids = topk_ids
 
         (
             dispatch_a1,
@@ -125,6 +127,6 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         result = self.mori_op.combine(
             fused_expert_output,
             None,
-            topk_ids,
+            self._original_topk_ids,
         )[0]
         output.copy_(result[:num_token])
