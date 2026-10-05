@@ -23,7 +23,11 @@ else:
     gl = TritonLanguagePlaceholder()
     aggregate = TritonLanguagePlaceholder()
 
+from vllm.triton_utils.ptr_range import install_view_ptr_range
 from vllm.triton_utils.tensor_descriptor import use_tensor_descriptor
+
+if HAS_TRITON:
+    install_view_ptr_range()
 
 LOG2E = 1.4426950408889634
 LOGE2 = 0.6931471805599453
