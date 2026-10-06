@@ -1395,8 +1395,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "off",
         ["off", "decode", "prefill", "all"],
     ),
-    # Built rocm-libraries checkout whose hipBLASLt exposes the w4a16 API; the
-    # extension for VLLM_ROCM_W4A16_HIPBLASLT is compiled against it on demand.
+    # Install prefix of a hipBLASLt that exposes the w4a16 API; the extension
+    # for VLLM_ROCM_W4A16_HIPBLASLT is compiled against it on demand.
     "VLLM_HIPBLASLT_W4A16_ROOT": lambda: os.environ.get(
         "VLLM_HIPBLASLT_W4A16_ROOT", None
     ),

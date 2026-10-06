@@ -3,18 +3,15 @@
 """hipBLASLt W4A16 GEMM, as a drop-in replacement for the RDNAHybrid kernels.
 
 Experimental: gated off by default behind ``VLLM_ROCM_W4A16_HIPBLASLT`` and
-built on demand against a hipBLASLt checkout that exposes the w4a16 API
+built on demand against an installed hipBLASLt that exposes the w4a16 API
 (``VLLM_HIPBLASLT_W4A16_ROOT``), so a stock ROCm SDK build is unaffected.
 
-Activations and the output are handed over untouched -- see
-``csrc/rocm/hipblaslt_w4a16.cu`` for the index mapping. Two things do have to
-be rebuilt at load time:
-
-* the weights, since hipBLASLt dropped the ExLlama int4 encoding and now needs
-  plain K order, which is why only "off" and "all" are valid modes;
-* the zero-point region, which hipBLASLt wants appended to the scales in one
-  allocation and ordered ``[rowpair][group]`` rather than vLLM's
-  ``[group][rowpair]``.
+Activations, the output and the zero-points are handed over untouched -- see
+``csrc/rocm/hipblaslt_w4a16.cu`` for the index mapping, and note that
+hipBLASLt's zero-point region is ``[ceil(N/8)][K/G]`` 32-bit words with row n
+in nibble ``n % 8``, which is already how vLLM packs ``qzeros``. Only the
+weights are rebuilt at load time: hipBLASLt dropped the ExLlama int4 encoding
+and needs plain K order, which is why only "off" and "all" are valid modes.
 """
 
 import functools
@@ -65,25 +62,26 @@ def _root() -> Path:
     if not root:
         raise RuntimeError(
             "VLLM_ROCM_W4A16_HIPBLASLT is enabled but VLLM_HIPBLASLT_W4A16_ROOT "
-            "is unset. Point it at a built rocm-libraries checkout whose "
-            "hipBLASLt exposes the w4a16 API."
+            "is unset. Point it at an install prefix whose hipBLASLt exposes "
+            "the w4a16 API."
         )
     return Path(root)
 
 
 def _paths() -> tuple[list[str], str, str]:
-    """(include dirs, hipBLASLt lib dir, Tensile library dir)."""
+    """(include dirs, hipBLASLt lib dir, Tensile library dir).
+
+    ``VLLM_HIPBLASLT_W4A16_ROOT`` is an install prefix, laid out the way ROCm
+    itself ships hipBLASLt. Only ``hipblaslt/`` comes from there:
+    ``hipblas-common`` and ``hipblas`` are taken from the SDK, which a prefix
+    does not carry anyway.
+    """
     root = _root()
-    lib_dir = root / "build" / "projects" / "hipblaslt" / "library"
-    includes = [
-        # The w4a16 enums live here, so it must precede the ROCm SDK's copy.
-        str(root / "projects" / "hipblaslt" / "library" / "include"),
-        str(lib_dir / "include"),
-        str(root / "projects" / "hipblas-common" / "library" / "include"),
-    ]
-    # A build tree keeps the Tensile artifacts under a per-arch subdirectory,
-    # unlike an installed ROCm where they sit flat in hipblaslt/library.
-    tensile_dir = root / "build" / "projects" / "hipblaslt" / "Tensile" / "library"
+    # The w4a16 enums live here, so it must precede the ROCm SDK's copy.
+    includes = [str(root / "include")]
+    lib_dir = root / "lib"
+    tensile_dir = lib_dir / "hipblaslt" / "library"
+
     from vllm.platforms.rocm import _GCN_ARCH
 
     arch = _GCN_ARCH.split(":")[0]  # gfx1151:xnack- -> gfx1151
@@ -93,8 +91,8 @@ def _paths() -> tuple[list[str], str, str]:
     for p in includes + [str(lib_dir / "libhipblaslt.so"), str(tensile_dir)]:
         if not os.path.exists(p):
             raise RuntimeError(
-                f"VLLM_HIPBLASLT_W4A16_ROOT={root} does not look like a built "
-                f"rocm-libraries checkout: {p} is missing."
+                f"VLLM_HIPBLASLT_W4A16_ROOT={root} does not look like an "
+                f"installed hipBLASLt: {p} is missing."
             )
     return includes, str(lib_dir), str(tensile_dir)
 
@@ -185,18 +183,11 @@ def build_scale_buffer(
     if w_zp is None:
         return w_s, w_s
 
-    # vLLM packs the zero-points [q][g][p] (group outside the 4-byte word);
-    # hipBLASLt wants [q][p][g] (each row-pair gets a contiguous group run).
-    # Same nibble pairing, so this is a transpose of the last two axes.
     n8 = w_zp.shape[0]
     assert n8 == N // 8, f"zp rows {n8} do not match N={N}"
-    zp_hbl = (
-        w_zp.contiguous()
-        .view(torch.uint8)
-        .reshape(n8, num_groups, 4)
-        .permute(0, 2, 1)
-        .reshape(-1)
-    )
+    # vLLM packs [q][g] words with row n in nibble n % 8, which is exactly what
+    # hipBLASLt addresses, so the words go over as bytes with no repack.
+    zp_hbl = w_zp.contiguous().view(torch.uint8).reshape(-1)
 
     scale_bytes = N * num_groups * w_s.element_size()
     zp_offset = -(-scale_bytes // ZERO_POINT_ALIGNMENT) * ZERO_POINT_ALIGNMENT

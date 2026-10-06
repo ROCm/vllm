@@ -3,11 +3,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness of the hipBLASLt W4A16 path against the RDNAHybrid reference.
 
-Opt-in: needs a built rocm-libraries checkout whose hipBLASLt exposes the w4a16
-API, and the process must resolve that libhipblaslt (see hipblaslt_w4a16.py):
+Opt-in: needs an installed hipBLASLt that exposes the w4a16 API, and the
+process must resolve that libhipblaslt (see hipblaslt_w4a16.py):
 
-    VLLM_HIPBLASLT_W4A16_ROOT=<root> \\
-    LD_LIBRARY_PATH=<root>/build/projects/hipblaslt/library \\
+    VLLM_HIPBLASLT_W4A16_ROOT=<prefix> \\
+    LD_LIBRARY_PATH=<prefix>/lib \\
     pytest tests/kernels/quantization/test_hipblaslt_w4a16.py
 """
 
@@ -99,11 +99,11 @@ def test_hipblaslt_w4a16_matches_reference(dtype, group_size, has_zp, M):
 
 @pytest.mark.parametrize("group_size", [32, 128])
 def test_build_scale_buffer_zero_point_layout(group_size):
-    """The zero-point region is vLLM's packing transposed, nibbles untouched.
+    """The zero-point region matches hipBLASLt's addressing, nibbles untouched.
 
-    Checked against hipBLASLt's own addressing (w4a16_datagen.hpp): the
-    zero-point for (n, g) is at byte (n//2)*ceil(K/G) + g of the region, in the
-    low nibble for even n.
+    Checked against hipBLASLt's own addressing (w4a16_datagen.hpp): (n, g)
+    lives at word (n//8)*ceil(K/G) + g, bits 4*(n%8). Pinned independently of
+    build_scale_buffer so a layout change cannot pass by moving both sides.
     """
     K, N = 512, 32
     num_groups = K // group_size
@@ -121,6 +121,6 @@ def test_build_scale_buffer_zero_point_layout(group_size):
 
     n = torch.arange(N).repeat_interleave(num_groups)
     g = torch.arange(num_groups).repeat(N)
-    byte = zp_region[(n // 2) * num_groups + g].to(torch.int32)
-    got = torch.where(n % 2 == 0, byte & 0xF, (byte >> 4) & 0xF)
+    word = zp_region.view(torch.int32)[(n // 8) * num_groups + g]
+    got = ((word >> (4 * (n % 8)).to(torch.int32)) & 0xF).to(torch.int32)
     torch.testing.assert_close(got, zp_nkg.cpu().reshape(-1))

@@ -25,12 +25,13 @@ def _preload_w4a16_hipblaslt() -> None:
     if not root:
         return
 
-    lib = os.path.join(
-        root, "build", "projects", "hipblaslt", "library", "libhipblaslt.so"
-    )
+    # The layout _paths() in hipblaslt_w4a16.py accepts, open-coded because
+    # importing vLLM here would pull in torch, and the preload has to happen
+    # before that.
+    lib = os.path.join(root, "lib", "libhipblaslt.so")
     if not os.path.exists(lib):
         raise RuntimeError(
-            f"VLLM_HIPBLASLT_W4A16_ROOT={root} has no built hipBLASLt at {lib}"
+            f"VLLM_HIPBLASLT_W4A16_ROOT={root} has no installed hipBLASLt at {lib}"
         )
 
     import ctypes
