@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_AITER_MLA_DCP_VERIFY: Literal["asm", "segmented"] = "segmented"
     VLLM_ROCM_USE_AITER_MHA: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
+    VLLM_ROCM_AITER_A4W4_MOE_BACKEND: str = "triton"
     VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1352,6 +1353,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_FP4_ASM_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_FP4_ASM_GEMM", "False").lower() in ("true", "1")
     ),
+    # gfx1250 MXFP4 W4A4 MoE GEMMs: Gluon is nondeterministic for several tuned configs 
+    # and emits garbage output tiles, default to Triton
+    "VLLM_ROCM_AITER_A4W4_MOE_BACKEND": lambda: os.getenv(
+        "VLLM_ROCM_AITER_A4W4_MOE_BACKEND", "triton"
+    ).lower(),
     # Whether sparse MLA prefill and decode run on aiter's Triton kernel, which
     # reads the KV cache as stored (bf16 or fp8, paged or flat). Used by the
     # ROCM_AITER_MLA_SPARSE backend (DeepSeek V3.2, GLM-5.x) and DeepSeek

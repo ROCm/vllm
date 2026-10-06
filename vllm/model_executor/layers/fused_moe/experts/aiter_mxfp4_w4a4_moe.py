@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -69,6 +70,14 @@ def aiter_triton_kernel_w4a4_moe_forward(
         _routing_mod.is_tdm_avail = lambda: False
     aiter_routing = _routing_mod.routing
 
+    gating_output = torch.nan_to_num(gating_output, nan=0.0, posinf=0.0, neginf=0.0)
+
+    moe_gemm_backend = envs.VLLM_ROCM_AITER_A4W4_MOE_BACKEND
+    assert moe_gemm_backend in ("triton", "gluon"), (
+        f"VLLM_ROCM_AITER_A4W4_MOE_BACKEND must be 'triton' or 'gluon', "
+        f"got {moe_gemm_backend!r}"
+    )
+
     if hash_indices_table is not None:
         assert input_ids is not None, "hash routing requires input_ids"
         n_tokens, n_expts_tot = gating_output.shape
@@ -96,7 +105,11 @@ def aiter_triton_kernel_w4a4_moe_forward(
             gating_output,
             topk,
             score_mode=score_mode,
-            bias=e_score_correction_bias,
+            bias=(
+                e_score_correction_bias.float()
+                if e_score_correction_bias is not None
+                else None
+            ),
             renorm=renormalize,
             routed_scaling_factor=(
                 routed_scaling_factor
@@ -168,6 +181,7 @@ def aiter_triton_kernel_w4a4_moe_forward(
         gammas=gammas if apply_router_weight_on_input else None,
         swizzle_mx_scale=swizzle_mx_scale,
         apply_swiglu=fused_swiglu,
+        backend=moe_gemm_backend,
         **swiglu_kwargs,
     )
 
@@ -213,6 +227,7 @@ def aiter_triton_kernel_w4a4_moe_forward(
         gammas=None if apply_router_weight_on_input else gammas,
         swizzle_mx_scale=swizzle_mx_scale,
         apply_swiglu=False,
+        backend=moe_gemm_backend,
     )
 
     return out
