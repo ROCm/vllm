@@ -61,6 +61,8 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+    is_full_attention_spec,
+    iter_layer_specs,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
@@ -135,6 +137,30 @@ def new_kv_cache_spec(
         sliding_window=sliding_window,
         attention_chunk_size=attention_chunk_size,
         kv_quant_mode=kv_quant_mode,
+    )
+
+
+def test_kv_cache_config_selects_only_transferable_groups():
+    """Connectors must see a stable projection of transfer-eligible groups."""
+    groups = [
+        KVCacheGroupSpec(["layer.0"], new_kv_cache_spec()),
+        KVCacheGroupSpec(["layer.1"], new_kv_cache_spec(), enable_kv_transfer=False),
+        KVCacheGroupSpec(["layer.2"], new_kv_cache_spec()),
+    ]
+    config = KVCacheConfig(
+        num_blocks=1,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+
+    assert config.transfer_group_ids == (0, 2)
+    assert config.transfer_groups == (groups[0], groups[2])
+    assert config.transfer_group_index_by_layer == {"layer.0": 0, "layer.2": 1}
+    first_blocks = [1, 2]
+    third_blocks = [4]
+    assert config.select_transfer_block_ids((first_blocks, [3], third_blocks)) == (
+        first_blocks,
+        third_blocks,
     )
 
 
@@ -3179,3 +3205,40 @@ def test_check_enough_kv_cache_memory_reserves_null_block():
     check_enough_kv_cache_memory(
         vllm_config, {"layer1": spec}, spec.page_size_bytes * 33
     )
+
+
+def test_is_full_attention_spec_unwraps_uniform_type_specs():
+    """``UniformTypeKVCacheSpecs`` is not a ``FullAttentionSpec``, so callers
+    scanning groups with a bare isinstance miss DeepSeek-V4-shaped configs."""
+    common = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
+    full = FullAttentionSpec(block_size=4, **common)
+    mla = MLAAttentionSpec(block_size=4, **common)
+    swa = SlidingWindowMLASpec(block_size=4, sliding_window=8, **common)
+
+    def wrap(**specs):
+        return UniformTypeKVCacheSpecs(block_size=4, kv_cache_specs=specs)
+
+    assert is_full_attention_spec(full)
+    assert is_full_attention_spec(mla)
+    assert not is_full_attention_spec(swa)
+
+    assert is_full_attention_spec(wrap(a=mla, b=mla))
+    assert not is_full_attention_spec(wrap(a=swa, b=swa))
+
+    # Every layer must qualify: a group holding a recycling sliding-window layer
+    # has no stable slot layout. Grouping forbids mixing today, but the wrapper
+    # is also built directly (e.g. projecting groups onto a PP worker).
+    assert not is_full_attention_spec(wrap(a=mla, b=swa))
+    assert not is_full_attention_spec(wrap())
+
+
+def test_iter_layer_specs_returns_group_members():
+    common = dict(num_kv_heads=1, head_size=1, dtype=torch.float32)
+    full = FullAttentionSpec(block_size=4, **common)
+    mla = MLAAttentionSpec(block_size=4, **common)
+
+    assert list(iter_layer_specs(full)) == [full]
+    wrapped = UniformTypeKVCacheSpecs(
+        block_size=4, kv_cache_specs={"a": full, "b": mla}
+    )
+    assert list(iter_layer_specs(wrapped)) == [full, mla]
