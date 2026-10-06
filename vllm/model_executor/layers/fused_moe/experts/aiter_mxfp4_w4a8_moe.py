@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -668,6 +670,20 @@ class AiterW4A16ExpertsMonolithic(mk.FusedMoEExpertsMonolithic):
         )
 
 
+def rocm_moe_preshuffle_enabled() -> bool:
+    """gfx1250 preshuffled MoE weights (WMMA 16x16 tile order).
+
+    Off by default. The layout is produced at load time by the mxfp4 oracle
+    and read by moe_gemm_a4w4 with preshuffle_weights=True; both sides call
+    this, so they cannot disagree. Worth ~5.6% on the two DeepSeek-V4-Pro MoE
+    GEMMs in isolation (moe1 570.9 -> 535.6 us, moe2 427.0 -> 409.5 us at
+    M=16384), but it has not yet run a clean end-to-end sequence: the one run
+    with it enabled took an intermittent memory fault that also occurs without
+    it, so cause is unattributed.
+    """
+    return os.environ.get("VLLM_ROCM_MOE_PRESHUFFLE_WEIGHTS", "0") == "1"
+
+
 def aiter_triton_kernel_w4a4_moe_forward(
     hidden_states: torch.Tensor,
     w1,
@@ -734,6 +750,13 @@ def aiter_triton_kernel_w4a4_moe_forward(
 
     gammas = routing_data.gate_scal if routing_data else None
 
+    # Must match the oracle's weight prep exactly: it preshuffles only for
+    # SILU, and a mismatch is silently wrong numerics, not an error. Both
+    # sides read the same predicate so they cannot drift.
+    preshuffle_weights = (
+        rocm_moe_preshuffle_enabled() and activation is MoEActivation.SILU
+    )
+
     swiglu_limit = (
         quant_config.gemm1_clamp_limit
         if quant_config.gemm1_clamp_limit is not None
@@ -773,7 +796,15 @@ def aiter_triton_kernel_w4a4_moe_forward(
 
     x_q, x_scale = mxfp4_quant(hidden_states.to(torch.bfloat16))
 
-    n_w1 = w1_data.shape[-1]
+    # The preshuffled weight is viewed as (E, K*16, N//16), so its last dim is
+    # N//16 rather than N -- moe_weight_decode_view does the (// 16, * 16)
+    # reshape that puts the WMMA 16x16 tiles in the kernel's order. Reading it
+    # raw made both tests below compare against N//16 (96 instead of 1536 at
+    # DeepSeek-V4-Pro tp4), so each one failed and the fused output quant was
+    # silently dropped: correct numbers, one extra mxfp4 kernel per MoE layer
+    # per step. aiter's own launcher corrects the same way, `if
+    # preshuffle_weights: N = N * 16`, so this keeps the two in step.
+    n_w1 = w1_data.shape[-1] * 16 if preshuffle_weights else w1_data.shape[-1]
     fused_out_quant = (
         fused_swiglu
         and on_gfx1250()
@@ -791,6 +822,7 @@ def aiter_triton_kernel_w4a4_moe_forward(
         routing_data=routing_data,
         gather_indx=gather_idx,
         gammas=gammas if apply_router_weight_on_input else None,
+        preshuffle_weights=preshuffle_weights,
         swizzle_mx_scale=swizzle_mx_scale,
         apply_swiglu=fused_swiglu,
         out_mx_quant=fused_out_quant,
@@ -842,6 +874,7 @@ def aiter_triton_kernel_w4a4_moe_forward(
         scatter_indx=scatter_idx,
         gammas=None if apply_router_weight_on_input else gammas,
         swizzle_mx_scale=swizzle_mx_scale,
+        preshuffle_weights=preshuffle_weights,
         apply_swiglu=False,
     )
 

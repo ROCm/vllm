@@ -1109,6 +1109,77 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
             w13_data = w13_weight.data.view(torch.uint8)
             w2_data = w2_weight.data.view(torch.uint8)
             w13_scale_data = w13_weight_scale.data.view(torch.uint8)
+            w2_scale_data = w2_weight_scale.data.view(torch.uint8)
+
+            # SILU takes the preshuffled weight layout: the gate/up rows are
+            # interleaved and then shuffled into the WMMA 16x16 tile order the
+            # gluon kernel reads directly, so moe_gemm_a4w4 is called with
+            # preshuffle_weights=True. This is independent of the scale swizzle
+            # below -- that pairs with swizzle_mx_scale="GFX1250_SCALE" and
+            # applies either way. Separate path because moe_shuffle_weight does
+            # the gate/up interleave itself, so the generic branch underneath
+            # would do it twice.
+            from vllm.model_executor.layers.fused_moe.experts.aiter_mxfp4_w4a8_moe import (  # noqa: E501
+                rocm_moe_preshuffle_enabled,
+            )
+
+            if (
+                rocm_moe_preshuffle_enabled()
+                and getattr(layer, "activation", None) is MoEActivation.SILU
+            ):
+                from aiter.ops.shuffle import (
+                    interleave_gate_up_rows,
+                    moe_shuffle_weight,
+                )
+                from aiter.ops.triton.utils.shuffle import (
+                    moe_weight_decode_view,
+                    shuffle_scale_moe,
+                )
+
+                if w13_bias is not None or w2_bias is not None:
+                    raise NotImplementedError(
+                        "preshuffled MoE weights do not carry a bias; "
+                        "got w13_bias=%s w2_bias=%s"
+                        % (w13_bias is not None, w2_bias is not None)
+                    )
+
+                # Swap through .data so the unshuffled buffer is released as
+                # soon as the shuffled one exists, instead of both living
+                # until the caller's replace_parameter(). The w13_data /
+                # w2_data views taken above alias the old storage, so they
+                # are dropped first -- holding either would keep it alive and
+                # defeat the point.
+                del w13_data, w2_data
+                w13_weight.data = moe_shuffle_weight(
+                    w13_weight.data.view(torch.uint8),
+                    experts_cnt=w13_weight.shape[0],
+                    is_guinterleave=True,
+                    gate_up=True,
+                )
+                # w2 is the down projection: no gate/up, and
+                # moe_shuffle_weight ignores is_guinterleave unless gate_up.
+                w2_weight.data = moe_shuffle_weight(
+                    w2_weight.data.view(torch.uint8),
+                    experts_cnt=w2_weight.shape[0],
+                    gate_up=False,
+                )
+                w13_data = moe_weight_decode_view(w13_weight.data)
+                w2_data = moe_weight_decode_view(w2_weight.data)
+
+                w13_scale = interleave_gate_up_rows(w13_scale_data).transpose(
+                    -2, -1
+                )
+                w2_scale = w2_scale_data.transpose(-2, -1)
+                w13_scale = shuffle_scale_moe(
+                    w13_scale, arch="gfx1250", preshuffle_factor=32,
+                    scale_kwidth=4,
+                )
+                w2_scale = shuffle_scale_moe(
+                    w2_scale, arch="gfx1250", preshuffle_factor=32,
+                    scale_kwidth=4,
+                )
+                return (w13_data, w2_data, w13_scale, w2_scale,
+                        w13_bias, w2_bias)
 
             if getattr(layer, "activation", None) in (
                 MoEActivation.SWIGLUOAI,
