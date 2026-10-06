@@ -266,6 +266,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        assert vllm_config.speculative_config is not None
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         self._dflare_rope_theta = float(
             self.config.rope_parameters.get("rope_theta", 10000.0)
@@ -622,6 +623,7 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
+        assert vllm_config.speculative_config is not None
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         draft_hidden_size = _draft_hidden_size(self.config)
