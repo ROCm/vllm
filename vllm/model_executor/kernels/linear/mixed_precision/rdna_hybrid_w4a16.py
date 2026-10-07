@@ -72,15 +72,6 @@ MEDIUM_SKINNY_LIMIT_ELEMENTS = int(LDS_CAPACITY_ELEMENTS * 1.2)
 # ---------------------------------------------------------------------------
 
 
-@triton.constexpr_function
-def _target_is_gfx11() -> bool:
-    """True when the kernel is being compiled for RDNA3 (gfx11)."""
-    target = tl.target_info.current_target()
-    if target is None or target.backend != "hip":
-        return False
-    return str(target.arch).startswith("gfx11")
-
-
 @triton.jit
 def _int4_pair_to_fp16x2(x):
     """Unpack two packed int4 nibbles into a uint32 holding two fp16 lanes,
@@ -123,6 +114,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     group_size,
     ZP_BIAS: tl.constexpr,
     HAS_ZP: tl.constexpr,
+    PACKED_DEQUANT: tl.constexpr,
     # Block sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -141,7 +133,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     (nibble - zp_raw) * scale.
     When HAS_ZP=False, only the constant ZP_BIAS is subtracted (symmetric).
 
-    On the fp16 path the nibble arrives as ``b_raw`` = 1024 + nibble (the
+    With PACKED_DEQUANT the nibble arrives as ``b_raw`` = 1024 + nibble (the
     magic-constant unpack), so the subtrahend absorbs the 1024: the arithmetic
     is unchanged and every intermediate stays exact, since fp16 represents every
     integer below 2048.
@@ -176,7 +168,7 @@ def _triton_w4a16_skinny_fmt_kernel(
         mask_b = (offs_n[:, None] < N) & (offs_k8[None, :] < K8)
         b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
 
-        if a.dtype == tl.float16 and _target_is_gfx11():
+        if PACKED_DEQUANT:
             # The ExLlama int32 holds the paired nibbles val[2p] @ bits[4p:4p+4]
             # and val[2p+1] @ bits[16+4p:20+4p], so for pre-shift 4p (p=0..3),
             #   (x >> 4p) & 0x000F000F | 0x64006400
@@ -213,13 +205,10 @@ def _triton_w4a16_skinny_fmt_kernel(
             zp_word = tl.load(zp_ptrs, mask=scale_mask, other=0)
             zp_raw = (zp_word >> (4 * (offs_n % 8))) & 0xF
 
-        if a.dtype == tl.float16:
+        if PACKED_DEQUANT:
             # The magic unpack yields b_raw = 1024 + nibble, so fold the 1024
             # into the subtrahend: (b_raw - (1024 + zp)) == (nibble - zp),
             # exactly, and the multiply that follows rounds once as before.
-            # 1024..1039 are all exact in fp16, so the cast cannot round.
-            if not _target_is_gfx11():
-                b_raw = (b | 0x6400).to(tl.uint16).to(tl.float16, bitcast=True)
             c1024 = tl.full((), 1024.0, tl.float16)
             if HAS_ZP:
                 zp_off = (c1024 + zp_raw.to(tl.float16))[:, None]
@@ -300,20 +289,31 @@ _GFX1151_BF16_PREFILL_OVERRIDES: dict[
 # a K=2048 model, and far worse on shapes whose packed row stride sits on the
 # gfx11 cache cliff). A dedicated small-M sweep did remove those regressions but
 # bought nothing -- at short prompts the prefill GEMMs are a small share of TTFT
-# -- so the tiles there are left alone. The packed dequant itself applies at
-# every M; only tile selection is gated.
+# -- so the tiles there are left alone.
 _FP16_TILE_MIN_M = 128
+
+# Asymmetric fp16 layers stay on the scalar path, tiles and dequant both, up to
+# this M: the packed dequant with the zero-point gather measured 1.3-2.4x slower
+# on the scalar tiles and 1.2-1.6x slower on the packed tiles at M = 129-256,
+# and only wins from M = 512.
+_FP16_ASYM_TILE_MIN_M = 256
 
 
 def _select_skinny_gfx1151_config(
-    M: int, N: int, K: int, group_size: int, dtype: torch.dtype
+    M: int,
+    N: int,
+    K: int,
+    group_size: int,
+    dtype: torch.dtype,
+    has_zp: bool = False,
 ) -> tuple[int, int, int, int, int | None]:
     """Return (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) for gfx1151.
 
     num_stages None means "leave Triton's default pipeline depth alone".
     """
     num_stages: int | None = None
-    if dtype == torch.float16 and M > _FP16_TILE_MIN_M:
+    min_m = _FP16_ASYM_TILE_MIN_M if has_zp else _FP16_TILE_MIN_M
+    if dtype == torch.float16 and min_m < M:
         # The packed path issues a single per-group load, so the pipeline buys
         # nothing and only costs registers. Not applied to bf16 -- see above.
         num_stages = 1
@@ -414,6 +414,7 @@ def triton_w4a16_skinny_fmt_gemm(
     # num_stages stays None unless the tile table sets it, so the generic
     # heuristics fall back to Triton's default pipeline depth.
     num_stages: int | None = None
+    packed_dequant = False
     if _on_gfx12x():
         # Tuned on gfx1201 (Radeon AI PRO R9700, 32 CUs, 32-wide wavefronts)
         # using Llama-3.1-8B AWQ weight shapes with group_size=128.
@@ -454,7 +455,10 @@ def triton_w4a16_skinny_fmt_gemm(
         # _select_skinny_gfx1151_config; re-run
         # benchmarks/kernels/benchmark_rdna_hybrid_w4a16_gemm.py after edits.
         BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = (
-            _select_skinny_gfx1151_config(M, N, K, group_size, a.dtype)
+            _select_skinny_gfx1151_config(M, N, K, group_size, a.dtype, has_zp)
+        )
+        packed_dequant = a.dtype == torch.float16 and (
+            not has_zp or M > _FP16_ASYM_TILE_MIN_M
         )
     else:
         num_warps = 4
@@ -489,6 +493,7 @@ def triton_w4a16_skinny_fmt_gemm(
         group_size=group_size,
         ZP_BIAS=zp_bias,
         HAS_ZP=has_zp,
+        PACKED_DEQUANT=packed_dequant,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,

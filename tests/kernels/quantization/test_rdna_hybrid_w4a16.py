@@ -225,11 +225,22 @@ def _make_prefill_case(M, K, N, G, dtype, has_zp):
 @pytest.mark.parametrize("has_zp", [False, True])
 @pytest.mark.parametrize(
     "M,K,N,G",
-    [(17, 256, 512, 32), (32, 512, 256, 64), (33, 512, 512, 128), (64, 1024, 256, 128)],
+    [
+        (17, 256, 512, 32),
+        (32, 512, 256, 64),
+        (33, 512, 512, 128),
+        (64, 1024, 256, 128),
+        (129, 256, 512, 32),
+        (256, 512, 512, 128),
+        (257, 512, 512, 128),
+    ],
 )
 def test_triton_prefill_gemm_matches_reference(dtype, has_zp, M, K, N, G):
-    """Prefill GEMM against a float32 oracle, over both unpacks and both the
-    asymmetric and symmetric dequants."""
+    """The Triton prefill GEMM matches a float32 dequantize-then-matmul reference.
+
+    Covers fp16 and bf16, with and without zero points, at M values on both
+    sides of where gfx1151 switches fp16 to the packed dequant.
+    """
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP device not available")
     set_random_seed(0)
@@ -246,11 +257,10 @@ def test_triton_prefill_gemm_matches_reference(dtype, has_zp, M, K, N, G):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_gfx1151_tile_table_never_straddles_a_quant_group(dtype):
-    """BLOCK_K > group_size would give a tile's tail the wrong scale.
+    """Every gfx1151 tile config keeps each K tile inside one quant group.
 
-    The kernel loads one scale per BLOCK_K tile, so this is a correctness
-    invariant of the table, not a tuning preference. Checked in Python so it
-    holds for shapes no test has hardware for.
+    The kernel loads one scale per K tile, so a BLOCK_K wider than group_size
+    would apply the wrong scale to the rest of the tile.
     """
     for group_size in SUPPORTED_GROUP_SIZES:
         for M in (1, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096):
