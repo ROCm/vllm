@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, replace
 from typing import cast
 
 import torch
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -14,20 +17,28 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
-from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.models.deepseek_v4.amd.ops.cache_utils import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
     DeepseekV4SparseMLAMetadataBuilder,
 )
 from vllm.platforms import current_platform
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import _ON_GFX1250
+else:
+    _ON_GFX1250 = False
 from vllm.platforms.rocm import _ON_GFX950, on_gfx1250
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
+    DeepseekV4SWACache,
     DeepseekSparseSWAMetadataBuilder,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
@@ -56,8 +67,17 @@ def _trust_dsv4_extra_cache_nan_free(
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     lengths = lengths.to(dtype=torch.int32).contiguous()
-    indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
-    torch.cumsum(lengths, dim=0, out=indptr[1:])
+    n = lengths.shape[0]
+    if 0 < n <= _INDPTR_MAX_BLOCK and lengths.is_cuda:
+        # One scan kernel instead of a fill plus a device-wide scan.
+        indptr = torch.empty(n + 1, dtype=torch.int32, device=lengths.device)
+        _build_indptr_kernel[(1,)](
+            lengths, indptr, n, BLOCK=triton.next_power_of_2(n)
+        )
+        return indptr
+    indptr = torch.zeros(n + 1, dtype=torch.int32, device=lengths.device)
+    if n:
+        torch.cumsum(lengths, dim=0, out=indptr[1:])
     return indptr
 
 
@@ -236,6 +256,32 @@ def _compute_topk_lens_kernel(
         count += tl.sum((local_idx >= 0).to(tl.int32), axis=0)
 
     tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
+
+
+# One block is enough: `lengths` carries one entry per decode token, which is
+# bounded by max_num_seqs. Beyond that bound the caller falls back to torch.
+_INDPTR_MAX_BLOCK = 8192
+
+
+@triton.jit
+def _build_indptr_kernel(
+    lens_ptr,
+    indptr_ptr,
+    n,
+    BLOCK: tl.constexpr,
+):
+    """lengths -> exclusive prefix sum, written as indptr[0..n].
+
+    Replaces a torch.zeros + torch.cumsum pair. indptr[0] is 0 and
+    indptr[i + 1] is the inclusive scan at i, so the whole thing is one
+    tl.cumsum plus one scalar store -- no fill, no device-wide scan.
+    """
+    offs = tl.arange(0, BLOCK)
+    m = offs < n
+    v = tl.load(lens_ptr + offs, mask=m, other=0).to(tl.int32)
+    c = tl.cumsum(v, axis=0)
+    tl.store(indptr_ptr + offs + 1, c, mask=m)
+    tl.store(indptr_ptr, 0)
 
 
 @triton.jit
@@ -508,10 +554,142 @@ class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4SparseMLABackend):
         return DeepseekV4ROCMAiterMLASparseMetadataBuilder
 
 
+def _use_aiter_sparse_decode() -> bool:
+    """Whether to run aiter's sparse-MLA decode, which also selects the KV
+    record layout.
+
+    One knob, not two: aiter's 2buff kernel reads the ALIGNED 640-byte record
+    (448 NoPE | 14 duplicated UE8M0 | 50 pad | 128 RoPE) and nothing else
+    reads it, so the layout and the kernel have to move together. This reads
+    the SAME env var as `_dsv4_aiter_sparse_decode_enabled` in
+    v1/attention/ops/rocm_aiter_mla_sparse.py, so the pair cannot be split:
+    a 640-byte record read by the incumbent packed-record kernel does not
+    crash, it silently returns garbage.
+
+    Off by default while the sparse-MLA path is being bisected. Other
+    architectures keep the packed 576/584 record and their own decode.
+    """
+    return os.environ.get("VLLM_DSV4_AITER_SPARSE_MLA", "0") == "1"
+
+
+class DeepseekV4ROCMAiterSWACache(DeepseekV4SWACache):
+    """The SWA cache, pitched to the aligned record when aiter decodes.
+
+    Same reasoning as the top-k spec in DeepseekV4ROCMAiterMLAAttention: the
+    two caches hold the identical record, so their specs move together or the
+    pooled block stride stops being a whole number of records.
+    """
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        spec = super().get_kv_cache_spec(vllm_config)
+        if (
+            not _use_aiter_sparse_decode()
+            or self.cache_config.cache_dtype != "fp8_ds_mla"
+        ):
+            return spec
+        # page_size_padded is NOT an ordinary field: __post_init__ stamps it
+        # from (alignment, state_content_bytes) and only when padding is
+        # actually needed. Carrying the base's value over would keep a padding
+        # computed for the 576/584 record, which is smaller than the 640 page
+        # and trips the spec's own >= assertion. Clear it and let
+        # __post_init__ recompute -- at 640 the page is already a multiple of
+        # the alignment, so it correctly stays None.
+        return replace(
+            spec,
+            alignment=640,
+            state_content_bytes=640,
+            page_size_padded=None,
+        )
+
+
+def _dsv4_qpack_fusion_enabled() -> bool:
+    """Fold the fp8 Q pack into the producer instead of a second pass.
+
+    Still behind a switch, defaulting off, until the path has more hours on
+    it. Its history is worth keeping:
+
+    The first version faulted the MoE prefill GEMM intermittently (plan
+    section 32) -- it allocated the packed pair inside the producer and
+    stashed it across the step boundary, so under FULL_AND_PIECEWISE the
+    buffers came from the shared CUDA graph pool and were held or released on
+    a schedule that pool does not model.
+
+    The second version replaced that with a persistent pair, and faulted the
+    same way, eight runs out of eight. The pair was sized by its first caller
+    -- the profile run, 256 rows -- captured into the graphs, and then outgrown
+    during serving (922, 1243, 16384), so a graph indexing `rows` entries from
+    a 256-row base read past the end of the allocation. Pre-sizing it to
+    max_num_batched_tokens removed the growth entirely and did NOT stop the
+    fault, which ruled resizing out as the cause.
+
+    What did stop it was owning no buffer at all: the producer allocates the
+    pair per call, exactly as the non-fused path's pack_q does. That ran a
+    full 11-step gsm8k sequence, 1123 completions, with accuracy in band --
+    against a bug that had been killing the engine at 2 completions. It was
+    bundled with a consume-once stash on self, so which was load-bearing is
+    not established; the stash has since been replaced by passing the pair
+    down the call chain, which removes the last strong reference to it.
+    """
+    return os.environ.get("VLLM_DSV4_QPACK_FUSION", "0") == "1"
+
+
+def _aiter_compress_fns():
+    """aiter's compress launchers, or None if this build lacks them."""
+    try:
+        from aiter.ops.triton.quant.fused_mxfp8_quant import (
+            fused_deepseek_v4_compress_norm_rope_store,
+            fused_deepseek_v4_compress_norm_rope_store_two_stage,
+        )
+    except ImportError:
+        return None
+    return fused_deepseek_v4_compress_norm_rope_store, fused_deepseek_v4_compress_norm_rope_store_two_stage
+
+
+_AITER_COMPRESS = _aiter_compress_fns()
+
+
+class DeepseekV4ROCMAiterCompressor(DeepseekCompressor):
+    """The compressor, writing the aligned record when aiter decodes.
+
+    The aligned record interleaves each token's scales, so the token stride is
+    the whole record; the packed layout strides by data only.
+
+    The kernels come from aiter rather than vLLM's own
+    fused_compress_quant_cache: they are the same kernels, but owning them on
+    the aiter side is what lets that shared vLLM file stay upstream. Without
+    them this falls back to the base class, which is fine for the packed
+    record and refused for the aligned one -- see __init__.
+    """
+
+    if _AITER_COMPRESS is not None:
+        compress_fn = staticmethod(_AITER_COMPRESS[0])
+        compress_two_stage_fn = staticmethod(_AITER_COMPRESS[1])
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.head_dim == 512 and _use_aiter_sparse_decode():
+            # The aligned record lives only in aiter's compressor now that the
+            # shared vLLM file is back to upstream, so there is no fallback
+            # for it: the base class's launcher would accept the 640 stride
+            # and still write the packed layout, corrupting every record
+            # silently instead of failing. Refuse at construction instead.
+            if _AITER_COMPRESS is None:
+                raise RuntimeError(
+                    "VLLM_DSV4_AITER_SPARSE_MLA needs aiter's "
+                    "fused_deepseek_v4_compress_norm_rope_store for the aligned 640B KV "
+                    "record, and this aiter build does not provide it. "
+                    "Update aiter, or unset VLLM_DSV4_AITER_SPARSE_MLA to use "
+                    "the packed record."
+                )
+            self._token_stride = 640
+
+
 class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     """ROCm sparse MLA attention layer for DeepSeek V4."""
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
+    swa_cache_cls = DeepseekV4ROCMAiterSWACache
+    compressor_cls = DeepseekV4ROCMAiterCompressor
 
     def __init__(self, *args, **kwargs):
         vllm_config = args[0] if args else kwargs["vllm_config"]
@@ -523,6 +701,237 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         self._fused_compressor_weight: torch.Tensor | None
         self.register_buffer("_fused_compressor_weight", None, persistent=False)
         self._fused_compressor_split_sizes: tuple[int, int] | None = None
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        """The base spec, re-pitched to the aligned record when aiter decodes.
+
+        ``alignment`` has to move WITH the record size: left at 576 the pooled
+        block stride stays a multiple of 576, the descriptor unit falls back to
+        gcd(640, stride) = 64, and the row index stops being the slot index --
+        which is the whole point of the padding.
+
+        A replace() of the base's spec rather than a rebuild of it, so a change
+        to any other field upstream carries over on its own.
+        """
+        spec = super().get_kv_cache_spec(vllm_config)
+        if (
+            spec is None
+            or not _use_aiter_sparse_decode()
+            or self.kv_cache_dtype != "fp8_ds_mla"
+        ):
+            return spec
+        # page_size_padded is NOT an ordinary field: __post_init__ stamps it
+        # from (alignment, state_content_bytes) and only when padding is
+        # actually needed. Carrying the base's value over would keep a padding
+        # computed for the 576/584 record, which is smaller than the 640 page
+        # and trips the spec's own >= assertion. Clear it and let
+        # __post_init__ recompute -- at 640 the page is already a multiple of
+        # the alignment, so it correctly stays None.
+        return replace(
+            spec,
+            alignment=640,
+            state_content_bytes=640,
+            page_size_padded=None,
+        )
+
+    def _fused_qnorm_rope_kv_insert(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """aiter's fused producer, or the base's .cu one.
+
+        Returns ``(q, q_packed, q_rope)``; the pair is None whenever the fp8
+        pack did not happen. Returning it beats stashing it on self: the
+        consumer had to recognise its own pack by comparing storage pointers,
+        because forward_mqa slices q, and a per-step pair whose memory has
+        been recycled can make a stale tuple look current. It also kept a
+        strong reference on the module across a cudagraph replay.
+
+        The .cu producer writes the packed record; aiter's Triton kernel writes
+        the aligned one, fused the same way -- head-slot dispatch, one extra
+        slot per token carrying the KV row -- so this path needs no
+        C-extension rebuild.
+        """
+        if not _use_aiter_sparse_decode() or not isinstance(attn_metadata, dict):
+            return super()._fused_qnorm_rope_kv_insert(
+                q, kv, positions, attn_metadata
+            ), None, None
+
+        swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+        assert swa_metadata is not None
+        swa_kv_cache = self.swa_cache_layer.kv_cache
+        if swa_kv_cache.dtype != torch.uint8:
+            return super()._fused_qnorm_rope_kv_insert(
+                q, kv, positions, attn_metadata
+            ), None, None
+
+        from aiter.ops.triton.quant.fused_mxfp8_quant import (
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert,
+        )
+
+        assert positions.dtype == torch.int64
+        # pack_q=True: the fp8 pack comes off the same registers as the
+        # RMSNorm and RoPE, so it costs no second pass over Q. The pair rides
+        # the return value down to _forward_decode; the base's one-bf16-tensor
+        # contract still holds for every other backend, since this override
+        # and the two methods it hands to are all ROCm's.
+        # On a pure-decode step the decode reads only the packed pair, so the
+        # bf16 Q is written and never read -- T * padded_heads * 512 * 2
+        # bytes. Skip it, but ONLY when the aiter decode is certain to run:
+        # its fallback, and prefill, both read Q as bf16.
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            _dsv4_aiter_sparse_decode_fns,
+        )
+
+        # [A/B] forced True -- isolating the uninitialised-q_out skip from an
+        # intermittent GPU memory fault. Restore by removing this line.
+        write_q = True
+        _unused_skip = (
+            swa_metadata.num_prefills == 0
+            and swa_metadata.num_decodes > 0
+            and _dsv4_aiter_sparse_decode_fns() is not None
+        )
+        fuse = _dsv4_qpack_fusion_enabled()
+        res = (
+            fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                q,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                swa_metadata.block_size,
+                self.eps,
+                self.padded_heads,
+                apply_q_norm=True,
+                pack_q=fuse,
+                write_q=write_q,
+                # No caller-owned buffers: the producer allocates the
+                # packed pair per call, as the non-fused path does. A pair
+                # that outlives the step is what faulted the MoE prefill
+                # GEMM (see _dsv4_qpack_fusion_enabled).
+                q_packed_out=None,
+                q_rope_out=None,
+            )
+        )
+        if fuse:
+            return res
+        return res, None, None
+
+    def _prepare_and_attn(
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        kv: torch.Tensor,
+        qr_scale: torch.Tensor | None,
+        kv_score: torch.Tensor,
+        indexer_kv_score: torch.Tensor,
+        indexer_weights: torch.Tensor,
+        positions: torch.Tensor,
+        o_padded: torch.Tensor,
+    ) -> None:
+        """As the base, but with the Q/KV producer moved below the indexer.
+
+        The base runs the producer first so it can overlap the indexer and
+        compressor on aux streams. ROCm has no aux streams, so that ordering
+        buys nothing here and costs a long lifetime for the packed Q pair the
+        producer returns under VLLM_DSV4_QPACK_FUSION -- which is what faults
+        the MoE prefill GEMM. Producing last leaves the pair live only across
+        forward_mqa, which is its only consumer.
+
+        Reordering is safe because the SWA KV cache the producer writes is
+        read only by forward_mqa (and the _forward_decode inside it); the
+        indexer keeps its own cache and the compressor writes the compressed
+        record.
+        """
+        assert self.aux_stream_list is None, (
+            "ROCm _prepare_and_attn assumes no aux streams: the base class "
+            "overlaps the producer with the indexer/compressor, and this "
+            "override serialises them instead."
+        )
+        attn_metadata = get_forward_context().attn_metadata
+        indexer = self.indexer
+        compressor = self.compressor
+
+        index_q: torch.Tensor | None = None
+        index_q_scale: torch.Tensor | None = None
+        index_weights_out: torch.Tensor | None = None
+
+        if indexer is not None:
+            assert compressor is not None
+            index_q, index_q_scale, index_weights_out = indexer(
+                hidden_states,
+                qr,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                self.indexer_rotary_emb,
+                qr_scale,
+            )
+            compressor(kv_score, positions, self.rotary_emb)
+        elif compressor is not None:
+            compressor(kv_score, positions, self.rotary_emb)
+
+        # Last, so the packed pair is consumed almost immediately.
+        q = self._wq_b_proj(qr, qr_scale).view(
+            -1, self.n_local_heads, self.head_dim
+        )
+        q, q_packed, q_rope = self._fused_qnorm_rope_kv_insert(
+            q, kv, positions, attn_metadata
+        )
+
+        self._sparse_indexer_and_attn(
+            hidden_states,
+            index_q,
+            index_q_scale,
+            index_weights_out,
+            q,
+            kv,
+            positions,
+            o_padded,
+            q_packed=q_packed,
+            q_rope=q_rope,
+        )
+
+    @eager_break_during_capture
+    def _sparse_indexer_and_attn(  # type: ignore[override]
+        self,
+        hidden_states: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_q_scale: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        out: torch.Tensor,
+        q_packed: torch.Tensor | None = None,
+        q_rope: torch.Tensor | None = None,
+    ) -> None:
+        """As the base, plus the producer's packed Q pair.
+
+        The pair has to cross this boundary as two separate tensor arguments,
+        not bundled into one. eager_break_during_capture weak-refs arguments
+        it can see are tensors and keeps everything else by strong reference,
+        so a tuple would pin the pair's cudagraph-pool slots across replays --
+        the decorator's own docstring warns about exactly that.
+
+        Carries the base's decorator because it is the capture break point:
+        dropping it would merge two graph segments.
+        """
+        if self.indexer is not None and index_q is not None:
+            assert index_weights is not None
+            q_quant = (index_q, index_q_scale) if index_q_scale is not None else index_q
+            self.indexer.indexer_op(
+                hidden_states,
+                q_quant,
+                None,
+                index_weights,
+            )
+
+        self.forward_mqa(q, kv, positions, out, q_packed=q_packed, q_rope=q_rope)
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -641,9 +1050,20 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
+        from aiter.tuned_gemm import tgemm
+
         fused_weight = self._fused_compressor_weight
         split_sizes = self._fused_compressor_split_sizes
         if fused_weight is None or split_sizes is None:
+            if self.compressor is not None and self.indexer is None:
+                # HCA (cr=128) layers
+                qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
+                kv_score = tgemm.mm(
+                    hidden_states,
+                    self.compressor.fused_wkv_wgate.weight,
+                    otype=torch.float32,
+                )
+                return qr_kv, kv_score, None, None
             return super()._run_parallel_input_projections(hidden_states)
 
         indexer = self.indexer
@@ -651,10 +1071,10 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             raise RuntimeError("Fused compressor weight requires a C4 indexer")
 
         qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
-        fused_scores = torch.mm(
+        fused_scores = tgemm.mm(
             hidden_states,
-            fused_weight.T,
-            out_dtype=torch.float32,
+            fused_weight,
+            otype=torch.float32,
         )
         kv_score, indexer_kv_score = fused_scores.split(split_sizes, dim=-1)
         indexer_weights, _ = indexer.weights_proj(hidden_states)
@@ -722,7 +1142,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             kv_weight=self.kv_norm.weight.data,
             kv_epsilon=self.eps,
             group_size=128,
-            transpose_scale=False,
+            transpose_scale=True,
         )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -741,12 +1161,14 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
         return self.wo_b(zf)
 
-    def forward_mqa(
+    def forward_mqa(  # type: ignore[override]
         self,
         q: torch.Tensor,
         kv: torch.Tensor,
         positions: torch.Tensor,
         output: torch.Tensor,
+        q_packed: torch.Tensor | None = None,
+        q_rope: torch.Tensor | None = None,
     ) -> None:
         assert output.shape == q.shape, (
             f"output buffer shape {output.shape} must match q shape {q.shape}"
@@ -806,8 +1228,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 swa_metadata=swa_metadata,
             )
         if num_decodes > 0:
+            # The pair is the same rows as q, so it takes the same slice.
+            # Decode tokens lead the batch, so the prefix is the right one.
             self._forward_decode(
                 q=q[:num_decode_tokens],
+                q_packed=None if q_packed is None else q_packed[:num_decode_tokens],
+                q_rope=None if q_rope is None else q_rope[:num_decode_tokens],
                 kv_cache=self_kv_cache,
                 swa_metadata=swa_metadata,
                 attn_metadata=rocm_metadata,
@@ -825,6 +1251,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     def _forward_decode(
         self,
         q: torch.Tensor,
+        q_packed: torch.Tensor | None,
+        q_rope: torch.Tensor | None,
         kv_cache: torch.Tensor | None,
         swa_metadata: DeepseekV4ROCMAiterSparseSWAMetadata,
         attn_metadata: DeepseekV4ROCMAiterMLASparseMetadata | None,
@@ -865,6 +1293,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         rocm_sparse_attn_decode(
             q=q,
+            q_packed=q_packed,
+            q_rope=q_rope,
             kv_cache=kv_cache,
             swa_k_cache=self.swa_cache_layer.kv_cache,
             swa_only=swa_only,
