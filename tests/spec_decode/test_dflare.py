@@ -11,7 +11,7 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.config import VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig
 from vllm.model_executor.models.gemma4_dflare import (
     DFlareGemma4ForCausalLM,
     DFlareGemma4Model,
@@ -167,13 +167,18 @@ def test_qwen_mrope_image_positions_use_height_and_width():
     hidden = torch.randn(2, 2, 16)
     text = torch.tensor([[5, 5], [5, 5], [5, 5]])
     image = torch.tensor([[5, 5], [5, 7], [5, 9]])
-    kwargs = dict(
-        theta=1e7, layout="neox", mrope_section=[2, 1, 1], partial_rotary_factor=0.5
-    )
-    assert not torch.allclose(
-        _apply_angelslim_rope(hidden, text, **kwargs),
-        _apply_angelslim_rope(hidden, image, **kwargs),
-    )
+
+    def rotate(positions: torch.Tensor) -> torch.Tensor:
+        return _apply_angelslim_rope(
+            hidden,
+            positions,
+            1e7,
+            "neox",
+            mrope_section=[2, 1, 1],
+            partial_rotary_factor=0.5,
+        )
+
+    assert not torch.allclose(rotate(text), rotate(image))
 
 
 def test_partial_rotary_cache_leaves_remainder_unrotated():
@@ -245,10 +250,13 @@ def test_mrope_positions_require_runner_token_positions():
 def test_mrope_target_rejects_unpadded_drafter_batch():
     proposer = object.__new__(DFlareProposer)
     text_config = SimpleNamespace(rope_parameters={"mrope_section": [2, 1, 1]})
-    proposer.vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(hf_text_config=text_config)
+    proposer.vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config)),
     )
-    proposer.speculative_config = SimpleNamespace(disable_padded_drafter_batch=True)
+    proposer.speculative_config = cast(
+        SpeculativeConfig, SimpleNamespace(disable_padded_drafter_batch=True)
+    )
     with pytest.raises(NotImplementedError, match="padded drafter batch"):
         proposer.load_model(nn.Module())
 
