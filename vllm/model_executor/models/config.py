@@ -240,7 +240,8 @@ class Gemma4Config(VerifyAndUpdateConfig):
         requests to this per-layer FA3/FA4 selection. For other configurations,
         force FA4 for all layers to avoid the mixed
         FA3+FA4 penalty.
-        When FA4 is not available, fall back to Triton.
+        When FA4 is not available, fall back to Triton. On gfx1151 every layer
+        runs ROCM_ATTN, ahead of both.
         """
         model_config = vllm_config.model_config
         arch_config = model_config.model_arch_config
@@ -256,6 +257,19 @@ class Gemma4Config(VerifyAndUpdateConfig):
         from vllm.platforms import current_platform
         from vllm.v1.attention.backends.fa_utils import is_fa_version_supported
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+        if current_platform.is_rocm() and vllm_config.attention_config.backend is None:
+            from vllm.platforms.rocm import on_gfx1151
+
+            # gfx1151: ROCM_ATTN, the RDNA3.5 kernel, built for both head sizes.
+            if on_gfx1151():
+                vllm_config.attention_config.backend = AttentionBackendEnum.ROCM_ATTN
+                logger.info(
+                    "Gemma4 model has heterogeneous head dimensions %s. Using "
+                    "ROCM_ATTN for all layers.",
+                    head_dims,
+                )
+                return
 
         max_head_dim = max(head_dims.values())
 

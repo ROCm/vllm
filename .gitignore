@@ -214,6 +214,8 @@ cython_debug/
 
 # Results
 *.csv
+# Kernel variants _rocm_C is built from
+!vllm/v1/attention/ops/rdna35_variants.csv
 
 # Python pickle files
 *.pkl
