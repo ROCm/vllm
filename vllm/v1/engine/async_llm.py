@@ -7,10 +7,9 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from typing import Any
+from typing import Any, Optional
 
 import psutil
-import torch
 
 import vllm.envs as envs
 from vllm import TokensPrompt
@@ -35,6 +34,7 @@ from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.outputs import STREAM_FINISHED, PoolingRequestOutput, RequestOutput
 from vllm.pooling_params import PoolingParams
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.renderers import renderer_from_config
 from vllm.renderers.inputs.preprocess import extract_prompt_components
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -93,6 +93,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
+        profiler: Optional[TorchProfilerWrapper] = None,  # type: ignore # noqa
     ) -> None:
         """
         Create an AsyncLLM.
@@ -186,6 +187,7 @@ class AsyncLLM(EngineClient):
         except RuntimeError:
             pass
 
+        self.profiler = profiler
         if (
             vllm_config.profiler_config.profiler == "torch"
             and not vllm_config.profiler_config.ignore_frontend
@@ -196,23 +198,12 @@ class AsyncLLM(EngineClient):
                 profiler_dir,
             )
             worker_name = f"{socket.gethostname()}_{os.getpid()}.async_llm"
-            if vllm_config.profiler_config.torch_profiler_export_trace:
-                trace_handler = torch.profiler.tensorboard_trace_handler(
-                    profiler_dir,
-                    worker_name=worker_name,
-                    use_gzip=vllm_config.profiler_config.torch_profiler_use_gzip,
-                )
-            else:
-                trace_handler = lambda _prof: None  # noqa: E731
-            self.profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                ],
-                with_stack=vllm_config.profiler_config.torch_profiler_with_stack,
-                on_trace_ready=trace_handler,
+            self.profiler = TorchProfilerWrapper(
+                vllm_config.profiler_config,
+                worker_name=worker_name,
+                local_rank=0,
+                activities=["CPU"],
             )
-        else:
-            self.profiler = None
 
     @classmethod
     def from_vllm_config(
