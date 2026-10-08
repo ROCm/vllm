@@ -72,15 +72,6 @@ def tiny_sigmoid_dot(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     )
 
 
-MOE_LAYER_ROUTER_GATE_SUFFIXES = {
-    "gate",
-    "router",
-    "router_gate",
-    "shared_expert_gate",
-    "expert_gate",
-}
-
-
 def get_token_bin_counts_and_mask(
     tokens: torch.Tensor,
     vocab_size: int,
