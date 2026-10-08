@@ -249,7 +249,10 @@ class ModelConfig:
     """Whether to always use eager-mode PyTorch. If True, we will disable CUDA
     graph and always execute the model in eager mode. If False, we will use
     CUDA graph and eager execution in hybrid for maximal performance and
-    flexibility."""
+    flexibility.
+
+    NOTE: This disables both `torch.compile` and CUDA graphs, and is
+    equivalent to setting `-cc.mode=none -cc.cudagraph_mode=none`."""
     w4a16_prefill_dequant: str = "off"
     """Cache dequantized W4A16 weights for the prefill GEMM.
     'off': no caching (default). 'soft': cache until budget exhausted, warn on
@@ -709,7 +712,10 @@ class ModelConfig:
                 self.tokenizer_mode = "kimi_k3"
             elif arch == "DeepseekV32ForCausalLM":
                 self.tokenizer_mode = "deepseek_v32"
-            elif arch == "DeepseekV4ForCausalLM":
+            elif arch in (
+                "DeepseekV4ForCausalLM",
+                "DeepseekV4ForConditionalGeneration",
+            ):
                 self.tokenizer_mode = "deepseek_v4"
             elif arch in ("InklingForCausalLM", "InklingForConditionalGeneration"):
                 self.tokenizer_mode = "inkling"
