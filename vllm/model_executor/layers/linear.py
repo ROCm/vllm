@@ -56,13 +56,10 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "AutoGPTQLinearMethod",
     "Fp8LinearMethod",
     "FBGEMMFp8LinearMethod",
-    "ModelOptFp8LinearMethod",
-    "ModelOptFp8PcPtLinearMethod",
-    "ModelOptFp8PbWoLinearMethod",
     "QuarkLinearMethod",
-    "ModelOptNvFp4LinearMethod",
-    "ModelOptNvFp4W4A16LinearMethod",
     "HummingLinearMethod",
+    # ModelOptLinearMethod self-registers via
+    # register_weight_loader_v2_supported_method (see modelopt.py).
 ]
 
 
@@ -167,6 +164,8 @@ class LinearMethodBase(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    supports_pre_processed_weights = True
+
     def __init__(self) -> None:
         config = get_current_vllm_config_or_none()
         linear_backend = (
@@ -215,6 +214,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
             return
+        elif current_platform.is_xpu():
+            # Opt-in: F.linear on XPU is faster with an N-contiguous (N, K) weight
+            # when K > N, but oneDNN's ab-weights matmul is not run-to-run bitwise
+            # bitwise reproducible. Off by default.
+            weight = layer.weight.data
+            if (
+                envs.VLLM_XPU_FORCE_N_CONTIG_WEIGHT
+                and weight.ndim == 2
+                and weight.stride(0) != 1
+            ):
+                layer.weight.data = weight.t().contiguous().t()
+            return
 
         # gfx11x bandwidth cliff: when the weight row stride lands on a 2048 B
         # multiple, hipBLASLt (and the stride-aware wvSplitK kernel) hit an
@@ -229,7 +240,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+        if envs.VLLM_BATCH_INVARIANT and (
+            current_platform.is_cuda_alike() or current_platform.is_xpu()
+        ):
             return linear_batch_invariant(x, layer.weight, bias)
         return self._gemm_impl(layer, x, layer.weight, bias)
 
