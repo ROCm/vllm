@@ -154,14 +154,12 @@ is_nvidia_hopper = is_nvidia and (
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_gather_supported = hasattr(triton.language, "gather")
-is_tma_supported = (
-    is_nvidia_hopper
-    and os.getenv("FLA_USE_TMA", "0") == "1"
-    and (
-        hasattr(triton.language, "_experimental_make_tensor_descriptor")
-        or hasattr(triton.language, "make_tensor_descriptor")
-    )
-)
+
+if is_nvidia_hopper:
+    def _fla_triton_alloc(size: int, alignment: int, stream: int | None):
+        return torch.empty(size, device=device, dtype=torch.int8)
+
+    triton.set_allocator(_fla_triton_alloc)
 
 
 def get_all_max_shared_mem():
