@@ -7,7 +7,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from typing import Any, Optional
+from typing import Any
 
 import psutil
 
@@ -93,7 +93,7 @@ class AsyncLLM(EngineClient):
         client_addresses: dict[str, Any] | None = None,
         client_count: int = 1,
         client_index: int = 0,
-        profiler: Optional[TorchProfilerWrapper] = None,  # type: ignore # noqa
+        profiler: TorchProfilerWrapper | None = None,
     ) -> None:
         """
         Create an AsyncLLM.
