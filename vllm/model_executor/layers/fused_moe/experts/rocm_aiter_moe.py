@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
+    RoutingMethodType,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -509,6 +510,17 @@ class AiterExperts(mk.FusedMoEExpertsModular):
 
             return False
         return True
+
+    @staticmethod
+    def _supports_routing_method(
+        routing_method: RoutingMethodType,
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return not (
+            routing_method == RoutingMethodType.DeepseekV4
+            and (weight_key, activation_key) == (kMxfp4Static, kMxfp4Dynamic)
+        )
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
