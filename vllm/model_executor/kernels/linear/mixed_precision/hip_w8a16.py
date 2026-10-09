@@ -110,9 +110,6 @@ class HipW8A16LinearKernel(MPLinearKernel):
         if c.zero_points:
             return False, "does not support zero points (asymmetric)"
 
-        if c.has_g_idx:
-            return False, "does not support g_idx reordering"
-
         K = c.partition_weight_shape[0]
         if K % 16 != 0:
             return False, f"K={K} must be divisible by 16"
@@ -142,7 +139,7 @@ class HipW8A16LinearKernel(MPLinearKernel):
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
 
-        w_q, w_s, _, _ = self._get_weight_params(layer)
+        w_q, w_s, _ = self._get_weight_params(layer)
         if c.group_size == -1:
             self._w_dequant = (w_q.to(c.act_type) * w_s.unsqueeze(1)).contiguous()
         else:
@@ -160,7 +157,7 @@ class HipW8A16LinearKernel(MPLinearKernel):
     ) -> torch.Tensor:
         from vllm.utils.platform_utils import num_compute_units
 
-        w_q, w_s, _, _ = self._get_weight_params(layer)
+        w_q, w_s, _ = self._get_weight_params(layer)
         x_2d = x.reshape(-1, x.shape[-1])
         N = x_2d.shape[0]
         K = x_2d.shape[1]

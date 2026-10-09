@@ -504,7 +504,6 @@ def test_hybrid_can_implement_per_channel_rejects_asymmetric():
         act_type=torch.float16,
         group_size=-1,
         zero_points=True,
-        has_g_idx=False,
     )
     ok, reason = RDNAHybridW4A16LinearKernel.can_implement(config)
     assert ok is False
