@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tune one (Hq, Hkv, D, window, M) of the RDNA3.5 decode kernel, and apply.
+"""Tune one (Hq, Hkv, D, window, M) of the RDNA3.5 decode kernel, or with
+--prefill one (Hq, Hkv, D, window) of the prefill kernel, and apply.
 
 A configuration may not depend on S: the grid is fixed when the CUDA graph is
 captured and S is a runtime argument, so one knob set has to serve 128 and
@@ -50,6 +51,28 @@ row whose winner is the dot decomposition takes the best WMMA point instead:
 the dot path buys latency for one sequence and loses once a batch fills the
 machine.  A decision measured against another kernel source or another row
 is refused.
+
+--prefill tunes the prefill kernel (rdna35_prefill_attn.cu), one row per step
+of M (STEPS), all steps of a configuration in one run.  It runs outside CUDA
+graphs and the host knows M, so a row only has to serve its step:
+
+1. The prefill knob grid (`prefill_grid`), built up front; every point checked
+   against Triton's unified attention, then timed calling the op directly
+   (L2 flushed) at each cell: the start of every step after each of
+   --prefixes cached tokens.
+2. Per step, the --top best by the weighted mean of their speedups over the
+   step's fastest point, the current row and the previous step's winner are
+   timed through ROCM_ATTN in an interleaved A/B with TRITON_ATTN and
+   ROCM_SEGMENTED_ATTN, each in the KV cache layout vLLM gives it.
+3. Per step, a point that is slower than the best baseline at no cell wins
+   over one that is, then the best mean of its speedups weighted by
+   sqrt(FLOPs); the previous step's row stays if it is as safe and within
+   PREFILL_SLACK, so that steps share rows.  The decision is one line with
+   every step's winner.
+
+`--apply` writes a prefill decision's rows into rdna35_prefill_variants.csv,
+both dtypes, every page size the configuration has (--block-sizes for a new
+one), contiguous steps with the same winner merged.
 """
 
 import argparse
@@ -187,13 +210,16 @@ PINS = {
     "no_prefetch": lambda k, r: not k["prefetch"],
     "no_v_in_lds": lambda k, r: not k["v_in_lds"],
     "no_head_dim_split": lambda k, r: k["head_dim_split"] in (0, r),
-    "min_segment_blocks_1": lambda k, r: k["min_segment_blocks"] == 1
-    or k["dot_product"],
+    "min_segment_blocks_1": lambda k, r: (
+        k["min_segment_blocks"] == 1 or k["dot_product"]
+    ),
     "max_segments_pow2": lambda k, r: k["max_segments"] & (k["max_segments"] - 1) == 0,
     "no_waves_2": lambda k, r: k["waves"] != 2,
-    "simple": lambda k, r: not (k["dot_product"] or k["prefetch"] or k["v_in_lds"])
-    and k["head_dim_split"] in (0, r)
-    and k["min_segment_blocks"] == 1,
+    "simple": lambda k, r: (
+        not (k["dot_product"] or k["prefetch"] or k["v_in_lds"])
+        and k["head_dim_split"] in (0, r)
+        and k["min_segment_blocks"] == 1
+    ),
 }
 
 
@@ -597,11 +623,425 @@ def tune(a) -> None:
         )
 
 
+# ------------------------------------------------------------------- prefill --
+
+# Steps of M: a row serves its step, from the first value up to the next one.
+STEPS = (128, 256, 512, 1024, 2048, 4096)
+PREFIXES = (0, 1024, 16384)
+# A step keeps the previous step's row within this factor of its winner.
+PREFILL_SLACK = 1.02
+PREFILL_BASELINES = ("TRITON_ATTN", "ROCM_SEGMENTED_ATTN")
+
+
+def prefill_grid(d):
+    """Prefill knob sets for head size d: the head dim splits that keep a
+    lane's V slice to 4..16 elements, 1 for D <= 128."""
+    split = max(1, d // 128)
+    if d <= 128:
+        axes = {
+            "waves": (2, 4, 8),
+            "key_tile": (16, 32, 64),
+            "v_t": (0, 1),
+            "key_waves": (1, 2),
+            "double_buffer": (0,),
+        }
+    elif d == 256:
+        axes = {
+            "waves": (4, 8, 16),
+            "key_tile": (16, 32),
+            "v_t": (0, 1),
+            "key_waves": (1,),
+            "double_buffer": (0, 1),
+        }
+    else:
+        axes = {
+            "waves": (8, 16),
+            "key_tile": (16,),
+            "v_t": (0,),
+            "key_waves": (1,),
+            "double_buffer": (0, 1),
+        }
+    axes |= {"max_segments": (8, 16), "head_group": (4, 8)}
+    out = []
+    for values in itertools.product(*axes.values()):
+        k = dict(zip(axes, values), head_dim_split=split)
+        if (
+            k["waves"] % (split * k["key_waves"])
+            or k["key_tile"] // 16 % k["key_waves"]
+        ):
+            continue
+        out.append(k)
+    return out
+
+
+def prefill_knobs_of(v):
+    return {k: getattr(v, k) for k in utils.PREFILL_KNOBS}
+
+
+def prefill_label(k):
+    return " ".join(f"{n}={k[n]}" for n in utils.PREFILL_KNOBS)
+
+
+def weighted_speedup(weights, ratio):
+    """Mean of the speedups (other / ours), weighted, in log space."""
+    return math.exp(sum(w * math.log(r) for w, r in zip(weights, ratio)) / sum(weights))
+
+
+def tune_prefill(a) -> None:
+    import common
+    import jit
+    import torch
+    from runner import run_attention_benchmark
+    from triton.testing import do_bench
+
+    import vllm
+    import vllm.v1.attention.ops.rdna35_hip_decode as R
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    jit.install()
+    common.gc = types.SimpleNamespace(collect=lambda *x: 0)
+    dtype = utils.torch_dtype(a.dtype)
+    hq, hkv, d, win, bs = a.hq, a.hkv, a.head_dim, a.window, a.block_size
+    tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + f" prefill {a.dtype}"
+    cells = [(m, p) for m in STEPS for p in a.prefixes]
+    flops = [utils.attention_flops(hq, d, m, m + p, win) for m, p in cells]
+    total = sum(flops)
+    weight = {c: math.sqrt(f / total) for c, f in zip(cells, flops)}
+    fixed = {
+        "kind": "prefill",
+        "hq": hq,
+        "hkv": hkv,
+        "d": d,
+        "window": win,
+        "dtype": a.dtype,
+        "block_size": bs,
+        "source": jit.source_digest(prefill=True),
+        "cells": cells,
+    }
+    meta = {
+        "vllm": vllm.__version__,
+        "torch": torch.__version__,
+        "host": platform.node(),
+    }
+
+    def variant(knobs):
+        return R.PrefillVariant(d, hq, hkv, win, bs, STEPS[0], **knobs, dtype=dtype)
+
+    def pid(knobs):
+        return json.dumps(sorted(knobs.items()))
+
+    current = {
+        m: R.prefill_variant_for(hq, hkv, d, bs, 1, win, dtype, m) for m in STEPS
+    }
+    raw = (
+        [json.loads(x) for x in Path(a.candidates).read_text().splitlines() if x]
+        if a.candidates
+        else prefill_grid(d)
+    )
+    cands: dict[str, R.PrefillVariant] = {}
+    for k in [*raw, *(prefill_knobs_of(v) for v in current.values() if v)]:
+        try:
+            cands.setdefault(pid(k), variant(k))
+        except (TypeError, ValueError):
+            continue
+    items = list(cands.items())[: a.limit or None]
+    known: dict[str, dict] = {}
+    if a.reuse and Path(a.points).exists():
+        for line in Path(a.points).read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if all(rec.get(k) == v for k, v in fixed.items()):
+                known[pid(rec["knobs"])] = rec
+    t0 = time.time()
+    jit.precompile([v for p, v in items if p not in known])
+    jit.seal()
+    print(
+        f"# {tag}: {len(items)} points, built in {time.time() - t0:.0f} s", flush=True
+    )
+    time.sleep(5)  # a parallel build moves the SoC clock
+
+    dev = torch.device("cuda")
+
+    def inputs(m, p, seed):
+        torch.manual_seed(seed)
+        s = m + p
+        pages = -(-s // bs)
+        kv = (torch.randn(pages, hkv, bs, 2 * d, device=dev) * 0.5).to(dtype)
+        table = torch.randperm(pages, device=dev).to(torch.int32)
+        q = (torch.randn(m, hq, d, device=dev) * 0.5).to(dtype)
+        return q, kv, table, torch.tensor([s], device=dev, dtype=torch.int32)
+
+    def triton(q, kv, table, sl):
+        m, s = q.shape[0], int(sl.item())
+        k, v = kv.transpose(1, 2).split(d, dim=-1)
+        out = torch.empty_like(q)
+        one = torch.ones(1, hkv, device=dev)
+        starts = torch.tensor([0, m], device=dev, dtype=torch.int32)
+        unified_attention(
+            q,
+            k,
+            v,
+            out,
+            starts,
+            m,
+            sl,
+            s,
+            d**-0.5,
+            True,
+            (win - 1, 0) if win else (-1, -1),
+            table.view(1, -1),
+            0,
+            None,
+            one,
+            one,
+        )
+        return out
+
+    scratch = {}
+
+    def op(module, v, q, kv, table, sl, out):
+        key = v.scratch_rows()
+        if key not in scratch:
+            scratch[key] = R.make_prefill_scratch([v], dev)
+        s = int(sl.item())
+        return lambda: module.prefill_attn(
+            q, kv, table, out, *scratch[key], sl, s, d**-0.5
+        )
+
+    # 1. Search: correctness, then the op directly at every cell.
+    with open(a.points, "a") as fh:
+        for i, (key, v) in enumerate(items):
+            if key in known:
+                continue
+            rec = {
+                **fixed,
+                "knobs": prefill_knobs_of(v),
+                **meta,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            module = jit.load(v)
+            if module is None:
+                rec.update(status="build", error=(jit.failure(v) or "")[:400])
+            else:
+                us = []
+                for seed, (m, p) in enumerate(cells):
+                    q, kv, table, sl = inputs(m, p, seed)
+                    out = torch.full_like(q, float("nan"))
+                    run = op(module, v, q, kv, table, sl, out)
+                    run()
+                    torch.accelerator.synchronize()
+                    err = (out.float() - triton(q, kv, table, sl).float()).abs().max()
+                    if not err.item() <= 5e-3:
+                        rec.update(status="wrong", cell=[m, p], err=err.item())
+                        break
+                    us.append(
+                        do_bench(run, warmup=5, rep=40, return_mode="median") * 1e3
+                    )
+                else:
+                    rec.update(status="ok", us=[round(u, 2) for u in us])
+            fh.write(json.dumps(rec) + "\n")
+            fh.flush()
+            known[key] = rec
+            if (i + 1) % 20 == 0:
+                print(
+                    f"#   {i + 1}/{len(items)} points, "
+                    f"{(time.time() - t0) / 60:.1f} min",
+                    flush=True,
+                )
+    ok = {
+        k: dict(zip(map(tuple, cells), r["us"]))
+        for k, r in known.items()
+        if r.get("status") == "ok"
+    }
+    if not ok:
+        print(f"{tag}: no point measured correct", flush=True)
+        return
+
+    # 2. Finalists per step, timed through ROCM_ATTN against the baselines.
+    def step_cells(m):
+        return [c for c in cells if c[0] == m]
+
+    finalists: dict[int, set[str]] = {}
+    for m in STEPS:
+        sc = step_cells(m)
+        fastest = {c: min(t[c] for t in ok.values()) for c in sc}
+        ranked = sorted(
+            ok,
+            key=lambda k: (
+                -weighted_speedup(
+                    [weight[c] for c in sc], [fastest[c] / ok[k][c] for c in sc]
+                )
+            ),
+        )
+        finalists[m] = set(ranked[: a.top])
+        if current[m] is not None and pid(prefill_knobs_of(current[m])) in ok:
+            finalists[m].add(pid(prefill_knobs_of(current[m])))
+    for m, prev in zip(STEPS[1:], STEPS):
+        finalists[m] |= finalists[prev]
+
+    def harness(backend, m, p, knobs=None):
+        from common import BenchmarkConfig
+
+        cfg = BenchmarkConfig(
+            backend=backend,
+            batch_spec=f"q{m}s{m + p}",
+            num_layers=10,
+            min_working_set_mb=96,
+            head_dim=d,
+            num_q_heads=hq,
+            num_kv_heads=hkv,
+            block_size=bs,
+            device="cuda:0",
+            dtype=dtype,
+            sliding_window=win or None,
+            use_cuda_graphs=False,
+            max_model_len=max(STEPS) * 2 + max(a.prefixes),
+        )
+        if knobs is None:
+            return run_attention_benchmark(cfg).median_time * 1e6
+        with jit.paths() as path, jit.override(knobs):
+            us = run_attention_benchmark(cfg).median_time * 1e6
+        if path() != "prefill":
+            raise RuntimeError(f"ran {path()} at q{m}s{m + p}")
+        return us
+
+    times: dict = {}
+    for _ in range(a.confirm_rounds):
+        for m in STEPS:
+            for c in step_cells(m):
+                for b in PREFILL_BASELINES:
+                    try:
+                        times.setdefault((b, c), []).append(harness(b, *c))
+                    except Exception:  # noqa: BLE001 - the backend refuses the shape
+                        times.setdefault((b, c), []).append(float("inf"))
+                for k in sorted(finalists[m]):
+                    times.setdefault((k, c), []).append(
+                        harness("ROCM_ATTN", *c, dict(json.loads(k)))
+                    )
+    med = {key: statistics.median(t) for key, t in times.items()}
+
+    # 3. Per step: safe first, then the weighted speedup over the best baseline.
+    steps, prev = [], None
+    for m in STEPS:
+        sc = step_cells(m)
+        base = {c: min(med[(b, c)] for b in PREFILL_BASELINES) for c in sc}
+        w = [weight[c] for c in sc]
+        scored = {}
+        for k in finalists[m]:
+            ratio = [base[c] / med[(k, c)] for c in sc]
+            scored[k] = (min(ratio) >= 1.0, weighted_speedup(w, ratio), ratio)
+        best = max(scored, key=lambda k: scored[k][:2])
+        if (
+            prev in scored
+            and (scored[prev][0] or not scored[best][0])
+            and scored[prev][1] * PREFILL_SLACK >= scored[best][1]
+        ):
+            best = prev
+        cur = None if current[m] is None else prefill_knobs_of(current[m])
+        steps.append(
+            {
+                "m": m,
+                "current": cur,
+                "winner": dict(json.loads(best)),
+                "speedup": scored[best][1],
+                "worst": min(scored[best][2]),
+                "cells": {
+                    f"{c[0]}:{c[1]}": {"ours": med[(best, c)], "base": base[c]}
+                    for c in sc
+                },
+            }
+        )
+        prev = best
+        print(
+            f"{tag} M>={m}: {prefill_label(steps[-1]['winner'])}  "
+            f"speedup {steps[-1]['speedup']:.2f}x, "
+            f"worst cell {steps[-1]['worst']:.2f}x",
+            flush=True,
+        )
+    decision = {
+        **fixed,
+        "current": {m: s["current"] for m, s in zip(STEPS, steps)},
+        "steps": steps,
+        "accepted": True,
+        **meta,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with open(a.decisions, "a") as out:
+        out.write(json.dumps(decision) + "\n")
+
+
+def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
+    """Write one prefill decision's rows into rdna35_prefill_variants.csv."""
+    import jit
+    import torch
+
+    import vllm.v1.attention.ops.rdna35_hip_decode as R
+
+    hq, hkv, d, win = dec["hq"], dec["hkv"], dec["d"], dec["window"]
+    tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + " prefill"
+    if dec["source"] != jit.source_digest(prefill=True):
+        print(f"{tag}: refused, measured on another kernel source")
+        return 0
+    path = R.PREFILL_VARIANTS_CSV
+    with path.open(newline="") as fh:
+        reader = csv.reader(fh)
+        header = next(reader)
+        rows = [list(map(int, r)) for r in reader]
+    col = {c: i for i, c in enumerate(header)}
+    dtype = utils.torch_dtype(dec["dtype"])
+    for step in dec["steps"]:
+        now = R.prefill_variant_for(
+            hq, hkv, d, dec["block_size"], 1, win, dtype, step["m"]
+        )
+        if step["current"] != (None if now is None else prefill_knobs_of(now)):
+            print(f"{tag}: refused, the rows changed since they were measured")
+            return 0
+
+    def mine(r):
+        return (
+            r[col["HEAD_DIM"]],
+            r[col["NUM_Q_HEADS"]],
+            r[col["NUM_KV_HEADS"]],
+            r[col["WINDOW"]],
+        ) == (d, hq, hkv, win)
+
+    sizes = sorted({r[col["PAGE_SIZE"]] for r in rows if mine(r)}) or block_sizes
+    rows = [r for r in rows if not mine(r)]
+    merged = []
+    for step in dec["steps"]:
+        if not merged or merged[-1]["winner"] != step["winner"]:
+            merged.append(step)
+    written = 0
+    for bf16, bs, step in itertools.product((0, 1), sizes, merged):
+        v = R.PrefillVariant(
+            d,
+            hq,
+            hkv,
+            win,
+            bs,
+            step["m"],
+            **step["winner"],
+            dtype=torch.bfloat16 if bf16 else torch.float16,
+        )
+        rows.append(list(R.prefill_variant_defines(v).values()))
+        written += 1
+    with path.open("w", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(header)
+        w.writerows(sorted(rows))
+    for step in merged:
+        print(f"{tag} M>={step['m']}: {prefill_label(step['winner'])}")
+    return written
+
+
 # ------------------------------------------------------------------- --apply --
 
 
 def apply(path: str, block_sizes: list[int]) -> None:
-    """Write the accepted decisions of `path` into rdna35_variants.csv."""
+    """Write the accepted decisions of `path` into rdna35_variants.csv, and
+    prefill decisions into rdna35_prefill_variants.csv."""
     import jit
     import torch
 
@@ -626,6 +1066,9 @@ def apply(path: str, block_sizes: list[int]) -> None:
     written = 0
     for line in Path(path).read_text().splitlines():
         dec = json.loads(line)
+        if dec.get("kind") == "prefill":
+            written += apply_prefill(dec, block_sizes)
+            continue
         if not dec["accepted"]:
             continue
         hq, hkv, d, m, win = dec["hq"], dec["hkv"], dec["d"], dec["m"], dec["window"]
@@ -672,7 +1115,7 @@ def apply(path: str, block_sizes: list[int]) -> None:
         w = csv.writer(fh, lineterminator="\n")
         w.writerow(header)
         w.writerows(rows[k] for k in sorted(rows))
-    print(f"# {written} rows written to {csv_path}")
+    print(f"# {written} rows written")
 
 
 def main() -> None:
@@ -684,6 +1127,18 @@ def main() -> None:
         nargs="+",
         default=[16],
         help="with --apply: page sizes of a configuration the CSV does not have",
+    )
+    p.add_argument(
+        "--prefill",
+        action="store_true",
+        help="tune the prefill kernel: every step of M of one configuration",
+    )
+    p.add_argument(
+        "--prefixes",
+        type=int,
+        nargs="+",
+        default=list(PREFIXES),
+        help="with --prefill: cached tokens before each step's M",
     )
     p.add_argument("--hq", type=int)
     p.add_argument("--hkv", type=int)
@@ -707,14 +1162,16 @@ def main() -> None:
     if a.apply:
         apply(a.apply, a.block_sizes)
         return
+    needed = ("hq", "hkv", "head_dim", "points", "decisions")
     missing = [
-        n
-        for n in ("hq", "hkv", "head_dim", "m", "points", "decisions")
-        if getattr(a, n) is None
+        n for n in (*needed, *(() if a.prefill else ("m",))) if getattr(a, n) is None
     ]
     if missing:
         p.error("tuning needs --" + ", --".join(n.replace("_", "-") for n in missing))
-    tune(a)
+    if a.prefill:
+        tune_prefill(a)
+    else:
+        tune(a)
 
 
 if __name__ == "__main__":

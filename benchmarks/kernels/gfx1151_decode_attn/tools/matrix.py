@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""ROCM_ATTN's RDNA3.5 decode kernel on every shape, as markdown.
+"""ROCM_ATTN's RDNA3.5 decode and prefill kernels on every shape, as markdown.
 
 By default one sequence of --m tokens at each of --contexts, per configuration
 of shapes.csv; --batch measures batch specs instead (attention_benchmarks
 grammar, or `decode` / `mixed` for the lists below): batches of sequences
 decoding together, and decodes mixed with a prefill or a chunked-prefill
-extend (decodes on the kernel, the rest on Triton).  Specs whose requests are
-all decodes are timed under CUDA graphs, as vLLM replays them; mixed ones
+extend.  --prefill measures one sequence of --m new tokens (128..8192) after
+each of --prefixes cached ones, on the prefill kernel.  Specs whose requests
+are all decodes are timed under CUDA graphs, as vLLM replays them; the rest
 eagerly, as vLLM runs them.
 
-Only our kernel runs unless --baselines names other backends.  It is the one
-_rocm_C carries; forcing a knob (--max-segments ...) or --ablate builds variants with
-jit.py instead.  The path column says what ran: `kernel`, `split` (decodes on
-the kernel, the rest on Triton) or `triton` (fallback).  Every backend runs
-in the KV cache layout vLLM gives it: ours LBHNC, TRITON_ATTN LBNHC,
+Only our kernels run unless --baselines names other backends.  They are the
+ones _rocm_C carries; forcing a knob (--max-segments ...) or --ablate builds
+variants with jit.py instead (a knob goes to the kernel the run measures).
+The path column says what ran: `kernel`, `prefill` (prefills on the prefill
+kernel), `split` (decodes on the kernel, the rest on Triton) or `triton`
+(fallback).  %roof is against utils.roofline: the call's bytes at peak
+bandwidth or its FLOPs at sustained WMMA throughput, whichever is longer; AI
+is its arithmetic intensity (FLOP/byte) and `bound` the roof that sets the
+floor (memory below utils.RIDGE, compute above).  Every backend runs in the
+KV cache layout vLLM gives it: ours LBHNC, TRITON_ATTN LBNHC,
 ROCM_SEGMENTED_ATTN LHBNC.
 
     cd <worktree> && PYTHONPATH=$PWD <venv>/bin/python \\
         benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py > table.md
+    ... matrix.py --prefill --m 128 1024 8192 --prefixes 0 16384 > prefill.md
 """
 
 import argparse
@@ -126,7 +133,7 @@ def describe(args: argparse.Namespace) -> str:
     return " ".join(bits)
 
 
-def spec_roofline_us(
+def spec_roofline(
     spec: str,
     hq: int,
     hkv: int,
@@ -134,22 +141,21 @@ def spec_roofline_us(
     itemsize: int = 2,
     block_size: int = 16,
     window: int = 0,
-) -> float | None:
-    """`utils.roofline_us` of a batch spec: one dispatch plus every sequence's bytes.
-
-    None if a request is a prefill, whose floor is compute rather than bytes.
-    """
+) -> tuple[float, float, str]:
+    """`utils.roofline` of a batch spec: one dispatch, and the bytes and FLOPs
+    of every sequence together.  Returns (us, FLOP/byte, bound)."""
     from batch_spec import parse_batch_spec
 
     reqs = parse_batch_spec(spec)
-    if any(r.q_len > 8 for r in reqs):
-        return None
+    args = (itemsize, block_size, window)
+    flops = sum(utils.attention_flops(hq, d, r.q_len, r.kv_len, window) for r in reqs)
     moved = sum(
-        utils.roofline_us(hq, hkv, d, r.q_len, r.kv_len, itemsize, block_size, window)
-        - utils.DISPATCH_US
-        for r in reqs
+        utils.attention_bytes(hq, hkv, d, r.q_len, r.kv_len, *args) for r in reqs
     )
-    return utils.DISPATCH_US + moved
+    memory_us = moved / (utils.PEAK_GIBS * 1024**3) * 1e6
+    compute_us = flops / (utils.PEAK_TFLOPS * 1e6)
+    bound = "compute" if compute_us > memory_us else "memory"
+    return utils.DISPATCH_US + max(memory_us, compute_us), flops / moved, bound
 
 
 def main() -> None:
@@ -160,9 +166,15 @@ def main() -> None:
         "--m",
         type=int,
         nargs="+",
-        default=[1, 4],
-        help="query tokens per sequence; 1 is plain decode, 4 is speculative",
+        help="query tokens per sequence; 1 is plain decode, 4 is speculative "
+        "(default 1 4; with --prefill 128 256 512 1024 2048 4096 8192)",
     )
+    p.add_argument(
+        "--prefill",
+        action="store_true",
+        help="one sequence of --m new tokens after each of --prefixes cached ones",
+    )
+    p.add_argument("--prefixes", type=int, nargs="+", default=[0, 4096, 16384])
     p.add_argument(
         "--contexts",
         type=int,
@@ -183,7 +195,7 @@ def main() -> None:
         help="whole re-setups per cell; do_bench medians many iterations "
         "inside one already",
     )
-    for knob in utils.KNOBS:
+    for knob in dict.fromkeys(utils.KNOBS + utils.PREFILL_KNOBS):
         p.add_argument(
             f"--{knob.replace('_', '-')}",
             type=int,
@@ -211,11 +223,14 @@ def main() -> None:
     from common import BenchmarkConfig
     from runner import run_attention_benchmark
 
-    specs = (
-        [s for b in args.batch for s in SPECS.get(b, [b])]
-        if args.batch
-        else [f"q{m}s{s}" for s in args.contexts for m in args.m]
-    )
+    if args.m is None:
+        args.m = [128, 256, 512, 1024, 2048, 4096, 8192] if args.prefill else [1, 4]
+    if args.batch:
+        specs = [s for b in args.batch for s in SPECS.get(b, [b])]
+    elif args.prefill:
+        specs = [f"q{m}s{m + p}" for p in args.prefixes for m in args.m]
+    else:
+        specs = [f"q{m}s{s}" for s in args.contexts for m in args.m]
     parsed = {spec: parse_batch_spec(spec) for spec in specs}
     # One limit for the whole run, so that a backend's startup autotuning
     # (keyed on it) runs once per configuration rather than once per cell.
@@ -231,12 +246,21 @@ def main() -> None:
     for sh in shapes:
         groups.setdefault((sh.hq, sh.hkv, sh.d, sh.window), []).append(sh.model)
 
-    forced = {k: getattr(args, k) for k in utils.KNOBS if getattr(args, k) is not None}
+    names = utils.PREFILL_KNOBS if args.prefill else utils.KNOBS
+    forced = {k: getattr(args, k) for k in names if getattr(args, k) is not None}
     if forced or args.ablate:
         jit.install(ablate=args.ablate)
         wanted = []
         for hq, hkv, d, window in groups:
             for reqs in parsed.values():
+                for r in reqs:
+                    if r.q_len > 8:
+                        with jit.override(forced):
+                            v = jit.prefill_variant_for(
+                                hq, hkv, d, args.block_size, 1, window, dtype, r.q_len
+                            )
+                        if v is not None:
+                            wanted.append(v)
                 dec = [r for r in reqs if r.q_len <= 8]
                 if dec and all(r.q_len == dec[0].q_len for r in dec):
                     with jit.override(forced):
@@ -297,6 +321,8 @@ def main() -> None:
         "D",
         "window",
         "path",
+        "AI",
+        "bound",
         "roofline",
         *args.baselines,
         "ours",
@@ -313,7 +339,7 @@ def main() -> None:
     for spec in specs:
         for (hq, hkv, d, window), models in groups.items():
             label = models[0] if len(models) == 1 else f"{models[0]} +{len(models) - 1}"
-            roof = spec_roofline_us(
+            roof, intensity, bound = spec_roofline(
                 spec, hq, hkv, d, block_size=args.block_size, window=window
             )
             head = [label, spec, hq, hkv, d, window or "-"]
@@ -337,11 +363,13 @@ def main() -> None:
             cells = [
                 *head,
                 path(),
-                "-" if roof is None else f"{roof:.2f}",
+                f"{intensity:.0f}",
+                bound,
+                f"{roof:.2f}",
                 *("-" if t is None else f"{t:.2f}" for t in base),
                 f"{ours:.2f}",
                 *([f"{min(served) / ours:.2f}x" if served else "-"] if base else []),
-                "-" if roof is None else f"{roof / ours * 100:.1f} %",
+                f"{roof / ours * 100:.1f} %",
                 f"{spread:.1f} %",
             ]
             print("| " + " | ".join(map(str, cells)) + " |", flush=True)

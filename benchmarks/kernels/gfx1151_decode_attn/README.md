@@ -1,7 +1,9 @@
-# RDNA3.5 decode attention: adding, tuning and checking a configuration
+# RDNA3.5 attention: adding, tuning and checking a configuration
 
 On RDNA3.5 `ROCM_ATTN` serves decode with the HIP kernel in
-`csrc/rocm/rdna35_decode_attn.cu`. The kernel takes every shape and launch
+`csrc/rocm/rdna35_decode_attn.cu`, and prefills of 128 to 8192 query tokens
+with the one in `csrc/rocm/rdna35_prefill_attn.cu` (see
+[Prefill](#prefill)). The kernel takes every shape and launch
 knob as a compile-time define, so each build serves exactly one tuple. The
 builds are the rows of `vllm/v1/attention/ops/rdna35_variants.csv`. CMake
 compiles every row into `_rocm_C` (`cmake/rdna35_attn.cmake`,
@@ -114,9 +116,59 @@ PYTHONPATH=$PWD .venv/bin/python \
 ```
 
 - The `path` column must read `kernel`. `triton` means the call found no row.
-- `%roof` is the time against a bandwidth roofline.
+- `%roof` is the time against a roofline (`tools/utils.py`): the call's bytes
+  at 230 GiB/s or its FLOPs at 43 TFLOPS of sustained WMMA, whichever is
+  longer. `AI` is the arithmetic intensity in FLOP/byte and `bound` says which
+  roof applies: memory below the ridge point (~174 FLOP/byte), compute above.
+  Decode is memory-bound; prefills of a few hundred tokens or more are
+  compute-bound.
 - Add `--windowed` for sliding-window configurations and `--block-size P` for
   other page sizes.
 
 When the change affects a model's output, run a model eval as well
 (`tests/evals/` or `lm_eval`).
+
+## Prefill
+
+The prefill kernel serves one sequence of M query tokens after its cached
+prefix, outside CUDA graphs, so M is known on the host. Its rows are in
+`vllm/v1/attention/ops/rdna35_prefill_variants.csv`: for every configuration,
+in fp16 and bf16, one row per step of M, the row whose `MIN_QUERY_LEN` is the
+largest at or below M. Steps start at 128, 256, 512, 1024, 2048 and 4096;
+contiguous steps that share a row are one row. Below 128 query tokens a
+prefill goes to Triton.
+
+Tune every step of a configuration in one run (fp16; bf16 reuses it):
+
+```bash
+PYTHONPATH=$PWD .venv/bin/python \
+    benchmarks/kernels/gfx1151_decode_attn/tools/tune.py --prefill \
+    --hq 16 --hkv 2 --head-dim 256 \
+    --points points.jsonl --decisions decisions.jsonl
+```
+
+- Every point of the prefill grid is checked against Triton and timed at the
+  start of each step after 0, 1k and 16k cached tokens (`--prefixes`).
+- Per step, the best points, the current row and the previous step's winner
+  are timed through `ROCM_ATTN` against `TRITON_ATTN` and
+  `ROCM_SEGMENTED_ATTN`. A point slower than the best baseline at no cell
+  wins over one that is, then the best speedup weighted by sqrt(FLOPs); a step
+  keeps the previous step's row within 2 %. The module docstring has the rest.
+- `--window`, `--block-size`, `--points`/`--reuse` and `--limit` work as
+  above.
+
+`tune.py --apply decisions.jsonl` writes prefill decisions into the prefill
+CSV like decode ones. Gemma-4 hybrids give some layers 32- or 64-token pages:
+their rows carry that page size.
+
+Check it with the tests above (`-k prefill` for the prefill ones), and measure
+it against the baselines:
+
+```bash
+PYTHONPATH=$PWD .venv/bin/python \
+    benchmarks/kernels/gfx1151_decode_attn/tools/matrix.py --prefill \
+    --hq 16 --hkv 2 --head-dim 256 --m 128 512 2048 8192 --prefixes 0 16384 \
+    --baselines TRITON_ATTN ROCM_SEGMENTED_ATTN > prefill.md
+```
+
+The `path` column must read `prefill`.

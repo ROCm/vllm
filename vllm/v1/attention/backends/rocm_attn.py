@@ -969,7 +969,7 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
         starts = starts[: nreq + 1].tolist()
         seq_lens = getattr(md, "seq_lens_cpu", None)
         seq_lens = seq_lens[:nreq].tolist() if seq_lens is not None else None
-        launches: list[tuple[Any, int, int, int]] = []
+        launches: list[tuple[Any, Any, int, int, int]] = []
         for i in range(nd, nreq):
             m = starts[i + 1] - starts[i]
             if m < PREFILL_MIN_M:
@@ -994,7 +994,7 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
                 )
                 return False
             host_len = seq_lens[i] if seq_lens is not None else md.max_seq_len
-            launches.append((module, i, m, max(host_len, m)))
+            launches.append((module, variant, i, m, max(host_len, m)))
 
         if nd:
             dec = dict(kwargs)
@@ -1033,13 +1033,19 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
             win,
             dtype,
         )
+        # Sized for every row of the shape, and for the builds launched now,
+        # which a tool may have given other knobs.
+        used = [v for _, v, *_ in launches]
         scratch_key = (shape, kwargs["q"].device)
-        if scratch_key not in _PREFILL_SCRATCH:
-            _PREFILL_SCRATCH[scratch_key] = make_prefill_scratch(
-                prefill_variants(*shape), kwargs["q"].device
+        scratch = _PREFILL_SCRATCH.get(scratch_key)
+        if scratch is None or scratch[1].numel() < 2 * max(
+            v.scratch_rows() for v in used
+        ):
+            scratch = make_prefill_scratch(
+                prefill_variants(*shape) + used, kwargs["q"].device
             )
-        scratch = _PREFILL_SCRATCH[scratch_key]
-        for module, i, m, host_len in launches:
+            _PREFILL_SCRATCH[scratch_key] = scratch
+        for module, _, i, m, host_len in launches:
             q0 = starts[i]
             module.prefill_attn(
                 kwargs["q"][q0 : q0 + m],

@@ -352,6 +352,13 @@ class PrefillVariant:
     dtype: torch.dtype = torch.float16
 
     @property
+    def name(self) -> str:
+        """The CSV row joined by "_", as _rocm_C names the variant's launch."""
+        return "rdna35_prefill_" + "_".join(
+            map(str, prefill_variant_defines(self).values())
+        )
+
+    @property
     def block_rows(self) -> int:
         """Query rows of one workgroup's tile."""
         return self.waves // (self.head_dim_split * self.key_waves) * 16

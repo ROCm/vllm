@@ -1,17 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Builds of the RDNA3.5 decode kernel outside _rocm_C, and hooks into ROCM_ATTN.
+"""Builds of the RDNA3.5 decode and prefill kernels outside _rocm_C, and hooks
+into ROCM_ATTN.
 
-_rocm_C carries the rows of rdna35_variants.csv.  Tuning measures knob sets
-that are not rows, so here a variant is the kernel source compiled by itself
-with clang (no torch headers, ~1 s) into a shared object exporting
-`rdna35_launch(const rdna35::LaunchArgs*)` -- the launch() _rocm_C's registry
-calls -- and launched through ctypes.  Builds are cached by a hash of the
-sources and the command.
+_rocm_C carries the rows of rdna35_variants.csv and rdna35_prefill_variants.csv.
+Tuning measures knob sets that are not rows, so here a variant is the kernel
+source compiled by itself with clang (no torch headers, ~1 s) into a shared
+object exporting the launch() _rocm_C's registry calls --
+`rdna35_launch(const rdna35::LaunchArgs*)` for decode,
+`rdna35_prefill_launch(const rdna35::PrefillArgs*)` for prefill -- and launched
+through ctypes.  Builds are cached by a hash of the sources and the command.
 
 `install()` makes ROCM_ATTN run these builds, with knobs from `override()` on
-top of the CSV row (or of the kernel's defaults where there is no row).
-`paths()` reports which path the backend took.
+top of the CSV row (or of the kernel's defaults where there is no row); a knob
+applies to whichever kernel has it.  `paths()` reports which path the backend
+took.
 """
 
 import contextlib
@@ -31,7 +34,9 @@ import torch
 import vllm.v1.attention.ops.rdna35_hip_decode as R
 
 _CSRC = Path(__file__).resolve().parents[4] / "csrc" / "rocm"
-_SOURCES = (_CSRC / "rdna35_decode_attn.cu", _CSRC / "rdna35_decode_attn.h")
+_COMMON = (_CSRC / "rdna35_attn_common.cuh", _CSRC / "rdna35_decode_attn.h")
+_SOURCES = (_CSRC / "rdna35_decode_attn.cu", *_COMMON)
+_PREFILL_SOURCES = (_CSRC / "rdna35_prefill_attn.cu", *_COMMON)
 _ARCH = "gfx1151"
 
 _WRAPPER = """#include <hip/hip_runtime.h>
@@ -43,6 +48,17 @@ _WRAPPER = """#include <hip/hip_runtime.h>
 #include "rdna35_decode_attn.cu"
 extern "C" __attribute__((visibility("default"))) void rdna35_launch(
     const rdna35::LaunchArgs* a) {
+  launch(*a);
+}
+"""
+_PREFILL_WRAPPER = """#include <hip/hip_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+
+#include "rdna35_prefill_attn.cu"
+extern "C" __attribute__((visibility("default"))) void rdna35_prefill_launch(
+    const rdna35::PrefillArgs* a) {
   launch(*a);
 }
 """
@@ -72,20 +88,39 @@ class _LaunchArgs(ctypes.Structure):
     ]
 
 
+class _PrefillArgs(ctypes.Structure):
+    """rdna35::PrefillArgs (csrc/rocm/rdna35_decode_attn.h), field for field."""
+
+    _fields_ = [
+        ("q", ctypes.c_void_p),
+        ("kv", ctypes.c_void_p),
+        ("bt", ctypes.c_void_p),
+        ("out", ctypes.c_void_p),
+        ("seq_lens", ctypes.c_void_p),
+        ("partial_o", ctypes.c_void_p),
+        ("partial_ml", ctypes.c_void_p),
+        ("counters", ctypes.c_void_p),
+        ("num_tokens", ctypes.c_int),
+        ("max_seq_len", ctypes.c_int),
+        ("scale", ctypes.c_float),
+        ("stream", ctypes.c_void_p),
+    ]
+
+
 _cache: Path | None = None
 _ablate = 0
 _sealed = False
 _overrides: dict = {}
 _loaded: dict = {}
-_failed: dict[R.KernelVariant, str] = {}
+_failed: dict[R.KernelVariant | R.PrefillVariant, str] = {}
 _lock = threading.Lock()
 
 
-def source_digest() -> str:
+def source_digest(prefill: bool = False) -> str:
     """The kernel source a build compiles; points of another digest measured
     another kernel."""
     h = hashlib.sha256()
-    for p in _SOURCES:
+    for p in _PREFILL_SOURCES if prefill else _SOURCES:
         h.update(p.read_bytes())
     return h.hexdigest()[:16]
 
@@ -130,10 +165,18 @@ def _toolchain() -> tuple[list[str], str]:
     )
 
 
-def _build(v: R.KernelVariant) -> Path:
+def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
     """Compile one variant, or find it built: named by a hash of the sources,
     the command and the compiler, written under a temporary name and renamed."""
-    tag = f"{v.name}_l{v.layout}_ab{_ablate}"
+    prefill = isinstance(v, R.PrefillVariant)
+    if prefill:
+        defines = R.prefill_variant_defines(v)
+        tag = "prefill_" + "_".join(map(str, defines.values())) + f"_ab{_ablate}"
+        kernel, wrapper = "prefill_attn", "prefill_wrapper.hip"
+    else:
+        defines = R.variant_defines(v)
+        tag = f"{v.name}_l{v.layout}_ab{_ablate}"
+        kernel, wrapper = "decode_attn", "wrapper.hip"
     clang, rpath = _toolchain()
     cmd = [
         *clang,
@@ -148,14 +191,14 @@ def _build(v: R.KernelVariant) -> Path:
         "-Wno-unused-variable",
         # HIP resolves kernels by name across the process: every build loaded
         # side by side needs its own.
-        f"-Ddecode_attn=decode_attn_{hashlib.sha256(tag.encode()).hexdigest()[:16]}",
-        *(f"-D{c}={x}" for c, x in R.variant_defines(v).items()),
+        f"-D{kernel}={kernel}_{hashlib.sha256(tag.encode()).hexdigest()[:16]}",
+        *(f"-D{c}={x}" for c, x in defines.items()),
         f"-DABLATE={_ablate}",
         f"-I{_CSRC}",
         f"-Wl,-rpath,{rpath}",
-        str(_cache / "wrapper.hip"),
+        str(_cache / wrapper),
     ]
-    h = hashlib.sha256((source_digest() + " ".join(cmd)).encode()).hexdigest()
+    h = hashlib.sha256((source_digest(prefill) + " ".join(cmd)).encode()).hexdigest()
     so = _cache / f"{tag}-{h[:16]}.so"
     if so.is_file():
         return so
@@ -211,13 +254,60 @@ class Jit:
         self._launch(ctypes.byref(args))
 
 
-def load(v: R.KernelVariant) -> Jit | None:
+class JitPrefill:
+    """One prefill build, with the prefill_attn interface of _rocm_C's."""
+
+    def __init__(self, v: R.PrefillVariant, path: Path):
+        self.variant = v
+        self._launch = ctypes.CDLL(str(path)).rdna35_prefill_launch
+        self._launch.argtypes = [ctypes.POINTER(_PrefillArgs)]
+        self._launch.restype = None
+
+    def prefill_attn(
+        self,
+        q,
+        kv_cache,
+        block_table,
+        out,
+        partial_o,
+        partial_ml,
+        counters,
+        seq_lens,
+        max_seq_len,
+        scale,
+    ):
+        v = self.variant
+        if not (q.is_contiguous() and out.is_contiguous()):
+            raise RuntimeError("q and out must be contiguous")
+        if not q.dtype == kv_cache.dtype == out.dtype == v.dtype:
+            raise RuntimeError("dtype does not match the build")
+        args = _PrefillArgs(
+            q.data_ptr(),
+            kv_cache.data_ptr(),
+            block_table.data_ptr(),
+            out.data_ptr(),
+            seq_lens.data_ptr(),
+            partial_o.data_ptr(),
+            partial_ml.data_ptr(),
+            counters.data_ptr(),
+            q.size(0),
+            max_seq_len,
+            scale,
+            torch.cuda.current_stream(q.device).cuda_stream,
+        )
+        self._launch(ctypes.byref(args))
+
+
+def load(v: R.KernelVariant | R.PrefillVariant) -> Jit | JitPrefill | None:
     """The variant's build, or None if it does not build (`failure` says why).
 
     Raises:
         RuntimeError: Sealed, and the variant was not built before.
 
     """
+    if isinstance(v, R.PrefillVariant):
+        # MIN_QUERY_LEN only selects the row: every step's build is the same.
+        v = dataclasses.replace(v, min_query_len=R.PREFILL_MIN_M)
     if v in _loaded:
         return _loaded[v]
     if v in _failed:
@@ -228,7 +318,8 @@ def load(v: R.KernelVariant) -> Jit | None:
             "timed region"
         )
     try:
-        mod = Jit(v, _build(v))
+        path = _build(v)
+        mod = JitPrefill(v, path) if isinstance(v, R.PrefillVariant) else Jit(v, path)
     except Exception as exc:  # noqa: BLE001 - a refused shape is a normal outcome
         with _lock:
             _failed[v] = f"{v.name} does not build: {exc}"
@@ -238,13 +329,19 @@ def load(v: R.KernelVariant) -> Jit | None:
     return mod
 
 
-def failure(v: R.KernelVariant) -> str | None:
+def failure(v: R.KernelVariant | R.PrefillVariant) -> str | None:
     return _failed.get(v)
 
 
 def precompile(variants) -> None:
     """Build in parallel, one clang process per variant, then load."""
-    todo = [v for v in dict.fromkeys(variants) if v not in _loaded]
+    todo = [
+        dataclasses.replace(v, min_query_len=R.PREFILL_MIN_M)
+        if isinstance(v, R.PrefillVariant)
+        else v
+        for v in variants
+    ]
+    todo = [v for v in dict.fromkeys(todo) if v not in _loaded]
     with ThreadPoolExecutor(max_workers=max(1, (os.cpu_count() or 8) - 2)) as pool:
         list(pool.map(load, todo))
 
@@ -272,7 +369,51 @@ def variant_for(hq, hkv, d, m, page_size, layout, window, dtype, batch):
             dtype=dtype,
             window=window,
         )
-    return dataclasses.replace(base, **_overrides) if _overrides else base
+    return _with_overrides(base)
+
+
+def _with_overrides(base):
+    """`base` with the overridden knobs it has (the two kernels' knobs
+    differ)."""
+    names = {f.name for f in dataclasses.fields(base)}
+    own = {k: v for k, v in _overrides.items() if k in names}
+    return dataclasses.replace(base, **own) if own else base
+
+
+# The prefill kernel's defaults where a shape has no row.
+def _prefill_defaults(d: int) -> dict:
+    return {
+        "waves": 8,
+        "key_tile": 64 if d <= 128 else 16,
+        "head_dim_split": max(1, d // 128),
+        "v_t": int(d <= 128),
+        "double_buffer": int(d == 256),
+        "key_waves": 1,
+        "max_segments": 8,
+        "head_group": 8,
+    }
+
+
+def prefill_variant_for(hq, hkv, d, page_size, layout, window, dtype, num_tokens):
+    """ROCM_ATTN's prefill_variant_for with the `override()` knobs on top: of
+    the CSV row, or of the kernel's defaults where the shape has none."""
+    base = R.prefill_variant_for(
+        hq, hkv, d, page_size, layout, window, dtype, num_tokens
+    )
+    if base is None:
+        if layout != 1 or not R.PREFILL_MIN_M <= num_tokens <= R.PREFILL_MAX_M:
+            return None
+        base = R.PrefillVariant(
+            d,
+            hq,
+            hkv,
+            window,
+            page_size,
+            R.PREFILL_MIN_M,
+            **_prefill_defaults(d),
+            dtype=dtype,
+        )
+    return _with_overrides(base)
 
 
 @contextlib.contextmanager
@@ -302,19 +443,31 @@ def install(ablate: int = 0) -> None:
     _ablate = ablate
     _cache = (Path(envs.VLLM_CACHE_ROOT) / "rdna35_jit").resolve()
     _cache.mkdir(parents=True, exist_ok=True)
-    wrapper = _cache / "wrapper.hip"
-    if not wrapper.is_file() or wrapper.read_text() != _WRAPPER:
-        tmp = wrapper.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(_WRAPPER)
-        os.replace(tmp, wrapper)
+    write_wrappers()
     B.load = load
     B.variant_for = variant_for
+    B.load_prefill = load
+    B.prefill_variant_for = prefill_variant_for
+
+
+def write_wrappers() -> None:
+    """The decode and prefill wrappers every build compiles, in _cache."""
+    for name, text in (
+        ("wrapper.hip", _WRAPPER),
+        ("prefill_wrapper.hip", _PREFILL_WRAPPER),
+    ):
+        wrapper = _cache / name
+        if not wrapper.is_file() or wrapper.read_text() != text:
+            tmp = wrapper.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(text)
+            os.replace(tmp, wrapper)
 
 
 @contextlib.contextmanager
 def paths():
     """The path ROCM_ATTN took for the calls inside: "kernel" (every call on
-    the kernel), "split" (decodes on the kernel, the rest on Triton) or
+    the decode kernel), "prefill" (prefills on the prefill kernel, decodes on
+    the decode kernel), "split" (decodes on the kernel, the rest on Triton) or
     "triton".  Yields a callable that reports it."""
     import vllm.v1.attention.backends.rocm_attn as B
 
@@ -327,6 +480,10 @@ def paths():
         impls.append(self)
 
     def path() -> str:
+        if any(i.prefill_calls for i in impls) and not any(
+            i.fallback_calls for i in impls
+        ):
+            return "prefill"
         if any(i.split_calls for i in impls):
             return "split"
         ran = any(i.kernel_calls for i in impls)
