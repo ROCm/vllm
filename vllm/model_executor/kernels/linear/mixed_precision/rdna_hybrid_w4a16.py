@@ -247,14 +247,14 @@ def _triton_w4a16_skinny_fmt_kernel(
             b = (b >> shifts_full) & 0xF  # [BLOCK_N, BLOCK_K]
 
         # ---- Per-group quant params from [N, K//G] layout ----
-        g_idx = (k_start * BLOCK_K) // group_size
+        group_idx = (k_start * BLOCK_K) // group_size
         scale_mask = offs_n < N
 
         # ---- Dequantize ----
         if HAS_ZP:
             # Asymmetric: packed scale/zp carrier (one fp32/group folds scale + zp).
             psz = tl.load(
-                packed_scale_zp_ptr + offs_n * stride_pn + g_idx,
+                packed_scale_zp_ptr + offs_n * stride_pn + group_idx,
                 mask=scale_mask,
                 other=0,
             )
@@ -278,7 +278,7 @@ def _triton_w4a16_skinny_fmt_kernel(
             # Symmetric: the -8 offset is constant (no zp to fold), so read the
             # scale directly — no carrier overhead.
             scales = tl.load(
-                scales_ptr + offs_n * stride_sn + g_idx, mask=scale_mask, other=1.0
+                scales_ptr + offs_n * stride_sn + group_idx, mask=scale_mask, other=1.0
             )
             if a.dtype == tl.float16:
                 # (nibble - 8) * scale == (b_raw - (1024+8)) * scale, via magic.
@@ -877,9 +877,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         if c.act_type not in (torch.float16, torch.bfloat16):
             return False, "requires float16 or bfloat16 activations"
 
-        if c.has_g_idx:
-            return False, "does not support g_idx reordering"
-
         gs = c.group_size
         if gs != PER_CHANNEL_GROUP_SIZE and gs not in SUPPORTED_GROUP_SIZES:
             return (
@@ -1121,7 +1118,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         from vllm.utils.platform_utils import num_compute_units
 
         c = self.config
-        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
+        w_q, w_s, w_zp = self._get_weight_params(layer)
         w_q_i32 = layer._hybrid_w_q_i32
         # Packed scale/zp carrier (asymmetric layers only; None for sym).
         packed_scale_zp = getattr(layer, "_hybrid_w_packed_scale_zp", None)
