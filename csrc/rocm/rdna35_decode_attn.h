@@ -1,7 +1,8 @@
-// Launch ABI of the RDNA3.5 decode-attention variants.
+// Launch ABI of the RDNA3.5 attention variants.
 //
-// Every variant (rdna35_decode_attn.cu, specialised by compile-time defines)
-// exposes one host function of type LaunchFn.  The kernel translation units
+// Every decode variant (rdna35_decode_attn.cu, specialised by compile-time
+// defines) exposes one host function of type LaunchFn, every prefill variant
+// (rdna35_prefill_attn.cu) one of type PrefillFn.  The kernel translation units
 // see only this header, not the list of variants, so a change to the list
 // rebuilds only the units whose variants changed.
 #pragma once
@@ -33,5 +34,26 @@ struct LaunchArgs {
 };
 
 using LaunchFn = void (*)(const LaunchArgs&);
+
+// One sequence of num_tokens query tokens, its seq_lens[0] - num_tokens
+// earlier tokens cached.  partial_o / partial_ml / counters are the split-KV
+// scratch (make_prefill_scratch); max_seq_len, the host's copy of S, only
+// sizes the split.
+struct PrefillArgs {
+  const void* q;
+  const void* kv;
+  const int* bt;
+  void* out;
+  const int* seq_lens;
+  float* partial_o;
+  float* partial_ml;
+  int* counters;
+  int num_tokens;
+  int max_seq_len;
+  float scale;
+  hipStream_t stream;
+};
+
+using PrefillFn = void (*)(const PrefillArgs&);
 
 }  // namespace rdna35

@@ -50,6 +50,17 @@ void rdna35_decode_attn(int64_t variant, torch::Tensor& q,
                         torch::Tensor& m, torch::Tensor& l, torch::Tensor& cnt,
                         torch::Tensor& seq_lens, double scale);
 
+// RDNA3.5 prefill attention, the variants of rdna35_prefill_variants.csv:
+// the index of a variant's key (-1 if not built), and a launch by that index
+// for one sequence.
+int64_t rdna35_prefill_variant(torch::IntArrayRef key);
+void rdna35_prefill_attn(int64_t variant, torch::Tensor& q,
+                         torch::Tensor& kv_cache, torch::Tensor& block_table,
+                         torch::Tensor& out, torch::Tensor& partial_o,
+                         torch::Tensor& partial_ml, torch::Tensor& counters,
+                         torch::Tensor& seq_lens, int64_t max_seq_len,
+                         double scale);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,

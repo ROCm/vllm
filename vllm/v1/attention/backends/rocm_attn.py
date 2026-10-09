@@ -46,11 +46,16 @@ from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
 from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.v1.attention.ops.rdna35_hip_decode import (
     MAX_M,
+    PREFILL_MIN_M,
     SUPPORTED_HEAD_SIZES,
     KernelVariant,
     expected_kv_cache_strides,
     load,
+    load_prefill,
+    make_prefill_scratch,
     make_scratch,
+    prefill_variant_for,
+    prefill_variants,
     scratch_bytes,
     variant_for,
 )
@@ -642,6 +647,9 @@ _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 # a larger batch falls back to Triton.
 _SCRATCH: dict[tuple[KernelVariant, torch.device], tuple[int, Any]] = {}
 _SCRATCH_BUDGET = 64 * 1024**2
+# Prefill split-KV scratch, one set per shape and device, sized for all of
+# the shape's rows and shared the same way.
+_PREFILL_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 # Mixed batches are split only from this head size up.
 _SPLIT_MIN_HEAD_SIZE = 256
 _SPLIT_MIN_DECODES = 16
@@ -653,7 +661,8 @@ _SPLIT_SMALL_WINDOW = 512
 class RocmAttentionRdna35MetadataBuilder(TritonAttentionMetadataBuilder):
     """Triton's metadata, with the batch ordered decodes first and the
     number of leading uniform decodes counted, so that a batch mixing
-    prefills and decodes can send its decodes to the kernel."""
+    prefills and decodes can send its decodes to the decode kernel and its
+    prefills to the prefill kernel."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -672,11 +681,16 @@ class RocmAttentionRdna35MetadataBuilder(TritonAttentionMetadataBuilder):
             )
         md.num_decodes = num_decodes  # type: ignore[attr-defined]
         md.num_decode_tokens = num_decode_tokens  # type: ignore[attr-defined]
+        # Host copies for the prefill kernel, one launch per sequence: query
+        # starts, and sequence lengths (exact for prefill rows).
+        md.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu  # type: ignore[attr-defined]
+        md.seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound  # type: ignore[attr-defined]
         return md
 
 
 class RocmAttentionRdna35Impl(TritonAttentionImpl):
-    """ROCM_ATTN on gfx1151: the RDNA3.5 HIP kernel where it serves the call,
+    """ROCM_ATTN on gfx1151: the RDNA3.5 HIP kernels where they serve the
+    call (decode, and prefills of PREFILL_MIN_M tokens or more),
     TRITON_ATTN's forward for everything else, on the same packed cache."""
 
     def __init__(self, *args, **kwargs):
@@ -691,6 +705,8 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
         self.fallback_calls = 0
         # Mixed batches served as decodes on the kernel plus the rest on Triton.
         self.split_calls = 0
+        # Batches whose prefills ran on the prefill kernel.
+        self.prefill_calls = 0
         try:
             from vllm.config import get_current_vllm_config
 
@@ -710,17 +726,9 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
                 "ROCM_ATTN (gfx1151) falling back to Triton: %s", reason, scope="local"
             )
 
-    def _prepare(self, kv_cache: torch.Tensor, **kwargs) -> _Built | None:
-        """Decide whether the kernel can serve this call, and build it if so.
-
-        Every condition is checked rather than assumed. The kernel walks the
-        paged KV cache with its own address arithmetic instead of reading the
-        tensor's strides, so a layout it did not expect would not fault — it
-        would read the wrong addresses and return finite, wrong numbers.
-
-        Returns the compiled module and its scratch buffers, or None to fall
-        back to Triton.
-        """
+    def _served_window(self, kwargs: dict) -> int | None:
+        """Features both kernels implement.  Returns the window in keys (0:
+        full causal), or None after recording why not."""
         if kwargs["alibi_slopes"] is not None or kwargs["sinks"] is not None:
             self._reject("alibi/sinks unsupported")
             return None
@@ -750,9 +758,49 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
         if kwargs["kv_quant_mode"] != KVQuantMode.NONE:
             self._reject(f"KV quant mode {kwargs['kv_quant_mode']!r} unsupported")
             return None
+        return win
+
+    def _served_tensors(
+        self, kv_cache: torch.Tensor, kwargs: dict, head_sizes: tuple[int, ...] | None
+    ) -> bool:
+        """fp16 or bf16 throughout, GQA, whole 16-key pages, and (decode) a
+        built head size; else False after recording why."""
+        dtype = kwargs["q"].dtype
+        if dtype not in (torch.float16, torch.bfloat16):
+            self._reject(f"kernel is fp16 or bf16 only, got {dtype}")
+            return False
+        if kv_cache.dtype != dtype:
+            self._reject(f"KV cache is {kv_cache.dtype}, query is {dtype}")
+            return False
+        if head_sizes is not None and self.head_size not in head_sizes:
+            self._reject(f"head_size {self.head_size} not built")
+            return False
+        if self.num_heads % self.num_kv_heads:
+            self._reject("q heads must divide evenly over kv heads")
+            return False
+        if kv_cache.shape[2] % 16:
+            self._reject(f"block size {kv_cache.shape[2]} is not a multiple of 16")
+            return False
+        return True
+
+    def _prepare(self, kv_cache: torch.Tensor, **kwargs) -> _Built | None:
+        """Decide whether the kernel can serve this call, and build it if so.
+
+        Every condition is checked rather than assumed. The kernel walks the
+        paged KV cache with its own address arithmetic instead of reading the
+        tensor's strides, so a layout it did not expect would not fault — it
+        would read the wrong addresses and return finite, wrong numbers.
+
+        Returns the compiled module and its scratch buffers, or None to fall
+        back to Triton.
+        """
+        win = self._served_window(kwargs)
+        if win is None:
+            return None
 
         # Every sequence with the same number of query tokens: decode, or
-        # speculative decode.  Mixed batches (prefill in them) go to Triton.
+        # speculative decode.  Batches with prefills go to _serve_prefills or
+        # Triton.
         nseq = kwargs["seqused_k"].shape[0]
         max_query_len = kwargs["max_seqlen_q"]
         if kwargs["q"].shape[0] != nseq * max_query_len:
@@ -765,22 +813,9 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
                 f"{max_query_len} query tokens per sequence, more than {MAX_M}"
             )
             return None
+        if not self._served_tensors(kv_cache, kwargs, SUPPORTED_HEAD_SIZES):
+            return None
         dtype = kwargs["q"].dtype
-        if dtype not in (torch.float16, torch.bfloat16):
-            self._reject(f"kernel is fp16 or bf16 only, got {dtype}")
-            return None
-        if kv_cache.dtype != dtype:
-            self._reject(f"KV cache is {kv_cache.dtype}, query is {dtype}")
-            return None
-        if self.head_size not in SUPPORTED_HEAD_SIZES:
-            self._reject(f"head_size {self.head_size} not built")
-            return None
-        if self.num_heads % self.num_kv_heads:
-            self._reject("q heads must divide evenly over kv heads")
-            return None
-        if kv_cache.shape[2] % 16:
-            self._reject(f"block size {kv_cache.shape[2]} is not a multiple of 16")
-            return None
 
         # Logical KV cache order is (num_blocks, num_kv_heads, block_size, 2*hs).
         q = kwargs["q"]
@@ -875,6 +910,12 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
             "chunk_lookback": self.chunk_lookback,
             "kv_quant_mode": self._kv_quant_mode,
         }
+        if self._serve_prefills(
+            layer, query, key, value, kv_cache, attn_metadata, args
+        ):
+            self.kernel_calls += 1
+            self.prefill_calls += 1
+            return output
         if self._split_mixed(layer, query, key, value, kv_cache, attn_metadata, args):
             self.kernel_calls += 1
             self.split_calls += 1
@@ -888,6 +929,129 @@ class RocmAttentionRdna35Impl(TritonAttentionImpl):
         self.kernel_calls += 1
         self._launch(built, kv_cache, args)
         return output
+
+    def _serve_prefills(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        md: TritonAttentionMetadata,
+        kwargs: dict,
+    ) -> bool:
+        """Serve a batch of decodes followed by prefills of PREFILL_MIN_M
+        tokens or more: the decodes on the decode kernel (Triton if it cannot
+        take them), each prefill a launch of the prefill kernel.  Returns
+        False, having done nothing, when the batch is not like that.
+
+        Never under CUDA-graph capture: the launches follow this step's
+        lengths on the host, and prefills run piecewise anyway.
+        """
+        nd = getattr(md, "num_decodes", 0)
+        ndt = getattr(md, "num_decode_tokens", 0)
+        nreq = kwargs["seqused_k"].shape[0]
+        starts = getattr(md, "query_start_loc_cpu", None)
+        if nd >= nreq or starts is None or torch.cuda.is_current_stream_capturing():
+            return False
+        if kwargs["max_seqlen_q"] < PREFILL_MIN_M:
+            return False
+        win = self._served_window(kwargs)
+        if win is None or not self._served_tensors(kv_cache, kwargs, None):
+            return False
+        block_size = kv_cache.shape[2]
+        kv_row = 2 * self.head_size
+        hnd = (block_size * self.num_kv_heads * kv_row, block_size * kv_row, kv_row)
+        if (kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2)) != hnd:
+            self._reject("prefill: KV cache is not the packed HND layout")
+            return False
+        dtype = kwargs["q"].dtype
+        starts = starts[: nreq + 1].tolist()
+        seq_lens = getattr(md, "seq_lens_cpu", None)
+        seq_lens = seq_lens[:nreq].tolist() if seq_lens is not None else None
+        launches: list[tuple[Any, int, int, int]] = []
+        for i in range(nd, nreq):
+            m = starts[i + 1] - starts[i]
+            if m < PREFILL_MIN_M:
+                self._reject(f"prefill of {m} query tokens, fewer than {PREFILL_MIN_M}")
+                return False
+            variant = prefill_variant_for(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                block_size,
+                1,
+                win,
+                dtype,
+                m,
+            )
+            module = load_prefill(variant) if variant is not None else None
+            if module is None:
+                self._reject(
+                    f"prefill of {m} query tokens: no build in _rocm_C for "
+                    f"{self.num_heads}/{self.num_kv_heads}/{self.head_size} "
+                    f"window {win} page {block_size} {dtype}"
+                )
+                return False
+            host_len = seq_lens[i] if seq_lens is not None else md.max_seq_len
+            launches.append((module, i, m, max(host_len, m)))
+
+        if nd:
+            dec = dict(kwargs)
+            for k in ("q", "out"):
+                dec[k] = kwargs[k][:ndt]
+            for k in ("seqused_k", "block_table"):
+                dec[k] = kwargs[k][:nd]
+            dec["max_seqlen_q"] = ndt // nd
+            built = self._prepare(kv_cache, **dec)
+            if built is not None:
+                self._launch(built, kv_cache, dec)
+            else:
+                decodes = replace(
+                    md,
+                    num_actual_tokens=ndt,
+                    max_query_len=ndt // nd,
+                    query_start_loc=md.query_start_loc[: nd + 1],
+                    seq_lens=md.seq_lens[:nd],
+                    block_table=md.block_table[:nd],
+                )
+                super().forward(
+                    layer,
+                    query[:ndt],
+                    key,
+                    value,
+                    kv_cache,
+                    decodes,
+                    kwargs["out"][:ndt],
+                )
+
+        shape = (
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            block_size,
+            win,
+            dtype,
+        )
+        scratch_key = (shape, kwargs["q"].device)
+        if scratch_key not in _PREFILL_SCRATCH:
+            _PREFILL_SCRATCH[scratch_key] = make_prefill_scratch(
+                prefill_variants(*shape), kwargs["q"].device
+            )
+        scratch = _PREFILL_SCRATCH[scratch_key]
+        for module, i, m, host_len in launches:
+            q0 = starts[i]
+            module.prefill_attn(
+                kwargs["q"][q0 : q0 + m],
+                kv_cache,
+                kwargs["block_table"][i],
+                kwargs["out"][q0 : q0 + m],
+                *scratch,
+                kwargs["seqused_k"][i : i + 1],
+                host_len,
+                kwargs["softmax_scale"],
+            )
+        return True
 
     def _split_mixed(
         self,

@@ -289,3 +289,188 @@ MAX_M = 8
 # dims below allow; its GQA packing assumes the q heads divide evenly over the
 # kv heads.
 SUPPORTED_HEAD_SIZES = (64, 128, 256, 512)
+
+
+# ---------------------------------------------------------------- prefill
+#
+# rdna35_prefill_attn.cu serves one sequence of M query tokens after a cached
+# prefix.  M is a run-time argument; the knobs are compile-time, one build per
+# row of rdna35_prefill_variants.csv, and a shape has a row per step of M
+# (MIN_QUERY_LEN: the row serves M from there up to the next row's).  Rows were
+# tuned in fp16 over M 128..8192 and prefixes 0..16k, against segmented and
+# Triton, and bf16 shares them.
+
+PREFILL_VARIANTS_CSV = Path(__file__).with_name("rdna35_prefill_variants.csv")
+# Query tokens a prefill launch serves; below, the decode kernel or Triton.
+PREFILL_MIN_M = 128
+PREFILL_MAX_M = 8192
+# The kernel splits the KV only below this many workgroups, so a split launch
+# has fewer than twice as many row tiles (kTargetWorkgroups in the kernel).
+_PREFILL_TARGET_WORKGROUPS = 80
+
+_PREFILL_FIELDS = {
+    "HEAD_DIM": "head_size",
+    "NUM_Q_HEADS": "num_q_heads",
+    "NUM_KV_HEADS": "num_kv_heads",
+    "WINDOW": "window",
+    "PAGE_SIZE": "page_size",
+    "MIN_QUERY_LEN": "min_query_len",
+    "WAVES": "waves",
+    "KEY_TILE": "key_tile",
+    "HEAD_DIM_SPLIT": "head_dim_split",
+    "V_T": "v_t",
+    "DOUBLE_BUFFER": "double_buffer",
+    "KEY_WAVES": "key_waves",
+    "MAX_SEGMENTS": "max_segments",
+    "HEAD_GROUP": "head_group",
+}
+
+
+@dataclass(frozen=True)
+class PrefillVariant:
+    """One prefill build: a shape, the smallest M its row serves, its knobs.
+
+    A workgroup serves (kv head, query tile, KV segment); each wave 16 query
+    rows over 1/head_dim_split of the head dim and every key_waves-th 16-key
+    sub-tile of a step of key_tile keys, staged in LDS for the workgroup.
+    """
+
+    head_size: int
+    num_q_heads: int
+    num_kv_heads: int
+    window: int
+    page_size: int
+    min_query_len: int
+    waves: int
+    key_tile: int
+    head_dim_split: int
+    v_t: int
+    double_buffer: int
+    key_waves: int
+    max_segments: int
+    head_group: int
+    dtype: torch.dtype = torch.float16
+
+    @property
+    def block_rows(self) -> int:
+        """Query rows of one workgroup's tile."""
+        return self.waves // (self.head_dim_split * self.key_waves) * 16
+
+    def scratch_rows(self) -> int:
+        """Rows of split-KV partials a launch may write."""
+        return 2 * _PREFILL_TARGET_WORKGROUPS * self.block_rows
+
+
+def prefill_variant_defines(variant: PrefillVariant) -> dict[str, int]:
+    """The variant's row of the CSV, in column order."""
+    return {
+        c: int(variant.dtype == torch.bfloat16)
+        if c == "BF16"
+        else getattr(variant, _PREFILL_FIELDS[c])
+        for c in _prefill_table()[0]
+    }
+
+
+@functools.cache
+def _prefill_table() -> tuple[tuple[str, ...], dict[tuple, list[PrefillVariant]]]:
+    """Header, and per (Hq, Hkv, D, page, window, dtype) the rows by M."""
+    table: dict[tuple, list[PrefillVariant]] = {}
+    with PREFILL_VARIANTS_CSV.open(newline="") as fh:
+        reader = csv.reader(fh)
+        header = tuple(next(reader))
+        for row in reader:
+            f = dict(zip(header, map(int, row), strict=True))
+            v = PrefillVariant(
+                **{_PREFILL_FIELDS[c]: x for c, x in f.items() if c != "BF16"},
+                dtype=torch.bfloat16 if f["BF16"] else torch.float16,
+            )
+            key = (
+                v.num_q_heads,
+                v.num_kv_heads,
+                v.head_size,
+                v.page_size,
+                v.window,
+                v.dtype,
+            )
+            table.setdefault(key, []).append(v)
+    for rows in table.values():
+        rows.sort(key=lambda v: v.min_query_len)
+    return header, table
+
+
+def prefill_variants(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    page_size: int,
+    window: int,
+    dtype: torch.dtype,
+) -> list[PrefillVariant]:
+    """Every row of one shape, by the M it starts at."""
+    return _prefill_table()[1].get(
+        (num_q_heads, num_kv_heads, head_size, page_size, window, dtype), []
+    )
+
+
+def prefill_variant_for(
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    page_size: int,
+    layout: int,
+    window: int,
+    dtype: torch.dtype,
+    num_tokens: int,
+) -> PrefillVariant | None:
+    """The row that serves a prefill of num_tokens query tokens, or None."""
+    if layout != _HND or not PREFILL_MIN_M <= num_tokens <= PREFILL_MAX_M:
+        return None
+    rows = prefill_variants(
+        num_q_heads, num_kv_heads, head_size, page_size, window, dtype
+    )
+    served = [v for v in rows if v.min_query_len <= num_tokens]
+    return served[-1] if served else None
+
+
+class _BuiltinPrefill:
+    """A prefill variant compiled into _rocm_C."""
+
+    def __init__(self, index: int):
+        self.index = index
+
+    def prefill_attn(self, q, kv_cache, block_table, out, *scratch_and_args):
+        torch.ops._rocm_C.rdna35_prefill_attn(
+            self.index, q, kv_cache, block_table, out, *scratch_and_args
+        )
+
+
+_prefill_loaded: dict[PrefillVariant, _BuiltinPrefill | None] = {}
+
+
+def load_prefill(variant: PrefillVariant) -> _BuiltinPrefill | None:
+    """The variant in _rocm_C, or None if this _rocm_C or device has none."""
+    if variant not in _prefill_loaded:
+        try:
+            op = torch.ops._rocm_C.rdna35_prefill_variant
+        except (AttributeError, RuntimeError):
+            index = -1
+        else:
+            index = int(op(list(prefill_variant_defines(variant).values())))
+        _prefill_loaded[variant] = _BuiltinPrefill(index) if index >= 0 else None
+    return _prefill_loaded[variant]
+
+
+def make_prefill_scratch(
+    variants: list[PrefillVariant], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split-KV partials (O, then max and sum per row) and arrival counters,
+    enough for any of `variants`.  The counters start at zero and every
+    launch leaves them so."""
+    rows = max(v.scratch_rows() for v in variants)
+    head_size = max(v.head_size for v in variants)
+    opts = {"dtype": torch.float32, "device": device}
+    return (
+        torch.empty(rows * head_size, **opts),
+        torch.empty(rows * 2, **opts),
+        torch.zeros(_PREFILL_TARGET_WORKGROUPS, dtype=torch.int32, device=device),
+    )

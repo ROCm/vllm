@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""RDNA3.5 HIP decode attention: agreement with a reference, and honest fallback.
+"""RDNA3.5 HIP decode and prefill attention: agreement with a reference, and
+honest fallback.
 
 The kernel walks the paged KV cache with its own address arithmetic rather than
 reading the tensor's strides, so a layout it did not expect yields finite,
@@ -16,6 +17,9 @@ tolerance check would miss:
   launch's correct numbers.
 - that an unsupported shape falls back to Triton rather than being served
   wrong.
+- every prefill variant at the M its row starts at and an odd M within its
+  step, after no prefix and after a long one (where the KV is split), several
+  launches on one scratch.
 """
 
 import csv
@@ -426,3 +430,203 @@ def test_rocm_attn_layout_and_impl_only_on_gfx1151(gfx1151, monkeypatch):
         assert KVCacheLayout.LHBNC in backend.supported_kv_cache_layouts()
         assert 512 not in backend.get_supported_head_sizes()
     assert 512 not in Aiter.get_supported_head_sizes()
+
+
+# ---------------------------------------------------------------- prefill
+
+
+def _prefill_reference(q, kv, block_table, seq_len, window=0):
+    """Float reference of a prefill, a few q heads at a time to bound memory."""
+    m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
+    pages = kv[block_table.long()]
+    flat = pages.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len].float()
+    gqa = hq // hkv
+    pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
+    lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
+    masked = pos > lim
+    if window:
+        masked |= pos < lim - (window - 1)
+    out = torch.empty(m, hq, hd, device=q.device)
+    for h0 in range(0, hq, 4):
+        heads = range(h0, min(hq, h0 + 4))
+        kvh = [h // gqa for h in heads]
+        qf = q[:, h0 : h0 + len(heads)].float().permute(1, 0, 2)
+        k = flat[:, kvh, :hd].permute(1, 0, 2)
+        v = flat[:, kvh, hd:].permute(1, 0, 2)
+        scores = torch.bmm(qf, k.transpose(1, 2)) * (hd**-0.5)
+        scores = scores.masked_fill(masked.view(1, m, seq_len), float("-inf"))
+        out[:, h0 : h0 + len(heads)] = torch.bmm(torch.softmax(scores, -1), v).permute(
+            1, 0, 2
+        )
+    return out
+
+
+def _triton_prefill(q, kv, block_table, seq_len, window=0):
+    """What serves prefills without the kernel: Triton's unified attention,
+    whose P is one element too, on the same cache."""
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+    m, hd, hkv = q.shape[0], q.shape[2], kv.shape[1]
+    k, v = kv.transpose(1, 2).split(hd, dim=-1)
+    out = torch.empty_like(q)
+    one = torch.ones(1, hkv, device=q.device)
+    unified_attention(
+        q,
+        k,
+        v,
+        out,
+        torch.tensor([0, m], device=q.device, dtype=torch.int32),
+        m,
+        torch.tensor([seq_len], device=q.device, dtype=torch.int32),
+        seq_len,
+        hd**-0.5,
+        True,
+        (window - 1, 0) if window else (-1, -1),
+        block_table.view(1, -1),
+        0,
+        None,
+        one,
+        one,
+    )
+    return out
+
+
+def _assert_prefill_close(got, q, kv, block_table, seq_len, window, what):
+    """Within twice Triton's own error against the float reference: a prefill
+    rounds P to one element (decode keeps a low half), so near-zero outputs
+    carry the element's absolute error, as Triton's do."""
+    ref = _prefill_reference(q, kv, block_table, seq_len, window)
+    err = (got.float().nan_to_num(1e9) - ref).abs().max().item()
+    triton = _triton_prefill(q, kv, block_table, seq_len, window)
+    bound = 2 * (triton.float() - ref).abs().max().item() + 1e-4
+    assert err <= bound, f"{what}: max error {err:.2e}, Triton's x2 {bound:.2e}"
+
+
+def _prefill_inputs(v, m, seq_len, seed=0):
+    """Q for m tokens and a shuffled HND cache of seq_len keys, whole pages."""
+    torch.manual_seed(seed)
+    dev = torch.device("cuda")
+    num_blocks = -(-seq_len // v.page_size)
+    kv = torch.randn(
+        num_blocks + 2, v.num_kv_heads, v.page_size, 2 * v.head_size, device=dev
+    )
+    q = torch.randn(m, v.num_q_heads, v.head_size, device=dev)
+    block_table = torch.randperm(num_blocks + 2, device=dev)[:num_blocks]
+    return (
+        (q * 0.5).to(v.dtype),
+        (kv * 0.5).to(v.dtype),
+        block_table.to(torch.int32).contiguous(),
+    )
+
+
+def _prefill_unit(v):
+    dt = "bf16" if v.dtype == torch.bfloat16 else "fp16"
+    return (
+        f"prefill_q{v.num_q_heads}_kv{v.num_kv_heads}_d{v.head_size}_w{v.window}_{dt}"
+    )
+
+
+def _prefill_rows():
+    return [v for rows in rdna35._prefill_table()[1].values() for v in rows]
+
+
+def test_prefill_variants_csv_is_well_formed():
+    """Every decode configuration at page 16 has prefill rows from
+    PREFILL_MIN_M in both dtypes, one row per step, and a call picks the row
+    of the largest step it reaches."""
+    with rdna35.PREFILL_VARIANTS_CSV.open(newline="") as fh:
+        rows = list(csv.reader(fh))
+    header, body = rows[0], rows[1:]
+    assert set(header) == set(rdna35._PREFILL_FIELDS) | {"BF16"}
+    assert all(len(r) == len(header) and all(x.isdigit() for x in r) for r in body)
+    assert len({tuple(r) for r in body}) == len(body)
+    configs = {
+        (v.num_q_heads, v.num_kv_heads, v.head_size, v.window)
+        for v in rdna35.variants()
+        if v.page_size == 16
+    }
+    for (hq, hkv, d, window), dtype in itertools.product(configs, DTYPES):
+        steps = rdna35.prefill_variants(hq, hkv, d, 16, window, dtype)
+        assert steps and steps[0].min_query_len == rdna35.PREFILL_MIN_M, (hq, hkv, d)
+        starts = [v.min_query_len for v in steps]
+        assert starts == sorted(set(starts))
+        for v in steps:
+            for m in (v.min_query_len, v.min_query_len + 1):
+                assert (
+                    rdna35.prefill_variant_for(hq, hkv, d, 16, 1, window, dtype, m) == v
+                )
+    v = steps[0]
+    args = (v.num_q_heads, v.num_kv_heads, v.head_size, 16, 1, v.window, v.dtype)
+    assert rdna35.prefill_variant_for(*args, rdna35.PREFILL_MIN_M - 1) is None
+    assert rdna35.prefill_variant_for(*args, rdna35.PREFILL_MAX_M + 1) is None
+
+
+def test_every_listed_prefill_variant_is_built_in():
+    _skip_unless_gfx1151()
+    missing = [v for v in _prefill_rows() if rdna35.load_prefill(v) is None]
+    assert not missing, f"{len(missing)} prefill variants not in _rocm_C"
+
+
+@pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _prefill_rows()}))
+def test_built_in_prefill_variants_match_reference(unit):
+    """Every prefill variant: at the M its row starts at and an odd M within
+    its step, after no prefix and after a long one (small M then splits the
+    KV), all on one scratch, each on new inputs.  Windows run past the window."""
+    _skip_unless_gfx1151()
+    for v in _prefill_rows():
+        if _prefill_unit(v) != unit:
+            continue
+        module = rdna35.load_prefill(v)
+        assert module is not None, v
+        args = (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
+        scratch = rdna35.make_prefill_scratch(
+            rdna35.prefill_variants(*args, v.dtype), torch.device("cuda")
+        )
+        prefix = max(4096, 2 * v.window)
+        cases = [(v.min_query_len, 0), (v.min_query_len + 37, prefix)]
+        for seed, (m, p) in enumerate(cases):
+            seq_len = m + p
+            q, kv, block_table = _prefill_inputs(v, m, seq_len, seed)
+            out = torch.full_like(q, float("nan"))
+            seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+            module.prefill_attn(
+                q,
+                kv,
+                block_table,
+                out,
+                *scratch,
+                seq_lens,
+                seq_len,
+                v.head_size**-0.5,
+            )
+            torch.accelerator.synchronize()
+            _assert_prefill_close(
+                out, q, kv, block_table, seq_len, v.window, f"{v}, M={m}, prefix={p}"
+            )
+
+
+def test_prefill_window_never_reads_freed_pages():
+    """Pages wholly before every query's window may be freed: their contents
+    must not reach the output, even as 0 * NaN."""
+    _skip_unless_gfx1151()
+    v = next(v for v in _prefill_rows() if v.window and v.dtype == torch.float16)
+    module = rdna35.load_prefill(v)
+    m, seq_len = v.min_query_len, v.min_query_len + 3 * v.window
+    q, kv, block_table = _prefill_inputs(v, m, seq_len)
+    clean = (kv.clone(), block_table.clone())
+    first = (seq_len - m - (v.window - 1)) // v.page_size
+    kv = torch.cat([kv, torch.full_like(kv[:1], float("nan"))])
+    block_table = block_table.clone()
+    block_table[:first] = kv.shape[0] - 1
+    out = torch.empty_like(q)
+    args = (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
+    scratch = rdna35.make_prefill_scratch(
+        rdna35.prefill_variants(*args, v.dtype), q.device
+    )
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+    module.prefill_attn(
+        q, kv, block_table, out, *scratch, seq_lens, seq_len, v.head_size**-0.5
+    )
+    torch.accelerator.synchronize()
+    assert torch.isfinite(out).all()
+    _assert_prefill_close(out, q, *clean, seq_len, v.window, "freed pages")

@@ -84,6 +84,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor block_table, Tensor! out, Tensor! acc, Tensor! m, Tensor! l, "
       "Tensor! cnt, Tensor seq_lens, float scale) -> ()");
   rocm_ops.impl("rdna35_decode_attn", torch::kCUDA, &rdna35_decode_attn);
+  // RDNA3.5 prefill attention (gfx1151), one sequence per launch.
+  rocm_ops.def("rdna35_prefill_variant(int[] key) -> int",
+               &rdna35_prefill_variant);
+  rocm_ops.def(
+      "rdna35_prefill_attn(int variant, Tensor q, Tensor kv_cache, "
+      "Tensor block_table, Tensor! out, Tensor! partial_o, "
+      "Tensor! partial_ml, Tensor! counters, Tensor seq_lens, "
+      "int max_seq_len, float scale) -> ()");
+  rocm_ops.impl("rdna35_prefill_attn", torch::kCUDA, &rdna35_prefill_attn);
 #endif
 
   // Custom attention op
