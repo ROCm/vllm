@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Gemma-4 DFlare draft model for vLLM's parallel speculator path."""
+"""AngelSlim DFlare draft model (Gemma 4 and Qwen targets) for vLLM's
+parallel speculator path."""
 
 from collections.abc import Iterable
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -129,7 +131,7 @@ def _apply_angelslim_rope(
     return hidden_states * cos + _rotate_half(hidden_states) * sin
 
 
-class DFlareGemma4Attention(DFlashQwen3Attention):
+class DFlareAttention(DFlashQwen3Attention):
     """DFlash query attention with dedicated context K/V projections."""
 
     def __init__(
@@ -228,7 +230,7 @@ def _draft_hidden_size(config) -> int:
     return int(getattr(config, "draft_hidden_size", config.hidden_size))
 
 
-class DFlareGemma4DecoderLayer(nn.Module):
+class DFlareDecoderLayer(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -250,7 +252,7 @@ class DFlareGemma4DecoderLayer(nn.Module):
             self.hidden_size,
         )
         sliding_window, causal = _resolve_layer_attention(config, layer_idx)
-        self.self_attn = DFlareGemma4Attention(
+        self.self_attn = DFlareAttention(
             hidden_size=self.hidden_size,
             target_hidden_size=target_hidden_size,
             num_heads=config.num_attention_heads,
@@ -315,8 +317,21 @@ class DFlareGemma4DecoderLayer(nn.Module):
 @support_torch_compile(
     dynamic_arg_dims={"input_ids": 0, "positions": -1, "input_embeds": 0}
 )
-class DFlareGemma4Model(DFlashQwen3Model):
+class DFlareModel(DFlashQwen3Model):
     """DFlash execution shell with DFlare context fusion and projections."""
+
+    embedding_scale: torch.Tensor
+    # Set by _build_fused_kv_buffers once weights are loaded.
+    _hidden_norm_weight: torch.Tensor
+    _k_norm_weights: torch.Tensor
+    _rope_head_size: int
+    _rope_cos_sin_cache: torch.Tensor
+    _rope_is_neox: bool
+    _num_attn_layers: int
+    _kv_size: int
+    _head_dim: int
+    _num_kv_heads: int
+    _rms_norm_eps: float
 
     def __init__(
         self,
@@ -326,7 +341,10 @@ class DFlareGemma4Model(DFlashQwen3Model):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
-        self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.config = speculative_config.draft_model_config.hf_config
+        dtype = cast(torch.dtype, vllm_config.model_config.dtype)
         rope_parameters = getattr(self.config, "rope_parameters", None) or {}
         self._dflare_rope_theta = float(rope_parameters.get("rope_theta", 10000.0))
         self._dflare_rope_layout = (
@@ -370,7 +388,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
                         target_embedding_size**0.5,
                     )
                 ),
-                dtype=vllm_config.model_config.dtype,
+                dtype=dtype,
             ),
             persistent=False,
         )
@@ -379,14 +397,14 @@ class DFlareGemma4Model(DFlashQwen3Model):
         self.mask_embedding = nn.Parameter(
             torch.zeros(
                 self.draft_hidden_size,
-                dtype=vllm_config.model_config.dtype,
+                dtype=dtype,
             ),
             requires_grad=False,
         )
         self.has_separate_mask_embedding = False
         self.layers = nn.ModuleList(
             [
-                DFlareGemma4DecoderLayer(
+                DFlareDecoderLayer(
                     current_config,
                     config=self.config,
                     layer_idx=layer_idx,
@@ -507,7 +525,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
     ) -> None:
-        """Project Gemma context with AngelSlim's rotary layout and cache it."""
+        """Project target context with AngelSlim's rotary layout and cache it."""
         if not hasattr(self, "_num_attn_layers"):
             self._build_fused_kv_buffers()
 
@@ -536,7 +554,9 @@ class DFlareGemma4Model(DFlashQwen3Model):
             )
             if slot_mapping is None:
                 continue
-            attention = self._attn_layers[layer_index]
+            # The backend impl type varies; do_kv_cache_update is not on the
+            # AttentionImpl base class.
+            attention: Any = self._attn_layers[layer_index]
             attention.impl.do_kv_cache_update(
                 attention,
                 all_k[layer_index],
@@ -546,31 +566,32 @@ class DFlareGemma4Model(DFlashQwen3Model):
             )
 
     def _build_fused_kv_buffers(self) -> None:
-        layers_attn = [layer.self_attn for layer in self.layers]
+        layers_attn = [
+            cast(DFlareDecoderLayer, layer).self_attn for layer in self.layers
+        ]
         attn0 = layers_attn[0]
         self._hidden_norm_weight = self.hidden_norm.weight.data
         self._fused_target_kv_weight: torch.Tensor | None = None
         self._fused_target_kv_bias: torch.Tensor | None = None
         target_projections_are_dense = all(
             isinstance(
-                getattr(layer.self_attn.target_k_proj, "weight", None),
+                getattr(attention.target_k_proj, "weight", None),
                 torch.Tensor,
             )
             and isinstance(
-                getattr(layer.self_attn.target_v_proj, "weight", None),
+                getattr(attention.target_v_proj, "weight", None),
                 torch.Tensor,
             )
-            and layer.self_attn.target_k_proj.weight.dtype
-            not in (torch.int32, torch.uint8)
-            for layer in self.layers
+            and attention.target_k_proj.weight.dtype not in (torch.int32, torch.uint8)
+            for attention in layers_attn
         )
         if target_projections_are_dense:
             self._fused_target_kv_weight = torch.stack(
                 [
                     torch.cat(
                         (
-                            attention.target_k_proj.weight.data,
-                            attention.target_v_proj.weight.data,
+                            cast(torch.Tensor, attention.target_k_proj.weight).data,
+                            cast(torch.Tensor, attention.target_v_proj.weight).data,
                         ),
                         dim=0,
                     )
@@ -583,8 +604,8 @@ class DFlareGemma4Model(DFlashQwen3Model):
                     [
                         torch.cat(
                             (
-                                attention.target_k_proj.bias.data,
-                                attention.target_v_proj.bias.data,
+                                cast(torch.Tensor, attention.target_k_proj.bias).data,
+                                cast(torch.Tensor, attention.target_v_proj.bias).data,
                             ),
                             dim=0,
                         )
@@ -659,6 +680,7 @@ class DFlareGemma4Model(DFlashQwen3Model):
         all_k = []
         all_v = []
         for layer_idx, layer in enumerate(self.layers):
+            attention = cast(DFlareDecoderLayer, layer).self_attn
             context = torch.empty_like(fused[:, layer_idx])
             ops.rms_norm(
                 context,
@@ -666,8 +688,8 @@ class DFlareGemma4Model(DFlashQwen3Model):
                 self._hidden_norm_weight,
                 self._rms_norm_eps,
             )
-            key, _ = layer.self_attn.target_k_proj(context)
-            value, _ = layer.self_attn.target_v_proj(context)
+            key, _ = attention.target_k_proj(context)
+            value, _ = attention.target_v_proj(context)
             all_k.append(key.view(num_ctx, num_kv_heads, head_dim))
             all_v.append(value.view(num_ctx, num_kv_heads, head_dim))
         return torch.stack(all_k), torch.stack(all_v)
@@ -689,14 +711,17 @@ class DFlareGemma4Model(DFlashQwen3Model):
         return super().load_weights(translate(weights))
 
 
-class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
+class DFlareForCausalLM(DFlashQwen3ForCausalLM):
     """vLLM draft-model wrapper for AngelSlim DFlare checkpoints."""
 
-    model_cls = DFlareGemma4Model
+    model_cls = DFlareModel
+    model: DFlareModel  # type: ignore[assignment]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         nn.Module.__init__(self)
-        self.draft_model_config = vllm_config.speculative_config.draft_model_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.draft_model_config = speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         draft_hidden_size = _draft_hidden_size(self.config)
         self.model = self.model_cls(
@@ -731,7 +756,7 @@ class DFlareGemma4ForCausalLM(DFlashQwen3ForCausalLM):
             )
             self.has_own_lm_head = True
         else:
-            self.draft_id_to_target_id = None
+            self.draft_id_to_target_id = None  # type: ignore[assignment]
             self.has_own_lm_head = False
 
     @staticmethod

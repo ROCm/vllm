@@ -12,9 +12,9 @@ import torch
 from torch import nn
 
 from vllm.config import SpeculativeConfig, VllmConfig
-from vllm.model_executor.models.gemma4_dflare import (
-    DFlareGemma4ForCausalLM,
-    DFlareGemma4Model,
+from vllm.model_executor.models.dflare import (
+    DFlareForCausalLM,
+    DFlareModel,
     _apply_angelslim_rope,
 )
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
@@ -305,7 +305,7 @@ class _Layer(nn.Module):
         self.self_attn = _Attention(key_weight, value_weight)
 
 
-class _ContextCacheModel(DFlareGemma4Model):
+class _ContextCacheModel(DFlareModel):
     test_keys: torch.Tensor
     test_values: torch.Tensor
 
@@ -331,7 +331,7 @@ class _ContextCacheModel(DFlareGemma4Model):
 
 
 def test_fused_context_kv_matches_layer_loop(monkeypatch):
-    model = object.__new__(DFlareGemma4Model)
+    model = object.__new__(DFlareModel)
     nn.Module.__init__(model)
     model.target_layer_ids = [0, 1]
     model.target_hidden_size = 4
@@ -367,7 +367,7 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "vllm.model_executor.models.gemma4_dflare.ops.rms_norm",
+        "vllm.model_executor.models.dflare.ops.rms_norm",
         rms_norm,
     )
     context_states = torch.randn(3, 8)
@@ -388,7 +388,7 @@ def test_dflare_weight_names_are_translated(monkeypatch):
         return {"loaded"}
 
     monkeypatch.setattr(DFlashQwen3Model, "load_weights", capture_weights)
-    model = object.__new__(DFlareGemma4Model)
+    model = object.__new__(DFlareModel)
     nn.Module.__init__(model)
     weights = [
         ("layers.0.attention.k_proj_target.weight", torch.zeros(1)),
@@ -470,8 +470,8 @@ def test_reduced_vocab_requires_draft_id_mapping():
     )
 
     with pytest.raises(ValueError, match="missing.*draft-to-target"):
-        DFlareGemma4ForCausalLM.load_weights(
-            cast(DFlareGemma4ForCausalLM, model),
+        DFlareForCausalLM.load_weights(
+            cast(DFlareForCausalLM, model),
             [("lm_head.weight", torch.zeros(4, 4))],
         )
 
@@ -487,8 +487,8 @@ def test_reduced_vocab_rejects_duplicate_target_ids():
     )
 
     with pytest.raises(ValueError, match="unique"):
-        DFlareGemma4ForCausalLM.load_weights(
-            cast(DFlareGemma4ForCausalLM, model),
+        DFlareForCausalLM.load_weights(
+            cast(DFlareForCausalLM, model),
             [
                 ("d2t", torch.tensor([0, -1, 0, 0])),
                 ("lm_head.weight", torch.zeros(4, 4)),
@@ -507,8 +507,8 @@ def test_reduced_vocab_requires_lm_head():
     )
 
     with pytest.raises(ValueError, match="missing lm_head"):
-        DFlareGemma4ForCausalLM.load_weights(
-            cast(DFlareGemma4ForCausalLM, model),
+        DFlareForCausalLM.load_weights(
+            cast(DFlareForCausalLM, model),
             [("d2t", torch.tensor([0, 0, 0, 0]))],
         )
 
@@ -543,14 +543,14 @@ def test_causal_lm_keeps_concatenated_hidden_size(monkeypatch):
             self.target_layer_ids = [0, 1]
             self.target_hidden_size = 4
 
-    monkeypatch.setattr(DFlareGemma4ForCausalLM, "model_cls", _FakeDraftModel)
+    monkeypatch.setattr(DFlareForCausalLM, "model_cls", _FakeDraftModel)
     monkeypatch.setattr(
-        DFlareGemma4ForCausalLM,
+        DFlareForCausalLM,
         "_make_lm_head",
         staticmethod(lambda *args, **kwargs: object()),
     )
     monkeypatch.setattr(
-        DFlareGemma4ForCausalLM,
+        DFlareForCausalLM,
         "_make_logits_processor",
         staticmethod(lambda *args, **kwargs: object()),
     )
@@ -572,7 +572,7 @@ def test_causal_lm_keeps_concatenated_hidden_size(monkeypatch):
         parallel_config=object(),
     )
 
-    DFlareGemma4ForCausalLM(vllm_config=cast(VllmConfig, vllm_config))
+    DFlareForCausalLM(vllm_config=cast(VllmConfig, vllm_config))
 
     assert captured["hidden_size"] == 12
     assert captured["draft_hidden_size"] == 4
@@ -670,7 +670,7 @@ def test_dflare_pipeline_converts_compacts_and_fuses(monkeypatch):
     assert compact_slots is not None
     torch.testing.assert_close(compact_slots[0], torch.tensor([10, 12]))
 
-    model = object.__new__(DFlareGemma4Model)
+    model = object.__new__(DFlareModel)
     nn.Module.__init__(model)
     model.target_layer_ids = converted["dflare_config"]["target_layer_ids"]
     model.target_hidden_size = converted["target_hidden_size"]
@@ -694,7 +694,7 @@ def test_dflare_pipeline_converts_compacts_and_fuses(monkeypatch):
         out.copy_(hidden_states)
 
     monkeypatch.setattr(
-        "vllm.model_executor.models.gemma4_dflare.ops.rms_norm",
+        "vllm.model_executor.models.dflare.ops.rms_norm",
         identity_norm,
     )
     keys, values = model._project_context_kv(compact_states, 2, 2, 2, 2)
