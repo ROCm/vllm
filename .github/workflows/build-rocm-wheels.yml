@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/rocm/vllm/gfx11-ci:latest
+      # Allow setarch -R for deterministic builds (requires personality syscall)
+      options: --security-opt seccomp=unconfined
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -153,7 +155,13 @@ jobs:
           sccache --show-stats || true
           echo ""
           echo "=== Building wheel ==="
-          python setup.py bdist_wheel --dist-dir=dist
+          # AIESW-45531: Disable ASLR to produce deterministic compiler output.
+          # The LLVM instruction scheduler's behavior depends on hash table
+          # iteration order, which varies with memory layout. Without this,
+          # identical source can produce binaries with up to 15% performance
+          # variance on small GEMM kernels.
+          SET_ADDR_NO_RANDOMIZE_FLAG="setarch $(uname -m) -R"
+          $SET_ADDR_NO_RANDOMIZE_FLAG python setup.py bdist_wheel --dist-dir=dist
           echo ""
           sccache --show-stats || true
           ls -la dist/
@@ -192,6 +200,7 @@ jobs:
       pytest_args: >-
         tests/kernels/moe/test_hybrid_w4a16_moe.py
         tests/kernels/quantization/test_hybrid_w4a16_triton.py
+        tests/kernels/quantization/test_rdna_hybrid_w4a16.py
         tests/kernels/quantization/test_rocm_compressed_tensors_w4a16.py
         tests/kernels/quantization/test_rocm_skinny_gemms.py
         tests/kernels/quantization/test_dynamic_int8_lm_head.py

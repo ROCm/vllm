@@ -32,9 +32,6 @@ class Dynamic4bitLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        ok, err = cls._validate_config_invariants(c)
-        if not ok:
-            return False, err
         if not current_platform.is_cpu():
             return False, "Only CPU is supported"
         if c.weight_type not in cls.SUPPORTED_QUANT_TYPES:
@@ -73,7 +70,6 @@ class Dynamic4bitLinearKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        self._validate_layer_invariants(layer)
         c = self.config
         packed_weight = getattr(layer, self.w_q_name)
         packed_weight = packed_weight.add(8)

@@ -30,9 +30,6 @@ class CutlassW4A8LinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        ok, err = cls._validate_config_invariants(c)
-        if not ok:
-            return False, err
         if not current_platform.is_cuda():
             return False, "CUTLASS only supported on CUDA"
 
@@ -77,8 +74,6 @@ class CutlassW4A8LinearKernel(MPLinearKernel):
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `weight_scale`  is: {input_dim = 0, output_dim = 1}
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        self._validate_layer_invariants(layer)
-
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
             convert_packed_uint4b8_to_signed_int4_inplace(x.data)

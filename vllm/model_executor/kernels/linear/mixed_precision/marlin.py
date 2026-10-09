@@ -39,9 +39,6 @@ class MarlinLinearKernel(MPLinearKernel):
 
     @classmethod
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
-        ok, err = cls._validate_config_invariants(c)
-        if not ok:
-            return False, err
         # Marlin uses inline PTX, so it can only be compatible with Nvidia
         if not current_platform.is_cuda():
             return False, "Marlin only supported on CUDA"
@@ -90,7 +87,6 @@ class MarlinLinearKernel(MPLinearKernel):
     #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
     #  `weight_scale` is: {input_dim = 0, output_dim = 1}
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        self._validate_layer_invariants(layer)
         device = getattr(layer, self.w_q_name).device
         c = self.config
         is_a_8bit = c.act_type is not None and c.act_type.itemsize == 1
