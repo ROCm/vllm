@@ -25,6 +25,8 @@ from vllm.transformers_utils.configs.dflare import (
 )
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
 from vllm.v1.spec_decode.dflare import DFlareProposer, compact_dflare_context
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 
 
@@ -259,6 +261,91 @@ def test_mrope_target_rejects_unpadded_drafter_batch():
     )
     with pytest.raises(NotImplementedError, match="padded drafter batch"):
         proposer.load_model(nn.Module())
+
+
+def test_mrope_draft_keeps_its_rope_theta(monkeypatch):
+    monkeypatch.setattr(
+        SpecDecodeBaseProposer, "load_model", lambda self, target_model: None
+    )
+    text_config = SimpleNamespace(
+        rope_parameters={
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1e7,
+            "rope_type": "default",
+        }
+    )
+    draft_config = SimpleNamespace(
+        rope_parameters={"rope_theta": 5e6, "rope_type": "default"}
+    )
+    proposer = object.__new__(DFlareProposer)
+    proposer.vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config)),
+    )
+    proposer.speculative_config = cast(
+        SpeculativeConfig,
+        SimpleNamespace(
+            disable_padded_drafter_batch=False,
+            draft_model_config=SimpleNamespace(hf_config=draft_config),
+        ),
+    )
+    proposer.max_padded_query_tokens = 8
+    proposer.positions = torch.zeros(8, dtype=torch.int64)
+
+    proposer.load_model(nn.Module())
+
+    assert draft_config.rope_parameters == {
+        "rope_theta": 5e6,
+        "rope_type": "default",
+        "mrope_section": [11, 11, 10],
+        "mrope_interleaved": True,
+        "partial_rotary_factor": 0.25,
+    }
+    assert draft_config.partial_rotary_factor == 0.25
+    assert proposer._mrope_query_buffer is not None
+    assert proposer._mrope_query_buffer.shape == (3, 9)
+
+
+class _RecordingContextModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, object]] = []
+
+    def precompute_and_store_context_kv(self, states, positions, slots=None):
+        self.calls.append((states, positions, slots))
+
+
+def test_mrope_context_drops_rejected_rows():
+    # Two requests with 3 and 2 context tokens; the last token of each was a
+    # rejected draft, which the input kernel marks with PADDING_SLOT_ID.
+    states = torch.arange(10, dtype=torch.float32).view(5, 2)
+    mrope = torch.stack((torch.arange(5), torch.arange(5) + 100, torch.arange(5) + 200))
+    slots = torch.tensor([10, 11, PADDING_SLOT_ID, 20, PADDING_SLOT_ID, 0, 0])
+    proposer = object.__new__(DFlareProposer)
+    proposer._dflash_num_context = 5
+    proposer._dflash_hidden_states = states
+    proposer._context_positions_buffer = torch.zeros(7, dtype=torch.int64)
+    proposer._context_slot_mapping_buffer = slots
+    proposer._mrope_context = mrope
+    proposer._has_rejected_context = True
+    proposer._mrope_query_buffer = torch.zeros((3, 9), dtype=torch.int64)
+    proposer.input_ids = torch.zeros(8, dtype=torch.int32)
+    model = _RecordingContextModel()
+    proposer.model = model
+
+    inputs, num_input_tokens = proposer.build_model_inputs_first_pass(8, 8, None)
+
+    assert len(model.calls) == 1
+    got_states, got_positions, got_slots = model.calls[0]
+    kept = [0, 1, 3]
+    torch.testing.assert_close(got_states, states[kept])
+    torch.testing.assert_close(got_positions, mrope[:, kept])
+    assert isinstance(got_slots, torch.Tensor)
+    torch.testing.assert_close(got_slots, slots[kept])
+    assert inputs["positions"].shape == (3, 8)
+    assert num_input_tokens == 8
 
 
 def test_compact_dflare_context_removes_rejected_rows():

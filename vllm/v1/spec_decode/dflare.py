@@ -141,17 +141,28 @@ class DFlareProposer(DFlashProposer):
                     "batch. Please unset disable_padded_drafter_batch in the "
                     "speculative_config."
                 )
-            # The draft rotates like the target: same sections, same partial
-            # rotary dimension.
+            # The draft takes the target's M-RoPE layout (sections, interleaving,
+            # partial rotary dimension) so its positions line up with the
+            # target's, but keeps its own rope_theta: that is what the draft
+            # checkpoint was trained with.
             draft_config = self.speculative_config.draft_model_config.hf_config
-            if "partial_rotary_factor" not in rope_parameters:
-                rope_parameters["partial_rotary_factor"] = getattr(
-                    text_config, "partial_rotary_factor", 1.0
+            partial_rotary_factor = float(
+                rope_parameters.get(
+                    "partial_rotary_factor",
+                    getattr(text_config, "partial_rotary_factor", 1.0),
                 )
-            draft_config.rope_parameters = rope_parameters
-            draft_config.partial_rotary_factor = rope_parameters[
-                "partial_rotary_factor"
-            ]
+            )
+            layout = {
+                key: rope_parameters[key]
+                for key in ("mrope_section", "mrope_interleaved")
+                if key in rope_parameters
+            }
+            draft_config.rope_parameters = {
+                **(getattr(draft_config, "rope_parameters", None) or {}),
+                **layout,
+                "partial_rotary_factor": partial_rotary_factor,
+            }
+            draft_config.partial_rotary_factor = partial_rotary_factor
             # Compiled and CUDA-graph draft forwards read positions from a
             # fixed address, so query M-RoPE lives in one persistent buffer.
             # The extra column keeps row slices non-contiguous like the
