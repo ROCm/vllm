@@ -101,7 +101,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
     scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
     zp_ptr,  # [N//8, K//G]  int32 zero-points (when HAS_ZP=True)
-    scale_zp_ptr,  # [N, K//G]  int32 scale/zero-point carrier (when SCALE_ZP=True)
+    scale_zp_ptr,  # [N, K//G]  int32 fp16 scale/bias carrier (when SCALE_ZP=True)
     c_ptr,  # [M, N]  fp16/bf16 output
     # Dimensions
     M,
@@ -134,9 +134,9 @@ def _triton_w4a16_skinny_fmt_kernel(
     zero-point at word[n//8] bits 4*(n%8), and dequant is
     (nibble - zp_raw) * scale.
     When HAS_ZP=False, only the constant ZP_BIAS is subtracted (symmetric).
-    When SCALE_ZP=True (asymmetric only), scale and zero-point come from one
-    int32 per (n, group) in scale_zp_ptr instead (see ``pack_scale_zp``), and
-    scales_ptr and zp_ptr are not read.
+    When SCALE_ZP=True (asymmetric fp16 with PACKED_DEQUANT only), scale and
+    bias_eff = -zp * scale come from one int32 per (n, group) in scale_zp_ptr
+    instead (see ``pack_scale_zp``), and scales_ptr and zp_ptr are not read.
 
     With PACKED_DEQUANT the nibble arrives as ``b_raw`` = 1024 + nibble (the
     magic-constant unpack), so the subtrahend absorbs the 1024: the arithmetic
@@ -201,14 +201,16 @@ def _triton_w4a16_skinny_fmt_kernel(
         group_idx = (k_start * BLOCK_K) // group_size
         scale_mask = offs_n < N
         if SCALE_ZP:
-            # low16 = scale bits; high16 = fp16 bias_eff bits or bf16 raw zp.
+            tl.static_assert(PACKED_DEQUANT, "SCALE_ZP needs PACKED_DEQUANT")
+            # low16 = fp16 scale bits; high16 = fp16 bias_eff bits.
             scale_zp = tl.load(
                 scale_zp_ptr + offs_n * num_groups + group_idx,
                 mask=scale_mask,
                 other=0,
             )
-            scales = (scale_zp & 0xFFFF).to(tl.uint16).to(a.dtype, bitcast=True)
-            zp_hi = (scale_zp >> 16) & 0xFFFF
+            scales = (scale_zp & 0xFFFF).to(tl.uint16).to(tl.float16, bitcast=True)
+            bias_eff = ((scale_zp >> 16) & 0xFFFF).to(tl.uint16)
+            bias_eff = bias_eff.to(tl.float16, bitcast=True)
         else:
             scale_ptrs = scales_ptr + offs_n * num_groups + group_idx
             scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
@@ -227,7 +229,6 @@ def _triton_w4a16_skinny_fmt_kernel(
             c1024 = tl.full((), 1024.0, tl.float16)
             if SCALE_ZP:
                 # bias_eff = -zp * scale, so the affine is one v_pk_fma_f16.
-                bias_eff = zp_hi.to(tl.uint16).to(tl.float16, bitcast=True)
                 b_fp = (b_raw - c1024) * scales[:, None] + bias_eff[:, None]
             elif HAS_ZP:
                 zp_off = (c1024 + zp_raw.to(tl.float16))[:, None]
@@ -238,12 +239,7 @@ def _triton_w4a16_skinny_fmt_kernel(
             # bf16 keeps the subtract in the int domain and casts once: zp_raw is
             # an int32 nibble, so casting b first would promote the whole
             # expression to fp32 and break the tl.dot dtype match.
-            if SCALE_ZP and scales.dtype == tl.float16:
-                bias_eff = zp_hi.to(tl.uint16).to(tl.float16, bitcast=True)
-                b_fp = b.to(tl.float16) * scales[:, None] + bias_eff[:, None]
-            elif SCALE_ZP:
-                b_fp = (b - zp_hi[:, None]).to(scales.dtype) * scales[:, None]
-            elif HAS_ZP:
+            if HAS_ZP:
                 b_fp = (b - zp_raw[:, None]).to(scales.dtype) * scales[:, None]
             else:
                 b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
@@ -322,6 +318,15 @@ _FP16_TILE_MIN_M = 128
 # and only wins from M = 512.
 _FP16_ASYM_TILE_MIN_M = 256
 
+# With the ``pack_scale_zp`` carrier the asymmetric packed dequant is one FMA
+# and drops the zero-point gather, which makes it 25-35% faster at M <= 256
+# and brings break-even with the scalar path down to about M = 192.
+_FP16_CARRIER_TILE_MIN_M = 192
+
+
+def _fp16_asym_min_m(has_scale_zp: bool) -> int:
+    return _FP16_CARRIER_TILE_MIN_M if has_scale_zp else _FP16_ASYM_TILE_MIN_M
+
 
 def _select_skinny_gfx1151_config(
     M: int,
@@ -330,13 +335,14 @@ def _select_skinny_gfx1151_config(
     group_size: int,
     dtype: torch.dtype,
     has_zp: bool = False,
+    has_scale_zp: bool = False,
 ) -> tuple[int, int, int, int, int | None]:
     """Return (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) for gfx1151.
 
     num_stages None means "leave Triton's default pipeline depth alone".
     """
     num_stages: int | None = None
-    min_m = _FP16_ASYM_TILE_MIN_M if has_zp else _FP16_TILE_MIN_M
+    min_m = _fp16_asym_min_m(has_scale_zp) if has_zp else _FP16_TILE_MIN_M
     if dtype == torch.float16 and min_m < M:
         # The packed path issues a single per-group load, so the pipeline buys
         # nothing and only costs registers. Not applied to bf16 -- see above.
@@ -393,7 +399,7 @@ def triton_w4a16_skinny_fmt_gemm(
     group_size: int,
     zp_bias: int = 8,
     zp: torch.Tensor | None = None,  # [N//8, K//G] int32 zero-points
-    scale_zp: torch.Tensor | None = None,  # [N, K//G] int32 carrier
+    scale_zp: torch.Tensor | None = None,  # [N, K//G] int32 fp16 carrier
 ) -> torch.Tensor:
     """Fused W4A16 GEMM reading from skinny weight format [N, K//8].
 
@@ -406,9 +412,10 @@ def triton_w4a16_skinny_fmt_gemm(
         zp:         Raw per-group zero-points [N//8, K//G] int32, row n at
                     word[n//8] bits 4*(n%8) (asymmetric). When provided,
                     dequant is (nibble - zp_raw) * scale.
-        scale_zp:   Scale/zero-point carrier from ``pack_scale_zp`` (asymmetric
-                    only). When provided, replaces the ``scales`` and ``zp``
-                    loads in the kernel.
+        scale_zp:   fp16 scale/bias carrier from ``pack_scale_zp``
+                    (asymmetric only). Used in place of the ``scales`` and
+                    ``zp`` loads when the packed fp16 dequant is selected, and
+                    ignored otherwise.
 
     Returns:
         Output matrix [M, N], same dtype as a.
@@ -438,6 +445,7 @@ def triton_w4a16_skinny_fmt_gemm(
     has_zp = zp is not None
     if scale_zp is not None:
         assert has_zp, "scale_zp is only built for asymmetric layers"
+        assert a.dtype == torch.float16, "scale_zp is only built for fp16"
         assert scale_zp.dtype == torch.int32 and scale_zp.is_contiguous()
         assert scale_zp.shape == (N, num_groups), (
             f"scale_zp shape mismatch: {scale_zp.shape} vs ({N}, {num_groups})"
@@ -489,10 +497,12 @@ def triton_w4a16_skinny_fmt_gemm(
         # _select_skinny_gfx1151_config; re-run
         # benchmarks/kernels/benchmark_rdna_hybrid_w4a16_gemm.py after edits.
         BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages = (
-            _select_skinny_gfx1151_config(M, N, K, group_size, a.dtype, has_zp)
+            _select_skinny_gfx1151_config(
+                M, N, K, group_size, a.dtype, has_zp, scale_zp is not None
+            )
         )
         packed_dequant = a.dtype == torch.float16 and (
-            not has_zp or M > _FP16_ASYM_TILE_MIN_M
+            not has_zp or _fp16_asym_min_m(scale_zp is not None) < M
         )
     else:
         num_warps = 4
@@ -502,6 +512,10 @@ def triton_w4a16_skinny_fmt_gemm(
             BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         else:
             BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
+
+    # The carrier only pays off on the packed dequant.
+    if not packed_dequant:
+        scale_zp = None
 
     # The kernel loads one scale per BLOCK_K tile, so BLOCK_K must not
     # exceed group_size — otherwise elements in the tile that belong to
@@ -611,31 +625,29 @@ def pack_skinny_int4(unpacked: torch.Tensor) -> torch.Tensor:
 
 
 def pack_scale_zp(scales: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
-    """Fold per-group scales and packed zero-points into one int32 per (n, group).
+    """Fold fp16 per-group scales and packed zero-points into one int32 each.
 
-    Lets the Triton prefill kernel replace its scale and zero-point loads with
-    one. The low 16 bits hold the scale. The high 16 bits hold, for fp16,
-    ``bias_eff = -zp * scale`` so dequant is a single FMA on the magic-constant
-    unpack; for bf16 (no ``v_pk_fma_bf16`` on RDNA3), the raw zero-point.
+    Lets the packed fp16 Triton prefill dequant replace its scale and
+    zero-point loads with one. The low 16 bits hold the scale and the high 16
+    bits ``bias_eff = -zp * scale``, so dequant is a single FMA on the
+    magic-constant unpack.
 
     Args:
-        scales: [N, K//G] fp16/bf16 per-group scales.
+        scales: [N, K//G] fp16 per-group scales.
         zp: [N//8, K//G] int32 zero-points, row n at word[n//8] bits 4*(n%8).
 
     Returns:
         [N, K//G] int32 carrier.
 
     """
+    assert scales.dtype == torch.float16, "the carrier is fp16 only"
     n_rows, num_groups = scales.shape
     shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=zp.device)
     zp_raw = ((zp[:, None, :] >> shifts[None, :, None]) & 0xF).reshape(
         n_rows, num_groups
     )
-    if scales.dtype == torch.float16:
-        bias_eff = -(zp_raw.to(torch.float32) * scales.to(torch.float32))
-        hi = bias_eff.to(torch.float16).view(torch.int16).to(torch.int32)
-    else:
-        hi = zp_raw
+    bias_eff = -(zp_raw.to(torch.float32) * scales.to(torch.float32))
+    hi = bias_eff.to(torch.float16).view(torch.int16).to(torch.int32)
     lo = scales.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
     return ((hi << 16) | lo).contiguous()
 
@@ -678,8 +690,8 @@ def _rdna_hybrid_w4a16_apply_impl(
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
     ``w_zp`` is [N//8, K//G] int32 for asymmetric layers, None for symmetric.
-    ``w_scale_zp`` is the optional ``pack_scale_zp`` carrier for the Triton
-    path.
+    ``w_scale_zp`` is the optional ``pack_scale_zp`` carrier for the packed
+    fp16 Triton path.
     """
     import vllm._custom_ops as ops
 
@@ -822,12 +834,14 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             permute_param_layout_(w_zp_raw, input_dim=1, output_dim=0, packed_dim=0)
             w_zp = w_zp_raw.data.contiguous()
             self._transform_param(layer, self.w_zp_name, lambda x: w_zp)
-            layer.register_parameter(
-                "_hybrid_w_scale_zp",
-                torch.nn.Parameter(
-                    pack_scale_zp(w_s_skinny, w_zp), requires_grad=False
-                ),
-            )
+            # Only the packed fp16 dequant, gfx1151-only, reads the carrier.
+            if c.act_type == torch.float16 and _on_gfx1151():
+                layer.register_parameter(
+                    "_hybrid_w_scale_zp",
+                    torch.nn.Parameter(
+                        pack_scale_zp(w_s_skinny, w_zp), requires_grad=False
+                    ),
+                )
 
         self._transform_param(layer, self.w_q_name, lambda x: w_q_skinny)
         self._transform_param(layer, self.w_s_name, lambda x: w_s_skinny)

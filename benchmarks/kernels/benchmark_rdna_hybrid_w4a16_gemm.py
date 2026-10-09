@@ -137,6 +137,8 @@ def benchmark(batch_size, provider, N, K, group_size, dtype, weights):
         cu_count = num_compute_units()
         use_zp = provider != "hybrid-w4a16"
         use_scale_zp = provider == "hybrid-w4a16-scale-zp"
+        if use_scale_zp and w["w_scale_zp"] is None:
+            return 0.0, 0.0, 0.0
 
         def run():
             return _rdna_hybrid_w4a16_apply_impl(
@@ -206,7 +208,9 @@ if __name__ == "__main__":
             "w_s_skinny": w_s_skinny,
             "w_fp16": w_fp16,
             "w_zp": w_zp,
-            "w_scale_zp": pack_scale_zp(w_s_skinny, w_zp),
+            "w_scale_zp": (
+                pack_scale_zp(w_s_skinny, w_zp) if dtype == torch.float16 else None
+            ),
         }
 
         save_path = args.save_path or f"bench_int4_res_n{N}_k{K}"

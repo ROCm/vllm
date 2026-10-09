@@ -242,6 +242,8 @@ def test_triton_prefill_gemm_matches_reference(dtype, zp_mode, M, K, N, G):
     of where gfx1151 switches fp16 to the packed dequant."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP device not available")
+    if zp_mode == "scale_zp" and dtype != torch.float16:
+        pytest.skip("The scale/zero-point carrier is fp16 only")
     set_random_seed(0)
 
     x, w_int4, b_q, scales, zp_raw, zp_packed = _make_prefill_case(
@@ -256,11 +258,11 @@ def test_triton_prefill_gemm_matches_reference(dtype, zp_mode, M, K, N, G):
 
 
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("M,K,N,G", PREFILL_SHAPES)
-def test_triton_prefill_scale_zp_matches_packed_zp(dtype, M, K, N, G):
-    """The carrier must not change bf16 output at all. fp16 rounds bias_eff to
-    fp16 and fuses it into an FMA, so it may differ by a rounding step."""
+def test_triton_prefill_scale_zp_matches_packed_zp(M, K, N, G):
+    """The carrier rounds bias_eff to fp16 and fuses it into an FMA, so it may
+    differ from the packed zero-point dequant by a rounding step."""
+    dtype = torch.float16
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP device not available")
     set_random_seed(0)
@@ -271,10 +273,7 @@ def test_triton_prefill_scale_zp_matches_packed_zp(dtype, M, K, N, G):
     out = triton_w4a16_skinny_fmt_gemm(
         **kwargs, scale_zp=pack_scale_zp(scales, zp_packed)
     )
-    if dtype == torch.bfloat16:
-        torch.testing.assert_close(out, base, rtol=0, atol=0)
-    else:
-        torch.testing.assert_close(out, base, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(out, base, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -514,6 +513,9 @@ def test_rdna_hybrid_w4a16_process_weights_asymmetric_repack(group_size, dist_in
     assert tuple(layer.weight_zero_point.shape) == (N // 8, K // G)
     expected_zp = _pack_zp_rows_for_kernel(zeros_int4_gn.t().contiguous())
     torch.testing.assert_close(layer.weight_zero_point, expected_zp)
+
+    # Only the gfx1151 packed fp16 dequant reads the carrier.
+    assert hasattr(layer, "_hybrid_w_scale_zp") == hybrid_module._on_gfx1151()
 
     # Quantized weights match symmetric path's layout regardless of zp.
     w_q_i32 = layer.weight_packed.view(torch.int32)
