@@ -260,7 +260,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
 
     # Maximum batch size for the HIP wvSplitK kernel path.  Above this
     # threshold the Triton prefill kernel is used instead.
-    MAX_SKINNY_BATCH_SIZE = 5
+    MAX_SKINNY_BATCH_SIZE = envs.VLLM_MOE_MAX_SKINNY_BATCH_SIZE
 
     # Default Triton BLOCK_SIZE_M for prefill / large-batch decode.
     #

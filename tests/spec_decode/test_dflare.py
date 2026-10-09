@@ -11,10 +11,10 @@ import pytest
 import torch
 from torch import nn
 
-from vllm.config import VllmConfig
-from vllm.model_executor.models.gemma4_dflare import (
-    DFlareGemma4ForCausalLM,
-    DFlareGemma4Model,
+from vllm.config import SpeculativeConfig, VllmConfig
+from vllm.model_executor.models.dflare import (
+    DFlareForCausalLM,
+    DFlareModel,
     _apply_angelslim_rope,
 )
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
@@ -24,7 +24,9 @@ from vllm.transformers_utils.configs.dflare import (
     dflash_config_from_dflare,
 )
 from vllm.transformers_utils.configs.speculators.base import SpeculatorsConfig
-from vllm.v1.spec_decode.dflare import compact_dflare_context
+from vllm.v1.spec_decode.dflare import DFlareProposer, compact_dflare_context
+from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 
 
@@ -79,6 +81,7 @@ def test_dflare_speculators_config_conversion():
 
 def test_dflare_model_is_registered():
     assert "DFlareDraftModel" in ModelRegistry.get_supported_archs()
+    assert "DFlareQwen3ForCausalLM" in ModelRegistry.get_supported_archs()
 
 
 def test_angelslim_legacy_rope_layout():
@@ -128,6 +131,223 @@ def test_angelslim_rope_cache_matches_computed_frequencies(layout):
     torch.testing.assert_close(cached, computed)
 
 
+def _partial_neox_rope(hidden, positions, theta, rotary_dim):
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
+    )
+    frequencies = torch.einsum("n,d->nd", positions.float(), inv_freq)
+    cos = torch.cat((frequencies.cos(), frequencies.cos()), dim=-1)[:, None, :]
+    sin = torch.cat((frequencies.sin(), frequencies.sin()), dim=-1)[:, None, :]
+    rotated = hidden[..., :rotary_dim]
+    first, second = rotated.chunk(2, dim=-1)
+    rotated = rotated * cos + torch.cat((-second, first), dim=-1) * sin
+    return torch.cat((rotated, hidden[..., rotary_dim:]), dim=-1)
+
+
+def test_qwen_mrope_text_positions_match_partial_rope():
+    # Text tokens carry t == h == w, so interleaved M-RoPE reduces to 1D RoPE
+    # on the first partial_rotary_factor of each head.
+    torch.manual_seed(0)
+    hidden = torch.randn(3, 2, 16)
+    positions = torch.tensor([4, 9, 30])
+    theta = 1e7
+    actual = _apply_angelslim_rope(
+        hidden,
+        positions.expand(3, -1),
+        theta,
+        "neox",
+        mrope_section=[2, 1, 1],
+        partial_rotary_factor=0.5,
+    )
+    expected = _partial_neox_rope(hidden, positions, theta, rotary_dim=8)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual[..., 8:], hidden[..., 8:])
+
+
+def test_qwen_mrope_image_positions_use_height_and_width():
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 2, 16)
+    text = torch.tensor([[5, 5], [5, 5], [5, 5]])
+    image = torch.tensor([[5, 5], [5, 7], [5, 9]])
+
+    def rotate(positions: torch.Tensor) -> torch.Tensor:
+        return _apply_angelslim_rope(
+            hidden,
+            positions,
+            1e7,
+            "neox",
+            mrope_section=[2, 1, 1],
+            partial_rotary_factor=0.5,
+        )
+
+    assert not torch.allclose(rotate(text), rotate(image))
+
+
+def test_partial_rotary_cache_leaves_remainder_unrotated():
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 2, 16)
+    positions = torch.tensor([1, 7])
+    theta = 10000.0
+    inv_freq = 1.0 / (theta ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
+    frequencies = torch.einsum("n,d->nd", torch.arange(8.0), inv_freq)
+    cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
+    actual = _apply_angelslim_rope(hidden, positions, theta, "neox", cache)
+    expected = _partial_neox_rope(hidden, positions, theta, rotary_dim=8)
+    torch.testing.assert_close(actual, expected)
+
+
+def _mrope_proposer(runner):
+    proposer = object.__new__(DFlareProposer)
+    proposer.runner = runner
+    proposer.num_speculative_tokens = 3
+    proposer._mrope_query_buffer = torch.zeros((3, 9), dtype=torch.int64)
+    return proposer
+
+
+def _mrope_first_pass(proposer, mrope):
+    # Two requests: 5 and 4 context tokens, with 1 and 2 rejected drafts.
+    cad = SimpleNamespace(batch_size=lambda: 2, query_start_loc=torch.tensor([0, 5, 9]))
+    return proposer.set_inputs_first_pass(
+        target_token_ids=torch.zeros(9, dtype=torch.long),
+        next_token_ids=torch.zeros(2, dtype=torch.long),
+        target_positions=mrope,
+        target_hidden_states=torch.zeros(9, 4),
+        token_indices_to_sample=None,
+        cad=cad,
+        num_rejected_tokens_gpu=torch.tensor([1, 2]),
+    )
+
+
+def test_mrope_query_positions_follow_last_accepted_token(monkeypatch):
+    from vllm.v1.spec_decode.dflash import DFlashProposer
+
+    seen = {}
+
+    def fake_first_pass(self, **kwargs):
+        seen["slots"] = kwargs["target_positions"]
+        return 0, None, None
+
+    monkeypatch.setattr(DFlashProposer, "set_inputs_first_pass", fake_first_pass)
+    # Absolute token positions: request 0 at 20-24, request 1 at 40-43.
+    token_positions = torch.cat((torch.arange(20, 25), torch.arange(40, 44)))
+    padding = torch.zeros(7, dtype=torch.long)
+    runner = SimpleNamespace(positions=torch.cat((token_positions, padding)))
+    proposer = _mrope_proposer(runner)
+    mrope = torch.stack((torch.arange(9), torch.arange(9) + 100, torch.arange(9) + 200))
+    _mrope_first_pass(proposer, mrope)
+
+    torch.testing.assert_close(seen["slots"], token_positions)
+    torch.testing.assert_close(proposer._mrope_context, mrope)
+    last = mrope[:, [3, 6]]
+    expected = (last[:, :, None] + 1 + torch.arange(4)).reshape(3, 8)
+    torch.testing.assert_close(proposer._get_positions(8), expected)
+
+
+def test_mrope_positions_require_runner_token_positions():
+    mrope = torch.zeros((3, 9), dtype=torch.long)
+    with pytest.raises(RuntimeError, match="V1 GPU model runner"):
+        _mrope_first_pass(_mrope_proposer(None), mrope)
+
+
+def test_mrope_target_rejects_unpadded_drafter_batch():
+    proposer = object.__new__(DFlareProposer)
+    text_config = SimpleNamespace(rope_parameters={"mrope_section": [2, 1, 1]})
+    proposer.vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config)),
+    )
+    proposer.speculative_config = cast(
+        SpeculativeConfig, SimpleNamespace(disable_padded_drafter_batch=True)
+    )
+    with pytest.raises(NotImplementedError, match="padded drafter batch"):
+        proposer.load_model(nn.Module())
+
+
+def test_mrope_draft_keeps_its_rope_theta(monkeypatch):
+    monkeypatch.setattr(
+        SpecDecodeBaseProposer, "load_model", lambda self, target_model: None
+    )
+    text_config = SimpleNamespace(
+        rope_parameters={
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+            "partial_rotary_factor": 0.25,
+            "rope_theta": 1e7,
+            "rope_type": "default",
+        }
+    )
+    draft_config = SimpleNamespace(
+        rope_parameters={"rope_theta": 5e6, "rope_type": "default"}
+    )
+    proposer = object.__new__(DFlareProposer)
+    proposer.vllm_config = cast(
+        VllmConfig,
+        SimpleNamespace(model_config=SimpleNamespace(hf_text_config=text_config)),
+    )
+    proposer.speculative_config = cast(
+        SpeculativeConfig,
+        SimpleNamespace(
+            disable_padded_drafter_batch=False,
+            draft_model_config=SimpleNamespace(hf_config=draft_config),
+        ),
+    )
+    proposer.max_padded_query_tokens = 8
+    proposer.positions = torch.zeros(8, dtype=torch.int64)
+
+    proposer.load_model(nn.Module())
+
+    assert draft_config.rope_parameters == {
+        "rope_theta": 5e6,
+        "rope_type": "default",
+        "mrope_section": [11, 11, 10],
+        "mrope_interleaved": True,
+        "partial_rotary_factor": 0.25,
+    }
+    assert draft_config.partial_rotary_factor == 0.25
+    assert proposer._mrope_query_buffer is not None
+    assert proposer._mrope_query_buffer.shape == (3, 9)
+
+
+class _RecordingContextModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[torch.Tensor, torch.Tensor, object]] = []
+
+    def precompute_and_store_context_kv(self, states, positions, slots=None):
+        self.calls.append((states, positions, slots))
+
+
+def test_mrope_context_drops_rejected_rows():
+    # Two requests with 3 and 2 context tokens; the last token of each was a
+    # rejected draft, which the input kernel marks with PADDING_SLOT_ID.
+    states = torch.arange(10, dtype=torch.float32).view(5, 2)
+    mrope = torch.stack((torch.arange(5), torch.arange(5) + 100, torch.arange(5) + 200))
+    slots = torch.tensor([10, 11, PADDING_SLOT_ID, 20, PADDING_SLOT_ID, 0, 0])
+    proposer = object.__new__(DFlareProposer)
+    proposer._dflash_num_context = 5
+    proposer._dflash_hidden_states = states
+    proposer._context_positions_buffer = torch.zeros(7, dtype=torch.int64)
+    proposer._context_slot_mapping_buffer = slots
+    proposer._mrope_context = mrope
+    proposer._has_rejected_context = True
+    proposer._mrope_query_buffer = torch.zeros((3, 9), dtype=torch.int64)
+    proposer.input_ids = torch.zeros(8, dtype=torch.int32)
+    model = _RecordingContextModel()
+    proposer.model = model
+
+    inputs, num_input_tokens = proposer.build_model_inputs_first_pass(8, 8, None)
+
+    assert len(model.calls) == 1
+    got_states, got_positions, got_slots = model.calls[0]
+    kept = [0, 1, 3]
+    torch.testing.assert_close(got_states, states[kept])
+    torch.testing.assert_close(got_positions, mrope[:, kept])
+    assert isinstance(got_slots, torch.Tensor)
+    torch.testing.assert_close(got_slots, slots[kept])
+    assert inputs["positions"].shape == (3, 8)
+    assert num_input_tokens == 8
+
+
 def test_compact_dflare_context_removes_rejected_rows():
     states = torch.arange(12).view(4, 3)
     positions = torch.tensor([5, 6, 7, 8])
@@ -172,7 +392,7 @@ class _Layer(nn.Module):
         self.self_attn = _Attention(key_weight, value_weight)
 
 
-class _ContextCacheModel(DFlareGemma4Model):
+class _ContextCacheModel(DFlareModel):
     test_keys: torch.Tensor
     test_values: torch.Tensor
 
@@ -198,7 +418,7 @@ class _ContextCacheModel(DFlareGemma4Model):
 
 
 def test_fused_context_kv_matches_layer_loop(monkeypatch):
-    model = object.__new__(DFlareGemma4Model)
+    model = object.__new__(DFlareModel)
     nn.Module.__init__(model)
     model.target_layer_ids = [0, 1]
     model.target_hidden_size = 4
@@ -234,7 +454,7 @@ def test_fused_context_kv_matches_layer_loop(monkeypatch):
         )
 
     monkeypatch.setattr(
-        "vllm.model_executor.models.gemma4_dflare.ops.rms_norm",
+        "vllm.model_executor.models.dflare.ops.rms_norm",
         rms_norm,
     )
     context_states = torch.randn(3, 8)
@@ -255,7 +475,7 @@ def test_dflare_weight_names_are_translated(monkeypatch):
         return {"loaded"}
 
     monkeypatch.setattr(DFlashQwen3Model, "load_weights", capture_weights)
-    model = object.__new__(DFlareGemma4Model)
+    model = object.__new__(DFlareModel)
     nn.Module.__init__(model)
     weights = [
         ("layers.0.attention.k_proj_target.weight", torch.zeros(1)),
@@ -337,8 +557,8 @@ def test_reduced_vocab_requires_draft_id_mapping():
     )
 
     with pytest.raises(ValueError, match="missing.*draft-to-target"):
-        DFlareGemma4ForCausalLM.load_weights(
-            cast(DFlareGemma4ForCausalLM, model),
+        DFlareForCausalLM.load_weights(
+            cast(DFlareForCausalLM, model),
             [("lm_head.weight", torch.zeros(4, 4))],
         )
 
@@ -354,8 +574,8 @@ def test_reduced_vocab_rejects_duplicate_target_ids():
     )
 
     with pytest.raises(ValueError, match="unique"):
-        DFlareGemma4ForCausalLM.load_weights(
-            cast(DFlareGemma4ForCausalLM, model),
+        DFlareForCausalLM.load_weights(
+            cast(DFlareForCausalLM, model),
             [
                 ("d2t", torch.tensor([0, -1, 0, 0])),
                 ("lm_head.weight", torch.zeros(4, 4)),
@@ -374,8 +594,8 @@ def test_reduced_vocab_requires_lm_head():
     )
 
     with pytest.raises(ValueError, match="missing lm_head"):
-        DFlareGemma4ForCausalLM.load_weights(
-            cast(DFlareGemma4ForCausalLM, model),
+        DFlareForCausalLM.load_weights(
+            cast(DFlareForCausalLM, model),
             [("d2t", torch.tensor([0, 0, 0, 0]))],
         )
 
@@ -410,17 +630,14 @@ def test_causal_lm_keeps_concatenated_hidden_size(monkeypatch):
             self.target_layer_ids = [0, 1]
             self.target_hidden_size = 4
 
+    monkeypatch.setattr(DFlareForCausalLM, "model_cls", _FakeDraftModel)
     monkeypatch.setattr(
-        "vllm.model_executor.models.gemma4_dflare.DFlareGemma4Model",
-        _FakeDraftModel,
-    )
-    monkeypatch.setattr(
-        DFlareGemma4ForCausalLM,
+        DFlareForCausalLM,
         "_make_lm_head",
         staticmethod(lambda *args, **kwargs: object()),
     )
     monkeypatch.setattr(
-        DFlareGemma4ForCausalLM,
+        DFlareForCausalLM,
         "_make_logits_processor",
         staticmethod(lambda *args, **kwargs: object()),
     )
@@ -442,7 +659,7 @@ def test_causal_lm_keeps_concatenated_hidden_size(monkeypatch):
         parallel_config=object(),
     )
 
-    DFlareGemma4ForCausalLM(vllm_config=cast(VllmConfig, vllm_config))
+    DFlareForCausalLM(vllm_config=cast(VllmConfig, vllm_config))
 
     assert captured["hidden_size"] == 12
     assert captured["draft_hidden_size"] == 4
@@ -540,7 +757,7 @@ def test_dflare_pipeline_converts_compacts_and_fuses(monkeypatch):
     assert compact_slots is not None
     torch.testing.assert_close(compact_slots[0], torch.tensor([10, 12]))
 
-    model = object.__new__(DFlareGemma4Model)
+    model = object.__new__(DFlareModel)
     nn.Module.__init__(model)
     model.target_layer_ids = converted["dflare_config"]["target_layer_ids"]
     model.target_hidden_size = converted["target_hidden_size"]
@@ -564,7 +781,7 @@ def test_dflare_pipeline_converts_compacts_and_fuses(monkeypatch):
         out.copy_(hidden_states)
 
     monkeypatch.setattr(
-        "vllm.model_executor.models.gemma4_dflare.ops.rms_norm",
+        "vllm.model_executor.models.dflare.ops.rms_norm",
         identity_norm,
     )
     keys, values = model._project_context_kv(compact_states, 2, 2, 2, 2)
