@@ -52,9 +52,17 @@ def test_aiter_unified_attention_uses_dedicated_metadata_builder():
     from vllm.v1.attention.backends.rocm_attn import (
         RocmAttentionBackend,
         RocmAttentionMetadataBuilder,
+        RocmAttentionRdna35MetadataBuilder,
+        _use_rdna35_kernel,
     )
 
-    assert RocmAttentionBackend.get_builder_cls() is RocmAttentionMetadataBuilder
+    # On gfx1151 ROCM_ATTN runs the RDNA3.5 kernel with a builder of its own.
+    expected = (
+        RocmAttentionRdna35MetadataBuilder
+        if _use_rdna35_kernel()
+        else RocmAttentionMetadataBuilder
+    )
+    assert RocmAttentionBackend.get_builder_cls() is expected
     assert (
         RocmAiterUnifiedAttentionBackend.get_builder_cls()
         is RocmAiterUnifiedAttentionMetadataBuilder
@@ -889,13 +897,17 @@ def test_unified_attn_prefers_block_contiguous_layout():
     from vllm.v1.attention.backends.rocm_aiter_unified_attn import (
         RocmAiterUnifiedAttentionBackend,
     )
-    from vllm.v1.attention.backends.rocm_attn import RocmAttentionBackend
+    from vllm.v1.attention.backends.rocm_attn import (
+        RocmAttentionBackend,
+        _use_rdna35_kernel,
+    )
 
     unified_preferred = RocmAiterUnifiedAttentionBackend.supported_kv_cache_layouts()[0]
     rocm_attn_preferred = RocmAttentionBackend.supported_kv_cache_layouts()[0]
 
     assert unified_preferred.is_block_contiguous is True
-    assert rocm_attn_preferred.is_block_contiguous is False
+    # On gfx1151 ROCM_ATTN's kernel reads LBHNC, which is block-contiguous.
+    assert rocm_attn_preferred.is_block_contiguous is _use_rdna35_kernel()
 
 
 def test_unified_attn_drops_lhbnc_with_kv_connector():

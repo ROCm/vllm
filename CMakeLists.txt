@@ -1536,6 +1536,18 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/moe_q_gemm_rdna3.cu")
   endif()
 
+  # RDNA3.5 decode and prefill attention: the variants of
+  # vllm/v1/attention/ops/rdna35_variants.csv and rdna35_prefill_variants.csv,
+  # built for gfx1151 alone, where they are tuned and validated; other shapes
+  # and devices are served by Triton.
+  set(VLLM_ROCM_HAS_RDNA35_ATTN OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx1151")
+    set(VLLM_ROCM_HAS_RDNA35_ATTN ON)
+    include(cmake/rdna35_attn.cmake)
+    rdna35_attn_target(_rocm_C_rdna35_attn VLLM_RDNA35_ATTN_INCLUDE)
+    list(APPEND VLLM_ROCM_EXT_SRC "csrc/rocm/rdna35_decode_registry.cu")
+  endif()
+
   define_extension_target(
     _rocm_C
     DESTINATION vllm
@@ -1554,6 +1566,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
 
   if(VLLM_ROCM_HAS_GFX1100)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1100)
+  endif()
+  if(VLLM_ROCM_HAS_RDNA35_ATTN)
+    target_link_libraries(_rocm_C PRIVATE _rocm_C_rdna35_attn)
+    target_include_directories(_rocm_C PRIVATE ${VLLM_RDNA35_ATTN_INCLUDE})
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_RDNA35_ATTN)
   endif()
 endif()
 

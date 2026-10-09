@@ -37,6 +37,30 @@ def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
         return (0, 0, 0)
 
 
+def layers_for_working_set(
+    num_layers: int,
+    kv_bytes_per_layer: int,
+    min_working_set_mb: float | None,
+) -> int:
+    """Raise the layer count until the KV working set outgrows the cache.
+
+    ``benchmark_fn`` walks one KV cache per layer and the result is divided by
+    the layer count, so the layer loop doubles as a rotation over disjoint KV
+    regions.  Whether a measurement reads DRAM or a last-level cache therefore
+    depends on ``num_layers * kv_bytes_per_layer``, not on the size of a single
+    layer's cache.
+
+    Left at the default this is a no-op.  Set it on parts with a large
+    last-level cache (for example the 32 MiB MALL on gfx1151), where a small
+    model at a short context otherwise stays resident across replays and
+    reports bandwidth the memory system cannot sustain.
+    """
+    if not min_working_set_mb or kv_bytes_per_layer <= 0:
+        return num_layers
+    needed = int(min_working_set_mb * 1024**2)
+    return max(num_layers, -(-needed // kv_bytes_per_layer))
+
+
 def run_do_bench(
     benchmark_fn,
     use_cuda_graphs: bool,
@@ -207,7 +231,7 @@ class MockLayer(AttentionLayerBase):
         # Return None as this is just a mock layer for benchmarking
         return None
 
-    def get_kv_cache_spec(self):
+    def get_kv_cache_spec(self, vllm_config=None):
         """Get the KV cache spec (required by AttentionLayerBase)."""
         return self._kv_cache_spec
 
@@ -283,9 +307,16 @@ class BenchmarkConfig:
     torch_profile_dir: str | None = None
     torch_profile_iters: int = 3
     warmup_ms: int | None = None
+    # Grow num_layers until the KV working set reaches this, so the timed
+    # kernel reads DRAM instead of a resident last-level cache.
+    min_working_set_mb: float | None = None
 
     # "auto" or "fp8"
     kv_cache_dtype: str = "auto"
+
+    # Sliding window in keys (None: full attention).  Set on the impl and the
+    # KV cache spec, so every backend sees the same windowed layer.
+    sliding_window: int | None = None
 
     # MLA-specific
     prefill_backend: str | None = None
@@ -540,6 +571,22 @@ def get_attention_scale(head_dim: int) -> float:
     return 1.0 / math.sqrt(head_dim)
 
 
+def split_backend(backend: str) -> tuple[str, bool]:
+    """A backend name and whether it asks for the backend's startup autotuning.
+
+    ``ROCM_SEGMENTED_ATTN@autotune`` is ROCM_SEGMENTED_ATTN with the autotuning
+    vLLM runs at startup when the kernel config enables it.
+
+    Returns:
+        (AttentionBackendEnum name, autotune)
+
+    """
+    name, sep, option = backend.partition("@")
+    if sep and option != "autotune":
+        raise ValueError(f"Unknown backend option '@{option}' in {backend}")
+    return name, bool(sep)
+
+
 def is_mla_backend(backend: str) -> bool:
     """Check if backend is an MLA backend using the AttentionBackendEnum.
 
@@ -554,7 +601,7 @@ def is_mla_backend(backend: str) -> bool:
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     try:
-        backend_enum = AttentionBackendEnum[backend]
+        backend_enum = AttentionBackendEnum[split_backend(backend)[0]]
         backend_class = backend_enum.get_class()
         return backend_class.is_mla()
     except (KeyError, ValueError, ImportError, AttributeError):
