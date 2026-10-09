@@ -147,7 +147,6 @@ def should_use_dynamic_int8_lm_head(embedding_dim: int) -> bool:
         act_type=torch.float16,
         group_size=group_size,
         zero_points=False,
-        has_g_idx=False,
     )
     try:
         kernel_cls = choose_mp_linear_kernel(probe_config)

@@ -28,7 +28,6 @@ def _has_int8_kernel() -> bool:
                 act_type=torch.float16,
                 group_size=-1,
                 zero_points=False,
-                has_g_idx=False,
             )
         )
         return True

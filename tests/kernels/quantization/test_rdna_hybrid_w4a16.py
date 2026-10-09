@@ -370,14 +370,12 @@ def test_rdna_hybrid_w4a16_process_weights_symmetric_repack(group_size, dist_ini
         act_type=torch.float16,
         group_size=group_size,
         zero_points=False,
-        has_g_idx=False,
     )
     kernel = RDNAHybridW4A16LinearKernel(
         config,
         w_q_param_name="weight_packed",
         w_s_param_name="weight_scale",
         w_zp_param_name=None,
-        w_gidx_param_name=None,
     )
     kernel.process_weights_after_loading(layer)
 
@@ -431,14 +429,12 @@ def test_rdna_hybrid_w4a16_process_weights_asymmetric_repack(group_size, dist_in
         act_type=torch.float16,
         group_size=G,
         zero_points=True,
-        has_g_idx=False,
     )
     kernel = RDNAHybridW4A16LinearKernel(
         config,
         w_q_param_name="weight_packed",
         w_s_param_name="weight_scale",
         w_zp_param_name="weight_zero_point",
-        w_gidx_param_name=None,
     )
     kernel.process_weights_after_loading(layer)
 
@@ -486,7 +482,6 @@ def test_hybrid_can_implement_group_size(group_size, expected_ok):
         act_type=torch.float16,
         group_size=group_size,
         zero_points=False,
-        has_g_idx=False,
     )
     ok, _ = RDNAHybridW4A16LinearKernel.can_implement(config)
     assert ok is expected_ok
@@ -509,7 +504,6 @@ def test_hybrid_can_implement_per_channel_rejects_asymmetric():
         act_type=torch.float16,
         group_size=-1,
         zero_points=True,
-        has_g_idx=False,
     )
     ok, reason = RDNAHybridW4A16LinearKernel.can_implement(config)
     assert ok is False
