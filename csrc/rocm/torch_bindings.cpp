@@ -208,6 +208,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+#ifdef VLLM_HIPBLASLT_HAS_W4A16
+  // Only defined when CMake found a hipBLASLt exposing the w4a16 API, so the
+  // Python side gates on hasattr() rather than on a build flag.
+  rocm_ops.def(
+      "hipblaslt_w4a16_gemm(Tensor a, Tensor b_q, Tensor scale,"
+      "                     int group_size, bool has_zp) -> Tensor");
+  rocm_ops.impl("hipblaslt_w4a16_gemm", torch::kCUDA, &hipblaslt_w4a16_gemm);
+#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

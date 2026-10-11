@@ -152,3 +152,10 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+#ifdef VLLM_HIPBLASLT_HAS_W4A16
+torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a,
+                                   const torch::Tensor& b_q,
+                                   const torch::Tensor& scale,
+                                   int64_t group_size, bool has_zp);
+#endif

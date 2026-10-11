@@ -157,8 +157,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
-    VLLM_ROCM_W4A16_HIPBLASLT: Literal["off", "decode", "prefill", "all"] = "off"
-    VLLM_HIPBLASLT_W4A16_ROOT: str | None = None
+    VLLM_ROCM_W4A16_HIPBLASLT: Literal["auto", "off", "decode", "prefill", "all"] = (
+        "auto"
+    )
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1388,17 +1389,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
     ),
     # Route the gfx11/gfx12 W4A16 GEMM through hipBLASLt instead of the
-    # RDNAHybrid kernels: "decode" replaces the HIP skinny path, "prefill" the
-    # Triton path, "all" both. Needs VLLM_HIPBLASLT_W4A16_ROOT.
+    # RDNAHybrid kernels. "auto" (default) uses hipBLASLt for every layer it
+    # has a kernel for, when vLLM was built against a hipBLASLt exposing the
+    # w4a16 API; "off" and "all" force the choice. The per-path modes are
+    # rejected -- see hipblaslt_w4a16_mode().
     "VLLM_ROCM_W4A16_HIPBLASLT": env_with_choices(
         "VLLM_ROCM_W4A16_HIPBLASLT",
-        "off",
-        ["off", "decode", "prefill", "all"],
-    ),
-    # Install prefix of a hipBLASLt that exposes the w4a16 API; the extension
-    # for VLLM_ROCM_W4A16_HIPBLASLT is compiled against it on demand.
-    "VLLM_HIPBLASLT_W4A16_ROOT": lambda: os.environ.get(
-        "VLLM_HIPBLASLT_W4A16_ROOT", None
+        "auto",
+        ["auto", "off", "decode", "prefill", "all"],
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
@@ -2324,9 +2322,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_XLA_CACHE_PATH",
         "VLLM_CONFIG_ROOT",
         "LD_LIBRARY_PATH",
-        # Where the w4a16-capable hipBLASLt is built, not whether it is used
-        # (VLLM_ROCM_W4A16_HIPBLASLT carries that and stays a factor).
-        "VLLM_HIPBLASLT_W4A16_ROOT",
         "VLLM_SERVER_DEV_MODE",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",

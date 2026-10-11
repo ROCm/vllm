@@ -3,12 +3,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness of the hipBLASLt W4A16 path against the RDNAHybrid reference.
 
-Opt-in: needs an installed hipBLASLt that exposes the w4a16 API, and the
-process must resolve that libhipblaslt (see hipblaslt_w4a16.py):
-
-    VLLM_HIPBLASLT_W4A16_ROOT=<prefix> \\
-    LD_LIBRARY_PATH=<prefix>/lib \\
-    pytest tests/kernels/quantization/test_hipblaslt_w4a16.py
+Skipped unless vLLM was built against a ROCm whose hipBLASLt exposes the w4a16
+API, in which case _rocm_C carries the ops (see the VLLM_HIPBLASLT_HAS_W4A16
+block in CMakeLists.txt).
 """
 
 import importlib
@@ -16,15 +13,12 @@ import importlib
 import pytest
 import torch
 
-from vllm import envs
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
 if not current_platform.is_rocm():
     pytest.skip("ROCm only", allow_module_level=True)
 
-if not envs.VLLM_HIPBLASLT_W4A16_ROOT:
-    pytest.skip("VLLM_HIPBLASLT_W4A16_ROOT is unset", allow_module_level=True)
 
 # Same directory, and pytest's default import mode puts it on sys.path.
 from test_rdna_hybrid_w4a16 import (  # noqa: E402
@@ -35,6 +29,13 @@ from test_rdna_hybrid_w4a16 import (  # noqa: E402
 hipblaslt_module = importlib.import_module(
     "vllm.model_executor.kernels.linear.mixed_precision.hipblaslt_w4a16"
 )
+
+if not hipblaslt_module.is_built():
+    pytest.skip(
+        "_rocm_C has no hipblaslt_w4a16_gemm: vLLM was built against a "
+        "hipBLASLt without the w4a16 API",
+        allow_module_level=True,
+    )
 hybrid_module = importlib.import_module(
     "vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16"
 )

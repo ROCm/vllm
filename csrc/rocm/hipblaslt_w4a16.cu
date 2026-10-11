@@ -4,9 +4,9 @@
 // hipBLASLt w4a16 GEMM: D = dequant(A) * B, with int4 weights in A, fp16/bf16
 // activations in B, and a per-K-group scale (plus optional zero-points).
 //
-// Built at import time by torch.utils.cpp_extension.load() against a hipBLASLt
-// that exposes the w4a16 API -- it is deliberately NOT part of the CMake build,
-// so vLLM keeps building against a stock ROCm SDK. See hipblaslt_w4a16.py.
+// Compiled into _rocm_C only when CMake's probe finds a hipBLASLt whose
+// headers expose the w4a16 API (VLLM_HIPBLASLT_HAS_W4A16). A stock ROCm SDK
+// without it simply does not get these ops. See hipblaslt_w4a16.py.
 //
 // The vLLM W4A16 tensors map onto the API without any repacking. With
 // hipBLASLt's m = vLLM's N (output features) and hipBLASLt's n = vLLM's M
@@ -19,7 +19,7 @@
 // lda comes from the weight's row stride, so the gfx1151 cliff padding applied
 // by pack_skinny_int4() is carried through as-is.
 
-#include <torch/extension.h>
+#include <torch/all.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -253,9 +253,4 @@ torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a, const torch::Tensor& 
                            plan.workspace_bytes,
                            at::cuda::getCurrentCUDAStream()));
   return out;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("hipblaslt_w4a16_gemm", &hipblaslt_w4a16_gemm,
-        "W4A16 GEMM through hipBLASLt (ROCm)");
 }

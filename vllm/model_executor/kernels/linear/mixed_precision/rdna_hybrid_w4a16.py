@@ -30,11 +30,13 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .hipblaslt_w4a16 import (
+    MODE_ALL,
     MODE_DECODE,
     MODE_PREFILL,
     build_scale_buffer,
     hipblaslt_w4a16_gemm,
     hipblaslt_w4a16_mode,
+    supports_layer,
 )
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
@@ -988,13 +990,18 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             unpacked = unpacked.t().contiguous()
 
         # ---- Pack into skinny [N, K//8] (+ gfx1151 cliff pad) ----
-        # hipBLASLt dropped the ExLlama int4 encoding, so when it owns every
-        # W4A16 GEMM the weights go down in plain K order instead. That is only
-        # safe because in that mode neither wvSplitK_int4_g nor the Triton
-        # kernel is reached -- they still read the ExLlama shuffle, and
-        # hipblaslt_w4a16_mode() rejects the mixed modes for that reason.
+        # hipBLASLt dropped the ExLlama int4 encoding, so when it owns this
+        # layer's GEMMs the weights go down in plain K order instead. Neither
+        # wvSplitK_int4_g nor the Triton kernel is then reached for this layer
+        # -- they read the ExLlama shuffle -- so the choice is made once, here,
+        # and holds for both prefill and decode.
+        use_hipblaslt = (
+            bool(hipblaslt_w4a16_mode())
+            and supports_layer(c.group_size)
+            and unpacked.device.type == "cuda"
+        )
         w_q_skinny, w_q_skinny_i32 = pack_skinny_int4(
-            unpacked, shuffle=not hipblaslt_w4a16_mode()
+            unpacked, shuffle=not use_hipblaslt
         )
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
@@ -1041,7 +1048,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         # zero-points appended to the scales in one allocation, so w_s becomes a
         # view into that buffer's head -- identical bytes and layout for the HIP
         # skinny and Triton kernels, and no second copy of the scales.
-        if hipblaslt_w4a16_mode() and w_s_skinny.device.type == "cuda":
+        if use_hipblaslt:
             hipblaslt_scale, w_s_skinny = build_scale_buffer(
                 w_s_skinny, w_zp, c.group_size
             )
@@ -1050,6 +1057,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
                     "_hybrid_hipblaslt_scale",
                     torch.nn.Parameter(hipblaslt_scale, requires_grad=False),
                 )
+        layer._hybrid_hipblaslt_ok = use_hipblaslt
 
         # ---- Store on layer ----
         # Replace w_q with skinny int8 (primary weights for skinny kernel)
@@ -1209,7 +1217,9 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         # Symmetric layers hand w_s to hipBLASLt directly; asymmetric ones carry
         # the combined scale+zero-point buffer built at load time. Stays None
         # when the path is off, so the op sees exactly the arguments it used to.
-        hipblaslt_mode = hipblaslt_w4a16_mode()
+        hipblaslt_mode = (
+            MODE_ALL if getattr(layer, "_hybrid_hipblaslt_ok", False) else 0
+        )
         hipblaslt_scale = None
         if hipblaslt_mode:
             hipblaslt_scale = getattr(layer, "_hybrid_hipblaslt_scale", w_s)
