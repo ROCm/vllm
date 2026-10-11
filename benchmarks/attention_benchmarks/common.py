@@ -37,6 +37,19 @@ def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
         return (0, 0, 0)
 
 
+def layers_for_working_set(
+    num_layers: int,
+    kv_bytes_per_layer: int,
+    min_working_set_mb: float | None,
+) -> int:
+    """Raise the layer count until the KV working set reaches the given size,
+    so it does not stay in the last-level cache."""
+    if not min_working_set_mb or kv_bytes_per_layer <= 0:
+        return num_layers
+    needed = int(min_working_set_mb * 1024**2)
+    return max(num_layers, -(-needed // kv_bytes_per_layer))
+
+
 def run_do_bench(
     benchmark_fn,
     use_cuda_graphs: bool,
@@ -207,7 +220,7 @@ class MockLayer(AttentionLayerBase):
         # Return None as this is just a mock layer for benchmarking
         return None
 
-    def get_kv_cache_spec(self):
+    def get_kv_cache_spec(self, vllm_config=None):
         """Get the KV cache spec (required by AttentionLayerBase)."""
         return self._kv_cache_spec
 
@@ -283,9 +296,14 @@ class BenchmarkConfig:
     torch_profile_dir: str | None = None
     torch_profile_iters: int = 3
     warmup_ms: int | None = None
+    # Grow num_layers until the KV working set reaches this size.
+    min_working_set_mb: float | None = None
 
     # "auto" or "fp8"
     kv_cache_dtype: str = "auto"
+
+    # Sliding window in keys (None: full attention).
+    sliding_window: int | None = None
 
     # MLA-specific
     prefill_backend: str | None = None
@@ -540,6 +558,14 @@ def get_attention_scale(head_dim: int) -> float:
     return 1.0 / math.sqrt(head_dim)
 
 
+def split_backend(backend: str) -> tuple[str, bool]:
+    """Split ``NAME@autotune`` into the backend name and an autotune flag."""
+    name, sep, option = backend.partition("@")
+    if sep and option != "autotune":
+        raise ValueError(f"Unknown backend option '@{option}' in {backend}")
+    return name, bool(sep)
+
+
 def is_mla_backend(backend: str) -> bool:
     """Check if backend is an MLA backend using the AttentionBackendEnum.
 
@@ -554,7 +580,7 @@ def is_mla_backend(backend: str) -> bool:
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     try:
-        backend_enum = AttentionBackendEnum[backend]
+        backend_enum = AttentionBackendEnum[split_backend(backend)[0]]
         backend_class = backend_enum.get_class()
         return backend_class.is_mla()
     except (KeyError, ValueError, ImportError, AttributeError):

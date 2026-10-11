@@ -21,6 +21,19 @@ python benchmark.py \
     --output-csv results.csv
 ```
 
+## Cache residency
+
+Each layer has its own KV cache. With a large last-level cache (gfx1151:
+32 MiB), small KV working sets stay cached and time too fast.
+`--min-working-set-mb` raises `--num-layers` until the KV working set reaches
+the given size.
+
+```bash
+python benchmark.py --backends TRITON_ATTN --batch-specs q1s512 \
+    --num-q-heads 32 --num-kv-heads 8 --head-dim 128 \
+    --min-working-set-mb 96
+```
+
 ## Simplified Batch Specification Grammar
 
 Express workloads concisely using query length and sequence length:
@@ -156,7 +169,9 @@ python benchmark.py \
 ```text
 --config CONFIG                     # Path to YAML config file (overrides other args)
 --backends BACKEND [BACKEND ...]    # flash, triton, flashinfer, cutlass_mla,
-                                    # flashinfer_mla, flashattn_mla, flashmla
+                                    # flashinfer_mla, flashattn_mla, flashmla;
+                                    # NAME@autotune runs the backend's startup
+                                    # autotuning first (ROCM_SEGMENTED_ATTN)
 --backend BACKEND                   # Single backend (alternative to --backends)
 --batch-specs SPEC [SPEC ...]       # Batch specifications using extended grammar
 
