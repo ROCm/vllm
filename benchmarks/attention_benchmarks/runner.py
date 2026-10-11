@@ -12,6 +12,7 @@ import logging
 import statistics
 import types
 from contextlib import contextmanager
+from dataclasses import replace
 from math import prod
 
 import torch
@@ -21,6 +22,7 @@ from common import (
     BenchmarkResult,
     MockLayer,
     get_attention_scale,
+    layers_for_working_set,
     run_do_bench,
     run_ncu_profile,
 )
@@ -98,11 +100,36 @@ def log_warnings_and_errors_only():
 # ============================================================================
 
 
+def _block_rows(
+    q_lens: list[int],
+    kv_lens: list[int],
+    block_size: int,
+    sliding_window: int | None,
+) -> tuple[list[list[int]], int]:
+    """Block table rows and the number of KV blocks. With a sliding window,
+    blocks outside every window map to the null block 0."""
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    if sliding_window is None:
+        rows = [
+            list(range(r * max_blocks, (r + 1) * max_blocks))
+            for r in range(len(kv_lens))
+        ]
+        return rows, len(kv_lens) * max_blocks
+    rows, nxt = [], 1
+    for q, kv in zip(q_lens, kv_lens):
+        first = max(0, kv - q - (sliding_window - 1)) // block_size
+        live = max_blocks - first
+        rows.append([0] * first + list(range(nxt, nxt + live)))
+        nxt += live
+    return rows, nxt
+
+
 def _build_common_attn_metadata(
     q_lens: list[int],
     kv_lens: list[int],
     block_size: int,
     device: torch.device,
+    sliding_window: int | None = None,
 ) -> CommonAttentionMetadata:
     """Build CommonAttentionMetadata from query/kv lengths."""
     batch_size = len(q_lens)
@@ -117,11 +144,8 @@ def _build_common_attn_metadata(
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
     max_seq_len = int(seq_lens.max().item())
 
-    max_blocks = (max(kv_lens) + block_size - 1) // block_size
-    num_blocks = batch_size * max_blocks
-    block_table_tensor = torch.arange(
-        num_blocks, dtype=torch.int32, device=device
-    ).view(batch_size, max_blocks)
+    rows, _ = _block_rows(q_lens, kv_lens, block_size, sliding_window)
+    block_table_tensor = torch.tensor(rows, dtype=torch.int32, device=device)
     slot_mapping = torch.arange(total_tokens, dtype=torch.int64, device=device)
 
     max_query_len = max(q_lens)
@@ -140,17 +164,29 @@ def _build_common_attn_metadata(
     )
 
 
+class _DropCastWarning(logging.Filter):
+    """Drop the expected dtype cast warning."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.getMessage().startswith("Casting ")
+
+
 def _create_vllm_config(
     config: BenchmarkConfig,
     max_num_blocks: int,
+    max_model_len: int,
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
+    cast_logger = logging.getLogger("vllm.config.model")
+    if not any(isinstance(f, _DropCastWarning) for f in cast_logger.filters):
+        cast_logger.addFilter(_DropCastWarning())
+    # Any ungated model; the dimensions are mocked below.
     model_config = ModelConfig(
-        model="HuggingFaceTB/SmolLM2-135M",  # Use public model to avoid login issues
+        model="HuggingFaceTB/SmolLM2-135M",
         tokenizer="HuggingFaceTB/SmolLM2-135M",
         skip_tokenizer_init=True,
         trust_remote_code=False,
-        dtype="auto",  # Use model's native dtype
+        dtype=str(config.dtype).removeprefix("torch."),
         seed=0,
         max_model_len=1024,
     )
@@ -197,6 +233,9 @@ def _create_vllm_config(
         lambda self: config.head_dim, model_config
     )
     model_config.get_sliding_window = types.MethodType(lambda self: None, model_config)
+    # Backends size their workspaces from max_model_len.
+    model_config.max_model_len = max_model_len
+    scheduler_config.max_model_len = max_model_len
 
     return VllmConfig(
         model_config=model_config,
@@ -238,7 +277,7 @@ def _create_backend_impl(
         scale=scale,
         num_kv_heads=config.num_kv_heads,
         alibi_slopes=None,
-        sliding_window=None,
+        sliding_window=config.sliding_window,
         kv_cache_dtype=config.kv_cache_dtype,
     )
 
@@ -247,6 +286,7 @@ def _create_backend_impl(
         num_kv_heads=config.num_kv_heads,
         head_size=config.head_dim,
         dtype=dtype,
+        sliding_window=config.sliding_window,
     )
 
     layer = MockLayer(device, kv_cache_spec=kv_cache_spec)
@@ -344,6 +384,11 @@ def _create_input_tensors(
     return q_list, k_list, v_list
 
 
+def dtype_size(config) -> int:
+    """Bytes per KV element for the configured cache dtype."""
+    return 1 if config.kv_cache_dtype.startswith("fp8") else config.dtype.itemsize
+
+
 def _create_kv_cache(
     config: BenchmarkConfig,
     max_num_blocks: int,
@@ -370,6 +415,15 @@ def _create_kv_cache(
         * config.num_layers
     )
     buf = torch.zeros(total_bytes, device=device, dtype=torch.int8)
+    # Random KV: zeros make every score tie and run unrealistically fast.
+    if cache_dtype.itemsize >= 2:
+        buf.view(cache_dtype).normal_()
+    else:
+        buf.copy_(
+            torch.randn(total_bytes, device=device, dtype=torch.float16)
+            .to(cache_dtype)
+            .view(torch.int8)
+        )
     layer_stride, block_stride, _, _, _ = compute_layout_strides(
         spec, max_num_blocks, config.num_layers, layout
     )
@@ -483,17 +537,34 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
-    max_kv = max(kv_lens)
-    batch_size = len(q_lens)
 
-    # Calculate total blocks needed: batch_size * max_blocks_per_request
-    max_blocks_per_request = (max_kv + config.block_size - 1) // config.block_size
-    max_num_blocks = batch_size * max_blocks_per_request
+    _, max_num_blocks = _block_rows(
+        q_lens, kv_lens, config.block_size, config.sliding_window
+    )
+
+    # Grow the layer count until the KV working set outgrows the cache.
+    read_lens = [
+        kv if config.sliding_window is None else min(kv, config.sliding_window + q - 1)
+        for kv, q in zip(kv_lens, q_lens)
+    ]
+    kv_bytes_per_layer = (
+        2 * sum(read_lens) * config.num_kv_heads * config.head_dim * dtype_size(config)
+    )
+    config = replace(
+        config,
+        num_layers=layers_for_working_set(
+            config.num_layers, kv_bytes_per_layer, config.min_working_set_mb
+        ),
+    )
 
     # Suppress vLLM logs during setup to reduce spam
     with log_warnings_and_errors_only():
         # Create vllm_config first - uses model's native dtype via "auto"
-        vllm_config = _create_vllm_config(config, max_num_blocks)
+        vllm_config = _create_vllm_config(
+            config,
+            max_num_blocks,
+            config.max_model_len or max(kv_lens),
+        )
         dtype = vllm_config.model_config.dtype
 
         # Wrap everything in set_current_vllm_config context
@@ -502,13 +573,16 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             backend_class, impl, layer = _create_backend_impl(
                 backend_cfg, config, device, dtype
             )
+            # As the model runner does after loading weights.
+            layer.impl = impl
+            impl.process_weights_after_loading(dtype)
             # Set KV cache layout if the backend requires a specific one
             # (e.g., FlashInfer requires LBHNC on SM100/Blackwell for TRTLLM attention)
             supported = get_supported_kv_cache_layouts([backend_class])
             layout = resolve_kv_cache_layout(vllm_config, [[m.name for m in supported]])
 
             common_metadata = _build_common_attn_metadata(
-                q_lens, kv_lens, config.block_size, device
+                q_lens, kv_lens, config.block_size, device, config.sliding_window
             )
 
             kv_cache_spec = FullAttentionSpec(
@@ -516,6 +590,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 num_kv_heads=config.num_kv_heads,
                 head_size=config.head_dim,
                 dtype=dtype,
+                sliding_window=config.sliding_window,
             )
 
             builder = _create_metadata_builder(
