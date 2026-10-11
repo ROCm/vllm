@@ -41,6 +41,26 @@ void moe_gptq_gemm_rdna3(torch::Tensor a, torch::Tensor c,
                          int64_t block_size_m, bool mul_topk_weight,
                          int64_t output_topk);
 
+// RDNA3.5 decode attention: the built rows as CSV, a row's index (-1 if not
+// built), and a launch by index.
+std::string rdna_singleseq_decode_table();
+int64_t rdna_singleseq_decode_variant(torch::IntArrayRef key);
+void rdna_singleseq_decode_attn(int64_t variant, torch::Tensor& q,
+                                torch::Tensor& kv_cache,
+                                torch::Tensor& block_table, torch::Tensor& out,
+                                torch::Tensor& acc, torch::Tensor& m,
+                                torch::Tensor& l, torch::Tensor& cnt,
+                                torch::Tensor& seq_lens, double scale);
+
+// RDNA3.5 prefill attention, likewise.
+std::string rdna_singleseq_prefill_table();
+int64_t rdna_singleseq_prefill_variant(torch::IntArrayRef key);
+void rdna_singleseq_prefill_attn(
+    int64_t variant, torch::Tensor& q, torch::Tensor& kv_cache,
+    torch::Tensor& block_table, torch::Tensor& out, torch::Tensor& partial_o,
+    torch::Tensor& partial_ml, torch::Tensor& counters, torch::Tensor& seq_lens,
+    int64_t max_seq_len, double scale);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
