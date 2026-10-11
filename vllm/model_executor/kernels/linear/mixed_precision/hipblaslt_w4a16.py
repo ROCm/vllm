@@ -2,21 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """hipBLASLt W4A16 GEMM, as a drop-in replacement for the RDNAHybrid kernels.
 
-Experimental: gated off by default behind ``VLLM_ROCM_W4A16_HIPBLASLT`` and
-built on demand against an installed hipBLASLt that exposes the w4a16 API
-(``VLLM_HIPBLASLT_W4A16_ROOT``), so a stock ROCm SDK build is unaffected.
+Compiled into ``_rocm_C`` only when CMake's probe finds that the ROCm being
+built against has a hipBLASLt exposing the w4a16 API (see the
+VLLM_HIPBLASLT_HAS_W4A16 block in CMakeLists.txt); against an older ROCm the
+ops simply do not exist. ``VLLM_ROCM_W4A16_HIPBLASLT`` then chooses whether to
+use them.
 
 Activations, the output and the zero-points are handed over untouched -- see
 ``csrc/rocm/hipblaslt_w4a16.cu`` for the index mapping, and note that
 hipBLASLt's zero-point region is ``[ceil(N/8)][K/G]`` 32-bit words with row n
 in nibble ``n % 8``, which is already how vLLM packs ``qzeros``. Only the
 weights are rebuilt at load time: hipBLASLt dropped the ExLlama int4 encoding
-and needs plain K order, which is why only "off" and "all" are valid modes.
+and needs plain K order, which is why a layer commits to one kernel family for
+both prefill and decode.
 """
 
 import functools
-import os
-from pathlib import Path
 
 import torch
 
@@ -34,120 +35,60 @@ _MODES = {"off": 0, "decode": MODE_DECODE, "prefill": MODE_PREFILL, "all": MODE_
 # Matches c_blockScaleAZeroPointAlignment in hipBLASLt's tensile_host.cpp.
 ZERO_POINT_ALIGNMENT = 256
 
+# One block-scale mode per group size, so these are the only ones expressible.
+SUPPORTED_GROUP_SIZES = (32, 64, 128)
+
+
+@functools.cache
+def is_built() -> bool:
+    """Whether CMake compiled the w4a16 ops into _rocm_C."""
+    return hasattr(torch.ops._rocm_C, "hipblaslt_w4a16_gemm")
+
 
 @functools.cache
 def hipblaslt_w4a16_mode() -> int:
     """Bitmask of the paths ``VLLM_ROCM_W4A16_HIPBLASLT`` routes to hipBLASLt.
 
-    Only "off" and "all" are usable. hipBLASLt dropped the ExLlama int4
-    encoding, so its weights must be packed in plain K order, while
-    ``wvSplitK_int4_g`` and the Triton kernel read the ExLlama shuffle. One
-    buffer cannot serve both, and duplicating it costs a second copy of the
-    whole weight -- so a mode that splits the GEMMs between them would either
-    read garbage or double the weight footprint.
+    "auto" uses hipBLASLt wherever it has a kernel and the in-tree kernels
+    elsewhere; "off" and "all" force the choice. The per-path modes are not
+    usable: hipBLASLt dropped the ExLlama int4 encoding, so its weights must be
+    packed in plain K order, while ``wvSplitK_int4_g`` and the Triton kernel
+    read the ExLlama shuffle. One buffer cannot serve both, and duplicating it
+    costs a second copy of the whole weight -- so a mode that splits the GEMMs
+    of one layer between them would either read garbage or double the weight
+    footprint. The choice is therefore per layer, not per call.
     """
-    mode = _MODES[envs.VLLM_ROCM_W4A16_HIPBLASLT]
+    setting = envs.VLLM_ROCM_W4A16_HIPBLASLT
+    if setting == "auto":
+        return MODE_ALL if is_built() else 0
+    mode = _MODES[setting]
     if mode not in (0, MODE_ALL):
         raise ValueError(
-            f"VLLM_ROCM_W4A16_HIPBLASLT={envs.VLLM_ROCM_W4A16_HIPBLASLT!r} is no "
-            "longer supported: hipBLASLt needs plain-K-order weights and the "
-            "in-tree kernels need the ExLlama shuffle, so the two cannot share "
-            "one weight buffer. Use 'off' or 'all'."
+            f"VLLM_ROCM_W4A16_HIPBLASLT={setting!r} is no longer supported: "
+            "hipBLASLt needs plain-K-order weights and the in-tree kernels "
+            "need the ExLlama shuffle, so the two cannot share one weight "
+            "buffer. Use 'auto', 'off' or 'all'."
+        )
+    if mode and not is_built():
+        raise RuntimeError(
+            "VLLM_ROCM_W4A16_HIPBLASLT=all but vLLM was built against a ROCm "
+            "whose hipBLASLt has no w4a16 API, so _rocm_C has no "
+            "hipblaslt_w4a16_gemm. Rebuild against a ROCm that exposes it, or "
+            "use 'off'."
         )
     return mode
 
 
-def _root() -> Path:
-    root = envs.VLLM_HIPBLASLT_W4A16_ROOT
-    if not root:
-        raise RuntimeError(
-            "VLLM_ROCM_W4A16_HIPBLASLT is enabled but VLLM_HIPBLASLT_W4A16_ROOT "
-            "is unset. Point it at an install prefix whose hipBLASLt exposes "
-            "the w4a16 API."
-        )
-    return Path(root)
+def supports_layer(group_size: int) -> bool:
+    """Whether hipBLASLt can own a layer quantised at this group size.
 
-
-def _paths() -> tuple[list[str], str, str]:
-    """(include dirs, hipBLASLt lib dir, Tensile library dir).
-
-    ``VLLM_HIPBLASLT_W4A16_ROOT`` is an install prefix, laid out the way ROCm
-    itself ships hipBLASLt. Only ``hipblaslt/`` comes from there:
-    ``hipblas-common`` and ``hipblas`` are taken from the SDK, which a prefix
-    does not carry anyway.
+    The scale modes are per group size -- VEC32/VEC64/VEC128, see
+    ``scale_mode_of`` in the .cu -- so anything else has no mode to ask for.
+    Shapes are unconstrained beyond what the op already checks, and the device
+    library covers every (dtype, symmetry) combination, so group size is the
+    whole predicate.
     """
-    root = _root()
-    # The w4a16 enums live here, so it must precede the ROCm SDK's copy.
-    includes = [str(root / "include")]
-    lib_dir = root / "lib"
-    tensile_dir = lib_dir / "hipblaslt" / "library"
-
-    from vllm.platforms.rocm import _GCN_ARCH
-
-    arch = _GCN_ARCH.split(":")[0]  # gfx1151:xnack- -> gfx1151
-    if (tensile_dir / arch).is_dir():
-        tensile_dir = tensile_dir / arch
-
-    for p in includes + [str(lib_dir / "libhipblaslt.so"), str(tensile_dir)]:
-        if not os.path.exists(p):
-            raise RuntimeError(
-                f"VLLM_HIPBLASLT_W4A16_ROOT={root} does not look like an "
-                f"installed hipBLASLt: {p} is missing."
-            )
-    return includes, str(lib_dir), str(tensile_dir)
-
-
-def _check_loaded_library(lib_dir: str) -> None:
-    """Fail loudly when the process resolved a different libhipblaslt.
-
-    PyTorch links ``libhipblaslt.so.1`` from the ROCm SDK wheel, and ``dlopen``
-    of a library with an already-loaded SONAME returns the loaded one whatever
-    the RPATH says. Without this check the symptom is an opaque
-    HIPBLAS_STATUS_INVALID_VALUE from an unrecognised scale mode.
-    """
-    loaded = set()
-    with open("/proc/self/maps") as f:
-        for line in f:
-            path = line.rsplit(" ", 1)[-1].strip()
-            if "libhipblaslt.so" in path:
-                loaded.add(os.path.realpath(path))
-    expected = os.path.realpath(os.path.join(lib_dir, "libhipblaslt.so"))
-    if expected not in loaded:
-        raise RuntimeError(
-            f"the process is using {sorted(loaded) or 'no libhipblaslt'} rather "
-            f"than {expected}; a same-SONAME library was already loaded. Launch "
-            f"with LD_LIBRARY_PATH={lib_dir} (or LD_PRELOAD of that .so) so the "
-            "w4a16-capable hipBLASLt wins."
-        )
-
-
-@functools.cache
-def _ext():
-    from torch.utils.cpp_extension import load
-
-    source = (
-        Path(__file__).resolve().parents[5] / "csrc" / "rocm" / "hipblaslt_w4a16.cu"
-    )
-    if not source.exists():
-        raise RuntimeError(
-            f"{source} is missing; the hipBLASLt W4A16 path needs an editable "
-            "vLLM checkout with csrc/ present."
-        )
-
-    includes, lib_dir, tensile_dir = _paths()
-    os.environ.setdefault("HIPBLASLT_TENSILE_LIBPATH", tensile_dir)
-
-    module = load(
-        name="vllm_hipblaslt_w4a16",
-        sources=[str(source)],
-        extra_include_paths=includes,
-        extra_cflags=["-O3"],
-        extra_ldflags=[f"-L{lib_dir}", "-lhipblaslt", f"-Wl,-rpath,{lib_dir}"],
-        verbose=False,
-    )
-    _check_loaded_library(lib_dir)
-    logger.info("hipBLASLt W4A16 enabled (mode=%s)", envs.VLLM_ROCM_W4A16_HIPBLASLT)
-    return module
+    return group_size in SUPPORTED_GROUP_SIZES
 
 
 def hipblaslt_w4a16_gemm(
@@ -157,7 +98,7 @@ def hipblaslt_w4a16_gemm(
     group_size: int,
     has_zp: bool,
 ) -> torch.Tensor:
-    return _ext().hipblaslt_w4a16_gemm(a, w_q, scale, group_size, has_zp)
+    return torch.ops._rocm_C.hipblaslt_w4a16_gemm(a, w_q, scale, group_size, has_zp)
 
 
 def build_scale_buffer(
