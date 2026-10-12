@@ -37,15 +37,32 @@ logger = init_logger(__name__)
 # so the two cannot drift). Both are hardware dependent.
 _MIN_WORK_PER_SPLIT = 512
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
+_MLA_DECODE_HEAD_BLOCK = 16
 
-
-def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
+def _compute_num_kv_splits(
+    max_seq_len: int, sm_count: int, batch_size: int, num_heads: int
+) -> int:
     # Power of 2 to avoid excessive kernel instantiations, capped by an SM-based
     # maximum (occupancy multiplier allows multiple blocks per SM
     # for latency hiding).
     ideal_splits = triton.next_power_of_2(max(1, max_seq_len // _MIN_WORK_PER_SPLIT))
     max_splits = sm_count * _SPLIT_OCCUPANCY_MULTIPLIER
-    return min(ideal_splits, max_splits)
+    head_blocks = triton.cdiv(num_heads, _MLA_DECODE_HEAD_BLOCK)
+    useful_splits = triton.next_power_of_2(
+        max(1, max_splits // max(1, batch_size * head_blocks))
+    )
+    return max(1, min(ideal_splits, max_splits, useful_splits))
+
+
+def _max_attn_logits_rows(
+    max_model_len: int, sm_count: int, max_batch_size: int, num_heads: int
+) -> int:
+    """Worst case of batch_size * num_kv_splits over all batch sizes, i.e. the
+    number of (num_heads, kv_lora_rank + 1) fp32 rows the logits scratch needs."""
+    return max(
+        b * _compute_num_kv_splits(max_model_len, sm_count, b, num_heads)
+        for b in range(1, max_batch_size + 1)
+    )
 
 
 class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
@@ -82,13 +99,15 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
         )
         # DCP all-gathers the query heads before forward_mqa.
         q_num_heads = self.num_heads * self.dcp_world_size
-        max_splits = _compute_num_kv_splits(
+        max_rows = _max_attn_logits_rows(
             self.model_config.max_model_len,
             current_platform.num_compute_units(),
+            B,
+            q_num_heads,
         )
         lse_dim = self.mla_dims.kv_lora_rank + 1
         current_workspace_manager().get_simultaneous(
-            ((B, q_num_heads, max_splits, lse_dim), torch.float32),
+            ((max_rows, q_num_heads, 1, lse_dim), torch.float32),
         )
 
 
@@ -252,7 +271,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             num_kv_splits = 1
         else:
             num_kv_splits = _compute_num_kv_splits(
-                attn_metadata.max_seq_len, self._sm_count
+                attn_metadata.max_seq_len, self._sm_count, B, q_num_heads
             )
 
         # NOTE: the +1 stores the LogSumExp (LSE) that the stage2 kernel uses to
