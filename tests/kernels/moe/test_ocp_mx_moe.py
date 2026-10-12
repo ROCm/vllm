@@ -1637,8 +1637,12 @@ def test_rocm_mxfp4_moe_oracle(
     if experts_cls_list is None or len(experts_cls_list) == 0:
         pytest.skip(f"Backend {backend_name} not available")
 
-    # Use first experts class
-    experts_cls = experts_cls_list[0]
+    # Use the first experts class supported on this device
+    experts_cls = next(
+        (c for c in experts_cls_list if c._supports_current_device()), None
+    )
+    if experts_cls is None:
+        pytest.skip(f"Backend {backend_name} not supported on this device")
 
     torch.manual_seed(42)
     dtype = torch.bfloat16
