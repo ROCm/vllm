@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
-from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -39,7 +38,6 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
@@ -66,6 +64,22 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _aiter_fa_metadata_types() -> list[type]:
+    """The ROCM_AITER_FA metadata type, if the aiter package is installed.
+
+    rocm_aiter_fa imports aiter at module load on ROCm, so importing it on a
+    build without aiter (e.g. gfx11) fails. Without aiter that backend cannot
+    be selected anyway.
+    """
+    from vllm import _aiter_ops
+
+    if not _aiter_ops.IS_AITER_FOUND:
+        return []
+    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionMetadata
+
+    return [AiterFlashAttentionMetadata]
 
 
 class SpecDecodeBaseProposer:
@@ -295,21 +309,7 @@ class SpecDecodeBaseProposer:
                 DeepseekV32IndexerMetadata,
                 MiniMaxM3SparseMetadata,
             ]
-            # ROCM_AITER_FA is an optional backend
-            # We check is_enabled() here to avoid importing the backend module during
-            # auto-discovery when VLLM_ROCM_USE_AITER=0, which would trigger aiter
-            # import and JIT compilation warnings. Explicit backend selection via
-            # attention_config still works because the backend module is loaded
-            # directly when selected, not through this auto-discovery path.
-            # Check if backend module exists to allow explicit selection
-            if find_spec(
-                AttentionBackendEnum.ROCM_AITER_FA.get_path(include_classname=False)
-            ):
-                from vllm.v1.attention.backends.rocm_aiter_fa import (
-                    AiterFlashAttentionMetadata,
-                )
-
-                rocm_types.append(AiterFlashAttentionMetadata)
+            rocm_types.extend(_aiter_fa_metadata_types())
 
             # TRITON_MLA backend support for MLA models (e.g., DeepSeek)
             from vllm.model_executor.layers.attention.mla_attention import (
