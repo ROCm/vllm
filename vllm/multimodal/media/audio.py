@@ -41,7 +41,9 @@ try:
 except (ImportError, RuntimeError) as exc:
     # RuntimeError: torchcodec is installed but the system ffmpeg is missing.
     AudioDecoder = None  # type: ignore[assignment]
-    _torchcodec_import_exc: BaseException | None = exc
+    # Drop the traceback: its frames would keep the importer's locals alive,
+    # e.g., an LLM, which can block engine core shutdown at exit.
+    _torchcodec_import_exc: BaseException | None = exc.with_traceback(None)
 else:
     _torchcodec_import_exc = None
 
