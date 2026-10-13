@@ -1151,7 +1151,8 @@ def unified_attention(
 
     # Launch the 2D kernel if
     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
-    # 2. Those buffers cannot hold one row per query token in this batch, or
+    # 2. Those buffers cannot hold one row per query token, or one padded head
+    #    per row, in this batch, or
     # 3. The number of sequences exceeds the configured threshold, or
     # 4. Batch invariance is enabled
     #
@@ -1170,6 +1171,7 @@ def unified_attention(
         or softmax_segm_output.shape[0] < q.shape[0]
         or softmax_segm_max.shape[0] < q.shape[0]
         or softmax_segm_expsum.shape[0] < q.shape[0]
+        or softmax_segm_output.shape[-1] < head_size_padded
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )

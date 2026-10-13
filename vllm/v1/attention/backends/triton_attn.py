@@ -145,7 +145,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             vllm_config, layer_names
         ) or model_config.get_num_attention_heads(vllm_config.parallel_config)
         self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
-        self.headdim = model_config.get_head_size()
+        # Not model_config as a drafter can have its own head size
+        self.headdim = kv_cache_spec.head_size
         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
 
         # gfx1151: a single KV head or a small head leaves the default
