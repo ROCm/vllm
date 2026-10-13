@@ -18,7 +18,12 @@ logger = init_logger(__name__)
 
 class AiterCustomAllreduce:
     # Default IPC buffer size for AITER's CustomAllreduce.
-    MAX_SIZE: int = 8192 * 1024 * 8 * 2
+    # 512 MiB. This is the registered pool, and aiter clamps
+    # AITER_CUSTOM_AR_MAX_SIZE to it (_resolve_car_max_size), so the pool has to
+    # be at least as large as the biggest input we want off RCCL. A TP4 prefill
+    # chunk of 16128 tokens is 16128 * 7168 * 2 = 220.5 MiB, which the previous
+    # 128 MiB pool could not hold -- those all-reduces fell back to NCCL.
+    MAX_SIZE: int = 8192 * 1024 * 8 * 8
 
     @classmethod
     def effective_max_size(cls) -> int:
