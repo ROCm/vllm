@@ -16,9 +16,9 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.deepseek_v4.amd.ops.cache_utils import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
-from vllm.models.deepseek_v4.amd.ops.cache_utils import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
@@ -35,11 +35,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
-    DeepseekV4SWACache,
     DeepseekSparseSWAMetadataBuilder,
+    DeepseekV4SWACache,
 )
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
@@ -47,6 +46,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
 )
+from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -109,6 +109,79 @@ def apply_pre_quantized_block_scaled_mm(
         A=x_fp8, B=params.weight, As=x_scale, Bs=weight_scale
     )
     return out.to(dtype=kernel.config.out_dtype)
+
+
+# Paged-direct fp8 prefill: attend straight out of the paged caches instead of
+# dequantizing both pools into a bf16 staging slab first.
+#
+#   off     today's path -- two dequantize_and_gather_k_cache calls into a
+#           [PREFILL_CHUNK_SIZE, M, 576] bf16 workspace, then attention over
+#           indices into that slab.
+#   on      rebase both pools' indices onto the shared 640-byte record grid,
+#           merge them into one stream, and run the packed-fp8 kernel over the
+#           caches directly. Deletes both gathers and the workspace. A second
+#           index stream costs ~1.8x in the kernel (1162 -> 648 us at T=16384
+#           H=32), which is why this merges rather than passing two pools.
+#   verify  run BOTH and log the max elementwise difference per layer.
+#
+# verify exists because the index remapping below cannot be unit-tested
+# without live metadata: the equivalence of merge-then-attend is covered by
+# tests/v1/attention/test_dsv4_unified_kv_prefill.py, but whether THESE
+# indices address the rows the staging path gathered depends on runtime
+# metadata semantics. A mis-mapping degrades accuracy silently instead of
+# crashing, so the first server run should be a verify run.
+_DSV4_PAGED_PREFILL_STATE: dict[str, object] = {}
+
+
+def _dsv4_paged_prefill_mode() -> str:
+    mode = os.environ.get("VLLM_DSV4_FP8_PAGED_PREFILL", "off").strip().lower()
+    if mode not in ("off", "on", "verify"):
+        raise ValueError(
+            "VLLM_DSV4_FP8_PAGED_PREFILL must be off, on or verify; got "
+            f"{mode!r}"
+        )
+    return mode
+
+
+def _dsv4_paged_prefill_step_cache(swa_metadata) -> dict:
+    """Scratch shared by every layer that sees this metadata object.
+
+    Most of the index work below depends on the step, not the layer: the token
+    geometry, the SWA stream, and the CSA lengths are all identical across the
+    layers of one class. Recomputing them per layer is what made prefill
+    host-bound (trace_13_c64: CPU 1.133s against 727ms of CUDA).
+
+    The table lives ON the metadata object, which is rebuilt every step, so an
+    entry cannot outlive the step it describes and nothing pins last step's
+    tensors. It is deliberately not a single module-level slot keyed by the
+    current metadata: DSv4 alternates HCA and CSA layers, those are separate
+    KV-cache groups with separate metadata objects, and a one-slot cache
+    thrashes between them and never hits. That is exactly what happened --
+    trace_15 came out byte-identical to the unhoisted trace_14.
+    """
+    table = getattr(swa_metadata, "_dsv4_paged_cache", None)
+    if table is None:
+        table = {}
+        try:
+            object.__setattr__(swa_metadata, "_dsv4_paged_cache", table)
+        except (AttributeError, TypeError):
+            # Frozen or __slots__ metadata: fall back to no caching. Slower,
+            # never wrong.
+            return {}
+    return table
+
+
+def _dsv4_paged_prefill_decline(reason: str) -> None:
+    """Log the first decline per reason, then stay quiet."""
+    seen = _DSV4_PAGED_PREFILL_STATE.setdefault("declined", set())
+    if reason in seen:
+        return
+    seen.add(reason)
+    logger.warning(
+        "DSV4 paged-direct prefill unavailable (%s); using the dequant-gather "
+        "staging path for this and every later step with the same cause.",
+        reason,
+    )
 
 
 # ROCm sparse prefill keeps this dense combine local so AMD-specific SWA changes
@@ -1332,6 +1405,28 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     ) -> None:
         swa_only = attn_metadata is None
 
+        paged_mode = _dsv4_paged_prefill_mode()
+        paged_out = None
+        if paged_mode != "off" and not swa_only:
+            # In "on" the kernel writes straight into `output`. That buffer is
+            # [tokens, heads, 512] bf16 -- ~536 MB at a full 16384-token chunk --
+            # so an extra allocation plus a copy back would cost more than the
+            # ~514 us the single-stream path saves. The verify runs confirmed the
+            # kernel writes every element, so there is nothing to pre-fill. Only
+            # verify needs a separate destination to compare against.
+            dest = output if paged_mode == "on" else torch.empty_like(output)
+            paged_out = self._try_paged_direct_prefill(
+                out_buf=dest,
+                q=q,
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                output=output,
+                attn_metadata=attn_metadata,
+                swa_metadata=swa_metadata,
+            )
+            if paged_out is not None and paged_mode == "on":
+                return  # written in place
+
         num_prefills = swa_metadata.num_prefills
         num_prefill_tokens = swa_metadata.num_prefill_tokens
         num_decodes = swa_metadata.num_decodes
@@ -1438,3 +1533,228 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
             )
+
+        if paged_out is not None:
+            # verify mode: `output` now holds the staging-path answer.
+            diff = (paged_out.float() - output.float()).abs()
+            denom = output.float().abs().amax().clamp_min(1e-6)
+            logger.info(
+                "DSV4 paged-direct prefill verify: cr=%d tokens=%d "
+                "max|diff|=%.3e rel=%.3e mean|diff|=%.3e",
+                self.compress_ratio,
+                output.shape[0],
+                diff.amax().item(),
+                (diff.amax() / denom).item(),
+                diff.mean().item(),
+            )
+
+    def _try_paged_direct_prefill(
+        self,
+        *,
+        out_buf: torch.Tensor,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: "DeepseekV4ROCMAiterMLASparseMetadata | None",
+        swa_metadata: "DeepseekV4ROCMAiterSparseSWAMetadata",
+    ) -> torch.Tensor | None:
+        """Attend over the paged caches directly. Returns output, or None.
+
+        Returning None is always safe: the caller falls back to the staging
+        path. Every precondition that cannot be met declines rather than
+        asserting, because this runs on every prefill step of every layer.
+        """
+        from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+
+        from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
+            triton_convert_req_index_to_global_index,
+        )
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            _DSV4_UNIFIED_KV_BUFFER_STATE,
+            _dsv4_aiter_sparse_decode_fns,
+            _dsv4_merge_to_unified_kv_buffer,
+            build_ragged_indices_from_dense,
+        )
+
+        if compressed_k_cache is None:
+            return _dsv4_paged_prefill_decline("no compressed cache (swa-only)")
+        fns = _dsv4_aiter_sparse_decode_fns()
+        if fns is None:
+            return _dsv4_paged_prefill_decline("aiter packed-fp8 path missing")
+        _, pack_q = fns
+
+        swa_idx_dense = swa_metadata.prefill_swa_indices
+        swa_lens = swa_metadata.prefill_swa_lens
+        if swa_idx_dense is None or swa_lens is None:
+            return _dsv4_paged_prefill_decline("no paged prefill SWA indices")
+
+        num_decodes = swa_metadata.num_decodes
+        num_prefills = swa_metadata.num_prefills
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        seq_lens = swa_metadata.prefill_seq_lens
+        query_start_loc = swa_metadata.query_start_loc
+        if seq_lens is None or query_start_loc is None or num_prefill_tokens == 0:
+            return _dsv4_paged_prefill_decline("incomplete prefill metadata")
+
+        if self.compress_ratio == 4:
+            if self.topk_indices_buffer is None:
+                return _dsv4_paged_prefill_decline("no topk buffer for cr=4")
+            topk_indices = self.topk_indices_buffer[
+                swa_metadata.num_decode_tokens :
+            ][:num_prefill_tokens]
+        else:
+            topk_indices = attn_metadata.c128a_prefill_topk_indices
+        if topk_indices is None:
+            return _dsv4_paged_prefill_decline("no prefill topk indices")
+        topk_indices = topk_indices.reshape(num_prefill_tokens, -1)
+        top_k = topk_indices.shape[-1]
+
+        dev = q.device
+        cache = _dsv4_paged_prefill_step_cache(swa_metadata)
+        cr = self.compress_ratio
+
+        # (1) Token geometry -- identical for every layer in the step.
+        # Which request each prefill token belongs to, and its absolute
+        # position in that sequence: what the combine kernel derives from
+        # query_start_loc/seq_lens, in the same form.
+        geom = cache.get("geom")
+        if geom is None:
+            qsl = query_start_loc[num_decodes : num_decodes + num_prefills + 1]
+            tok_start = (qsl[:-1] - qsl[0]).to(torch.int32)
+            tok_end = (qsl[1:] - qsl[0]).to(torch.int32)
+            query_lens = tok_end - tok_start
+            pos_in_batch = torch.arange(
+                num_prefill_tokens, device=dev, dtype=torch.int32
+            )
+            # searchsorted, NOT repeat_interleave. Two reasons, both learned
+            # the hard way:
+            #
+            #  - repeat_interleave without output_size does .sum().item() on
+            #    the repeats to size its result. That is a device-to-host sync
+            #    that drains the queued pipeline, and it was the single largest
+            #    prefill bubble in trace_14: ~35 ms per step over 60 gaps.
+            #  - repeat_interleave WITH output_size makes correctness depend
+            #    on a size we assert rather than derive: ATen's Repeat.h takes
+            #    the value on trust for the allocation, and the mismatch is
+            #    caught only by a check inside the compute kernel. So a wrong
+            #    size is a hard failure at an awkward place, not a wrong
+            #    number -- and it ties us to padding behaviour in metadata we
+            #    do not own.
+            #
+            # searchsorted has neither property: no sync, and the result
+            # length is fixed by pos_in_batch, which we allocate, so a padded
+            # batch simply clamps instead of tripping an assert.
+            req_of_token = torch.searchsorted(
+                tok_end, pos_in_batch, right=True
+            ).to(torch.int32)
+            # A token past the last boundary can only come from padding; clamp
+            # rather than index out of range.
+            req_of_token.clamp_(max=num_prefills - 1)
+            rt = req_of_token.long()
+            start_pos = seq_lens[:num_prefills].to(torch.int32) - query_lens
+            token_pos = start_pos[rt] + pos_in_batch - tok_start[rt]
+            geom = (req_of_token, token_pos)
+            cache["geom"] = geom
+        req_of_token, token_pos = geom
+
+        # (2) CSA valid prefix -- depends only on compress_ratio and top_k, so
+        # it is shared by every layer of one layer class. The expression
+        # min((pos + 1) // cr, top_k) is kept identical to
+        # _combine_topk_swa_indices_kernel so both paths agree on which
+        # entries are real.
+        lens_key = ("csa_indptr", cr, top_k)
+        csa_indptr = cache.get(lens_key)
+        if csa_indptr is None:
+            csa_lens = torch.clamp(
+                token_pos.add(1).div(cr, rounding_mode="floor"), max=top_k
+            ).to(torch.int32)
+            csa_indptr = torch.zeros(
+                num_prefill_tokens + 1, dtype=torch.int32, device=dev
+            )
+            torch.cumsum(csa_lens, dim=0, out=csa_indptr[1:])
+            cache[lens_key] = csa_indptr
+
+        # (3) CSA sequence-local compressed rows -> paged rows.
+        #
+        # Cacheable for cr=128 only. Those layers read
+        # attn_metadata.c128a_prefill_topk_indices, computed once per step and
+        # shared. The cr=4 layers instead each write their own top-k into the
+        # model's ONE shared topk_indices_buffer ("Reserved topk indices
+        # buffer for all Indexer layers to reuse"), so its contents differ
+        # between layers and the conversion genuinely has to run per layer.
+        csa_key = ("csa_idx", cr)
+        csa_idx = cache.get(csa_key) if cr != 4 else None
+        if csa_idx is None:
+            # Dense-width allocation, ragged content: the merge recovers its
+            # grid bound as numel // num_tokens instead of syncing on a max.
+            #
+            # cr=4 reconverts every layer, so this buffer is reused across
+            # them rather than reallocated: at a full chunk it is
+            # 16384 x 1024 x 4 B = 67 MB, and zeroing that 30 times a step
+            # costs more than the conversion it feeds. Reuse is safe because
+            # the kernel rewrites the whole valid prefix and the merge never
+            # reads past csa_indptr, so a stale tail is unreachable.
+            buf_key = ("csa_buf", cr, top_k)
+            csa_idx = cache.get(buf_key)
+            if csa_idx is None or csa_idx.numel() < num_prefill_tokens * top_k:
+                csa_idx = torch.zeros(
+                    num_prefill_tokens * top_k, dtype=torch.int32, device=dev
+                )
+                cache[buf_key] = csa_idx
+            csa_idx = csa_idx[: num_prefill_tokens * top_k]
+            triton_convert_req_index_to_global_index(
+                req_id=req_of_token,
+                block_table=attn_metadata.block_table[num_decodes:].to(torch.int32),
+                token_indices=topk_indices.to(torch.int32),
+                cu_seqlens=csa_indptr,
+                paged_kv_indices=csa_idx,
+                BLOCK_SIZE=attn_metadata.block_size // cr,
+                NUM_TOPK_TOKENS=top_k,
+                BLOCK_N=128 if top_k % 128 == 0 else top_k,
+            )
+            if cr != 4:
+                cache[csa_key] = csa_idx
+
+        # (4) SWA indices are already paged (built from the SWA block table)
+        # and do not depend on the layer at all.
+        swa = cache.get("swa")
+        if swa is None:
+            swa = build_ragged_indices_from_dense(
+                swa_idx_dense.reshape(num_prefill_tokens, -1),
+                swa_lens,
+                num_rows=swa_k_cache.shape[0] * swa_k_cache.shape[1],
+            )
+            cache["swa"] = swa
+        swa_idx, swa_indptr = swa
+
+        merged = _dsv4_merge_to_unified_kv_buffer(
+            compressed_k_cache, csa_idx, csa_indptr, swa_k_cache, swa_idx, swa_indptr
+        )
+        if merged is None:
+            return _dsv4_paged_prefill_decline(
+                str(_DSV4_UNIFIED_KV_BUFFER_STATE.get("why"))
+            )
+        kv, kv_rope, u_idx, u_indptr = merged
+
+        q_packed, q_rope = pack_q(q)
+        out = out_buf
+        pa_prefill_sparse(
+            q_packed,
+            kv,
+            u_idx,
+            u_indptr,
+            None,
+            None,
+            None,
+            None if self.attn_sink is None else self.attn_sink[: q.shape[1]],
+            self.scale,
+            q_rope=q_rope,
+            unified_kv_rope=kv_rope,
+            # Both streams are ragged via indptr, so there are no -1 sentinels
+            # in the valid range. This is what buys the single-stream speedup;
+            # setting it True would reinstate the per-tile column mask.
+            has_invalid=False,
+            out=out,
+        )
+        return out
