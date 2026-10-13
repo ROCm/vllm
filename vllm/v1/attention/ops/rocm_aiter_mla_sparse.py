@@ -63,6 +63,19 @@ _GFX950_C4A_NATIVE_MAX_ROWS = 256
 # Conservative perf gate, not a correctness bound: OPUS is correct for any query
 # count, but Triton stays faster below this measured crossover.
 _GFX950_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES = 1024
+# gfx1250 has no such crossover. Measured against the Triton ragged kernel at
+# the real prefill geometry -- ragged per-token widths of
+# min(index_topk, pos // compress_ratio) + min(sliding_window, pos + 1), which
+# is ~134 slots on DSv4-Pro's 31 compress_ratio=128 layers and ~352 on its 30
+# compress_ratio=4 layers -- OPUS wins at every query count from 1 to 2048:
+#
+#     T      1     16    128    256   1024   2048
+#     cr128  3.0x  3.1x  3.1x   5.4x  6.2x   7.0x
+#     cr4    5.5x  5.5x  5.2x   9.1x  9.8x  13.2x
+#
+# so the floor is 1, not 1024. Aggregate over the layer mix is ~8.3x, which is
+# ~45 ms of the 392 ms prefill in trace_7.
+_GFX1250_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES = 1
 
 
 def _get_aiter_top_k_kernel(
@@ -2715,10 +2728,20 @@ def _can_use_aiter_sparse_prefill_opus(
     attn_sink: torch.Tensor | None,
     output: torch.Tensor,
     on_gfx950: bool = _ON_GFX950,
+    on_gfx1250: bool = _ON_GFX1250,
 ) -> bool:
+    # aiter ships an OPUS code object for both arches
+    # (hsa/gfx1250/mla_v4_opus/opus_mla_v4_prefill_a16w16_32mx1_16nx4.co), and
+    # the query-count floor differs between them -- see the measurements above
+    # _GFX1250_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES.
+    if on_gfx1250:
+        min_queries = _GFX1250_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES
+    elif on_gfx950:
+        min_queries = _GFX950_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES
+    else:
+        return False
     return (
-        on_gfx950
-        and q.shape[0] >= _GFX950_AITER_SPARSE_PREFILL_OPUS_MIN_QUERIES
+        q.shape[0] >= min_queries
         and q.is_cuda
         and output.shape == q.shape
         and kv.shape[-1] == q.shape[-1]
