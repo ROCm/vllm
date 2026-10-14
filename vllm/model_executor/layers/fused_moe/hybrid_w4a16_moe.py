@@ -284,7 +284,30 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     # Alignment for the group_size <= SMALL_GROUP_SIZE_THRESHOLD branch
     # of _triton_config.  Must be lcm of the BLOCK_SIZE_M values that
     # branch emits (128 for gemm1, 64 for gemm2).
-    TRITON_BLOCK_SIZE_M_SMALL_GS = 128
+    #
+    # moe_align_block_size pads every touched expert up to a full block,
+    # and the kernel's only early exit is
+    # `pid_m*BLOCK_SIZE_M >= num_tokens_post_padded` -- an all-padding
+    # block still runs the whole contraction.  A short prefill on a
+    # large-E model touches nearly every expert with a few tokens each,
+    # so the padded row count tracks E*alignment, not the batch: at
+    # E=128, top_k=8 a 128-token prefill routes 1024 rows and pads to
+    # 14976 at alignment 128, 14.6x the useful work.
+    #
+    # Swept 32 / 64 / 128 on Strix Halo (gfx1151) over 6..2048 tokens x
+    # 3 routing distributions, gemm1+gemm2.  Chose 64: it beats 128 by
+    # 1.31-1.85x and 32 by 1.2-1.7x.  32 loses because the block count
+    # is pinned to the touched-expert count either way, so the per-block
+    # INT4 weight load + dequant does not shrink with the alignment and
+    # the narrower M-tile cannot amortize it.
+    TRITON_BLOCK_SIZE_M_SMALL_GS = 64
+
+    # Alignment once routed rows per expert reach a full block: every
+    # expert fills its block anyway, so the padding term is gone and the
+    # wider M-tile wins instead.  The measured crossover is at exactly
+    # that point (2048 tokens at E=128, top_k=8), where the two tiers are
+    # within 1-4% of each other in both directions.
+    TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE = 128
 
     # group_size <= THRESHOLD uses the small-gs _triton_config branch;
     # > THRESHOLD uses the default.  Boundary between 32 and 128.
@@ -295,12 +318,18 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
 
         Decode (num_tokens <= MAX_SKINNY_BATCH_SIZE): small block sizes
         compatible with the wvSplitK_int4 HIP kernel.
-        Prefill: TRITON_BLOCK_SIZE_M (or TRITON_BLOCK_SIZE_M_SMALL_GS for small
-        group_size). The rdna_moe_gemm WMMA gemm1 and the Triton gemm2 share this one
-        alignment.
+        Prefill: TRITON_BLOCK_SIZE_M, or for small group_size the
+        padding-aware pair TRITON_BLOCK_SIZE_M_SMALL_GS{,_LARGE} chosen on
+        routed tokens per expert (see those constants). The rdna_moe_gemm WMMA
+        gemm1 and the Triton gemm2 share this one alignment.
         """
         if num_tokens > HybridW4A16MoEExperts.MAX_SKINNY_BATCH_SIZE:
             if self._group_size <= HybridW4A16MoEExperts.SMALL_GROUP_SIZE_THRESHOLD:
+                large = HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE
+                # Average routed rows per expert -- what the padding cost
+                # scales with.
+                if num_tokens * topk / E >= large:
+                    return large
                 return HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M_SMALL_GS
             return HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M
         if num_tokens > 1:
@@ -384,33 +413,71 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         sized for the alignment block_size_m used by moe_align_block_size.
         apply() handles the BLOCK_M < align_block_size_m case by
         repeat-interleaving expert_ids; for that to be valid we require
-        BLOCK_SIZE_M divides align_block_size_m.  Today we only emit
-        BLOCK_SIZE_M = align_block_size_m so this is a no-op, but the
-        infrastructure stays in place to enable future per-gemm BLOCK_M
-        tuning when paired with per-gemm alignment.
+        BLOCK_SIZE_M divides align_block_size_m.  The small-group-size
+        branch below relies on that (it emits BLOCK_SIZE_M=64 for gemm2 at
+        either alignment) and reads align_block_size_m to pick its gemm1
+        tile, since the two alignment tiers are bound by different things.
         """
         BLOCK_SIZE_K = self._group_size  # = 128 for the Qwen3.5-A3B path
         assert BLOCK_SIZE_K % 8 == 0
 
         if self._group_size <= HybridW4A16MoEExperts.SMALL_GROUP_SIZE_THRESHOLD:
-            # gemm2 BM=64 < alignment=128; apply()'s _expert_ids_for
-            # repeat_interleaves expert_ids to compensate.
+            # Swept on Strix Halo (gfx1151), Qwen3-30B-A3B AWQ shapes
+            # (group_size=32, E=128): tile configs x 9-10 token counts
+            # (M_routed 48..24448) x routing distributions, at both alignments
+            # _select_block_size_m emits.  Picks below are the best geomean of
+            # (us / per-M best), so they hold across the batch range and not
+            # just at one M.  num_stages=4 is the common win; the "pipeliner
+            # regresses" note in the large-group branch below was measured at
+            # its much narrower BLOCK_SIZE_N=16/64, num_warps=2 tiles.
+            #
+            # gemm1 needs a different tile per alignment tier, and not just a
+            # rescaled one: at the low alignment the padding is gone and the
+            # kernel is bound by the per-block INT4 weight load + dequant
+            # rather than by the accumulate.
+            align = align_block_size_m or self.TRITON_BLOCK_SIZE_M_SMALL_GS
+            small_align = align <= self.TRITON_BLOCK_SIZE_M_SMALL_GS
             if K < 1024:
+                # gemm2 (K=768), same tile at both alignments.  Chose
+                # BLOCK_SIZE_N=128, num_warps=8, num_stages=4: geomean 1.043 vs
+                # 1.109 for the previous BLOCK_SIZE_N=64, num_warps=4,
+                # num_stages=1, and still the pick at alignment 64 (1.000).
+                # BLOCK_SIZE_M stays 64 in both tiers; at alignment 128 that
+                # makes it smaller than the alignment, which apply()'s
+                # _expert_ids_for handles by repeat_interleaving expert_ids.
                 return dict(
                     BLOCK_SIZE_M=64,
-                    BLOCK_SIZE_N=64,
+                    BLOCK_SIZE_N=128,
                     BLOCK_SIZE_K=BLOCK_SIZE_K,
                     GROUP_SIZE_M=1,
-                    num_warps=4,
-                    num_stages=1,
+                    num_warps=8,
+                    num_stages=4,
                 )
+            if small_align:
+                # gemm1 (K=2048) at alignment 64.  Chose BLOCK_SIZE_N=32,
+                # num_warps=2: best at all 27 (tokens x routing) points swept,
+                # by 1.10x (2048 tokens) to 2.13x (6 tokens) over the
+                # runner-up.  Keeping the alignment-128 tile here would give
+                # back most of what the smaller alignment buys.
+                return dict(
+                    BLOCK_SIZE_M=64,
+                    BLOCK_SIZE_N=32,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    GROUP_SIZE_M=1,
+                    num_warps=2,
+                    num_stages=4,
+                )
+            # gemm1 (K=2048) at alignment 128, reached only once every expert
+            # fills a padding block.  Only num_stages moves: 4 scores 1.040 vs
+            # 1.284 for 1.  BLOCK_SIZE_N=128 is up to 1.77x off the best at
+            # small batches and num_warps=4 ties 8, so both stay put.
             return dict(
                 BLOCK_SIZE_M=128,
                 BLOCK_SIZE_N=64,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 GROUP_SIZE_M=1,
                 num_warps=8,
-                num_stages=1,
+                num_stages=4,
             )
 
         # Per-shape sweep on Strix Halo (gfx1151) at BLOCK_M=32 (the
