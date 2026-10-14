@@ -383,8 +383,14 @@ def rocm_aiter_fused_experts(
         # Hence, we pass in GateMode.INTERLEAVE to match the weight shuffling.
         from aiter.ops.flydsl.moe_common import GateMode
 
+        from vllm.platforms.rocm import on_gfx1250
+
         gate_mode = ""
-        if activation == MoEActivation.SITU:
+        if on_gfx1250() and quant_config.use_mxfp4_w4a16:
+            # AITER's gfx1250 fused_moe rejects anything but GUGU, and
+            # `oracle/mxfp4.py` shuffles gfx1250 mxfp4 w13 that way.
+            gate_mode = GateMode.INTERLEAVE.value
+        elif activation == MoEActivation.SITU:
             # SiTUv2 flydsl (VLLM_ROCM_USE_AITER_MOE_SITUV2=1) uses a4w4
             # fp4 activations with separated gate/up weights (AITER #4463);
             # default a16w4 SiTU also stays separated.

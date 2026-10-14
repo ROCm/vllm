@@ -1722,15 +1722,13 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         import os
 
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
+        os.environ.setdefault("AITER_FORCE_A8W4", "1")
 
         from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
         fp4_dtype = torch.float4_e2m1fn_x2
         e8m0_dtype = torch.float8_e8m0fnu
         guinterleave = True
-        if activation == MoEActivation.SITU:
-            from vllm._aiter_ops import rocm_aiter_ops
-            guinterleave = rocm_aiter_ops.is_fused_moe_situv2_a8w4_enabled()
 
         w13_raw = w13_weight.data.view(fp4_dtype)
         w2_raw = w2_weight.data.view(fp4_dtype)
