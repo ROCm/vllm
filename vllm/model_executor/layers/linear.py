@@ -205,9 +205,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if current_platform.is_cpu():
-            # MLA's kv_b_proj (see `_cpu_skip_gemm_dispatch`): not
-            # perf-critical, so skip packing and use a plain fallback.
-            if getattr(layer, "_cpu_skip_gemm_dispatch", False):
+            # MLA's kv_b_proj (see `skip_weight_relayout`): not perf-critical,
+            # so skip packing and use a plain fallback.
+            if getattr(layer, "skip_weight_relayout", False):
                 layer.cpu_linear = torch.nn.functional.linear
                 return
 
@@ -390,7 +390,8 @@ class ReplicatedLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
+                torch.empty(self.output_size, dtype=self.params_dtype),
+                requires_grad=False,
             )
             set_weight_attrs(
                 self.bias,
@@ -535,7 +536,8 @@ class ColumnParallelLinear(LinearBase):
 
         if bias:
             self.bias = Parameter(
-                torch.empty(self.output_size_per_partition, dtype=params_dtype)
+                torch.empty(self.output_size_per_partition, dtype=params_dtype),
+                requires_grad=False,
             )
             set_weight_attrs(
                 self.bias,
@@ -1718,7 +1720,10 @@ class RowParallelLinear(LinearBase):
             )
 
         if bias:
-            self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
+            self.bias = Parameter(
+                torch.empty(self.output_size, dtype=params_dtype),
+                requires_grad=False,
+            )
             set_weight_attrs(
                 self.bias,
                 {
