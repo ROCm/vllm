@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-sequence attention for gfx1151 (max_num_seqs=1, opt-in).
+"""Single-sequence attention for gfx1151 (max_num_seqs=1).
 
 Calls of up to MAX_M query tokens run csrc/rocm/rdna_singleseq_decode_attn.cu, longer
 ones csrc/rocm/rdna_singleseq_prefill_attn.cu, on TRITON_ATTN's KV cache. Anything the

@@ -1,7 +1,7 @@
 # RDNA3.5 attention: adding, tuning and checking a configuration
 
-`ROCM_RDNA_SINGLESEQ_ATTN` (gfx1151, `--max-num-seqs 1`, opt-in with
-`--attention-backend`) runs calls of up to 8 query tokens on
+`ROCM_RDNA_SINGLESEQ_ATTN` (gfx1151, `--max-num-seqs 1`, selected by default
+there) runs calls of up to 8 query tokens on
 `csrc/rocm/rdna_singleseq_decode_attn.cu` and longer ones on
 `csrc/rocm/rdna_singleseq_prefill_attn.cu`. Each row of
 `vllm/v1/attention/ops/rocm_rdna_singleseq_{decode,prefill}_variants.csv` is one build;

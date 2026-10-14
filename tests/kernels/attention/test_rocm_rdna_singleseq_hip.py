@@ -323,14 +323,17 @@ def test_non_decode_batches_fall_back_to_triton(nseq, tokens, max_q, reason):
 
 
 @pytest.mark.parametrize("gfx1151", [True, False])
-def test_singleseq_is_opt_in(gfx1151, monkeypatch):
-    """The backend is never selected automatically."""
+def test_singleseq_is_first_on_gfx1151(gfx1151, monkeypatch):
+    """gfx1151 tries the backend first; other GPUs never list it."""
     import vllm.platforms.rocm as rocm
     from vllm.v1.attention.backends.registry import AttentionBackendEnum as B
 
     monkeypatch.setattr(rocm, "on_gfx1151", lambda: gfx1151)
     order = rocm._get_backend_priorities(use_mla=False, use_sparse=False)
-    assert B.ROCM_RDNA_SINGLESEQ_ATTN not in order
+    if gfx1151:
+        assert order[0] == B.ROCM_RDNA_SINGLESEQ_ATTN
+    else:
+        assert B.ROCM_RDNA_SINGLESEQ_ATTN not in order
 
 
 @pytest.mark.parametrize("max_num_seqs", [1, 2])
