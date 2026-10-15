@@ -144,8 +144,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         num_groups_w2: int | None = None,
         num_groups_w13: int | None = None,
     ) -> tuple[int, int, int]:
-        """
-        Get the shape of the weight based on the weight name, number of experts
+        """Get the shape of the weight based on the weight name, number of experts
         hidden size, intermediate size per partition, number of groups for w2,
         and number of groups for w13. Pass in num_groups_w2 and num_groups_w13
         for weight scales/zero_points.
@@ -529,7 +528,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             [E, N, K//8] -- the stride jumps over the pad, the kernels iterate
             only the real K//8 (zero extra FLOPs). Stride-aware on both paths:
             the Triton kernel reads B.stride(0/1/2); the HIP skinny kernel takes
-            an explicit B_row_stride_bytes."""
+            an explicit B_row_stride_bytes.
+            """
             E_dim, N_dim, k8 = w.shape
             if not (on_gfx1151() and w.device.type == "cuda"):
                 return w
@@ -545,7 +545,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         def convert_weights(w_packed: torch.Tensor) -> torch.Tensor:
             """Convert [E, K/8, N] GPTQ -> [E, N, K//8] skinny
-            (ExLlama shuffle)."""
+            (ExLlama shuffle).
+            """
             E_dim = w_packed.size(0)
             experts = []
             for e in range(E_dim):

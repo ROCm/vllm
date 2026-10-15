@@ -69,7 +69,8 @@ def _moe_gemm_triton_scope(
 
     valid_blocks is only known at runtime, so reading it forces a device->host
     sync. We take it solely when profiling scopes are enabled -- production (where
-    the context is a nullcontext) pays nothing."""
+    the context is a nullcontext) pays nothing.
+    """
     if not (
         envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
     ):
@@ -318,7 +319,8 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     ) -> bool:
         """Whether the rdna_moe_gemm WMMA kernel can run gemm1 for this shape+dtype
         (gemm1 K-by-N top_k; gemm2 down proj also checked since both must be
-        supported). Gates the gemm1 rdna_moe_gemm-vs-Triton dispatch in apply()."""
+        supported). Gates the gemm1 rdna_moe_gemm-vs-Triton dispatch in apply().
+        """
         from vllm.model_executor.layers.fused_moe import moe_hip_w4a16
 
         act_dim = self.adjust_N_for_activation(N, activation)

@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Abstract base class for vision NPU backends.
-"""
+"""Abstract base class for vision NPU backends."""
 
 from abc import ABC, abstractmethod
 
@@ -25,6 +23,7 @@ class NPUVisionBackend(ABC):
         Args:
             model_cache_path: Path to compiled .rai cache file
             device_name: NPU device identifier (e.g., "stx" for Strix)
+
         """
         pass
 
@@ -38,6 +37,7 @@ class NPUVisionBackend(ABC):
 
         Returns:
             embeddings: Vision embeddings [merged_seq_len, hidden_dim] float32
+
         """
         pass
 
@@ -48,5 +48,6 @@ class NPUVisionBackend(ABC):
 
         Returns:
             Hidden dimension of output embeddings (e.g., 3584 for Qwen2.5-VL)
+
         """
         pass

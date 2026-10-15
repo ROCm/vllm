@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Tests for the W8A8 INT8 skinny GEMM kernel (wvSplitK_w8a8).
+"""Tests for the W8A8 INT8 skinny GEMM kernel (wvSplitK_w8a8).
 
 This kernel handles int8 weights with fused activation quantization:
 - Activations passed as bf16/fp16, quantized to int8 inside the kernel
@@ -72,6 +71,7 @@ def ref_w8a8_gemm(
 
     Returns:
         [N, M] output in out_dtype
+
     """
     # Dequantize to float32 for reference accuracy
     w_f32 = w_int8.float() * w_scale.float().unsqueeze(1)  # [M, K]
@@ -97,6 +97,7 @@ def quantize_symmetric(
     Returns:
         quantized: [rows, cols] int8
         scale: [rows] float32 per-channel scale
+
     """
     amax = tensor.abs().amax(dim=1)
     scale = amax / 127.0
@@ -116,6 +117,7 @@ def quantize_per_tensor(
     Returns:
         quantized: int8 tensor
         scale: scalar float32 scale
+
     """
     amax = tensor.abs().max()
     scale = amax / 127.0
@@ -360,6 +362,7 @@ def ref_dynamic_w8a8_gemm(
 
     Returns:
         [N, M] output in out_dtype
+
     """
     a_f32 = a_fp.float()
 

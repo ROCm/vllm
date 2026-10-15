@@ -136,6 +136,7 @@ def _run_hybrid_moe(
         force_hip: Force the HIP wvSplitK path for all batch sizes.
 
     Returns (hybrid_output, reference_output).
+
     """
     set_random_seed(1)
     device = torch.device("cuda")

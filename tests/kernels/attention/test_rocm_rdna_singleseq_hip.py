@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """RDNA3.5 decode and prefill attention: accuracy against a reference, and
-fallback to Triton for unsupported calls."""
+fallback to Triton for unsupported calls.
+"""
 
 import csv
 import itertools
@@ -108,7 +109,8 @@ def _unit(v):
 
 def test_variants_csv_is_well_formed():
     """The decode CSV is well formed, matches _rocm_C and covers every M in
-    both dtypes."""
+    both dtypes.
+    """
     with hip.VARIANTS_CSV.open(newline="") as fh:
         rows = list(csv.reader(fh))
     header, body = rows[0], rows[1:]
@@ -459,7 +461,8 @@ def _prefill_rows():
 
 def test_prefill_variants_csv_is_well_formed():
     """The prefill CSV matches _rocm_C, covers every decode configuration and
-    picks the row of the largest step reached."""
+    picks the row of the largest step reached.
+    """
     with hip.PREFILL_VARIANTS_CSV.open(newline="") as fh:
         rows = list(csv.reader(fh))
     header, body = rows[0], rows[1:]
@@ -501,7 +504,8 @@ def test_every_listed_prefill_variant_is_built_in():
 @pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _prefill_rows()}))
 def test_built_in_prefill_variants_match_reference(unit):
     """Every built prefill variant matches the reference, with and without a
-    prefix."""
+    prefix.
+    """
     _skip_unless_gfx1151()
     for v in _prefill_rows():
         if _prefill_unit(v) != unit:

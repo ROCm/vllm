@@ -549,7 +549,8 @@ class SpeculativeConfig:
     @staticmethod
     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
         """Mean acceptance length to unconditional per-position rates, using
-        the minimum-variance schedule."""
+        the minimum-variance schedule.
+        """
         num_drafts = length - 1  # expected number of accepted draft tokens
         num_full = int(num_drafts)
         return (
@@ -563,7 +564,8 @@ class SpeculativeConfig:
         length: float | None,
     ) -> list[float]:
         """Return per-position unconditional acceptance rates from exactly one
-        of `rates` or `length` (validates range, length, and monotonicity)."""
+        of `rates` or `length` (validates range, length, and monotonicity).
+        """
         if (rates is None) == (length is None):
             raise ValueError(
                 "rejection_sample_method='synthetic' requires exactly one of "
@@ -604,8 +606,7 @@ class SpeculativeConfig:
     top-k base-logit candidates. Requires draft tensor parallel size 1."""
 
     def compute_hash(self) -> str:
-        """
-        WARNING: Whenever a new field is added to this config,
+        """WARNING: Whenever a new field is added to this config,
         ensure that it is included in the factors list if
         it affects the computation graph.
 
@@ -1645,7 +1646,6 @@ class SpeculativeConfig:
         speculative_max_model_len is mainly used for testing that sequences can
         skip speculation.
         """
-
         if speculative_max_model_len is not None:
             if speculative_max_model_len > draft_max_model_len:
                 raise ValueError(
@@ -1689,6 +1689,7 @@ class SpeculativeConfig:
         Args:
             draft_hf_config: The draft model's HF config, mutated in place.
             target_max_model_len: The target model's max_model_len.
+
         """
         draft_max_position_embeddings = getattr(
             draft_hf_config, "max_position_embeddings", None
@@ -1713,8 +1714,7 @@ class SpeculativeConfig:
         speculative_draft_tensor_parallel_size: int | None,
         draft_hf_config: PretrainedConfig,
     ) -> int:
-        """
-        Verifies and adjusts the tensor parallel size for a draft model
+        """Verifies and adjusts the tensor parallel size for a draft model
         specified using speculative_draft_tensor_parallel_size.
         """
         # If speculative_draft_tensor_parallel_size is unset then set it
@@ -1743,8 +1743,7 @@ class SpeculativeConfig:
         return speculative_draft_tensor_parallel_size
 
     def update_arch_(self):
-        """
-        EagleConfig and ExtractHiddenStatesConfig update architectures, so update all
+        """EagleConfig and ExtractHiddenStatesConfig update architectures, so update all
         architectures-related fields in self.draft_model_config
         """
         self.draft_model_config.hf_text_config = get_hf_text_config(
