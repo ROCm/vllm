@@ -37,7 +37,7 @@ _WRAPPER = """#include "rdna_singleseq_decode_attn.cu"
 using namespace rdna_singleseq;
 extern "C" __attribute__((visibility("default"))) void rdna_singleseq_decode_launch(
     const LaunchArgs* a) {{
-  launch_decode<DecodeConfig{{{fields}}}>(*a);
+  launch_decode<DecodeConfig{{{fields}}}, {batched}>(*a);
 }}
 """
 _PREFILL_WRAPPER = """#include "rdna_singleseq_prefill_attn.cu"
@@ -91,6 +91,11 @@ class _LaunchArgs(ctypes.Structure):
         ("stream", ctypes.c_void_p),
         ("mm_ranges", ctypes.c_void_p),
         ("mm_capacity", ctypes.c_int),
+        ("nseq", ctypes.c_int),
+        ("bt_stride", ctypes.c_int),
+        ("acc_stride", ctypes.c_int),
+        ("ml_stride", ctypes.c_int),
+        ("cnt_stride", ctypes.c_int),
     ]
 
 
@@ -112,6 +117,11 @@ class _PrefillArgs(ctypes.Structure):
         ("stream", ctypes.c_void_p),
         ("mm_ranges", ctypes.c_void_p),
         ("num_mm_ranges", ctypes.c_int),
+        ("plan", ctypes.c_void_p),
+        ("query_start", ctypes.c_void_p),
+        ("num_entries", ctypes.c_int),
+        ("bt_stride", ctypes.c_int),
+        ("head_group", ctypes.c_int),
     ]
 
 
@@ -178,12 +188,14 @@ def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
         fields = cpp_fields(R.prefill_config_fields(v), R.PREFILL_CONFIG_FIELDS)
         tag = f"{v.name}_ab{_ablate}"
         kernel, template = "prefill_attn", _PREFILL_WRAPPER
+        batched = "false"
     else:
         fields = cpp_fields(R.config_fields(v), R.DECODE_CONFIG_FIELDS)
         tag = f"{v.name}_l{v.layout}_ab{_ablate}"
         kernel, template = "decode_attn", _WRAPPER
+        batched = "true" if v.batched else "false"
     wrapper = _cache / f"{tag}.hip"
-    _write(wrapper, template.format(fields=fields))
+    _write(wrapper, template.format(fields=fields, batched=batched))
     clang, rpath = _toolchain()
     cmd = [
         *clang,
@@ -244,8 +256,11 @@ class Jit:
             raise RuntimeError("q and out must be contiguous")
         if not q.dtype == kv_cache.dtype == out.dtype == v.dtype:
             raise RuntimeError("dtype does not match the build")
-        if q.size(0) != v.max_query_len:
+        nseq = q.size(0) // v.max_query_len
+        if nseq * v.max_query_len != q.size(0) or (not v.batched and nseq != 1):
             raise RuntimeError(f"q has {q.size(0)} tokens for {v.name}")
+        if mm_ranges is not None and v.batched:
+            raise RuntimeError("a batched decode build takes no multimodal ranges")
         if mm_ranges is not None and not (
             mm_ranges.dtype == torch.int32
             and mm_ranges.is_contiguous()
@@ -272,6 +287,11 @@ class Jit:
             torch.cuda.current_stream(q.device).cuda_stream,
             mm_ranges.data_ptr() if mm_ranges is not None else None,
             mm_ranges.numel() // 2 if mm_ranges is not None else 0,
+            nseq,
+            block_table.stride(0) if block_table.dim() == 2 else 0,
+            acc.stride(0) if v.batched else 0,
+            m.stride(0) if v.batched else 0,
+            cnt.stride(0) if v.batched else 0,
         )
         self._launch(ctypes.byref(args))
 
@@ -298,21 +318,27 @@ class JitPrefill:
         max_seq_len,
         scale,
         mm_ranges=None,
+        plan=None,
+        query_start_loc=None,
+        head_group=0,
     ):
         v = self.variant
         if not (q.is_contiguous() and out.is_contiguous()):
             raise RuntimeError("q and out must be contiguous")
         if not q.dtype == kv_cache.dtype == out.dtype == v.dtype:
             raise RuntimeError("dtype does not match the build")
+        if (plan is None) != (query_start_loc is None):
+            raise RuntimeError("a batch takes both a plan and query_start_loc")
+        dim = 2 if plan is None else 3
         if mm_ranges is not None and not (
             mm_ranges.dtype == torch.int32
             and mm_ranges.is_contiguous()
-            and mm_ranges.dim() == 2
-            and mm_ranges.size(1) == 2
+            and mm_ranges.dim() == dim
+            and mm_ranges.size(-1) == 2
             and mm_ranges.device == q.device
         ):
             raise RuntimeError(
-                "mm_ranges must be one sequence's contiguous int32 (ranges, 2) on "
+                f"mm_ranges must be contiguous int32 of {dim} dims (.., 2) on "
                 f"{q.device}, got {mm_ranges.dtype} {tuple(mm_ranges.shape)} "
                 f"on {mm_ranges.device}"
             )
@@ -330,7 +356,12 @@ class JitPrefill:
             scale,
             torch.cuda.current_stream(q.device).cuda_stream,
             mm_ranges.data_ptr() if mm_ranges is not None else None,
-            mm_ranges.numel() // 2 if mm_ranges is not None else 0,
+            mm_ranges.size(-2) if mm_ranges is not None else 0,
+            plan.data_ptr() if plan is not None else None,
+            query_start_loc.data_ptr() if plan is not None else None,
+            plan.size(0) if plan is not None else 0,
+            block_table.stride(0) if block_table.dim() == 2 else 0,
+            head_group,
         )
         self._launch(ctypes.byref(args))
 
@@ -395,12 +426,20 @@ def seal() -> None:
     _sealed = True
 
 
-def variant_for(hq, hkv, d, m, page_size, layout, window, dtype):
+def variant_for(hq, hkv, d, m, page_size, layout, window, dtype, batch=False):
     """variant_for with the `override()` knobs applied."""
-    base = R.variant_for(hq, hkv, d, m, page_size, layout, window, dtype)
+    base = R.variant_for(hq, hkv, d, m, page_size, layout, window, dtype, batch)
     if base is None:
         base = R.KernelVariant(
-            d, hq, hkv, m, page_size, layout, dtype=dtype, window=window
+            d,
+            hq,
+            hkv,
+            m,
+            page_size,
+            layout,
+            dtype=dtype,
+            window=window,
+            batched=int(batch),
         )
     return _with_overrides(base)
 
@@ -451,6 +490,19 @@ def prefill_variant_for(hq, hkv, d, page_size, layout, window, dtype, num_tokens
     return _with_overrides(base)
 
 
+def prefill_batch_variant_for(hq, hkv, d, page_size, layout, window, dtype, *batch):
+    """prefill_batch_variant_for with the `override()` knobs applied."""
+    v, head_group = R.prefill_batch_variant_for(
+        hq, hkv, d, page_size, layout, window, dtype, *batch
+    )
+    if v is None:
+        v = prefill_variant_for(
+            hq, hkv, d, page_size, layout, window, dtype, R.PREFILL_MIN_M
+        )
+        return v, 0
+    return _with_overrides(v), head_group
+
+
 @contextlib.contextmanager
 def override(knobs: dict):
     """Force these launch knobs (after `install`)."""
@@ -480,6 +532,7 @@ def install(ablate: int = 0) -> None:
     B.variant_for = variant_for
     B.load_prefill = load
     B.prefill_variant_for = prefill_variant_for
+    B.prefill_batch_variant_for = prefill_batch_variant_for
 
 
 def _write(path: Path, text: str) -> None:

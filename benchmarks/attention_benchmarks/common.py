@@ -306,6 +306,9 @@ class BenchmarkConfig:
     # Sliding window in keys (None: full attention).
     sliding_window: int | None = None
 
+    # Speculative tokens per decode (0: none).
+    num_speculative_tokens: int = 0
+
     # MLA-specific
     prefill_backend: str | None = None
     kv_lora_rank: int | None = None

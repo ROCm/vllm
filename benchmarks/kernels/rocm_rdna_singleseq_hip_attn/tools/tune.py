@@ -7,14 +7,16 @@ Decode, per (Hq, Hkv, D, window, M): every point of the knob grid is checked
 against a float reference and timed over --contexts; the finalists are timed
 against the current row in an interleaved A/B. A point may lose at most
 loss_limit(S) at any context, and wins on the mean speedup weighted by
-sqrt(S / 128) if above --min-gain.
+sqrt(S / 128) if above --min-gain. With --batch, the batched build, timed
+over batch specs instead of contexts.
 
 Prefill (--prefill), per (Hq, Hkv, D, window): one row per step of M, chosen
 in an interleaved A/B against TRITON_ATTN.
 
-`--apply` writes accepted decisions into
-csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h, refusing those measured on
-another kernel source or row.
+Prefill batches (--prefill-batch): per cell, the build and head group.
+
+`--apply` writes accepted decisions into csrc/rocm/rdna_singleseq_*_configs.h,
+refusing those measured on another kernel source or row.
 
     PYTHONPATH=$PWD python \\
         benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/tune.py \\
@@ -23,6 +25,7 @@ another kernel source or row.
 """
 
 import argparse
+import functools
 import gc
 import itertools
 import json
@@ -77,8 +80,9 @@ def dspl_rule(d):
     return d // 128 if d >= 256 else 1
 
 
-def grid(hq, hkv, d, m):
-    """Valid, distinct knob sets for one configuration."""
+def grid(hq, hkv, d, m, batch=False):
+    """Valid, distinct knob sets for one configuration; no dot product for a
+    batch."""
     gqa = hq // hkv
     rule = dspl_rule(d)
     out = []
@@ -114,7 +118,7 @@ def grid(hq, hkv, d, m):
                     }
                 )
     # The dot path needs whole dot2 pairs per lane (not D=96).
-    if (8 if d == 128 else d // 32) % 2 == 0:
+    if not batch and (8 if d == 128 else d // 32) % 2 == 0:
         for waves, max_segments in itertools.product(*DOT_GRID.values()):
             out.append({"dot_product": 1, "waves": waves, "max_segments": max_segments})
     return out
@@ -125,8 +129,21 @@ def geomean(xs):
 
 
 def rank(contexts, pct):
-    long_ = [c for s, c in zip(contexts, pct) if s >= LONG_S]
-    return (min(min(long_), LONG_TARGET) if long_ else LONG_TARGET, geomean(pct))
+    # Cells on Triton are left out.
+    served = [(s, c) for s, c in zip(contexts, pct) if c > 0]
+    long_ = [c for s, c in served if s >= LONG_S]
+    return (
+        min(min(long_), LONG_TARGET) if long_ else LONG_TARGET,
+        geomean([c for _, c in served]) if served else 0.0,
+    )
+
+
+def cell_ratio(ref_us, us):
+    """Speedup over the reference at one cell; inf (Triton) is neutral for
+    both, a loss for the point alone."""
+    if math.isinf(ref_us):
+        return 1.0
+    return ref_us / us
 
 
 def loss_limit(s):
@@ -212,6 +229,66 @@ def reference(q, kv, s, window=0):
     return torch.bmm(torch.softmax(sc, -1), vf).permute(1, 0, 2)
 
 
+def check_batch(module, v, repeat=2):
+    """Worst relative error of a batched build over a long, a short and a
+    padded sequence; the padded rows must stay unwritten."""
+    import torch
+
+    from vllm.v1.attention.ops.rocm_rdna_singleseq_hip import make_scratch
+
+    base = max(1040, v.window + 64, v.page_size + 1000)
+    lens = [base, 48, 0]
+    torch.manual_seed(0)
+    width = -(-base // v.page_size)
+    kv = (
+        torch.randn(
+            len(lens) * width,
+            v.num_kv_heads,
+            v.page_size,
+            2 * v.head_size,
+            device="cuda",
+            dtype=v.dtype,
+        )
+        * 0.5
+    )
+    table = torch.arange(len(lens) * width, device="cuda", dtype=torch.int32)
+    table = table.view(len(lens), width)
+    q = (
+        torch.randn(
+            len(lens) * v.max_query_len,
+            v.num_q_heads,
+            v.head_size,
+            device="cuda",
+            dtype=v.dtype,
+        )
+        * 0.5
+    )
+    sl = torch.tensor(lens, device="cuda", dtype=torch.int32)
+    scratch = make_scratch(v, torch.device("cuda"), max_seqs=len(lens))
+    worst = 0.0
+    for _ in range(repeat):
+        out = torch.full_like(q, 7.0)
+        module.decode_attn(q, kv, table, out, *scratch, sl, v.head_size**-0.5)
+        torch.accelerator.synchronize()
+        for i, s in enumerate(lens):
+            rows = out[i * v.max_query_len : (i + 1) * v.max_query_len].float()
+            if s == 0:
+                if not (rows == 7.0).all():
+                    return float("inf")
+                continue
+            if not torch.isfinite(rows).all():
+                return float("inf")
+            ref = reference(
+                q[i * v.max_query_len : (i + 1) * v.max_query_len],
+                kv[table[i].long()],
+                s,
+                v.window,
+            )
+            err = ((rows - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
+            worst = max(worst, err)
+    return worst
+
+
 def check(module, v, repeat=2):
     """Worst relative error over several contexts, each on new inputs and a
     NaN-filled output, launched `repeat` times on one scratch.
@@ -272,14 +349,31 @@ def tune(a) -> None:
     from runner import run_attention_benchmark
 
     import vllm
+    import vllm.v1.attention.backends.rocm_rdna_singleseq_attn as backend
     from vllm.v1.attention.ops.rocm_rdna_singleseq_hip import KernelVariant, variant_for
 
     jit.install()
     common.gc = types.SimpleNamespace(collect=lambda *x: 0)
     dtype = utils.torch_dtype(a.dtype)
     hq, hkv, d, m, win, bs = a.hq, a.hkv, a.head_dim, a.m, a.window, a.block_size
-    ctxs = list(a.contexts)
-    tag = f"{hq}/{hkv}/{d} M={m}" + (f" w{win}" if win else "") + f" {a.dtype}"
+    batch = list(a.batch or [])
+    # Contexts, or batch specs weighted as their longest sequence.
+    cells = batch or list(a.contexts)
+    if batch:
+        from batch_spec import parse_batch_spec
+
+        for spec in batch:
+            if any(r.q_len != m for r in parse_batch_spec(spec)):
+                raise SystemExit(f"{spec}: every sequence of a batch takes M={m}")
+        ctxs = [max(r.kv_len for r in parse_batch_spec(spec)) for spec in batch]
+    else:
+        ctxs = cells
+    tag = (
+        f"{hq}/{hkv}/{d} M={m}"
+        + (f" w{win}" if win else "")
+        + (" batch" if batch else "")
+        + f" {a.dtype}"
+    )
     fixed = {
         "hq": hq,
         "hkv": hkv,
@@ -289,27 +383,48 @@ def tune(a) -> None:
         "dtype": a.dtype,
         "block_size": bs,
         "source": jit.source_digest(),
-        "contexts": ctxs,
+        "contexts": cells,
+        "batch": bool(batch),
     }
     meta = {
         "vllm": vllm.__version__,
         "torch": torch.__version__,
         "host": platform.node(),
     }
-    roof = [
-        utils.roofline_us(hq, hkv, d, m, s, block_size=bs, window=win) for s in ctxs
-    ]
+    if batch:
+        from matrix import spec_roofline
+
+        roof = [
+            spec_roofline(spec, hq, hkv, d, block_size=bs, window=win)[0]
+            for spec in batch
+        ]
+    else:
+        roof = [
+            utils.roofline_us(hq, hkv, d, m, s, block_size=bs, window=win) for s in ctxs
+        ]
 
     def variant(knobs):
-        return KernelVariant(d, hq, hkv, m, bs, 1, **knobs, dtype=dtype, window=win)
+        return KernelVariant(
+            d,
+            hq,
+            hkv,
+            m,
+            bs,
+            1,
+            **knobs,
+            dtype=dtype,
+            window=win,
+            batched=int(bool(batch)),
+        )
 
-    def decode(v, s):
-        """(us, spread %) of m tokens at context s, on v."""
+    def decode(v, cell):
+        """(us, spread %) of m tokens at context `cell`, or of batch spec `cell`,
+        on v; (inf, 0) if it runs on Triton."""
         from common import BenchmarkConfig
 
         cfg = BenchmarkConfig(
             backend="ROCM_RDNA_SINGLESEQ_ATTN",
-            batch_spec=f"q{m}s{s}",
+            batch_spec=cell if batch else f"q{m}s{cell}",
             num_layers=10,
             min_working_set_mb=96,
             head_dim=d,
@@ -323,8 +438,10 @@ def tune(a) -> None:
         with jit.paths() as path, jit.override(knobs_of(v)):
             r = run_attention_benchmark(cfg)
         progress["t"] = time.time()
+        if batch and path() == "triton":
+            return math.inf, 0.0
         if path() != "kernel":
-            raise RuntimeError(f"ran {path()} at S={s}")
+            raise RuntimeError(f"ran {path()} at {cell}")
         return r.median_time * 1e6, r.std_time / r.median_time * 100
 
     def pid(knobs):
@@ -340,11 +457,11 @@ def tune(a) -> None:
             if all(rec.get(k) == v for k, v in fixed.items()):
                 known[pid(rec["knobs"])] = rec
 
-    current = variant_for(hq, hkv, d, m, bs, 1, win, dtype)
+    current = variant_for(hq, hkv, d, m, bs, 1, win, dtype, bool(batch))
     raw = (
         [json.loads(x) for x in Path(a.candidates).read_text().splitlines() if x]
         if a.candidates
-        else grid(hq, hkv, d, m)
+        else grid(hq, hkv, d, m, bool(batch))
     )
     cands: dict = {} if current is None else {current: knobs_of(current)}
     space = set()
@@ -359,7 +476,8 @@ def tune(a) -> None:
     items = list(cands.items())[: a.limit or None]
     todo = [v for v, k in items if pid(k) not in known]
     t0 = time.time()
-    jit.precompile(todo)
+    # Reused points too: any may be a finalist.
+    jit.precompile([v for v, _ in items])
     jit.seal()
     print(
         f"# {tag}: {len(items)} points, {len(items) - len(todo)} reused, "
@@ -407,11 +525,13 @@ def tune(a) -> None:
                     mod = jit.load(v)
                     if mod is None:
                         raise RuntimeError(jit.failure(v))
-                    rec["max_rel"] = err = check(mod, v)
+                    rec["max_rel"] = err = (check_batch if batch else check)(mod, v)
                     if err > tol:
                         rec["status"] = "wrong"
                     else:
-                        us, spread = zip(*(decode(v, s) for s in ctxs))
+                        us, spread = zip(*(decode(v, c) for c in cells))
+                        if all(math.isinf(u) for u in us):
+                            raise RuntimeError("ran triton at every batch")
                         rec.update(
                             status="ok",
                             us=[round(u, 3) for u in us],
@@ -426,7 +546,9 @@ def tune(a) -> None:
                 os.fsync(fh.fileno())
                 known[pid(k)] = rec
                 progress["rec"] = None
-            if (i + 1) % GC_EVERY == 0:
+                # Free the batched scratch the backend keeps.
+                backend._SCRATCH.clear()
+            if (i + 1) % GC_EVERY == 0 or rec.get("status") == "error":
                 gc.collect()
             if rec.get("status") == "ok":
                 scored.append((rank(ctxs, rec["pct_roof"]), v, k))
@@ -444,7 +566,7 @@ def tune(a) -> None:
         scored = [
             ((within_limits(ctxs, r), weighted(ctxs, r)), v, k)
             for _, v, k in scored
-            for r in [[b / u for b, u in zip(ref_us, known[pid(k)]["us"])]]
+            for r in [[cell_ratio(b, u) for b, u in zip(ref_us, known[pid(k)]["us"])]]
         ]
     scored.sort(key=lambda x: x[0], reverse=True)
     rule = dspl_rule(d)
@@ -471,21 +593,26 @@ def tune(a) -> None:
     runs = [(v, k, tags) for v, (k, tags) in finalists.items()]
     if current is not None:
         runs.insert(0, (current, knobs_of(current), ["current"]))
-    times = [{s: [] for s in ctxs} for _ in runs]
+    times = [{c: [] for c in cells} for _ in runs]
     for _ in range(a.confirm_rounds):
-        for s in ctxs:
+        for c in cells:
             for (v, _, _), t in zip(runs, times):
                 try:
-                    t[s].append(decode(v, s)[0])
+                    t[c].append(decode(v, c)[0])
                 except Exception:  # noqa: BLE001
-                    t[s].append(float("inf"))
-    med = [[statistics.median(t[s]) for s in ctxs] for t in times]
+                    t[c].append(float("inf"))
+    med = [[statistics.median(t[c]) for c in cells] for t in times]
     base = med[0] if current is not None else None
     results = []
     for (v, k, tags), us in zip(runs, med):
         if "current" in tags:
             continue
-        ratio = [b / u for b, u in zip(base or roof, us)]
+        # Against the row, or roof without one.
+        ratio = (
+            [cell_ratio(b, u) for b, u in zip(base, us)]
+            if base
+            else [r / u for r, u in zip(roof, us)]
+        )
         score = weighted(ctxs, ratio)
         accepted = base is None or (score > a.min_gain and within_limits(ctxs, ratio))
         results.append(
@@ -948,12 +1075,228 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
     return written
 
 
+# ------------------------------------------------------------- prefill batch --
+
+# A cell's representative mean M and keys, by its lower bounds.
+BATCH_M = {1: 4, 16: 32, 64: 128, 256: 512, 1024: 2048, 4096: 4096}
+BATCH_KEYS = {0: 256, 512: 1024, 2048: 4096, 8192: 16384}
+# Tokens of a cell's larger batch (the smaller has a quarter), within
+# BATCH_KV_BYTES of KV.
+BATCH_TOKENS = 4096
+BATCH_KV_BYTES = 1 << 30
+# Launches rotate over KV copies this large, so caches do not flatter small
+# batches.
+BATCH_WORKING_SET = 96 << 20
+
+
+def prefill_batch_cells(window, kv_bytes_per_key):
+    """((min mean M, min keys), representative batches) of every cell."""
+    import numpy as np
+
+    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+
+    out = []
+    for i, m_lo in enumerate(R.PREFILL_BATCH_MEAN_M):
+        m = BATCH_M[m_lo]
+        for j, k_lo in enumerate(R.PREFILL_BATCH_KEYS):
+            k_hi = (R.PREFILL_BATCH_KEYS + (float("inf"),))[j + 1]
+            context = max(0, BATCH_KEYS[k_lo] - (m + 1) // 2)
+            n = min(64, max(2, BATCH_TOKENS // m))
+            n = max(2, min(n, BATCH_KV_BYTES // (kv_bytes_per_key * (m + context))))
+            specs = []
+            for nseq in dict.fromkeys((n, max(2, n // 4))):
+                starts = np.arange(nseq + 1) * m
+                lens = np.full(nseq, m + context)
+                mean_m, keys = R.prefill_batch_features(starts, lens, window)
+                if m_lo <= mean_m and k_lo <= keys < k_hi:
+                    specs.append((starts, lens, f"{nseq}q{m}s{m + context}"))
+            if specs:
+                out.append(((m_lo, k_lo), specs))
+    return out
+
+
+def tune_prefill_batch(a) -> None:
+    """Pick, per cell of a shape, the fastest prefill build and head group."""
+    import jit
+    import torch
+
+    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+
+    jit.install()
+    dtype = utils.torch_dtype(a.dtype)
+    hq, hkv, d, win, bs = a.hq, a.hkv, a.head_dim, a.window, a.block_size
+    tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + f" batch {a.dtype}"
+    dev = torch.device("cuda")
+    rows = R.prefill_variants(hq, hkv, d, bs, win, dtype)
+    if not rows:
+        raise SystemExit(f"{tag}: no prefill rows")
+    # Rows differing in max_segments or head_group build the same kernel.
+    builds: dict = {}
+    for v in rows:
+        k = prefill_knobs_of(v)
+        k.pop("max_segments"), k.pop("head_group")
+        builds.setdefault(json.dumps(sorted(k.items())), v)
+    groups = [g for g in range(1, hkv + 1) if hkv % g == 0]
+    jit.precompile(list(builds.values()))
+    jit.seal()
+    time.sleep(5)  # a parallel build moves the SoC clock
+    scratch = R.make_prefill_scratch(rows, dev)
+    target = R.prefill_target_workgroups(dev)
+
+    def timed(launches, iters=25):
+        """Median us of one launch, `launches` taken in turn."""
+        for fn in launches[:3]:
+            fn()
+        torch.accelerator.synchronize()
+        ts = []
+        for i in range(iters):
+            start, end = torch.cuda.Event(True), torch.cuda.Event(True)
+            start.record()
+            launches[i % len(launches)]()
+            end.record()
+            end.synchronize()
+            ts.append(start.elapsed_time(end) * 1000)
+        return statistics.median(ts)
+
+    cells = []
+    kv_bytes_per_key = hkv * 2 * d * torch.finfo(dtype).bits // 8
+    for (m_lo, k_lo), specs in prefill_batch_cells(win, kv_bytes_per_key):
+        times: dict = {}
+        for starts, lens, spec in specs:
+            torch.manual_seed(0)
+            nseq, pages = len(lens), -(-int(lens[0]) // bs)
+            kv = (torch.randn(nseq * pages, hkv, bs, 2 * d, device=dev) * 0.5).to(dtype)
+            kvs = [kv] + [
+                kv.clone()
+                for _ in range(BATCH_WORKING_SET // (kv.numel() * kv.element_size()))
+            ]
+            table = torch.randperm(nseq * pages, device=dev).to(torch.int32)
+            table = table.view(nseq, pages)
+            q = (torch.randn(int(starts[-1]), hq, d, device=dev) * 0.5).to(dtype)
+            out = torch.empty_like(q)
+            sl = torch.tensor(lens, dtype=torch.int32, device=dev)
+            qsl = torch.tensor(starts, dtype=torch.int32, device=dev)
+            for v in builds.values():
+                mod = jit.load(v)
+                for g in groups:
+                    plan, hg = R.plan_prefill(starts, lens, v, win, target, g)
+                    plan = torch.from_numpy(plan).to(dev)
+                    t = timed(
+                        [
+                            functools.partial(
+                                mod.prefill_attn,
+                                q,
+                                cache,
+                                table,
+                                out,
+                                *scratch,
+                                sl,
+                                int(lens.max()),
+                                d**-0.5,
+                                plan=plan,
+                                query_start_loc=qsl,
+                                head_group=hg,
+                            )
+                            for cache in kvs
+                        ]
+                    )
+                    times.setdefault((v.min_query_len, g), {})[spec] = t
+        best = {spec: min(t[spec] for t in times.values()) for _, _, spec in specs}
+        score = {
+            c: geomean([t[spec] / best[spec] for spec in t]) for c, t in times.items()
+        }
+        (row, group), s_ = min(score.items(), key=lambda x: x[1])
+        cells.append(
+            {
+                "min_mean_m": m_lo,
+                "min_keys": k_lo,
+                "row": row,
+                "head_group": group,
+                "score": s_,
+                "specs": [spec for _, _, spec in specs],
+                "us": {spec: times[(row, group)][spec] for spec in best},
+            }
+        )
+        print(
+            f"{tag}: mean M >= {m_lo:4}, keys >= {k_lo:4}: row {row:5} head group "
+            f"{group}, {s_:.3f} of the best per batch",
+            flush=True,
+        )
+    with open(a.decisions, "a") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "kind": "prefill_batch",
+                    "hq": hq,
+                    "hkv": hkv,
+                    "d": d,
+                    "window": win,
+                    "dtype": a.dtype,
+                    "block_size": bs,
+                    "source": jit.source_digest(prefill=True),
+                    "rows": [
+                        prefill_knobs_of(v) | {"min_query_len": v.min_query_len}
+                        for v in rows
+                    ],
+                    "cells": cells,
+                    "host": platform.node(),
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            )
+            + "\n"
+        )
+
+
+def apply_prefill_batch(dec: dict, block_sizes: list[int]) -> int:
+    """Write a shape's cells into the prefill batch configs; refused if its
+    prefill builds changed since."""
+    import torch
+
+    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+
+    hq, hkv, d, win = dec["hq"], dec["hkv"], dec["d"], dec["window"]
+    tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + " batch"
+    rows = R.prefill_variants(hq, hkv, d, dec["block_size"], win, torch.float16)
+    now = [prefill_knobs_of(v) | {"min_query_len": v.min_query_len} for v in rows]
+    if now != dec["rows"]:
+        print(f"{tag}: refused, the prefill builds changed since it was measured")
+        return 0
+    lines, table = read_configs(PREFILL_BATCH_CONFIGS_H)
+    pages = (
+        sorted(
+            {k[3] for k in R._prefill_table() if k[:3] == (hq, hkv, d) and k[4] == win}
+        )
+        or block_sizes
+    )
+    table = [r for r in table if (r[0], r[1], r[2], r[3]) != (d, hq, hkv, win)]
+    for page in pages:
+        for c in dec["cells"]:
+            table.append(
+                [
+                    d,
+                    hq,
+                    hkv,
+                    win,
+                    page,
+                    c["min_mean_m"],
+                    c["min_keys"],
+                    c["row"],
+                    c["head_group"],
+                ]
+            )
+    write_configs(PREFILL_BATCH_CONFIGS_H, lines, table, R.PREFILL_BATCH_CONFIG_FIELDS)
+    print(f"{tag}: {len(dec['cells'])} cells at pages {pages}")
+    return len(dec["cells"]) * len(pages)
+
+
 # ------------------------------------------------------------------- --apply --
 
 
 _CSRC = _HERE.parents[4] / "csrc" / "rocm"
 DECODE_CONFIGS_H = _CSRC / "rdna_singleseq_decode_configs.h"
+DECODE_BATCH_CONFIGS_H = _CSRC / "rdna_singleseq_decode_batch_configs.h"
 PREFILL_CONFIGS_H = _CSRC / "rdna_singleseq_prefill_configs.h"
+PREFILL_BATCH_CONFIGS_H = _CSRC / "rdna_singleseq_prefill_batch_configs.h"
 # One config entry per line.
 _ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
 
@@ -997,8 +1340,13 @@ def apply(path: str, block_sizes: list[int]) -> None:
         "dtype",
         "page_size",
     ), R.DECODE_CONFIG_FIELDS
-    lines, entries = read_configs(DECODE_CONFIGS_H)
-    rows = {tuple(r[:7]): r for r in entries}
+    # Keyed by (batched, shape).
+    headers = (DECODE_CONFIGS_H, DECODE_BATCH_CONFIGS_H)
+    lines, rows = [], {}
+    for batched, header in enumerate(headers):
+        text, entries = read_configs(header)
+        lines.append(text)
+        rows |= {(batched, *r[:7]): r for r in entries}
     source = jit.source_digest()
     written = 0
     for line in Path(path).read_text().splitlines():
@@ -1006,10 +1354,18 @@ def apply(path: str, block_sizes: list[int]) -> None:
         if dec.get("kind") == "prefill":
             written += apply_prefill(dec, block_sizes)
             continue
+        if dec.get("kind") == "prefill_batch":
+            written += apply_prefill_batch(dec, block_sizes)
+            continue
         if not dec["accepted"]:
             continue
         hq, hkv, d, m, win = dec["hq"], dec["hkv"], dec["d"], dec["m"], dec["window"]
-        tag = f"{hq}/{hkv}/{d} M={m}" + (f" w{win}" if win else "")
+        batched = int(dec.get("batch", False))
+        tag = (
+            f"{hq}/{hkv}/{d} M={m}"
+            + (f" w{win}" if win else "")
+            + (" batch" if batched else "")
+        )
         if dec["source"] != source:
             print(f"{tag}: refused, measured on another kernel source")
             continue
@@ -1022,11 +1378,12 @@ def apply(path: str, block_sizes: list[int]) -> None:
             1,
             win,
             utils.torch_dtype(dec["dtype"]),
+            bool(batched),
         )
         if dec["current"] != (None if now is None else knobs_of(now)):
             print(f"{tag}: refused, the row changed since it was measured")
             continue
-        sizes = sorted({k[6] for k in rows if k[:5] == (d, hq, hkv, win, m)})
+        sizes = sorted({k[7] for k in rows if k[:6] == (batched, d, hq, hkv, win, m)})
         for bf16, bs in itertools.product((0, 1), sizes or block_sizes):
             v = R.KernelVariant(
                 d,
@@ -1038,12 +1395,19 @@ def apply(path: str, block_sizes: list[int]) -> None:
                 **dec["winner"],
                 window=win,
                 dtype=torch.bfloat16 if bf16 else torch.float16,
+                batched=batched,
             )
             row = R.config_fields(v)
-            rows[tuple(row[:7])] = row
+            rows[(batched, *row[:7])] = row
             written += 1
         print(f"{tag}: {label(dec['winner'])}")
-    write_configs(DECODE_CONFIGS_H, lines, list(rows.values()), R.DECODE_CONFIG_FIELDS)
+    for batched, header in enumerate(headers):
+        write_configs(
+            header,
+            lines[batched],
+            [r for k, r in rows.items() if k[0] == batched],
+            R.DECODE_CONFIG_FIELDS,
+        )
     print(f"# {written} rows written")
 
 
@@ -1065,6 +1429,12 @@ def main() -> None:
         help="tune the prefill kernel: every step of M of one configuration",
     )
     p.add_argument(
+        "--prefill-batch",
+        action="store_true",
+        help="tune the prefill batch configs: the prefill build and "
+        "head group of every cell of one configuration's batches",
+    )
+    p.add_argument(
         "--prefixes",
         type=int,
         nargs="+",
@@ -1079,6 +1449,11 @@ def main() -> None:
     utils.add_dtype_argument(p)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--contexts", type=int, nargs="+", default=CONTEXTS)
+    p.add_argument(
+        "--batch",
+        nargs="+",
+        help="tune the batched row over these batch specs instead of --contexts",
+    )
     p.add_argument("--points", help="append every point (JSONL)")
     p.add_argument("--decisions", help="append the decision (JSONL)")
     p.add_argument("--reuse", action="store_true", help="skip points in --points")
@@ -1093,13 +1468,18 @@ def main() -> None:
     if a.apply:
         apply(a.apply, a.block_sizes)
         return
-    needed = ("hq", "hkv", "head_dim", "points", "decisions")
+    needed = ("hq", "hkv", "head_dim", "decisions")
+    if not a.prefill_batch:
+        needed += ("points",)
+    batchless = a.prefill or a.prefill_batch
     missing = [
-        n for n in (*needed, *(() if a.prefill else ("m",))) if getattr(a, n) is None
+        n for n in (*needed, *(() if batchless else ("m",))) if getattr(a, n) is None
     ]
     if missing:
         p.error("tuning needs --" + ", --".join(n.replace("_", "-") for n in missing))
-    if a.prefill:
+    if a.prefill_batch:
+        tune_prefill_batch(a)
+    elif a.prefill:
         tune_prefill(a)
     else:
         tune(a)

@@ -23,9 +23,12 @@ struct LaunchArgs {
   hipStream_t stream;
   // Multimodal ranges in device memory, read at run time so CUDA graphs
   // follow them: mm_ranges[0] ranges, then (start, end) pairs, at most
-  // mm_capacity. Null for no ranges.
+  // mm_capacity. Null for no ranges; batched builds take none.
   const int* mm_ranges;
   int mm_capacity;
+  // Batched builds: sequences, and per-sequence strides.
+  int nseq;
+  int bt_stride, acc_stride, ml_stride, cnt_stride;
 };
 
 using LaunchFn = void (*)(const LaunchArgs&);
@@ -34,10 +37,14 @@ using LaunchFn = void (*)(const LaunchArgs&);
 // (cmake/rocm_rdna_singleseq_attn.cmake) registers it. Defined in
 // rdna_singleseq_registry.cu.
 LaunchFn* decode_launchers();
+// Likewise for kDecodeBatchConfigs.
+LaunchFn* decode_batch_launchers();
 
 // One sequence of num_tokens query tokens. partial_o, partial_ml and counters
 // are the split-KV scratch; max_seq_len only sizes the split. mm_ranges holds
-// num_mm_ranges (start, end) multimodal ranges, empty ones with start == end.
+// num_mm_ranges (start, end) multimodal ranges per sequence, empty ones with
+// start == end. With a plan (plan_prefill's [num_entries, 4] work list), a
+// batch at query_start; head_group 0 is the build's.
 struct PrefillArgs {
   const void* q;
   const void* kv;
@@ -53,6 +60,11 @@ struct PrefillArgs {
   hipStream_t stream;
   const int* mm_ranges;
   int num_mm_ranges;
+  const int* plan;
+  const int* query_start;
+  int num_entries;
+  int bt_stride;
+  int head_group;
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);
