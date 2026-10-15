@@ -110,7 +110,9 @@ def _gqa_sparse_fwd_kernel(
     bt_row = block_table_ptr + pid_b * stride_bt_b
     off_n = tl.arange(0, BLOCK_SIZE_K)
     off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_h = tl.arange(0, BLOCK_SIZE_H)
     d_mask = off_d < head_dim
+    h_mask = off_h < gqa_group_size
     for j in range(real_q_loop):
         pid_q_j = pid_q * num_q_loop + j
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
@@ -118,15 +120,20 @@ def _gqa_sparse_fwd_kernel(
         q_abs = prefix_len + pid_q_j * BLOCK_SIZE_Q
         valid_blocks = (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
         real_topk = tl.minimum(max_topk, valid_blocks)
-        q_desc = tl.make_tensor_descriptor(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=[q_len, gqa_group_size, head_dim],
-            strides=[stride_qn, stride_qh, stride_qd],
-            block_shape=[BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D],
-            padding_option="zero",
+        off_qi = pid_q_j * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+        qo_mask = (
+            (off_qi < q_len)[:, None, None]
+            & h_mask[None, :, None]
+            & d_mask[None, None, :]
         )
-
-        q = tl.load_tensor_descriptor(q_desc, [pid_q_j * BLOCK_SIZE_Q, 0, 0])
+        q = tl.load(
+            q_ptr
+            + (q_start + off_qi)[:, None, None] * stride_qn
+            + (pid_h + off_h)[None, :, None] * stride_qh
+            + off_d[None, None, :] * stride_qd,
+            mask=qo_mask,
+            other=0.0,
+        )
         off_q = (
             tl.arange(0, BLOCK_SIZE_Q)[:, None]
             + pid_q_j * BLOCK_SIZE_Q
@@ -203,15 +210,13 @@ def _gqa_sparse_fwd_kernel(
             lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-        o_desc = tl.make_tensor_descriptor(
-            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-            shape=[q_len, gqa_group_size, head_dim],
-            strides=[stride_on, stride_oh, stride_od],
-            block_shape=[BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D],
-        )
-
-        tl.store_tensor_descriptor(
-            o_desc, [pid_q_j * BLOCK_SIZE_Q, 0, 0], acc_o.to(o_ptr.dtype.element_ty)
+        tl.store(
+            o_ptr
+            + (q_start + off_qi)[:, None, None] * stride_on
+            + (pid_h + off_h)[None, :, None] * stride_oh
+            + off_d[None, None, :] * stride_od,
+            acc_o.to(o_ptr.dtype.element_ty),
+            mask=qo_mask,
         )
 
 
@@ -299,7 +304,7 @@ def _gqa_sparse_decode_kernel(
     # attention range instead of letting padded rows produce negative lengths.
     kv_len = tl.maximum(query_pos + 1, 0)
 
-    # Valid block count from seq_len (no sentinel): min(topk, cdiv(kv_len, blk)).
+    # Upper bound on top-k entries from causal length; entries may be sentinels.
     idx_base = t_ptr + pid_kh * stride_th + pid_b * stride_tn
     num_blocks = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
     real_topk = tl.minimum(max_topk, num_blocks)
@@ -307,30 +312,37 @@ def _gqa_sparse_decode_kernel(
 
     off_n = tl.arange(0, BLOCK_SIZE_K)
     off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_h = tl.arange(0, BLOCK_SIZE_H)
     d_mask = off_d < head_dim
+    h_mask = off_h < gqa_group_size
+    hd_mask = h_mask[:, None] & d_mask[None, :]
     bt_row = block_table_ptr + req_id * stride_bt_b
 
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q_desc = tl.make_tensor_descriptor(
-        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
-        shape=[gqa_group_size, head_dim],
-        strides=[stride_qh, stride_qd],
-        block_shape=[BLOCK_SIZE_H, BLOCK_SIZE_D],
-        padding_option="zero",
+    q = tl.load(
+        q_ptr
+        + pid_b * stride_qn
+        + (pid_h + off_h)[:, None] * stride_qh
+        + off_d[None, :] * stride_qd,
+        mask=hd_mask,
+        other=0.0,
     )
-
-    q = tl.load_tensor_descriptor(q_desc, [0, 0])
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
         blk = tl.load(cur_idx_ptr).to(tl.int32)
         cur_idx_ptr = cur_idx_ptr + stride_tk
-        c = blk * BLOCK_SIZE_K
-        page = tl.load(bt_row + blk).to(tl.int64)
+        # topk_idx uses -1 for unused entries. Select a safe logical block
+        # before dereferencing the block table; invalid and future blocks then
+        # contribute a neutral online-softmax update without control flow.
+        valid_blk = (blk >= 0) & (blk < num_blocks)
+        safe_blk = tl.where(valid_blk, blk, 0)
+        c = safe_blk * BLOCK_SIZE_K
+        page = tl.load(bt_row + safe_blk).to(tl.int64)
         pos = c + off_n
-        pos_mask = pos < kv_len
+        pos_mask = (pos < kv_len) & valid_blk
         k = tl.load(
             kv_cache_ptr
             + page * stride_kv_blk
@@ -357,9 +369,11 @@ def _gqa_sparse_decode_kernel(
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp2(qk - m_ij[:, None])
+        m_safe = tl.where(valid_blk, m_ij, 0.0)
+        p = tl.where(pos_mask[None, :], tl.exp2(qk - m_safe[:, None]), 0.0)
         l_ij = tl.sum(p, axis=1)
-        acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
+        alpha = tl.where(valid_blk, tl.exp2(m_i - m_safe), 1.0)
+        acc_o = acc_o * alpha[:, None]
         v = tl.load(
             kv_cache_ptr
             + page * stride_kv_blk
@@ -383,8 +397,9 @@ def _gqa_sparse_decode_kernel(
                 )
                 v = (v * v_scale[:, None]).to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
-        m_i = m_ij
-        lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        lse_ij = m_safe + tl.log2(tl.exp2(lse_i - m_safe) + l_ij)
+        m_i = tl.where(valid_blk, m_safe, m_i)
+        lse_i = tl.where(valid_blk, lse_ij, lse_i)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -393,30 +408,22 @@ def _gqa_sparse_decode_kernel(
     # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
-    o_desc = tl.make_tensor_descriptor(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=[gqa_group_size, head_dim],
-        strides=[stride_o_h, stride_o_d],
-        block_shape=[BLOCK_SIZE_H, BLOCK_SIZE_D],
-    )
-
-    tl.store_tensor_descriptor(
-        o_desc,
-        [0, 0],
+    tl.store(
+        o_ptr
+        + pid_c * stride_o_c
+        + pid_b * stride_o_b
+        + (pid_h + off_h)[:, None] * stride_o_h
+        + off_d[None, :] * stride_o_d,
         acc_o.to(o_ptr.dtype.element_ty),
+        mask=hd_mask,
     )
-
-    lse_desc = tl.make_tensor_descriptor(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
-        shape=[gqa_group_size],
-        strides=[stride_l_h],
-        block_shape=[BLOCK_SIZE_H],
-    )
-
-    tl.store_tensor_descriptor(
-        lse_desc,
-        [0],
+    tl.store(
+        lse_ptr
+        + pid_c * stride_l_c
+        + pid_b * stride_l_b
+        + (pid_h + off_h) * stride_l_h,
         lse_i.to(lse_ptr.dtype.element_ty),
+        mask=h_mask,
     )
 
 
@@ -452,18 +459,17 @@ def _merge_topk_attn_out_kernel(
 
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    o_desc = tl.make_tensor_descriptor(
-        base=o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=[NUM_TOPK_CHUNKS, head_dim],
-        strides=[stride_o_c, stride_o_d],
-        block_shape=[NUM_TOPK_CHUNKS, BLOCK_SIZE_D],
-        padding_option="zero",
+    d_mask = off_d < head_dim
+    o_ptrs = (
+        o_ptr
+        + pid_b * stride_o_b
+        + pid_h * stride_o_h
+        + off_c[:, None] * stride_o_c
+        + off_d[None, :] * stride_o_d
     )
-
     lse_ptrs = lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c
-
-    o = tl.load_tensor_descriptor(o_desc, [0, 0])
-    lse = tl.load(lse_ptrs)  # Direct pointer load remains unchanged
+    o = tl.load(o_ptrs, mask=d_mask[None, :], other=0.0)
+    lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
     weights = tl.exp2(lse - lse_max)
     weights = weights / tl.sum(weights, axis=0)
@@ -471,7 +477,7 @@ def _merge_topk_attn_out_kernel(
     out_ptrs = (
         out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
     )
-    tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=off_d < head_dim)
+    tl.store(out_ptrs, o_merged.to(out_ptr.dtype.element_ty), mask=d_mask)
 
 
 # ---------------------------------------------------------------------------

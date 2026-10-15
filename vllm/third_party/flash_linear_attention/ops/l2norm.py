@@ -13,8 +13,6 @@ import torch
 
 from vllm.triton_utils import tl, triton
 
-from .op import make_tensor_descriptor
-
 BT_LIST = [8, 16, 32, 64, 128]
 
 USE_DEFAULT_FLA_NORM = int(os.getenv("USE_DEFAULT_FLA_NORM", "0"))
@@ -68,13 +66,18 @@ def l2norm_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    desc_x = make_tensor_descriptor(x, [T, D], [D, 1], [BT, BD])
-    desc_y = make_tensor_descriptor(y, [T, D], [D, 1], [BT, BD])
-    b_x = desc_x.load([i_t * BT, 0]).to(tl.float32)
+    i_t = tl.program_id(0).to(tl.int64)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_t = o_t < T
+    m_x = m_t[:, None] & (o_d[None, :] < D)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    desc_y.store([i_t * BT, 0], b_y.to(desc_y.dtype))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
 @triton.jit

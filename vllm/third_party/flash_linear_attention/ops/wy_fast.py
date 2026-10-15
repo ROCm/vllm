@@ -14,7 +14,6 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
-from .op import make_tensor_descriptor
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
@@ -47,12 +46,12 @@ def recompute_w_u_fwd_kernel(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -62,37 +61,40 @@ def recompute_w_u_fwd_kernel(
     else:
         bos, eos = i_b * T, i_b * T + T
     o_t = i_t * BT + tl.arange(0, BT)
+    o_A = tl.arange(0, BT)
     m_t = o_t < T
-    desc_A = make_tensor_descriptor(
-        A + (bos * H + i_h) * BT, [T, BT], [H * BT, 1], [BT, BT]
-    )
-    desc_v = make_tensor_descriptor(
-        v + (bos * H + i_h) * V, [T, V], [H * V, 1], [BT, BV]
-    )
-    desc_u = make_tensor_descriptor(
-        u + (bos * H + i_h) * V, [T, V], [H * V, 1], [BT, BV]
-    )
-    desc_k = make_tensor_descriptor(
-        k + (bos * Hg + i_h // (H // Hg)) * K, [T, K], [Hg * K, 1], [BT, BK]
-    )
-    desc_w = make_tensor_descriptor(
-        w + (bos * H + i_h) * K, [T, K], [H * K, 1], [BT, BK]
-    )
-    b_beta = tl.load(beta + (bos + o_t) * H + i_h, mask=m_t, other=0.0)
-    b_A = desc_A.load([i_t * BT, 0])
-    b_g = tl.exp(tl.load(g + (bos + o_t) * H + i_h, mask=m_t, other=0.0))
+    m_A = m_t[:, None] & (o_A[None, :] < BT)
+    p_beta = beta + bos * H + i_h + o_t * H
+    p_g = g + (bos * H + i_h) + o_t * H
+    p_A = A + (bos * H + i_h) * BT + o_t[:, None] * (H * BT) + o_A[None, :]
+    b_beta = tl.load(p_beta, mask=m_t, other=0.0)
+    b_A = tl.load(p_A, mask=m_A, other=0.0)
+    b_g = tl.exp(tl.load(p_g, mask=m_t, other=0.0))
 
     for i_v in range(tl.cdiv(V, BV)):
-        b_v = desc_v.load([i_t * BT, i_v * BV])
+        o_v = i_v * BV + tl.arange(0, BV)
+        m_v = m_t[:, None] & (o_v[None, :] < V)
+        p_v = v + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
+        p_u = u + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :]
+        b_v = tl.load(p_v, mask=m_v, other=0.0)
         b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
         b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        desc_u.store([i_t * BT, i_v * BV], b_u.to(desc_u.dtype))
+        tl.store(p_u, b_u.to(p_u.dtype.element_ty), mask=m_v)
 
     for i_k in range(tl.cdiv(K, BK)):
-        b_k = desc_k.load([i_t * BT, i_k * BK])
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = m_t[:, None] & (o_k[None, :] < K)
+        p_k = (
+            k
+            + (bos * Hg + i_h // (H // Hg)) * K
+            + o_t[:, None] * (Hg * K)
+            + o_k[None, :]
+        )
+        p_w = w + (bos * H + i_h) * K + o_t[:, None] * (H * K) + o_k[None, :]
+        b_k = tl.load(p_k, mask=m_k, other=0.0)
         b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
         b_w = tl.dot(b_A, b_kb)
-        desc_w.store([i_t * BT, i_k * BK], b_w.to(desc_w.dtype))
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty), mask=m_k)
 
 
 def recompute_w_u_fwd(

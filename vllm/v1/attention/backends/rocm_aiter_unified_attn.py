@@ -29,7 +29,12 @@ from vllm.v1.attention.backends.rocm_attn import (
     RocmAttentionMetadata,
     RocmAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheLayout
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheLayout,
+    KVQuantMode,
+    get_kv_quant_mode,
+)
 
 logger = init_logger(__name__)
 
@@ -84,7 +89,8 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
-        return True
+        # Not implemented
+        return False
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -128,10 +134,6 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
             # Connectors like MoRI assume contiguous blocks
             return (KVCacheLayout.LBHNC,)
         return (KVCacheLayout.LBHNC, KVCacheLayout.LHBNC)
-
-    @staticmethod
-    def use_cascade_attention(*args, **kwargs) -> bool:
-        return False
 
     @staticmethod
     def get_builder_cls() -> type["RocmAiterUnifiedAttentionMetadataBuilder"]:
@@ -184,8 +186,21 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         )
         from aiter.ops.triton.unified_attention import unified_attention
 
+        from vllm.platforms.rocm import on_gfx11
+
         self.unified_attention = unified_attention
-        self.supports_quant_query_input = True
+        # RDNA3 has no low precision MMA, preserve query precision
+        self.supports_quant_query_input = not on_gfx11()
+
+        # Layout flag: must mirror get_kv_cache_shape, which is attn_type
+        # agnostic because the allocation is shared across layers.
+        self._shuffle_kv_layout = (
+            rocm_aiter_ops.is_shuffle_kv_cache_enabled() and on_gfx1250()
+        )
+        # Kernel flag: the shuffled reader/writer is causal decoder only.
+        self._use_shuffle_kv = (
+            self._shuffle_kv_layout and self.attn_type != AttentionType.ENCODER_DECODER
+        )
 
         # Layout flag: must mirror get_kv_cache_shape, which is attn_type
         # agnostic because the allocation is shared across layers.
@@ -255,8 +270,6 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         if attn_metadata is None:
             # Profiling run.
             return output.fill_(0)
-
-        assert attn_metadata.use_cascade is False
 
         # IMPORTANT!
         # NOTE(woosuk): With piece-wise CUDA graphs, this method is executed in
@@ -373,7 +386,7 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 reshape_and_cache_shuffle_triton,
             )
 
-            if is_quantized_kv_cache(self.kv_cache_dtype):
+            if get_kv_quant_mode(self.kv_cache_dtype) == KVQuantMode.FP8_PER_TENSOR:
                 key_cache = key_cache.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)
             _dummy = torch.empty(1, dtype=torch.float32, device=key.device)

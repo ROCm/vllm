@@ -15,7 +15,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
-from .op import exp, make_tensor_descriptor
+from .op import exp
 from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -60,14 +60,18 @@ def chunk_fwd_kernel_o(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_v, i_t, i_bh = (
+        tl.program_id(0),
+        tl.program_id(1).to(tl.int64),
+        tl.program_id(2).to(tl.int64),
+    )
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
         i_tg = i_t
         i_n, i_t = (
             tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -90,16 +94,21 @@ def chunk_fwd_kernel_o(
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
-    desc_q = make_tensor_descriptor(q, [T, K], [Hg * K, 1], [BT, BK])
-    desc_k = make_tensor_descriptor(k, [T, K], [Hg * K, 1], [BT, BK])
-    desc_h = make_tensor_descriptor(h, [V, K], [K, 1], [BV, BK])
+    o_t = i_t * BT + tl.arange(0, BT)
+    m_t = o_t < T
+    o_v = i_v * BV + tl.arange(0, BV)
     for i_k in range(tl.cdiv(K, BK)):
+        o_k = i_k * BK + tl.arange(0, BK)
+        m_k = o_k < K
+        p_q = q + o_t[:, None] * (Hg * K) + o_k[None, :]
+        p_k = k + o_k[:, None] + o_t[None, :] * (Hg * K)
+        p_h = h + o_v[:, None] * K + o_k[None, :]
         # [BT, BK]
-        b_q = desc_q.load([i_t * BT, i_k * BK])
+        b_q = tl.load(p_q, mask=m_t[:, None] & m_k[None, :], other=0.0)
         # [BK, BT]
-        b_k = tl.trans(desc_k.load([i_t * BT, i_k * BK]))
+        b_k = tl.load(p_k, mask=m_k[:, None] & m_t[None, :], other=0.0)
         # [BV, BK]
-        b_h = desc_h.load([i_v * BV, i_k * BK])
+        b_h = tl.load(p_h, mask=(o_v[:, None] < V) & m_k[None, :], other=0.0)
 
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         b_o += tl.dot(b_q, tl.trans(b_h))
@@ -108,24 +117,22 @@ def chunk_fwd_kernel_o(
 
     if USE_G:
         g += bos * H + i_h
-        o_tg = i_t * BT + tl.arange(0, BT)
-        b_g = tl.load(g + o_tg * H, mask=o_tg < T, other=0.0)
+        p_g = g + o_t * H
+        b_g = tl.load(p_g, mask=m_t, other=0.0)
         b_o = b_o * exp(b_g)[:, None]
         b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     b_A = tl.where(m_A, b_A, 0)
 
-    desc_v = make_tensor_descriptor(v, [T, V], [H * V, 1], [BT, BV])
-    desc_o = make_tensor_descriptor(o, [T, V], [H * V, 1], [BT, BV])
-    b_v = desc_v.load([i_t * BT, i_v * BV])
+    p_v = v + o_t[:, None] * (H * V) + o_v[None, :]
+    p_o = o + o_t[:, None] * (H * V) + o_v[None, :]
+    b_v = tl.load(p_v, mask=m_t[:, None] & (o_v < V)[None, :], other=0.0)
 
     # to fix mma -> mma layout conversion
     # already solved by triton v3.2 or higher
     b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    desc_o.store([i_t * BT, i_v * BV], b_o.to(desc_o.dtype))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_t[:, None] & (o_v < V)[None, :])
 
 
 def chunk_fwd_o(

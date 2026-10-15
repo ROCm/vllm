@@ -15,8 +15,6 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv, next_power_of_2
 
-from .op import make_tensor_descriptor
-
 
 @triton.heuristics(
     {
@@ -52,28 +50,30 @@ def layer_norm_gated_fwd_kernel(
     HAS_BIAS: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0).to(tl.int64)
 
+    o_t = i_t * BT + tl.arange(0, BT)
     o_d = tl.arange(0, BD)
     m_d = o_d < D
+    m_t = o_t < T
+    m_x = m_t[:, None] & m_d[None, :]
 
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
-    desc_x = make_tensor_descriptor(x, [T, D], [D, 1], [BT, BD])
-    b_x = desc_x.load([i_t * BT, 0]).to(tl.float32)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     if HAS_RESIDUAL:
-        desc_res = make_tensor_descriptor(residual, [T, D], [D, 1], [BT, BD])
-        b_x += desc_res.load([i_t * BT, 0]).to(tl.float32)
+        p_res = residual + o_t[:, None] * D + o_d[None, :]
+        b_x += tl.load(p_res, mask=m_x, other=0.0).to(tl.float32)
     if STORE_RESIDUAL_OUT:
-        desc_res_out = make_tensor_descriptor(residual_out, [T, D], [D, 1], [BT, BD])
-        desc_res_out.store([i_t * BT, 0], b_x.to(desc_res_out.dtype))
+        p_res_out = residual_out + o_t[:, None] * D + o_d[None, :]
+        tl.store(p_res_out, b_x.to(p_res_out.dtype.element_ty), mask=m_x)
     if not IS_RMS_NORM:
         b_mean = tl.sum(b_x, axis=1) / D
-        tl.store(mean + o_t, b_mean.to(mean.dtype.element_ty), mask=m_t)
+        p_mean = mean + o_t
+        tl.store(p_mean, b_mean.to(p_mean.dtype.element_ty), mask=m_t)
         b_xbar = tl.where(m_d[None, :], b_x - b_mean[:, None], 0.0)
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     else:
@@ -81,7 +81,8 @@ def layer_norm_gated_fwd_kernel(
         b_var = tl.sum(b_xbar * b_xbar, axis=1) / D
     b_rstd = 1 / tl.sqrt(b_var + eps)
 
-    tl.store(rstd + o_t, b_rstd.to(rstd.dtype.element_ty), mask=m_t)
+    p_rstd = rstd + o_t
+    tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), mask=m_t)
 
     if HAS_WEIGHT:
         b_w = tl.load(w + o_d, mask=m_d).to(tl.float32)
@@ -109,8 +110,8 @@ def layer_norm_gated_fwd_kernel(
         b_y = b_y * tl.sigmoid(b_g)
 
     # Write output
-    desc_y = make_tensor_descriptor(y, [T, D], [D, 1], [BT, BD])
-    desc_y.store([i_t * BT, 0], b_y.to(desc_y.dtype))
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
 @triton.heuristics(
