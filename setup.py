@@ -22,6 +22,18 @@ from setuptools_rust.build import build_rust
 from setuptools_scm import get_version
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
+# Select vLLM release tags, excluding crate tags such as "proto-v0.3.0".
+VLLM_GIT_DESCRIBE_COMMAND = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--abbrev=40",
+    "--match",
+    "v[0-9]*",
+]
+
 
 def load_module_from_path(module_name, path):
     spec = importlib.util.spec_from_file_location(module_name, path)
@@ -1247,31 +1259,20 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
-VLLM_TAG_REGEX = r"^v(?P<version>\d+(?:\.\d+)*(?:[._-]?\w+)*)$"
-VLLM_GIT_DESCRIBE = [
-    "git",
-    "describe",
-    "--dirty",
-    "--tags",
-    "--long",
-    "--abbrev=40",
-    "--match",
-    "v[0-9]*",
-]
-
-
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py", tag_regex=VLLM_TAG_REGEX)
+        return get_version(
+            write_to="vllm/_version.py",
+            git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,
+        )
 
     version = get_version(
         write_to="vllm/_version.py",
-        tag_regex=VLLM_TAG_REGEX,
-        git_describe_command=VLLM_GIT_DESCRIBE,
+        git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,
     )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
