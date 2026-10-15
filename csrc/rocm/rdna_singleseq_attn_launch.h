@@ -21,6 +21,9 @@ struct LaunchArgs {
   int bt_width;
   float scale;
   hipStream_t stream;
+  // Batched builds: sequences, and per-sequence strides.
+  int nseq;
+  int bt_stride, acc_stride, ml_stride, cnt_stride;
 };
 
 using LaunchFn = void (*)(const LaunchArgs&);
@@ -29,9 +32,13 @@ using LaunchFn = void (*)(const LaunchArgs&);
 // (cmake/rocm_rdna_singleseq_attn.cmake) registers it. Defined in
 // rdna_singleseq_registry.cu.
 LaunchFn* decode_launchers();
+// Likewise for kDecodeBatchConfigs.
+LaunchFn* decode_batch_launchers();
 
 // One sequence of num_tokens query tokens. partial_o, partial_ml and counters
-// are the split-KV scratch; max_seq_len only sizes the split.
+// are the split-KV scratch; max_seq_len only sizes the split. With a plan
+// (plan_prefill's [num_entries, 4] work list), a batch at query_start;
+// head_group 0 is the build's.
 struct PrefillArgs {
   const void* q;
   const void* kv;
@@ -45,6 +52,11 @@ struct PrefillArgs {
   int max_seq_len;
   float scale;
   hipStream_t stream;
+  const int* plan;
+  const int* query_start;
+  int num_entries;
+  int bt_stride;
+  int head_group;
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);
