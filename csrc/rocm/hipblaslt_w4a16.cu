@@ -63,17 +63,30 @@ hipDataType hip_type_of(at::ScalarType t) {
   }
 }
 
-hipblasLtMatmulMatrixScale_t scale_mode_of(int64_t group_size, bool has_zp) {
+// The scale mode names the scale element type, which hipBLASLt requires to
+// equal the type of matrix B -- the activations. The modes used to be
+// polymorphic over that type; they are not any more, and the bf16 ones kept
+// the old numeric values, so feeding an fp16 layer the bf16 mode is silent
+// rather than an error.
+hipblasLtMatmulMatrixScale_t scale_mode_of(at::ScalarType dtype,
+                                           int64_t group_size, bool has_zp) {
+  const bool bf16 = dtype == at::kBFloat16;
   switch (group_size) {
     case 32:
-      return has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_ZP_EXT
-                    : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_EXT;
+      return bf16 ? (has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16BF_ZP_EXT
+                            : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16BF_EXT)
+                  : (has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT
+                            : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_EXT);
     case 64:
-      return has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC64_ZP_EXT
-                    : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC64_EXT;
+      return bf16 ? (has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC64_16BF_ZP_EXT
+                            : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC64_16BF_EXT)
+                  : (has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC64_16F_ZP_EXT
+                            : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC64_16F_EXT);
     case 128:
-      return has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_ZP_EXT
-                    : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_EXT;
+      return bf16 ? (has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_16BF_ZP_EXT
+                            : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_16BF_EXT)
+                  : (has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_16F_ZP_EXT
+                            : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_16F_EXT);
     default:
       TORCH_CHECK(false, "hipblaslt_w4a16: unsupported group_size ", group_size);
   }
@@ -140,7 +153,7 @@ Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K, int64_t ld
       sizeof(encoding)));
 
   // Mode before pointer: a pointer set while the mode is None defaults to Scalar.
-  hipblasLtMatmulMatrixScale_t mode = scale_mode_of(group_size, has_zp);
+  hipblasLtMatmulMatrixScale_t mode = scale_mode_of(dtype, group_size, has_zp);
   LT_CHECK(hipblasLtMatmulDescSetAttribute(
       plan.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)));
   // The heuristic only offers block-scale solutions when the scale pointer is
