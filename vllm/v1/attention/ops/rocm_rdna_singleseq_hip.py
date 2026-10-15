@@ -228,12 +228,11 @@ def make_scratch(
 
 
 def expected_kv_cache_strides(variant: KernelVariant) -> tuple[int, int, int]:
-    """Strides of (block, kv head, token) the kernel assumes."""
+    """Strides of (block, kv head, token) of the HND cache the kernel assumes:
+    (NB, HKV, PAGE_SIZE, 2D)."""
     kv_row = 2 * variant.head_size
     page = variant.page_size * variant.num_kv_heads * kv_row
-    if variant.layout == 0:  # NHD: (NB, PAGE_SIZE, HKV, 2D)
-        return page, kv_row, variant.num_kv_heads * kv_row
-    return page, variant.page_size * kv_row, kv_row  # HND: (NB, HKV, PAGE_SIZE, 2D)
+    return page, variant.page_size * kv_row, kv_row
 
 
 # Most query tokens the decode kernel serves.
