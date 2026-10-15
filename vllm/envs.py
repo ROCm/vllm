@@ -153,6 +153,9 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
+    VLLM_ROCM_W4A16_HIPBLASLT: Literal["auto", "off", "decode", "prefill", "all"] = (
+        "auto"
+    )
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1247,9 +1250,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the single-kernel HIP gated delta net prefill on RDNA3.5.
     # Set to 0 to fall back to the Triton kernels.
     # By default is enabled.
-    "VLLM_GDN_HIP": lambda: (
-        os.getenv("VLLM_GDN_HIP", "True").lower() in ("true", "1")
-    ),
+    "VLLM_GDN_HIP": lambda: os.getenv("VLLM_GDN_HIP", "True").lower() in ("true", "1"),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.
     "VLLM_USE_OINK_OPS": lambda: (
@@ -1369,6 +1370,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Route the gfx11/gfx12 W4A16 GEMM through hipBLASLt instead of the
+    # RDNAHybrid kernels. "auto" (default) uses hipBLASLt for every layer it
+    # has a kernel for, when vLLM was built against a hipBLASLt exposing the
+    # w4a16 API; "off" and "all" force the choice. The per-path modes are
+    # rejected -- see hipblaslt_w4a16_mode().
+    "VLLM_ROCM_W4A16_HIPBLASLT": env_with_choices(
+        "VLLM_ROCM_W4A16_HIPBLASLT",
+        "auto",
+        ["auto", "off", "decode", "prefill", "all"],
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

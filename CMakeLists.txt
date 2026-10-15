@@ -1590,6 +1590,43 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/gdn_chunked.cu")
   endif()
 
+  #
+  # hipBLASLt W4A16.
+  #
+  # The API is enumerators and one typedef -- no feature macro, and no version
+  # that implies it, since it is not upstream yet. Nothing in the preprocessor
+  # or in C++ can test for a missing enumerator (naming it is a hard error, and
+  # SFINAE cannot help a non-dependent name), so the only way to detect it is to
+  # try compiling against the headers and let CMake turn the answer into a
+  # define.
+  #
+  # hipblaslt.h includes hipblas-common and hip/hip_runtime.h, so the probe
+  # must define __HIP_PLATFORM_AMD__ -- it compiles as plain C++, and
+  # hip_runtime.h #errors without it. Getting this wrong makes the probe fail
+  # closed on its own prerequisites and report "no w4a16 API" for a ROCm that
+  # has one.
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES "${ROCM_PATH}/include")
+  set(CMAKE_REQUIRED_DEFINITIONS "-D__HIP_PLATFORM_AMD__")
+  set(CMAKE_REQUIRED_QUIET ON)
+  check_cxx_source_compiles("
+    #include <hipblaslt/hipblaslt.h>
+    int main() {
+      hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;
+      return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT
+                    + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;
+    }" VLLM_HIPBLASLT_HAS_W4A16)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+  unset(CMAKE_REQUIRED_QUIET)
+
+  if(VLLM_HIPBLASLT_HAS_W4A16)
+    message(STATUS "hipBLASLt in ${ROCM_PATH} exposes the W4A16 API; building that path")
+    list(APPEND VLLM_ROCM_EXT_SRC "csrc/rocm/hipblaslt_w4a16.cu")
+  else()
+    message(STATUS "hipBLASLt in ${ROCM_PATH} has no W4A16 API; skipping that path")
+  endif()
+
   define_extension_target(
     _rocm_C
     DESTINATION vllm
@@ -1604,6 +1641,11 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_link_libraries(_rocm_C PRIVATE _rocm_C_skinny)
   else()
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
+  endif()
+
+  if(VLLM_HIPBLASLT_HAS_W4A16)
+    target_link_libraries(_rocm_C PRIVATE hipblaslt)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_HIPBLASLT_HAS_W4A16=1)
   endif()
 
   rocm_arch_list_definition(VLLM_ROCM_ARCH_LIST_DEF ${VLLM_GPU_ARCHES})
