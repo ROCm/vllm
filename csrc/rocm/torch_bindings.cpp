@@ -189,6 +189,32 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int n_valid_tokens, int top_k, int block_m, int num_blocks) -> ()");
   rocm_ops.impl("moe_gemm_w4a16", torch::kCUDA, &moe_gemm_w4a16);
 
+#ifdef VLLM_ROCM_RDNA_SINGLESEQ_ATTN
+  // RDNA3.5 decode attention (gfx1151).
+  rocm_ops.def("rdna_singleseq_decode_table() -> str",
+               &rdna_singleseq_decode_table);
+  rocm_ops.def("rdna_singleseq_decode_variant(int[] key) -> int",
+               &rdna_singleseq_decode_variant);
+  rocm_ops.def(
+      "rdna_singleseq_decode_attn(int variant, Tensor q, Tensor kv_cache, "
+      "Tensor block_table, Tensor! out, Tensor! acc, Tensor! m, Tensor! l, "
+      "Tensor! cnt, Tensor seq_lens, float scale) -> ()");
+  rocm_ops.impl("rdna_singleseq_decode_attn", torch::kCUDA,
+                &rdna_singleseq_decode_attn);
+  // RDNA3.5 prefill attention (gfx1151).
+  rocm_ops.def("rdna_singleseq_prefill_table() -> str",
+               &rdna_singleseq_prefill_table);
+  rocm_ops.def("rdna_singleseq_prefill_variant(int[] key) -> int",
+               &rdna_singleseq_prefill_variant);
+  rocm_ops.def(
+      "rdna_singleseq_prefill_attn(int variant, Tensor q, Tensor kv_cache, "
+      "Tensor block_table, Tensor! out, Tensor! partial_o, "
+      "Tensor! partial_ml, Tensor! counters, Tensor seq_lens, "
+      "int max_seq_len, float scale) -> ()");
+  rocm_ops.impl("rdna_singleseq_prefill_attn", torch::kCUDA,
+                &rdna_singleseq_prefill_attn);
+#endif
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.
