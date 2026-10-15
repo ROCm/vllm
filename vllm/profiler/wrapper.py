@@ -19,6 +19,7 @@ import vllm.version
 from vllm.config import ProfilerConfig
 from vllm.config.profiler import _is_uri_path
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -265,14 +266,21 @@ class TorchProfilerWrapper(WorkerProfiler):
         # Set default max_name_column_width=100 to ensure profiler scopes like:
         # "attn_causal B=1 Q=1 S=159 H=14 D=64 KV_H=2 DT=bfloat16 BE=ROCM_ATTN"
         # have sufficient characters to show the full set of data
-        if row_limit is None:
-            return self.profiler.key_averages().table(
-                sort_by=sort_key, max_name_column_width=100
+        max_name_column_width = 100
+        group_by_input_shape = (
+            current_platform.is_cpu()
+            and self.profiler_config.torch_profiler_record_shapes
+        )
+        averages = self.profiler.key_averages(group_by_input_shape=group_by_input_shape)
+        if row_limit is None:  # use profiler default row limit of 100
+            return averages.table(
+                sort_by=sort_key,
+                max_name_column_width=max_name_column_width,
             )
-        return self.profiler.key_averages().table(
+        return averages.table(
             sort_by=sort_key,
             row_limit=row_limit,
-            max_name_column_width=100,
+            max_name_column_width=max_name_column_width,
         )
 
     def _write_profiler_table(self, rank: int, table: str) -> None:

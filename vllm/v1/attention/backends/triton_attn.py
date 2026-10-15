@@ -378,6 +378,10 @@ class TritonAttentionBackend(AttentionBackend):
         return "TRITON_ATTN"
 
     @classmethod
+    def supports_rswa(cls) -> bool:
+        return True
+
+    @classmethod
     def supports_sliding_window(cls) -> bool:
         return True
 
