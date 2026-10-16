@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Regression tests for attention benchmarks.
+"""Regression tests for attention benchmarks.
 
 This module uses the attention benchmark infrastructure in
 <vllm>/benchmarks/attention/ to test for performance regressions in
@@ -106,8 +105,7 @@ INTERMITTENT_CASES: dict[tuple[str, str, str, str], str] = {
 
 
 def get_gfx_target() -> str:
-    """
-    Get current gcn architecture name.
+    """Get current gcn architecture name.
     Likely works on non-rocm platforms, but untested
     """
     if current_platform.is_rocm():
@@ -116,8 +114,7 @@ def get_gfx_target() -> str:
 
 
 def get_attn_benchmarks_dir() -> Path:
-    """
-    Get path to attention benchmark directory
+    """Get path to attention benchmark directory
     This directory contains the benchmark script and YAML configs
     """
     test_dir = Path(__file__).parent
@@ -127,15 +124,12 @@ def get_attn_benchmarks_dir() -> Path:
 
 
 def get_benchmark_script_path() -> Path:
-    """
-    Get path to attention benchmark.py script
-    """
+    """Get path to attention benchmark.py script"""
     return get_attn_benchmarks_dir() / "benchmark.py"
 
 
 def get_config_path(config_name: str) -> Path:
-    """
-    Get path to benchmark config YAML.
+    """Get path to benchmark config YAML.
     config_name: config name without .yaml extension
     """
     configs_dir = get_attn_benchmarks_dir() / "configs" / "pytest_regression"
@@ -143,8 +137,7 @@ def get_config_path(config_name: str) -> Path:
 
 
 def _build_filters(cases_dict: dict, platform: str, config_name: str) -> list[dict]:
-    """
-    Build filter list from skip/intermittent cases dictionary.
+    """Build filter list from skip/intermittent cases dictionary.
 
     Args:
         cases_dict: Dictionary of (platform, config, batch_pattern, backend) -> reason
@@ -154,6 +147,7 @@ def _build_filters(cases_dict: dict, platform: str, config_name: str) -> list[di
     Returns:
         List of filter dicts suitable for --skip or --intermittent CLI arg.
         Groups by reason for efficiency.
+
     """
     filters: list[dict[str, Any]] = []
     for (plat, cfg, batch_pattern, backend), reason in cases_dict.items():
@@ -199,8 +193,7 @@ def run_benchmark_subprocess(
     skip_filters: list[dict] | None = None,
     intermittent_filters: list[dict] | None = None,
 ) -> tuple[bool, str, str]:
-    """
-    Run benchmark.py as subprocess and capture output.
+    """Run benchmark.py as subprocess and capture output.
 
     Creates output directory if needed, runs benchmark,
     saves stdout/stderr to log file.
@@ -219,6 +212,7 @@ def run_benchmark_subprocess(
 
     Raises:
         subprocess.TimeoutExpired: If benchmark exceeds BENCHMARK_TIMEOUT
+
     """
     skip_filters = skip_filters or []
     intermittent_filters = intermittent_filters or []
@@ -291,8 +285,7 @@ def run_benchmark_subprocess(
 
 
 def load_benchmark_results(json_path: str) -> list[dict]:
-    """
-    Load and parse benchmark results from JSON.
+    """Load and parse benchmark results from JSON.
 
     Args:
         json_path: Path to JSON results file
@@ -303,14 +296,14 @@ def load_benchmark_results(json_path: str) -> list[dict]:
     Raises:
         FileNotFoundError: If JSON file doesn't exist
         json.JSONDecodeError: If JSON is malformed
+
     """
     with open(json_path) as f:
         return json.load(f)
 
 
 def make_config_key(entry: dict) -> tuple:
-    """
-    Create hashable key from benchmark result entry for matching.
+    """Create hashable key from benchmark result entry for matching.
 
     Each test config YAML has a single model configuration, so only
     backend and batch_spec vary within a test run.
@@ -331,14 +324,14 @@ def make_config_key(entry: dict) -> tuple:
         ... }
         >>> make_config_key(entry)
         ('TRITON_ATTN', 'q1ks128')
+
     """
     config = entry["config"]
     return (config["backend"], config["batch_spec"])
 
 
 def calculate_sem(std_time: float, num_samples: int) -> float:
-    """
-    Calculate standard error of the mean.
+    """Calculate standard error of the mean.
 
     SEM = σ / √n
     where σ is standard deviation, n is number of samples
@@ -353,13 +346,13 @@ def calculate_sem(std_time: float, num_samples: int) -> float:
     Example:
         >>> calculate_sem(0.0001, 10)
         3.162277660168379e-05
+
     """
     return std_time / math.sqrt(num_samples)
 
 
 def format_config_details(entry: dict) -> str:
-    """
-    Format config entry as human-readable string for error messages.
+    """Format config entry as human-readable string for error messages.
 
     Args:
         entry: Benchmark result dict with "config" key
@@ -370,6 +363,7 @@ def format_config_details(entry: dict) -> str:
     Example:
         >>> format_config_details(entry)
         'backend=TRITON_ATTN, batch_spec=q1ks128, ...'
+
     """
     config = entry["config"]
     return (
@@ -383,14 +377,14 @@ def format_config_details(entry: dict) -> str:
 
 
 def print_last_n_lines(filepath: str, n: int = 20) -> None:
-    """
-    Print last N lines of a file.
+    """Print last N lines of a file.
 
     Useful for showing relevant error context without flooding output.
 
     Args:
         filepath: Path to file
         n: Number of lines to print (default: 20)
+
     """
     with open(filepath) as f:
         lines = f.readlines()
@@ -425,8 +419,7 @@ def test_attn_bench_regression(
     target_platforms: list[str],
     request: pytest.FixtureRequest,
 ):
-    """
-    Regression test for attention benchmark configurations.
+    """Regression test for attention benchmark configurations.
 
     This test runs the attention benchmark with a specified YAML config,
     validates the output structure against a golden reference, and checks
@@ -460,6 +453,7 @@ def test_attn_bench_regression(
 
     Examples:
         pytest test_benchmark_attention.py::test_benchmark_regression[gemma_2b_awq-gfx1151]
+
     """  # noqa: E501
     gfx_target = get_gfx_target()
 

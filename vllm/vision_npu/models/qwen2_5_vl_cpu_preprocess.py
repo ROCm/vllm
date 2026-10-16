@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-CPU preprocessing for Qwen2.5-VL vision models compiled for FlexMLRT.
+"""CPU preprocessing for Qwen2.5-VL vision models compiled for FlexMLRT.
 
 VitisAI-compiled models partition operations between CPU and NPU. FlexMLRT
 requires the CPU path to be implemented explicitly:

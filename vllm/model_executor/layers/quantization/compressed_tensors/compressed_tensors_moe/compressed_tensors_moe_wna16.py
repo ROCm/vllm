@@ -12,7 +12,6 @@ from compressed_tensors.quantization import (
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEExpertsModular,
     RoutedExperts,
     SharedExperts,
 )
@@ -37,7 +36,6 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     check_moe_marlin_supports_config,
     get_marlin_input_dtype,
-    marlin_make_workspace_new,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
@@ -144,8 +142,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         num_groups_w2: int | None = None,
         num_groups_w13: int | None = None,
     ) -> tuple[int, int, int]:
-        """
-        Get the shape of the weight based on the weight name, number of experts
+        """Get the shape of the weight based on the weight name, number of experts
         hidden size, intermediate size per partition, number of groups for w2,
         and number of groups for w13. Pass in num_groups_w2 and num_groups_w13
         for weight scales/zero_points.
@@ -474,18 +471,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                     torch.nn.Parameter(w2_input_global_scale, requires_grad=False),
                 )
 
-            # Marlin workspace — only needed for Marlin-family backends, not emulation.
-            if (
-                self.experts_cls is not None
-                and issubclass(self.experts_cls, FusedMoEExpertsModular)
-                and self.wna16_backend != WNA16MoEBackend.EMULATION
-            ):
-                layer.workspace = marlin_make_workspace_new(
-                    layer.w13_weight_packed.device,
-                    4,
-                    existing=getattr(layer, "workspace", None),
-                )
-
         # Alias packed weights to w13_weight/w2_weight for the modular kernel interface
         layer.w13_weight = layer.w13_weight_packed
         layer.w2_weight = layer.w2_weight_packed
@@ -529,7 +514,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             [E, N, K//8] -- the stride jumps over the pad, the kernels iterate
             only the real K//8 (zero extra FLOPs). Stride-aware on both paths:
             the Triton kernel reads B.stride(0/1/2); the HIP skinny kernel takes
-            an explicit B_row_stride_bytes."""
+            an explicit B_row_stride_bytes.
+            """
             E_dim, N_dim, k8 = w.shape
             if not (on_gfx1151() and w.device.type == "cuda"):
                 return w
@@ -545,7 +531,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         def convert_weights(w_packed: torch.Tensor) -> torch.Tensor:
             """Convert [E, K/8, N] GPTQ -> [E, N, K//8] skinny
-            (ExLlama shuffle)."""
+            (ExLlama shuffle).
+            """
             E_dim = w_packed.size(0)
             experts = []
             for e in range(E_dim):

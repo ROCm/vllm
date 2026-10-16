@@ -45,7 +45,8 @@ def is_enabled() -> bool:
 
 def _shape_supported(K: int, N: int, G: int, top_k: int) -> bool:
     """Divisibility constraints a (K, N, G, top_k) GEMM must meet for a tuned
-    tile family (top_k picks BN; K % G == 0 also gives K % GK == 0 since GK|G)."""
+    tile family (top_k picks BN; K % G == 0 also gives K % GK == 0 since GK|G).
+    """
     bn = _TILE_N_DIVISOR_BY_TOPK.get(top_k)
     return bn is not None and G == _SUPPORTED_G and K % G == 0 and N % bn == 0
 
@@ -63,7 +64,8 @@ def prefill_uses_rdna_moe_gemm(
     and apply() can agree on block_m up front. gemm1 = (K_hidden, N_gemm1, top_k);
     gemm2 = down proj (act_dim, K_hidden, top_k=1). The WMMA kernel is bf16-only
     (wmma_f32_16x16x16_bf16); any other dtype falls through to the Triton path,
-    which handles fp16."""
+    which handles fp16.
+    """
     if not is_enabled() or not on_gfx11():
         return False
     if in_dtype != torch.bfloat16:

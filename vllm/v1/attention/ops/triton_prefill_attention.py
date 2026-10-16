@@ -19,8 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""
-Memory-efficient attention for prefill.
+"""Memory-efficient attention for prefill.
 It supports page size = 1.
 """
 
@@ -323,7 +322,8 @@ def get_block_n(dtype: torch.dtype, head_dim: int | None = None) -> int:
     split-D ViT path wants an asymmetric BM=64 / BN=16 tile. Re-tuned after the
     head-stride 16B alignment hint (HEAD_STRIDE_ALIGNED_8) vectorized the Q/K/V
     loads and removed register spills: with spills gone the narrower BN=16 / NW=2
-    tile wins (BN=32/NW=4/WE=6 was sized for the old spilling codegen)."""
+    tile wins (BN=32/NW=4/WE=6 was sized for the old spilling codegen).
+    """
     if _is_rdna() and head_dim == 72 and dtype in (torch.bfloat16, torch.float16):
         return 16
     # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
@@ -396,8 +396,7 @@ def context_attention_fwd(
     sinks: torch.Tensor | None = None,
     sinks_bias_key0: bool = False,
 ):
-    """
-    q, k, v: [b * s, head, head_dim]
+    """q, k, v: [b * s, head, head_dim]
     b_start_loc: [b]
     b_seq_len: [b]
     out: [b * s, head, head_dim]

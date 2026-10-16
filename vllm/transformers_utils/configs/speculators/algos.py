@@ -16,8 +16,7 @@ def register_speculator(name):
 
 @register_speculator("eagle3")
 def update_eagle3(config_dict: dict, pre_trained_config: dict) -> None:
-    """
-    Apply Eagle-3 specific configuration transformations to the `dict` used to
+    """Apply Eagle-3 specific configuration transformations to the `dict` used to
     construct the Transformers PreTrainedConfig.
 
     Eagle-3 specific fields:
@@ -30,7 +29,6 @@ def update_eagle3(config_dict: dict, pre_trained_config: dict) -> None:
         provide intermediate hidden states that help the drafter make better
         predictions. This is the standard field used in Eagle3 checkpoints.
     """
-
     pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
     if config_dict.get("target_hidden_size") is not None:
         pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
@@ -56,8 +54,7 @@ def update_eagle3(config_dict: dict, pre_trained_config: dict) -> None:
 
 @register_speculator("peagle")
 def update_peagle(config_dict: dict, pre_trained_config: dict) -> None:
-    """
-    Apply PEagle (Parallel Eagle) specific configuration transformations to
+    """Apply PEagle (Parallel Eagle) specific configuration transformations to
     the `dict` used to construct the Transformers PreTrainedConfig.
 
     PEagle specific fields:
@@ -94,8 +91,7 @@ def update_peagle(config_dict: dict, pre_trained_config: dict) -> None:
 
 @register_speculator("dflash")
 def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
-    """
-    Apply DFlash specific configuration transformations to the `dict` used to
+    """Apply DFlash specific configuration transformations to the `dict` used to
     construct the Transformers PreTrainedConfig.
 
     DFlash specific fields:
@@ -152,8 +148,7 @@ def update_dflare(config_dict: dict, pre_trained_config: dict) -> None:
 
 @register_speculator("dflash2")
 def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
-    """
-    Apply DFlash2 specific configuration transformations to the `dict` used
+    """Apply DFlash2 specific configuration transformations to the `dict` used
     to construct the Transformers PreTrainedConfig.
 
     DFlash2 extends DFlash with a grouped convolution layer and a
@@ -176,8 +171,7 @@ def update_dflash2(config_dict: dict, pre_trained_config: dict) -> None:
 
 @register_speculator("dspark")
 def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
-    """
-    Apply DSpark specific configuration transformations to the `dict` used to
+    """Apply DSpark specific configuration transformations to the `dict` used to
     construct the Transformers PreTrainedConfig.
 
     DSpark extends DFlash with a Markov logit-bias head, reusing the same

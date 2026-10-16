@@ -566,7 +566,8 @@ _ROTATE_MAX = int(os.environ.get("VLLM_BENCH_ROTATE_MAX", "32"))
 def _clone_strided(t: torch.Tensor | None) -> torch.Tensor | None:
     """Clone preserving exact size AND stride (the K%2048 cliff workaround uses
     row-padded weight strides; a plain .clone() would compact them and change
-    the measured kernel). None passes through (symmetric path has no carrier)."""
+    the measured kernel). None passes through (symmetric path has no carrier).
+    """
     if t is None:
         return None
     c = torch.empty_strided(t.size(), t.stride(), dtype=t.dtype, device=t.device)

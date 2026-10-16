@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AngelSlim DFlare draft model (Gemma 4 and Qwen targets) for vLLM's
-parallel speculator path."""
+parallel speculator path.
+"""
 
 from collections.abc import Iterable
 from typing import Any, cast

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Regression test for OpenVLA model verifying vLLM output against reference tokens.
+"""Regression test for OpenVLA model verifying vLLM output against reference tokens.
 
 OpenVLA is a Vision-Language-Action model that outputs 7 discretized action tokens
 (xyz, rpy, gripper) with 256 bins each (token IDs 31744-31999 in Llama vocab).
@@ -65,6 +64,7 @@ def get_vllm_tokens(
 
     Returns:
         List of 7 action token IDs from the model output.
+
     """
     prompt = format_prompt(instruction)
 

@@ -490,7 +490,8 @@ def test_hybrid_can_implement_group_size(group_size, expected_ok):
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
 def test_hybrid_can_implement_per_channel_rejects_asymmetric():
     """Per-channel (group_size=-1) is symmetric-only: asymmetric zero points
-    must be rejected rather than silently accepted."""
+    must be rejected rather than silently accepted.
+    """
     from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
         MPLinearLayerConfig,
     )
@@ -670,7 +671,8 @@ def test_hip_skinny_wvSplitK_int4_g_rejects_bad_group_size(bad_group_size):
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
 def test_hip_skinny_wvSplitK_int4_g_rejects_per_channel_with_zero_points():
     """Per-channel (group_size=-1) is symmetric-only at the host boundary too:
-    passing zero_points must raise rather than dequantize incorrectly."""
+    passing zero_points must raise rather than dequantize incorrectly.
+    """
     import vllm._custom_ops as ops
     from vllm.utils.platform_utils import num_compute_units
 
