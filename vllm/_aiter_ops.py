@@ -2007,6 +2007,11 @@ def _resolve_situv2_activation() -> str:
     auto (default) and the legacy 1 mean a4w4; legacy 0 means a16w4.
     """
     value = envs.VLLM_ROCM_USE_AITER_MOE_SITUV2.lower()
+    if value == "auto" and current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx1250
+
+        if on_gfx1250():
+            return "a8w4"
     if value in ("auto", "1"):
         return "a4w4"
     if value == "0":
