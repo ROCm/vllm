@@ -96,7 +96,7 @@ jobs:
           echo "torchvision==0.28.${TORCH_PATCH_SUFFIX}+${TORCH_LOCAL}" >> constraints.txt
           # torchaudio is frozen at 2.11.0 (no 2.12+ exists); hardcode the
           # base version and only inherit the +rocm build-date suffix.
-          echo "torchaudio==2.11.0+${TORCH_LOCAL}" >> constraints.txt
+          echo "torchaudio==2.11.0.2+${TORCH_LOCAL}" >> constraints.txt
           cat constraints.txt
           # unsafe-best-match: uv defaults to stopping at the first
           # index that has a given package name, so PyPI (extra-index)
