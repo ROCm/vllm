@@ -793,6 +793,7 @@ def create_attention_profiler_scope(
     dtype: torch.dtype,
     is_causal: bool,
     v_token_stride: int | None = None,
+    block_diagonal_segments: list[int] | None = None,
 ) -> AbstractContextManager:
     """Create a profiler scope for attention operations with metadata.
 
@@ -813,6 +814,7 @@ def create_attention_profiler_scope(
             mult*H*D, e.g. 3*H*D). This carries a measurable latency impact on
             some GPUs (e.g. Strix Point cold cache); natural strides are omitted
             to keep the scope label short.
+        block_diagonal_segments: Per-segment lengths for block-diagonal attention
 
     Returns:
         Context manager for the profiler scope
@@ -831,11 +833,17 @@ def create_attention_profiler_scope(
         if v_token_stride is not None and v_token_stride != num_kv_heads * head_size
         else ""
     )
+    # Emit segs= field only when there are multiple segments.
+    segs_suffix = (
+        f" segs={','.join(map(str, block_diagonal_segments))}"
+        if block_diagonal_segments is not None and len(block_diagonal_segments) > 1
+        else ""
+    )
     scope_name = (
         f"attn_{causal_str} "
         f"B={batch_size} Q={max_query_len} S={max_seq_len} "
         f"H={num_heads} D={head_size} KV_H={num_kv_heads} "
-        f"DT={dtype_str} BE={backend_name}{vstride_suffix}"
+        f"DT={dtype_str} BE={backend_name}{vstride_suffix}{segs_suffix}"
     )
 
     return record_function_or_nullcontext(scope_name)

@@ -205,6 +205,12 @@ def triton_attn_wrapper(
     head_size = q.shape[2]
     num_kv_heads = k.shape[1]
 
+    # Compute segment lengths for block-diagonal attention in multi-segment batches.
+    block_diagonal_segments: list[int] | None = None
+    if cu_seqlens.numel() > 2:
+        seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        block_diagonal_segments = seg_lens.tolist()
+
     with create_attention_profiler_scope(
         backend_name="TRITON_ATTN",
         batch_size=batch_size,
@@ -216,6 +222,7 @@ def triton_attn_wrapper(
         dtype=q.dtype,
         is_causal=False,
         v_token_stride=v.stride(0),
+        block_diagonal_segments=block_diagonal_segments,
     ):
         context_attention_fwd(
             q,
