@@ -141,22 +141,19 @@ void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                  torch::Tensor& cu_seqlens, torch::Tensor& out,
                  torch::Tensor& final_state, double scale);
 
-// RDNA3.5 decode attention: the built rows as CSV, a row's index (-1 if not
-// built), and a launch by index.
-std::string rdna_singleseq_decode_table();
-int64_t rdna_singleseq_decode_variant(torch::IntArrayRef key);
-void rdna_singleseq_decode_attn(int64_t variant, torch::Tensor& q,
+// RDNA3.5 decode and prefill attention: the fields of every build (none off
+// gfx1151), and a launch of one build by its index.
+std::vector<int64_t> rdna_singleseq_decode_configs();
+void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
                                 torch::Tensor& kv_cache,
                                 torch::Tensor& block_table, torch::Tensor& out,
                                 torch::Tensor& acc, torch::Tensor& m,
                                 torch::Tensor& l, torch::Tensor& cnt,
                                 torch::Tensor& seq_lens, double scale);
 
-// RDNA3.5 prefill attention, likewise.
-std::string rdna_singleseq_prefill_table();
-int64_t rdna_singleseq_prefill_variant(torch::IntArrayRef key);
+std::vector<int64_t> rdna_singleseq_prefill_configs();
 void rdna_singleseq_prefill_attn(
-    int64_t variant, torch::Tensor& q, torch::Tensor& kv_cache,
+    int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,
     torch::Tensor& block_table, torch::Tensor& out, torch::Tensor& partial_o,
     torch::Tensor& partial_ml, torch::Tensor& counters, torch::Tensor& seq_lens,
     int64_t max_seq_len, double scale);

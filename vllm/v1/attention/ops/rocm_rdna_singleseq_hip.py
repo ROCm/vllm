@@ -2,16 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Lookup of the RDNA3.5 attention kernels built into ``_rocm_C``.
 
-Each row of ``rocm_rdna_singleseq_{decode,prefill}_variants.csv`` is one build,
-with its shape and launch knobs as compile-time defines.
+Each entry of ``csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h`` is one
+build, with its shape and launch knobs as compile-time constants.
 """
 
 import contextlib
-import csv
 import functools
-import io
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 
@@ -52,10 +49,8 @@ class KernelVariant:
 
     @property
     def name(self) -> str:
-        """The CSV row joined by "_"."""
-        return "rdna_singleseq_decode_" + "_".join(
-            map(str, variant_defines(self).values())
-        )
+        """The DecodeConfig fields joined by "_"."""
+        return "rdna_singleseq_decode_" + "_".join(map(str, config_fields(self)))
 
     @property
     def rows_padded(self) -> int:
@@ -81,27 +76,35 @@ class KernelVariant:
         return (rows, self.head_size), (rows,), cnt
 
 
-# Read by CMake and the tools; the wheel uses the rows built into _rocm_C.
-VARIANTS_CSV = Path(__file__).with_name("rocm_rdna_singleseq_decode_variants.csv")
-
-# CSV column -> KernelVariant field. BF16 sets dtype; every build is HND.
-_FIELDS = {
-    "HEAD_DIM": "head_size",
-    "NUM_Q_HEADS": "num_q_heads",
-    "NUM_KV_HEADS": "num_kv_heads",
-    "WINDOW": "window",
-    "MAX_QUERY_LEN": "max_query_len",
-    "PAGE_SIZE": "page_size",
-    "MAX_SEGMENTS": "max_segments",
-    "ROW_GROUPS": "row_groups",
-    "MIN_SEGMENT_BLOCKS": "min_segment_blocks",
-    "WAVES": "waves",
-    "HEAD_DIM_SPLIT": "head_dim_split",
-    "PREFETCH": "prefetch",
-    "V_IN_LDS": "v_in_lds",
-    "DOT_PRODUCT": "dot_product",
-}
+# DecodeConfig's fields (csrc/rocm/rdna_singleseq_decode_configs.h) in order,
+# as KernelVariant fields; the dtype is 0 for fp16 and 1 for bf16 (Dtype in
+# rdna_singleseq_attn_types.h). Every build is HND.
+DECODE_CONFIG_FIELDS = (
+    "head_size",
+    "num_q_heads",
+    "num_kv_heads",
+    "window",
+    "max_query_len",
+    "dtype",
+    "page_size",
+    "max_segments",
+    "row_groups",
+    "min_segment_blocks",
+    "waves",
+    "head_dim_split",
+    "prefetch",
+    "v_in_lds",
+    "dot_product",
+)
 _HND = 1
+
+
+def config_fields(variant: KernelVariant) -> list[int]:
+    """The variant's DecodeConfig fields, in order."""
+    return [
+        int(variant.dtype == torch.bfloat16) if f == "dtype" else getattr(variant, f)
+        for f in DECODE_CONFIG_FIELDS
+    ]
 
 
 def _lookup_key(v: KernelVariant) -> tuple:
@@ -116,46 +119,41 @@ def _lookup_key(v: KernelVariant) -> tuple:
     )
 
 
-def _built_rows(op_name: str) -> list[list[str]]:
-    """The header and rows built into _rocm_C; [] if none."""
+def _built_configs(op_name: str, fields: tuple[str, ...]) -> list[dict[str, int]]:
+    """The builds in _rocm_C as fields, by index, with the dtype as a torch
+    dtype."""
     with contextlib.suppress(ImportError):
         import vllm._rocm_C  # noqa: F401
     try:
-        op = getattr(torch.ops._rocm_C, op_name)
+        flat = getattr(torch.ops._rocm_C, op_name)()
     except (AttributeError, RuntimeError):
         return []
-    return list(csv.reader(io.StringIO(op())))
+    n = len(fields)
+    configs = []
+    for i in range(0, len(flat), n):
+        f = dict(zip(fields, flat[i : i + n], strict=True))
+        f["dtype"] = torch.bfloat16 if f["dtype"] else torch.float16
+        configs.append(f)
+    return configs
 
 
 @functools.cache
-def _table() -> tuple[tuple[str, ...], dict[tuple, KernelVariant]]:
-    first, *rows = _built_rows("rdna_singleseq_decode_table") or [[]]
-    header = tuple(first)
-    table = {}
-    for row in rows:
-        f = dict(zip(header, map(int, row), strict=True))
-        v = KernelVariant(
-            **{_FIELDS[c]: x for c, x in f.items() if c != "BF16"},
-            layout=_HND,
-            dtype=torch.bfloat16 if f["BF16"] else torch.float16,
-        )
-        table[_lookup_key(v)] = v
-    return header, table
+def _builds() -> list[KernelVariant]:
+    """The decode builds in _rocm_C, by index."""
+    return [
+        KernelVariant(**f, layout=_HND)
+        for f in _built_configs("rdna_singleseq_decode_configs", DECODE_CONFIG_FIELDS)
+    ]
+
+
+@functools.cache
+def _by_key() -> dict[tuple, KernelVariant]:
+    return {_lookup_key(v): v for v in _builds()}
 
 
 def variants() -> list[KernelVariant]:
-    """Every decode variant built into _rocm_C."""
-    return list(_table()[1].values())
-
-
-def variant_defines(variant: KernelVariant) -> dict[str, int]:
-    """The variant's CSV row, in column order."""
-    return {
-        c: int(variant.dtype == torch.bfloat16)
-        if c == "BF16"
-        else getattr(variant, _FIELDS[c])
-        for c in _table()[0]
-    }
+    """Every decode build in _rocm_C."""
+    return list(_builds())
 
 
 def variant_for(
@@ -171,7 +169,7 @@ def variant_for(
     """The build for one call, or None."""
     if layout != _HND:
         return None
-    return _table()[1].get(
+    return _by_key().get(
         (
             num_q_heads,
             num_kv_heads,
@@ -185,7 +183,7 @@ def variant_for(
 
 
 class _Builtin:
-    """A variant compiled into _rocm_C."""
+    """A decode build in _rocm_C."""
 
     def __init__(self, index: int):
         self.index = index
@@ -202,13 +200,10 @@ _loaded: dict[KernelVariant, _Builtin | None] = {}
 def load(variant: KernelVariant) -> _Builtin | None:
     """The variant in _rocm_C, or None if unavailable."""
     if variant not in _loaded:
-        try:
-            op = torch.ops._rocm_C.rdna_singleseq_decode_variant
-        except (AttributeError, RuntimeError):
-            index = -1
-        else:
-            index = int(op(list(variant_defines(variant).values())))
-        _loaded[variant] = _Builtin(index) if index >= 0 else None
+        builds = _builds()
+        _loaded[variant] = (
+            _Builtin(builds.index(variant)) if variant in builds else None
+        )
     return _loaded[variant]
 
 
@@ -244,12 +239,9 @@ SUPPORTED_HEAD_SIZES = (64, 96, 128, 256, 512)
 
 # ---------------------------------------------------------------- prefill
 #
-# A shape has one row per step of M; a row serves M from its MIN_QUERY_LEN up
-# to the next row's, and the first row also every smaller M.
+# A shape has one build per step of M; a build serves M from its min_query_len
+# up to the next one's, and the first also every smaller M.
 
-PREFILL_VARIANTS_CSV = Path(__file__).with_name(
-    "rocm_rdna_singleseq_prefill_variants.csv"
-)
 # Fewest query tokens the prefill kernel serves.
 PREFILL_MIN_M = MAX_M + 1
 
@@ -260,22 +252,25 @@ def prefill_target_workgroups(device: torch.device) -> int:
     return 4 * torch.cuda.get_device_properties(device).multi_processor_count
 
 
-_PREFILL_FIELDS = {
-    "HEAD_DIM": "head_size",
-    "NUM_Q_HEADS": "num_q_heads",
-    "NUM_KV_HEADS": "num_kv_heads",
-    "WINDOW": "window",
-    "PAGE_SIZE": "page_size",
-    "MIN_QUERY_LEN": "min_query_len",
-    "WAVES": "waves",
-    "KEY_TILE": "key_tile",
-    "HEAD_DIM_SPLIT": "head_dim_split",
-    "V_T": "v_t",
-    "DOUBLE_BUFFER": "double_buffer",
-    "KEY_WAVES": "key_waves",
-    "MAX_SEGMENTS": "max_segments",
-    "HEAD_GROUP": "head_group",
-}
+# PrefillConfig's fields (csrc/rocm/rdna_singleseq_prefill_configs.h) in order,
+# as PrefillVariant fields, the dtype as for decode.
+PREFILL_CONFIG_FIELDS = (
+    "head_size",
+    "num_q_heads",
+    "num_kv_heads",
+    "window",
+    "dtype",
+    "page_size",
+    "min_query_len",
+    "waves",
+    "key_tile",
+    "head_dim_split",
+    "v_t",
+    "double_buffer",
+    "key_waves",
+    "max_segments",
+    "head_group",
+)
 
 
 @dataclass(frozen=True)
@@ -300,9 +295,9 @@ class PrefillVariant:
 
     @property
     def name(self) -> str:
-        """The CSV row joined by "_"."""
+        """The PrefillConfig fields joined by "_"."""
         return "rdna_singleseq_prefill_" + "_".join(
-            map(str, prefill_variant_defines(self).values())
+            map(str, prefill_config_fields(self))
         )
 
     @property
@@ -315,28 +310,28 @@ class PrefillVariant:
         return 2 * prefill_target_workgroups(device) * self.block_rows
 
 
-def prefill_variant_defines(variant: PrefillVariant) -> dict[str, int]:
-    """The variant's CSV row, in column order."""
-    return {
-        c: int(variant.dtype == torch.bfloat16)
-        if c == "BF16"
-        else getattr(variant, _PREFILL_FIELDS[c])
-        for c in _prefill_table()[0]
-    }
+def prefill_config_fields(variant: PrefillVariant) -> list[int]:
+    """The variant's PrefillConfig fields, in order."""
+    return [
+        int(variant.dtype == torch.bfloat16) if f == "dtype" else getattr(variant, f)
+        for f in PREFILL_CONFIG_FIELDS
+    ]
 
 
 @functools.cache
-def _prefill_table() -> tuple[tuple[str, ...], dict[tuple, list[PrefillVariant]]]:
-    """Header, and rows by M per (Hq, Hkv, D, page, window, dtype)."""
-    first, *rows = _built_rows("rdna_singleseq_prefill_table") or [[]]
-    header = tuple(first)
+def _prefill_builds() -> list[PrefillVariant]:
+    """The prefill builds in _rocm_C, by index."""
+    return [
+        PrefillVariant(**f)
+        for f in _built_configs("rdna_singleseq_prefill_configs", PREFILL_CONFIG_FIELDS)
+    ]
+
+
+@functools.cache
+def _prefill_table() -> dict[tuple, list[PrefillVariant]]:
+    """The builds by M per (Hq, Hkv, D, page, window, dtype)."""
     table: dict[tuple, list[PrefillVariant]] = {}
-    for row in rows:
-        f = dict(zip(header, map(int, row), strict=True))
-        v = PrefillVariant(
-            **{_PREFILL_FIELDS[c]: x for c, x in f.items() if c != "BF16"},
-            dtype=torch.bfloat16 if f["BF16"] else torch.float16,
-        )
+    for v in _prefill_builds():
         key = (
             v.num_q_heads,
             v.num_kv_heads,
@@ -348,7 +343,7 @@ def _prefill_table() -> tuple[tuple[str, ...], dict[tuple, list[PrefillVariant]]
         table.setdefault(key, []).append(v)
     for by_m in table.values():
         by_m.sort(key=lambda v: v.min_query_len)
-    return header, table
+    return table
 
 
 def prefill_variants(
@@ -360,7 +355,7 @@ def prefill_variants(
     dtype: torch.dtype,
 ) -> list[PrefillVariant]:
     """Every row of one shape, sorted by M."""
-    return _prefill_table()[1].get(
+    return _prefill_table().get(
         (num_q_heads, num_kv_heads, head_size, page_size, window, dtype), []
     )
 
@@ -386,7 +381,7 @@ def prefill_variant_for(
 
 
 class _BuiltinPrefill:
-    """A prefill variant compiled into _rocm_C."""
+    """A prefill build in _rocm_C."""
 
     def __init__(self, index: int):
         self.index = index
@@ -403,13 +398,10 @@ _prefill_loaded: dict[PrefillVariant, _BuiltinPrefill | None] = {}
 def load_prefill(variant: PrefillVariant) -> _BuiltinPrefill | None:
     """The variant in _rocm_C, or None if unavailable."""
     if variant not in _prefill_loaded:
-        try:
-            op = torch.ops._rocm_C.rdna_singleseq_prefill_variant
-        except (AttributeError, RuntimeError):
-            index = -1
-        else:
-            index = int(op(list(prefill_variant_defines(variant).values())))
-        _prefill_loaded[variant] = _BuiltinPrefill(index) if index >= 0 else None
+        builds = _prefill_builds()
+        _prefill_loaded[variant] = (
+            _BuiltinPrefill(builds.index(variant)) if variant in builds else None
+        )
     return _prefill_loaded[variant]
 
 

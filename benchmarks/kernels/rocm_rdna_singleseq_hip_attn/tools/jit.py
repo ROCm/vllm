@@ -3,7 +3,8 @@
 """Standalone builds of the RDNA3.5 attention kernels, called through ctypes.
 
 `install()` makes ROCM_RDNA_SINGLESEQ_ATTN use them, with knobs from
-`override()` on top of the CSV row. `paths()` reports the path the backend took.
+`override()` on top of the built config. `paths()` reports the path the backend
+took.
 """
 
 import contextlib
@@ -27,33 +28,49 @@ _COMMON = (
     _CSRC / "rdna_singleseq_attn_common.cuh",
     _CSRC / "rdna_singleseq_attn_launch.h",
 )
+# Not the configs headers: their entries do not change a build.
 _SOURCES = (_CSRC / "rdna_singleseq_decode_attn.cu", *_COMMON)
 _PREFILL_SOURCES = (_CSRC / "rdna_singleseq_prefill_attn.cu", *_COMMON)
 _ARCH = os.environ.get("RDNA_SINGLESEQ_JIT_ARCH", "gfx1151")
 
-_WRAPPER = """#include <hip/hip_runtime.h>
-
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-
-#include "rdna_singleseq_decode_attn.cu"
+_WRAPPER = """#include "rdna_singleseq_decode_attn.cu"
+using namespace rdna_singleseq;
 extern "C" __attribute__((visibility("default"))) void rdna_singleseq_decode_launch(
-    const rdna_singleseq::LaunchArgs* a) {
-  launch(*a);
-}
+    const LaunchArgs* a) {{
+  launch_decode<DecodeConfig{{{fields}}}>(*a);
+}}
 """
-_PREFILL_WRAPPER = """#include <hip/hip_runtime.h>
-
-#include <algorithm>
-#include <cmath>
-
-#include "rdna_singleseq_prefill_attn.cu"
+_PREFILL_WRAPPER = """#include "rdna_singleseq_prefill_attn.cu"
+using namespace rdna_singleseq;
 extern "C" __attribute__((visibility("default"))) void rdna_singleseq_prefill_launch(
-    const rdna_singleseq::PrefillArgs* a) {
-  launch(*a);
-}
+    const PrefillArgs* a) {{
+  launch_prefill<PrefillConfig{{{fields}}}>(*a);
+}}
 """
+
+
+def cpp_fields(fields: list[int], names: tuple[str, ...]) -> str:
+    """A config's fields, named by `names`, as C++ initializers: the head size
+    and dtype as their HeadDim and Dtype enumerators
+    (csrc/rocm/rdna_singleseq_attn_types.h)."""
+    out = []
+    for name, x in zip(names, fields, strict=True):
+        if name == "head_size":
+            out.append(f"HeadDim::k{x}")
+        elif name == "dtype":
+            out.append("Dtype::kBf16" if x else "Dtype::kFp16")
+        else:
+            out.append(str(x))
+    return ", ".join(out)
+
+
+def parse_cpp_fields(text: str) -> list[int]:
+    """The fields of C++ initializers written by `cpp_fields`."""
+    enums = {"Dtype::kFp16": 0, "Dtype::kBf16": 1}
+    return [
+        enums[t] if t in enums else int(t.removeprefix("HeadDim::k"))
+        for t in map(str.strip, text.split(","))
+    ]
 
 
 class _LaunchArgs(ctypes.Structure):
@@ -153,13 +170,15 @@ def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
     """Compile one variant, cached by a hash of the sources and command."""
     prefill = isinstance(v, R.PrefillVariant)
     if prefill:
-        defines = R.prefill_variant_defines(v)
-        tag = "prefill_" + "_".join(map(str, defines.values())) + f"_ab{_ablate}"
-        kernel, wrapper = "prefill_attn", "prefill_wrapper.hip"
+        fields = cpp_fields(R.prefill_config_fields(v), R.PREFILL_CONFIG_FIELDS)
+        tag = f"{v.name}_ab{_ablate}"
+        kernel, template = "prefill_attn", _PREFILL_WRAPPER
     else:
-        defines = R.variant_defines(v)
+        fields = cpp_fields(R.config_fields(v), R.DECODE_CONFIG_FIELDS)
         tag = f"{v.name}_l{v.layout}_ab{_ablate}"
-        kernel, wrapper = "decode_attn", "wrapper.hip"
+        kernel, template = "decode_attn", _WRAPPER
+    wrapper = _cache / f"{tag}.hip"
+    _write(wrapper, template.format(fields=fields))
     clang, rpath = _toolchain()
     cmd = [
         *clang,
@@ -174,11 +193,10 @@ def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
         "-Wno-unused-variable",
         # Builds loaded together need distinct kernel names.
         f"-D{kernel}={kernel}_{hashlib.sha256(tag.encode()).hexdigest()[:16]}",
-        *(f"-D{c}={x}" for c, x in defines.items()),
         f"-DABLATE={_ablate}",
         f"-I{_CSRC}",
         f"-Wl,-rpath,{rpath}",
-        str(_cache / wrapper),
+        str(wrapper),
     ]
     h = hashlib.sha256((source_digest(prefill) + " ".join(cmd)).encode()).hexdigest()
     so = _cache / f"{tag}-{h[:16]}.so"
@@ -414,24 +432,18 @@ def install(ablate: int = 0) -> None:
     _ablate = ablate
     _cache = (Path(envs.VLLM_CACHE_ROOT) / "rdna_singleseq_jit").resolve()
     _cache.mkdir(parents=True, exist_ok=True)
-    write_wrappers()
     B.load = load
     B.variant_for = variant_for
     B.load_prefill = load
     B.prefill_variant_for = prefill_variant_for
 
 
-def write_wrappers() -> None:
-    """Write the decode and prefill wrappers to _cache."""
-    for name, text in (
-        ("wrapper.hip", _WRAPPER),
-        ("prefill_wrapper.hip", _PREFILL_WRAPPER),
-    ):
-        wrapper = _cache / name
-        if not wrapper.is_file() or wrapper.read_text() != text:
-            tmp = wrapper.with_suffix(f".{os.getpid()}.tmp")
-            tmp.write_text(text)
-            os.replace(tmp, wrapper)
+def _write(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically, unless it is already there."""
+    if not path.is_file() or path.read_text() != text:
+        tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
 
 
 @contextlib.contextmanager
