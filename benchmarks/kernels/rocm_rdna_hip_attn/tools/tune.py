@@ -15,11 +15,11 @@ in an interleaved A/B against TRITON_ATTN.
 
 Prefill batches (--prefill-batch): per cell, the build and head group.
 
-`--apply` writes accepted decisions into csrc/rocm/rdna_singleseq_*_configs.h,
+`--apply` writes accepted decisions into csrc/rocm/rdna_*_configs.h,
 refusing those measured on another kernel source or row.
 
     PYTHONPATH=$PWD python \\
-        benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/tune.py \\
+        benchmarks/kernels/rocm_rdna_hip_attn/tools/tune.py \\
         --hq 32 --hkv 8 --head-dim 128 --m 1 \\
         --points points.jsonl --decisions decisions.jsonl
 """
@@ -234,7 +234,7 @@ def check_batch(module, v, repeat=2):
     padded sequence; the padded rows must stay unwritten."""
     import torch
 
-    from vllm.v1.attention.ops.rocm_rdna_singleseq_hip import make_scratch
+    from vllm.v1.attention.ops.rocm_rdna_hip import make_scratch
 
     base = max(1040, v.window + 64, v.page_size + 1000)
     lens = [base, 48, 0]
@@ -294,7 +294,7 @@ def check(module, v, repeat=2):
     NaN-filled output, launched `repeat` times on one scratch."""
     import torch
 
-    from vllm.v1.attention.ops.rocm_rdna_singleseq_hip import make_scratch
+    from vllm.v1.attention.ops.rocm_rdna_hip import make_scratch
 
     worst = 0.0
     scratch = make_scratch(v, torch.device("cuda"))
@@ -348,8 +348,8 @@ def tune(a) -> None:
     from runner import run_attention_benchmark
 
     import vllm
-    import vllm.v1.attention.backends.rocm_rdna_singleseq_attn as backend
-    from vllm.v1.attention.ops.rocm_rdna_singleseq_hip import KernelVariant, variant_for
+    import vllm.v1.attention.backends.rocm_rdna_attn as backend
+    from vllm.v1.attention.ops.rocm_rdna_hip import KernelVariant, variant_for
 
     jit.install()
     common.gc = types.SimpleNamespace(collect=lambda *x: 0)
@@ -422,7 +422,7 @@ def tune(a) -> None:
         from common import BenchmarkConfig
 
         cfg = BenchmarkConfig(
-            backend="ROCM_RDNA_SINGLESEQ_ATTN",
+            backend="ROCM_RDNA_ATTN",
             batch_spec=cell if batch else f"q{m}s{cell}",
             num_layers=10,
             min_working_set_mb=96,
@@ -740,7 +740,7 @@ def tune_prefill(a) -> None:
     from triton.testing import do_bench
 
     import vllm
-    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
     from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
     jit.install()
@@ -963,7 +963,7 @@ def tune_prefill(a) -> None:
                         times.setdefault((b, c), []).append(float("inf"))
                 for k in sorted(finalists[m]):
                     times.setdefault((k, c), []).append(
-                        harness("ROCM_RDNA_SINGLESEQ_ATTN", *c, dict(json.loads(k)))
+                        harness("ROCM_RDNA_ATTN", *c, dict(json.loads(k)))
                     )
     med = {key: statistics.median(t) for key, t in times.items()}
 
@@ -1022,7 +1022,7 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
     import jit
     import torch
 
-    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     hq, hkv, d, win = dec["hq"], dec["hkv"], dec["d"], dec["window"]
     tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + " prefill"
@@ -1092,7 +1092,7 @@ def prefill_batch_cells(window, kv_bytes_per_key):
     """((min mean M, min keys), representative batches) of every cell."""
     import numpy as np
 
-    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     out = []
     for i, m_lo in enumerate(R.PREFILL_BATCH_MEAN_M):
@@ -1119,7 +1119,7 @@ def tune_prefill_batch(a) -> None:
     import jit
     import torch
 
-    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     jit.install()
     dtype = utils.torch_dtype(a.dtype)
@@ -1251,7 +1251,7 @@ def apply_prefill_batch(dec: dict, block_sizes: list[int]) -> int:
     prefill builds changed since."""
     import torch
 
-    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     hq, hkv, d, win = dec["hq"], dec["hkv"], dec["d"], dec["window"]
     tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + " batch"
@@ -1292,10 +1292,10 @@ def apply_prefill_batch(dec: dict, block_sizes: list[int]) -> int:
 
 
 _CSRC = _HERE.parents[4] / "csrc" / "rocm"
-DECODE_CONFIGS_H = _CSRC / "rdna_singleseq_decode_configs.h"
-DECODE_BATCH_CONFIGS_H = _CSRC / "rdna_singleseq_decode_batch_configs.h"
-PREFILL_CONFIGS_H = _CSRC / "rdna_singleseq_prefill_configs.h"
-PREFILL_BATCH_CONFIGS_H = _CSRC / "rdna_singleseq_prefill_batch_configs.h"
+DECODE_CONFIGS_H = _CSRC / "rdna_decode_configs.h"
+DECODE_BATCH_CONFIGS_H = _CSRC / "rdna_decode_batch_configs.h"
+PREFILL_CONFIGS_H = _CSRC / "rdna_prefill_configs.h"
+PREFILL_BATCH_CONFIGS_H = _CSRC / "rdna_prefill_batch_configs.h"
 # One config entry per line.
 _ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
 
@@ -1327,7 +1327,7 @@ def apply(path: str, block_sizes: list[int]) -> None:
     import jit
     import torch
 
-    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     # The shape: the first seven fields.
     assert R.DECODE_CONFIG_FIELDS[:7] == (

@@ -3,8 +3,8 @@
 """Attention for gfx1151.
 
 Decodes of up to MAX_M query tokens per sequence run
-csrc/rocm/rdna_singleseq_decode_attn.cu, other batches
-csrc/rocm/rdna_singleseq_prefill_attn.cu, on TRITON_ATTN's KV cache. Anything
+csrc/rocm/rdna_decode_attn.cu, other batches
+csrc/rocm/rdna_prefill_attn.cu, on TRITON_ATTN's KV cache. Anything
 the kernels do not support runs TRITON_ATTN.
 """
 
@@ -31,7 +31,7 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.attention.ops.rocm_rdna_singleseq_hip import (
+from vllm.v1.attention.ops.rocm_rdna_hip import (
     MAX_M,
     PREFILL_MIN_M,
     SUPPORTED_HEAD_SIZES,
@@ -84,7 +84,7 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 @dataclass
-class RocmRdnaSingleSeqMetadata(TritonAttentionMetadata):
+class RocmRdnaMetadata(TritonAttentionMetadata):
     """Triton's metadata plus the host's copy of the batch for the prefill
     plan."""
 
@@ -99,7 +99,7 @@ class RocmRdnaSingleSeqMetadata(TritonAttentionMetadata):
     plans: dict = field(default_factory=dict)
 
 
-class RocmRdnaSingleSeqMetadataBuilder(TritonAttentionMetadataBuilder):
+class RocmRdnaMetadataBuilder(TritonAttentionMetadataBuilder):
     """Triton's builder, decodes first and counted. CUDA graphs only for
     uniform decode batches: a prefill plan follows the host."""
 
@@ -116,7 +116,7 @@ class RocmRdnaSingleSeqMetadataBuilder(TritonAttentionMetadataBuilder):
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> RocmRdnaSingleSeqMetadata:
+    ) -> RocmRdnaMetadata:
         md = super().build(common_prefix_len, common_attn_metadata, fast_build)
         num_decodes = num_decode_tokens = 0
         if self.reorder_batch_threshold is not None:
@@ -125,7 +125,7 @@ class RocmRdnaSingleSeqMetadataBuilder(TritonAttentionMetadataBuilder):
                 decode_threshold=self.reorder_batch_threshold,
                 require_uniform=True,
             )
-        return RocmRdnaSingleSeqMetadata(
+        return RocmRdnaMetadata(
             **{f.name: getattr(md, f.name) for f in fields(TritonAttentionMetadata)},
             query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
             seq_lens_cpu=common_attn_metadata.seq_lens_cpu_upper_bound,
@@ -134,7 +134,7 @@ class RocmRdnaSingleSeqMetadataBuilder(TritonAttentionMetadataBuilder):
         )
 
 
-class RocmRdnaSingleSeqAttentionBackend(TritonAttentionBackend):
+class RocmRdnaAttentionBackend(TritonAttentionBackend):
     """TRITON_ATTN with the RDNA3.5 kernels."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -146,15 +146,15 @@ class RocmRdnaSingleSeqAttentionBackend(TritonAttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "ROCM_RDNA_SINGLESEQ_ATTN"
+        return "ROCM_RDNA_ATTN"
 
     @staticmethod
-    def get_impl_cls() -> type["RocmRdnaSingleSeqAttentionImpl"]:
-        return RocmRdnaSingleSeqAttentionImpl
+    def get_impl_cls() -> type["RocmRdnaAttentionImpl"]:
+        return RocmRdnaAttentionImpl
 
     @staticmethod
-    def get_builder_cls() -> type[RocmRdnaSingleSeqMetadataBuilder]:
-        return RocmRdnaSingleSeqMetadataBuilder
+    def get_builder_cls() -> type[RocmRdnaMetadataBuilder]:
+        return RocmRdnaMetadataBuilder
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -203,7 +203,7 @@ class RocmRdnaSingleSeqAttentionBackend(TritonAttentionBackend):
         return (KVCacheLayout.LBHNC,)
 
 
-class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
+class RocmRdnaAttentionImpl(TritonAttentionImpl):
     """Runs the RDNA3.5 kernels when they support the call, else Triton."""
 
     def __init__(self, *args, **kwargs):
@@ -227,7 +227,7 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
         if self._rejected != reason:
             self._rejected = reason
             logger.info_once(
-                "ROCM_RDNA_SINGLESEQ_ATTN falling back to Triton: %s",
+                "ROCM_RDNA_ATTN falling back to Triton: %s",
                 reason,
                 scope="local",
             )
@@ -501,7 +501,7 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
         hq, hkv, d = self.num_heads, self.num_kv_heads, self.head_size
         if planned:
             variant, plan, head_group, starts = self._plan(
-                cast(RocmRdnaSingleSeqMetadata, md), block_size, win, first, q
+                cast(RocmRdnaMetadata, md), block_size, win, first, q
             )
         else:
             variant = prefill_variant_for(hq, hkv, d, block_size, 1, win, q.dtype, m)
@@ -547,7 +547,7 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
 
     def _plan(
         self,
-        md: RocmRdnaSingleSeqMetadata,
+        md: RocmRdnaMetadata,
         block_size: int,
         win: int,
         first: int,

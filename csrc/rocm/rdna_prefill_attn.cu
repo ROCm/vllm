@@ -2,7 +2,7 @@
 // prefix, or a batch through plan_prefill's work list, causal and optionally
 // windowed, over the paged KV cache
 // (num_pages, NUM_KV_HEADS, PAGE_SIZE, 2 * HEAD_DIM), as a template on one
-// entry of rdna_singleseq_prefill_configs.h.
+// entry of rdna_prefill_configs.h.
 //
 // FlashAttention-2 on WMMA 16x16x16. One workgroup per (kv head, query tile,
 // KV segment); row r of a kv head is token r / G, q head kvHead * G + r % G.
@@ -19,11 +19,11 @@
 #include <cmath>
 #include <type_traits>
 
-#include "rdna_singleseq_attn_common.cuh"
-#include "rdna_singleseq_attn_launch.h"
-#include "rdna_singleseq_prefill_configs.h"
+#include "rdna_attn_common.cuh"
+#include "rdna_attn_launch.h"
+#include "rdna_prefill_configs.h"
 
-namespace rdna_singleseq {
+namespace rdna {
 
 // The largest divisor of n up to cap.
 constexpr int largest_divisor_up_to(int n, int cap) {
@@ -853,7 +853,7 @@ struct Prefill {
   }
 };
 
-// Arguments are checked by rdna_singleseq_registry.cu. Splits the KV
+// Arguments are checked by rdna_registry.cu. Splits the KV
 // until the GPU is full, keeping at least kMinSegmentSteps steps per segment;
 // a batch's plan has split it already.
 template <PrefillConfig C>
@@ -907,4 +907,4 @@ void launch_prefill(const PrefillArgs& a) {
 
 }  // namespace
 
-}  // namespace rdna_singleseq
+}  // namespace rdna
