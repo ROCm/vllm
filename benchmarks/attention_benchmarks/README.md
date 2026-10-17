@@ -37,11 +37,11 @@ python benchmark.py --backends TRITON_ATTN --batch-specs q1s512 \
 ## Prefill and CUDA graphs
 
 Specs are timed under CUDA graphs unless `--no-cuda-graphs` is passed.
-`ROCM_RDNA_SINGLESEQ_ATTN` falls back to Triton for calls of more than 8 query
+`ROCM_RDNA_ATTN` falls back to Triton for calls of more than 8 query
 tokens under capture, so time its prefill and extend specs without graphs:
 
 ```bash
-python benchmark.py --backends ROCM_RDNA_SINGLESEQ_ATTN --batch-specs q512s4096 \
+python benchmark.py --backends ROCM_RDNA_ATTN --batch-specs q512s4096 \
     --num-q-heads 32 --num-kv-heads 8 --head-dim 128 --dtype bfloat16 \
     --no-cuda-graphs
 ```

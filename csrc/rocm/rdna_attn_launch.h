@@ -4,10 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
-namespace rdna_singleseq {
+namespace rdna {
 
 // Raw pointers keep torch headers out of the kernels. Mirrored by
-// benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/jit.py.
+// benchmarks/kernels/rocm_rdna_hip_attn/tools/jit.py.
 struct LaunchArgs {
   const void* q;
   const void* kv;
@@ -21,17 +21,24 @@ struct LaunchArgs {
   int bt_width;
   float scale;
   hipStream_t stream;
+  // Batched builds: sequences, and per-sequence strides.
+  int nseq;
+  int bt_stride, acc_stride, ml_stride, cnt_stride;
 };
 
 using LaunchFn = void (*)(const LaunchArgs&);
 
 // The launch function of each entry of kDecodeConfigs, null until its unit
-// (cmake/rocm_rdna_singleseq_attn.cmake) registers it. Defined in
-// rdna_singleseq_registry.cu.
+// (cmake/rocm_rdna_attn.cmake) registers it. Defined in
+// rdna_registry.cu.
 LaunchFn* decode_launchers();
+// Likewise for kDecodeBatchConfigs.
+LaunchFn* decode_batch_launchers();
 
 // One sequence of num_tokens query tokens. partial_o, partial_ml and counters
-// are the split-KV scratch; max_seq_len only sizes the split.
+// are the split-KV scratch; max_seq_len only sizes the split. With a plan
+// (plan_prefill's [num_entries, 4] work list), a batch at query_start;
+// head_group 0 is the build's.
 struct PrefillArgs {
   const void* q;
   const void* kv;
@@ -45,6 +52,11 @@ struct PrefillArgs {
   int max_seq_len;
   float scale;
   hipStream_t stream;
+  const int* plan;
+  const int* query_start;
+  int num_entries;
+  int bt_stride;
+  int head_group;
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);
@@ -52,4 +64,4 @@ using PrefillFn = void (*)(const PrefillArgs&);
 // Likewise for kPrefillConfigs.
 PrefillFn* prefill_launchers();
 
-}  // namespace rdna_singleseq
+}  // namespace rdna
