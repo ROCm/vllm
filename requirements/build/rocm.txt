@@ -1,13 +1,16 @@
 # Common dependencies
 -r ../common.txt
 
-
---extra-index-url https://download.pytorch.org/whl/rocm7.1
+# AMD provides this interactive web page documenting the correct
+# versions of torch, torchvision, and torchaudio given a ROCm release
+# version, device, and OS:
+#
+# https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html
+#
+--extra-index-url https://stable.repo.amd.com/rocm/whl-next/
 torch==2.13.0
 torchvision==0.28.0
-# torchaudio was retired at 2.11 (no 2.12+; see pytorch/audio#3902). Its
-# terminal release declares no torch pin and floats across torch minors.
-torchaudio==2.11.0
+torchaudio==2.11.0.2
 triton
 cmake>=3.26.1,<4
 packaging>=26.2
