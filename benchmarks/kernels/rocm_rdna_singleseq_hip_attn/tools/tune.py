@@ -214,7 +214,8 @@ def reference(q, kv, s, window=0):
 
 def check(module, v, repeat=2):
     """Worst relative error over several contexts, each on new inputs and a
-    NaN-filled output, launched `repeat` times on one scratch."""
+    NaN-filled output, launched `repeat` times on one scratch.
+    """
     import torch
 
     from vllm.v1.attention.ops.rocm_rdna_singleseq_hip import make_scratch

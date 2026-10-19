@@ -2,8 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Universal vLLM Attention Benchmark
+"""Universal vLLM Attention Benchmark.
 
 Benchmark any attention backend with the extended grammar.
 Supports standard attention (Flash/Triton/FlashInfer) and MLA backends.
@@ -23,6 +22,7 @@ Examples:
 
     # Parameter sweep (YAML config - recommended)
     python benchmark.py --config configs/cutlass_numsplits.yaml
+
 """
 
 import argparse
@@ -89,8 +89,7 @@ def run_mla_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
 def run_benchmark(
     config: BenchmarkConfig, cooldown: int = 0, **kwargs
 ) -> BenchmarkResult:
-    """
-    Run a single benchmark with proper backend selection.
+    """Run a single benchmark with proper backend selection.
 
     Args:
         config: BenchmarkConfig with backend, batch_spec, and model params
@@ -99,6 +98,7 @@ def run_benchmark(
 
     Returns:
         BenchmarkResult (may have error field set on failure)
+
     """
     try:
         if is_mla_backend(config.backend):
@@ -134,8 +134,7 @@ def run_model_parameter_sweep(
     intermittent_filters: list[dict] | None = None,
     cooldown: int = 0,
 ) -> list[BenchmarkResult]:
-    """
-    Run model parameter sweep for given backends and batch specs.
+    """Run model parameter sweep for given backends and batch specs.
 
     Args:
         backends: List of backend names
@@ -145,9 +144,11 @@ def run_model_parameter_sweep(
         console: Rich console for output
         skip_filters: Optional list of skip filter dicts
         intermittent_filters: Optional list of intermittent filter dicts
+        cooldown: Seconds to sleep after benchmark completes (for thermal management)
 
     Returns:
         List of BenchmarkResult objects
+
     """
     skip_filters = skip_filters or []
     intermittent_filters = intermittent_filters or []
@@ -343,8 +344,7 @@ def run_parameter_sweep(
     intermittent_filters: list[dict] | None = None,
     cooldown: int = 0,
 ) -> list[BenchmarkResult]:
-    """
-    Run parameter sweep for given backends and batch specs.
+    """Run parameter sweep for given backends and batch specs.
 
     Args:
         backends: List of backend names
@@ -354,9 +354,11 @@ def run_parameter_sweep(
         console: Rich console for output
         skip_filters: Optional list of skip filter dicts
         intermittent_filters: Optional list of intermittent filter dicts
+        cooldown: Seconds to sleep after benchmark completes (for thermal management)
 
     Returns:
         List of BenchmarkResult objects
+
     """
     skip_filters = skip_filters or []
     intermittent_filters = intermittent_filters or []
@@ -455,8 +457,7 @@ def load_config_from_yaml(config_path: str) -> dict:
 
 
 def generate_batch_specs_from_ranges(ranges: list[dict]) -> list[str]:
-    """
-    Generate batch specs from range specifications.
+    """Generate batch specs from range specifications.
 
     Args:
         ranges: List of range specifications, each containing:
@@ -480,6 +481,7 @@ def generate_batch_specs_from_ranges(ranges: list[dict]) -> list[str]:
             }
         ]
         Returns: ["q1kv1k", "q2kv1k", ..., "q16kv1k"]
+
     """
     all_specs = []
 
@@ -543,8 +545,7 @@ def parse_filter_args(filter_args: list[str]) -> list[dict]:
 
 
 def matches_filter(backend: str, batch_spec: str, filter_dict: dict) -> bool:
-    """
-    Check if backend/batch_spec matches a filter.
+    """Check if backend/batch_spec matches a filter.
 
     Pattern matching:
     - backends: exact match or "*" wildcard
@@ -619,11 +620,11 @@ def _check_and_handle_skip(
     skip_filters: list[dict],
     console: Console,
 ) -> BenchmarkResult | None:
-    """
-    Check if case should be skipped and return skipped result if so.
+    """Check if case should be skipped and return skipped result if so.
 
     Returns:
         BenchmarkResult if skipped, None otherwise
+
     """
     should_skip_case, skip_reason = should_skip(backend, spec, skip_filters)
     if should_skip_case:

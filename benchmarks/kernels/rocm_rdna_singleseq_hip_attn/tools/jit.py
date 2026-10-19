@@ -132,7 +132,8 @@ def source_digest(prefill: bool = False) -> str:
 @functools.cache
 def _toolchain() -> tuple[list[str], str]:
     """(clang command, HIP runtime rpath). The pip ROCm SDK gets a shim
-    --rocm-path with the unversioned libamdhip64.so."""
+    --rocm-path with the unversioned libamdhip64.so.
+    """
     sdk = Path(torch.__file__).resolve().parents[1] / "_rocm_sdk_core"
     if sdk.is_dir():
         shim = _cache / "rocm"
@@ -449,7 +450,8 @@ def _write(path: Path, text: str) -> None:
 @contextlib.contextmanager
 def paths():
     """Yield a callable reporting the backend's path: "kernel", "prefill" or
-    "triton"."""
+    "triton".
+    """
     import vllm.v1.attention.backends.rocm_rdna_singleseq_attn as B
 
     impls: list = []

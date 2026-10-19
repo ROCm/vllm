@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Hybrid W4A16 kernel: Triton for prefill, HIP skinny for decode.
+"""Hybrid W4A16 kernel: Triton for prefill, HIP skinny for decode.
 
 Routes based on batch size M:
   M <= MAX_SKINNY_BATCH_SIZE: HIP skinny GEMM (wvSplitK_int4_g)
@@ -102,7 +101,8 @@ MAX_SKINNY_BATCH_SIZE = 5
 @tl.target_info.constexpr_function
 def _target_is_gfx1x() -> bool:
     """Compile-time True on RDNA gfx11/gfx12 (where the v_and_or_b32 packed
-    dequant is validated/tuned)."""
+    dequant is validated/tuned).
+    """
     target = tl.target_info.current_target()
     if target is None or target.backend != "hip":
         return False
@@ -156,8 +156,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    Fused W4A16 GEMM reading skinny weights [N, K//8].
+    """Fused W4A16 GEMM reading skinny weights [N, K//8].
 
     B is stored as [N, K//8] int32 using ExLlama shuffle packing:
       each int32 packs 8 K-values with interleave [0,2,4,6,1,3,5,7]:
@@ -432,8 +431,7 @@ def triton_w4a16_skinny_fmt_gemm(
     out: torch.Tensor | None = None,  # [M, N] optional pre-allocated output
     packed_scale_zp: torch.Tensor | None = None,  # [N, K//G] fp32 carrier (asym only)
 ) -> torch.Tensor:
-    """
-    Fused W4A16 GEMM reading skinny weights [N, K//8].
+    """Fused W4A16 GEMM reading skinny weights [N, K//8].
 
     Asymmetric layers pass ``packed_scale_zp`` (the carrier that folds scale +
     zero-point into one load); symmetric layers leave it None and the kernel
@@ -453,6 +451,7 @@ def triton_w4a16_skinny_fmt_gemm(
 
     Returns:
         Output matrix [M, N], same dtype as a.
+
     """
     assert a.is_contiguous(), "Activation matrix must be contiguous"
     # b_q may be a row-padded view (stride(0) > K//8) when the K_packed%2048

@@ -56,7 +56,8 @@ TOP_K = 8
 
 def pack_int4(values_int8: torch.Tensor) -> torch.Tensor:
     """Pack signed int4 (-8..7) using the ExLlama shuffle the production
-    kernel expects.  Mirrors sweep_int4g_kernel.py exactly."""
+    kernel expects.  Mirrors sweep_int4g_kernel.py exactly.
+    """
     M, K = values_int8.shape
     unsigned = (values_int8.to(torch.int16) + 8).to(torch.uint8)
     g = unsigned.view(M, K // 8, 8).to(torch.int32)

@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-FlexMLRT-based vision NPU backend with CPU preprocessing.
+"""FlexMLRT-based vision NPU backend with CPU preprocessing.
 
 VitisAI-compiled models partition operations between CPU and NPU. This backend
 implements the CPU preprocessing operations before calling FlexMLRT for NPU

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Correctness tests for wvSplitK_fused_silu_mul, wvSplitK_fused_silu_gate_mul kernels.
+"""Correctness tests for wvSplitK_fused_silu_mul, wvSplitK_fused_silu_gate_mul kernels.
 
 This test verifies that the new fused kernels produce numerically correct results
 compared to the unfused baseline implementation.
@@ -141,8 +140,7 @@ def test_wvsplitk_fused_silu_mul(H: int, IN: int, dtype: torch.dtype):
 @pytest.mark.parametrize("H,IN", KERNEL_SHAPES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_wvsplitk_fused_silu_gate_mul(H: int, IN: int, dtype: torch.dtype):
-    """
-    Test wvSplitK_fused_silu_gate_mul correctness against baseline.
+    """Test wvSplitK_fused_silu_gate_mul correctness against baseline.
     The kernel fuses: silu(gate) * up → GEMM → sigmoid(gate) * out
     """
     if not hasattr(torch.ops, "_rocm_C") or not hasattr(

@@ -61,7 +61,8 @@ def test_tiny_dot_matches_eager(K: int, dtype: torch.dtype, apply_sigmoid: bool)
 def test_tiny_sigmoid_dot_helper(K: int, dtype: torch.dtype):
     """Public helper tiny_sigmoid_dot(x, weight) matches the eager
     3-launch chain (mul + sum + sigmoid) used at the shared_expert_gate
-    call site in qwen2_moe.py."""
+    call site in qwen2_moe.py.
+    """
     from vllm.model_executor.layers.utils import tiny_sigmoid_dot
 
     torch.manual_seed(0)
