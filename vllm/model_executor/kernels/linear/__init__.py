@@ -26,9 +26,6 @@ from vllm.model_executor.kernels.linear.mixed_precision import (
     MPLinearKernel,
     MPLinearLayerConfig,
 )
-from vllm.model_executor.kernels.linear.mixed_precision.allspark import (
-    AllSparkLinearKernel,
-)
 from vllm.model_executor.kernels.linear.mixed_precision.conch import (
     ConchLinearKernel,
 )
@@ -514,7 +511,6 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
-        AllSparkLinearKernel,
         MarlinLinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
@@ -1283,7 +1279,6 @@ __all__ = [
     "ZentorchWNA16LinearKernel",
     "MPLinearKernel",
     "MPLinearLayerConfig",
-    "AllSparkLinearKernel",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",
     "CutlassW4A8LinearKernel",
