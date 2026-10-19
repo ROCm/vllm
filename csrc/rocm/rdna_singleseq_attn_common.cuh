@@ -1,10 +1,13 @@
-// Helpers shared by the RDNA3.5 decode and prefill kernels. Included once per
-// variant after kBf16 is defined, so there is no include guard.
+// Helpers shared by the RDNA3.5 decode and prefill kernels.
+#pragma once
 
-using elem_t = std::conditional_t<kBf16, __bf16, _Float16>;
-typedef elem_t e16 __attribute__((ext_vector_type(16)));
-typedef elem_t e8 __attribute__((ext_vector_type(8)));
-typedef elem_t e2 __attribute__((ext_vector_type(2)));
+#include <hip/hip_runtime.h>
+
+#include <cmath>
+#include <type_traits>
+
+namespace rdna_singleseq {
+
 typedef _Float16 h16 __attribute__((ext_vector_type(16)));
 typedef _Float16 h2 __attribute__((ext_vector_type(2)));
 typedef short s16 __attribute__((ext_vector_type(16)));
@@ -14,6 +17,35 @@ typedef float f4 __attribute__((ext_vector_type(4)));
 typedef unsigned u8v __attribute__((ext_vector_type(8)));
 typedef unsigned u4v __attribute__((ext_vector_type(4)));
 typedef unsigned u2v __attribute__((ext_vector_type(2)));
+
+// The element type, bf16 or fp16, and what depends on it.
+template <bool kBf16>
+struct Elem {
+  using type = std::conditional_t<kBf16, __bf16, _Float16>;
+  typedef type v16 __attribute__((ext_vector_type(16)));
+  typedef type v8 __attribute__((ext_vector_type(8)));
+  typedef type v2 __attribute__((ext_vector_type(2)));
+
+  // Round to nearest even; a bf16 NaN may become Inf.
+  static __device__ __forceinline__ type from_float(float x) {
+    if constexpr (kBf16) {
+      const unsigned bits = __builtin_bit_cast(unsigned, x);
+      return __builtin_bit_cast(
+          type, (unsigned short)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16));
+    } else {
+      return (type)x;
+    }
+  }
+
+  static __device__ __forceinline__ f8 wmma(v16 a, v16 b, f8 c) {
+    if constexpr (kBf16)
+      return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+          __builtin_bit_cast(s16, a), __builtin_bit_cast(s16, b), c);
+    else
+      return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+          __builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b), c);
+  }
+};
 
 // Barrier that waits for LDS only, not for global loads.
 __device__ __forceinline__ void lds_barrier() {
@@ -49,22 +81,4 @@ __device__ __forceinline__ float weight_of(float partMax, float maxAll) {
   return (maxAll == -INFINITY) ? 0.f : __builtin_amdgcn_exp2f(partMax - maxAll);
 }
 
-// Round to nearest even; a bf16 NaN may become Inf.
-__device__ __forceinline__ elem_t to_elem(float x) {
-  if constexpr (kBf16) {
-    const unsigned bits = __builtin_bit_cast(unsigned, x);
-    return __builtin_bit_cast(
-        elem_t, (unsigned short)((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16));
-  } else {
-    return (elem_t)x;
-  }
-}
-
-__device__ __forceinline__ f8 wmma(e16 a, e16 b, f8 c) {
-  if constexpr (kBf16)
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
-        __builtin_bit_cast(s16, a), __builtin_bit_cast(s16, b), c);
-  else
-    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-        __builtin_bit_cast(h16, a), __builtin_bit_cast(h16, b), c);
-}
+}  // namespace rdna_singleseq

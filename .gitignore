@@ -214,9 +214,6 @@ cython_debug/
 
 # Results
 *.csv
-# RDNA3.5 attention kernel variants
-!vllm/v1/attention/ops/rocm_rdna_singleseq_decode_variants.csv
-!vllm/v1/attention/ops/rocm_rdna_singleseq_prefill_variants.csv
 
 # Python pickle files
 *.pkl

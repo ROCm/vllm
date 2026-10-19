@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE Triton kernels."""
 
+import contextlib
 import functools
 import json
 import os
@@ -1028,51 +1029,72 @@ def invoke_fused_moe_triton_kernel(
     if A_scale is not None and A_scale.ndim == 0:
         A_scale = A_scale.reshape(1)
 
-    fused_moe_kernel[grid](
-        A,
-        B,
-        C,
-        B_bias,
-        A_scale,
-        B_scale,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        B.size(1),
-        B.size(2),
-        EM,
-        num_tokens,
-        A.stride(0),
-        A.stride(1),
-        B.stride(0),
-        B.stride(2),
-        B.stride(1),
-        C.stride(1),
-        C.stride(2),
-        A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
-        A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
-        B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
-        B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
-        B_bias.stride(0) if B_bias is not None else 0,
-        B_bias.stride(1) if B_bias is not None else 0,
-        0 if block_shape is None else block_shape[0],
-        0 if block_shape is None else block_shape[1],
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=top_k,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        per_channel_quant=per_channel_quant,
-        naive_block_assignment=(sorted_token_ids is None),
-        HAS_BIAS=HAS_BIAS,
-        BLOCK_SIZE_K=BLOCK_SIZE_K,
-        SWAP_AB=SWAP_AB,
-        USE_TD=use_td,
-        **config,
+    E, N, K = B.size(0), B.size(1), A.size(1)
+    block_m = config["BLOCK_SIZE_M"]
+    valid_blocks = int(num_tokens_post_padded.item()) // block_m
+
+    # Emit profiler annotation with kernel dimensions and distinct expert count.
+    # Expert count requires device->host sync, so only computed when enabled.
+    profiling_enabled = (
+        envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
     )
+    if profiling_enabled:
+        ids = expert_ids[(expert_ids >= 0) & (expert_ids < E)]
+        n_experts = int((torch.bincount(ids, minlength=E) > 0).sum().item())
+        scope_str = (
+            f"moe_gemm_triton {M}x{N}x{K} E={E} top_k={top_k} "
+            f"block_m={block_m} valid_blocks={valid_blocks} experts={n_experts}"
+        )
+        scope = record_function_or_nullcontext(scope_str)
+    else:
+        scope = contextlib.nullcontext()
+
+    with scope:
+        fused_moe_kernel[grid](
+            A,
+            B,
+            C,
+            B_bias,
+            A_scale,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.size(1),
+            B.size(2),
+            EM,
+            num_tokens,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
+            A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
+            B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_scale.stride(2) if B_scale is not None and B_scale.ndim == 3 else 0,
+            B_scale.stride(1) if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_bias.stride(0) if B_bias is not None else 0,
+            B_bias.stride(1) if B_bias is not None else 0,
+            0 if block_shape is None else block_shape[0],
+            0 if block_shape is None else block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            per_channel_quant=per_channel_quant,
+            naive_block_assignment=(sorted_token_ids is None),
+            HAS_BIAS=HAS_BIAS,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            SWAP_AB=SWAP_AB,
+            USE_TD=use_td,
+            **config,
+        )
 
 
 def dispatch_fused_moe_kernel(

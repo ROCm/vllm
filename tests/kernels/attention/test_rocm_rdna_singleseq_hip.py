@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """RDNA3.5 decode and prefill attention: accuracy against a reference, and
-fallback to Triton for unsupported calls.
-"""
+fallback to Triton for unsupported calls."""
 
-import csv
 import itertools
 
 import pytest
@@ -102,25 +100,20 @@ def _check_one(v, module, lens):
 
 
 def _unit(v):
-    """The generated unit a variant is built in."""
+    """A test case: the variants of one shape and dtype."""
     dt = "bf16" if v.dtype == torch.bfloat16 else "fp16"
     return f"q{v.num_q_heads}_kv{v.num_kv_heads}_d{v.head_size}_w{v.window}_{dt}"
 
 
-def test_variants_csv_is_well_formed():
-    """The decode CSV is well formed, matches _rocm_C and covers every M in
-    both dtypes.
-    """
-    with hip.VARIANTS_CSV.open(newline="") as fh:
-        rows = list(csv.reader(fh))
-    header, body = rows[0], rows[1:]
-    assert set(header) == set(hip._FIELDS) | {"BF16"}
-    assert all(len(r) == len(header) and all(x.isdigit() for x in r) for r in body)
+def test_decode_configs_are_well_formed():
+    """No two decode builds share a shape, and every built shape covers every M
+    in both dtypes."""
     variants = hip.variants()
     if not variants:
         pytest.skip("_rocm_C carries no RDNA3.5 variants")
-    built = [list(hip.variant_defines(v).values()) for v in variants]
-    assert built == [list(map(int, r)) for r in body], "two rows share a key"
+    assert len({hip._lookup_key(v) for v in variants}) == len(variants), (
+        "two builds share a shape"
+    )
     configs = {
         (v.num_q_heads, v.num_kv_heads, v.head_size, v.window, v.page_size)
         for v in variants
@@ -134,6 +127,8 @@ def test_variants_csv_is_well_formed():
 
 def test_every_listed_variant_is_built_in():
     _skip_unless_gfx1151()
+    # Raises if a build has no instantiation unit.
+    assert torch.ops._rocm_C.rdna_singleseq_decode_configs()
     missing = [v.name for v in hip.variants() if hip.load(v) is None]
     assert not missing, f"{len(missing)} variants not in _rocm_C, e.g. {missing[0]}"
 
@@ -456,25 +451,20 @@ def _prefill_unit(v):
 
 
 def _prefill_rows():
-    return [v for rows in hip._prefill_table()[1].values() for v in rows]
+    return [v for rows in hip._prefill_table().values() for v in rows]
 
 
-def test_prefill_variants_csv_is_well_formed():
-    """The prefill CSV matches _rocm_C, covers every decode configuration and
-    picks the row of the largest step reached.
-    """
-    with hip.PREFILL_VARIANTS_CSV.open(newline="") as fh:
-        rows = list(csv.reader(fh))
-    header, body = rows[0], rows[1:]
-    assert set(header) == set(hip._PREFILL_FIELDS) | {"BF16"}
-    assert all(len(r) == len(header) and all(x.isdigit() for x in r) for r in body)
-    assert len({tuple(r) for r in body}) == len(body)
+def test_prefill_configs_are_well_formed():
+    """No two prefill builds share a shape and step, every decode configuration
+    has prefill builds, and the build of the largest step reached runs."""
     if not _prefill_rows():
         pytest.skip("_rocm_C carries no RDNA3.5 variants")
-    built = sorted(
-        list(hip.prefill_variant_defines(v).values()) for v in _prefill_rows()
-    )
-    assert built == sorted(list(map(int, r)) for r in body)
+    keys = {
+        (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
+        + (v.dtype, v.min_query_len)
+        for v in _prefill_rows()
+    }
+    assert len(keys) == len(_prefill_rows()), "two builds share a step"
     configs = {
         (v.num_q_heads, v.num_kv_heads, v.head_size, v.window)
         for v in hip.variants()
@@ -497,6 +487,8 @@ def test_prefill_variants_csv_is_well_formed():
 
 def test_every_listed_prefill_variant_is_built_in():
     _skip_unless_gfx1151()
+    # Raises if a build has no instantiation unit.
+    assert torch.ops._rocm_C.rdna_singleseq_prefill_configs()
     missing = [v for v in _prefill_rows() if hip.load_prefill(v) is None]
     assert not missing, f"{len(missing)} prefill variants not in _rocm_C"
 
@@ -504,8 +496,7 @@ def test_every_listed_prefill_variant_is_built_in():
 @pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _prefill_rows()}))
 def test_built_in_prefill_variants_match_reference(unit):
     """Every built prefill variant matches the reference, with and without a
-    prefix.
-    """
+    prefix."""
     _skip_unless_gfx1151()
     for v in _prefill_rows():
         if _prefill_unit(v) != unit:
@@ -546,7 +537,7 @@ def test_prefill_past_the_last_step():
     _skip_unless_gfx1151()
     v = next(
         rows[-1]
-        for rows in hip._prefill_table()[1].values()
+        for rows in hip._prefill_table().values()
         if rows[-1].dtype == torch.float16 and rows[-1].head_size == 128
     )
     module = hip.load_prefill(v)

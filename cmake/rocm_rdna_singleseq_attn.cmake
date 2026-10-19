@@ -1,29 +1,33 @@
 #
-# Builds every row of
-# vllm/v1/attention/ops/rocm_rdna_singleseq_{decode,prefill}_variants.csv into
-# the object library ${TARGET} for ${ARCHES}, and sets ${OUT_INCLUDE} to the
-# directory of the generated registry tables.
+# Builds the RDNA3.5 attention kernels into the object library ${TARGET} for
+# ${ARCHES}. Each (kernel, head dim, dtype) is a generated translation unit
+# that builds the entries of csrc/rocm/rdna_singleseq_<kernel>_configs.h with
+# that head dim and dtype and registers them, so the builds compile in
+# parallel. The head dims and dtypes are the enumerators of
+# csrc/rocm/rdna_singleseq_attn_types.h; an entry without a unit makes
+# rdna_singleseq_<kernel>_configs() raise.
 #
-function(rdna_singleseq_attn_target TARGET ARCHES OUT_INCLUDE)
-  set(_OPS ${CMAKE_SOURCE_DIR}/vllm/v1/attention/ops)
-  set(_GEN ${CMAKE_SOURCE_DIR}/csrc/rocm/generate_rdna_singleseq_attn.py)
+function(rdna_singleseq_attn_target TARGET ARCHES)
+  set(_KERNELS decode prefill)
+  set(_HEAD_DIMS 64 96 128 256 512)
+  set(_DTYPES Fp16 Bf16)
   set(_OUT ${CMAKE_CURRENT_BINARY_DIR}/rdna_singleseq_attn)
   set(_UNITS "")
-  foreach(_KIND_CSV "decode:rocm_rdna_singleseq_decode_variants.csv"
-                    "prefill:rocm_rdna_singleseq_prefill_variants.csv")
-    string(REPLACE ":" ";" _KIND_CSV "${_KIND_CSV}")
-    list(GET _KIND_CSV 0 _KIND)
-    list(GET _KIND_CSV 1 _CSV)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_OPS}/${_CSV})
-    execute_process(
-      COMMAND ${Python_EXECUTABLE} ${_GEN} ${_OPS}/${_CSV} ${_OUT} --kind ${_KIND}
-      OUTPUT_VARIABLE _KIND_UNITS
-      OUTPUT_STRIP_TRAILING_WHITESPACE
-      COMMAND_ERROR_IS_FATAL ANY)
-    string(REPLACE "\n" ";" _KIND_UNITS "${_KIND_UNITS}")
-    list(APPEND _UNITS ${_KIND_UNITS})
+  foreach(_KERNEL IN LISTS _KERNELS)
+    foreach(_HEAD_DIM IN LISTS _HEAD_DIMS)
+      foreach(_DTYPE IN LISTS _DTYPES)
+        string(TOLOWER ${_DTYPE} _DTYPE_NAME)
+        set(_UNIT ${_OUT}/${_KERNEL}_d${_HEAD_DIM}_${_DTYPE_NAME}.hip)
+        file(CONFIGURE OUTPUT ${_UNIT} CONTENT
+"#include \"rdna_singleseq_attn_instances.cuh\"
+using namespace rdna_singleseq;
+static const bool kRegistered =
+    register_${_KERNEL}<HeadDim::k${_HEAD_DIM}, Dtype::k${_DTYPE}>();
+")
+        list(APPEND _UNITS ${_UNIT})
+      endforeach()
+    endforeach()
   endforeach()
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_GEN})
 
   add_library(${TARGET} OBJECT ${_UNITS})
   set_source_files_properties(${_UNITS} PROPERTIES LANGUAGE ${VLLM_GPU_LANG})
@@ -31,9 +35,8 @@ function(rdna_singleseq_attn_target TARGET ARCHES OUT_INCLUDE)
     ${VLLM_GPU_LANG}_ARCHITECTURES "${ARCHES}"
     POSITION_INDEPENDENT_CODE ON)
   target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/csrc/rocm)
-  # -O3 regardless of build type. Some variants leave values unused.
+  # -O3 regardless of build type. Some builds leave values unused.
   target_compile_options(${TARGET} PRIVATE
     $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS}>
     -O3 -g0 -Wno-unused-variable)
-  set(${OUT_INCLUDE} ${_OUT} PARENT_SCOPE)
 endfunction()

@@ -3,12 +3,12 @@
 `ROCM_RDNA_SINGLESEQ_ATTN` (gfx1151, `--max-num-seqs 1`, selected by default
 there) runs calls of up to 8 query tokens on
 `csrc/rocm/rdna_singleseq_decode_attn.cu` and longer ones on
-`csrc/rocm/rdna_singleseq_prefill_attn.cu`. Each row of
-`vllm/v1/attention/ops/rocm_rdna_singleseq_{decode,prefill}_variants.csv` is one build;
-calls without a row run on Triton.
+`csrc/rocm/rdna_singleseq_prefill_attn.cu`. Each entry of
+`csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h` is one build; calls
+without one run on Triton.
 
-A *configuration* is `(Hq, Hkv, D, window, page size)`, with decode rows for
-M = 1..8 and prefill rows per step of M, in fp16 and bf16.
+A *configuration* is `(Hq, Hkv, D, window, page size)`, with decode entries
+for M = 1..8 and prefill entries per step of M, in fp16 and bf16.
 
 ## Requirements
 
@@ -37,7 +37,7 @@ PYTHONPATH=$PWD .venv/bin/python \
 
 - `--window W`, `--block-size P`, `--reuse` to resume, `--limit 20` for a
   smoke run.
-- `--apply` refuses decisions measured on another kernel source or row.
+- `--apply` refuses decisions measured on another kernel source or entry.
 
 Rebuild `_rocm_C` and add the configuration to `tools/shapes.csv`.
 
@@ -52,8 +52,8 @@ PYTHONPATH=$PWD .venv/bin/python \
     --points points.jsonl --decisions decisions.jsonl
 ```
 
-A row serves M from its `MIN_QUERY_LEN` up to the next row's. Steps start at
-16, 32, ..., 4096; the first row also serves 9 to 15 tokens.
+An entry serves M from its `min_query_len` up to the next entry's. Steps start
+at 16, 32, ..., 4096; the first entry also serves 9 to 15 tokens.
 
 ## Check
 

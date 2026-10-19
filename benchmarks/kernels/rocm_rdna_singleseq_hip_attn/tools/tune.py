@@ -12,7 +12,8 @@ sqrt(S / 128) if above --min-gain.
 Prefill (--prefill), per (Hq, Hkv, D, window): one row per step of M, chosen
 in an interleaved A/B against TRITON_ATTN.
 
-`--apply` writes accepted decisions into the CSVs, refusing those measured on
+`--apply` writes accepted decisions into
+csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h, refusing those measured on
 another kernel source or row.
 
     PYTHONPATH=$PWD python \\
@@ -22,7 +23,6 @@ another kernel source or row.
 """
 
 import argparse
-import csv
 import gc
 import itertools
 import json
@@ -35,6 +35,8 @@ import threading
 import time
 import types
 from pathlib import Path
+
+import regex as re
 
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[3] / "attention_benchmarks"))
@@ -890,7 +892,7 @@ def tune_prefill(a) -> None:
 
 
 def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
-    """Write one prefill decision into rocm_rdna_singleseq_prefill_variants.csv."""
+    """Write one prefill decision into the prefill configs."""
     import jit
     import torch
 
@@ -901,12 +903,8 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
     if dec["source"] != jit.source_digest(prefill=True):
         print(f"{tag}: refused, measured on another kernel source")
         return 0
-    path = R.PREFILL_VARIANTS_CSV
-    with path.open(newline="") as fh:
-        reader = csv.reader(fh)
-        header = next(reader)
-        rows = [list(map(int, r)) for r in reader]
-    col = {c: i for i, c in enumerate(header)}
+    lines, rows = read_configs(PREFILL_CONFIGS_H)
+    col = {f: i for i, f in enumerate(R.PREFILL_CONFIG_FIELDS)}
     dtype = utils.torch_dtype(dec["dtype"])
     for step in dec["steps"]:
         now = R.prefill_variant_for(
@@ -918,13 +916,13 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
 
     def mine(r):
         return (
-            r[col["HEAD_DIM"]],
-            r[col["NUM_Q_HEADS"]],
-            r[col["NUM_KV_HEADS"]],
-            r[col["WINDOW"]],
+            r[col["head_size"]],
+            r[col["num_q_heads"]],
+            r[col["num_kv_heads"]],
+            r[col["window"]],
         ) == (d, hq, hkv, win)
 
-    sizes = sorted({r[col["PAGE_SIZE"]] for r in rows if mine(r)}) or block_sizes
+    sizes = sorted({r[col["page_size"]] for r in rows if mine(r)}) or block_sizes
     rows = [r for r in rows if not mine(r)]
     merged = []
     for step in dec["steps"]:
@@ -942,12 +940,9 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
             **step["winner"],
             dtype=torch.bfloat16 if bf16 else torch.float16,
         )
-        rows.append(list(R.prefill_variant_defines(v).values()))
+        rows.append(R.prefill_config_fields(v))
         written += 1
-    with path.open("w", newline="") as fh:
-        w = csv.writer(fh, lineterminator="\n")
-        w.writerow(header)
-        w.writerows(sorted(rows))
+    write_configs(PREFILL_CONFIGS_H, lines, rows, R.PREFILL_CONFIG_FIELDS)
     for step in merged:
         print(f"{tag} M>={step['m']}: {prefill_label(step['winner'])}")
     return written
@@ -956,27 +951,54 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
 # ------------------------------------------------------------------- --apply --
 
 
+_CSRC = _HERE.parents[4] / "csrc" / "rocm"
+DECODE_CONFIGS_H = _CSRC / "rdna_singleseq_decode_configs.h"
+PREFILL_CONFIGS_H = _CSRC / "rdna_singleseq_prefill_configs.h"
+# One config entry per line.
+_ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
+
+
+def read_configs(path: Path) -> tuple[list[str], list[list[int]]]:
+    """The lines of a configs header, and its entries."""
+    import jit
+
+    lines = path.read_text().splitlines()
+    rows = [jit.parse_cpp_fields(m[1]) for m in map(_ENTRY.match, lines) if m]
+    return lines, rows
+
+
+def write_configs(
+    path: Path, lines: list[str], rows: list[list[int]], names: tuple[str, ...]
+) -> None:
+    """Replace the entries of a configs header with `rows`, sorted; `names`
+    are their fields."""
+    import jit
+
+    at = [i for i, line in enumerate(lines) if _ENTRY.match(line)]
+    entries = [f"    {{{jit.cpp_fields(r, names)}}}," for r in sorted(rows)]
+    text = lines[: at[0]] + entries + lines[at[-1] + 1 :]
+    path.write_text("\n".join(text) + "\n")
+
+
 def apply(path: str, block_sizes: list[int]) -> None:
-    """Write the accepted decisions of `path` into the variant CSVs."""
+    """Write the accepted decisions of `path` into the configs headers."""
     import jit
     import torch
 
     import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
 
-    csv_path = R.VARIANTS_CSV
-    with csv_path.open(newline="") as fh:
-        reader = csv.reader(fh)
-        header = next(reader)
-        rows = {tuple(map(int, r[:7])): list(map(int, r)) for r in reader}
-    assert header[:7] == [
-        "HEAD_DIM",
-        "NUM_Q_HEADS",
-        "NUM_KV_HEADS",
-        "WINDOW",
-        "MAX_QUERY_LEN",
-        "BF16",
-        "PAGE_SIZE",
-    ], header
+    # The shape: the first seven fields.
+    assert R.DECODE_CONFIG_FIELDS[:7] == (
+        "head_size",
+        "num_q_heads",
+        "num_kv_heads",
+        "window",
+        "max_query_len",
+        "dtype",
+        "page_size",
+    ), R.DECODE_CONFIG_FIELDS
+    lines, entries = read_configs(DECODE_CONFIGS_H)
+    rows = {tuple(r[:7]): r for r in entries}
     source = jit.source_digest()
     written = 0
     for line in Path(path).read_text().splitlines():
@@ -1017,26 +1039,25 @@ def apply(path: str, block_sizes: list[int]) -> None:
                 window=win,
                 dtype=torch.bfloat16 if bf16 else torch.float16,
             )
-            row = list(R.variant_defines(v).values())
+            row = R.config_fields(v)
             rows[tuple(row[:7])] = row
             written += 1
         print(f"{tag}: {label(dec['winner'])}")
-    with csv_path.open("w", newline="") as fh:
-        w = csv.writer(fh, lineterminator="\n")
-        w.writerow(header)
-        w.writerows(rows[k] for k in sorted(rows))
+    write_configs(DECODE_CONFIGS_H, lines, list(rows.values()), R.DECODE_CONFIG_FIELDS)
     print(f"# {written} rows written")
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--apply", metavar="DECISIONS", help="write decisions to the CSV")
+    p.add_argument(
+        "--apply", metavar="DECISIONS", help="write decisions to the configs"
+    )
     p.add_argument(
         "--block-sizes",
         type=int,
         nargs="+",
         default=[16],
-        help="with --apply: page sizes of a configuration the CSV does not have",
+        help="with --apply: page sizes of a configuration not built yet",
     )
     p.add_argument(
         "--prefill",
