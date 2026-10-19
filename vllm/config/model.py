@@ -258,8 +258,6 @@ class ModelConfig:
     """Cache dequantized W4A16 weights for the prefill GEMM.
     'off': no caching (default). 'soft': cache until budget exhausted, warn on
     skip. 'hard': cache, error if budget exhausted."""
-    enable_return_routed_experts: bool = False
-    """Whether to return routed experts."""
     return_sampling_mask: bool = False
     """Whether to return the post-processing token support for each sample."""
     max_logprobs: int = Field(default=20, ge=-1)
