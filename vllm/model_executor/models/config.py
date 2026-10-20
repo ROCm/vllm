@@ -206,6 +206,27 @@ class UnlimitedOCRForCausalLMConfig(VerifyAndUpdateConfig):
         text_config.rswa_window = rswa_window
 
 
+def rdna_singleseq_serves(vllm_config: "VllmConfig", head_sizes: set[int]) -> bool:
+    """Whether ROCM_RDNA_SINGLESEQ_ATTN can take every layer: gfx1151, one
+    sequence, a 16-bit model and KV cache, and each head size."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1151
+    from vllm.v1.attention.backends.rocm_rdna_singleseq_attn import (
+        RocmRdnaSingleSeqAttentionBackend as Backend,
+    )
+
+    return (
+        on_gfx1151()
+        and vllm_config.scheduler_config.max_num_seqs == 1
+        and vllm_config.model_config.dtype in Backend.supported_dtypes
+        and vllm_config.cache_config.cache_dtype in Backend.supported_kv_cache_dtypes
+        and all(Backend.supports_head_size(d) for d in head_sizes)
+    )
+
+
 class Gemma4Config(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
@@ -216,8 +237,9 @@ class Gemma4Config(VerifyAndUpdateConfig):
         mixed backend selection and numerical divergence.
 
         When FA4 is available we force it for ALL layers, giving a uniform kernel path
-        and avoiding the mixed FA3+FA4 penalty. When FA4 is not available we fall back
-        to Triton.
+        and avoiding the mixed FA3+FA4 penalty. When FA4 is not available we force
+        ROCM_RDNA_SINGLESEQ_ATTN where it serves every layer (gfx1151, one sequence),
+        else Triton.
         """
         model_config = vllm_config.model_config
         arch_config = model_config.model_arch_config
@@ -248,11 +270,17 @@ class Gemma4Config(VerifyAndUpdateConfig):
                     head_dims,
                 )
         elif vllm_config.attention_config.backend is None:
-            vllm_config.attention_config.backend = AttentionBackendEnum.TRITON_ATTN
+            backend = (
+                AttentionBackendEnum.ROCM_RDNA_SINGLESEQ_ATTN
+                if rdna_singleseq_serves(vllm_config, set(head_dims.values()))
+                else AttentionBackendEnum.TRITON_ATTN
+            )
+            vllm_config.attention_config.backend = backend
             logger.info(
                 "Gemma4 model has heterogeneous head dimensions "
-                "%s. FA4 not available, forcing TRITON_ATTN backend.",
+                "%s. FA4 not available, forcing %s backend.",
                 head_dims,
+                backend.name,
             )
 
 

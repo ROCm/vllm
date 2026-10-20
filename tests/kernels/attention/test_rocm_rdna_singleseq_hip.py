@@ -319,6 +319,37 @@ def test_non_decode_batches_fall_back_to_triton(nseq, tokens, max_q, reason):
     assert reason in impl._rejected
 
 
+@pytest.mark.parametrize(
+    "gfx1151, max_num_seqs, dtype, cache_dtype, head_sizes, expected",
+    [
+        (True, 1, torch.bfloat16, "auto", {256, 512}, True),
+        (False, 1, torch.bfloat16, "auto", {256, 512}, False),
+        (True, 2, torch.bfloat16, "auto", {256, 512}, False),
+        (True, 1, torch.float32, "auto", {256, 512}, False),
+        (True, 1, torch.bfloat16, "fp8", {256, 512}, False),
+        (True, 1, torch.bfloat16, "auto", {256, 576}, False),
+    ],
+    ids=["serves", "not_gfx1151", "two_seqs", "fp32", "fp8_kv", "head_size"],
+)
+def test_gemma4_forces_singleseq_where_it_serves(
+    gfx1151, max_num_seqs, dtype, cache_dtype, head_sizes, expected, monkeypatch
+):
+    """Gemma4's heterogeneous head sizes force one backend for every layer:
+    ours where it serves them all, else Triton."""
+    import types
+
+    import vllm.platforms.rocm as rocm
+    from vllm.model_executor.models.config import rdna_singleseq_serves
+
+    monkeypatch.setattr(rocm, "on_gfx1151", lambda: gfx1151)
+    config = types.SimpleNamespace(
+        scheduler_config=types.SimpleNamespace(max_num_seqs=max_num_seqs),
+        model_config=types.SimpleNamespace(dtype=dtype),
+        cache_config=types.SimpleNamespace(cache_dtype=cache_dtype),
+    )
+    assert rdna_singleseq_serves(config, head_sizes) == expected
+
+
 @pytest.mark.parametrize("gfx1151", [True, False])
 def test_singleseq_is_first_on_gfx1151(gfx1151, monkeypatch):
     """gfx1151 tries the backend first; other GPUs never list it."""
