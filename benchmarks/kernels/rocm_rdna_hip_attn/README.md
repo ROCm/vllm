@@ -1,7 +1,7 @@
-# RDNA3.5 attention: adding, tuning and checking a configuration
+# RDNA attention: adding, tuning and checking a configuration
 
-`ROCM_RDNA_ATTN` (gfx1150..gfx1153, selected by default on gfx1150 and gfx1151)
-runs decodes
+`ROCM_RDNA_ATTN` (gfx1150..gfx1153, selected by default on gfx1150 and gfx1151;
+on RDNA4, gfx1200 and gfx1201, opt-in) runs decodes
 of up to 8 query tokens per sequence on
 `csrc/rocm/rdna_decode_attn.cu` and everything else on
 `csrc/rocm/rdna_prefill_attn.cu`. Its tables, in `csrc/rocm/`:
@@ -14,14 +14,16 @@ of up to 8 query tokens per sequence on
 | `rdna_prefill_batch_configs.h` | per batch cell, a prefill build and head group | a batch of sequences |
 
 Calls without a build run on Triton. Each file has a table per GPU family:
-gfx1151's (1536 VGPRs a SIMD lane) and gfx1150's (1024), which gfx1152 and
-gfx1153 also use. The tools tune and write the tables of the GPU they run on.
+gfx1151's (1536 VGPRs a SIMD lane), gfx1150's (1024), which gfx1152 and
+gfx1153 also use, and gfx1201's, which gfx1200 also uses. The tools tune and
+write the tables of the GPU they run on. Prefill `v_t` 2 loads V^T with
+GLOBAL_LOAD_TR (gfx12; gfx11 builds it as 1).
 
 A *configuration* is `(Hq, Hkv, D, window, page size)`, in fp16 and bf16.
 
 ## Requirements
 
-- A gfx1150..gfx1153 GPU and a vLLM build of this tree for it; run from the
+- A gfx1150..gfx1153 or RDNA4 GPU and a vLLM build of this tree for it; run from the
   tree root with `PYTHONPATH=$PWD`.
 - `D` in 64, 96, 128, 256, 512, `Hq % Hkv == 0`, and a page size that is a
   multiple of 16 (the one vLLM uses for the model, e.g. 544 for Qwen3.5-0.8B).
