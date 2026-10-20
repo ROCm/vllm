@@ -15,14 +15,18 @@ on:
         description: 'Container image used for ROCm CI'
         required: true
         type: string
+      combined_test_timeout_minutes:
+        description: 'test step timeout in minutes (sum of all tests)'
+        required: true
+        type: number
+      per_test_timeout_seconds:
+        description: 'pytest timeout in seconds (applied per test)'
+        required: true
+        type: number
       pytorch_index:
         description: 'PyTorch index URL for ROCm nightly wheels'
         required: true
         type: string
-      timeout:
-        description: 'pytest-timeout timeout in seconds'
-        required: true
-        type: number
       pytest_args:
         description: 'Arguments passed to pytest'
         required: true
@@ -161,5 +165,6 @@ jobs:
           "
 
       - name: Test kernel ${{ inputs.test_name }}
+        timeout-minutes: ${{ inputs.combined_test_timeout_minutes }}
         run: |
-          python -m pytest -v --timeout=${{ inputs.timeout }} ${{ inputs.pytest_args }}
+          python -m pytest -v --timeout=${{ inputs.per_test_timeout_seconds }} ${{ inputs.pytest_args }}

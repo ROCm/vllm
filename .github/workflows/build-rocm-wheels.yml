@@ -173,8 +173,9 @@ jobs:
       test_name: correctness
       runs_on: linux-strix-halo-gpu-rocm-oem
       ci_image: ghcr.io/rocm/vllm/gfx11-ci:latest
+      combined_test_timeout_minutes: 10
+      per_test_timeout_seconds: 300
       pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
-      timeout: 300
       pytest_args: >-
         tests/kernels/moe/test_hybrid_w4a16_moe.py
         tests/kernels/quantization/test_hybrid_w4a16_triton.py
@@ -196,8 +197,9 @@ jobs:
       test_name: performance
       runs_on: linux-strix-halo-gpu-rocm-noneng
       ci_image: ghcr.io/rocm/vllm/gfx11-ci:latest
+      combined_test_timeout_minutes: 20
+      per_test_timeout_seconds: 900
       pytorch_index: ${{ github.event.inputs.pytorch_index || 'https://nightly.repo.amd.com/rocm/whl-next' }}
-      timeout: 300
       pytest_args: >-
         tests/kernels/quantization/test_hybrid_w4a16_perf.py
 
