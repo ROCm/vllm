@@ -485,7 +485,7 @@ def rocm_unquantized_gemm_impl(
         # The skinny kernels assume contiguous K elements. A shape-preserving
         # reshape can retain a transposed activation's non-contiguous strides.
         x_view = x.reshape(-1, x.size(-1)).contiguous()
-        if m > 8 and 0 < n <= 5:
+        if (m == 1 or m > 8) and 0 < n <= 5:
             cu_count = num_compute_units()
             with record_function_or_nullcontext(f"wvSplitK {n}x{m}x{k}"):
                 out = ops.wvSplitK(weight, x_view, cu_count, bias)

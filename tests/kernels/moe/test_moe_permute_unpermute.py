@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
     get_moe_permute_scratch,
     moe_permute,
     moe_permute_unpermute_supported,
+    moe_prepare_scatter,
     moe_unpermute,
 )
 from vllm.utils.torch_utils import set_random_seed
@@ -451,7 +452,7 @@ def test_moe_permute_ignores_invalid_expert_ids_with_scratch() -> None:
         hidden_dtype=hidden_states.dtype,
     )
 
-    permuted, _, expert_offsets, _, _ = moe_permute(
+    permuted, _, expert_offsets, inverse, _ = moe_permute(
         hidden_states=hidden_states,
         a1q_scale=None,
         topk_ids=topk_ids,
@@ -466,3 +467,27 @@ def test_moe_permute_ignores_invalid_expert_ids_with_scratch() -> None:
         torch.tensor([0, 1, 2], dtype=torch.int64, device="cuda"),
     )
     torch.testing.assert_close(permuted[:2], hidden_states[[0, 2]])
+    assert torch.all(inverse[[1, 3, 4]] >= expert_offsets[-1])
+    expected = torch.zeros_like(hidden_states)
+    expected[[0, 2]] = hidden_states[[0, 2]]
+    output = torch.empty_like(hidden_states)
+    moe_unpermute(
+        output, permuted, torch.ones(5, 1, device="cuda"), inverse, expert_offsets
+    )
+    torch.testing.assert_close(output, expected)
+
+    expected_inverse = inverse.clone()
+    expected_offsets = expert_offsets.clone()
+    expert_offsets, indices = moe_prepare_scatter(topk_ids, expert_map, scratch)
+    torch.testing.assert_close(indices.flatten(), expected_inverse)
+    torch.testing.assert_close(expert_offsets, expected_offsets)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        expert_offsets, indices = moe_prepare_scatter(topk_ids, expert_map, scratch)
+    topk_ids.zero_()
+    graph.replay()
+
+    expected_inverse = torch.arange(5, dtype=torch.int32, device="cuda")
+    expected_offsets = torch.tensor([0, 5, 5], dtype=torch.int64, device="cuda")
+    torch.testing.assert_close(indices.flatten(), expected_inverse)
+    torch.testing.assert_close(expert_offsets, expected_offsets)
