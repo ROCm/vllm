@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -177,7 +178,8 @@ void rdna_singleseq_prefill_attn(
     int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,
     torch::Tensor& block_table, torch::Tensor& out, torch::Tensor& partial_o,
     torch::Tensor& partial_ml, torch::Tensor& counters, torch::Tensor& seq_lens,
-    int64_t max_seq_len, double scale) {
+    int64_t max_seq_len, double scale,
+    const std::optional<torch::Tensor>& mm_ranges) {
   using namespace rdna_singleseq;
   TORCH_CHECK(
       config >= 0 && config < kNumPrefillConfigs && prefill_launchers()[config],
@@ -210,6 +212,21 @@ void rdna_singleseq_prefill_attn(
   check_kv_cache(kv_cache, c.num_kv_heads, c.page_size, d);
   check_device(q, {&kv_cache, &block_table, &out, &partial_o, &partial_ml,
                    &counters, &seq_lens});
+  const int* ranges = nullptr;
+  int num_ranges = 0;
+  if (mm_ranges.has_value()) {
+    // One sequence's (ranges, 2), not the batch's (sequences, ranges, 2).
+    TORCH_CHECK(mm_ranges->scalar_type() == torch::kInt32 &&
+                    mm_ranges->is_contiguous() && mm_ranges->dim() == 2 &&
+                    mm_ranges->size(1) == 2 &&
+                    mm_ranges->device() == q.device(),
+                "mm_ranges must be one sequence's contiguous int32 (ranges, 2) "
+                "on ",
+                q.device(), ", got ", mm_ranges->scalar_type(), " ",
+                mm_ranges->sizes(), " on ", mm_ranges->device());
+    ranges = mm_ranges->data_ptr<int>();
+    num_ranges = static_cast<int>(mm_ranges->size(0));
+  }
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
   if (c.max_segments > 1) {
     // As PrefillVariant.scratch_rows.
@@ -227,5 +244,6 @@ void rdna_singleseq_prefill_attn(
       {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
        out.data_ptr(), seq_lens.data_ptr<int>(), partial_o.data_ptr<float>(),
        partial_ml.data_ptr<float>(), counters.data_ptr<int>(), (int)q.size(0),
-       (int)max_seq_len, (float)scale, at::cuda::getCurrentCUDAStream()});
+       (int)max_seq_len, (float)scale, at::cuda::getCurrentCUDAStream(), ranges,
+       num_ranges});
 }

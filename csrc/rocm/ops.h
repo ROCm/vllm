@@ -156,7 +156,8 @@ void rdna_singleseq_prefill_attn(
     int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,
     torch::Tensor& block_table, torch::Tensor& out, torch::Tensor& partial_o,
     torch::Tensor& partial_ml, torch::Tensor& counters, torch::Tensor& seq_lens,
-    int64_t max_seq_len, double scale);
+    int64_t max_seq_len, double scale,
+    const std::optional<torch::Tensor>& mm_ranges);
 
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,

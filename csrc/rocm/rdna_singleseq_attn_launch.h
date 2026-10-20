@@ -31,7 +31,8 @@ using LaunchFn = void (*)(const LaunchArgs&);
 LaunchFn* decode_launchers();
 
 // One sequence of num_tokens query tokens. partial_o, partial_ml and counters
-// are the split-KV scratch; max_seq_len only sizes the split.
+// are the split-KV scratch; max_seq_len only sizes the split. mm_ranges holds
+// num_mm_ranges (start, end) multimodal ranges, empty ones with start == end.
 struct PrefillArgs {
   const void* q;
   const void* kv;
@@ -45,6 +46,8 @@ struct PrefillArgs {
   int max_seq_len;
   float scale;
   hipStream_t stream;
+  const int* mm_ranges;
+  int num_mm_ranges;
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);

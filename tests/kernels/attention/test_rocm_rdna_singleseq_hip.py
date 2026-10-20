@@ -362,8 +362,9 @@ def test_singleseq_requires_one_sequence(max_num_seqs, monkeypatch):
 # ---------------------------------------------------------------- prefill
 
 
-def _prefill_reference(q, kv, block_table, seq_len, window=0):
-    """Float reference of a prefill."""
+def _prefill_reference(q, kv, block_table, seq_len, window=0, mm_ranges=()):
+    """Float reference of a prefill; a token in a multimodal range [start, end]
+    also sees the range's later keys."""
     m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
     pages = kv[block_table.long()]
     flat = pages.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len].float()
@@ -371,6 +372,10 @@ def _prefill_reference(q, kv, block_table, seq_len, window=0):
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
     lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
     masked = pos > lim
+    for start, end in mm_ranges:
+        q_in = (lim >= start) & (lim <= end)
+        k_in = (pos >= start) & (pos <= end)
+        masked &= ~(q_in & k_in)
     if window:
         masked |= pos < lim - (window - 1)
     out = torch.empty(m, hq, hd, device=q.device)
@@ -388,7 +393,14 @@ def _prefill_reference(q, kv, block_table, seq_len, window=0):
     return out
 
 
-def _triton_prefill(q, kv, block_table, seq_len, window=0):
+def _mm_ranges_tensor(mm_ranges, device):
+    """One sequence's ranges as TRITON_ATTN's (1, ranges, 2), padded with an
+    empty range."""
+    pairs = [*mm_ranges, (0, 0)]
+    return torch.tensor([pairs], device=device, dtype=torch.int32)
+
+
+def _triton_prefill(q, kv, block_table, seq_len, window=0, mm_ranges=()):
     """Triton's unified attention on the same cache."""
     from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 
@@ -413,15 +425,17 @@ def _triton_prefill(q, kv, block_table, seq_len, window=0):
         None,
         one,
         one,
+        mm_prefix_range=(_mm_ranges_tensor(mm_ranges, q.device) if mm_ranges else None),
+        mm_prefix_clamp_sliding_window=True,
     )
     return out
 
 
-def _assert_prefill_close(got, q, kv, block_table, seq_len, window, what):
+def _assert_prefill_close(got, q, kv, block_table, seq_len, window, what, mm_ranges=()):
     """Within twice Triton's error against the float reference."""
-    ref = _prefill_reference(q, kv, block_table, seq_len, window)
+    ref = _prefill_reference(q, kv, block_table, seq_len, window, mm_ranges)
     err = (got.float().nan_to_num(1e9) - ref).abs().max().item()
-    triton = _triton_prefill(q, kv, block_table, seq_len, window)
+    triton = _triton_prefill(q, kv, block_table, seq_len, window, mm_ranges)
     bound = 2 * (triton.float() - ref).abs().max().item() + 1e-4
     assert err <= bound, f"{what}: max error {err:.2e}, Triton's x2 {bound:.2e}"
 
@@ -581,3 +595,160 @@ def test_prefill_window_never_reads_freed_pages():
     torch.accelerator.synchronize()
     assert torch.isfinite(out).all()
     _assert_prefill_close(out, q, *clean, seq_len, v.window, "freed pages")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(32, 16, 256, 1024, torch.float16), (32, 4, 512, 0, torch.float16)]
+    + [(32, 16, 256, 1024, torch.bfloat16)],
+    ids=["swa_fp16", "global_fp16", "swa_bf16"],
+)
+@pytest.mark.parametrize(
+    "m, prefix, mm_ranges",
+    [
+        (600, 0, [(40, 295), (400, 469)]),
+        (700, 3000, [(3100, 3355)]),
+        (300, 500, [(450, 560)]),
+        # Longer than the 1024-key window: the window bounds earlier keys.
+        (2048, 512, [(600, 2099)]),
+    ],
+    ids=["two_images", "split_kv", "from_prefix", "longer_than_window"],
+)
+def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
+    """Tokens of a multimodal range see the whole range (Gemma4's shapes)."""
+    _skip_unless_gfx1151()
+    hq, hkv, d, window, dtype = shape
+    v = hip.prefill_variant_for(hq, hkv, d, 16, 1, window, dtype, m)
+    assert v is not None, shape
+    module = hip.load_prefill(v)
+    assert module is not None, v
+    scratch = hip.make_prefill_scratch(
+        hip.prefill_variants(hq, hkv, d, 16, window, dtype), torch.device("cuda")
+    )
+    seq_len = m + prefix
+    q, kv, block_table = _prefill_inputs(v, m, seq_len)
+    out = torch.full_like(q, float("nan"))
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+    module.prefill_attn(
+        q,
+        kv,
+        block_table,
+        out,
+        *scratch,
+        seq_lens,
+        seq_len,
+        d**-0.5,
+        _mm_ranges_tensor(mm_ranges, q.device)[0],
+    )
+    torch.accelerator.synchronize()
+    _assert_prefill_close(
+        out, q, kv, block_table, seq_len, window, f"{v}, M={m}", mm_ranges
+    )
+
+
+@pytest.mark.parametrize("bad", ["batch", "triples", "cpu"])
+def test_prefill_refuses_malformed_mm_ranges(bad):
+    """Only one sequence's (ranges, 2) on the device reaches the kernel: the
+    batch's (sequences, ranges, 2) would unmask other sequences' keys."""
+    _skip_unless_gfx1151()
+    v = hip.prefill_variant_for(32, 16, 256, 16, 1, 1024, torch.float16, 64)
+    module = hip.load_prefill(v)
+    scratch = hip.make_prefill_scratch([v], torch.device("cuda"))
+    q, kv, block_table = _prefill_inputs(v, 64, 64)
+    good = _mm_ranges_tensor([(10, 40)], q.device)
+    ranges = {
+        "batch": good,
+        "triples": torch.zeros(2, 3, dtype=torch.int32, device=q.device),
+        "cpu": good[0].cpu(),
+    }[bad]
+    seq_lens = torch.tensor([64], device=q.device, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="mm_ranges must be"):
+        module.prefill_attn(
+            q, kv, block_table, torch.empty_like(q), *scratch, seq_lens, 64,
+            256**-0.5, ranges,
+        )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "ranges, seq_len, query_len, expected",
+    [
+        # Decode after the image: no query token in a range.
+        ([(100, 355)], 500, 1, (False, -1)),
+        # The image's last token recomputed alone: no later keys.
+        ([(100, 355)], 356, 1, (False, 255)),
+        # A short call inside a long image (e.g. after a prefix-cache hit).
+        ([(100, 355)], 300, 5, (True, 199)),
+        # A short image long past.
+        ([(10, 14)], 500, 1, (False, -1)),
+        # An empty range over the query tokens.
+        ([(495, 495)], 500, 8, (False, -1)),
+        # Text after a 2000-token image.
+        ([(0, 1999)], 2200, 100, (False, -1)),
+        # A prefill chunk ending inside the image.
+        ([(100, 355)], 200, 150, (True, 99)),
+    ],
+    ids=[
+        "after",
+        "last_token",
+        "short_call_inside",
+        "short_past",
+        "empty",
+        "text_after_long",
+        "prefill_into",
+    ],  # fmt: skip
+)
+def test_mm_query_overlap(ranges, seq_len, query_len, expected):
+    """Only ranges holding the step's query tokens count."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_singleseq_attn import mm_query_overlap
+
+    md = types.SimpleNamespace(
+        mm_req_doc_ranges={0: ranges},
+        seq_lens_cpu_upper_bound=torch.tensor([seq_len]),
+        query_start_loc_cpu=torch.tensor([0, query_len]),
+    )
+    assert mm_query_overlap(md) == expected
+
+
+@pytest.mark.parametrize(
+    "future_keys, reach, clamp, reason",
+    [
+        (True, 4, True, "later keys"),
+        (False, 1500, False, "past the window"),
+        (False, 1500, True, None),
+        (False, 1000, False, None),
+    ],
+    ids=["later_keys", "unclamped_reach", "clamped_reach", "within_window"],
+)
+def test_mm_ranges_decode_decision(future_keys, reach, clamp, reason):
+    """Decode runs Triton when a query token's range has later keys, or when an
+    unclamped range reaches past the window; otherwise the ranges do not
+    stop it."""
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    impl = _impl()
+    impl._rejected = None
+    impl.head_size, impl.num_heads, impl.num_kv_heads = HEAD_DIM, HQ, HKV
+    fits = impl._prepare(
+        kv_cache=torch.empty(0, dtype=torch.float16),
+        q=torch.empty(1, HQ, HEAD_DIM, dtype=torch.float16),
+        out=torch.empty(1, HQ, HEAD_DIM, dtype=torch.float16),
+        alibi_slopes=None,
+        sinks=None,
+        softcap=0,
+        causal=True,
+        window_size=(1023, 0),
+        kv_quant_mode=KVQuantMode.NONE,
+        seqused_k=torch.zeros(1),
+        max_seqlen_q=2,
+        mm_future_keys=future_keys,
+        mm_reach=reach,
+        mm_prefix_clamp=clamp,
+    )
+    assert not fits
+    if reason is None:
+        # Refused later, on the tensors, not for the ranges.
+        assert "multimodal" not in impl._rejected
+    else:
+        assert reason in impl._rejected

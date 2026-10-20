@@ -108,6 +108,8 @@ class _PrefillArgs(ctypes.Structure):
         ("max_seq_len", ctypes.c_int),
         ("scale", ctypes.c_float),
         ("stream", ctypes.c_void_p),
+        ("mm_ranges", ctypes.c_void_p),
+        ("num_mm_ranges", ctypes.c_int),
     ]
 
 
@@ -268,12 +270,25 @@ class JitPrefill:
         seq_lens,
         max_seq_len,
         scale,
+        mm_ranges=None,
     ):
         v = self.variant
         if not (q.is_contiguous() and out.is_contiguous()):
             raise RuntimeError("q and out must be contiguous")
         if not q.dtype == kv_cache.dtype == out.dtype == v.dtype:
             raise RuntimeError("dtype does not match the build")
+        if mm_ranges is not None and not (
+            mm_ranges.dtype == torch.int32
+            and mm_ranges.is_contiguous()
+            and mm_ranges.dim() == 2
+            and mm_ranges.size(1) == 2
+            and mm_ranges.device == q.device
+        ):
+            raise RuntimeError(
+                "mm_ranges must be one sequence's contiguous int32 (ranges, 2) on "
+                f"{q.device}, got {mm_ranges.dtype} {tuple(mm_ranges.shape)} "
+                f"on {mm_ranges.device}"
+            )
         args = _PrefillArgs(
             q.data_ptr(),
             kv_cache.data_ptr(),
@@ -287,6 +302,8 @@ class JitPrefill:
             max_seq_len,
             scale,
             torch.cuda.current_stream(q.device).cuda_stream,
+            mm_ranges.data_ptr() if mm_ranges is not None else None,
+            mm_ranges.numel() // 2 if mm_ranges is not None else 0,
         )
         self._launch(ctypes.byref(args))
 
