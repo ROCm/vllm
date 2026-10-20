@@ -289,6 +289,7 @@ def tune(a) -> None:
         "dtype": a.dtype,
         "block_size": bs,
         "source": jit.source_digest(),
+        "family": gpu_family(),
         "contexts": ctxs,
     }
     meta = {
@@ -635,6 +636,7 @@ def tune_prefill(a) -> None:
         "dtype": a.dtype,
         "block_size": bs,
         "source": jit.source_digest(prefill=True),
+        "family": gpu_family(),
         "cells": cells,
     }
     meta = {
@@ -903,7 +905,8 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
     if dec["source"] != jit.source_digest(prefill=True):
         print(f"{tag}: refused, measured on another kernel source")
         return 0
-    lines, rows = read_configs(PREFILL_CONFIGS_H)
+    family = dec.get("family", FAMILIES["gfx1151"])
+    lines, rows = read_configs(PREFILL_CONFIGS_H, family)
     col = {f: i for i, f in enumerate(R.PREFILL_CONFIG_FIELDS)}
     dtype = utils.torch_dtype(dec["dtype"])
     for step in dec["steps"]:
@@ -942,7 +945,7 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
         )
         rows.append(R.prefill_config_fields(v))
         written += 1
-    write_configs(PREFILL_CONFIGS_H, lines, rows, R.PREFILL_CONFIG_FIELDS)
+    write_configs(PREFILL_CONFIGS_H, lines, rows, R.PREFILL_CONFIG_FIELDS, family)
     for step in merged:
         print(f"{tag} M>={step['m']}: {prefill_label(step['winner'])}")
     return written
@@ -958,25 +961,53 @@ PREFILL_CONFIGS_H = _CSRC / "rdna_singleseq_prefill_configs.h"
 _ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
 
 
-def read_configs(path: Path) -> tuple[list[str], list[list[int]]]:
-    """The lines of a configs header, and its entries."""
+# The GPU family of each arch: its config tables (Arch in
+# csrc/rocm/rdna_singleseq_attn_types.h).
+FAMILIES = {"gfx1151": "Gfx115X", "gfx1200": "Gfx120X", "gfx1201": "Gfx120X"}
+
+
+def gpu_family() -> str:
+    """The family of the GPU tune.py measures on."""
+    import torch
+
+    return FAMILIES[torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]]
+
+
+def _table_lines(lines: list[str], family: str) -> range:
+    """The line indices of family's entries in a configs header."""
+    start = 1 + next(
+        i
+        for i, line in enumerate(lines)
+        if re.search(rf"\bk{family}\w*Configs\[\] = \{{$", line)
+    )
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("};"))
+    return range(start, end)
+
+
+def read_configs(path: Path, family: str) -> tuple[list[str], list[list[int]]]:
+    """The lines of a configs header, and the entries of family's table."""
     import jit
 
     lines = path.read_text().splitlines()
-    rows = [jit.parse_cpp_fields(m[1]) for m in map(_ENTRY.match, lines) if m]
+    at = _table_lines(lines, family)
+    rows = [jit.parse_cpp_fields(m[1]) for i in at if (m := _ENTRY.match(lines[i]))]
     return lines, rows
 
 
 def write_configs(
-    path: Path, lines: list[str], rows: list[list[int]], names: tuple[str, ...]
+    path: Path,
+    lines: list[str],
+    rows: list[list[int]],
+    names: tuple[str, ...],
+    family: str,
 ) -> None:
-    """Replace the entries of a configs header with `rows`, sorted; `names`
-    are their fields."""
+    """Replace the entries of family's table in a configs header with `rows`,
+    sorted; `names` are their fields."""
     import jit
 
-    at = [i for i, line in enumerate(lines) if _ENTRY.match(line)]
+    at = _table_lines(lines, family)
     entries = [f"    {{{jit.cpp_fields(r, names)}}}," for r in sorted(rows)]
-    text = lines[: at[0]] + entries + lines[at[-1] + 1 :]
+    text = lines[: at.start] + entries + lines[at.stop :]
     path.write_text("\n".join(text) + "\n")
 
 
@@ -997,8 +1028,15 @@ def apply(path: str, block_sizes: list[int]) -> None:
         "dtype",
         "page_size",
     ), R.DECODE_CONFIG_FIELDS
-    lines, entries = read_configs(DECODE_CONFIGS_H)
-    rows = {tuple(r[:7]): r for r in entries}
+    # Each family's table, keyed by shape.
+    tables: dict[str, dict[tuple, list[int]]] = {}
+
+    def table(family: str) -> dict[tuple, list[int]]:
+        if family not in tables:
+            _, entries = read_configs(DECODE_CONFIGS_H, family)
+            tables[family] = {tuple(r[:7]): r for r in entries}
+        return tables[family]
+
     source = jit.source_digest()
     written = 0
     for line in Path(path).read_text().splitlines():
@@ -1026,6 +1064,7 @@ def apply(path: str, block_sizes: list[int]) -> None:
         if dec["current"] != (None if now is None else knobs_of(now)):
             print(f"{tag}: refused, the row changed since it was measured")
             continue
+        rows = table(dec.get("family", FAMILIES["gfx1151"]))
         sizes = sorted({k[6] for k in rows if k[:5] == (d, hq, hkv, win, m)})
         for bf16, bs in itertools.product((0, 1), sizes or block_sizes):
             v = R.KernelVariant(
@@ -1043,7 +1082,11 @@ def apply(path: str, block_sizes: list[int]) -> None:
             rows[tuple(row[:7])] = row
             written += 1
         print(f"{tag}: {label(dec['winner'])}")
-    write_configs(DECODE_CONFIGS_H, lines, list(rows.values()), R.DECODE_CONFIG_FIELDS)
+    for family, rows in tables.items():
+        lines = DECODE_CONFIGS_H.read_text().splitlines()
+        write_configs(
+            DECODE_CONFIGS_H, lines, list(rows.values()), R.DECODE_CONFIG_FIELDS, family
+        )
     print(f"# {written} rows written")
 
 

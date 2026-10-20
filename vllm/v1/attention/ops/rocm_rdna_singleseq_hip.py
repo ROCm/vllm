@@ -3,7 +3,8 @@
 """Lookup of the RDNA3.5 attention kernels built into ``_rocm_C``.
 
 Each entry of ``csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h`` is one
-build, with its shape and launch knobs as compile-time constants.
+build, with its shape and launch knobs as compile-time constants; ``_rocm_C``
+lists the table of the current GPU's family (gfx1151 or RDNA4).
 """
 
 import contextlib

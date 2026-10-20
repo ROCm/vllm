@@ -5,25 +5,38 @@
 
 import argparse
 
-# Peak DRAM bandwidth, GiB/s.
-PEAK_GIBS = 230.0
+# Measured on each GPU: sustained DRAM read (GiB/s), sustained f16/bf16 WMMA
+# (TFLOPS, hipBLASLt GEMM), per-kernel dispatch overhead under a HIP graph
+# (us), DRAM round trip (us, pointer chase), SIMDs, and cycles of one 16x16x16
+# f16 WMMA. Keyed by device name, else by arch.
+GPUS = {
+    "gfx1151": (230.0, 43.0, 1.48, 0.545, 80, 32),
+    "AMD Radeon RX 9070 XT": (596.0, 128.0, 2.15, 0.30, 128, 16),
+}
 
-# Per-kernel dispatch overhead under a HIP graph.
-DISPATCH_US = 1.48
 
-# Sustained WMMA f16/bf16 throughput on gfx1151.
-PEAK_TFLOPS = 43.0
+def _gpu() -> str:
+    try:
+        import torch
+
+        p = torch.cuda.get_device_properties(0)
+    except Exception:  # noqa: BLE001 - no GPU: the gfx1151 model
+        return "gfx1151"
+    arch = p.gcnArchName.split(":")[0]
+    return p.name if p.name in GPUS else arch if arch in GPUS else "gfx1151"
+
+
+GPU = _gpu()
+PEAK_GIBS, PEAK_TFLOPS, DISPATCH_US, DRAM_LATENCY_US, SIMDS, WMMA_CYCLES = GPUS[GPU]
 
 # Prefill model (roofline(realistic=True)): whole 16x16 score tiles, plus
 # SOFTMAX_CYCLES of VALU work per tile that does not overlap the WMMAs.
+# DRAM_LATENCY_US counts three dependent round trips: page table, KV, output.
 WMMA_TILE = 16
-SIMDS = 80
-WMMA_GHZ = PEAK_TFLOPS * 1e12 * 32 / (SIMDS * 2 * WMMA_TILE**3) / 1e9
+WMMA_GHZ = PEAK_TFLOPS * 1e12 * WMMA_CYCLES / (SIMDS * 2 * WMMA_TILE**3) / 1e9
 VALU_OPS_PER_SCORE = 4.5
 VALU_LANES = 32
 SOFTMAX_CYCLES = VALU_OPS_PER_SCORE * WMMA_TILE**2 / VALU_LANES
-# Plus three dependent DRAM round trips: page table, KV, output.
-DRAM_LATENCY_US = 0.545
 
 # Arithmetic intensity (FLOP/byte) where the roofs meet.
 RIDGE = PEAK_TFLOPS * 1e12 / (PEAK_GIBS * 1024**3)
