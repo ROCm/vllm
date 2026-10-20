@@ -720,13 +720,19 @@ RUN echo "VLLM_BASE_IMAGE=${BASE_IMAGE}" >> ${COMMON_WORKDIR}/versions.txt \
 RUN curl -k -O https://raw.githubusercontent.com/ROCm/vllm/refs/heads/gfx1250_bench/vllm_smoketest.sh
 RUN curl -k -O https://raw.githubusercontent.com/ROCm/vllm/refs/heads/gfx1250_bench/vllm_benchserve.sh
 
-
-### Install triton from upstream for AITER Deps TODO: (JPVILLAM) If possible to get this on whls it would be better
-RUN pip3 uninstall -y triton && \
-    git clone https://github.com/triton-lang/triton.git && \
-    cd triton && \
-    git checkout 78420176f2d90c3270a48c9218e27e9b5d923c8d && \
-    TRITON_APPEND_CMAKE_ARGS="-DCMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH=FALSE" pip3 install .
+# NOTE: this stage previously uninstalled the ROCm-built triton wheel (installed
+# in Dockerfile.rocm_base_gfx1250, matched to the resolved ROCm SDK/torch build)
+# and replaced it with a vanilla upstream triton-lang/triton built from a
+# hardcoded, frozen commit (78420176f2d90c3270a48c9218e27e9b5d923c8d) "for AITER
+# Deps". That commit predates gfx1250 support and carries none of the
+# ROCm-specific fixes the SDK's own triton wheel ships, and pip itself flagged
+# it as incompatible with the installed torch build (`torch ... requires
+# triton==<sdk-wheel-version>, but you have triton <frozen-commit-version>
+# which is incompatible`). The ROCm wheel index now ships a triton build that
+# already satisfies AITER's needs, so this override is stale and actively
+# harmful -- removed. (Same fix as ROCm/vllm#1306 on 455_wip, applied here on
+# top of gfx1250_perf1 since this branch carries its own independent pin of
+# the same stale workaround.)
 
 CMD ["/bin/bash"]
 
