@@ -458,6 +458,32 @@ direct_register_custom_op(
 )
 
 
+def rocm_unquantized_gemm_fp32_out_impl(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """bf16 ``x @ weight.T`` with an fp32 output."""
+    from vllm.platforms.rocm import on_gfx1250
+
+    if rocm_aiter_ops.is_triton_gemm_enabled() and on_gfx1250():
+        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+
+        return gemm_a16w16(x, weight, dtype=torch.float32)
+    return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+
+def rocm_unquantized_gemm_fp32_out_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="rocm_unquantized_gemm_fp32_out",
+    op_func=rocm_unquantized_gemm_fp32_out_impl,
+    fake_impl=rocm_unquantized_gemm_fp32_out_fake,
+)
+
+
 @functools.cache
 def warmup_rocm_skinny_gemm_workspaces(device: torch.device) -> None:
     """Eagerly allocate wvSplitKrc's per-device split-K workspace pool.

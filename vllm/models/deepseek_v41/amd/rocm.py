@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -685,6 +686,42 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 return super()._run_parallel_input_projections(hidden_states)
             finally:
                 self.aux_stream_list = aux_streams
+        if self.compressor is not None:
+            from aiter.tuned_gemm import tgemm
+
+            compressor = self.compressor
+            indexer = self.indexer
+            aux_streams = self.aux_stream_list
+            if aux_streams is not None:
+                aux_streams = aux_streams[:2]
+
+            def compressor_kv_score() -> torch.Tensor:
+                return tgemm.mm(
+                    hidden_states,
+                    compressor.fused_wkv_wgate.weight,
+                    otype=torch.float32,
+                )
+
+            aux_fns: list[Callable[[], Any] | None] = [compressor_kv_score, None]
+            if indexer is not None:
+
+                def indexer_weights_proj() -> torch.Tensor:
+                    # ReplicatedLinear returns (output, bias); bias is None.
+                    weights, _ = indexer.weights_proj(hidden_states)
+                    return weights
+
+                aux_fns[1] = indexer_weights_proj
+
+            qr_kv, (kv_score, indexer_weights) = execute_in_parallel(
+                lambda: self._fused_wqa_wkv_gemm(hidden_states),
+                aux_fns,
+                self.ln_events[0],
+                self.ln_events[1:3],
+                aux_streams,
+                enable=hidden_states.shape[0]
+                <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            )
+            return qr_kv, kv_score, indexer_weights
         return super()._run_parallel_input_projections(hidden_states)
 
     def forward(
@@ -749,6 +786,8 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         ``wk`` consumes the aux-0 latent and the q-side's wq_b consumes the
         default-stream qr.
         """
+        from aiter.tuned_gemm import tgemm
+
         attn_metadata = get_forward_context().attn_metadata
         compressor = self.compressor
         indexer = self.indexer
@@ -770,10 +809,10 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             )
 
         def compressor_chain():
-            kv_score = torch.mm(
+            kv_score = tgemm.mm(
                 hidden_states,
-                compressor.fused_wkv_wgate.weight.T,
-                out_dtype=torch.float32,
+                compressor.fused_wkv_wgate.weight,
+                otype=torch.float32,
             )
             latent = compressor(kv_score, positions)
             compressor.insert_cache(latent, positions, self.rotary_emb)

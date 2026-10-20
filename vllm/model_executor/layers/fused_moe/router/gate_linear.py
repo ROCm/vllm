@@ -31,8 +31,9 @@ class GateLinear(ReplicatedLinear):
     4. bf16x3 CuteDSL kernel (SM100, bf16 in, fp32 weight)
     5. ROCm bf16x3 router GEMM (gfx950, bf16 in, fp32 weight, fp32 out,
        M>=2048)
-    6. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
-    7. F.linear via ReplicatedLinear (ultimate fallback)
+    6. ROCm bf16×bf16→fp32 (AITER or hipBLASLt, picked per call)
+    7. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    8. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
     (e.g. when the required dtype depends on the expert quantization
@@ -347,12 +348,22 @@ class GateLinear(ReplicatedLinear):
             output = bf16x3_router_gemm(x, self.weight)
             return self._return(output)
 
-        # Tier 6: cuBLAS bf16→fp32
+        # Tier 6: ROCm bf16→fp32 custom op: AITER on gfx1250 when AITER Triton
+        # GEMM is enabled, otherwise hipBLASLt.
+        if (
+            self.allow_cublas_router_gemm
+            and current_platform.is_rocm()
+            and x.dtype == torch.bfloat16
+        ):
+            output = torch.ops.vllm.rocm_unquantized_gemm_fp32_out(x, self.weight)
+            return self._return(output)
+
+        # Tier 7: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)
 
-        # Tier 7: F.linear (ReplicatedLinear)
+        # Tier 8: F.linear (ReplicatedLinear)
         if (
             self.out_dtype is not None
             and self.is_unquantized
