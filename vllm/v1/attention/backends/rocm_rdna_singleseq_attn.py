@@ -7,6 +7,7 @@ ones csrc/rocm/rdna_singleseq_prefill_attn.cu, on TRITON_ATTN's KV cache. Anythi
 kernels do not support runs TRITON_ATTN.
 """
 
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
@@ -15,7 +16,11 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
+from vllm.v1.attention.backend import (
+    AttentionCGSupport,
+    AttentionType,
+    CommonAttentionMetadata,
+)
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
@@ -60,9 +65,62 @@ _SCRATCH: dict[tuple[KernelVariant, torch.device], Any] = {}
 _PREFILL_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
+def mm_query_overlap(md: CommonAttentionMetadata) -> tuple[bool, int]:
+    """How the step's query tokens sit in its multimodal ranges.
+
+    Returns:
+        (whether a query token's range has later keys, which only the
+        bidirectional mask shows; how far back the farthest in-range query
+        token reaches into its range, -1 if none is in one). Ranges are
+        inclusive; start >= end is empty.
+
+    """
+    ranges = md.mm_req_doc_ranges
+    if not ranges:
+        return False, -1
+    seq_lens = md.seq_lens_cpu_upper_bound
+    if seq_lens is None:
+        return True, 1 << 30
+    starts = md.query_start_loc_cpu
+    future_keys, reach = False, -1
+    for req_idx, spans in ranges.items():
+        end = int(seq_lens[req_idx])
+        begin = end - int(starts[req_idx + 1] - starts[req_idx])
+        for start, stop in spans:
+            if start >= stop:
+                continue
+            # The in-range query tokens: max(start, begin) .. min(stop, end - 1).
+            first, last = max(start, begin), min(stop, end - 1)
+            if first <= last:
+                future_keys |= first < last
+                reach = max(reach, last - start)
+    return future_keys, reach
+
+
+@dataclass
+class RocmRdnaSingleSeqMetadata(TritonAttentionMetadata):
+    # mm_query_overlap of the step.
+    mm_future_keys: bool = False
+    mm_reach: int = -1
+
+
 class RocmRdnaSingleSeqMetadataBuilder(TritonAttentionMetadataBuilder):
     # The decode kernel is built for a fixed M and ignores query_start_loc.
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
+    ) -> RocmRdnaSingleSeqMetadata:
+        md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        future_keys, reach = mm_query_overlap(common_attn_metadata)
+        return RocmRdnaSingleSeqMetadata(
+            **{f.name: getattr(md, f.name) for f in fields(md)},
+            mm_future_keys=future_keys,
+            mm_reach=reach,
+        )
 
 
 class RocmRdnaSingleSeqAttentionBackend(TritonAttentionBackend):
@@ -98,7 +156,7 @@ class RocmRdnaSingleSeqAttentionBackend(TritonAttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -183,9 +241,6 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
                 self._reject(f"only causal sliding windows, got {window}")
                 return None
             win = window[0] + 1
-        if kwargs.get("mm_prefix_range") is not None:
-            self._reject("multimodal bidirectional prefix unsupported")
-            return None
         if kwargs.get("rswa_prefix_lens") is not None:
             self._reject("rswa unsupported")
             return None
@@ -194,6 +249,16 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
             return None
         if kwargs["kv_quant_mode"] != KVQuantMode.NONE:
             self._reject(f"KV quant mode {kwargs['kv_quant_mode']!r} unsupported")
+            return None
+        # The kernels bound a multimodal range's earlier keys by the window, as
+        # the clamp does. Unclamped, a query token farther than the window into
+        # its range also sees the range's first keys.
+        if (
+            win
+            and not kwargs.get("mm_prefix_clamp")
+            and kwargs.get("mm_reach", -1) >= win
+        ):
+            self._reject("unclamped multimodal range reaches past the window")
             return None
         return win
 
@@ -227,6 +292,11 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
         """The decode kernel and its scratch, or None to fall back."""
         win = self._served_window(kwargs)
         if win is None:
+            return None
+        # The decode kernel ignores multimodal ranges: causal is right unless
+        # a query token's range has later keys.
+        if kwargs.get("mm_future_keys"):
+            self._reject("decode: a query token's multimodal range has later keys")
             return None
         max_query_len = kwargs["max_seqlen_q"]
         if kwargs["q"].shape[0] != max_query_len:
@@ -298,6 +368,7 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
                 output_scale,
                 output_block_scale,
             )
+        assert isinstance(attn_metadata, RocmRdnaSingleSeqMetadata)
         n = attn_metadata.num_actual_tokens
         args = {
             "q": query[:n],
@@ -312,6 +383,9 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
             "sinks": self.sinks,
             "softcap": self.logits_soft_cap,
             "mm_prefix_range": attn_metadata.mm_prefix_range_tensor,
+            "mm_future_keys": attn_metadata.mm_future_keys,
+            "mm_reach": attn_metadata.mm_reach,
+            "mm_prefix_clamp": getattr(layer, "mm_prefix_clamp_sliding_window", False),
             "rswa_prefix_lens": attn_metadata.rswa_prefix_lens,
             "chunk_lookback": self.chunk_lookback,
             "kv_quant_mode": self._kv_quant_mode,
@@ -333,7 +407,7 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
         )
 
     def _serve_prefill(
-        self, kv_cache: torch.Tensor, md: TritonAttentionMetadata, kwargs: dict
+        self, kv_cache: torch.Tensor, md: RocmRdnaSingleSeqMetadata, kwargs: dict
     ) -> bool:
         """Run the prefill kernel; False if it cannot serve the call.
 
@@ -344,6 +418,8 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
         win = self._served_window(kwargs)
         if win is None or not self._served_tensors(kv_cache, kwargs, None):
             return False
+        # Ranges whose query tokens see no later keys leave the mask causal.
+        mm_ranges = kwargs["mm_prefix_range"] if kwargs["mm_future_keys"] else None
         block_size = kv_cache.shape[2]
         kv_row = 2 * self.head_size
         hnd = (block_size * self.num_kv_heads * kv_row, block_size * kv_row, kv_row)
@@ -379,6 +455,7 @@ class RocmRdnaSingleSeqAttentionImpl(TritonAttentionImpl):
             # Only sizes the KV split.
             max(md.max_seq_len, m),
             kwargs["softmax_scale"],
+            mm_ranges[0] if mm_ranges is not None else None,
         )
         return True
 

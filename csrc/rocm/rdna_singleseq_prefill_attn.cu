@@ -3,6 +3,10 @@
 // (num_pages, NUM_KV_HEADS, PAGE_SIZE, 2 * HEAD_DIM), as a template on one
 // entry of rdna_singleseq_prefill_configs.h.
 //
+// PrefixLM: a token in a multimodal range [start, end] (absolute positions,
+// inclusive) also sees the range's later keys. The window still bounds its
+// earlier keys, as TRITON_ATTN with mm_prefix_clamp_sliding_window.
+//
 // FlashAttention-2 on WMMA 16x16x16. One workgroup per (kv head, query tile,
 // KV segment); row r of a kv head is token r / G, q head kvHead * G + r % G.
 // Each wave owns 16 rows over part of the head dim; a step's key_tile keys are
@@ -187,8 +191,8 @@ struct Prefill {
                    const int* __restrict__ blockTable, elem_t* __restrict__ out,
                    const int* __restrict__ seqLens, int numTokens, float scale,
                    float* __restrict__ partialO, float* __restrict__ partialML,
-                   int* __restrict__ counters, int numSegments,
-                   int firstRound) {
+                   int* __restrict__ counters, int numSegments, int firstRound,
+                   const int* __restrict__ mmRanges, int numMmRanges) {
     __shared__ __attribute__((
         aligned(16))) elem_t kTile[kBuffers][kKeyTile][kRowPitch];
     __shared__ __attribute__((aligned(16))) elem_t
@@ -222,8 +226,20 @@ struct Prefill {
     const int tileRow = tile * kBlockRows;
     const int firstToken = tileRow / kG;
     const int lastToken = min(numTokens - 1, (tileRow + kBlockRows - 1) / kG);
-    // Keys from the first token's window to the last token.
-    const int keyEnd = context + lastToken + 1;
+    // The last key any of tokens first..last sees: the last token, or the end
+    // of a multimodal range they reach into.
+    auto last_key = [&](int first, int last) __attribute__((always_inline)) {
+      int key = context + last;
+      if (numMmRanges == 0) return key;
+      for (int r = 0; r < numMmRanges; ++r) {
+        const int start = mmRanges[2 * r], end = mmRanges[2 * r + 1];
+        if (start < end && start <= context + last && end >= context + first)
+          key = max(key, end);
+      }
+      return min(key, seqLen - 1);
+    };
+    // Keys from the first token's window to the last key.
+    const int keyEnd = last_key(firstToken, lastToken) + 1;
     const int windowFirst =
         kWindow ? max(0, context + firstToken - (kWindow - 1)) : 0;
     const int tileKeyBegin = windowFirst / kKeyTile * kKeyTile;
@@ -241,6 +257,8 @@ struct Prefill {
     const int rowHead = kvHead * kG + row % kG;
     const int waveFirstToken = waveRow / kG;
     const int waveLastToken = min(numTokens - 1, (waveRow + 15) / kG);
+    const int waveLastKey = last_key(waveFirstToken, waveLastToken);
+    const int rowLastKey = last_key(rowToken, rowToken);
 
     // Stagger the Q loads of the first resident workgroups so the heaviest
     // tiles start first.
@@ -487,7 +505,7 @@ struct Prefill {
       for (int ls = 0, st = keyWave; ls < kWaveSubTiles;
            ++ls, st += kKeyWaves) {
         const int first = keyStart + st * 16;
-        live[ls] = first <= context + waveLastToken &&
+        live[ls] = first <= waveLastKey &&
                    (!kWindow ||
                     first + 15 >= context + waveFirstToken - (kWindow - 1));
       }
@@ -562,7 +580,8 @@ struct Prefill {
         }
       }
 
-      // Mask only diagonal and window-edge steps.
+      // Mask only diagonal and window-edge steps. No row's last key is before
+      // the first token's.
       const bool causalEdge = keyStart + kKeyTile - 1 > context + firstToken;
       const bool windowEdge =
           kWindow && keyStart < context + lastToken - (kWindow - 1);
@@ -573,7 +592,7 @@ struct Prefill {
 #pragma unroll
           for (int e = 0; e < 8; ++e) {
             const int key = keyStart + st * 16 + 2 * e + laneHalf;
-            if (key > context + rowToken) scores[ls][e] = -INFINITY;
+            if (key > rowLastKey) scores[ls][e] = -INFINITY;
             if constexpr (kWindow)
               if (key < context + rowToken - (kWindow - 1))
                 scores[ls][e] = -INFINITY;
@@ -857,8 +876,8 @@ void launch_prefill(const PrefillArgs& a) {
       P::prefill_attn, dim3(groups * segments), dim3(P::kThreads), 0, a.stream,
       static_cast<const elem_t*>(a.q), static_cast<const elem_t*>(a.kv), a.bt,
       static_cast<elem_t*>(a.out), a.seq_lens, a.num_tokens, a.scale,
-      a.partial_o, a.partial_ml, a.counters, segments,
-      kWgpWorkgroups * numWgps);
+      a.partial_o, a.partial_ml, a.counters, segments, kWgpWorkgroups * numWgps,
+      a.mm_ranges, a.num_mm_ranges);
 }
 
 }  // namespace

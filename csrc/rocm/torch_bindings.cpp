@@ -206,7 +206,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "rdna_singleseq_prefill_attn(int config, Tensor q, Tensor kv_cache, "
       "Tensor block_table, Tensor! out, Tensor! partial_o, "
       "Tensor! partial_ml, Tensor! counters, Tensor seq_lens, "
-      "int max_seq_len, float scale) -> ()");
+      "int max_seq_len, float scale, Tensor? mm_ranges=None) -> ()");
   rocm_ops.impl("rdna_singleseq_prefill_attn", torch::kCUDA,
                 &rdna_singleseq_prefill_attn);
 #endif
