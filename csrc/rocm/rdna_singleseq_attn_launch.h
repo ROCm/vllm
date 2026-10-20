@@ -25,11 +25,6 @@ struct LaunchArgs {
 
 using LaunchFn = void (*)(const LaunchArgs&);
 
-// The launch function of each entry of kDecodeConfigs, null until its unit
-// (cmake/rocm_rdna_singleseq_attn.cmake) registers it. Defined in
-// rdna_singleseq_registry.cu.
-LaunchFn* decode_launchers();
-
 // One sequence of num_tokens query tokens. partial_o, partial_ml and counters
 // are the split-KV scratch; max_seq_len only sizes the split.
 struct PrefillArgs {
@@ -48,8 +43,5 @@ struct PrefillArgs {
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);
-
-// Likewise for kPrefillConfigs.
-PrefillFn* prefill_launchers();
 
 }  // namespace rdna_singleseq

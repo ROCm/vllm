@@ -1590,13 +1590,33 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/gdn_chunked.cu")
   endif()
 
-  # RDNA3.5 attention kernels (gfx1151 only).
+  # RDNA attention kernels: a table of builds for the archs with 1536 VGPRs a
+  # SIMD lane (gfx1151) and one for those with 1024 (gfx1150, gfx1152,
+  # gfx1153).
   set(VLLM_ROCM_HAS_RDNA_SINGLESEQ_ATTN OFF)
-  if("gfx1151" IN_LIST VLLM_GPU_ARCHES)
+  set(VLLM_RDNA_SINGLESEQ_1536_ARCHES "")
+  set(VLLM_RDNA_SINGLESEQ_1024_ARCHES "")
+  foreach(_ARCH gfx1150 gfx1151 gfx1152 gfx1153)
+    if(_ARCH IN_LIST VLLM_GPU_ARCHES)
+      if(_ARCH STREQUAL "gfx1151")
+        list(APPEND VLLM_RDNA_SINGLESEQ_1536_ARCHES ${_ARCH})
+      else()
+        list(APPEND VLLM_RDNA_SINGLESEQ_1024_ARCHES ${_ARCH})
+      endif()
+    endif()
+  endforeach()
+  if(VLLM_RDNA_SINGLESEQ_1536_ARCHES OR VLLM_RDNA_SINGLESEQ_1024_ARCHES)
     set(VLLM_ROCM_HAS_RDNA_SINGLESEQ_ATTN ON)
     include(cmake/rocm_rdna_singleseq_attn.cmake)
-    rdna_singleseq_attn_target(_rocm_C_rdna_singleseq_attn "gfx1151")
     list(APPEND VLLM_ROCM_EXT_SRC "csrc/rocm/rdna_singleseq_registry.cu")
+  endif()
+  if(VLLM_RDNA_SINGLESEQ_1536_ARCHES)
+    rdna_singleseq_attn_target(_rocm_C_rdna_singleseq_attn
+      "${VLLM_RDNA_SINGLESEQ_1536_ARCHES}" Vgpr1536)
+  endif()
+  if(VLLM_RDNA_SINGLESEQ_1024_ARCHES)
+    rdna_singleseq_attn_target(_rocm_C_rdna_singleseq_attn_1024vgpr
+      "${VLLM_RDNA_SINGLESEQ_1024_ARCHES}" Vgpr1024)
   endif()
 
   define_extension_target(
@@ -1648,8 +1668,15 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GDN_CHUNKED)
   endif()
   if(VLLM_ROCM_HAS_RDNA_SINGLESEQ_ATTN)
-    target_link_libraries(_rocm_C PRIVATE _rocm_C_rdna_singleseq_attn)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_RDNA_SINGLESEQ_ATTN)
+  endif()
+  if(VLLM_RDNA_SINGLESEQ_1536_ARCHES)
+    target_link_libraries(_rocm_C PRIVATE _rocm_C_rdna_singleseq_attn)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_RDNA_SINGLESEQ_1536)
+  endif()
+  if(VLLM_RDNA_SINGLESEQ_1024_ARCHES)
+    target_link_libraries(_rocm_C PRIVATE _rocm_C_rdna_singleseq_attn_1024vgpr)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_RDNA_SINGLESEQ_1024)
   endif()
 endif()
 

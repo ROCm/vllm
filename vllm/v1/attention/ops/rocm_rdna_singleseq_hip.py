@@ -3,7 +3,10 @@
 """Lookup of the RDNA3.5 attention kernels built into ``_rocm_C``.
 
 Each entry of ``csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h`` is one
-build, with its shape and launch knobs as compile-time constants.
+build, with its shape and launch knobs as compile-time constants. gfx1151 (1536
+VGPRs a SIMD lane) builds those entries; gfx1150, gfx1152 and gfx1153 (1024)
+build those of the ``_configs_1024vgpr.h`` headers, tuned for them. _rocm_C
+lists the builds of the current device's table.
 """
 
 import contextlib

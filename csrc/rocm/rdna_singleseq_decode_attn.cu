@@ -31,6 +31,10 @@ inline constexpr int kDecodeAblate = ABLATE;
 inline constexpr int kDecodeAblate = 0;
 #endif
 
+// Internal linkage: each table's units instantiate their own builds, so the
+// same entry in two tables built for different archs does not collide.
+namespace {
+
 // Six dims (D=96): three 4-byte aligned dwords.
 struct u3w {
   unsigned w[3];
@@ -1220,16 +1224,20 @@ void launch_decode(const LaunchArgs& a) {
                                 device);
     (void)hipOccupancyMaxActiveBlocksPerMultiprocessor(
         &perWgp, decode_attn<C, elem_t>, K::kThreads, 0);
-    // The runtime assumes 64 KiB of LDS per WGP; gfx1151 has 128 KiB.
+    // The runtime assumes 64 KiB of LDS per WGP; gfx1150..gfx1153 have
+    // 128 KiB (64 KiB at most per workgroup).  VGPRs a SIMD lane: 1536 in
+    // blocks of 24 on gfx1151, 1024 in blocks of 16 on the others.
     hipFuncAttributes attrs;
     hipDeviceProp_t prop;
     if (hipFuncGetAttributes(
             &attrs, reinterpret_cast<const void*>(decode_attn<C, elem_t>)) ==
             hipSuccess &&
         hipGetDeviceProperties(&prop, device) == hipSuccess &&
-        strstr(prop.gcnArchName, "gfx1151")) {
+        strstr(prop.gcnArchName, "gfx115")) {
+      const bool gfx1151 = strstr(prop.gcnArchName, "gfx1151");
+      const int vgprs = gfx1151 ? 1536 : 1024, block = gfx1151 ? 24 : 16;
       const int wavesPerSimd =
-          std::min(16, 1536 / ((attrs.numRegs + 23) / 24 * 24));
+          std::min(16, vgprs / ((attrs.numRegs + block - 1) / block * block));
       const int byWaves = 2 * (2 * wavesPerSimd / K::kWaves);
       const int byLds = attrs.sharedSizeBytes
                             ? 128 * 1024 / (int)attrs.sharedSizeBytes
@@ -1246,5 +1254,7 @@ void launch_decode(const LaunchArgs& a) {
                      a.cnt, static_cast<elem_t*>(a.out), a.seq_lens, a.bt_width,
                      a.scale, cooperative);
 }
+
+}  // namespace
 
 }  // namespace rdna_singleseq

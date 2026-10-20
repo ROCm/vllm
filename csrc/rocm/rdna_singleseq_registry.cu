@@ -1,6 +1,7 @@
-// Torch ops over the RDNA3.5 attention kernels built into _rocm_C.
+// Torch ops over the RDNA attention kernels built into _rocm_C.
 // rdna_singleseq_{decode,prefill}_configs list the builds of a kernel and
-// rdna_singleseq_{decode,prefill}_attn launch one by its index.
+// rdna_singleseq_{decode,prefill}_attn launch one by its index, both in the
+// table of the current device (rdna_singleseq_attn_tables.h).
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -11,29 +12,71 @@
 #include <string>
 #include <vector>
 
-#include "rdna_singleseq_attn_launch.h"
-#include "rdna_singleseq_decode_configs.h"
-#include "rdna_singleseq_prefill_configs.h"
+#include "rdna_singleseq_attn_tables.h"
 
+template <class Table>
 rdna_singleseq::LaunchFn* rdna_singleseq::decode_launchers() {
-  static LaunchFn launchers[std::size(kDecodeConfigs)] = {};
+  static LaunchFn launchers[std::size(Table::decode)] = {};
   return launchers;
 }
 
+template <class Table>
 rdna_singleseq::PrefillFn* rdna_singleseq::prefill_launchers() {
-  static PrefillFn launchers[std::size(kPrefillConfigs)] = {};
+  static PrefillFn launchers[std::size(Table::prefill)] = {};
   return launchers;
 }
+
+template rdna_singleseq::LaunchFn*
+rdna_singleseq::decode_launchers<rdna_singleseq::Vgpr1536>();
+template rdna_singleseq::LaunchFn*
+rdna_singleseq::decode_launchers<rdna_singleseq::Vgpr1024>();
+template rdna_singleseq::PrefillFn*
+rdna_singleseq::prefill_launchers<rdna_singleseq::Vgpr1536>();
+template rdna_singleseq::PrefillFn*
+rdna_singleseq::prefill_launchers<rdna_singleseq::Vgpr1024>();
 
 namespace {
 
-constexpr int64_t kNumDecodeConfigs = std::size(rdna_singleseq::kDecodeConfigs);
-constexpr int64_t kNumPrefillConfigs =
-    std::size(rdna_singleseq::kPrefillConfigs);
+using rdna_singleseq::DecodeConfig;
+using rdna_singleseq::LaunchFn;
+using rdna_singleseq::PrefillConfig;
+using rdna_singleseq::PrefillFn;
 
-bool on_gfx1151() {
+// A table's builds and their launch functions.
+struct Table {
+  const DecodeConfig* decode = nullptr;
+  int64_t num_decode = 0;
+  LaunchFn* decode_launchers = nullptr;
+  const PrefillConfig* prefill = nullptr;
+  int64_t num_prefill = 0;
+  PrefillFn* prefill_launchers = nullptr;
+};
+
+template <class T>
+Table table_of() {
+  return {T::decode,
+          static_cast<int64_t>(std::size(T::decode)),
+          rdna_singleseq::decode_launchers<T>(),
+          T::prefill,
+          static_cast<int64_t>(std::size(T::prefill)),
+          rdna_singleseq::prefill_launchers<T>()};
+}
+
+// The table built for the current device; empty for any other.
+Table device_table() {
   const std::string arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
-  return arch.find("gfx1151") != std::string::npos;
+  const auto on = [&](const char* a) {
+    return arch.find(a) != std::string::npos;
+  };
+#ifdef VLLM_RDNA_SINGLESEQ_1536
+  if (on("gfx1151")) return table_of<rdna_singleseq::Vgpr1536>();
+#endif
+#ifdef VLLM_RDNA_SINGLESEQ_1024
+  if (on("gfx1150") || on("gfx1152") || on("gfx1153"))
+    return table_of<rdna_singleseq::Vgpr1024>();
+#endif
+  (void)on;
+  return {};
 }
 
 // The kernels expect (num_pages, NUM_KV_HEADS, PAGE_SIZE, 2 * HEAD_DIM).
@@ -59,15 +102,15 @@ void check_device(const torch::Tensor& q,
 
 }  // namespace
 
-// Every decode build, its DecodeConfig fields in order; none off gfx1151.
-// Raises if a build has no instantiation unit.
+// Every decode build of the device's table, its DecodeConfig fields in order;
+// none on other devices. Raises if a build has no instantiation unit.
 std::vector<int64_t> rdna_singleseq_decode_configs() {
   std::vector<int64_t> fields;
-  if (!on_gfx1151()) return fields;
-  for (int64_t i = 0; i < kNumDecodeConfigs; ++i) {
-    const rdna_singleseq::DecodeConfig& c = rdna_singleseq::kDecodeConfigs[i];
-    TORCH_CHECK(rdna_singleseq::decode_launchers()[i], "decode build ", i,
-                " (head dim ", static_cast<int>(c.head_dim), ", bf16 ",
+  const Table t = device_table();
+  for (int64_t i = 0; i < t.num_decode; ++i) {
+    const DecodeConfig& c = t.decode[i];
+    TORCH_CHECK(t.decode_launchers[i], "decode build ", i, " (head dim ",
+                static_cast<int>(c.head_dim), ", bf16 ",
                 c.dtype == rdna_singleseq::Dtype::kBf16,
                 ") has no unit in cmake/rocm_rdna_singleseq_attn.cmake");
     fields.insert(
@@ -80,15 +123,15 @@ std::vector<int64_t> rdna_singleseq_decode_configs() {
   return fields;
 }
 
-// Every prefill build, its PrefillConfig fields in order; none off gfx1151.
-// Raises if a build has no instantiation unit.
+// Every prefill build of the device's table, its PrefillConfig fields in
+// order; none on other devices. Raises if a build has no instantiation unit.
 std::vector<int64_t> rdna_singleseq_prefill_configs() {
   std::vector<int64_t> fields;
-  if (!on_gfx1151()) return fields;
-  for (int64_t i = 0; i < kNumPrefillConfigs; ++i) {
-    const rdna_singleseq::PrefillConfig& c = rdna_singleseq::kPrefillConfigs[i];
-    TORCH_CHECK(rdna_singleseq::prefill_launchers()[i], "prefill build ", i,
-                " (head dim ", static_cast<int>(c.head_dim), ", bf16 ",
+  const Table t = device_table();
+  for (int64_t i = 0; i < t.num_prefill; ++i) {
+    const PrefillConfig& c = t.prefill[i];
+    TORCH_CHECK(t.prefill_launchers[i], "prefill build ", i, " (head dim ",
+                static_cast<int>(c.head_dim), ", bf16 ",
                 c.dtype == rdna_singleseq::Dtype::kBf16,
                 ") has no unit in cmake/rocm_rdna_singleseq_attn.cmake");
     fields.insert(
@@ -109,10 +152,11 @@ void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
                                 torch::Tensor& l, torch::Tensor& cnt,
                                 torch::Tensor& seq_lens, double scale) {
   using namespace rdna_singleseq;
+  const Table t = device_table();
   TORCH_CHECK(
-      config >= 0 && config < kNumDecodeConfigs && decode_launchers()[config],
+      config >= 0 && config < t.num_decode && t.decode_launchers[config],
       "no decode build ", config);
-  const DecodeConfig& c = kDecodeConfigs[config];
+  const DecodeConfig& c = t.decode[config];
   const int maxm = c.max_query_len;
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
@@ -164,7 +208,7 @@ void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
               "scratch too small for this build: needs ", rows * d, ", ", rows,
               ", ", rows, ", ", counters, " elements");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
-  decode_launchers()[config](
+  t.decode_launchers[config](
       {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
        acc.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(),
        cnt.data_ptr<int>(), out.data_ptr(), seq_lens.data_ptr<int>(),
@@ -179,10 +223,11 @@ void rdna_singleseq_prefill_attn(
     torch::Tensor& partial_ml, torch::Tensor& counters, torch::Tensor& seq_lens,
     int64_t max_seq_len, double scale) {
   using namespace rdna_singleseq;
+  const Table t = device_table();
   TORCH_CHECK(
-      config >= 0 && config < kNumPrefillConfigs && prefill_launchers()[config],
+      config >= 0 && config < t.num_prefill && t.prefill_launchers[config],
       "no prefill build ", config);
-  const PrefillConfig& c = kPrefillConfigs[config];
+  const PrefillConfig& c = t.prefill[config];
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
   TORCH_CHECK(
@@ -223,7 +268,7 @@ void rdna_singleseq_prefill_attn(
                 "scratch too small for this build: needs ", rows * d, ", ",
                 2 * rows, ", ", target, " elements");
   }
-  prefill_launchers()[config](
+  t.prefill_launchers[config](
       {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
        out.data_ptr(), seq_lens.data_ptr<int>(), partial_o.data_ptr<float>(),
        partial_ml.data_ptr<float>(), counters.data_ptr<int>(), (int)q.size(0),
