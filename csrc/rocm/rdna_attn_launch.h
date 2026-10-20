@@ -4,10 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
-namespace rdna_singleseq {
+namespace rdna {
 
 // Raw pointers keep torch headers out of the kernels. Mirrored by
-// benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/jit.py.
+// benchmarks/kernels/rocm_rdna_hip_attn/tools/jit.py.
 struct LaunchArgs {
   const void* q;
   const void* kv;
@@ -34,8 +34,8 @@ struct LaunchArgs {
 using LaunchFn = void (*)(const LaunchArgs&);
 
 // The launch function of each entry of kDecodeConfigs, null until its unit
-// (cmake/rocm_rdna_singleseq_attn.cmake) registers it. Defined in
-// rdna_singleseq_registry.cu.
+// (cmake/rocm_rdna_attn.cmake) registers it. Defined in
+// rdna_registry.cu.
 LaunchFn* decode_launchers();
 // Likewise for kDecodeBatchConfigs.
 LaunchFn* decode_batch_launchers();
@@ -72,4 +72,4 @@ using PrefillFn = void (*)(const PrefillArgs&);
 // Likewise for kPrefillConfigs.
 PrefillFn* prefill_launchers();
 
-}  // namespace rdna_singleseq
+}  // namespace rdna

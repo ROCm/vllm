@@ -2,9 +2,9 @@
 // compiled; a call whose shape has no entry runs on Triton.
 #pragma once
 
-#include "rdna_singleseq_attn_types.h"
+#include "rdna_attn_types.h"
 
-namespace rdna_singleseq {
+namespace rdna {
 
 struct DecodeConfig {
   // The shape a build serves.
@@ -27,7 +27,7 @@ struct DecodeConfig {
   int dot_product;     // per-q-head dot products instead of WMMA
 };
 
-// Written by benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/tune.py
+// Written by benchmarks/kernels/rocm_rdna_hip_attn/tools/tune.py
 // --apply, one entry per line in DecodeConfig order.
 // clang-format off
 inline constexpr DecodeConfig kDecodeConfigs[] = {
@@ -706,4 +706,4 @@ inline constexpr DecodeConfig kDecodeConfigs[] = {
 };
 // clang-format on
 
-}  // namespace rdna_singleseq
+}  // namespace rdna

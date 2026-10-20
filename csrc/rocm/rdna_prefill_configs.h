@@ -2,9 +2,9 @@
 // compiled; a call whose shape has no entry runs on Triton.
 #pragma once
 
-#include "rdna_singleseq_attn_types.h"
+#include "rdna_attn_types.h"
 
-namespace rdna_singleseq {
+namespace rdna {
 
 struct PrefillConfig {
   // The shape a build serves.
@@ -28,7 +28,7 @@ struct PrefillConfig {
   int head_group;      // kv heads whose tiles interleave in the grid
 };
 
-// Written by benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/tune.py
+// Written by benchmarks/kernels/rocm_rdna_hip_attn/tools/tune.py
 // --apply, one entry per line in PrefillConfig order.
 // clang-format off
 inline constexpr PrefillConfig kPrefillConfigs[] = {
@@ -469,4 +469,4 @@ inline constexpr PrefillConfig kPrefillConfigs[] = {
 };
 // clang-format on
 
-}  // namespace rdna_singleseq
+}  // namespace rdna

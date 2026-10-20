@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Time ROCM_RDNA_SINGLESEQ_ATTN on the shapes of shapes.csv, as markdown.
+"""Time ROCM_RDNA_ATTN on the shapes of shapes.csv, as markdown.
 
 Decode specs run under CUDA graphs, prefill specs without, as in vLLM.
 `path` is what ran (`kernel`, `prefill` or `triton`); %roof is against
@@ -10,7 +10,7 @@ backends to compare. Forcing a knob, --ablate or --jit builds the variants
 with jit.py.
 
     PYTHONPATH=$PWD python \\
-        benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/matrix.py
+        benchmarks/kernels/rocm_rdna_hip_attn/tools/matrix.py
 """
 
 import argparse
@@ -144,7 +144,7 @@ def our_variants(reqs, hq, hkv, d, window, block_size, dtype, forced, spec=0):
     import jit
     import numpy as np
 
-    import vllm.v1.attention.ops.rocm_rdna_singleseq_hip as R
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     m = reqs[0].q_len
     out = []
@@ -392,9 +392,7 @@ def main() -> None:
             head = [spec, hq, hkv, d, window or "-"]
             try:
                 with jit.paths() as path, jit.override(forced):
-                    ours, spread = timeit(
-                        "ROCM_RDNA_SINGLESEQ_ATTN", spec, hq, hkv, d, window
-                    )
+                    ours, spread = timeit("ROCM_RDNA_ATTN", spec, hq, hkv, d, window)
             except Exception as exc:  # noqa: BLE001 - a forced knob may not build
                 print(
                     f"| {' | '.join(map(str, head))} | {type(exc).__name__}: "

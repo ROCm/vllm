@@ -53,9 +53,8 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.triton_flash_attn.TritonFlashAttentionBackend"
     )
     ROCM_ATTN = "vllm.v1.attention.backends.rocm_attn.RocmAttentionBackend"
-    ROCM_RDNA_SINGLESEQ_ATTN = (
-        "vllm.v1.attention.backends.rocm_rdna_singleseq_attn."
-        "RocmRdnaSingleSeqAttentionBackend"
+    ROCM_RDNA_ATTN = (
+        "vllm.v1.attention.backends.rocm_rdna_attn.RocmRdnaAttentionBackend"
     )
     ROCM_AITER_MLA = "vllm.v1.attention.backends.mla.rocm_aiter_mla.AiterMLABackend"
     ROCM_AITER_TRITON_MLA = (
