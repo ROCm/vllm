@@ -2,9 +2,9 @@
 // kPrefillConfigs entry and head group that run a prefill batch.
 #pragma once
 
-#include "rdna_singleseq_attn_types.h"
+#include "rdna_attn_types.h"
 
-namespace rdna_singleseq {
+namespace rdna {
 
 struct PrefillBatchConfig {
   HeadDim head_dim;
@@ -18,7 +18,7 @@ struct PrefillBatchConfig {
   int head_group;     // 0: the build's
 };
 
-// Written by benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/tune.py
+// Written by benchmarks/kernels/rocm_rdna_hip_attn/tools/tune.py
 // --apply, one entry per line in PrefillBatchConfig order.
 // clang-format off
 inline constexpr PrefillBatchConfig kPrefillBatchConfigs[] = {
@@ -824,4 +824,4 @@ inline constexpr PrefillBatchConfig kPrefillBatchConfigs[] = {
 };
 // clang-format on
 
-}  // namespace rdna_singleseq
+}  // namespace rdna
