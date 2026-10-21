@@ -89,6 +89,8 @@ class _LaunchArgs(ctypes.Structure):
         ("bt_width", ctypes.c_int),
         ("scale", ctypes.c_float),
         ("stream", ctypes.c_void_p),
+        ("mm_ranges", ctypes.c_void_p),
+        ("mm_capacity", ctypes.c_int),
     ]
 
 
@@ -224,7 +226,18 @@ class Jit:
         self._launch.restype = None
 
     def decode_attn(
-        self, q, kv_cache, block_table, out, acc, m, ls, cnt, seq_lens, scale
+        self,
+        q,
+        kv_cache,
+        block_table,
+        out,
+        acc,
+        m,
+        ls,
+        cnt,
+        seq_lens,
+        scale,
+        mm_ranges=None,
     ):
         v = self.variant
         if not (q.is_contiguous() and out.is_contiguous()):
@@ -233,6 +246,17 @@ class Jit:
             raise RuntimeError("dtype does not match the build")
         if q.size(0) != v.max_query_len:
             raise RuntimeError(f"q has {q.size(0)} tokens for {v.name}")
+        if mm_ranges is not None and not (
+            mm_ranges.dtype == torch.int32
+            and mm_ranges.is_contiguous()
+            and mm_ranges.dim() == 1
+            and mm_ranges.numel() % 2 == 1
+            and mm_ranges.device == q.device
+        ):
+            raise RuntimeError(
+                "mm_ranges must be a contiguous int32 [count, start0, end0, ...] "
+                f"on {q.device}"
+            )
         args = _LaunchArgs(
             q.data_ptr(),
             kv_cache.data_ptr(),
@@ -246,6 +270,8 @@ class Jit:
             block_table.size(-1),
             scale,
             torch.cuda.current_stream(q.device).cuda_stream,
+            mm_ranges.data_ptr() if mm_ranges is not None else None,
+            mm_ranges.numel() // 2 if mm_ranges is not None else 0,
         )
         self._launch(ctypes.byref(args))
 

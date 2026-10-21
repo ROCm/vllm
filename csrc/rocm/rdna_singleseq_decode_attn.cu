@@ -114,6 +114,22 @@ struct Decode {
     return __builtin_bit_cast(e16, packed);
   }
 
+  // The last key a query token at `position` sees: its own, or the end of the
+  // multimodal range [start, end] it is in. `ranges` as LaunchArgs::mm_ranges.
+  static __device__ __forceinline__ int mm_last_key(const int* ranges,
+                                                    int capacity, int position,
+                                                    int seqLen) {
+    int key = position;
+    if (ranges == nullptr) return key;
+    const int count = min(ranges[0], capacity);
+    for (int r = 0; r < count; ++r) {
+      const int start = ranges[1 + 2 * r], end = ranges[2 + 2 * r];
+      if (start < end && start <= position && position <= end)
+        key = max(key, end);
+    }
+    return min(key, seqLen - 1);
+  }
+
   // Dot-product path (C.dot_product). Its constants and asserts are
   // evaluated for every build; the asserts only bind its own.
   // One workgroup per (q head, segment); each wave takes kTileKeys keys at a
@@ -206,7 +222,8 @@ struct Decode {
       float* __restrict__ partialMax, float* __restrict__ partialSum,
       int* __restrict__ counters, OutT* __restrict__ out, const int seqLen,
       int pageIndices, int blockTableWidth, float scale, int cooperative,
-      char* __restrict__ lds) {
+      char* __restrict__ lds, const int* __restrict__ mmRanges,
+      int mmCapacity) {
     (void)cooperative;
     if (blockIdx.x >= kDotGrid) return;
     const int thread = threadIdx.x;
@@ -241,6 +258,11 @@ struct Decode {
     __builtin_assume(seqLen > 0);
     const float scaleLog2 = scale * kLog2e;
     const int context = seqLen - kMaxQueryLen;
+    // Each token's last key: its own, or its multimodal range's end.
+    int lastKey[kMaxQueryLen];
+#pragma unroll
+    for (int t = 0; t < kMaxQueryLen; ++t)
+      lastKey[t] = mm_last_key(mmRanges, mmCapacity, context + t, seqLen);
     const int globalWave =
         __builtin_amdgcn_readfirstlane(segment * kWaves + wave);
     // With a window, start at the tile of the first visible key.
@@ -306,7 +328,7 @@ struct Decode {
         const int key = tileKey + c * kKeysPerStep + keyInStep;
 #pragma unroll
         for (int t = 0; t < kMaxQueryLen; ++t) {
-          const bool causal = key <= context + t;
+          const bool causal = key <= lastKey[t];
           if constexpr (kWindow)
             scores[c][t] =
                 (key < context + t - (kWindow - 1)) ? -INFINITY : scores[c][t];
@@ -605,7 +627,8 @@ struct Decode {
       float* __restrict__ partialMax, float* __restrict__ partialSum,
       int* __restrict__ counters, OutT* __restrict__ out, const int seqLen,
       int pageIndices, int blockTableWidth, float scale, int cooperative,
-      char* __restrict__ lds) {
+      char* __restrict__ lds, const int* __restrict__ mmRanges,
+      int mmCapacity) {
     const int thread = threadIdx.x;
     const int lane = thread & (kWaveSize - 1);
     const int wave = __builtin_amdgcn_readfirstlane(thread / kWaveSize);
@@ -842,10 +865,14 @@ struct Decode {
 #pragma unroll
       for (int rt = 0; rt < kRowTiles; ++rt) {
         if (__builtin_expect(pastContext || belowWindow, 0)) {
+          // The row's last key: its token's own, or its multimodal range's
+          // end. Here, not before the loop: a register the loop would hold.
+          const int lastKey =
+              mm_last_key(mmRanges, mmCapacity, context + rowToken[rt], seqLen);
 #pragma unroll
           for (int e = 0; e < 8; ++e) {
             const int key = tileKey + 2 * e + laneHalf;
-            const bool causal = key <= context + rowToken[rt];
+            const bool causal = key <= lastKey;
             if constexpr (kWindow)
               if (key < context + rowToken[rt] - (kWindow - 1))
                 scores[rt][e] = -INFINITY;
@@ -1187,7 +1214,7 @@ __global__ __launch_bounds__(Decode<C>::kThreads) void decode_attn(
     float* __restrict__ partialMax, float* __restrict__ partialSum,
     int* __restrict__ counters, OutT* __restrict__ out,
     const int* __restrict__ seqLens, int blockTableWidth, float scale,
-    int cooperative) {
+    int cooperative, const int* __restrict__ mmRanges, int mmCapacity) {
   using K = Decode<C>;
   __shared__ __attribute__((aligned(16))) char lds[K::kLds];
   // Load S and the first pages together.
@@ -1196,12 +1223,14 @@ __global__ __launch_bounds__(Decode<C>::kThreads) void decode_attn(
     const int pageIndices = K::dot_first_pages(blockTable, blockTableWidth);
     K::template dot_body<OutT>(q, kv, blockTable, partialAcc, partialMax,
                                partialSum, counters, out, seqLen, pageIndices,
-                               blockTableWidth, scale, cooperative, lds);
+                               blockTableWidth, scale, cooperative, lds,
+                               mmRanges, mmCapacity);
   } else {
     const int pageIndices = K::wmma_first_pages(blockTable, blockTableWidth);
     K::template wmma_body<OutT>(q, kv, blockTable, partialAcc, partialMax,
                                 partialSum, counters, out, seqLen, pageIndices,
-                                blockTableWidth, scale, cooperative, lds);
+                                blockTableWidth, scale, cooperative, lds,
+                                mmRanges, mmCapacity);
   }
 }
 
@@ -1244,7 +1273,7 @@ void launch_decode(const LaunchArgs& a) {
                      static_cast<const elem_t*>(a.q),
                      static_cast<const elem_t*>(a.kv), a.bt, a.acc, a.m, a.l,
                      a.cnt, static_cast<elem_t*>(a.out), a.seq_lens, a.bt_width,
-                     a.scale, cooperative);
+                     a.scale, cooperative, a.mm_ranges, a.mm_capacity);
 }
 
 }  // namespace rdna_singleseq

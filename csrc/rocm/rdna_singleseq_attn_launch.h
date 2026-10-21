@@ -21,6 +21,11 @@ struct LaunchArgs {
   int bt_width;
   float scale;
   hipStream_t stream;
+  // Multimodal ranges in device memory, read at run time so CUDA graphs
+  // follow them: mm_ranges[0] ranges, then (start, end) pairs, at most
+  // mm_capacity. Null for no ranges.
+  const int* mm_ranges;
+  int mm_capacity;
 };
 
 using LaunchFn = void (*)(const LaunchArgs&);

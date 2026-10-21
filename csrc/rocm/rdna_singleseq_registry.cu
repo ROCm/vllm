@@ -108,7 +108,8 @@ void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
                                 torch::Tensor& block_table, torch::Tensor& out,
                                 torch::Tensor& acc, torch::Tensor& m,
                                 torch::Tensor& l, torch::Tensor& cnt,
-                                torch::Tensor& seq_lens, double scale) {
+                                torch::Tensor& seq_lens, double scale,
+                                const std::optional<torch::Tensor>& mm_ranges) {
   using namespace rdna_singleseq;
   TORCH_CHECK(
       config >= 0 && config < kNumDecodeConfigs && decode_launchers()[config],
@@ -164,13 +165,29 @@ void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
                   l.numel() >= rows && cnt.numel() >= counters,
               "scratch too small for this build: needs ", rows * d, ", ", rows,
               ", ", rows, ", ", counters, " elements");
+  // [count, start0, end0, ...] in device memory: CUDA graphs read the count
+  // at replay.
+  const int* ranges = nullptr;
+  int capacity = 0;
+  if (mm_ranges.has_value()) {
+    TORCH_CHECK(mm_ranges->scalar_type() == torch::kInt32 &&
+                    mm_ranges->is_contiguous() && mm_ranges->dim() == 1 &&
+                    mm_ranges->numel() % 2 == 1 &&
+                    mm_ranges->device() == q.device(),
+                "mm_ranges must be a contiguous int32 [count, start0, end0, "
+                "...] on ",
+                q.device(), ", got ", mm_ranges->scalar_type(), " ",
+                mm_ranges->sizes(), " on ", mm_ranges->device());
+    ranges = mm_ranges->data_ptr<int>();
+    capacity = static_cast<int>(mm_ranges->numel() / 2);
+  }
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
   decode_launchers()[config](
       {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
        acc.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(),
        cnt.data_ptr<int>(), out.data_ptr(), seq_lens.data_ptr<int>(),
        (int)block_table.size(-1), (float)scale,
-       at::cuda::getCurrentCUDAStream()});
+       at::cuda::getCurrentCUDAStream(), ranges, capacity});
 }
 
 // One sequence; runs outside CUDA graphs, so max_seq_len may size the split.
