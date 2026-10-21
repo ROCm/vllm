@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Microbenchmark for ViT attention backends at a parametrizable shape,
-default = Gemma3-4B SigLIP ViT.
+"""Microbenchmark for the ViT prefill attention backends at a parametrizable
+shape, default = Gemma3-4B SigLIP ViT.
 
 Calls `triton.testing.do_bench`, which clears the L2 cache before every
 measurement iteration to approximate the kernel's cold-cache behavior inside
@@ -17,8 +17,9 @@ by --mm-encoder-attn-backend in vllm serve (TRITON_ATTN, TORCH_SDPA,
 FLASH_ATTN, ROCM_AITER_FA).  The default "all" runs every backend in sequence
 and emits one JSON line per backend.
 
-Triton-specific tuning knobs (--bm/--bn/--nw/--ns/--we) are passed directly
-to the kernel launch and are ignored for other backends.
+TRITON_ATTN launches _fwd_kernel with the configuration context_attention_fwd
+picks on this device. The Triton tuning knobs (--bm/--bn/--nw/--ns/--we)
+override that configuration and are ignored for other backends.
 
 Output: one JSON line per backend to stdout.
 """
@@ -30,10 +31,9 @@ import site
 import sys
 
 # Without amd_smi importable, vllm.platforms falls back to UnspecifiedPlatform
-# and get_block_size returns the wrong default for ROCm (BLOCK_M=64 instead
-# of the cuda_alike+capability(80) branch's 128). The TheRock ROCm SDK ships
-# the amd_smi Python package under a non-standard share/ path; add it to
-# sys.path if present, BEFORE importing anything from vllm.
+# and context_attention_fwd picks the wrong launch configuration. The TheRock
+# ROCm SDK ships the amd_smi Python package under a non-standard share/ path;
+# add it to sys.path if present, BEFORE importing anything from vllm.
 for _site in site.getsitepackages():
     _amdsmi = os.path.join(_site, "_rocm_sdk_core", "share", "amd_smi")
     if os.path.isdir(_amdsmi) and _amdsmi not in sys.path:
@@ -43,15 +43,9 @@ for _site in site.getsitepackages():
 import torch  # noqa: E402
 
 from vllm.triton_utils import triton  # noqa: E402
-from vllm.utils.math_utils import RCP_LN2  # noqa: E402
 from vllm.v1.attention.backends.registry import AttentionBackendEnum  # noqa: E402
-from vllm.v1.attention.ops.triton_prefill_attention import (  # noqa: E402
-    _fwd_kernel,
-    _split_head_dim,
-    get_block_n,
-    get_block_size,
-    get_num_warps,
-)
+from vllm.v1.attention.ops import triton_prefill_attention as prefill_ops  # noqa: E402
+from vllm.v1.attention.ops.triton_prefill_attention import _fwd_kernel  # noqa: E402
 
 _SUPPORTED_BACKENDS = [
     "TRITON_ATTN",
@@ -82,13 +76,26 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--bm", type=int, default=None, help="BLOCK_M (TRITON_ATTN only)")
     p.add_argument("--bn", type=int, default=None, help="BLOCK_N (TRITON_ATTN only)")
     p.add_argument("--nw", type=int, default=None, help="num_warps (TRITON_ATTN only)")
-    p.add_argument("--ns", type=int, default=1, help="num_stages (TRITON_ATTN only)")
+    p.add_argument("--ns", type=int, default=None, help="num_stages (TRITON_ATTN only)")
     p.add_argument(
         "--we", type=int, default=None, help="waves_per_eu (TRITON_ATTN only)"
     )
     p.add_argument("--warmup-ms", type=int, default=200)
     p.add_argument("--rep-ms", type=int, default=600)
     return p.parse_args()
+
+
+class _LaunchCapture:
+    """Records the launch in place of ``_fwd_kernel``."""
+
+    args: tuple
+    kwargs: dict
+
+    def __getitem__(self, grid):
+        return self._record
+
+    def _record(self, *args, **kwargs) -> None:
+        self.args, self.kwargs = args, kwargs
 
 
 def _bench_one(
@@ -107,63 +114,38 @@ def _bench_one(
     scale = 1.0 / (D**0.5)
 
     if backend == AttentionBackendEnum.TRITON_ATTN:
-        # Keep direct kernel launch so tuning knobs are honoured.
-        BLOCK_M = args.bm if args.bm is not None else get_block_size(dtype, head_dim=D)
-        BLOCK_N = args.bn if args.bn is not None else get_block_n(dtype, head_dim=D)
-        num_warps = args.nw if args.nw is not None else get_num_warps(D)
-        BLOCK_DMODEL, BLOCK_DMODEL_TAIL = _split_head_dim(D)
-        sm_scale = scale * RCP_LN2
-        grid = (B, H, triton.cdiv(S, BLOCK_M))
-        kv_group_num = H // H
-
         # Flat (B*S, H, D) layout expected by _fwd_kernel
         q = q4.view(B * S, H, D)
         k = k4.view(B * S, H, D)
         v = v4.view(B * S, H, D)
         o = torch.empty_like(q)
         seqlen = cu[1:] - cu[:-1]
-        head_stride_aligned_8 = (
-            q.stride(1) % 8 == 0
-            and k.stride(1) % 8 == 0
-            and v.stride(1) % 8 == 0
-            and o.stride(1) % 8 == 0
-        )
 
-        extra_kwargs: dict = {}
-        if args.we is not None:
-            extra_kwargs["waves_per_eu"] = args.we
+        # Take the launch context_attention_fwd would make, so the defaults
+        # are whatever vLLM runs on this device; the knobs override it.
+        launch = _LaunchCapture()
+        prefill_ops._fwd_kernel = launch
+        try:
+            prefill_ops.context_attention_fwd(
+                q, k, v, o, cu[:-1], seqlen, S, is_causal=False, softmax_scale=scale
+            )
+        finally:
+            prefill_ops._fwd_kernel = _fwd_kernel
+
+        kwargs = launch.kwargs
+        for knob, key in (
+            (args.bm, "BLOCK_M"),
+            (args.bn, "BLOCK_N"),
+            (args.nw, "num_warps"),
+            (args.ns, "num_stages"),
+            (args.we, "waves_per_eu"),
+        ):
+            if knob is not None:
+                kwargs[key] = knob
+        grid = (B, H, triton.cdiv(S, kwargs["BLOCK_M"]))
 
         def _fn():
-            _fwd_kernel[grid](
-                q,
-                k,
-                v,
-                sm_scale,
-                cu[:-1],
-                seqlen,
-                o,
-                q.stride(0),
-                q.stride(1),
-                k.stride(0),
-                k.stride(1),
-                v.stride(0),
-                v.stride(1),
-                o.stride(0),
-                o.stride(1),
-                kv_group_num=kv_group_num,
-                BLOCK_M=BLOCK_M,
-                BLOCK_DMODEL=BLOCK_DMODEL,
-                BLOCK_DMODEL_TAIL=BLOCK_DMODEL_TAIL,
-                BLOCK_N=BLOCK_N,
-                IS_CAUSAL=False,
-                SLIDING_WINDOW_Q=0,
-                SLIDING_WINDOW_K=0,
-                num_warps=num_warps,
-                num_stages=args.ns,
-                Lk=D,
-                HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
-                **extra_kwargs,
-            )
+            _fwd_kernel[grid](*launch.args, **kwargs)
 
     elif backend in (
         AttentionBackendEnum.FLASH_ATTN,
@@ -235,13 +217,17 @@ def _bench_one(
     if backend == AttentionBackendEnum.TRITON_ATTN:
         config.update(
             {
-                "BLOCK_M": BLOCK_M,
-                "BLOCK_DMODEL": BLOCK_DMODEL,
-                "BLOCK_DMODEL_TAIL": BLOCK_DMODEL_TAIL,
-                "BLOCK_N": BLOCK_N,
-                "num_warps": num_warps,
-                "num_stages": args.ns,
-                "waves_per_eu": args.we,
+                key: kwargs.get(key)
+                for key in (
+                    "BLOCK_M",
+                    "BLOCK_DMODEL",
+                    "BLOCK_DMODEL_TAIL",
+                    "BLOCK_N",
+                    "HEAD_STRIDE_ALIGNED_8",
+                    "num_warps",
+                    "num_stages",
+                    "waves_per_eu",
+                )
             }
         )
 

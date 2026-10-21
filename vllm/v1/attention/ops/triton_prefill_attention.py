@@ -32,6 +32,25 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import RCP_LN2
 
 
+def _prefer_narrow_kv_tile() -> bool:
+    """RDNA3/RDNA4 prefer a narrower KV tile than the shared default."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1x
+
+    # RDNA3/RDNA4 only: on_gfx1x() excludes gfx10xx and gfx1250.
+    return on_gfx1x()
+
+
+def on_gfx1151() -> bool:
+    """The only part the head-dim blocking below was tuned on."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1151 as _on_gfx1151
+
+    return _on_gfx1151()
+
+
 @triton.jit
 def _fwd_kernel(
     Q,
@@ -79,16 +98,9 @@ def _fwd_kernel(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
-    # Head-axis byte offsets. For the packed [seq, heads, dim] layout the head
-    # stride equals head_dim; when head_dim is a multiple of 8 but not 16
-    # (e.g. 72) Triton's integer-arg auto-specialization does not attach
-    # tt.divisibility=8 to stride_*h (its threshold is 16), so AxisInfo treats
-    # the Q/K/V global loads as 2-byte aligned and Coalesce emits scalar
-    # buffer_load_u16 instead of vectorized buffer_load_b128. Hinting
-    # multiple_of(.., 8) on the head offset restores 16-byte alignment so the
-    # D-contiguous loads coalesce. The wrapper only sets the flag when the
-    # actual runtime strides are %8==0, so it stays sound for non-contiguous
-    # Q/K/V views. Mirrors aiter PR #3424.
+    # Triton only marks stride_*h divisible by 8 when head_dim is a multiple of
+    # 16, so at head_dim=72 the D-contiguous Q/K/V loads lower to scalar ones.
+    # Everywhere else the hint is something the compiler already knew.
     off_h_q = cur_head * stride_qh
     off_h_k = cur_kv_head * stride_kh
     off_h_v = cur_kv_head * stride_vh
@@ -119,11 +131,11 @@ def _fwd_kernel(
     v_ptrs = V + off_v
 
     # Split-D path: a non-power-of-2 head_dim (e.g. 72) would otherwise force
-    # BLOCK_DMODEL = next_pow2(Lk) = 128, so the qk/pv WMMAs run 8 K-passes
-    # when only ceil(Lk/16) are needed. Covering D as a power-of-2 main block
-    # plus a power-of-2 tail block (e.g. 64 + 16 = 80 for Lk=72) drops that to
-    # 5 passes. Constexpr-guarded: BLOCK_DMODEL_TAIL == 0 reproduces the
-    # single-block kernel exactly (dead-code eliminated) for power-of-2 dims.
+    # BLOCK_DMODEL = next_pow2(Lk) = 128, so the qk/pv dots run 8 K-passes when
+    # only ceil(Lk / 16) are needed. Covering D as a power-of-2 main block plus
+    # a power-of-2 tail block (72 -> 64 + 16 = 80) drops that to 5. Constexpr
+    # guarded: BLOCK_DMODEL_TAIL == 0 is dead code, so every power-of-2 head_dim
+    # compiles to the single-block kernel exactly as before.
     if BLOCK_DMODEL_TAIL > 0:
         offs_dt = BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_TAIL)
         mask_dt = offs_dt < Lk
@@ -221,7 +233,7 @@ def _fwd_kernel(
                 mask=(pos_k < cur_batch_seq_len) & (mask_dt[:, None]),
                 other=0.0,
             )
-            qk += tl.dot(qt, kt)
+            qk = tl.dot(qt, kt, qk)
         qk = tl.where(mask, qk * sm_scale, -1.0e8)
         if USE_SINKS and SINKS_BIAS_KEY0:
             qk = tl.where(mask & (pos_k == 0), qk + sink, qk)
@@ -280,105 +292,15 @@ def _fwd_kernel(
         )
 
 
-def _is_rdna() -> bool:
-    """Check if running on RDNA architecture (gfx11xx, gfx12xx)."""
-    if not current_platform.is_rocm():
-        return False
-    try:
-        from vllm.platforms.rocm import on_gfx1x
-
-        return on_gfx1x()
-    except ImportError:
-        return False
-
-
-def get_block_size(dtype: torch.dtype, head_dim: int | None = None) -> int:
-    """Query-tile size BLOCK_M (also the KV tile unless get_block_n differs)."""
-    # SigLIP / Qwen3-VL ViT (head_dim=72) on gfx1151: with the split-D kernel
-    # (D covered as 64+16, see _split_head_dim) BM=64 is fastest. The companion
-    # KV tile / warps were re-tuned after the head-stride alignment hint
-    # vectorized the loads (see get_block_n / get_num_warps: BN=16, NW=2).
-    if _is_rdna() and head_dim == 72 and dtype in (torch.bfloat16, torch.float16):
-        return 64
-    # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
-    if _is_rdna() and head_dim == 80 and dtype in (torch.bfloat16, torch.float16):
-        return 64
+def get_block_size(dtype: torch.dtype) -> int:
     if dtype == torch.float32:
         return 32
     elif current_platform.is_cuda_alike() and current_platform.has_device_capability(
         80
     ):
         return 128
-    elif _is_rdna():
-        # RDNA (gfx11xx, gfx12xx) performs better with smaller block sizes
-        # This matches the tuning used by flash_attn's triton backend for RDNA
-        return 32
     else:
         return 64
-
-
-def get_block_n(dtype: torch.dtype, head_dim: int | None = None) -> int:
-    """KV-tile size BLOCK_N. Defaults to BLOCK_M (square tile); the head_dim=72
-    split-D ViT path wants an asymmetric BM=64 / BN=16 tile. Re-tuned after the
-    head-stride 16B alignment hint (HEAD_STRIDE_ALIGNED_8) vectorized the Q/K/V
-    loads and removed register spills: with spills gone the narrower BN=16 / NW=2
-    tile wins (BN=32/NW=4/WE=6 was sized for the old spilling codegen).
-    """
-    if _is_rdna() and head_dim == 72 and dtype in (torch.bfloat16, torch.float16):
-        return 16
-    # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
-    if _is_rdna() and head_dim == 80 and dtype in (torch.bfloat16, torch.float16):
-        return 16
-    return get_block_size(dtype, head_dim)
-
-
-def get_num_warps(head_dim: int) -> int:
-    """Get optimal number of warps based on architecture and head dimension."""
-    if _is_rdna():
-        # RDNA tuning: Block=32, Warps=8 is optimal for ViT attention.
-        # Tested on Radeon 8060S (gfx1151) with Qwen2.5-VL-7B.
-        # Tested configs: Block in {16,32,64}, Warps in {2,4,8,16}.
-        if head_dim == 72:
-            # SigLIP / Qwen3-VL, split-D kernel. Re-tuned after the head-stride
-            # alignment hint vectorized the loads (0 reg spills): BM=64 + BN=16
-            # + NW=2 (no waves_per_eu override) is fastest at B=1,S=3520,H=16,
-            # D=72 bf16 (~2.36 ms vs ~2.85 ms at the old NW=4/WE=6 tile).
-            return 2
-        # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
-        if head_dim == 80:
-            return 2
-        return 8
-    else:
-        return 4 if head_dim <= 64 else 8
-
-
-def get_waves_per_eu(head_dim: int) -> int | None:
-    """Per-shape waves_per_eu override for the ViT prefill kernel on RDNA."""
-    if _is_rdna() and head_dim == 72:
-        # No override after the alignment-hint re-tune: with vectorized loads /
-        # 0 spills the default occupancy beats the old waves_per_eu=6 (which was
-        # tuned for the spilling BM=32/NW=2 codegen).
-        return None
-    # Qwen2.5-VL ViT (head_dim=80) tuning for RDNA (gfx1151)
-    if _is_rdna() and head_dim == 80:
-        return 6
-    return None
-
-
-def _split_head_dim(Lk: int) -> tuple[int, int]:
-    """Pick (BLOCK_DMODEL, BLOCK_DMODEL_TAIL) covering head_dim ``Lk``.
-
-    For a power-of-2 Lk, returns (Lk, 0) -- the single-block kernel.
-    Otherwise covers Lk with the largest power-of-2 main block (< Lk) plus a
-    power-of-2 tail block, so the WMMA K/N extent is ceil to a multiple of 16
-    near Lk (e.g. 72 -> 64 + 16 = 80) instead of next_pow2(Lk) = 128.
-    """
-    npo2 = triton.next_power_of_2(Lk)
-    if npo2 == Lk:
-        return npo2, 0
-    main = npo2 // 2  # largest power of 2 strictly below Lk
-    tail = max(16, triton.next_power_of_2(Lk - main))
-    return main, tail
 
 
 def context_attention_fwd(
@@ -401,10 +323,9 @@ def context_attention_fwd(
     b_seq_len: [b]
     out: [b * s, head, head_dim]
     """
-    Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
+    BLOCK = get_block_size(q.dtype)
 
-    block_m = get_block_size(q.dtype, head_dim=Lk)
-    block_n = get_block_n(q.dtype, head_dim=Lk)
+    Lq, Lk, _ = q.shape[-1], k.shape[-1], v.shape[-1]
 
     sm_scale = 1.0 / (Lq**0.5) if softmax_scale is None else softmax_scale
     # rescale with 1/ln(2) for triton exp2
@@ -415,29 +336,47 @@ def context_attention_fwd(
     if sinks is not None:
         assert sinks.shape[0] == head, "Sinks must be num_query_heads size"
 
-    grid = (batch, head, triton.cdiv(max_input_len, block_m))
-    num_warps = get_num_warps(Lk)
+    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
+    num_warps = 4 if Lk <= 64 else 8
+
+    # BLOCK_M, num_warps and num_stages stay at the shared defaults; min()
+    # leaves dtypes whose default tile is already 32, such as float32, alone.
+    BLOCK_N = min(BLOCK, 32) if _prefer_narrow_kv_tile() else BLOCK
+
+    BLOCK_DMODEL = triton.next_power_of_2(Lk)
+    BLOCK_DMODEL_TAIL = 0
+    HEAD_STRIDE_ALIGNED_8 = False
+
+    if on_gfx1151() and q.dtype in (torch.bfloat16, torch.float16):
+        # Cover the head dim as a power-of-2 main block plus a power-of-2 tail
+        # instead of padding up to next_power_of_2: 72 runs the dots over
+        # 64 + 16 = 80 lanes rather than 128. Only taken when it narrows the
+        # extent -- 112 would be 64 + 64, the same 128 lanes for 12% more time.
+        main = BLOCK_DMODEL // 2
+        tail = max(16, triton.next_power_of_2(Lk - main))
+        if Lk != BLOCK_DMODEL and main + tail < BLOCK_DMODEL:
+            BLOCK_DMODEL, BLOCK_DMODEL_TAIL = main, tail
+
+        # Keyed off the real strides rather than head_dim, so it stays sound
+        # for non-contiguous views. Only head dims that are 8 mod 16 learn
+        # anything from it; elsewhere it is measured exactly neutral.
+        HEAD_STRIDE_ALIGNED_8 = (
+            q.stride(1) % 8 == 0
+            and k.stride(1) % 8 == 0
+            and v.stride(1) % 8 == 0
+            and o.stride(1) % 8 == 0
+        )
+
+        # The 64 + 16 head dims (72 SigLIP/Qwen3-VL, 80 Qwen2.5-VL) are faster
+        # on a narrower KV tile than _prefer_narrow_kv_tile picks, with 4 warps
+        # -- but only once the loads above are vectorized. A padded head
+        # stride cannot assert the alignment, and without it the narrow tile
+        # measures ~9% slower than the wider one.
+        if HEAD_STRIDE_ALIGNED_8 and (BLOCK_DMODEL, BLOCK_DMODEL_TAIL) == (64, 16):
+            BLOCK_N, num_warps = 16, 4
 
     sliding_window_q = sliding_window_q if sliding_window_q is not None else 0
     sliding_window_k = sliding_window_k if sliding_window_k is not None else 0
-
-    waves_per_eu = get_waves_per_eu(Lk)
-    extra_kwargs = {}
-    if waves_per_eu is not None:
-        extra_kwargs["waves_per_eu"] = waves_per_eu
-
-    block_dmodel, block_dmodel_tail = _split_head_dim(Lk)
-
-    # Hint 16-byte alignment on the head axis so the D-contiguous Q/K/V loads
-    # coalesce to buffer_load_b128 instead of scalar buffer_load_u16. Checked
-    # against the actual runtime strides (not head_dim) so it stays sound for
-    # non-contiguous Q/K/V/O views. See _fwd_kernel / aiter PR #3424.
-    head_stride_aligned_8 = (
-        q.stride(1) % 8 == 0
-        and k.stride(1) % 8 == 0
-        and v.stride(1) % 8 == 0
-        and o.stride(1) % 8 == 0
-    )
 
     _fwd_kernel[grid](
         q,
@@ -457,10 +396,10 @@ def context_attention_fwd(
         o.stride(0),
         o.stride(1),
         kv_group_num=kv_group_num,
-        BLOCK_M=block_m,
-        BLOCK_DMODEL=block_dmodel,
-        BLOCK_DMODEL_TAIL=block_dmodel_tail,
-        BLOCK_N=block_n,
+        BLOCK_M=BLOCK,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DMODEL_TAIL=BLOCK_DMODEL_TAIL,
+        BLOCK_N=BLOCK_N,
         IS_CAUSAL=is_causal,
         SLIDING_WINDOW_Q=sliding_window_q,
         SLIDING_WINDOW_K=sliding_window_k,
@@ -469,6 +408,5 @@ def context_attention_fwd(
         num_warps=num_warps,
         num_stages=1,
         Lk=Lk,
-        HEAD_STRIDE_ALIGNED_8=head_stride_aligned_8,
-        **extra_kwargs,
+        HEAD_STRIDE_ALIGNED_8=HEAD_STRIDE_ALIGNED_8,
     )
