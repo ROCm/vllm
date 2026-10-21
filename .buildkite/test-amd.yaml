@@ -1807,6 +1807,19 @@ steps:
 
 #-----------------------------------------------------  mi300 · models / quantized  -----------------------------------------------------#
 
+# TEMPORARY probe for the int4_per_token_head flake. Do not merge.
+- label: ":amd: (MI300) [PROBE] int4 KV rank probe Shard %N"
+  timeout_in_minutes: 45
+  mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
+  dind: false
+  agent_pool: mi300_1
+  parallelism: 8
+  working_dir: "/vllm-workspace/tests"
+  source_file_dependencies:
+  - tests/ci_probes/
+  commands:
+  - pytest -v -s ci_probes/test_int4_kv_rank_probe.py
+
 - label: ":amd: (MI300) Quantized Models" # TBD
   timeout_in_minutes: 90
   mirror_hardwares: [amdexperimental, amdproduction, amdgfx942nightly, amdmi300]
