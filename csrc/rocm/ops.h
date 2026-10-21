@@ -149,7 +149,8 @@ void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
                                 torch::Tensor& block_table, torch::Tensor& out,
                                 torch::Tensor& acc, torch::Tensor& m,
                                 torch::Tensor& l, torch::Tensor& cnt,
-                                torch::Tensor& seq_lens, double scale);
+                                torch::Tensor& seq_lens, double scale,
+                                const std::optional<torch::Tensor>& mm_ranges);
 
 std::vector<int64_t> rdna_singleseq_prefill_configs();
 void rdna_singleseq_prefill_attn(

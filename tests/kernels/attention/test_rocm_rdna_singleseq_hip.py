@@ -58,7 +58,7 @@ def _paged_inputs(seq_len, v, seed=0):
     return q * 0.5, kv, torch.arange(num_blocks, device=dev, dtype=torch.int32)
 
 
-def _reference(q, kv, seq_len, window=0):
+def _reference(q, kv, seq_len, window=0, mm_ranges=()):
     m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
     flat = kv.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len]
     k, v = flat[..., :hd], flat[..., hd:]
@@ -70,6 +70,8 @@ def _reference(q, kv, seq_len, window=0):
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
     lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
     masked = pos > lim
+    for start, end in mm_ranges:
+        masked &= ~((lim >= start) & (lim <= end) & (pos >= start) & (pos <= end))
     if window:
         masked |= pos < lim - (window - 1)
     scores = scores.masked_fill(masked.view(1, m, seq_len), float("-inf"))
@@ -144,6 +146,18 @@ def test_built_in_variants_match_reference(unit):
         assert module is not None, v.name
         s = max(1024, v.window + 64, v.page_size + 1000)
         _check_one(v, module, [48, s, s + 1000])
+        # An image ending among the query tokens: rows on each side differ.
+        m = v.max_query_len
+        ranges = [(s - m - 40, s - m + m // 2)]
+        q, kv, block_table = _paged_inputs(s, v)
+        buf = _decode_mm_buf(ranges, q.device)
+        got = _decode_mm(module, v, q, kv, block_table, s, buf)
+        ref = _reference(q, kv, s, v.window, ranges)
+        assert _max_rel(got, ref) <= TOL[v.dtype], f"{v.name}, image"
+        # At M=1 the image ends at the only query token, so nothing changes.
+        if m > 1:
+            causal = _reference(q, kv, s, v.window)
+            assert _max_rel(causal, ref) > 10 * TOL[v.dtype], f"{v.name}, image"
 
 
 @pytest.mark.parametrize(
@@ -669,6 +683,196 @@ def test_prefill_refuses_malformed_mm_ranges(bad):
         )  # fmt: skip
 
 
+def _decode_mm_buf(ranges, device, capacity=4):
+    """The decode kernel's [count, start0, end0, ...], empty slots zeroed."""
+    buf = torch.zeros(1 + 2 * capacity, dtype=torch.int32)
+    flat = [len(ranges), *(x for r in ranges for x in r)]
+    buf[: len(flat)] = torch.tensor(flat, dtype=torch.int32)
+    return buf.to(device)
+
+
+def _decode_mm(module, v, q, kv, block_table, seq_len, buf):
+    out = torch.full_like(q, float("nan"))
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+    module.decode_attn(
+        q, kv, block_table, out, *hip.make_scratch(v, q.device), seq_lens,
+        q.shape[2] ** -0.5, buf,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    return out.float().nan_to_num(1e9)
+
+
+@pytest.mark.parametrize(
+    "want, min_m",
+    [
+        (
+            {
+                "window": bool,
+                "dot_product": lambda x: not x,
+                "max_segments": lambda x: x > 1,
+            },
+            4,
+        ),
+        (
+            {
+                "window": lambda x: not x,
+                "dot_product": lambda x: not x,
+                "max_segments": lambda x: x > 1,
+            },
+            4,
+        ),
+        (
+            {
+                "window": lambda x: not x,
+                "dot_product": lambda x: not x,
+                "max_segments": lambda x: x == 1,
+            },
+            4,
+        ),
+        # Dot-product builds go up to M=3; an image starting among M=2's query
+        # tokens would only hold the last one.
+        ({"dot_product": bool}, 3),
+    ],
+    ids=["wmma_window segments", "wmma segments", "wmma", "dot_product"],
+)
+@pytest.mark.parametrize(
+    "image",
+    [
+        # Over every query token, beside a past image.
+        lambda s, m, w: [(100, 355), (s - m - 40, s - 1)],
+        # Ending, or starting, among the query tokens: the rows after it, or
+        # before it, stay causal.
+        lambda s, m, w: [(s - m - 40, s - m + m // 2)],
+        lambda s, m, w: [(s - m + m // 2, s - 1)],
+        # Past the sequence, as in a chunk ending inside the image.
+        lambda s, m, w: [(s - m - 40, s + 200)],
+        # Longer than the window, which still bounds earlier keys.
+        lambda s, m, w: [(s - (w or 1000) - 500, s - 1)],
+        # Two images over the query tokens: rows end at either one.
+        lambda s, m, w: [(s - m - 40, s - m + 1), (s - m + 2, s - 1)],
+    ],
+    ids=[
+        "covers_all",
+        "ends_mid",
+        "starts_mid",
+        "past_seq_len",
+        "longer_than_window",
+        "two_in_span",
+    ],
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_decode_mm_prefix_matches_reference(want, min_m, image, dtype):
+    """Decode-sized calls inside an image see the image's later keys, and the
+    count comes from device memory."""
+    v, module = _built(dtype, max_query_len=lambda m: m >= min_m, **want)
+    m, seq_len = v.max_query_len, max(2000, v.window + 1000) + 7
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    # Keys past the sequence must not be read, even inside an image.
+    kv[-1, :, seq_len % v.page_size :] = float("nan")
+    ranges = image(seq_len, m, v.window)
+    got = _decode_mm(
+        module, v, q, kv, block_table, seq_len, _decode_mm_buf(ranges, q.device)
+    )
+    ref = _reference(q, kv, seq_len, v.window, ranges)
+    assert _max_rel(got, ref) <= TOL[v.dtype], v.name
+    causal = _reference(q, kv, seq_len, v.window)
+    assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "the image changed nothing"
+    # With several images over the query tokens, each one shows.
+    cut = [r for r in ranges if r[0] < r[1] and r[1] >= seq_len - m]
+    for r in cut if len(cut) > 1 else []:
+        rest = [x for x in ranges if x != r]
+        without = _reference(q, kv, seq_len, v.window, rest)
+        assert _max_rel(without, ref) > 10 * TOL[v.dtype], f"{r} changed nothing"
+
+
+@pytest.mark.parametrize("case", ["zero", "over_capacity"])
+def test_decode_mm_ranges_stop_at_count_and_capacity(case):
+    """The kernel reads min(count, capacity) ranges: those it reads apply, and
+    a range past them, over every query token, changes nothing."""
+    v, module = _built(
+        window=lambda x: not x,
+        dot_product=lambda x: not x,
+        max_query_len=lambda m: m >= 4,
+    )
+    m, seq_len = v.max_query_len, 2000
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    trap = (seq_len - m - 40, seq_len - 1)
+    if case == "zero":
+        # The trap in the buffer, past count.
+        ranges, count, size = [], 0, 3
+    else:
+        # count 5 in a 2-range buffer, the trap just past its end. The second
+        # range ends among the query tokens, so the trap would extend it.
+        ranges = [(100, 355), (seq_len - m - 40, seq_len - m + m // 2)]
+        count, size = 5, 5
+    flat = [count, *(x for r in ranges for x in r), *trap]
+    buf = torch.tensor(flat, dtype=torch.int32, device=q.device)[:size]
+    got = _decode_mm(module, v, q, kv, block_table, seq_len, buf)
+    ref = _reference(q, kv, seq_len, 0, ranges)
+    assert _max_rel(got, ref) <= TOL[v.dtype], v.name
+    # Reading the trap, or ignoring the ranges that fit, must show.
+    for wrong in (ranges + [trap], []):
+        if wrong != ranges:
+            wrong_ref = _reference(q, kv, seq_len, 0, wrong)
+            assert _max_rel(wrong_ref, ref) > 10 * TOL[v.dtype], wrong
+
+
+def test_graph_replay_follows_mm_ranges():
+    """A captured graph reads the ranges the builder rewrites in place each
+    step, and none are left over when they go back to empty."""
+    v, module = _built(
+        window=lambda x: not x,
+        dot_product=lambda x: not x,
+        max_query_len=lambda m: m >= 4,
+    )
+    seq_len = 1024
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    scratch = hip.make_scratch(v, q.device)
+    out = torch.empty_like(q)
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+    buf = _decode_mm_buf([], q.device)
+
+    def launch():
+        module.decode_attn(
+            q, kv, block_table, out, *scratch, seq_lens, q.shape[2] ** -0.5, buf
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    m = v.max_query_len
+    for ranges in ([], [(seq_len - m - 40, seq_len - 1)], []):
+        # As the builder: a smaller count leaves earlier ranges past it.
+        flat = _decode_mm_buf(ranges, q.device)[: 1 + 2 * len(ranges)]
+        buf[: flat.numel()].copy_(flat)
+        out.zero_()
+        graph.replay()
+        torch.accelerator.synchronize()
+        ref = _reference(q, kv, seq_len, 0, ranges)
+        assert _max_rel(out.float(), ref) <= TOL[v.dtype], f"ranges={ranges}"
+
+
+@pytest.mark.parametrize("bad", ["even", "int64", "cpu"])
+def test_decode_refuses_malformed_mm_ranges(bad):
+    """Only an odd-length int32 [count, start0, end0, ...] on the device
+    reaches the kernel, which sizes its capacity from it."""
+    v, module = _built()
+    q, kv, block_table = _paged_inputs(64, v)
+    good = _decode_mm_buf([(10, 40)], q.device)
+    ranges = {
+        "even": good[:4],
+        "int64": good.long(),
+        "cpu": good.cpu(),
+    }[bad]
+    seq_lens = torch.tensor([64], device=q.device, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="mm_ranges must be"):
+        module.decode_attn(
+            q, kv, block_table, torch.empty_like(q), *hip.make_scratch(v, q.device),
+            seq_lens, q.shape[2] ** -0.5, ranges,
+        )  # fmt: skip
+
+
 @pytest.mark.parametrize(
     "ranges, seq_len, query_len, expected",
     [
@@ -711,17 +915,149 @@ def test_mm_query_overlap(ranges, seq_len, query_len, expected):
     assert mm_query_overlap(md) == expected
 
 
+# 40 ten-token images, [100 + 20i, 109 + 20i]: more than MM_RANGES_CAPACITY.
+_MANY = [(100 + 20 * i, 109 + 20 * i) for i in range(40)]
+
+
 @pytest.mark.parametrize(
-    "future_keys, reach, clamp, reason",
+    "ranges, seq_len, query_len, expected",
     [
-        (True, 4, True, "later keys"),
-        (False, 1500, False, "past the window"),
-        (False, 1500, True, None),
-        (False, 1000, False, None),
+        # Query tokens 202..204, inside image 5.
+        (_MANY, 205, 3, [(200, 209)]),
+        # Text after the images.
+        (_MANY, 2000, 3, []),
+        # No sequence lengths: every range, which do not fit.
+        (_MANY, None, 3, None),
+        # Query tokens 98..99, widened to 97 for rejected drafts: a range ending
+        # at 97 or starting at 99 is kept; one ending at 96, starting at 100 or
+        # empty is not.
+        ([(80, 96), (90, 97), (98, 98), (99, 120), (100, 110)], 100, 2,
+         [(90, 97), (99, 120)]),
     ],
-    ids=["later_keys", "unclamped_reach", "clamped_reach", "within_window"],
+    ids=["inside_one", "text_after", "no_seq_lens", "edges"],
+)  # fmt: skip
+def test_mm_ranges_decode_buffer(ranges, seq_len, query_len, expected):
+    """The decode buffer holds only the ranges that can hold the step's query
+    tokens, so any number of images fits; when they do not fit it is emptied,
+    so a replayed CUDA graph never reads an earlier step's ranges."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_singleseq_attn import (
+        RocmRdnaSingleSeqMetadataBuilder,
+        mm_ranges_buffer,
+    )
+
+    device = torch.device("cpu")
+    buf = mm_ranges_buffer(device)
+    buf.fill_(7)
+    md = types.SimpleNamespace(
+        mm_req_doc_ranges={0: ranges},
+        seq_lens_cpu_upper_bound=None if seq_len is None else torch.tensor([seq_len]),
+        query_start_loc_cpu=torch.tensor([0, query_len]),
+    )
+    out = RocmRdnaSingleSeqMetadataBuilder._mm_ranges_decode(
+        types.SimpleNamespace(device=device), md
+    )
+    if expected is None:
+        assert out is None
+        assert buf[0] == 0
+    else:
+        assert out is buf
+        flat = [x for span in expected for x in span]
+        assert buf[: 1 + len(flat)].tolist() == [len(expected), *flat]
+
+
+@pytest.mark.parametrize("overshoot", [False, True], ids=["exact", "async_spec"])
+def test_mm_ranges_decode_builder_feeds_kernel(overshoot):
+    """The builder's buffer gives the kernel the mask of all the request's
+    ranges, also when seq_lens_cpu_upper_bound overshoots by M - 1 rejected
+    drafts: the image then ends before the estimated query tokens."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_singleseq_attn import (
+        RocmRdnaSingleSeqMetadataBuilder,
+    )
+
+    v, module = _built(
+        window=lambda x: not x,
+        dot_product=lambda x: not x,
+        max_query_len=lambda m: m >= 4,
+    )
+    m, seq_len = v.max_query_len, 2007
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    # 40 past images, more than the buffer holds, and one ending among the
+    # query tokens.
+    ranges = [(10 + 40 * i, 30 + 40 * i) for i in range(40)]
+    ranges.append((seq_len - m - 40, seq_len - 2))
+    md = types.SimpleNamespace(
+        mm_req_doc_ranges={0: ranges},
+        seq_lens_cpu_upper_bound=torch.tensor([seq_len + overshoot * (m - 1)]),
+        query_start_loc_cpu=torch.tensor([0, m]),
+    )
+    buf = RocmRdnaSingleSeqMetadataBuilder._mm_ranges_decode(
+        types.SimpleNamespace(device=q.device), md
+    )
+    assert buf is not None
+    got = _decode_mm(module, v, q, kv, block_table, seq_len, buf)
+    ref = _reference(q, kv, seq_len, 0, ranges)
+    assert _max_rel(got, ref) <= TOL[v.dtype], v.name
+    causal = _reference(q, kv, seq_len)
+    assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "the image changed nothing"
+
+
+def test_forward_passes_mm_ranges_to_the_decode_kernel():
+    """Forward hands the builder's buffer to the decode kernel."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_singleseq_attn import (
+        RocmRdnaSingleSeqMetadata,
+    )
+
+    impl = _impl()
+    impl.scale, impl.logits_soft_cap, impl.kernel_calls = HEAD_DIM**-0.5, 0, 0
+    impl.sliding_window = impl.alibi_slopes = impl.sinks = None
+    impl.chunk_lookback = impl._kv_quant_mode = None
+    passed = []
+    module = types.SimpleNamespace(decode_attn=lambda *args: passed.append(args[-1]))
+    impl._prepare = lambda kv_cache, **kwargs: (module, (None,) * 4)
+    buf = torch.zeros(3, dtype=torch.int32)
+    md = RocmRdnaSingleSeqMetadata.__new__(RocmRdnaSingleSeqMetadata)
+    for name, value in {
+        "num_actual_tokens": 2,
+        "seq_lens": torch.tensor([100]),
+        "block_table": None,
+        "max_query_len": 2,
+        "causal": True,
+        "mm_prefix_range_tensor": None,
+        "mm_future_keys": True,
+        "mm_reach": 4,
+        "mm_ranges_decode": buf,
+        "rswa_prefix_lens": None,
+    }.items():
+        setattr(md, name, value)
+    q = torch.zeros(2, HQ, HEAD_DIM, dtype=torch.float16)
+    impl.forward(types.SimpleNamespace(), q, q, q, torch.empty(0), md, q.clone())
+    assert len(passed) == 1 and passed[0] is buf
+
+
+@pytest.mark.parametrize(
+    "future_keys, ranges, reach, clamp, reason",
+    [
+        (True, False, 4, True, "do not fit"),
+        (True, True, 4, True, None),
+        (False, False, 1500, False, "past the window"),
+        (False, False, 1500, True, None),
+        (False, False, 1000, False, None),
+    ],
+    ids=[
+        "later_keys_no_buffer",
+        "later_keys_buffer",
+        "unclamped_reach",
+        "clamped_reach",
+        "within_window",
+    ],  # fmt: skip
 )
-def test_mm_ranges_decode_decision(future_keys, reach, clamp, reason):
+def test_mm_ranges_decode_decision(future_keys, ranges, reach, clamp, reason):
     """Decode runs Triton when a query token's range has later keys, or when an
     unclamped range reaches past the window; otherwise the ranges do not
     stop it."""
@@ -745,6 +1081,7 @@ def test_mm_ranges_decode_decision(future_keys, reach, clamp, reason):
         mm_future_keys=future_keys,
         mm_reach=reach,
         mm_prefix_clamp=clamp,
+        mm_ranges_decode=torch.zeros(3, dtype=torch.int32) if ranges else None,
     )
     assert not fits
     if reason is None:

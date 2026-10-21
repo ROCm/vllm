@@ -196,7 +196,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "rdna_singleseq_decode_attn(int config, Tensor q, Tensor kv_cache, "
       "Tensor block_table, Tensor! out, Tensor! acc, Tensor! m, Tensor! l, "
-      "Tensor! cnt, Tensor seq_lens, float scale) -> ()");
+      "Tensor! cnt, Tensor seq_lens, float scale, Tensor? mm_ranges=None) -> "
+      "()");
   rocm_ops.impl("rdna_singleseq_decode_attn", torch::kCUDA,
                 &rdna_singleseq_decode_attn);
   // RDNA3.5 prefill attention (gfx1151).
