@@ -28,7 +28,7 @@ SHAPES = [
     (7168, 384),
     (1000, 100),
 ]
-MAX_TOKENS = 32
+LOW_M_TOKENS = 32
 ATOL = 5e-4
 RTOL = 0.0
 
@@ -55,7 +55,7 @@ def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(("hidden_size", "num_experts"), SHAPES)
-@pytest.mark.parametrize("num_tokens", range(MAX_TOKENS + 1))
+@pytest.mark.parametrize("num_tokens", range(LOW_M_TOKENS + 1))
 @torch.inference_mode()
 def test_rocm_fp32_router_gemm_matches_reference(
     num_tokens: int,
@@ -75,6 +75,54 @@ def test_rocm_fp32_router_gemm_matches_reference(
     assert output.dtype == torch.float32
     assert output.device == x.device
     torch.testing.assert_close(output, expected, atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.parametrize("num_tokens", [33, 36, 48, 64, 65, 96, 114, 128])
+@pytest.mark.parametrize(("hidden_size", "num_experts"), SHAPES)
+@torch.inference_mode()
+def test_rocm_fp32_router_gemm_matches_reference_above_32_tokens(
+    num_tokens: int, hidden_size: int, num_experts: int
+) -> None:
+    """Speculative-decode verify batches (e.g. 16 requests x 4 tokens)."""
+    torch.manual_seed(500 + num_tokens + hidden_size + num_experts)
+    device = torch.device("cuda")
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(num_experts, hidden_size, dtype=torch.float32, device=device)
+    if not rocm_router.can_use_rocm_fp32_router_gemm(x, weight):
+        pytest.skip("shape is outside the kernel's multiply-add budget")
+
+    torch.testing.assert_close(
+        rocm_fp32_router_gemm(x, weight), _reference(x, weight), atol=ATOL, rtol=RTOL
+    )
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "num_experts", "num_tokens", "weight_dtype", "eligible"),
+    [
+        (6144, 128, 64, torch.float32, True),
+        (6144, 128, 114, torch.float32, True),
+        (6144, 128, 115, torch.float32, False),
+        (6144, 128, 128, torch.float32, False),
+        (2048, 64, 128, torch.float32, True),
+        (2048, 64, 129, torch.float32, False),
+        (8192, 256, 40, torch.float32, True),
+        (8192, 256, 48, torch.float32, False),
+        (7168, 384, 32, torch.float32, True),
+        (7168, 384, 33, torch.float32, False),
+        (2048, 64, 33, torch.bfloat16, False),
+    ],
+)
+@torch.inference_mode()
+def test_rocm_fp32_router_gemm_eligibility_above_32_tokens(
+    hidden_size: int,
+    num_experts: int,
+    num_tokens: int,
+    weight_dtype: torch.dtype,
+    eligible: bool,
+) -> None:
+    x = torch.empty(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    weight = torch.empty(num_experts, hidden_size, dtype=weight_dtype, device="cuda")
+    assert rocm_router.can_use_rocm_fp32_router_gemm(x, weight) == eligible
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 24, 32])
@@ -113,7 +161,7 @@ def test_rocm_fp32_router_gemm_rejects_invalid_inputs() -> None:
     with pytest.raises(ValueError, match="num_tokens"):
         rocm_fp32_router_gemm(
             torch.randn(
-                MAX_TOKENS + 1,
+                rocm_router.MAX_TOKENS + 1,
                 hidden_size,
                 dtype=torch.bfloat16,
                 device=device,
@@ -127,7 +175,7 @@ def test_rocm_fp32_router_gemm_rejects_invalid_inputs() -> None:
     with pytest.raises(ValueError, match="num_experts"):
         big_weight = torch.empty(1024, 7168, dtype=torch.float32, device=device)
         rocm_fp32_router_gemm(
-            torch.empty(MAX_TOKENS, 7168, dtype=torch.bfloat16, device=device),
+            torch.empty(LOW_M_TOKENS, 7168, dtype=torch.bfloat16, device=device),
             big_weight,
         )
 
@@ -179,7 +227,7 @@ def test_rocm_fp32_router_gemm_cuda_graph_observes_input_mutation() -> None:
     assert not torch.equal(first_output, second_output)
 
 
-@pytest.mark.parametrize("num_tokens", [4, 32, 33])
+@pytest.mark.parametrize("num_tokens", [4, 32, 33, 64, 128, 129])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @torch.inference_mode()
 def test_rocm_fp32_router_gemm_custom_op_dispatch(
@@ -340,12 +388,18 @@ def _make_gate_linear(
 
 
 @pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("num_tokens", [1, 32, 33])
+@pytest.mark.parametrize(
+    ("num_tokens", "uses_kernel"), [(1, True), (32, True), (64, True), (80, False)]
+)
 @torch.inference_mode()
 def test_gate_linear_uses_rocm_fp32_router_gemm(
-    monkeypatch: pytest.MonkeyPatch, num_tokens: int, x_dtype: torch.dtype
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    uses_kernel: bool,
+    x_dtype: torch.dtype,
 ) -> None:
-    """A router shape outside the old tuned list takes the fast path for M<=32."""
+    """A router shape outside the old tuned list takes the fast path while it
+    stays within the kernel's token and multiply-add limits."""
     gate = _make_gate_linear(monkeypatch, 2560, 512)
     assert gate.allow_fp32_router_gemm
     calls = []
@@ -360,7 +414,7 @@ def test_gate_linear_uses_rocm_fp32_router_gemm(
     output, bias = gate(x)
 
     assert bias is None
-    assert calls == ([num_tokens] if num_tokens <= MAX_TOKENS else [])
+    assert calls == ([num_tokens] if uses_kernel else [])
     torch.testing.assert_close(output, _reference(x, gate.weight), atol=ATOL, rtol=RTOL)
 
 

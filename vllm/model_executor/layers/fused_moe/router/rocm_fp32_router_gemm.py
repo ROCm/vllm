@@ -8,9 +8,15 @@ from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx950
 from vllm.triton_utils import tl, triton
 
-_MAX_TOKENS = 32
+# FP32 weights: up to MAX_TOKENS tokens, within the multiply-add budgets below.
+MAX_TOKENS = 128
+_MAX_BF16_WEIGHT_TOKENS = 32
 # From this many multiply-adds on, F.linear wins on MI355.
 _MAX_MACS = 1 << 27
+# Past 32 tokens (speculative-decode verify batches, mid-size decode batches)
+# the kernel still beats F.linear's cast + split-K GEMM, but only below this
+# many multiply-adds; it keeps e.g. 6144x128 routers to M <= 114.
+_MAX_MACS_ABOVE_32_TOKENS = 90_000_000
 # Above this num_tokens * num_experts, hipBLASLt wins for BF16 weights.
 _MAX_BF16_TOKEN_EXPERTS = 8192
 
@@ -70,7 +76,7 @@ def _rocm_fp32_router_gemm_kernel(
 def _launch_config(
     num_experts: int, num_tokens: int, bf16_weight: bool
 ) -> tuple[int, int, int]:
-    """Return (BLOCK_M, BLOCK_K, num_warps), swept on MI355 for M<=32.
+    """Return (BLOCK_M, BLOCK_K, num_warps), swept on MI355 for M<=128.
 
     One program computes BLOCK_M tokens for one expert, so narrow routers keep
     BLOCK_M=1 to fill the GPU and wide routers grow BLOCK_M to reuse weights.
@@ -90,6 +96,8 @@ def _launch_config(
         return (8, 512, 2) if wide else (4, 1024, 4)
     if num_experts >= 768:
         return 16, 256, 2
+    if num_tokens > 64:
+        return 8, 256, 2
     return (8, 256, 2) if wide else (4, 512, 2)
 
 
@@ -125,20 +133,26 @@ def _validate_inputs(
         raise ValueError("hidden_states and router_weight must be contiguous")
     if router_weight.shape[1] != hidden_states.shape[1]:
         raise ValueError("router_weight and hidden_states hidden sizes differ")
-    if not 0 <= hidden_states.shape[0] <= _MAX_TOKENS:
-        raise ValueError(f"num_tokens must be in [0, {_MAX_TOKENS}]")
-    if hidden_states.shape[0] * router_weight.numel() >= _MAX_MACS:
+    num_tokens = hidden_states.shape[0]
+    if not 0 <= num_tokens <= MAX_TOKENS:
+        raise ValueError(f"num_tokens must be in [0, {MAX_TOKENS}]")
+    macs = num_tokens * router_weight.numel()
+    max_macs = _MAX_MACS if num_tokens <= 32 else _MAX_MACS_ABOVE_32_TOKENS
+    if macs >= max_macs:
         raise ValueError(
-            f"num_tokens * num_experts * hidden_size must be < {_MAX_MACS}"
+            f"num_tokens * num_experts * hidden_size must be < {max_macs} "
+            f"for {num_tokens} tokens"
         )
-    if (
-        router_weight.dtype == torch.bfloat16
-        and hidden_states.shape[0] * router_weight.shape[0] > _MAX_BF16_TOKEN_EXPERTS
-    ):
-        raise ValueError(
-            f"num_tokens * num_experts must be <= {_MAX_BF16_TOKEN_EXPERTS} "
-            "for bfloat16 weights"
-        )
+    if router_weight.dtype == torch.bfloat16:
+        if num_tokens > _MAX_BF16_WEIGHT_TOKENS:
+            raise ValueError(
+                f"num_tokens must be <= {_MAX_BF16_WEIGHT_TOKENS} for bfloat16 weights"
+            )
+        if num_tokens * router_weight.shape[0] > _MAX_BF16_TOKEN_EXPERTS:
+            raise ValueError(
+                f"num_tokens * num_experts must be <= {_MAX_BF16_TOKEN_EXPERTS} "
+                "for bfloat16 weights"
+            )
 
 
 def rocm_fp32_router_gemm(

@@ -25,7 +25,8 @@ class GateLinear(ReplicatedLinear):
     1. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
        any shape w/ K divisible by 8)
     2. fp32 specialized kernel (bf16/fp32 in, fp32 out; SM90+
-       model-specific shapes and batch limits, gfx950 any shape with M<=32)
+       model-specific shapes and batch limits, gfx950 any shape with M<=32,
+       up to M<=128 for small fp32-weight routers)
     3. cuteDSL ll_fp32w_gemm (SM90+, M<=32, bf16/fp32 in, fp32 out,
        any shape)
     4. bf16x3 CuteDSL kernel (SM100, bf16 in, fp32 weight)
@@ -310,7 +311,7 @@ class GateLinear(ReplicatedLinear):
                 )
                 return self._return(output)
 
-        # Tier 2: fp32 specialized kernel (model-specific shapes, M<=32)
+        # Tier 2: fp32 specialized kernel (model-specific shapes, low M)
         # Dispatch is wrapped in a custom op so that torch.compile/CUDA-graph
         # capture does not freeze the runtime num_tokens branch.
         if self.allow_fp32_router_gemm and x.dtype in (
@@ -427,12 +428,13 @@ def rocm_bf16x3_router_gemm_dispatch_impl(
         return bf16x3_router_gemm_rocm.bf16x3_router_gemm(x, weight_split)
     # Below MIN_TOKENS, hand back to the low-M gfx950 kernel this tier is
     # checked ahead of.
-    if x.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS:
-        from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (  # noqa: E501
-            can_use_rocm_fp32_router_gemm,
-            rocm_fp32_router_gemm,
-        )
+    from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (
+        MAX_TOKENS,
+        can_use_rocm_fp32_router_gemm,
+        rocm_fp32_router_gemm,
+    )
 
+    if x.shape[0] <= MAX_TOKENS:
         x = x.contiguous()
         if can_use_rocm_fp32_router_gemm(x, weight):
             return rocm_fp32_router_gemm(x, weight)
@@ -467,11 +469,12 @@ def fp32_router_gemm_dispatch_impl(
     """
     if current_platform.is_rocm():
         from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (  # noqa: E501
+            MAX_TOKENS,
             can_use_rocm_fp32_router_gemm,
             rocm_fp32_router_gemm,
         )
 
-        if x.shape[0] <= _FP32_ROUTER_GEMM_MAX_TOKENS:
+        if x.shape[0] <= MAX_TOKENS:
             x = x.contiguous()
             if can_use_rocm_fp32_router_gemm(x, weight):
                 return rocm_fp32_router_gemm(x, weight)
