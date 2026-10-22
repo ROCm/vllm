@@ -5,6 +5,7 @@ namespace rdna {
 
 enum class HeadDim : int {
   k32 = 32,
+  k48 = 48,
   k64 = 64,
   k80 = 80,
   k96 = 96,
