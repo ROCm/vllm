@@ -94,6 +94,9 @@ class _LaunchArgs(ctypes.Structure):
         ("acc_stride", ctypes.c_int),
         ("ml_stride", ctypes.c_int),
         ("cnt_stride", ctypes.c_int),
+        ("mm_ranges", ctypes.c_void_p),
+        ("mm_capacity", ctypes.c_int),
+        ("mm_stride", ctypes.c_int),
     ]
 
 
@@ -236,7 +239,18 @@ class Jit:
         self._launch.restype = None
 
     def decode_attn(
-        self, q, kv_cache, block_table, out, acc, m, ls, cnt, seq_lens, scale
+        self,
+        q,
+        kv_cache,
+        block_table,
+        out,
+        acc,
+        m,
+        ls,
+        cnt,
+        seq_lens,
+        scale,
+        mm_ranges=None,
     ):
         v = self.variant
         if not (q.is_contiguous() and out.is_contiguous()):
@@ -264,6 +278,9 @@ class Jit:
             acc.stride(0) if v.batched else 0,
             m.stride(0) if v.batched else 0,
             cnt.stride(0) if v.batched else 0,
+            mm_ranges.data_ptr() if mm_ranges is not None else None,
+            mm_ranges.size(-1) // 2 if mm_ranges is not None else 0,
+            mm_ranges.size(1) if mm_ranges is not None and mm_ranges.dim() == 2 else 0,
         )
         self._launch(ctypes.byref(args))
 

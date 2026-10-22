@@ -202,7 +202,9 @@ class _Builtin:
         self.index = index
         self.batched = bool(batched)
 
-    def decode_attn(self, q, kv_cache, block_table, out, *scratch_and_args):
+    def decode_attn(
+        self, q, kv_cache, block_table, out, *scratch_and_args, mm_ranges=None
+    ):
         torch.ops._rocm_C.rdna_decode_attn(
             self.index,
             q,
@@ -211,6 +213,7 @@ class _Builtin:
             out,
             *scratch_and_args,
             batched=self.batched,
+            mm_ranges=mm_ranges,
         )
 
 

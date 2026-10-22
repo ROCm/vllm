@@ -149,7 +149,8 @@ void rdna_decode_attn(int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,
                       torch::Tensor& block_table, torch::Tensor& out,
                       torch::Tensor& acc, torch::Tensor& m, torch::Tensor& l,
                       torch::Tensor& cnt, torch::Tensor& seq_lens, double scale,
-                      bool batched);
+                      bool batched,
+                      const std::optional<torch::Tensor>& mm_ranges);
 
 std::vector<int64_t> rdna_prefill_configs();
 std::vector<int64_t> rdna_prefill_batch_configs();

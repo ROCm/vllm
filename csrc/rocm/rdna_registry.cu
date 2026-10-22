@@ -156,7 +156,8 @@ void rdna_decode_attn(int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,
                       torch::Tensor& block_table, torch::Tensor& out,
                       torch::Tensor& acc, torch::Tensor& m, torch::Tensor& l,
                       torch::Tensor& cnt, torch::Tensor& seq_lens, double scale,
-                      bool batched) {
+                      bool batched,
+                      const std::optional<torch::Tensor>& mm_ranges) {
   using namespace rdna;
   LaunchFn* launchers = batched ? decode_batch_launchers() : decode_launchers();
   TORCH_CHECK(
@@ -226,16 +227,45 @@ void rdna_decode_attn(int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,
                   l.numel() / seqs >= rows && cnt.numel() / seqs >= counters,
               "scratch too small for this build: needs ", rows * d, ", ", rows,
               ", ", rows, ", ", counters, " elements");
+  // [count, start0, end0, ...] in device memory, so CUDA graphs read the count
+  // at replay: one for all sequences, or one row per sequence.
+  const int* ranges = nullptr;
+  int capacity = 0, ranges_stride = 0;
+  if (mm_ranges.has_value()) {
+    const torch::Tensor& r = *mm_ranges;
+    TORCH_CHECK(r.scalar_type() == torch::kInt32 && r.is_contiguous() &&
+                    r.device() == q.device() &&
+                    (r.dim() == 1 || r.dim() == 2) && r.size(-1) % 2 == 1 &&
+                    (r.dim() == 1 || r.size(0) >= nseq),
+                "mm_ranges must be a contiguous int32 [count, start0, end0, "
+                "...], or one such row per sequence, on ",
+                q.device(), "; got ", r.scalar_type(), " ", r.sizes(), " on ",
+                r.device());
+    ranges = r.data_ptr<int>();
+    capacity = static_cast<int>(r.size(-1) / 2);
+    ranges_stride = r.dim() == 2 ? static_cast<int>(r.size(1)) : 0;
+  }
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
-  launchers[config](
-      {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
-       acc.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(),
-       cnt.data_ptr<int>(), out.data_ptr(), seq_lens.data_ptr<int>(),
-       (int)block_table.size(-1), (float)scale,
-       at::cuda::getCurrentCUDAStream(), nseq,
-       block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
-       batched ? (int)acc.stride(0) : 0, batched ? (int)m.stride(0) : 0,
-       batched ? (int)cnt.stride(0) : 0});
+  launchers[config]({q.data_ptr(),
+                     kv_cache.data_ptr(),
+                     block_table.data_ptr<int>(),
+                     acc.data_ptr<float>(),
+                     m.data_ptr<float>(),
+                     l.data_ptr<float>(),
+                     cnt.data_ptr<int>(),
+                     out.data_ptr(),
+                     seq_lens.data_ptr<int>(),
+                     (int)block_table.size(-1),
+                     (float)scale,
+                     at::cuda::getCurrentCUDAStream(),
+                     nseq,
+                     block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
+                     batched ? (int)acc.stride(0) : 0,
+                     batched ? (int)m.stride(0) : 0,
+                     batched ? (int)cnt.stride(0) : 0,
+                     ranges,
+                     capacity,
+                     ranges_stride});
 }
 
 // One sequence, or a batch with a plan; runs outside CUDA graphs, so
