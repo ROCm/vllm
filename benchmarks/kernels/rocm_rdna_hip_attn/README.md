@@ -22,8 +22,7 @@ A *configuration* is `(Hq, Hkv, D, window, page size)`, in fp16 and bf16.
   `PYTHONPATH=$PWD`.
 - `D` in 64, 96, 128, 256, 512, `Hq % Hkv == 0`, and a page size that is a
   multiple of 16 (the one vLLM uses for the model, e.g. 544 for Qwen3.5-0.8B).
-- `HuggingFaceTB/SmolLM2-135M`'s config in the HF cache, and nothing else
-  running on the GPU.
+- Nothing else running on the GPU.
 
 ## Decode
 

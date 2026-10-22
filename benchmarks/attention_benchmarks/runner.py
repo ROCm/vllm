@@ -7,8 +7,11 @@ This module provides helpers for running standard attention backends
 (FlashAttention, Triton, FlashInfer) with real vLLM integration.
 """
 
+import json
 import logging
+import os
 import statistics
+import tempfile
 import types
 from contextlib import contextmanager
 from dataclasses import replace
@@ -176,6 +179,19 @@ class _DropCastWarning(logging.Filter):
         return not record.getMessage().startswith("Casting ")
 
 
+_STUB_HF_CONFIG = {
+    "architectures": ["LlamaForCausalLM"],
+    "model_type": "llama",
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_attention_heads": 1,
+    "num_key_value_heads": 1,
+    "num_hidden_layers": 1,
+    "vocab_size": 128,
+    "max_position_embeddings": 1024,
+}
+
+
 def _create_vllm_config(
     config: BenchmarkConfig,
     max_num_blocks: int,
@@ -185,16 +201,18 @@ def _create_vllm_config(
     cast_logger = logging.getLogger("vllm.config.model")
     if not any(isinstance(f, _DropCastWarning) for f in cast_logger.filters):
         cast_logger.addFilter(_DropCastWarning())
-    # Any ungated model; the dimensions are mocked below.
-    model_config = ModelConfig(
-        model="HuggingFaceTB/SmolLM2-135M",
-        tokenizer="HuggingFaceTB/SmolLM2-135M",
-        skip_tokenizer_init=True,
-        trust_remote_code=False,
-        dtype=str(config.dtype).removeprefix("torch."),
-        seed=0,
-        max_model_len=1024,
-    )
+    # A minimal local config, so no Hub access; the dimensions are mocked below.
+    with tempfile.TemporaryDirectory(prefix="vllm_bench_") as model_dir:
+        with open(os.path.join(model_dir, "config.json"), "w") as f:
+            json.dump(_STUB_HF_CONFIG, f)
+        model_config = ModelConfig(
+            model=model_dir,
+            skip_tokenizer_init=True,
+            trust_remote_code=False,
+            dtype=str(config.dtype).removeprefix("torch."),
+            seed=0,
+            max_model_len=1024,
+        )
 
     cache_config = CacheConfig(
         block_size=config.block_size,
