@@ -68,7 +68,10 @@ struct Prefill {
   static constexpr int kBlockRows = kRowWaves * 16;
   static constexpr int kSubTiles = kKeyTile / 16;
   static constexpr int kWaveSubTiles = kSubTiles / kKeyWaves;
-  static constexpr int kPartDims = kHeadDim / kDimParts;
+  // The head dim padded to whole 16-dim chunks (D=72: 80). Q, the K tile and
+  // V_T hold zeros past D; loads past D are clamped and stored as zeros.
+  static constexpr int kHeadDimP = (kHeadDim + 15) / 16 * 16;
+  static constexpr int kPartDims = kHeadDimP / kDimParts;
   static constexpr int kPartChunks = kPartDims / 16;
   // Consecutive dims of a V row per lane.
   static constexpr int kLaneDims = kPartDims / 16;
@@ -76,14 +79,14 @@ struct Prefill {
   static constexpr int kKvRowElems = 2 * kHeadDim;
   static constexpr int kPageElems = kPageSize * kNumKvHeads * kKvRowElems;
   // LDS rows are padded by 16 bytes to avoid bank conflicts.
-  static constexpr int kRowPitch = kHeadDim + 8;
+  static constexpr int kRowPitch = kHeadDimP + 8;
   // V_T row pitch, chosen to avoid bank conflicts.
   static constexpr int kVtPitch = kKeyTile == 16 ? 16 : kKeyTile + 16;
   static constexpr int kBuffers = kDoubleBuffer ? 2 : 1;
   // Elements per load unit: 8, or 4 where a 16-key sub-tile of 8-element
   // units would not be whole waves (D=48, 80).
-  static constexpr int kUnitElems = kHeadDim / 8 % 4 == 0 ? 8 : 4;
-  static constexpr int kRowChunks = kHeadDim / kUnitElems;
+  static constexpr int kUnitElems = kHeadDimP / 8 % 4 == 0 ? 8 : 4;
+  static constexpr int kRowChunks = kHeadDimP / kUnitElems;
   static constexpr int kKUnits = kKeyTile * kRowChunks;
   // With V_T a V unit is keys kk and kk + 2 of a sub-tile.
   static constexpr int kVUnits = (kVT ? kKeyTile / 2 : kKeyTile) * kRowChunks;
@@ -103,7 +106,9 @@ struct Prefill {
 
   static_assert(kNumQHeads % kNumKvHeads == 0, "GQA must be integral");
   static_assert(kWaves % (kDimParts * kKeyWaves) == 0, "whole row tiles");
-  static_assert(kHeadDim % (16 * kDimParts) == 0, "whole chunks per part");
+  static_assert(kHeadDimP % (16 * kDimParts) == 0, "whole chunks per part");
+  static_assert(kHeadDimP == kHeadDim || (kDimParts == 1 && kVT),
+                "a padded head dim is one part with V transposed");
   static_assert(kSubTiles % kKeyWaves == 0, "whole sub-tiles per key wave");
   static_assert(kVT || kLaneDims % 2 == 0,
                 "a lane's V slice is whole dwords, or V is transposed");
@@ -192,7 +197,7 @@ struct Prefill {
   // LDS per workgroup, and the waves per SIMD the register budget targets.
   static constexpr int kLdsBytes =
       kBuffers * kKeyTile * kRowPitch * sizeof(elem_t) +
-      kBuffers * (kVT ? kHeadDim * kVtPitch : kKeyTile * kRowPitch) *
+      kBuffers * (kVT ? kHeadDimP * kVtPitch : kKeyTile * kRowPitch) *
           sizeof(elem_t) +
       (kDimParts > 1 ? kWaves * kWaveSubTiles * 256 * 4 : 0) +
       (kKeyWaves > 1 ? (2 * kKeyWaves * kBlockRows + kWaves * kWaveSize * 8) * 4
@@ -220,7 +225,7 @@ struct Prefill {
     __shared__ __attribute__((
         aligned(16))) elem_t kTile[kBuffers][kKeyTile][kRowPitch];
     __shared__ __attribute__((aligned(16))) elem_t
-        vTile[kBuffers][kVT ? kHeadDim : kKeyTile][kVT ? kVtPitch : kRowPitch];
+        vTile[kBuffers][kVT ? kHeadDimP : kKeyTile][kVT ? kVtPitch : kRowPitch];
     __shared__ __attribute__((aligned(
         16))) float scoreX[kDimParts > 1 ? kWaves * kWaveSubTiles * 256 : 1];
 
@@ -334,10 +339,19 @@ struct Prefill {
 
     e16 qOperand[kPartChunks];
 #pragma unroll
-    for (int c = 0; c < kPartChunks; ++c)
-      qOperand[c] = *(
-          const e16*)(q + ((size_t)rowToken * kNumQHeads + rowHead) * kHeadDim +
-                      (firstChunk + c) * 16);
+    for (int c = 0; c < kPartChunks; ++c) {
+      const elem_t* qRow =
+          q + ((size_t)rowToken * kNumQHeads + rowHead) * kHeadDim +
+          (firstChunk + c) * 16;
+      if (kHeadDimP != kHeadDim && (firstChunk + c) * 16 + 16 > kHeadDim) {
+        // The padded chunk: 8 real dims (D=72), zeros after.
+        const e8 lo = *(const e8*)qRow;
+        qOperand[c] = __builtin_shufflevector(lo, e8{}, 0, 1, 2, 3, 4, 5, 6, 7,
+                                              8, 9, 10, 11, 12, 13, 14, 15);
+      } else {
+        qOperand[c] = *(const e16*)qRow;
+      }
+    }
 
     const elem_t* kvHeadBase = kv + (size_t)kvHead * (kPageSize * kKvRowElems);
     eu kStaged[kKLoads];
@@ -457,7 +471,7 @@ struct Prefill {
             if (kKUnits % kThreads == 0 || unit < kKUnits)
               kStaged[i] = load_row.template operator()<kEdge>(
                   pages, keyStart, unit / kRowChunks,
-                  unit % kRowChunks * kUnitElems);
+                  min(unit % kRowChunks * kUnitElems, kHeadDim - kUnitElems));
           }
 #pragma unroll
           for (int i = 0; i < kVLoads; ++i) {
@@ -467,7 +481,8 @@ struct Prefill {
 #pragma unroll
               for (int x = 0; x < kVPerUnit; ++x)
                 vStaged[i][x] = load_row.template operator()<kEdge>(
-                    pages, keyStart, key + 2 * x, kHeadDim + col);
+                    pages, keyStart, key + 2 * x,
+                    kHeadDim + min(col, kHeadDim - kUnitElems));
             }
           }
         };
@@ -485,7 +500,8 @@ struct Prefill {
           const int key = unit / kRowChunks,
                     col = unit % kRowChunks * kUnitElems;
           *(eu*)&kTile[buffer][key][col] =
-              !kEdge || valid(keyStart + key) ? kStaged[i] : eu{};
+              (!kEdge || valid(keyStart + key)) && col < kHeadDim ? kStaged[i]
+                                                                  : eu{};
         }
       }
 #pragma unroll
@@ -494,9 +510,12 @@ struct Prefill {
         if (kVUnits % kThreads == 0 || unit < kVUnits) {
           const int key = v_unit_key(unit), col = v_unit_col(unit);
           if constexpr (kVT) {
-            const eu a = !kEdge || valid(keyStart + key) ? vStaged[i][0] : eu{};
-            const eu b =
-                !kEdge || valid(keyStart + key + 2) ? vStaged[i][1] : eu{};
+            const eu a = (!kEdge || valid(keyStart + key)) && col < kHeadDim
+                             ? vStaged[i][0]
+                             : eu{};
+            const eu b = (!kEdge || valid(keyStart + key + 2)) && col < kHeadDim
+                             ? vStaged[i][1]
+                             : eu{};
             const uu aw = __builtin_bit_cast(uu, a),
                      bw = __builtin_bit_cast(uu, b);
             const int slot = key / 16 * 16 + vt_slot(key % 16);
@@ -811,7 +830,9 @@ struct Prefill {
         if constexpr (kLaneDims % 2) {
 #pragma unroll
           for (int j = 0; j < kLaneDims; ++j)
-            dst[kLaneDims * (2 * e + laneHalf) + j] = x[j];
+            if (kHeadDimP == kHeadDim ||
+                kLaneDims * (2 * e + laneHalf) + j < kHeadDim)
+              dst[kLaneDims * (2 * e + laneHalf) + j] = x[j];
         } else {
           unsigned* d = (unsigned*)(dst + kLaneDims * (2 * e + laneHalf));
 #pragma unroll
@@ -832,7 +853,9 @@ struct Prefill {
       for (int e = 0; e < 8; ++e)
 #pragma unroll
         for (int j = 0; j < kLaneDims; ++j)
-          dst[kLaneDims * (2 * e + laneHalf) + j] = accum[j][e];
+          if (kHeadDimP == kHeadDim ||
+              kLaneDims * (2 * e + laneHalf) + j < kHeadDim)
+            dst[kLaneDims * (2 * e + laneHalf) + j] = accum[j][e];
       if (laneHalf == 0 && dimPart == 0) {
         partialML[partialRow * 2] = runMax;
         partialML[partialRow * 2 + 1] = runSum;

@@ -265,7 +265,7 @@ def expected_kv_cache_strides(variant: KernelVariant) -> tuple[int, int, int]:
 MAX_M = 8
 
 # Head dims the decode kernel supports.
-SUPPORTED_HEAD_SIZES = (32, 48, 64, 80, 96, 128, 256, 512)
+SUPPORTED_HEAD_SIZES = (32, 48, 64, 72, 80, 96, 128, 256, 512)
 
 
 # ---------------------------------------------------------------- prefill

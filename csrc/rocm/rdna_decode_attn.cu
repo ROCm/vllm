@@ -470,7 +470,10 @@ struct Decode {
   static constexpr int kPaddedRows = kRowTiles * 16;
   static constexpr int kKeyTiles = kWaves / kHeadDimSplit;
   static constexpr int kBlockKeys = 16 * kKeyTiles;
-  static constexpr int kPartDims = kHeadDim / kHeadDimSplit;
+  // The head dim padded to whole 16-dim chunks (D=72: 80); Q and the K tile
+  // hold zeros past D, the odd lane slice only real dims.
+  static constexpr int kHeadDimP = (kHeadDim + 15) / 16 * 16;
+  static constexpr int kPartDims = kHeadDimP / kHeadDimSplit;
   static constexpr int kPartChunks = kPartDims / 16;
   // Dims of a K or V row per lane: kLaneA consecutive ones (dims
   // kLaneA * r .. of row tile lane r) and, when kLaneDims is odd, one more
@@ -478,6 +481,8 @@ struct Decode {
   static constexpr int kLaneDims = kPartDims / 16;
   static constexpr int kLaneB = kLaneDims % 2;
   static constexpr int kLaneA = kLaneDims - kLaneB;
+  // Real dims of the odd slice: 16, or 8 for D=72.
+  static constexpr int kTailDims = kLaneB ? kHeadDim - 16 * kLaneA : 0;
   // P goes into P@V as a high and a low part for precision. With at most 8 rows
   // the low part uses the padding columns of the same WMMA.
   static constexpr bool kPackLowHalf = kGroupRows <= 8;
@@ -486,7 +491,7 @@ struct Decode {
   static constexpr int kTilesPerWave = kVInLds ? 2 : 1;
   static constexpr int kWaveTileBytes = kTilesPerWave * 16 * kTileRowBytes;
   static constexpr int kQRowPad = 8;
-  static constexpr int kQBytes = kPaddedRows * (kHeadDim + kQRowPad) * 2;
+  static constexpr int kQBytes = kPaddedRows * (kHeadDimP + kQRowPad) * 2;
   // Merge buffer: one slot of real rows per (live tile, part).
   static constexpr int kMergeRowStride = kPartDims + 4;
   static constexpr int kMergeSlotFloats =
@@ -521,7 +526,7 @@ struct Decode {
                 "row groups split the rows evenly");
   static_assert(kDotProduct || kWaves % kHeadDimSplit == 0,
                 "whole tiles per workgroup");
-  static_assert(kDotProduct || kHeadDim / 16 % kHeadDimSplit == 0,
+  static_assert(kDotProduct || kHeadDimP / 16 % kHeadDimSplit == 0,
                 "whole chunks per part");
   static_assert(kDotProduct || kLaneA == 2 || kLaneA == 4 || kLaneA == 6 ||
                     kLaneA == 8,
@@ -616,7 +621,8 @@ struct Decode {
         *(fchunk*)(row + kLaneA * (2 * e + laneHalf) + k) =
             *(const fchunk*)(values + k);
       if constexpr (kLaneB)
-        row[16 * kLaneA + 2 * e + laneHalf] = accum[kLaneA][e];
+        if (kTailDims == 16 || 2 * e + laneHalf < kTailDims)
+          row[16 * kLaneA + 2 * e + laneHalf] = accum[kLaneA][e];
     }
   }
 
@@ -633,7 +639,8 @@ struct Decode {
         for (int j = 0; j < kRowChunk; ++j) accum[k + j][e] += values[j];
       }
       if constexpr (kLaneB)
-        accum[kLaneA][e] += row[16 * kLaneA + 2 * e + laneHalf];
+        if (kTailDims == 16 || 2 * e + laneHalf < kTailDims)
+          accum[kLaneA][e] += row[16 * kLaneA + 2 * e + laneHalf];
     }
   }
 
@@ -718,7 +725,7 @@ struct Decode {
                      : 0;
 
     // The merge reuses the Q and K tile LDS.
-    auto qShared = reinterpret_cast<elem_t(*)[kHeadDim + kQRowPad]>(lds);
+    auto qShared = reinterpret_cast<elem_t(*)[kHeadDimP + kQRowPad]>(lds);
     float* mergeShared = reinterpret_cast<float*>(lds);
     char* waveTile = lds + kQBytes + wave * kTilesPerWave * 16 * kTileRowBytes;
     // Partial scores reuse the wave's K tile.
@@ -732,7 +739,10 @@ struct Decode {
 
     const elem_t* kvHeadBase = kv + (size_t)kvHead * (kPageSize * kKvRowElems);
     const int laneDim = dimPart * kPartDims + kLaneA * laneRow;
-    const int laneTailDim = dimPart * kPartDims + 16 * kLaneA + laneRow;
+    // Lanes past the real tail dims load a clamped one and zero it.
+    const int laneTailDim =
+        dimPart * kPartDims + 16 * kLaneA +
+        (kTailDims == 16 || !kLaneB ? laneRow : laneRow % kTailDims);
     const int firstChunk = dimPart * kPartChunks;
 
     // Load this wave's tile of `block` and the pages of the next block.
@@ -763,6 +773,8 @@ struct Decode {
           tile.vt[e] =
               *(const unsigned short*)(tail + 2 * e * kKvRowElems + kHeadDim);
           tile.kt[e] = *(const unsigned short*)(tail + 2 * e * kKvRowElems);
+          if (kTailDims < 16 && laneRow >= kTailDims)
+            tile.vt[e] = tile.kt[e] = 0;
         }
       }
       // Keep the loads from sinking to their first use.
@@ -777,6 +789,13 @@ struct Decode {
       const int elem = (it * kThreads + thread) * 8;
       if (elem < kPaddedRows * kHeadDim)
         *(e8*)&qShared[elem / kHeadDim][elem % kHeadDim] = qLoads[it];
+    }
+    if constexpr (kHeadDimP != kHeadDim) {
+      // Zero Q past D so the padded chunk adds nothing.
+      for (int row = thread; row < kPaddedRows; row += kThreads)
+#pragma unroll
+        for (int d = kHeadDim; d < kHeadDimP; d += 8)
+          *(e8*)&qShared[row][d] = e8{};
     }
 
     const float scaleLog2 = scale * kLog2e;
@@ -1110,7 +1129,8 @@ struct Decode {
                 x[j] = to_elem(accum[rt][j][e] * inv);
               *(vrow_t*)(dst + kLaneA * (2 * e + laneHalf)) = *(const vrow_t*)x;
               if constexpr (kLaneB)
-                dst[16 * kLaneA + 2 * e + laneHalf] = x[kLaneA];
+                if (kTailDims == 16 || 2 * e + laneHalf < kTailDims)
+                  dst[16 * kLaneA + 2 * e + laneHalf] = x[kLaneA];
             }
           } else {
             store_rows(partialAcc + (partialBase + rt * 16) * kHeadDim +
