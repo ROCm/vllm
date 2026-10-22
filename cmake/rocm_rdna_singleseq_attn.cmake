@@ -1,17 +1,19 @@
 #
-# Builds the RDNA3.5 attention kernels into the object library ${TARGET} for
-# ${ARCHES}. Each (kernel, head dim, dtype) is a generated translation unit
-# that builds the entries of csrc/rocm/rdna_singleseq_<kernel>_configs.h with
-# that head dim and dtype and registers them, so the builds compile in
-# parallel. The head dims and dtypes are the enumerators of
-# csrc/rocm/rdna_singleseq_attn_types.h; an entry without a unit makes
-# rdna_singleseq_<kernel>_configs() raise.
+# Builds the RDNA3.5 attention kernels of one GPU family into the object
+# library ${TARGET} for ${ARCHES}; FAMILY names the family's config tables
+# (Arch::k${FAMILY} in csrc/rocm/rdna_singleseq_attn_types.h). Each (kernel,
+# head dim, dtype) is a generated translation unit that builds the entries of
+# the family's table in csrc/rocm/rdna_singleseq_<kernel>_configs.h with that
+# head dim and dtype and registers them, so the builds compile in parallel.
+# The head dims and dtypes are the enumerators of rdna_singleseq_attn_types.h;
+# an entry without a unit makes rdna_singleseq_<kernel>_configs() raise.
 #
-function(rdna_singleseq_attn_target TARGET ARCHES)
+function(rdna_singleseq_attn_target TARGET FAMILY ARCHES)
   set(_KERNELS decode prefill)
   set(_HEAD_DIMS 64 96 128 256 512)
   set(_DTYPES Fp16 Bf16)
-  set(_OUT ${CMAKE_CURRENT_BINARY_DIR}/rdna_singleseq_attn)
+  string(TOLOWER ${FAMILY} _FAMILY_NAME)
+  set(_OUT ${CMAKE_CURRENT_BINARY_DIR}/rdna_singleseq_attn/${_FAMILY_NAME})
   set(_UNITS "")
   foreach(_KERNEL IN LISTS _KERNELS)
     foreach(_HEAD_DIM IN LISTS _HEAD_DIMS)
@@ -21,8 +23,8 @@ function(rdna_singleseq_attn_target TARGET ARCHES)
         file(CONFIGURE OUTPUT ${_UNIT} CONTENT
 "#include \"rdna_singleseq_attn_instances.cuh\"
 using namespace rdna_singleseq;
-static const bool kRegistered =
-    register_${_KERNEL}<HeadDim::k${_HEAD_DIM}, Dtype::k${_DTYPE}>();
+static const bool kRegistered = register_${_KERNEL}<
+    Arch::k${FAMILY}, HeadDim::k${_HEAD_DIM}, Dtype::k${_DTYPE}>();
 ")
         list(APPEND _UNITS ${_UNIT})
       endforeach()
@@ -39,4 +41,32 @@ static const bool kRegistered =
   target_compile_options(${TARGET} PRIVATE
     $<$<COMPILE_LANGUAGE:${VLLM_GPU_LANG}>:${VLLM_ROCM_EXT_FLAGS}>
     -O3 -g0 -Wno-unused-variable)
+  # The archs the registry offers the family on.
+  foreach(_ARCH IN LISTS ARCHES)
+    string(TOUPPER ${_ARCH} _ARCH)
+    target_compile_definitions(${TARGET} INTERFACE VLLM_RDNA_SINGLESEQ_${_ARCH})
+  endforeach()
+endfunction()
+
+# The object libraries, in OUT, of the GPU families with an arch in
+# VLLM_GPU_ARCHES: Gfx115X (gfx1151) and Gfx120X (gfx1200, gfx1201).
+function(rdna_singleseq_attn_targets OUT)
+  set(_TARGETS "")
+  foreach(_FAMILY_ARCHES "Gfx115X gfx1151" "Gfx120X gfx1200 gfx1201")
+    separate_arguments(_FAMILY_ARCHES)
+    list(POP_FRONT _FAMILY_ARCHES _FAMILY)
+    set(_ARCHES "")
+    foreach(_ARCH IN LISTS _FAMILY_ARCHES)
+      if(_ARCH IN_LIST VLLM_GPU_ARCHES)
+        list(APPEND _ARCHES ${_ARCH})
+      endif()
+    endforeach()
+    if(_ARCHES)
+      string(TOLOWER ${_FAMILY} _NAME)
+      rdna_singleseq_attn_target(_rocm_C_rdna_singleseq_attn_${_NAME} ${_FAMILY}
+                                 "${_ARCHES}")
+      list(APPEND _TARGETS _rocm_C_rdna_singleseq_attn_${_NAME})
+    endif()
+  endforeach()
+  set(${OUT} ${_TARGETS} PARENT_SCOPE)
 endfunction()

@@ -31,7 +31,8 @@ _COMMON = (
 # Not the configs headers: their entries do not change a build.
 _SOURCES = (_CSRC / "rdna_singleseq_decode_attn.cu", *_COMMON)
 _PREFILL_SOURCES = (_CSRC / "rdna_singleseq_prefill_attn.cu", *_COMMON)
-_ARCH = os.environ.get("RDNA_SINGLESEQ_JIT_ARCH", "gfx1151")
+# Default: the GPU's.
+_ARCH = os.environ.get("RDNA_SINGLESEQ_JIT_ARCH")
 
 _WRAPPER = """#include "rdna_singleseq_decode_attn.cu"
 using namespace rdna_singleseq;
@@ -171,6 +172,11 @@ def _toolchain() -> tuple[list[str], str]:
     )
 
 
+@functools.cache
+def _device_arch() -> str:
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
 def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
     """Compile one variant, cached by a hash of the sources and command."""
     prefill = isinstance(v, R.PrefillVariant)
@@ -189,7 +195,7 @@ def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
         *clang,
         "-x",
         "hip",
-        f"--offload-arch={_ARCH}",
+        f"--offload-arch={_ARCH or _device_arch()}",
         "-fno-gpu-rdc",
         "-O3",
         "-std=c++20",

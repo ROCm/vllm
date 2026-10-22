@@ -20,16 +20,16 @@ TOL = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 DTYPES = list(TOL)
 
 
-def _skip_unless_gfx1151():
-    from vllm.platforms.rocm import on_gfx1151
+def _skip_unless_built_gpu():
+    from vllm.platforms.rocm import on_gfx1151, on_rdna4
 
-    if not on_gfx1151():
-        pytest.skip("kernel is built for gfx1151")
+    if not (on_gfx1151() or on_rdna4()):
+        pytest.skip("kernel is built for gfx1151 and RDNA4")
 
 
 def _built(dtype=torch.float16, **want):
     """The first built variant matching `want`, and its module."""
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     for v in hip.variants():
         if v.dtype == dtype and all(pred(getattr(v, k)) for k, pred in want.items()):
             module = hip.load(v)
@@ -78,9 +78,23 @@ def _reference(q, kv, seq_len, window=0, mm_ranges=()):
     return torch.bmm(torch.softmax(scores, -1), vf).permute(1, 0, 2)
 
 
-def _max_rel(got, ref) -> float:
-    """Relative error with a floor."""
-    return ((got - ref).abs() / ref.abs().clamp_min(1e-3)).max().item()
+def _rounds_p(v) -> bool:
+    """On RDNA4, fp16 WMMA builds with more than 8 rows per workgroup take P
+    rounded to fp16 into P@V, as Triton does."""
+    from vllm.platforms.rocm import on_rdna4
+
+    gqa = v.num_q_heads // v.num_kv_heads
+    rows = gqa * v.max_query_len // v.row_groups
+    return on_rdna4() and v.dtype == torch.float16 and not v.dot_product and rows > 8
+
+
+def _max_rel(got, ref, v=None) -> float:
+    """Relative error with a floor. With P rounded to fp16 every term errs by
+    up to 2^-11, so outputs near zero are judged against the largest one."""
+    floor = 1e-3
+    if v is not None and _rounds_p(v):
+        floor = max(floor, ref.abs().max().item())
+    return ((got - ref).abs() / ref.abs().clamp_min(floor)).max().item()
 
 
 def _launch(module, q, kv, block_table, out, scratch, seq_len):
@@ -98,7 +112,7 @@ def _check_one(v, module, lens):
         torch.accelerator.synchronize()
         ref = _reference(q, kv, seq_len, v.window)
         got = out.float().nan_to_num(1e9)
-        assert _max_rel(got, ref) <= TOL[v.dtype], f"{v.name}, S={seq_len}"
+        assert _max_rel(got, ref, v) <= TOL[v.dtype], f"{v.name}, S={seq_len}"
 
 
 def _unit(v):
@@ -128,7 +142,7 @@ def test_decode_configs_are_well_formed():
 
 
 def test_every_listed_variant_is_built_in():
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     # Raises if a build has no instantiation unit.
     assert torch.ops._rocm_C.rdna_singleseq_decode_configs()
     missing = [v.name for v in hip.variants() if hip.load(v) is None]
@@ -138,7 +152,7 @@ def test_every_listed_variant_is_built_in():
 @pytest.mark.parametrize("unit", sorted({_unit(v) for v in hip.variants()}))
 def test_built_in_variants_match_reference(unit):
     """Every built decode variant matches the reference."""
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     for v in hip.variants():
         if _unit(v) != unit:
             continue
@@ -191,7 +205,7 @@ def test_sliding_window_never_reads_freed_pages(want):
     _launch(module, q, kv, block_table, out, hip.make_scratch(v, q.device), seq_len)
     torch.accelerator.synchronize()
     assert torch.isfinite(out).all()
-    assert _max_rel(out.float(), ref) <= TOL[v.dtype]
+    assert _max_rel(out.float(), ref, v) <= TOL[v.dtype]
 
 
 def test_graph_replay_follows_seq_lens():
@@ -222,7 +236,7 @@ def test_graph_replay_follows_seq_lens():
         graph.replay()
         torch.accelerator.synchronize()
         ref = _reference(q, kv, s)
-        assert _max_rel(out.float(), ref) <= TOL[v.dtype], f"S={s}"
+        assert _max_rel(out.float(), ref, v) <= TOL[v.dtype], f"S={s}"
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -514,7 +528,7 @@ def test_prefill_configs_are_well_formed():
 
 
 def test_every_listed_prefill_variant_is_built_in():
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     # Raises if a build has no instantiation unit.
     assert torch.ops._rocm_C.rdna_singleseq_prefill_configs()
     missing = [v for v in _prefill_rows() if hip.load_prefill(v) is None]
@@ -525,7 +539,7 @@ def test_every_listed_prefill_variant_is_built_in():
 def test_built_in_prefill_variants_match_reference(unit):
     """Every built prefill variant matches the reference, with and without a
     prefix."""
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     for v in _prefill_rows():
         if _prefill_unit(v) != unit:
             continue
@@ -562,7 +576,7 @@ def test_built_in_prefill_variants_match_reference(unit):
 
 def test_prefill_past_the_last_step():
     """M past the last step runs the last row."""
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     v = next(
         rows[-1]
         for rows in hip._prefill_table().values()
@@ -589,7 +603,7 @@ def test_prefill_past_the_last_step():
 
 def test_prefill_window_never_reads_freed_pages():
     """Freed pages before the window do not reach the output."""
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     v = next(v for v in _prefill_rows() if v.window and v.dtype == torch.float16)
     module = hip.load_prefill(v)
     m, seq_len = v.min_query_len, v.min_query_len + 3 * v.window
@@ -630,7 +644,7 @@ def test_prefill_window_never_reads_freed_pages():
 )
 def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
     """Tokens of a multimodal range see the whole range (Gemma4's shapes)."""
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     hq, hkv, d, window, dtype = shape
     v = hip.prefill_variant_for(hq, hkv, d, 16, 1, window, dtype, m)
     assert v is not None, shape
@@ -664,7 +678,7 @@ def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
 def test_prefill_refuses_malformed_mm_ranges(bad):
     """Only one sequence's (ranges, 2) on the device reaches the kernel: the
     batch's (sequences, ranges, 2) would unmask other sequences' keys."""
-    _skip_unless_gfx1151()
+    _skip_unless_built_gpu()
     v = hip.prefill_variant_for(32, 16, 256, 16, 1, 1024, torch.float16, 64)
     module = hip.load_prefill(v)
     scratch = hip.make_prefill_scratch([v], torch.device("cuda"))
