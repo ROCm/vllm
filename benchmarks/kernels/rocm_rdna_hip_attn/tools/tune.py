@@ -101,7 +101,7 @@ def grid(hq, hkv, d, m, batch=False):
                 continue
             for head_dim_split in sorted({rule, 2 * rule}):
                 lane_dims = (d // head_dim_split) // 16
-                if lane_dims not in (4, 6, 8) or waves % head_dim_split:
+                if lane_dims not in (2, 4, 6, 8) or waves % head_dim_split:
                     continue
                 out.append(
                     {
@@ -118,7 +118,7 @@ def grid(hq, hkv, d, m, batch=False):
                     }
                 )
     # The dot path needs whole dot2 pairs per lane (not D=96).
-    if not batch and (8 if d == 128 else d // 32) % 2 == 0:
+    if not batch and (8 if d == 128 else max(2, d // 32)) % 2 == 0:
         for waves, max_segments in itertools.product(*DOT_GRID.values()):
             out.append({"dot_product": 1, "waves": waves, "max_segments": max_segments})
     return out

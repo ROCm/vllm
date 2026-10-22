@@ -40,6 +40,13 @@ struct u3w {
   __device__ unsigned operator[](int i) const { return w[i]; }
 };
 
+// Two dims (D=32): one dword.
+struct u1w {
+  unsigned w[1];
+  __device__ unsigned& operator[](int i) { return w[i]; }
+  __device__ unsigned operator[](int i) const { return w[i]; }
+};
+
 template <DecodeConfig C, bool kBatchedBuild = false>
 struct Decode {
   static constexpr bool kBatched = kBatchedBuild;
@@ -124,7 +131,7 @@ struct Decode {
   // One workgroup per (q head, segment); each wave takes kTileKeys keys at a
   // time with the head dim across its lanes.
   static constexpr int kDimsPerLane =
-      kHeadDim == 128 ? 8 : kHeadDim / kWaveSize;
+      kHeadDim == 128 ? 8 : std::max(2, kHeadDim / kWaveSize);
   static constexpr int kLanesPerKey = kHeadDim / kDimsPerLane;
   static constexpr int kKeysPerStep = kWaveSize / kLanesPerKey;
   static constexpr int kKeysPerLane = std::max(4 / kKeysPerStep, 1);
@@ -503,9 +510,9 @@ struct Decode {
                 "whole tiles per workgroup");
   static_assert(kDotProduct || kHeadDim / 16 % kHeadDimSplit == 0,
                 "whole chunks per part");
-  static_assert(kDotProduct || kLaneDims == 4 || kLaneDims == 6 ||
-                    kLaneDims == 8,
-                "a lane's K and V slice is one b64, b96 or b128");
+  static_assert(kDotProduct || kLaneDims == 2 || kLaneDims == 4 ||
+                    kLaneDims == 6 || kLaneDims == 8,
+                "a lane's K and V slice is one b32, b64, b96 or b128");
   static_assert(kDotProduct || kKeyTiles <= kWaveSize,
                 "one lane per tile loads its page");
   static_assert(kDotProduct || kHeadDimSplit == 1 ||
@@ -514,9 +521,10 @@ struct Decode {
   static_assert(kDotProduct || !kVInLds || !kPrefetch,
                 "V_IN_LDS replaces PREFETCH's second tile");
 
-  using vrow_t =
-      std::conditional_t<kLaneDims == 8, u4v,
-                         std::conditional_t<kLaneDims == 6, u3w, u2v> >;
+  using vrow_t = std::conditional_t<
+      kLaneDims == 8, u4v,
+      std::conditional_t<kLaneDims == 6, u3w,
+                         std::conditional_t<kLaneDims == 4, u2v, u1w> > >;
   // A six-dim slice is only 8-byte aligned.
   static constexpr int kRowChunk = kLaneDims % 4 ? 2 : 4;
   typedef float fchunk __attribute__((ext_vector_type(kRowChunk)));
