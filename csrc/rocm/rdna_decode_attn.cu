@@ -40,6 +40,23 @@ struct u3w {
   __device__ unsigned operator[](int i) const { return w[i]; }
 };
 
+// Two dims (D=32): one dword.
+struct u1w {
+  unsigned w[1];
+  __device__ unsigned& operator[](int i) { return w[i]; }
+  __device__ unsigned operator[](int i) const { return w[i]; }
+};
+
+// Dims per lane of the dot path: the existing rule where D is a multiple of
+// 32, else the fewest whole dot2 pairs whose lanes per key divide the wave.
+constexpr int dot_dims_per_lane(int headDim) {
+  if (headDim == 128) return 8;
+  if (headDim % 32 == 0) return std::max(2, headDim / 32);
+  for (int dims = 2; dims <= headDim; dims += 2)
+    if (headDim % dims == 0 && 32 % (headDim / dims) == 0) return dims;
+  return headDim;
+}
+
 template <DecodeConfig C, bool kBatchedBuild = false>
 struct Decode {
   static constexpr bool kBatched = kBatchedBuild;
@@ -137,8 +154,7 @@ struct Decode {
   // evaluated for every build; the asserts only bind its own.
   // One workgroup per (q head, segment); each wave takes kTileKeys keys at a
   // time with the head dim across its lanes.
-  static constexpr int kDimsPerLane =
-      kHeadDim == 128 ? 8 : kHeadDim / kWaveSize;
+  static constexpr int kDimsPerLane = dot_dims_per_lane(kHeadDim);
   static constexpr int kLanesPerKey = kHeadDim / kDimsPerLane;
   static constexpr int kKeysPerStep = kWaveSize / kLanesPerKey;
   static constexpr int kKeysPerLane = std::max(4 / kKeysPerStep, 1);
@@ -474,10 +490,19 @@ struct Decode {
   static constexpr int kPaddedRows = kRowTiles * 16;
   static constexpr int kKeyTiles = kWaves / kHeadDimSplit;
   static constexpr int kBlockKeys = 16 * kKeyTiles;
-  static constexpr int kPartDims = kHeadDim / kHeadDimSplit;
+  // The head dim padded to whole 16-dim chunks (D=72: 80); Q and the K tile
+  // hold zeros past D, the odd lane slice only real dims.
+  static constexpr int kHeadDimP = (kHeadDim + 15) / 16 * 16;
+  static constexpr int kPartDims = kHeadDimP / kHeadDimSplit;
   static constexpr int kPartChunks = kPartDims / 16;
-  // Consecutive dims of a K or V row per lane.
+  // Dims of a K or V row per lane: kLaneA consecutive ones (dims
+  // kLaneA * r .. of row tile lane r) and, when kLaneDims is odd, one more
+  // (dim 16 * kLaneA + r), so D=48 runs as 32 + 16 and D=80 as 64 + 16.
   static constexpr int kLaneDims = kPartDims / 16;
+  static constexpr int kLaneB = kLaneDims % 2;
+  static constexpr int kLaneA = kLaneDims - kLaneB;
+  // Real dims of the odd slice: 16, or 8 for D=72.
+  static constexpr int kTailDims = kLaneB ? kHeadDim - 16 * kLaneA : 0;
   // P goes into P@V as a high and a low part for precision. With at most 8 rows
   // the low part uses the padding columns of the same WMMA; past that it costs
   // a second WMMA, which gfx12 skips for fp16.
@@ -488,7 +513,7 @@ struct Decode {
   static constexpr int kTilesPerWave = kVInLds ? 2 : 1;
   static constexpr int kWaveTileBytes = kTilesPerWave * 16 * kTileRowBytes;
   static constexpr int kQRowPad = 8;
-  static constexpr int kQBytes = kPaddedRows * (kHeadDim + kQRowPad) * 2;
+  static constexpr int kQBytes = kPaddedRows * (kHeadDimP + kQRowPad) * 2;
   // Merge buffer: one slot of real rows per (live tile, part).
   static constexpr int kMergeRowStride = kPartDims + 4;
   static constexpr int kMergeSlotFloats =
@@ -523,11 +548,13 @@ struct Decode {
                 "row groups split the rows evenly");
   static_assert(kDotProduct || kWaves % kHeadDimSplit == 0,
                 "whole tiles per workgroup");
-  static_assert(kDotProduct || kHeadDim / 16 % kHeadDimSplit == 0,
+  static_assert(kDotProduct || kHeadDimP / 16 % kHeadDimSplit == 0,
                 "whole chunks per part");
-  static_assert(kDotProduct || kLaneDims == 4 || kLaneDims == 6 ||
-                    kLaneDims == 8,
-                "a lane's K and V slice is one b64, b96 or b128");
+  static_assert(kDotProduct || kLaneA == 2 || kLaneA == 4 || kLaneA == 6 ||
+                    kLaneA == 8,
+                "a lane's K and V slice is one b32, b64, b96 or b128");
+  static_assert(kDotProduct || !kLaneB || kHeadDimSplit == 1,
+                "an odd lane slice is not split over the head dim");
   static_assert(kDotProduct || kKeyTiles <= kWaveSize,
                 "one lane per tile loads its page");
   static_assert(kDotProduct || kHeadDimSplit == 1 ||
@@ -536,11 +563,12 @@ struct Decode {
   static_assert(kDotProduct || !kVInLds || !kPrefetch,
                 "V_IN_LDS replaces PREFETCH's second tile");
 
-  using vrow_t =
-      std::conditional_t<kLaneDims == 8, u4v,
-                         std::conditional_t<kLaneDims == 6, u3w, u2v> >;
+  using vrow_t = std::conditional_t<
+      kLaneA == 8, u4v,
+      std::conditional_t<kLaneA == 6, u3w,
+                         std::conditional_t<kLaneA == 4, u2v, u1w> > >;
   // A six-dim slice is only 8-byte aligned.
-  static constexpr int kRowChunk = kLaneDims % 4 ? 2 : 4;
+  static constexpr int kRowChunk = kLaneA % 4 ? 2 : 4;
   typedef float fchunk __attribute__((ext_vector_type(kRowChunk)));
 
   // A wave's share of a 16-key tile: half h holds keys 2e + h, each lane
@@ -548,6 +576,9 @@ struct Decode {
   struct Tile {
     vrow_t k[8];
     vrow_t v[8];
+    // The odd dim, when kLaneB.
+    unsigned short kt[8];
+    unsigned short vt[8];
   };
 
   // Lane t holds the page of tile t of a block, clamped to the last page.
@@ -584,6 +615,15 @@ struct Decode {
         [](unsigned x) { return xhalf_u(x); });
   }
 
+  // A = V^T for the odd dim (kLaneB).
+  static __device__ __forceinline__ op_t vt_frag(const unsigned short* v) {
+    return Elem<kBf16>::own_first_op(
+        [&](int i) {
+          return (unsigned)v[2 * i] | ((unsigned)v[2 * i + 1] << 16);
+        },
+        [](unsigned x) { return xhalf_u(x); });
+  }
+
   // Store a wave's real rows of one row tile, `stride` floats apart.
   static __device__ __forceinline__ void store_rows(
       float* dst, const f8* accum, int laneRow, int laneHalf,
@@ -591,13 +631,16 @@ struct Decode {
     float* row = dst + laneRow * stride;
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
-      float values[kLaneDims];
+      float values[kLaneA];
 #pragma unroll
-      for (int j = 0; j < kLaneDims; ++j) values[j] = accum[j][e];
+      for (int j = 0; j < kLaneA; ++j) values[j] = accum[j][e];
 #pragma unroll
-      for (int k = 0; k < kLaneDims; k += kRowChunk)
-        *(fchunk*)(row + kLaneDims * acc_row(e, laneHalf) + k) =
+      for (int k = 0; k < kLaneA; k += kRowChunk)
+        *(fchunk*)(row + kLaneA * acc_row(e, laneHalf) + k) =
             *(const fchunk*)(values + k);
+      if constexpr (kLaneB)
+        if (kTailDims == 16 || acc_row(e, laneHalf) < kTailDims)
+          row[16 * kLaneA + acc_row(e, laneHalf)] = accum[kLaneA][e];
     }
   }
 
@@ -605,14 +648,18 @@ struct Decode {
                                                   int laneRow, int laneHalf) {
     const float* row = src + laneRow * kMergeRowStride;
 #pragma unroll
-    for (int e = 0; e < 8; ++e)
+    for (int e = 0; e < 8; ++e) {
 #pragma unroll
-      for (int k = 0; k < kLaneDims; k += kRowChunk) {
+      for (int k = 0; k < kLaneA; k += kRowChunk) {
         const fchunk values =
-            *(const fchunk*)(row + kLaneDims * acc_row(e, laneHalf) + k);
+            *(const fchunk*)(row + kLaneA * acc_row(e, laneHalf) + k);
 #pragma unroll
         for (int j = 0; j < kRowChunk; ++j) accum[k + j][e] += values[j];
       }
+      if constexpr (kLaneB)
+        if (kTailDims == 16 || acc_row(e, laneHalf) < kTailDims)
+          accum[kLaneA][e] += row[16 * kLaneA + acc_row(e, laneHalf)];
+    }
   }
 
   // The first block's pages, read before S is known.
@@ -697,7 +744,7 @@ struct Decode {
                      : 0;
 
     // The merge reuses the Q and K tile LDS.
-    auto qShared = reinterpret_cast<elem_t(*)[kHeadDim + kQRowPad]>(lds);
+    auto qShared = reinterpret_cast<elem_t(*)[kHeadDimP + kQRowPad]>(lds);
     float* mergeShared = reinterpret_cast<float*>(lds);
     char* waveTile = lds + kQBytes + wave * kTilesPerWave * 16 * kTileRowBytes;
     // Partial scores reuse the wave's K tile.
@@ -710,7 +757,11 @@ struct Decode {
     float* const groupSum = groupMax + kPaddedRows;
 
     const elem_t* kvHeadBase = kv + (size_t)kvHead * (kPageSize * kKvRowElems);
-    const int laneDim = dimPart * kPartDims + kLaneDims * laneRow;
+    const int laneDim = dimPart * kPartDims + kLaneA * laneRow;
+    // Lanes past the real tail dims load a clamped one and zero it.
+    const int laneTailDim =
+        dimPart * kPartDims + 16 * kLaneA +
+        (kTailDims == 16 || !kLaneB ? laneRow : laneRow % kTailDims);
     const int firstChunk = dimPart * kPartChunks;
 
     // Load this wave's tile of `block` and the pages of the next block.
@@ -734,6 +785,17 @@ struct Decode {
       for (int e = 0; e < 8; ++e)
         tile.k[e] = (kAblate & 4) ? vrow_t{}
                                   : *(const vrow_t*)(src + 2 * e * kKvRowElems);
+      if constexpr (kLaneB) {
+        const elem_t* tail = src - laneDim + laneTailDim;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          tile.vt[e] =
+              *(const unsigned short*)(tail + 2 * e * kKvRowElems + kHeadDim);
+          tile.kt[e] = *(const unsigned short*)(tail + 2 * e * kKvRowElems);
+          if (kTailDims < 16 && laneRow >= kTailDims)
+            tile.vt[e] = tile.kt[e] = 0;
+        }
+      }
       // Keep the loads from sinking to their first use.
       asm volatile("" ::: "memory");
     };
@@ -746,6 +808,13 @@ struct Decode {
       const int elem = (it * kThreads + thread) * 8;
       if (elem < kPaddedRows * kHeadDim)
         *(e8*)&qShared[elem / kHeadDim][elem % kHeadDim] = qLoads[it];
+    }
+    if constexpr (kHeadDimP != kHeadDim) {
+      // Zero Q past D so the padded chunk adds nothing.
+      for (int row = thread; row < kPaddedRows; row += kThreads)
+#pragma unroll
+        for (int d = kHeadDim; d < kHeadDimP; d += 8)
+          *(e8*)&qShared[row][d] = e8{};
     }
 
     const float scaleLog2 = scale * kLog2e;
@@ -778,22 +847,34 @@ struct Decode {
 #pragma unroll
       for (int e = 0; e < 8; ++e) {
         const int offset =
-            (2 * e + laneHalf) * kTileRowBytes + kLaneDims * laneRow * 2;
+            (2 * e + laneHalf) * kTileRowBytes + kLaneA * laneRow * 2;
         *(vrow_t*)(waveTile + offset) = tile.k[e];
         *(vrow_t*)(waveTile + 16 * kTileRowBytes + offset) = tile.v[e];
+        if constexpr (kLaneB) {
+          const int tailOffset =
+              (2 * e + laneHalf) * kTileRowBytes + (16 * kLaneA + laneRow) * 2;
+          *(unsigned short*)(waveTile + tailOffset) = tile.kt[e];
+          *(unsigned short*)(waveTile + 16 * kTileRowBytes + tailOffset) =
+              tile.vt[e];
+        }
       }
       asm volatile("" ::: "memory");
     };
     auto stageK = [&](const Tile& tile) {
 #pragma unroll
-      for (int e = 0; e < 8; ++e)
+      for (int e = 0; e < 8; ++e) {
         *(vrow_t*)(waveTile + (2 * e + laneHalf) * kTileRowBytes +
-                   kLaneDims * laneRow * 2) = tile.k[e];
+                   kLaneA * laneRow * 2) = tile.k[e];
+        if constexpr (kLaneB)
+          *(unsigned short*)(waveTile + (2 * e + laneHalf) * kTileRowBytes +
+                             (16 * kLaneA + laneRow) * 2) = tile.kt[e];
+      }
       asm volatile("" ::: "memory");
     };
 
     // Q@K, softmax update and P@V for the tile staged at kTile.
-    auto process = [&](Tile& tile, vrow_t* v, const char* kTile, int block) {
+    auto process = [&](Tile& tile, vrow_t* v, unsigned short* vt,
+                       const char* kTile, int block) {
       const int tileKey = block * kBlockKeys + keyTile * 16;
       if constexpr (kAblate & 64) {
         unsigned x = 0;
@@ -845,13 +926,21 @@ struct Decode {
         lds_barrier();
       }
       vrow_t ldsV[8];
+      unsigned short ldsVt[8];
       if constexpr (kVInLds) {
 #pragma unroll
-        for (int e = 0; e < 8; ++e)
+        for (int e = 0; e < 8; ++e) {
           ldsV[e] = *(const vrow_t*)(kTile + 16 * kTileRowBytes +
                                      (2 * e + laneHalf) * kTileRowBytes +
-                                     kLaneDims * laneRow * 2);
+                                     kLaneA * laneRow * 2);
+          if constexpr (kLaneB)
+            ldsVt[e] =
+                *(const unsigned short*)(kTile + 16 * kTileRowBytes +
+                                         (2 * e + laneHalf) * kTileRowBytes +
+                                         (16 * kLaneA + laneRow) * 2);
+        }
         v = ldsV;
+        vt = ldsVt;
       }
 
       // Zero V past S and before the window (possibly freed pages), so no
@@ -859,14 +948,19 @@ struct Decode {
       if (__builtin_expect(tileKey + 16 > seqLen, 0)) {
 #pragma unroll
         for (int e = 0; e < 8; ++e)
-          if (tileKey + 2 * e + laneHalf >= seqLen) v[e] = vrow_t{};
+          if (tileKey + 2 * e + laneHalf >= seqLen) {
+            v[e] = vrow_t{};
+            if constexpr (kLaneB) vt[e] = 0;
+          }
       }
       if constexpr (kWindow) {
         if (__builtin_expect(tileKey < context - (kWindow - 1), 0)) {
 #pragma unroll
           for (int e = 0; e < 8; ++e)
-            if (tileKey + 2 * e + laneHalf < context - (kWindow - 1))
+            if (tileKey + 2 * e + laneHalf < context - (kWindow - 1)) {
               v[e] = vrow_t{};
+              if constexpr (kLaneB) vt[e] = 0;
+            }
         }
       }
 
@@ -939,7 +1033,8 @@ struct Decode {
         for (int j = 0; j < kLaneDims; ++j) {
           accum[rt][j] *= accumScale;
           if ((kAblate & 2) && j) continue;
-          const op_t vOperand = v_frag(v, j);
+          const op_t vOperand =
+              (kLaneB && j == kLaneA) ? vt_frag(vt) : v_frag(v, j);
           accum[rt][j] = wmma(vOperand, pOperand, accum[rt][j]);
           if constexpr (kLowWmma)
             accum[rt][j] = wmma(vOperand, pLowOperand, accum[rt][j]);
@@ -954,25 +1049,25 @@ struct Decode {
            block += 2 * numSegments) {
         stageK(tileA);
         if (block + numSegments < numBlocks) issue(tileB, block + numSegments);
-        process(tileA, tileA.v, waveTile, block);
+        process(tileA, tileA.v, tileA.vt, waveTile, block);
         if (block + numSegments >= numBlocks) break;
         stageK(tileB);
         if (block + 2 * numSegments < numBlocks)
           issue(tileA, block + 2 * numSegments);
-        process(tileB, tileB.v, waveTile, block + numSegments);
+        process(tileB, tileB.v, tileB.vt, waveTile, block + numSegments);
       }
     } else if constexpr (kVInLds) {
       for (int block = firstBlock + segment; block < numBlocks;
            block += numSegments) {
         stageKv(tileA);
         if (block + numSegments < numBlocks) issue(tileA, block + numSegments);
-        process(tileA, nullptr, waveTile, block);
+        process(tileA, nullptr, nullptr, waveTile, block);
       }
     } else {
       for (int block = firstBlock + segment; block < numBlocks;
            block += numSegments) {
         stageK(tileA);
-        process(tileA, tileA.v, waveTile, block);
+        process(tileA, tileA.v, tileA.vt, waveTile, block);
         if (block + numSegments < numBlocks) issue(tileA, block + numSegments);
       }
     }
@@ -1056,8 +1151,11 @@ struct Decode {
 #pragma unroll
               for (int j = 0; j < kLaneDims; ++j)
                 x[j] = to_elem(accum[rt][j][e] * inv);
-              *(vrow_t*)(dst + kLaneDims * acc_row(e, laneHalf)) =
+              *(vrow_t*)(dst + kLaneA * acc_row(e, laneHalf)) =
                   *(const vrow_t*)x;
+              if constexpr (kLaneB)
+                if (kTailDims == 16 || acc_row(e, laneHalf) < kTailDims)
+                  dst[16 * kLaneA + acc_row(e, laneHalf)] = x[kLaneA];
             }
           } else {
             store_rows(partialAcc + (partialBase + rt * 16) * kHeadDim +

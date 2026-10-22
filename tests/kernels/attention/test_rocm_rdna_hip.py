@@ -356,7 +356,7 @@ def test_unsupported_head_size_falls_back_to_triton():
 
     impl = _impl()
     impl._rejected = None
-    impl.head_size, impl.num_heads, impl.num_kv_heads = 80, HQ, HKV
+    impl.head_size, impl.num_heads, impl.num_kv_heads = 160, HQ, HKV
 
     fits = impl._prepare(
         kv_cache=torch.empty(0, dtype=torch.float16),
@@ -372,7 +372,7 @@ def test_unsupported_head_size_falls_back_to_triton():
         max_seqlen_q=0,
     )
     assert not fits
-    assert "head_size 80" in impl._rejected
+    assert "head_size 160" in impl._rejected
 
 
 def test_strided_query_falls_back_to_triton():

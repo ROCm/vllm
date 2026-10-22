@@ -102,8 +102,23 @@ def grid(hq, hkv, d, m, batch=False):
             if max_segments == 1 and min_segment_blocks != 1:
                 continue
             for head_dim_split in sorted({rule, 2 * rule}):
-                lane_dims = (d // head_dim_split) // 16
-                if lane_dims not in (4, 6, 8) or waves % head_dim_split:
+                lane_dims = -(-d // 16) // head_dim_split
+                if (
+                    lane_dims - lane_dims % 2 not in (2, 4, 6, 8)
+                    or waves % head_dim_split
+                ):
+                    continue
+                # As the kernel's asserts: whole chunks per part, an odd lane
+                # slice unsplit, the score exchange inside a wave's K tile.
+                row_tiles = -(-(rows // row_groups) // 16)
+                if (
+                    -(-d // 16) % head_dim_split
+                    or (lane_dims % 2 and head_dim_split != 1)
+                    or (
+                        head_dim_split > 1
+                        and row_tiles * 1024 > 16 * ((d // head_dim_split) * 2 + 16)
+                    )
+                ):
                     continue
                 out.append(
                     {
@@ -120,7 +135,7 @@ def grid(hq, hkv, d, m, batch=False):
                     }
                 )
     # The dot path needs whole dot2 pairs per lane (not D=96).
-    if not batch and (8 if d == 128 else d // 32) % 2 == 0:
+    if not batch and (8 if d == 128 else max(2, d // 32)) % 2 == 0:
         for waves, max_segments in itertools.product(*DOT_GRID.values()):
             out.append({"dot_product": 1, "waves": waves, "max_segments": max_segments})
     return out
@@ -729,6 +744,9 @@ def prefill_grid(d):
         if (
             k["waves"] % (split * k["key_waves"])
             or k["key_tile"] // 16 % k["key_waves"]
+            # An odd lane slice (D=48, 80) or a padded one (D=72) needs V
+            # transposed.
+            or ((-(-d // 16) // split % 2 or d % 16) and not k["v_t"])
         ):
             continue
         out.append(k)
