@@ -17,7 +17,10 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.models.vision import get_npu_vision_backend
+from vllm.model_executor.models.vision import (
+    FusedInputNorm,
+    get_npu_vision_backend,
+)
 
 logger = init_logger(__name__)
 
@@ -28,11 +31,15 @@ class Qwen2_5_VisionTransformerNPU(nn.Module):
     def __init__(
         self,
         vision_config: Qwen2_5_VLVisionConfig,
+        input_norm: nn.Module | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         del prefix  # NPU backend has no trainable submodule tree.
 
+        self.input_norm = (
+            input_norm if input_norm is not None else FusedInputNorm.identity()
+        )
         self.out_hidden_size = vision_config.out_hidden_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
@@ -66,6 +73,7 @@ class Qwen2_5_VisionTransformerNPU(nn.Module):
         pixel_values: torch.Tensor,
         grid_thw: list[list[int]],
     ) -> torch.Tensor:
+        pixel_values = self.input_norm(pixel_values, self.dtype)
         if pixel_values.dtype == torch.bfloat16:
             pixel_values_np = pixel_values.cpu().float().numpy()
         else:

@@ -1158,6 +1158,7 @@ def build_qwen2_5_vision_transformer(
     vision_config: Qwen2_5_VLVisionConfig,
     norm_eps: float = 1e-6,
     quant_config: QuantizationConfig | None = None,
+    input_norm: nn.Module | None = None,
     prefix: str = "",
 ) -> nn.Module:
     """Build the Qwen2.5-VL vision tower for GPU or NPU execution."""
@@ -1166,6 +1167,7 @@ def build_qwen2_5_vision_transformer(
     if use_npu_vision_backend():
         return Qwen2_5_VisionTransformerNPU(
             vision_config=vision_config,
+            input_norm=input_norm,
             prefix=prefix,
         )
 
@@ -1173,6 +1175,7 @@ def build_qwen2_5_vision_transformer(
         vision_config=vision_config,
         norm_eps=norm_eps,
         quant_config=quant_config,
+        input_norm=input_norm,
         prefix=prefix,
     )
 
