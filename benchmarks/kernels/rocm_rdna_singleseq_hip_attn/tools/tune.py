@@ -10,11 +10,12 @@ loss_limit(S) at any context, and wins on the mean speedup weighted by
 sqrt(S / 128) if above --min-gain.
 
 Prefill (--prefill), per (Hq, Hkv, D, window): one row per step of M, chosen
-in an interleaved A/B against TRITON_ATTN.
+in an interleaved A/B against TRITON_ATTN among the finalists that lose at most
+--prefill-loss-limit to the current row at any cell.
 
-`--apply` writes accepted decisions into
-csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h, refusing those measured on
-another kernel source or row.
+`--apply` writes accepted decisions into the table of the GPU family they were
+measured on in csrc/rocm/rdna_singleseq_{decode,prefill}_configs.h, refusing
+those measured on another kernel source or row.
 
     PYTHONPATH=$PWD python \\
         benchmarks/kernels/rocm_rdna_singleseq_hip_attn/tools/tune.py \\
@@ -289,6 +290,7 @@ def tune(a) -> None:
         "dtype": a.dtype,
         "block_size": bs,
         "source": jit.source_digest(),
+        "family": gpu_family(),
         "contexts": ctxs,
     }
     meta = {
@@ -471,6 +473,9 @@ def tune(a) -> None:
     runs = [(v, k, tags) for v, (k, tags) in finalists.items()]
     if current is not None:
         runs.insert(0, (current, knobs_of(current), ["current"]))
+    # Points reused from --points were not built in this run.
+    if jit.precompile([v for v, _, _ in runs]):
+        time.sleep(5)  # let clocks settle after the build
     times = [{s: [] for s in ctxs} for _ in runs]
     for _ in range(a.confirm_rounds):
         for s in ctxs:
@@ -481,18 +486,24 @@ def tune(a) -> None:
                     t[s].append(float("inf"))
     med = [[statistics.median(t[s]) for s in ctxs] for t in times]
     base = med[0] if current is not None else None
+    # A failed run of the current row is no baseline: candidates are ranked
+    # against the roofline and none is accepted over it.
+    base_ok = base is None or all(map(math.isfinite, base))
     results = []
-    for (v, k, tags), us in zip(runs, med):
+    for (v, k, tags), us, t in zip(runs, med, times):
         if "current" in tags:
             continue
-        ratio = [b / u for b, u in zip(base or roof, us)]
+        ratio = [b / u for b, u in zip(base if base and base_ok else roof, us)]
         score = weighted(ctxs, ratio)
-        accepted = base is None or (score > a.min_gain and within_limits(ctxs, ratio))
+        accepted = base is None or (
+            base_ok and score > a.min_gain and within_limits(ctxs, ratio)
+        )
         results.append(
             {
                 "knobs": k,
                 "for": tags,
                 "us": us,
+                "samples": [t[s] for s in ctxs],
                 "ratio": ratio,
                 "score": score,
                 "worst": min(ratio),
@@ -511,6 +522,7 @@ def tune(a) -> None:
         **fixed,
         "current": None if current is None else knobs_of(current),
         "current_us": base,
+        "current_samples": None if current is None else [times[0][s] for s in ctxs],
         "finalists": results,
         "accepted": best is not None,
         # The row is outside the search space and nothing beat it.
@@ -546,11 +558,13 @@ def tune(a) -> None:
 # ------------------------------------------------------------------- prefill --
 
 # Steps of M; a row serves M from its step up to the next.
-STEPS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+STEPS = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 PREFIXES = (0, 1024, 16384)
 # A step keeps the previous step's row when within this factor of the winner.
 PREFILL_SLACK = 1.02
 PREFILL_BASELINES = ("TRITON_ATTN",)
+# Most a step's winner may lose at any cell against the current row.
+PREFILL_LOSS_LIMIT = 0.02
 
 
 def prefill_grid(d):
@@ -606,6 +620,49 @@ def weighted_speedup(weights, ratio):
     return math.exp(sum(w * math.log(r) for w, r in zip(weights, ratio)) / sum(weights))
 
 
+def prefill_weights(hq, d, win, cells):
+    flops = [utils.attention_flops(hq, d, m, m + p, win) for m, p in cells]
+    total = sum(flops)
+    return {c: math.sqrt(f / total) for c, f in zip(cells, flops)}
+
+
+def choose_prefill_steps(cells, weight, med, finalists, current, loss_limit):
+    """Per step of M, the finalist to keep: among those losing at most
+    `loss_limit` at any cell against the current row, prefer points never
+    slower than a baseline, then the speedup over it weighted by
+    sqrt(FLOPs); the previous step's winner stays within PREFILL_SLACK.
+
+    `med` maps (point id or baseline, cell) to us; `finalists` and `current`
+    map M to point ids. Returns (M, winner, scored, baseline us) per step.
+    """
+    out, prev = [], None
+    for m in sorted({c[0] for c in cells}):
+        sc = [c for c in cells if c[0] == m]
+        base = {c: min(med[(b, c)] for b in PREFILL_BASELINES) for c in sc}
+        cur = current.get(m)
+        allowed = [
+            k
+            for k in sorted(finalists[m])
+            if cur not in finalists[m]
+            or all(med[(cur, c)] / med[(k, c)] >= 1 - loss_limit for c in sc)
+        ]
+        w = [weight[c] for c in sc]
+        scored = {}
+        for k in allowed:
+            ratio = [base[c] / med[(k, c)] for c in sc]
+            scored[k] = (min(ratio) >= 1.0, weighted_speedup(w, ratio), ratio)
+        best = max(scored, key=lambda k: scored[k][:2])
+        if (
+            prev in scored
+            and (scored[prev][0] or not scored[best][0])
+            and scored[prev][1] * PREFILL_SLACK >= scored[best][1]
+        ):
+            best = prev
+        out.append((m, best, scored, base))
+        prev = best
+    return out
+
+
 def tune_prefill(a) -> None:
     import common
     import jit
@@ -622,10 +679,9 @@ def tune_prefill(a) -> None:
     dtype = utils.torch_dtype(a.dtype)
     hq, hkv, d, win, bs = a.hq, a.hkv, a.head_dim, a.window, a.block_size
     tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + f" prefill {a.dtype}"
-    cells = [(m, p) for m in STEPS for p in a.prefixes]
-    flops = [utils.attention_flops(hq, d, m, m + p, win) for m, p in cells]
-    total = sum(flops)
-    weight = {c: math.sqrt(f / total) for c, f in zip(cells, flops)}
+    ms = sorted(a.steps)
+    cells = [(m, p) for m in ms for p in a.prefixes]
+    weight = prefill_weights(hq, d, win, cells)
     fixed = {
         "kind": "prefill",
         "hq": hq,
@@ -635,7 +691,8 @@ def tune_prefill(a) -> None:
         "dtype": a.dtype,
         "block_size": bs,
         "source": jit.source_digest(prefill=True),
-        "cells": cells,
+        "family": gpu_family(),
+        "cells": [list(c) for c in cells],  # as read back from --points
     }
     meta = {
         "vllm": vllm.__version__,
@@ -649,9 +706,7 @@ def tune_prefill(a) -> None:
     def pid(knobs):
         return json.dumps(sorted(knobs.items()))
 
-    current = {
-        m: R.prefill_variant_for(hq, hkv, d, bs, 1, win, dtype, m) for m in STEPS
-    }
+    current = {m: R.prefill_variant_for(hq, hkv, d, bs, 1, win, dtype, m) for m in ms}
     raw = (
         [json.loads(x) for x in Path(a.candidates).read_text().splitlines() if x]
         if a.candidates
@@ -783,7 +838,7 @@ def tune_prefill(a) -> None:
         return [c for c in cells if c[0] == m]
 
     finalists: dict[int, set[str]] = {}
-    for m in STEPS:
+    for m in ms:
         sc = step_cells(m)
         fastest = {c: min(t[c] for t in ok.values()) for c in sc}
         ranked = sorted(
@@ -797,8 +852,11 @@ def tune_prefill(a) -> None:
         finalists[m] = set(ranked[: a.top])
         if current[m] is not None and pid(prefill_knobs_of(current[m])) in ok:
             finalists[m].add(pid(prefill_knobs_of(current[m])))
-    for m, prev in zip(STEPS[1:], STEPS):
+    for m, prev in zip(ms[1:], ms):
         finalists[m] |= finalists[prev]
+    # Points reused from --points were not built in this run.
+    if jit.precompile([cands[k] for m in ms for k in finalists[m]]):
+        time.sleep(5)  # let clocks settle after the build
 
     def harness(backend, m, p, knobs=None):
         from common import BenchmarkConfig
@@ -816,7 +874,7 @@ def tune_prefill(a) -> None:
             dtype=dtype,
             sliding_window=win or None,
             use_cuda_graphs=False,
-            max_model_len=max(STEPS) * 2 + max(a.prefixes),
+            max_model_len=max(ms) * 2 + max(a.prefixes),
         )
         if knobs is None:
             return run_attention_benchmark(cfg).median_time * 1e6
@@ -828,7 +886,7 @@ def tune_prefill(a) -> None:
 
     times: dict = {}
     for _ in range(a.confirm_rounds):
-        for m in STEPS:
+        for m in ms:
             for c in step_cells(m):
                 for b in PREFILL_BASELINES:
                     try:
@@ -841,23 +899,13 @@ def tune_prefill(a) -> None:
                     )
     med = {key: statistics.median(t) for key, t in times.items()}
 
-    # 3. Per step, prefer points never slower than a baseline, then speedup.
-    steps, prev = [], None
-    for m in STEPS:
+    # 3. Per step, the winner within the loss limit against the current row.
+    cur_ids = {m: pid(prefill_knobs_of(v)) for m, v in current.items() if v is not None}
+    steps = []
+    for m, best, scored, base in choose_prefill_steps(
+        cells, weight, med, finalists, cur_ids, a.prefill_loss_limit
+    ):
         sc = step_cells(m)
-        base = {c: min(med[(b, c)] for b in PREFILL_BASELINES) for c in sc}
-        w = [weight[c] for c in sc]
-        scored = {}
-        for k in finalists[m]:
-            ratio = [base[c] / med[(k, c)] for c in sc]
-            scored[k] = (min(ratio) >= 1.0, weighted_speedup(w, ratio), ratio)
-        best = max(scored, key=lambda k: scored[k][:2])
-        if (
-            prev in scored
-            and (scored[prev][0] or not scored[best][0])
-            and scored[prev][1] * PREFILL_SLACK >= scored[best][1]
-        ):
-            best = prev
         cur = None if current[m] is None else prefill_knobs_of(current[m])
         steps.append(
             {
@@ -866,13 +914,13 @@ def tune_prefill(a) -> None:
                 "winner": dict(json.loads(best)),
                 "speedup": scored[best][1],
                 "worst": min(scored[best][2]),
+                "finalists": [dict(json.loads(k)) for k in sorted(finalists[m])],
                 "cells": {
                     f"{c[0]}:{c[1]}": {"ours": med[(best, c)], "base": base[c]}
                     for c in sc
                 },
             }
         )
-        prev = best
         print(
             f"{tag} M>={m}: {prefill_label(steps[-1]['winner'])}  "
             f"speedup {steps[-1]['speedup']:.2f}x, "
@@ -881,14 +929,69 @@ def tune_prefill(a) -> None:
         )
     decision = {
         **fixed,
-        "current": {m: s["current"] for m, s in zip(STEPS, steps)},
+        "current": {m: s["current"] for m, s in zip(ms, steps)},
         "steps": steps,
+        # Every A/B run: the finalists of each step (the current row among
+        # them) and the baselines, per cell.
+        "ab": [
+            {
+                "cell": list(c),
+                **(
+                    {"backend": who}
+                    if who in PREFILL_BASELINES
+                    else {"knobs": dict(json.loads(who))}
+                ),
+                "samples": t,
+            }
+            for (who, c), t in times.items()
+        ],
+        "loss_limit": a.prefill_loss_limit,
         "accepted": True,
         **meta,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     with open(a.decisions, "a") as out:
         out.write(json.dumps(decision) + "\n")
+
+
+def reselect_prefill(path: str, out: str, loss_limit: float) -> None:
+    """Choose the steps of stored prefill decisions again from their A/B
+    samples, with `loss_limit`; no timing."""
+
+    def pid(knobs):
+        return json.dumps(sorted(knobs.items()))
+
+    with open(out, "a") as fh:
+        for line in Path(path).read_text().splitlines():
+            dec = json.loads(line)
+            if dec.get("kind") != "prefill" or "ab" not in dec:
+                continue
+            cells = [tuple(c) for c in dec["cells"]]
+            weight = prefill_weights(dec["hq"], dec["d"], dec["window"], cells)
+            med = {
+                (x.get("backend") or pid(x["knobs"]), tuple(x["cell"])): (
+                    statistics.median(x["samples"])
+                )
+                for x in dec["ab"]
+            }
+            finalists = {s["m"]: {pid(k) for k in s["finalists"]} for s in dec["steps"]}
+            current = {s["m"]: pid(s["current"]) for s in dec["steps"] if s["current"]}
+            chosen = choose_prefill_steps(
+                cells, weight, med, finalists, current, loss_limit
+            )
+            for step, (m, best, scored, base) in zip(dec["steps"], chosen):
+                sc = [c for c in cells if c[0] == m]
+                step.update(
+                    winner=dict(json.loads(best)),
+                    speedup=scored[best][1],
+                    worst=min(scored[best][2]),
+                    cells={
+                        f"{c[0]}:{c[1]}": {"ours": med[(best, c)], "base": base[c]}
+                        for c in sc
+                    },
+                )
+            dec["loss_limit"] = loss_limit
+            fh.write(json.dumps(dec) + "\n")
 
 
 def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
@@ -903,7 +1006,8 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
     if dec["source"] != jit.source_digest(prefill=True):
         print(f"{tag}: refused, measured on another kernel source")
         return 0
-    lines, rows = read_configs(PREFILL_CONFIGS_H)
+    family = dec.get("family") or gpu_family()
+    lines, rows = read_configs(PREFILL_CONFIGS_H, family)
     col = {f: i for i, f in enumerate(R.PREFILL_CONFIG_FIELDS)}
     dtype = utils.torch_dtype(dec["dtype"])
     for step in dec["steps"]:
@@ -923,28 +1027,51 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
         ) == (d, hq, hkv, win)
 
     sizes = sorted({r[col["page_size"]] for r in rows if mine(r)}) or block_sizes
-    rows = [r for r in rows if not mine(r)]
-    merged = []
-    for step in dec["steps"]:
-        if not merged or merged[-1]["winner"] != step["winner"]:
-            merged.append(step)
+    kept = [r for r in rows if not mine(r)]
+    # A decided step's winner serves M from its step up to the next step of
+    # STEPS; outside them the entries stay.
+    decided = {s["m"]: s["winner"] for s in dec["steps"]}
+    ends = dict(zip(STEPS, (*STEPS[1:], None)))
     written = 0
-    for bf16, bs, step in itertools.product((0, 1), sizes, merged):
-        v = R.PrefillVariant(
-            d,
-            hq,
-            hkv,
-            win,
-            bs,
-            step["m"],
-            **step["winner"],
-            dtype=torch.bfloat16 if bf16 else torch.float16,
+    for bf16, bs in itertools.product((0, 1), sizes):
+        group = sorted(
+            (
+                r
+                for r in rows
+                if mine(r) and (r[col["dtype"]], r[col["page_size"]]) == (bf16, bs)
+            ),
+            key=lambda r: r[col["min_query_len"]],
         )
-        rows.append(R.prefill_config_fields(v))
-        written += 1
-    write_configs(PREFILL_CONFIGS_H, lines, rows, R.PREFILL_CONFIG_FIELDS)
-    for step in merged:
-        print(f"{tag} M>={step['m']}: {prefill_label(step['winner'])}")
+        starts = {r[col["min_query_len"]] for r in group}
+        bounds = sorted(starts | set(decided) | {e for e in ends.values() if e})
+        out = []
+        for b in bounds:
+            m = max((m for m in decided if m <= b), default=None)
+            if m is not None and (ends[m] is None or b < ends[m]):
+                knobs = decided[m]
+            else:
+                below = [r for r in group if r[col["min_query_len"]] <= b]
+                if not below:
+                    continue
+                knobs = {k: below[-1][col[k]] for k in utils.PREFILL_KNOBS}
+            if not out or out[-1][1] != knobs:
+                out.append((b, knobs))
+        for b, knobs in out:
+            v = R.PrefillVariant(
+                d,
+                hq,
+                hkv,
+                win,
+                bs,
+                b,
+                **knobs,
+                dtype=torch.bfloat16 if bf16 else torch.float16,
+            )
+            kept.append(R.prefill_config_fields(v))
+            written += 1
+    write_configs(PREFILL_CONFIGS_H, lines, kept, R.PREFILL_CONFIG_FIELDS, family)
+    for m, knobs in sorted(decided.items()):
+        print(f"{tag} M>={m}: {prefill_label(knobs)}")
     return written
 
 
@@ -954,29 +1081,62 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
 _CSRC = _HERE.parents[4] / "csrc" / "rocm"
 DECODE_CONFIGS_H = _CSRC / "rdna_singleseq_decode_configs.h"
 PREFILL_CONFIGS_H = _CSRC / "rdna_singleseq_prefill_configs.h"
+
 # One config entry per line.
 _ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
 
+# The GPU family of each arch: its config tables (Arch in
+# csrc/rocm/rdna_singleseq_attn_types.h).
+FAMILIES = {
+    "gfx1150": "Gfx1150",
+    "gfx1151": "Gfx1151",
+    "gfx1152": "Gfx1150",
+    "gfx1153": "Gfx1150",
+}
 
-def read_configs(path: Path) -> tuple[list[str], list[list[int]]]:
-    """The lines of a configs header, and its entries."""
+
+def gpu_family() -> str:
+    """The family of the GPU tune.py measures on."""
+    import torch
+
+    return FAMILIES[torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]]
+
+
+def _table_lines(lines: list[str], family: str) -> range:
+    """The line indices of family's entries in a configs header."""
+    start = 1 + next(
+        i
+        for i, line in enumerate(lines)
+        if re.search(rf"\bk{family}\w*Configs\[\] = \{{$", line)
+    )
+    end = next(i for i in range(start, len(lines)) if lines[i].startswith("};"))
+    return range(start, end)
+
+
+def read_configs(path: Path, family: str) -> tuple[list[str], list[list[int]]]:
+    """The lines of a configs header, and the entries of family's table."""
     import jit
 
     lines = path.read_text().splitlines()
-    rows = [jit.parse_cpp_fields(m[1]) for m in map(_ENTRY.match, lines) if m]
+    at = _table_lines(lines, family)
+    rows = [jit.parse_cpp_fields(m[1]) for i in at if (m := _ENTRY.match(lines[i]))]
     return lines, rows
 
 
 def write_configs(
-    path: Path, lines: list[str], rows: list[list[int]], names: tuple[str, ...]
+    path: Path,
+    lines: list[str],
+    rows: list[list[int]],
+    names: tuple[str, ...],
+    family: str,
 ) -> None:
-    """Replace the entries of a configs header with `rows`, sorted; `names`
-    are their fields."""
+    """Replace the entries of family's table in a configs header with `rows`,
+    sorted; `names` are their fields."""
     import jit
 
-    at = [i for i, line in enumerate(lines) if _ENTRY.match(line)]
+    at = _table_lines(lines, family)
     entries = [f"    {{{jit.cpp_fields(r, names)}}}," for r in sorted(rows)]
-    text = lines[: at[0]] + entries + lines[at[-1] + 1 :]
+    text = lines[: at.start] + entries + lines[at.stop :]
     path.write_text("\n".join(text) + "\n")
 
 
@@ -997,8 +1157,15 @@ def apply(path: str, block_sizes: list[int]) -> None:
         "dtype",
         "page_size",
     ), R.DECODE_CONFIG_FIELDS
-    lines, entries = read_configs(DECODE_CONFIGS_H)
-    rows = {tuple(r[:7]): r for r in entries}
+    # Each family's table, keyed by shape.
+    tables: dict[str, dict[tuple, list[int]]] = {}
+
+    def table(family: str) -> dict[tuple, list[int]]:
+        if family not in tables:
+            _, entries = read_configs(DECODE_CONFIGS_H, family)
+            tables[family] = {tuple(r[:7]): r for r in entries}
+        return tables[family]
+
     source = jit.source_digest()
     written = 0
     for line in Path(path).read_text().splitlines():
@@ -1026,6 +1193,7 @@ def apply(path: str, block_sizes: list[int]) -> None:
         if dec["current"] != (None if now is None else knobs_of(now)):
             print(f"{tag}: refused, the row changed since it was measured")
             continue
+        rows = table(dec.get("family") or gpu_family())
         sizes = sorted({k[6] for k in rows if k[:5] == (d, hq, hkv, win, m)})
         for bf16, bs in itertools.product((0, 1), sizes or block_sizes):
             v = R.KernelVariant(
@@ -1043,7 +1211,11 @@ def apply(path: str, block_sizes: list[int]) -> None:
             rows[tuple(row[:7])] = row
             written += 1
         print(f"{tag}: {label(dec['winner'])}")
-    write_configs(DECODE_CONFIGS_H, lines, list(rows.values()), R.DECODE_CONFIG_FIELDS)
+    for family, rows in tables.items():
+        lines = DECODE_CONFIGS_H.read_text().splitlines()
+        write_configs(
+            DECODE_CONFIGS_H, lines, list(rows.values()), R.DECODE_CONFIG_FIELDS, family
+        )
     print(f"# {written} rows written")
 
 
@@ -1071,6 +1243,14 @@ def main() -> None:
         default=list(PREFIXES),
         help="with --prefill: cached tokens before each step's M",
     )
+    p.add_argument(
+        "--steps",
+        type=int,
+        nargs="+",
+        default=list(STEPS),
+        choices=STEPS,
+        help="with --prefill: the steps of M to choose; --apply keeps the others",
+    )
     p.add_argument("--hq", type=int)
     p.add_argument("--hkv", type=int)
     p.add_argument("--head-dim", type=int)
@@ -1089,7 +1269,23 @@ def main() -> None:
     )
     p.add_argument("--limit", type=int, default=0, help="first N points (smoke)")
     p.add_argument("--candidates", help="JSONL of knob sets instead of the grid")
+    p.add_argument(
+        "--prefill-loss-limit",
+        type=float,
+        default=PREFILL_LOSS_LIMIT,
+        help="with --prefill: most a winner may lose at a cell against the current row",
+    )
+    p.add_argument(
+        "--reselect",
+        metavar="DECISIONS",
+        help="choose stored prefill decisions again from their A/B (to --decisions)",
+    )
     a = p.parse_args()
+    if a.reselect:
+        if not a.decisions:
+            p.error("--reselect needs --decisions")
+        reselect_prefill(a.reselect, a.decisions, a.prefill_loss_limit)
+        return
     if a.apply:
         apply(a.apply, a.block_sizes)
         return

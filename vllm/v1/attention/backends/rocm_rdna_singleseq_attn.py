@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Single-sequence attention for gfx1151 (max_num_seqs=1).
+"""Single-sequence attention for gfx1150..gfx1153 (max_num_seqs=1).
 
 Calls of up to MAX_M query tokens run csrc/rocm/rdna_singleseq_decode_attn.cu, longer
 ones csrc/rocm/rdna_singleseq_prefill_attn.cu, on TRITON_ATTN's KV cache. Anything the
@@ -49,12 +49,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _on_gfx1151() -> bool:
+def _on_gfx115x() -> bool:
     if not current_platform.is_rocm():
         return False
-    from vllm.platforms.rocm import on_gfx1151
+    from vllm.platforms.rocm import on_gfx115x
 
-    return on_gfx1151()
+    return on_gfx115x()
 
 
 # A kernel and its scratch buffers.
@@ -234,7 +234,7 @@ class RocmRdnaSingleSeqAttentionBackend(TritonAttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: "DeviceCapability") -> bool:
-        return _on_gfx1151()
+        return _on_gfx115x()
 
     @classmethod
     def supports_combination(cls, *args, **kwargs) -> str | None:

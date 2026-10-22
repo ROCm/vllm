@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""RDNA3.5 decode and prefill attention: accuracy against a reference, and
+"""RDNA decode and prefill attention: accuracy against a reference, and
 fallback to Triton for unsupported calls."""
 
 import itertools
+from pathlib import Path
 
 import pytest
+import regex as re
 import torch
 
 from vllm.platforms import current_platform
@@ -20,16 +22,16 @@ TOL = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 DTYPES = list(TOL)
 
 
-def _skip_unless_gfx1151():
-    from vllm.platforms.rocm import on_gfx1151
+def _skip_unless_gfx115x():
+    from vllm.platforms.rocm import on_gfx115x
 
-    if not on_gfx1151():
-        pytest.skip("kernel is built for gfx1151")
+    if not on_gfx115x():
+        pytest.skip("kernels are built for gfx1150..gfx1153")
 
 
 def _built(dtype=torch.float16, **want):
     """The first built variant matching `want`, and its module."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     for v in hip.variants():
         if v.dtype == dtype and all(pred(getattr(v, k)) for k, pred in want.items()):
             module = hip.load(v)
@@ -128,7 +130,7 @@ def test_decode_configs_are_well_formed():
 
 
 def test_every_listed_variant_is_built_in():
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     # Raises if a build has no instantiation unit.
     assert torch.ops._rocm_C.rdna_singleseq_decode_configs()
     missing = [v.name for v in hip.variants() if hip.load(v) is None]
@@ -138,7 +140,7 @@ def test_every_listed_variant_is_built_in():
 @pytest.mark.parametrize("unit", sorted({_unit(v) for v in hip.variants()}))
 def test_built_in_variants_match_reference(unit):
     """Every built decode variant matches the reference."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     for v in hip.variants():
         if _unit(v) != unit:
             continue
@@ -333,15 +335,16 @@ def test_non_decode_batches_fall_back_to_triton(nseq, tokens, max_q, reason):
     assert reason in impl._rejected
 
 
-@pytest.mark.parametrize("gfx1151", [True, False])
-def test_singleseq_is_first_on_gfx1151(gfx1151, monkeypatch):
-    """gfx1151 tries the backend first; other GPUs never list it."""
+@pytest.mark.parametrize("arch", ["gfx1150", "gfx1151", "gfx1152", "gfx1201"])
+def test_singleseq_is_first_on_gfx1150_and_gfx1151(arch, monkeypatch):
+    """gfx1150 and gfx1151 try the backend first; other GPUs do not list it."""
     import vllm.platforms.rocm as rocm
     from vllm.v1.attention.backends.registry import AttentionBackendEnum as B
 
-    monkeypatch.setattr(rocm, "on_gfx1151", lambda: gfx1151)
+    monkeypatch.setattr(rocm, "on_gfx1150", lambda: arch == "gfx1150")
+    monkeypatch.setattr(rocm, "on_gfx1151", lambda: arch == "gfx1151")
     order = rocm._get_backend_priorities(use_mla=False, use_sparse=False)
-    if gfx1151:
+    if arch in ("gfx1150", "gfx1151"):
         assert order[0] == B.ROCM_RDNA_SINGLESEQ_ATTN
     else:
         assert B.ROCM_RDNA_SINGLESEQ_ATTN not in order
@@ -482,6 +485,26 @@ def _prefill_rows():
     return [v for rows in hip._prefill_table().values() for v in rows]
 
 
+_CONFIG_ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
+
+
+@pytest.mark.parametrize("kind, shape_fields", [("decode", 7), ("prefill", 6)])
+def test_gfx1150_configs_cover_the_same_shapes(kind, shape_fields):
+    """gfx1150's builds serve the shapes gfx1151's serve."""
+    csrc = Path(__file__).resolve().parents[3] / "csrc" / "rocm"
+    text = (csrc / f"rdna_singleseq_{kind}_configs.h").read_text()
+    shapes = {}
+    for table in text.split("inline constexpr ")[1:]:
+        if name := re.match(r"\w+ k(Gfx\d+)\w*Configs\[\] = \{", table):
+            entries = [
+                m[1].split(", ")
+                for m in map(_CONFIG_ENTRY.match, table.split("\n"))
+                if m
+            ]
+            shapes[name[1]] = {tuple(e[:shape_fields]) for e in entries}
+    assert shapes["Gfx1151"] and shapes["Gfx1151"] == shapes["Gfx1150"]
+
+
 def test_prefill_configs_are_well_formed():
     """No two prefill builds share a shape and step, every decode configuration
     has prefill builds, and the build of the largest step reached runs."""
@@ -514,7 +537,7 @@ def test_prefill_configs_are_well_formed():
 
 
 def test_every_listed_prefill_variant_is_built_in():
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     # Raises if a build has no instantiation unit.
     assert torch.ops._rocm_C.rdna_singleseq_prefill_configs()
     missing = [v for v in _prefill_rows() if hip.load_prefill(v) is None]
@@ -525,7 +548,7 @@ def test_every_listed_prefill_variant_is_built_in():
 def test_built_in_prefill_variants_match_reference(unit):
     """Every built prefill variant matches the reference, with and without a
     prefix."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     for v in _prefill_rows():
         if _prefill_unit(v) != unit:
             continue
@@ -562,7 +585,7 @@ def test_built_in_prefill_variants_match_reference(unit):
 
 def test_prefill_past_the_last_step():
     """M past the last step runs the last row."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = next(
         rows[-1]
         for rows in hip._prefill_table().values()
@@ -589,7 +612,7 @@ def test_prefill_past_the_last_step():
 
 def test_prefill_window_never_reads_freed_pages():
     """Freed pages before the window do not reach the output."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = next(v for v in _prefill_rows() if v.window and v.dtype == torch.float16)
     module = hip.load_prefill(v)
     m, seq_len = v.min_query_len, v.min_query_len + 3 * v.window
@@ -630,7 +653,7 @@ def test_prefill_window_never_reads_freed_pages():
 )
 def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
     """Tokens of a multimodal range see the whole range (Gemma4's shapes)."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     hq, hkv, d, window, dtype = shape
     v = hip.prefill_variant_for(hq, hkv, d, 16, 1, window, dtype, m)
     assert v is not None, shape
@@ -664,7 +687,7 @@ def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
 def test_prefill_refuses_malformed_mm_ranges(bad):
     """Only one sequence's (ranges, 2) on the device reaches the kernel: the
     batch's (sequences, ranges, 2) would unmask other sequences' keys."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = hip.prefill_variant_for(32, 16, 256, 16, 1, 1024, torch.float16, 64)
     module = hip.load_prefill(v)
     scratch = hip.make_prefill_scratch([v], torch.device("cuda"))

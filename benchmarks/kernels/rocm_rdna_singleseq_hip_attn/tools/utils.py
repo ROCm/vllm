@@ -4,20 +4,37 @@
 """Roofline, knobs and --dtype shared by matrix.py and tune.py."""
 
 import argparse
+import os
 
-# Peak DRAM bandwidth, GiB/s.
-PEAK_GIBS = 230.0
+# Sustained peaks of each GPU: DRAM GiB/s, WMMA f16/bf16 TFLOPS, SIMDs. The
+# GPU is the current device's (RDNA_SINGLESEQ_ROOFLINE_ARCH overrides it, e.g.
+# to analyse results elsewhere); any other GPU gets gfx1151's.
+PEAKS = {
+    "gfx1151": (230.0, 43.0, 80),
+    "gfx1150": (81.0, 17.2, 32),
+}
 
-# Per-kernel dispatch overhead under a HIP graph.
+
+def _arch() -> str:
+    arch = os.environ.get("RDNA_SINGLESEQ_ROOFLINE_ARCH")
+    if arch:
+        return arch
+    try:
+        import torch
+
+        return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception:  # noqa: BLE001 - no GPU here
+        return "gfx1151"
+
+
+PEAK_GIBS, PEAK_TFLOPS, SIMDS = PEAKS.get(_arch(), PEAKS["gfx1151"])
+
+# Per-kernel dispatch overhead under a HIP graph, the same on every GPU.
 DISPATCH_US = 1.48
-
-# Sustained WMMA f16/bf16 throughput on gfx1151.
-PEAK_TFLOPS = 43.0
 
 # Prefill model (roofline(realistic=True)): whole 16x16 score tiles, plus
 # SOFTMAX_CYCLES of VALU work per tile that does not overlap the WMMAs.
 WMMA_TILE = 16
-SIMDS = 80
 WMMA_GHZ = PEAK_TFLOPS * 1e12 * 32 / (SIMDS * 2 * WMMA_TILE**3) / 1e9
 VALU_OPS_PER_SCORE = 4.5
 VALU_LANES = 32
