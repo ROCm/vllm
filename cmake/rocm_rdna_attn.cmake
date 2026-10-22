@@ -9,7 +9,7 @@
 #
 function(rdna_attn_target TARGET ARCHES)
   set(_KERNELS decode decode_batch prefill)
-  set(_HEAD_DIMS 32 64 96 128 256 512)
+  set(_HEAD_DIMS 32 64 80 96 128 256 512)
   set(_DTYPES Fp16 Bf16)
   set(_OUT ${CMAKE_CURRENT_BINARY_DIR}/rdna_attn)
   set(_UNITS "")

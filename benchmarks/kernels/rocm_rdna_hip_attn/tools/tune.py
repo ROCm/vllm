@@ -101,7 +101,22 @@ def grid(hq, hkv, d, m, batch=False):
                 continue
             for head_dim_split in sorted({rule, 2 * rule}):
                 lane_dims = (d // head_dim_split) // 16
-                if lane_dims not in (2, 4, 6, 8) or waves % head_dim_split:
+                if (
+                    lane_dims - lane_dims % 2 not in (2, 4, 6, 8)
+                    or waves % head_dim_split
+                ):
+                    continue
+                # As the kernel's asserts: whole chunks per part, an odd lane
+                # slice unsplit, the score exchange inside a wave's K tile.
+                row_tiles = -(-(rows // row_groups) // 16)
+                if (
+                    d // 16 % head_dim_split
+                    or (lane_dims % 2 and head_dim_split != 1)
+                    or (
+                        head_dim_split > 1
+                        and row_tiles * 1024 > 16 * ((d // head_dim_split) * 2 + 16)
+                    )
+                ):
                     continue
                 out.append(
                     {
@@ -714,6 +729,8 @@ def prefill_grid(d):
         if (
             k["waves"] % (split * k["key_waves"])
             or k["key_tile"] // 16 % k["key_waves"]
+            # An odd lane slice (D=48, 80) needs V transposed.
+            or (d // split // 16 % 2 and not k["v_t"])
         ):
             continue
         out.append(k)
