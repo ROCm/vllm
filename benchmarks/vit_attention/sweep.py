@@ -32,9 +32,9 @@ TMP = Path(
 )
 TMP.mkdir(parents=True, exist_ok=True)
 
-# Baseline from triton_prefill_attention.py:get_block_size/get_num_warps on RDNA bf16:
-# BLOCK_M=BLOCK_N=32, num_warps=8, num_stages=1, no waves_per_eu override.
-BASELINE = dict(bm=32, bn=32, nw=8, ns=1, we=None)
+# Baseline from context_attention_fwd on gfx1151, head_dim=72, bf16:
+# BLOCK_M=128, BLOCK_N=16, num_warps=4, num_stages=1, no waves_per_eu override.
+BASELINE = dict(bm=128, bn=16, nw=4, ns=1, we=None)
 
 
 def _gpu_lock_cmd(cmd: list[str]) -> list[str]:
