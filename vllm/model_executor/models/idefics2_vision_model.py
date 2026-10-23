@@ -38,6 +38,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
 
 from .utils import AutoWeightsLoader, WeightsMapper
@@ -478,7 +479,16 @@ class Idefics2VisionTransformer(nn.Module):
         # - if apply_encoder_attention_mask is False, skip (not all models
         #   sharing this encoder apply masking in attention, e.g. Aria, Phi4)
         # - if patch_attention_mask was None, skip attention masking
-        if not self.apply_encoder_attention_mask or flat_patch_mask is None:
+        # - if no patch is padded, skip it too: a mask forces MMEncoderAttention
+        #   off its fused backend onto SDPA with a padded additive mask, which
+        #   costs several ms per request on small MiniCPM-V encoders. The
+        #   ``any`` is a device sync, so it is only done in eager mode; CUDA
+        #   graph capture always builds the mask (capture inputs are padded).
+        if (
+            not self.apply_encoder_attention_mask
+            or flat_patch_mask is None
+            or self._has_no_padding(flat_patch_mask)
+        ):
             attention_mask = None
         else:
             # Additive mask: masked positions receive a large negative value.
@@ -493,6 +503,13 @@ class Idefics2VisionTransformer(nn.Module):
             encoder_outputs = self.encoder(hidden_states, attention_mask=attention_mask)
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
+
+    @staticmethod
+    def _has_no_padding(flat_patch_mask: torch.Tensor) -> bool:
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        with gpu_sync_allowed():
+            return bool(flat_patch_mask.all())
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
