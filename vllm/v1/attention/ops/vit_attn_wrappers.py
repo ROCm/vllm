@@ -11,9 +11,13 @@ latencies by ~7% (see qwen2_5_vl for example usage)
 To use these ops, you must have a recent version of PyTorch installed (>= 2.4.0)
 """
 
+import contextlib
+import contextvars
+import weakref
 from typing import Any
 
 import einops
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -280,6 +284,98 @@ def vit_triton_attn_wrapper(
     )
 
 
+# Per cu_seqlens tensor that MMEncoderAttention.maybe_recompute_cu_seqlens
+# made from host lengths: (a reference to it, the segment lengths). Others
+# are read back from the device.
+_RDNA_SEG_LENS: dict[int, tuple[weakref.ref[torch.Tensor], list[int]]] = {}
+
+
+def remember_rdna_cu_seqlens(cu_seqlens: torch.Tensor, host: np.ndarray) -> None:
+    """Note the host lengths of cu_seqlens, which nothing changes in place."""
+    if len(_RDNA_SEG_LENS) >= 8:
+        _RDNA_SEG_LENS.clear()
+    _RDNA_SEG_LENS[id(cu_seqlens)] = (
+        weakref.ref(cu_seqlens),
+        np.diff(host).tolist(),
+    )
+
+
+def _rdna_segment_lengths(cu_seqlens: torch.Tensor) -> list[int]:
+    hit = _RDNA_SEG_LENS.get(id(cu_seqlens))
+    if hit and hit[0]() is cu_seqlens:
+        return hit[1]
+    # The plan follows the host, as Triton's segment lengths do.
+    with gpu_sync_allowed():
+        bounds = cu_seqlens.tolist()
+    return [b - a for a, b in zip(bounds, bounds[1:])]
+
+
+def rdna_attn_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """ROCM_RDNA_ATTN's kernels (gfx1151), else triton_attn_wrapper."""
+    from vllm.logger import init_logger
+    from vllm.v1.attention.ops import rocm_rdna_encoder
+
+    q_len = q.size(1)
+    seg_lens = (
+        [q_len] * batch_size
+        if cu_seqlens is None
+        else _rdna_segment_lengths(cu_seqlens)
+    )
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    qf, kf, vf = (einops.rearrange(x, "b s ... -> (b s) ...") for x in (q, k, v))
+    why = rocm_rdna_encoder.unsupported(qf, kf.shape[1], seg_lens)
+    if why is not None:
+        init_logger(__name__).info_once(
+            "ROCM_RDNA_ATTN mm-encoder call on TRITON_ATTN: %s", why
+        )
+        return triton_attn_wrapper(q, k, v, batch_size, scale, cu_seqlens, max_seqlen)
+    with create_attention_profiler_scope(
+        backend_name="ROCM_RDNA_ATTN",
+        batch_size=batch_size,
+        max_query_len=max(seg_lens, default=0),
+        max_seq_len=max(seg_lens, default=0),
+        num_heads=qf.shape[1],
+        head_size=qf.shape[2],
+        num_kv_heads=kf.shape[1],
+        dtype=q.dtype,
+        is_causal=False,
+        v_token_stride=vf.stride(0),
+        block_diagonal_segments=seg_lens if len(seg_lens) > 1 else None,
+    ):
+        output = rocm_rdna_encoder.forward(qf, kf, vf, seg_lens, scale)
+    return einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+
+
+direct_register_custom_op(
+    op_name="rdna_attn_wrapper",
+    op_func=rdna_attn_wrapper,
+    fake_impl=triton_attn_wrapper_fake,
+)
+
+
+def vit_rdna_attn_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.rdna_attn_wrapper(
+        q, k, v, batch_size, scale, cu_seqlens, max_seqlen
+    )
+
+
 def apply_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -489,3 +585,65 @@ def vit_flashinfer_wrapper(
         v_scale,
         o_data_type,
     )
+
+
+# ROCM_RDNA_ATTN for the Hugging Face towers a model runs as they are (Gemma
+# 4): a transformers attention function, given the call's segments by
+# rdna_hf_segments around the tower; SDPA without them.
+RDNA_HF_ATTENTION = "vllm_rocm_rdna"
+_RDNA_HF_SEGMENTS: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "rdna_hf_segments", default=None
+)
+
+
+@contextlib.contextmanager
+def rdna_hf_segments(seg_lens: list[int] | None):
+    """Segments of the (batch * tokens) rows of the attention calls within."""
+    token = _RDNA_HF_SEGMENTS.set(seg_lens)
+    try:
+        yield
+    finally:
+        _RDNA_HF_SEGMENTS.reset(token)
+
+
+def rdna_hf_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """An attention function of transformers: (batch, heads, tokens, D) in,
+    (batch, tokens, heads, D) out."""
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    from vllm.v1.attention.ops import rocm_rdna_encoder
+
+    seg_lens = _RDNA_HF_SEGMENTS.get()
+    b, h, s, d = query.shape
+    if seg_lens is not None and sum(seg_lens) == b * s and not dropout:
+        q, k, v = (
+            x.transpose(1, 2).reshape(b * s, x.shape[1], d) for x in (query, key, value)
+        )
+        if rocm_rdna_encoder.unsupported(q, k.shape[1], seg_lens) is None:
+            out = rocm_rdna_encoder.forward(
+                q, k, v, seg_lens, d**-0.5 if scaling is None else scaling
+            )
+            return out.view(b, s, h, d), None
+    return sdpa_attention_forward(
+        module, query, key, value, attention_mask,
+        dropout=dropout, scaling=scaling, **kwargs,
+    )  # fmt: skip
+
+
+def register_rdna_hf_attention() -> str:
+    """Register rdna_hf_attention (masks as SDPA's) with transformers."""
+    from transformers import AttentionInterface, AttentionMaskInterface
+    from transformers.masking_utils import sdpa_mask
+
+    AttentionInterface.register(RDNA_HF_ATTENTION, rdna_hf_attention)
+    AttentionMaskInterface.register(RDNA_HF_ATTENTION, sdpa_mask)
+    return RDNA_HF_ATTENTION

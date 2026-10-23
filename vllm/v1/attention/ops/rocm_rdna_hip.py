@@ -202,7 +202,9 @@ class _Builtin:
         self.index = index
         self.batched = bool(batched)
 
-    def decode_attn(self, q, kv_cache, block_table, out, *scratch_and_args):
+    def decode_attn(
+        self, q, kv_cache, block_table, out, *scratch_and_args, mm_ranges=None
+    ):
         torch.ops._rocm_C.rdna_decode_attn(
             self.index,
             q,
@@ -211,6 +213,7 @@ class _Builtin:
             out,
             *scratch_and_args,
             batched=self.batched,
+            mm_ranges=mm_ranges,
         )
 
 
@@ -265,7 +268,7 @@ def expected_kv_cache_strides(variant: KernelVariant) -> tuple[int, int, int]:
 MAX_M = 8
 
 # Head dims the decode kernel supports.
-SUPPORTED_HEAD_SIZES = (64, 96, 128, 256, 512)
+SUPPORTED_HEAD_SIZES = (32, 48, 64, 72, 80, 96, 128, 256, 512)
 
 
 # ---------------------------------------------------------------- prefill
@@ -301,6 +304,8 @@ PREFILL_CONFIG_FIELDS = (
     "key_waves",
     "max_segments",
     "head_group",
+    "causal",
+    "row_tiles",
 )
 
 
@@ -323,6 +328,10 @@ class PrefillVariant:
     max_segments: int
     head_group: int
     dtype: torch.dtype = torch.float16
+    # 0: every query token sees every key of its sequence; a build of its own.
+    causal: int = 1
+    # 16-row tiles per wave, 1 or (non-causal) 2.
+    row_tiles: int = 1
 
     @property
     def name(self) -> str:
@@ -332,7 +341,9 @@ class PrefillVariant:
     @property
     def block_rows(self) -> int:
         """Query rows per workgroup."""
-        return self.waves // (self.head_dim_split * self.key_waves) * 16
+        return (
+            self.waves // (self.head_dim_split * self.key_waves) * 16 * self.row_tiles
+        )
 
     def scratch_rows(self, device: torch.device) -> int:
         """Most split-KV partial rows a launch may write."""
@@ -358,7 +369,7 @@ def _prefill_builds() -> list[PrefillVariant]:
 
 @functools.cache
 def _prefill_table() -> dict[tuple, list[PrefillVariant]]:
-    """The builds by M per (Hq, Hkv, D, page, window, dtype)."""
+    """The builds by M per (Hq, Hkv, D, page, window, dtype, causal)."""
     table: dict[tuple, list[PrefillVariant]] = {}
     for v in _prefill_builds():
         key = (
@@ -368,6 +379,7 @@ def _prefill_table() -> dict[tuple, list[PrefillVariant]]:
             v.page_size,
             v.window,
             v.dtype,
+            v.causal,
         )
         table.setdefault(key, []).append(v)
     for by_m in table.values():
@@ -382,10 +394,12 @@ def prefill_variants(
     page_size: int,
     window: int,
     dtype: torch.dtype,
+    causal: bool = True,
 ) -> list[PrefillVariant]:
     """Every row of one shape, sorted by M."""
     return _prefill_table().get(
-        (num_q_heads, num_kv_heads, head_size, page_size, window, dtype), []
+        (num_q_heads, num_kv_heads, head_size, page_size, window, dtype, int(causal)),
+        [],
     )
 
 
@@ -398,12 +412,13 @@ def prefill_variant_for(
     window: int,
     dtype: torch.dtype,
     num_tokens: int,
+    causal: bool = True,
 ) -> PrefillVariant | None:
     """The row for num_tokens query tokens, or None."""
     if layout != _HND or num_tokens < PREFILL_MIN_M:
         return None
     rows = prefill_variants(
-        num_q_heads, num_kv_heads, head_size, page_size, window, dtype
+        num_q_heads, num_kv_heads, head_size, page_size, window, dtype, causal
     )
     served = [v for v in rows if v.min_query_len <= num_tokens]
     return served[-1] if served else (rows[0] if rows else None)
@@ -425,6 +440,7 @@ PREFILL_BATCH_CONFIG_FIELDS = (
     "min_keys",
     "min_query_len",
     "head_group",
+    "causal",
 )
 # The cells' lower bounds.
 PREFILL_BATCH_MEAN_M = (1, 16, 64, 256, 1024, 4096)
@@ -432,7 +448,10 @@ PREFILL_BATCH_KEYS = (0, 512, 2048, 8192)
 
 
 def prefill_batch_features(
-    query_start_loc: np.ndarray, seq_lens: np.ndarray, window: int
+    query_start_loc: np.ndarray,
+    seq_lens: np.ndarray,
+    window: int,
+    causal: bool = True,
 ) -> tuple[float, float]:
     """(mean query tokens, mean keys per token) of a batch, padding left out."""
     q_lens = np.diff(query_start_loc.astype(np.int64))
@@ -442,7 +461,7 @@ def prefill_batch_features(
     tokens = int(q_lens.sum())
     if not tokens:
         return 0.0, 0.0
-    keys = seq_lens - q_lens + (q_lens + 1) / 2
+    keys = seq_lens - q_lens + (q_lens + 1) / 2 if causal else seq_lens
     if window:
         keys = np.minimum(keys, window)
     return tokens / q_lens.shape[0], float((q_lens * keys).sum() / tokens)
@@ -450,7 +469,7 @@ def prefill_batch_features(
 
 @functools.cache
 def _prefill_batch_table() -> dict[tuple, list[tuple[int, int, int, int]]]:
-    """Per (Hq, Hkv, D, page, window), its cells (min mean M, min keys,
+    """Per (Hq, Hkv, D, page, window, causal), its cells (min mean M, min keys,
     min_query_len, head group)."""
     table: dict[tuple, list[tuple[int, int, int, int]]] = {}
     for f in _built_fields("rdna_prefill_batch_configs", PREFILL_BATCH_CONFIG_FIELDS):
@@ -460,6 +479,7 @@ def _prefill_batch_table() -> dict[tuple, list[tuple[int, int, int, int]]]:
             f["head_size"],
             f["page_size"],
             f["window"],
+            f["causal"],
         )
         table.setdefault(key, []).append(
             (f["min_mean_m"], f["min_keys"], f["min_query_len"], f["head_group"])
@@ -475,10 +495,11 @@ def prefill_batch_cell(
     window: int,
     mean_m: float,
     keys: float,
+    causal: bool = True,
 ) -> tuple[int, int] | None:
     """(min_query_len, head group) of the cell a batch falls in, or None."""
     cells = _prefill_batch_table().get(
-        (num_q_heads, num_kv_heads, head_size, page_size, window)
+        (num_q_heads, num_kv_heads, head_size, page_size, window, int(causal))
     )
     if not cells:
         return None
@@ -500,15 +521,16 @@ def prefill_batch_variant_for(
     dtype: torch.dtype,
     query_start_loc: np.ndarray,
     seq_lens: np.ndarray,
+    causal: bool = True,
 ) -> tuple[PrefillVariant | None, int]:
     """The build and head group for a prefill batch: its cell's, else the
     build of its tokens."""
-    mean_m, keys = prefill_batch_features(query_start_loc, seq_lens, window)
+    mean_m, keys = prefill_batch_features(query_start_loc, seq_lens, window, causal)
     cell = prefill_batch_cell(
-        num_q_heads, num_kv_heads, head_size, page_size, window, mean_m, keys
+        num_q_heads, num_kv_heads, head_size, page_size, window, mean_m, keys, causal
     )
     rows = prefill_variants(
-        num_q_heads, num_kv_heads, head_size, page_size, window, dtype
+        num_q_heads, num_kv_heads, head_size, page_size, window, dtype, causal
     )
     if cell is not None and layout == _HND:
         row = next((v for v in rows if v.min_query_len == cell[0]), None)
@@ -524,6 +546,7 @@ def prefill_batch_variant_for(
         window,
         dtype,
         max(tokens, PREFILL_MIN_M),
+        causal,
     )
     return v, 0
 
@@ -551,7 +574,7 @@ def plan_prefill(
         query_start_loc: The batch's query starts.
         seq_lens: Each sequence's length, or an upper bound.
         variant: The build that runs the launch.
-        window: Sliding window in keys, 0 for full causal.
+        window: Sliding window in keys, 0 for full causal (or non-causal).
         target_workgroups: One per SIMD (prefill_target_workgroups).
         head_group: Kv heads to interleave (0: the build's).
 
@@ -573,7 +596,8 @@ def plan_prefill(
     tile = np.repeat(starts + tiles - 1, tiles) - np.arange(seq.shape[0])
     first = tile * rows // g
     last = np.minimum(q_lens[seq] - 1, ((tile + 1) * rows - 1) // g)
-    key_end = context[seq] + last + 1
+    # Non-causal: every token sees its whole sequence.
+    key_end = context[seq] + last + 1 if variant.causal else context[seq] + q_lens[seq]
     key_begin = (
         np.maximum(0, context[seq] + first - window + 1) // key_tile * key_tile
         if window
@@ -644,6 +668,29 @@ class _BuiltinPrefill:
             q,
             kv_cache,
             block_table,
+            out,
+            *scratch_and_args,
+            plan=plan,
+            query_start_loc=query_start_loc,
+            head_group=head_group,
+        )
+
+    def encoder_attn(
+        self,
+        q,
+        k,
+        v,
+        out,
+        *scratch_and_args,
+        plan=None,
+        query_start_loc=None,
+        head_group=0,
+    ):
+        torch.ops._rocm_C.rdna_encoder_attn(
+            self.index,
+            q,
+            k,
+            v,
             out,
             *scratch_and_args,
             plan=plan,

@@ -94,6 +94,9 @@ class _LaunchArgs(ctypes.Structure):
         ("acc_stride", ctypes.c_int),
         ("ml_stride", ctypes.c_int),
         ("cnt_stride", ctypes.c_int),
+        ("mm_ranges", ctypes.c_void_p),
+        ("mm_capacity", ctypes.c_int),
+        ("mm_stride", ctypes.c_int),
     ]
 
 
@@ -120,6 +123,10 @@ class _PrefillArgs(ctypes.Structure):
         ("num_entries", ctypes.c_int),
         ("bt_stride", ctypes.c_int),
         ("head_group", ctypes.c_int),
+        ("v", ctypes.c_void_p),
+        ("q_stride", ctypes.c_int),
+        ("k_stride", ctypes.c_int),
+        ("v_stride", ctypes.c_int),
     ]
 
 
@@ -236,7 +243,18 @@ class Jit:
         self._launch.restype = None
 
     def decode_attn(
-        self, q, kv_cache, block_table, out, acc, m, ls, cnt, seq_lens, scale
+        self,
+        q,
+        kv_cache,
+        block_table,
+        out,
+        acc,
+        m,
+        ls,
+        cnt,
+        seq_lens,
+        scale,
+        mm_ranges=None,
     ):
         v = self.variant
         if not (q.is_contiguous() and out.is_contiguous()):
@@ -264,6 +282,9 @@ class Jit:
             acc.stride(0) if v.batched else 0,
             m.stride(0) if v.batched else 0,
             cnt.stride(0) if v.batched else 0,
+            mm_ranges.data_ptr() if mm_ranges is not None else None,
+            mm_ranges.size(-1) // 2 if mm_ranges is not None else 0,
+            mm_ranges.size(1) if mm_ranges is not None and mm_ranges.dim() == 2 else 0,
         )
         self._launch(ctypes.byref(args))
 
@@ -334,6 +355,55 @@ class JitPrefill:
             plan.size(0) if plan is not None else 0,
             block_table.stride(0) if block_table.dim() == 2 else 0,
             head_group,
+        )
+        self._launch(ctypes.byref(args))
+
+    def encoder_attn(
+        self,
+        q,
+        k,
+        v,
+        out,
+        partial_o,
+        partial_ml,
+        counters,
+        seq_lens,
+        max_seq_len,
+        scale,
+        plan=None,
+        query_start_loc=None,
+        head_group=0,
+    ):
+        var = self.variant
+        if var.causal:
+            raise RuntimeError("a causal build runs through prefill_attn")
+        for x in (q, k, v):
+            if x.stride(2) != 1 or x.stride(1) != var.head_size:
+                raise RuntimeError("each token's heads must be contiguous")
+        if not (out.is_contiguous() and q.dtype == k.dtype == v.dtype == var.dtype):
+            raise RuntimeError("out must be contiguous, all of the build's dtype")
+        if (plan is None) != (query_start_loc is None):
+            raise RuntimeError("a batch takes both a plan and query_start_loc")
+        args = _PrefillArgs(
+            q=q.data_ptr(),
+            kv=k.data_ptr(),
+            out=out.data_ptr(),
+            seq_lens=seq_lens.data_ptr(),
+            partial_o=partial_o.data_ptr(),
+            partial_ml=partial_ml.data_ptr(),
+            counters=counters.data_ptr(),
+            num_tokens=q.size(0),
+            max_seq_len=max_seq_len,
+            scale=scale,
+            stream=torch.cuda.current_stream(q.device).cuda_stream,
+            plan=plan.data_ptr() if plan is not None else None,
+            query_start=query_start_loc.data_ptr() if plan is not None else None,
+            num_entries=plan.size(0) if plan is not None else 0,
+            head_group=head_group,
+            v=v.data_ptr(),
+            q_stride=q.stride(0),
+            k_stride=k.stride(0),
+            v_stride=v.stride(0),
         )
         self._launch(ctypes.byref(args))
 

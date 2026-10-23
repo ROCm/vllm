@@ -74,7 +74,7 @@ def _paged_inputs(seq_len, v, seed=0):
     return q * 0.5, kv, torch.arange(num_blocks, device=dev, dtype=torch.int32)
 
 
-def _reference(q, kv, seq_len, window=0):
+def _reference(q, kv, seq_len, window=0, mm_ranges=()):
     m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
     flat = kv.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len]
     k, v = flat[..., :hd], flat[..., hd:]
@@ -86,6 +86,8 @@ def _reference(q, kv, seq_len, window=0):
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
     lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
     masked = pos > lim
+    for start, end in mm_ranges:
+        masked &= ~((lim >= start) & (lim <= end) & (pos >= start) & (pos <= end))
     if window:
         masked |= pos < lim - (window - 1)
     scores = scores.masked_fill(masked.view(1, m, seq_len), float("-inf"))
@@ -193,8 +195,21 @@ def test_built_in_variants_match_reference(unit):
         s = max(1024, v.window + 64, v.page_size + 1000)
         if v.batched:
             _check_batch(v, module, [s, 48, 0])
-        else:
-            _check_one(v, module, [48, s, s + 1000])
+            continue
+        _check_one(v, module, [48, s, s + 1000])
+        # An image ending among the query tokens: rows on each side differ.
+        m = v.max_query_len
+        ranges = [(s - m - 40, s - m + m // 2)]
+        q, kv, block_table = _paged_inputs(s, v)
+        got = _decode_mm(
+            module, v, q, kv, block_table, s, _decode_mm_buf(ranges, q.device)
+        )
+        ref = _reference(q, kv, s, v.window, ranges)
+        assert _max_rel(got, ref) <= TOL[v.dtype], f"{v.name}, image"
+        # At M=1 the image ends at the only query token, so nothing changes.
+        if m > 1:
+            causal = _reference(q, kv, s, v.window)
+            assert _max_rel(causal, ref) > 10 * TOL[v.dtype], f"{v.name}, image"
 
 
 @pytest.mark.parametrize(
@@ -295,7 +310,7 @@ def test_unsupported_head_size_falls_back_to_triton():
 
     impl = _impl()
     impl._rejected = None
-    impl.head_size, impl.num_heads, impl.num_kv_heads = 80, HQ, HKV
+    impl.head_size, impl.num_heads, impl.num_kv_heads = 160, HQ, HKV
 
     fits = impl._prepare(
         kv_cache=torch.empty(0, dtype=torch.float16),
@@ -311,7 +326,7 @@ def test_unsupported_head_size_falls_back_to_triton():
         max_seqlen_q=0,
     )
     assert not fits
-    assert "head_size 80" in impl._rejected
+    assert "head_size 160" in impl._rejected
 
 
 def test_strided_query_falls_back_to_triton():
@@ -415,16 +430,18 @@ def test_rdna_valid_for_any_batch():
 # ---------------------------------------------------------------- prefill
 
 
-def _prefill_reference(q, kv, block_table, seq_len, window=0, mm_ranges=()):
+def _prefill_reference(
+    q, kv, block_table, seq_len, window=0, mm_ranges=(), causal=True
+):
     """Float reference of a prefill; a token in a multimodal range [start, end]
-    also sees the range's later keys."""
+    also sees the range's later keys. Non-causal: every key."""
     m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
     pages = kv[block_table.long()]
     flat = pages.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len].float()
     gqa = hq // hkv
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
     lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
-    masked = pos > lim
+    masked = pos > lim if causal else torch.zeros_like(pos > lim)
     for start, end in mm_ranges:
         q_in = (lim >= start) & (lim <= end)
         k_in = (pos >= start) & (pos <= end)
@@ -512,13 +529,19 @@ def _prefill_inputs(v, m, seq_len, seed=0):
 
 def _prefill_unit(v):
     dt = "bf16" if v.dtype == torch.bfloat16 else "fp16"
+    mode = "" if v.causal else "_noncausal"
     return (
         f"prefill_q{v.num_q_heads}_kv{v.num_kv_heads}_d{v.head_size}_w{v.window}_{dt}"
+        f"{mode}"
     )
 
 
 def _prefill_rows():
     return [v for rows in hip._prefill_table().values() for v in rows]
+
+
+def _causal_prefill_rows():
+    return [v for v in _prefill_rows() if v.causal]
 
 
 def test_prefill_configs_are_well_formed():
@@ -528,7 +551,7 @@ def test_prefill_configs_are_well_formed():
         pytest.skip("_rocm_C carries no RDNA3.5 variants")
     keys = {
         (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
-        + (v.dtype, v.min_query_len)
+        + (v.dtype, v.min_query_len, v.causal)
         for v in _prefill_rows()
     }
     assert len(keys) == len(_prefill_rows()), "two builds share a step"
@@ -560,7 +583,9 @@ def test_every_listed_prefill_variant_is_built_in():
     assert not missing, f"{len(missing)} prefill variants not in _rocm_C"
 
 
-@pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _prefill_rows()}))
+@pytest.mark.parametrize(
+    "unit", sorted({_prefill_unit(v) for v in _causal_prefill_rows()})
+)
 def test_built_in_prefill_variants_match_reference(unit):
     """Every built prefill variant matches the reference, with and without a
     prefix."""
@@ -605,7 +630,9 @@ def test_prefill_past_the_last_step():
     v = next(
         rows[-1]
         for rows in hip._prefill_table().values()
-        if rows[-1].dtype == torch.float16 and rows[-1].head_size == 128
+        if rows[-1].dtype == torch.float16
+        and rows[-1].head_size == 128
+        and rows[-1].causal
     )
     module = hip.load_prefill(v)
     args = (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
@@ -648,6 +675,210 @@ def test_prefill_window_never_reads_freed_pages():
     torch.accelerator.synchronize()
     assert torch.isfinite(out).all()
     _assert_prefill_close(out, q, *clean, seq_len, v.window, "freed pages")
+
+
+# ---------------------------------------------------------------- non-causal
+
+
+def _non_causal_rows():
+    return [v for v in _prefill_rows() if not v.causal]
+
+
+def _non_causal_inputs(v, lens, seed=0):
+    """Q, K and V of sequences of `lens` tokens, one after the other, as views
+    of one (tokens, 3, H, D) projection (a token stride of 3 H D)."""
+    torch.manual_seed(seed)
+    n = sum(lens)
+    qkv = torch.randn(n, 3, v.num_q_heads, v.head_size, device="cuda") * 0.5
+    qkv = qkv.to(v.dtype)
+    q, k, val = qkv[:, 0], qkv[:, 1, : v.num_kv_heads], qkv[:, 2, : v.num_kv_heads]
+    return q, k, val, np.cumsum([0] + list(lens))
+
+
+def _assert_non_causal_close(got, q, k, v, what):
+    """Within twice the error of TRITON_ATTN's mm-encoder kernel against the
+    float reference, for one sequence."""
+    from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+
+    m, hq, hd = q.shape
+    g = hq // k.shape[1]
+    # A few heads at a time: all 64 heads of a long sequence take 16 GiB.
+    step = max(1, (1 << 28) // (m * m))
+    ref = torch.cat(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                *(
+                    x[:, h : h + step].float().transpose(0, 1)
+                    for x in (q, k.repeat_interleave(g, 1), v.repeat_interleave(g, 1))
+                ),
+                scale=hd**-0.5,
+            ).transpose(0, 1)
+            for h in range(0, hq, step)
+        ],
+        dim=1,
+    )
+    triton = torch.empty_like(q)
+    lens = torch.tensor([m], device=q.device, dtype=torch.int32)
+    context_attention_fwd(
+        q.contiguous(), k.contiguous(), v.contiguous(), triton,
+        b_start_loc=torch.zeros_like(lens), b_seq_len=lens, max_input_len=m,
+        is_causal=False, softmax_scale=hd**-0.5,
+    )  # fmt: skip
+    err = (got.float().nan_to_num(1e9) - ref).abs().max().item()
+    bound = 2 * (triton.float() - ref).abs().max().item() + 1e-4
+    assert err <= bound, f"{what}: max error {err:.2e}, Triton's x2 {bound:.2e}"
+
+
+@pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _non_causal_rows()}))
+def test_built_in_non_causal_prefill_variants_match_reference(unit):
+    """Every non-causal build: each token sees every key of its sequence,
+    read in place, also past the last whole step."""
+    _skip_unless_gfx1151()
+    for v in _non_causal_rows():
+        if _prefill_unit(v) != unit:
+            continue
+        module = hip.load_prefill(v)
+        assert module is not None, v
+        args = (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
+        rows = hip.prefill_variants(*args, v.dtype, causal=False)
+        scratch = hip.make_prefill_scratch(rows, torch.device("cuda"))
+        lens = [v.min_query_len, v.min_query_len + 37]
+        if v == rows[0]:
+            lens += [hip.PREFILL_MIN_M, 100]
+        for seed, m in enumerate(lens):
+            q, k, val, _ = _non_causal_inputs(v, [m], seed)
+            out = torch.full(q.shape, float("nan"), dtype=q.dtype, device=q.device)
+            seq_lens = torch.tensor([m], device=q.device, dtype=torch.int32)
+            module.encoder_attn(
+                q, k, val, out, *scratch, seq_lens, m, v.head_size**-0.5
+            )
+            torch.accelerator.synchronize()
+            _assert_non_causal_close(out, q, k, val, f"{v}, L={m}")
+
+
+_NON_CAUSAL_BATCHES = {
+    "5 x 577": [577] * 5,
+    "mixed": [1024, 257, 9, 100, 64],
+    "windows": [64] * 20 + [16, 36, 48],
+}
+
+
+@pytest.mark.parametrize("batch", _NON_CAUSAL_BATCHES)
+@pytest.mark.parametrize(
+    "shape",
+    sorted(
+        {
+            (v.num_q_heads, v.num_kv_heads, v.head_size, v.dtype)
+            for v in _non_causal_rows()
+        },
+        key=str,
+    ),
+    ids=str,
+)
+def test_non_causal_prefill_batch_matches_reference(shape, batch):
+    """An encoder's segments in one planned launch, each against its
+    reference."""
+    _skip_unless_gfx1151()
+    hq, hkv, d, dtype = shape
+    lens = _NON_CAUSAL_BATCHES[batch]
+    dev = torch.device("cuda")
+    seq_lens = np.array(lens)
+    v = hip.prefill_variants(hq, hkv, d, 16, 0, dtype, causal=False)[0]
+    q, k, val, starts = _non_causal_inputs(v, lens)
+    v, head_group = hip.prefill_batch_variant_for(
+        hq, hkv, d, 16, 1, 0, dtype, starts, seq_lens, causal=False
+    )
+    plan, head_group = hip.plan_prefill(
+        starts, seq_lens, v, 0, hip.prefill_target_workgroups(dev), head_group
+    )
+    scratch = hip.make_prefill_scratch(
+        hip.prefill_variants(hq, hkv, d, 16, 0, dtype, causal=False), dev
+    )
+    out = torch.full(q.shape, float("nan"), dtype=dtype, device=dev)
+    hip.load_prefill(v).encoder_attn(
+        q, k, val, out, *scratch,
+        torch.tensor(lens, device=dev, dtype=torch.int32), max(lens), d**-0.5,
+        plan=torch.from_numpy(plan).to(dev),
+        query_start_loc=torch.from_numpy(starts.astype(np.int32)).to(dev),
+        head_group=head_group,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    for i, n in enumerate(lens):
+        rows = slice(int(starts[i]), int(starts[i + 1]))
+        _assert_non_causal_close(
+            out[rows], q[rows], k[rows], val[rows], f"{batch}: sequence {i} (L={n})"
+        )
+
+
+def test_non_causal_rows_are_full_attention():
+    """Non-causal builds have no window and run only through encoder_attn;
+    causal builds only through prefill_attn."""
+    rows = _non_causal_rows()
+    if not rows:
+        pytest.skip("_rocm_C carries no non-causal RDNA3.5 variants")
+    assert all(v.window == 0 for v in rows)
+    _skip_unless_gfx1151()
+    dev = torch.device("cuda")
+    causal_sizes = {c.head_size for c in _causal_prefill_rows()}
+    v = next(v for v in rows if v.head_size in causal_sizes)
+    scratch = hip.make_prefill_scratch([v], dev)
+    q, k, val, _ = _non_causal_inputs(v, [64])
+    seq_lens = torch.tensor([64], device=dev, dtype=torch.int32)
+    kv = torch.zeros(4, v.num_kv_heads, 16, 2 * v.head_size, dtype=v.dtype, device=dev)
+    table = torch.arange(4, dtype=torch.int32, device=dev)
+    out = torch.empty(q.shape, dtype=q.dtype, device=dev)
+    with pytest.raises(RuntimeError, match="rdna_encoder_attn"):
+        hip.load_prefill(v).prefill_attn(
+            q.contiguous(), kv, table, out, *scratch, seq_lens, 64, 0.1
+        )
+    causal = next(c for c in _causal_prefill_rows() if c.head_size == v.head_size)
+    with pytest.raises(RuntimeError, match="rdna_prefill_attn"):
+        hip.load_prefill(causal).encoder_attn(
+            q, k, val, out, *scratch, seq_lens, 64, 0.1
+        )
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [[4, 8, 1, 3], [577, 5, 1024, 8, 9, 64, 8], [9] * 7, [4096], [5]],
+    ids=["short", "mixed", "first step", "one", "one short"],
+)
+def test_encoder_forward_matches_reference(segments):
+    """rocm_rdna_encoder: every segment, however short, in one non-causal
+    launch."""
+    _skip_unless_gfx1151()
+    from vllm.v1.attention.ops import rocm_rdna_encoder
+
+    shapes = sorted(
+        {
+            (v.num_q_heads, v.num_kv_heads, v.head_size, v.dtype)
+            for v in _non_causal_rows()
+        },
+        key=str,
+    )
+    if not shapes:
+        pytest.skip("_rocm_C carries no non-causal RDNA3.5 variants")
+    torch.manual_seed(0)
+    for hq, hkv, d, dtype in shapes:
+        n = sum(segments)
+        q, k, v = (
+            (torch.randn(n, h, d, device="cuda") * 0.5).to(dtype)
+            for h in (hq, hkv, hkv)
+        )
+        assert rocm_rdna_encoder.unsupported(q, hkv, segments) is None
+        out = rocm_rdna_encoder.forward(q, k, v, segments, d**-0.5)
+        start = 0
+        for i, s in enumerate(segments):
+            rows = slice(start, start + s)
+            ref = torch.nn.functional.scaled_dot_product_attention(
+                *(x[rows].float().transpose(0, 1) for x in (q, k, v)),
+                scale=d**-0.5,
+                enable_gqa=hq != hkv,
+            ).transpose(0, 1)
+            err = (out[rows].float() - ref).abs().max().item()
+            tol = 2e-2 if dtype == torch.bfloat16 else 4e-3
+            assert err <= tol, f"{hq}/{hkv}/{d} {dtype}: segment {i} (L={s}) {err:.2e}"
+            start += s
 
 
 # ---------------------------------------------------------------- prefill batches
@@ -827,7 +1058,8 @@ def test_prefill_batch_mm_prefix_matches_reference(shape):
 
 
 @pytest.mark.parametrize(
-    "unit", sorted({_prefill_unit(v) for v in _prefill_rows() if v.page_size == 16})
+    "unit",
+    sorted({_prefill_unit(v) for v in _causal_prefill_rows() if v.page_size == 16}),
 )
 def test_prefill_batch_matches_reference(unit):
     """A batch in one launch, each sequence against its reference."""
@@ -859,7 +1091,7 @@ def test_prefill_batch_matches_reference(unit):
     sorted(
         {
             _prefill_unit(v)
-            for v in _prefill_rows()
+            for v in _causal_prefill_rows()
             if v.page_size == 16 and v.head_size in hip.SUPPORTED_HEAD_SIZES
         }
     ),
@@ -868,7 +1100,7 @@ def test_mixed_batch_matches_reference(unit):
     """Decodes then prefills, including a short one, each against its
     reference."""
     _skip_unless_gfx1151()
-    v = next(v for v in _prefill_rows() if _prefill_unit(v) == unit)
+    v = next(v for v in _causal_prefill_rows() if _prefill_unit(v) == unit)
     batches = [
         [(1, 3000 + v.window), (1, 77), (1, 1024), (130, 2000 + v.window), (40, 40)],
         [(1, 3000 + v.window), (1, 77), (1, 1024), (5, 2000 + v.window)],
@@ -898,25 +1130,26 @@ def test_prefill_batch_configs_are_well_formed():
     if not table:
         pytest.skip("_rocm_C carries no RDNA3.5 variants")
     seen = set()
-    for (hq, hkv, d, page, window), cells in table.items():
+    for (hq, hkv, d, page, window, causal), cells in table.items():
         for mean_m, keys, min_query_len, head_group in cells:
-            key = (hq, hkv, d, page, window, mean_m, keys)
+            key = (hq, hkv, d, page, window, causal, mean_m, keys)
             assert key not in seen, key
             seen.add(key)
             assert mean_m in hip.PREFILL_BATCH_MEAN_M
             assert keys in hip.PREFILL_BATCH_KEYS
             assert head_group == 0 or hkv % head_group == 0
             for dtype in DTYPES:
-                steps = hip.prefill_variants(hq, hkv, d, page, window, dtype)
-                assert min_query_len in {v.min_query_len for v in steps}, key
-    for config in {k[:5] for k in seen}:
+                steps = hip.prefill_variants(hq, hkv, d, page, window, dtype, causal)
+                if steps or causal:
+                    assert min_query_len in {v.min_query_len for v in steps}, key
+    for config in {k[:6] for k in seen}:
         assert (*config, hip.PREFILL_BATCH_MEAN_M[0], 0) in seen, config
 
 
 def test_prefill_batch_cell_lookup(monkeypatch):
     """A batch takes the cell of the largest steps at or below its features."""
     table = {
-        (32, 8, 128, 16, 0): [(1, 0, 16, 8), (1, 2048, 128, 1), (256, 512, 512, 4)]
+        (32, 8, 128, 16, 0, 1): [(1, 0, 16, 8), (1, 2048, 128, 1), (256, 512, 512, 4)]
     }
     monkeypatch.setattr(hip, "_prefill_batch_table", lambda: table)
     cell = functools.partial(hip.prefill_batch_cell, 32, 8, 128, 16, 0)
@@ -1128,3 +1361,378 @@ def test_mm_ranges_decode_decision(future_keys, reach, clamp, reason):
         assert "multimodal" not in impl._rejected
     else:
         assert reason in impl._rejected
+
+
+def _decode_mm_buf(ranges, device, capacity=4):
+    """The decode kernel's [count, start0, end0, ...], empty slots zeroed."""
+    buf = torch.zeros(1 + 2 * capacity, dtype=torch.int32)
+    flat = [len(ranges), *(x for r in ranges for x in r)]
+    buf[: len(flat)] = torch.tensor(flat, dtype=torch.int32)
+    return buf.to(device)
+
+
+def _decode_mm(module, v, q, kv, block_table, seq_len, buf):
+    out = torch.full_like(q, float("nan"))
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+    module.decode_attn(
+        q, kv, block_table, out, *hip.make_scratch(v, q.device), seq_lens,
+        q.shape[2] ** -0.5, mm_ranges=buf,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    return out.float().nan_to_num(1e9)
+
+
+@pytest.mark.parametrize(
+    "want, min_m",
+    [
+        (
+            {
+                "window": bool,
+                "dot_product": lambda x: not x,
+                "max_segments": lambda x: x > 1,
+            },
+            4,
+        ),
+        (
+            {
+                "window": lambda x: not x,
+                "dot_product": lambda x: not x,
+                "max_segments": lambda x: x > 1,
+            },
+            4,
+        ),
+        (
+            {
+                "window": lambda x: not x,
+                "dot_product": lambda x: not x,
+                "max_segments": lambda x: x == 1,
+            },
+            4,
+        ),
+        # Dot-product builds go up to M=3; an image starting among M=2's query
+        # tokens would only hold the last one.
+        ({"dot_product": bool}, 3),
+    ],
+    ids=["wmma_window segments", "wmma segments", "wmma", "dot_product"],
+)
+@pytest.mark.parametrize(
+    "image",
+    [
+        # Over every query token, beside a past image.
+        lambda s, m, w: [(100, 355), (s - m - 40, s - 1)],
+        # Ending, or starting, among the query tokens: the rows after it, or
+        # before it, stay causal.
+        lambda s, m, w: [(s - m - 40, s - m + m // 2)],
+        lambda s, m, w: [(s - m + m // 2, s - 1)],
+        # Past the sequence, as in a chunk ending inside the image.
+        lambda s, m, w: [(s - m - 40, s + 200)],
+        # Longer than the window, which still bounds earlier keys.
+        lambda s, m, w: [(s - (w or 1000) - 500, s - 1)],
+        # Two images over the query tokens: rows end at either one.
+        lambda s, m, w: [(s - m - 40, s - m + 1), (s - m + 2, s - 1)],
+    ],
+    ids=[
+        "covers_all",
+        "ends_mid",
+        "starts_mid",
+        "past_seq_len",
+        "longer_than_window",
+        "two_in_span",
+    ],
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_decode_mm_prefix_matches_reference(want, min_m, image, dtype):
+    """Decode-sized calls inside an image see the image's later keys, and the
+    count comes from device memory."""
+    v, module = _built(dtype, max_query_len=lambda m: m >= min_m, **want)
+    m, seq_len = v.max_query_len, max(2000, v.window + 1000) + 7
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    # Keys past the sequence must not be read, even inside an image.
+    kv[-1, :, seq_len % v.page_size :] = float("nan")
+    ranges = image(seq_len, m, v.window)
+    got = _decode_mm(
+        module, v, q, kv, block_table, seq_len, _decode_mm_buf(ranges, q.device)
+    )
+    ref = _reference(q, kv, seq_len, v.window, ranges)
+    assert _max_rel(got, ref) <= TOL[v.dtype], v.name
+    causal = _reference(q, kv, seq_len, v.window)
+    assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "the image changed nothing"
+    # With several images over the query tokens, each one shows.
+    cut = [r for r in ranges if r[0] < r[1] and r[1] >= seq_len - m]
+    for r in cut if len(cut) > 1 else []:
+        rest = [x for x in ranges if x != r]
+        without = _reference(q, kv, seq_len, v.window, rest)
+        assert _max_rel(without, ref) > 10 * TOL[v.dtype], f"{r} changed nothing"
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["per_sequence", "shared"])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_batched_decode_mm_prefix_matches_reference(shared, dtype):
+    """A batched build reads sequence s's ranges from row s, or one row for
+    all (stride 0), in positions of that sequence."""
+    v, module = _built(
+        dtype, batch=1, window=lambda x: not x, max_query_len=lambda m: m >= 4
+    )
+    m = v.max_query_len
+    lens = [2007, 300, 1500]
+    if shared:
+        ranges = [[(250, 299 + 20)]] * len(lens)
+    else:
+        ranges = [[(s - m - 40, s - m + m // 2)] for s in lens]
+        ranges[1] = []
+    width = max(lens) // v.page_size + 1
+    parts = [_paged_inputs(s, v, seed=i) for i, s in enumerate(lens)]
+    kv = torch.cat([p[1] for p in parts])
+    first = torch.tensor([0] + [p[1].shape[0] for p in parts]).cumsum(0)
+    block_table = torch.zeros(len(lens), width, device=kv.device, dtype=torch.int32)
+    for i, p in enumerate(parts):
+        block_table[i, : p[1].shape[0]] = p[2] + int(first[i])
+    q = torch.cat([p[0] for p in parts])
+    if shared:
+        buf = _decode_mm_buf(ranges[0], q.device)
+    else:
+        buf = torch.stack([_decode_mm_buf(r, q.device) for r in ranges])
+    scratch = hip.make_scratch(v, q.device, max_seqs=len(lens))
+    out = torch.full_like(q, float("nan"))
+    seq_lens = torch.tensor(lens, device=q.device, dtype=torch.int32)
+    module.decode_attn(
+        q, kv, block_table, out, *scratch, seq_lens, q.shape[2] ** -0.5,
+        mm_ranges=buf,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    changed = 0
+    for i, s in enumerate(lens):
+        rows = out[i * m : (i + 1) * m].float().nan_to_num(1e9)
+        ref = _reference(parts[i][0], parts[i][1], s, 0, ranges[i])
+        assert _max_rel(rows, ref) <= TOL[v.dtype], f"{v.name}: sequence {i}"
+        causal = _reference(parts[i][0], parts[i][1], s)
+        changed += _max_rel(causal, ref) > 10 * TOL[v.dtype]
+    assert changed >= (1 if shared else 2), "the ranges changed nothing"
+
+
+@pytest.mark.parametrize("case", ["zero", "over_capacity"])
+def test_decode_mm_ranges_stop_at_count_and_capacity(case):
+    """The kernel reads min(count, capacity) ranges: those it reads apply, and
+    a range past them, over every query token, changes nothing."""
+    v, module = _built(
+        window=lambda x: not x,
+        dot_product=lambda x: not x,
+        max_query_len=lambda m: m >= 4,
+    )
+    m, seq_len = v.max_query_len, 2000
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    trap = (seq_len - m - 40, seq_len - 1)
+    if case == "zero":
+        # The trap in the buffer, past count.
+        ranges, count, size = [], 0, 3
+    else:
+        # count 5 in a 2-range buffer, the trap just past its end. The second
+        # range ends among the query tokens, so the trap would extend it.
+        ranges = [(100, 355), (seq_len - m - 40, seq_len - m + m // 2)]
+        count, size = 5, 5
+    flat = [count, *(x for r in ranges for x in r), *trap]
+    buf = torch.tensor(flat, dtype=torch.int32, device=q.device)[:size]
+    got = _decode_mm(module, v, q, kv, block_table, seq_len, buf)
+    ref = _reference(q, kv, seq_len, 0, ranges)
+    assert _max_rel(got, ref) <= TOL[v.dtype], v.name
+    # Reading the trap, or ignoring the ranges that fit, must show.
+    for wrong in (ranges + [trap], []):
+        if wrong != ranges:
+            wrong_ref = _reference(q, kv, seq_len, 0, wrong)
+            assert _max_rel(wrong_ref, ref) > 10 * TOL[v.dtype], wrong
+
+
+def test_graph_replay_follows_mm_ranges():
+    """A captured graph reads the ranges the builder rewrites in place each
+    step, and none are left over when they go back to empty."""
+    v, module = _built(
+        window=lambda x: not x,
+        dot_product=lambda x: not x,
+        max_query_len=lambda m: m >= 4,
+    )
+    seq_len = 1024
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    scratch = hip.make_scratch(v, q.device)
+    out = torch.empty_like(q)
+    seq_lens = torch.tensor([seq_len], device=q.device, dtype=torch.int32)
+    buf = _decode_mm_buf([], q.device)
+
+    def launch():
+        module.decode_attn(
+            q, kv, block_table, out, *scratch, seq_lens, q.shape[2] ** -0.5,
+            mm_ranges=buf,
+        )  # fmt: skip
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    m = v.max_query_len
+    for ranges in ([], [(seq_len - m - 40, seq_len - 1)], []):
+        # As the builder: a smaller count leaves earlier ranges past it.
+        flat = _decode_mm_buf(ranges, q.device)[: 1 + 2 * len(ranges)]
+        buf[: flat.numel()].copy_(flat)
+        out.zero_()
+        graph.replay()
+        torch.accelerator.synchronize()
+        ref = _reference(q, kv, seq_len, 0, ranges)
+        assert _max_rel(out.float(), ref) <= TOL[v.dtype], f"ranges={ranges}"
+
+
+@pytest.mark.parametrize("bad", ["even", "int64", "cpu", "few_rows"])
+def test_decode_refuses_malformed_mm_ranges(bad):
+    """Only an odd-length int32 [count, start0, end0, ...] on the device, or
+    one such row per sequence, reaches the kernel."""
+    v, module = _built()
+    q, kv, block_table = _paged_inputs(64, v)
+    good = _decode_mm_buf([(10, 40)], q.device)
+    ranges = {
+        "even": good[:4],
+        "int64": good.long(),
+        "cpu": good.cpu(),
+        "few_rows": good.view(1, -1)[:0],
+    }[bad]
+    seq_lens = torch.tensor([64], device=q.device, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="mm_ranges must be"):
+        module.decode_attn(
+            q, kv, block_table, torch.empty_like(q), *hip.make_scratch(v, q.device),
+            seq_lens, q.shape[2] ** -0.5, mm_ranges=ranges,
+        )  # fmt: skip
+
+
+# 40 ten-token images, [100 + 20i, 109 + 20i]: more than MM_RANGES_CAPACITY.
+_MANY = [(100 + 20 * i, 109 + 20 * i) for i in range(40)]
+
+
+def _builder(device, max_num_seqs=4):
+    import types
+
+    return types.SimpleNamespace(
+        device=device,
+        vllm_config=types.SimpleNamespace(
+            scheduler_config=types.SimpleNamespace(max_num_seqs=max_num_seqs)
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "ranges, seq_len, query_len, expected",
+    [
+        # Query tokens 202..204, inside image 5.
+        (_MANY, 205, 3, [(200, 209)]),
+        # Text after the images.
+        (_MANY, 2000, 3, []),
+        # No sequence lengths: every range, which do not fit.
+        (_MANY, None, 3, None),
+        # Query tokens 98..99, widened to 97 for rejected drafts: a range ending
+        # at 97 or starting at 99 is kept; one ending at 96, starting at 100 or
+        # empty is not.
+        ([(80, 96), (90, 97), (98, 98), (99, 120), (100, 110)], 100, 2,
+         [(90, 97), (99, 120)]),
+    ],
+    ids=["inside_one", "text_after", "no_seq_lens", "edges"],
+)  # fmt: skip
+def test_mm_ranges_decode_buffer(ranges, seq_len, query_len, expected):
+    """The decode buffer holds, per request, only the ranges that can hold its
+    query tokens, so any number of images fits; when they do not fit it is
+    emptied, so a replayed CUDA graph never reads an earlier step's ranges."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_attn import (
+        _MM_RANGES,
+        RocmRdnaMetadataBuilder,
+        mm_ranges_buffer,
+    )
+
+    device = torch.device("cpu")
+    _MM_RANGES.pop(device, None)
+    buf = mm_ranges_buffer(device, 4)
+    buf.fill_(7)
+    # Request 1: no images.
+    md = types.SimpleNamespace(
+        num_reqs=2,
+        mm_req_doc_ranges={0: ranges},
+        seq_lens_cpu_upper_bound=None
+        if seq_len is None
+        else torch.tensor([seq_len, 50]),
+        query_start_loc_cpu=torch.tensor([0, query_len, 2 * query_len]),
+    )
+    out = RocmRdnaMetadataBuilder._mm_ranges_decode(_builder(device), md)
+    if expected is None:
+        assert out is None
+        assert (buf[:, 0] == 0).all()
+    else:
+        assert out is buf
+        flat = [x for span in expected for x in span]
+        assert buf[0, : 1 + len(flat)].tolist() == [len(expected), *flat]
+        assert buf[1, 0] == 0
+
+
+@pytest.mark.parametrize("overshoot", [False, True], ids=["exact", "async_spec"])
+def test_mm_ranges_decode_builder_feeds_kernel(overshoot):
+    """The builder's buffer gives the kernel the mask of all the request's
+    ranges, also when seq_lens_cpu_upper_bound overshoots by M - 1 rejected
+    drafts: the image then ends before the estimated query tokens."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_attn import RocmRdnaMetadataBuilder
+
+    v, module = _built(
+        window=lambda x: not x,
+        dot_product=lambda x: not x,
+        max_query_len=lambda m: m >= 4,
+    )
+    m, seq_len = v.max_query_len, 2007
+    q, kv, block_table = _paged_inputs(seq_len, v)
+    # 40 past images, more than the buffer holds, and one ending among the
+    # query tokens.
+    ranges = [(10 + 40 * i, 30 + 40 * i) for i in range(40)]
+    ranges.append((seq_len - m - 40, seq_len - 2))
+    md = types.SimpleNamespace(
+        num_reqs=1,
+        mm_req_doc_ranges={0: ranges},
+        seq_lens_cpu_upper_bound=torch.tensor([seq_len + overshoot * (m - 1)]),
+        query_start_loc_cpu=torch.tensor([0, m]),
+    )
+    buf = RocmRdnaMetadataBuilder._mm_ranges_decode(_builder(q.device), md)
+    assert buf is not None
+    got = _decode_mm(module, v, q, kv, block_table, seq_len, buf)
+    ref = _reference(q, kv, seq_len, 0, ranges)
+    assert _max_rel(got, ref) <= TOL[v.dtype], v.name
+    causal = _reference(q, kv, seq_len)
+    assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "the image changed nothing"
+
+
+def test_forward_passes_mm_ranges_to_the_decode_kernel():
+    """Forward hands the builder's buffer to the decode kernel."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_attn import RocmRdnaMetadata
+
+    impl = _impl()
+    impl.scale, impl.logits_soft_cap, impl.kernel_calls = HEAD_DIM**-0.5, 0, 0
+    impl.sliding_window = impl.alibi_slopes = impl.sinks = None
+    impl.chunk_lookback = impl._kv_quant_mode = None
+    passed = []
+    module = types.SimpleNamespace(
+        decode_attn=lambda *args, **kwargs: passed.append(kwargs["mm_ranges"])
+    )
+    impl._prepare = lambda kv_cache, **kwargs: (module, (None,) * 4)
+    buf = torch.zeros(1, 3, dtype=torch.int32)
+    md = RocmRdnaMetadata.__new__(RocmRdnaMetadata)
+    for name, value in {
+        "num_actual_tokens": 2,
+        "seq_lens": torch.tensor([100]),
+        "block_table": None,
+        "max_query_len": 2,
+        "causal": True,
+        "mm_prefix_range_tensor": None,
+        "mm_future_keys": True,
+        "mm_reach": 4,
+        "mm_ranges_decode": buf,
+        "rswa_prefix_lens": None,
+    }.items():
+        setattr(md, name, value)
+    q = torch.zeros(2, HQ, HEAD_DIM, dtype=torch.float16)
+    impl.forward(types.SimpleNamespace(), q, q, q, torch.empty(0), md, q.clone())
+    assert len(passed) == 1 and passed[0] is buf

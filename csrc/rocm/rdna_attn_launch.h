@@ -24,6 +24,13 @@ struct LaunchArgs {
   // Batched builds: sequences, and per-sequence strides.
   int nseq;
   int bt_stride, acc_stride, ml_stride, cnt_stride;
+  // Multimodal ranges in device memory, read at run time so CUDA graphs
+  // follow them: [count, start0, end0, ...], at most mm_capacity ranges, in
+  // positions of the sequence; sequence s reads mm_ranges + s * mm_stride
+  // (0: all share them). Null for no ranges.
+  const int* mm_ranges;
+  int mm_capacity;
+  int mm_stride;
 };
 
 using LaunchFn = void (*)(const LaunchArgs&);
@@ -60,6 +67,11 @@ struct PrefillArgs {
   int num_entries;
   int bt_stride;
   int head_group;
+  // Non-causal builds: V, and the token strides of Q, K (in `kv`) and V.
+  const void* v;
+  int q_stride;
+  int k_stride;
+  int v_stride;
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);

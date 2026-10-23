@@ -20,6 +20,7 @@
 
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -38,7 +39,9 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .utils import AutoWeightsLoader, WeightsMapper
 from .vision import is_vit_use_data_parallel, run_dp_sharded_vision_model
@@ -206,6 +209,7 @@ class Idefics2VisionAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(
             hidden_states
@@ -215,8 +219,11 @@ class Idefics2VisionAttention(nn.Module):
         # If attention_mask is provided, prefer Torch SDPA so the mask is
         # correctly applied (aligns with HuggingFace NaViT SigLIP behavior).
         if attention_mask is None:
-            # Use unified MMEncoderAttention implementation
-            out = self.attn(query_states, key_states, value_states)
+            # Use unified MMEncoderAttention implementation; cu_seqlens: the
+            # segments of the (batch * patches) rows, in place of a mask.
+            out = self.attn(
+                query_states, key_states, value_states, cu_seqlens=cu_seqlens
+            )
         else:
             bsz, q_len = query_states.size()[:2]
             kv_len = key_states.size(1)
@@ -306,6 +313,7 @@ class Idefics2EncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Args:
         hidden_states (`torch.FloatTensor`):
@@ -314,7 +322,9 @@ class Idefics2EncoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask=attention_mask)
+        hidden_states = self.self_attn(
+            hidden_states, attention_mask=attention_mask, cu_seqlens=cu_seqlens
+        )
         hidden_states += residual
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
@@ -365,6 +375,7 @@ class Idefics2Encoder(nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Args:
         inputs_embeds (torch.Tensor):
@@ -377,7 +388,9 @@ class Idefics2Encoder(nn.Module):
         """
         hidden_states = inputs_embeds
         for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(hidden_states, attention_mask=attention_mask)
+            layer_outputs = encoder_layer(
+                hidden_states, attention_mask=attention_mask, cu_seqlens=cu_seqlens
+            )
             hidden_states = layer_outputs
         return hidden_states
 
@@ -487,12 +500,40 @@ class Idefics2VisionTransformer(nn.Module):
             attention_mask = (~flat_patch_mask).to(dtype=hidden_states.dtype) * min_val
             attention_mask = attention_mask[:, None, None, :]
 
+        cu_seqlens = None
+        if attention_mask is not None and not self.use_data_parallel:
+            cu_seqlens = self._rdna_cu_seqlens(flat_patch_mask)
+            if cu_seqlens is not None:
+                attention_mask = None
+
         if self.use_data_parallel:
             encoder_outputs = run_dp_sharded_vision_model(hidden_states, self.encoder)
         else:
-            encoder_outputs = self.encoder(hidden_states, attention_mask=attention_mask)
+            encoder_outputs = self.encoder(
+                hidden_states, attention_mask=attention_mask, cu_seqlens=cu_seqlens
+            )
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
+
+    def _rdna_cu_seqlens(self, flat_patch_mask: torch.Tensor) -> torch.Tensor | None:
+        """With ROCM_RDNA_ATTN, the mask as segments: each image's patches,
+        then its padding (None unless the padding ends every row)."""
+        attn = self.encoder.layers[0].self_attn.attn
+        if attn.attn_backend != AttentionBackendEnum.ROCM_RDNA_ATTN:
+            return None
+        with gpu_sync_allowed():
+            rows = flat_patch_mask.tolist()
+        valid = [r.index(False) if False in r else len(r) for r in rows]
+        if not all(all(r[:n]) and not any(r[n:]) for r, n in zip(rows, valid)):
+            return None
+        lens = [m for r, n in zip(rows, valid) for m in (n, len(r) - n) if m]
+        return MMEncoderAttention.maybe_recompute_cu_seqlens(
+            attn.attn_backend,
+            np.concatenate([[0], np.cumsum(lens)]).astype(np.int32),
+            self.config.hidden_size,
+            1,
+            flat_patch_mask.device,
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
