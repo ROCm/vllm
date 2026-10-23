@@ -163,7 +163,7 @@ jobs:
           path: |
             dist/*.whl
             dist/constraints.txt
-          retention-days: 90
+          retention-days: 45
 
   test-kernels-correctness:
     name: test-kernels (correctness)
