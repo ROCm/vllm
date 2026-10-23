@@ -510,6 +510,7 @@ void rdna_encoder_attn(int64_t config, torch::Tensor& q, torch::Tensor& k,
               "scratch must be float32 partials and int32 counters");
   check_device(q,
                {&k, &v, &out, &partial_o, &partial_ml, &counters, &seq_lens});
+  if (plan) check_device(q, {&*plan, &*query_start_loc});
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
   if (c.max_segments > 1) {
     // As PrefillVariant.scratch_rows.

@@ -853,12 +853,18 @@ class RocmPlatform(Platform):
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list["AttentionBackendEnum"]:
-        return [
+        backends = [
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.ROCM_AITER_FA,
             AttentionBackendEnum.TRITON_ATTN,
             AttentionBackendEnum.TORCH_SDPA,
         ]
+        # The RDNA kernels, on request (--mm-encoder-attn-backend); calls they
+        # cannot serve run on TRITON_ATTN. gfx1152 and gfx1153 share gfx1150's
+        # tables and gfx1200 gfx1201's, but they are not tested yet.
+        if on_gfx115x() or on_rdna4():
+            backends.append(AttentionBackendEnum.ROCM_RDNA_ATTN)
+        return backends
 
     @classmethod
     def get_vit_attn_backend(

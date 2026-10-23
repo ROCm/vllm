@@ -26,6 +26,7 @@ from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils import random_uuid
 from vllm.utils.hashing import safe_hash
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .attention import AttentionConfig, HiSparseConfig
 from .aux_output import AuxOutputConfig
@@ -1456,6 +1457,24 @@ class VllmConfig:
                 "cudagraph_mm_encoder=True, since it disables all multimodal "
                 "inputs and the multimodal encoder is never run. Please "
                 "disable one of them."
+            )
+
+        mm_backend = (
+            self.model_config.multimodal_config.mm_encoder_attn_backend
+            if self.model_config is not None
+            and self.model_config.multimodal_config is not None
+            else None
+        )
+        if (
+            mm_backend is not None
+            and mm_backend == AttentionBackendEnum.ROCM_RDNA_ATTN
+            and self.compilation_config.cudagraph_mm_encoder
+        ):
+            raise ValueError(
+                "--mm-encoder-attn-backend ROCM_RDNA_ATTN is incompatible with "
+                "cudagraph_mm_encoder=True: its kernels are planned on the host "
+                "from each call's segment lengths, which a CUDA graph would "
+                "replay unchanged. Please disable one of them."
             )
 
         self._verify_sampling_replay_config()
