@@ -26,6 +26,11 @@ struct PrefillConfig {
   int key_waves;       // waves sharing a row tile, merged at the end
   int max_segments;    // most KV segments per tile
   int head_group;      // kv heads whose tiles interleave in the grid
+  // 0: every query token sees every key of its sequence (no window, no
+  // multimodal ranges); a build of its own. Entries leave it out when 1.
+  int causal = 1;
+  // 16-row tiles per wave, 1 or (non-causal) 2; left out when 1.
+  int row_tiles = 1;
 };
 
 // Written by benchmarks/kernels/rocm_rdna_hip_attn/tools/tune.py

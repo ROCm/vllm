@@ -1036,6 +1036,303 @@ def tune_prefill(a) -> None:
         out.write(json.dumps(decision) + "\n")
 
 
+# Non-causal (an encoder's segments, L = S): the sequence lengths tuned, the
+# steps' own and the traced mm-encoder calls'.
+NON_CAUSAL_CELLS = tuple(
+    sorted({*STEPS, 320, 577, 784, 1200, 2040, 3200, 3520, 4292, 8192})
+)
+# Finer than STEPS: one row per size band of the encoders' calls.
+NON_CAUSAL_STEPS = (*STEPS[:6], 768, 1024, 1536, 2048, 3072, 4096, 8192)
+NON_CAUSAL_GRID = {
+    "waves": (4, 8, 16),
+    "key_tile": (16, 32, 64),
+    "v_t": (0, 1),
+    "key_waves": (1, 2),
+    "double_buffer": (0, 1),
+    "max_segments": (1, 4, 16),
+    "head_group": (1, 2, 4, 8),
+    "row_tiles": (1, 2),
+}
+
+
+def non_causal_grid(d):
+    """Non-causal knob sets for head size d: the whole space, as the masking
+    it drops changes the register pressure."""
+    split = max(1, d // 128)
+    out = []
+    for values in itertools.product(*NON_CAUSAL_GRID.values()):
+        k = dict(zip(NON_CAUSAL_GRID, values), head_dim_split=split)
+        if (
+            k["waves"] % (split * k["key_waves"])
+            or k["key_tile"] // 16 % k["key_waves"]
+            or ((-(-d // 16) // split % 2 or d % 16) and not k["v_t"])
+            or (
+                k["row_tiles"] > 1
+                and (split > 1 or k["key_waves"] > 1 or k["key_tile"] > 32)
+            )
+        ):
+            continue
+        out.append(k)
+    return out
+
+
+def tune_prefill_non_causal(a) -> None:
+    """Prefill rows for one sequence of L = S tokens, every token seeing every
+    key: per step of M, the knobs fastest against TRITON_ATTN's mm-encoder
+    kernel (context_attention_fwd, is_causal=False) over NON_CAUSAL_CELLS."""
+    import jit
+    import torch
+    from triton.testing import do_bench
+
+    import vllm
+    import vllm.v1.attention.ops.rocm_rdna_hip as R
+    from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+
+    jit.install()
+    dtype = utils.torch_dtype(a.dtype)
+    hq, hkv, d, bs = a.hq, a.hkv, a.head_dim, a.block_size
+    if a.window:
+        raise SystemExit("a non-causal build has no window")
+    tag = f"{hq}/{hkv}/{d} non-causal prefill {a.dtype}"
+    cells = [m for m in NON_CAUSAL_CELLS if m >= STEPS[0]]
+    flops = [4.0 * hq * d * m * m for m in cells]
+    weight = {c: math.sqrt(f / sum(flops)) for c, f in zip(cells, flops)}
+    roof = {m: utils.roofline_noncausal(hq, hkv, d, [m])[0] for m in cells}
+    tol = 5e-3 if dtype == torch.float16 else 3e-2
+    fixed = {
+        "kind": "prefill",
+        "causal": 0,
+        "hq": hq,
+        "hkv": hkv,
+        "d": d,
+        "window": 0,
+        "dtype": a.dtype,
+        "block_size": bs,
+        "source": jit.source_digest(prefill=True),
+        "cells": cells,
+    }
+    meta = {
+        "vllm": vllm.__version__,
+        "torch": torch.__version__,
+        "host": platform.node(),
+    }
+
+    def variant(knobs):
+        return R.PrefillVariant(
+            d, hq, hkv, 0, bs, NON_CAUSAL_STEPS[0], **knobs, dtype=dtype, causal=0
+        )
+
+    def pid(knobs):
+        return json.dumps(sorted(knobs.items()))
+
+    current = {
+        m: R.prefill_variant_for(hq, hkv, d, bs, 1, 0, dtype, m, causal=False)
+        for m in NON_CAUSAL_STEPS
+    }
+    raw = (
+        [json.loads(x) for x in Path(a.candidates).read_text().splitlines() if x]
+        if a.candidates
+        else non_causal_grid(d)
+    )
+    cands: dict[str, R.PrefillVariant] = {}
+    for k in [*raw, *(prefill_knobs_of(v) for v in current.values() if v)]:
+        try:
+            cands.setdefault(pid(k), variant(k))
+        except (TypeError, ValueError):
+            continue
+    items = list(cands.items())[: a.limit or None]
+    known: dict[str, dict] = {}
+    if a.reuse and Path(a.points).exists():
+        for line in Path(a.points).read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if all(rec.get(k) == v for k, v in fixed.items()):
+                known[pid(rec["knobs"])] = rec
+    t0 = time.time()
+    # Reused points run again as finalists.
+    jit.precompile([v for _, v in items])
+    jit.seal()
+    print(
+        f"# {tag}: {len(items)} points, built in {time.time() - t0:.0f} s", flush=True
+    )
+    time.sleep(5)  # let clocks settle after the build
+
+    dev = torch.device("cuda")
+    data = {}
+
+    def inputs(m):
+        if m not in data:
+            torch.manual_seed(m)
+            q = (torch.randn(m, hq, d, device=dev) * 0.5).to(dtype)
+            k = (torch.randn(m, hkv, d, device=dev) * 0.5).to(dtype)
+            v = (torch.randn(m, hkv, d, device=dev) * 0.5).to(dtype)
+            sl = torch.tensor([m], device=dev, dtype=torch.int32)
+            ref = torch.empty_like(q)
+            data[m] = (q, k, v, sl, ref)
+        return data[m]
+
+    def triton(m):
+        q, k, v, _, ref = inputs(m)
+        starts = torch.zeros(1, device=dev, dtype=torch.int32)
+        lens = torch.tensor([m], device=dev, dtype=torch.int32)
+        return lambda: context_attention_fwd(
+            q, k, v, ref, b_start_loc=starts, b_seq_len=lens, max_input_len=m,
+            is_causal=False, softmax_scale=d**-0.5,
+        )  # fmt: skip
+
+    scratch = {}
+
+    def op(module, var, m, out):
+        q, k, v, sl, _ = inputs(m)
+        key = var.scratch_rows(dev)
+        if key not in scratch:
+            scratch[key] = R.make_prefill_scratch([var], dev)
+        return lambda: module.encoder_attn(q, k, v, out, *scratch[key], sl, m, d**-0.5)
+
+    for m in cells:
+        triton(m)()
+    torch.accelerator.synchronize()
+
+    # 1. Check and time every point.
+    with open(a.points, "a") as fh:
+        for i, (key, v) in enumerate(items):
+            if key in known:
+                continue
+            rec = {
+                **fixed,
+                "knobs": prefill_knobs_of(v),
+                **meta,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            module = jit.load(v)
+            if module is None:
+                rec.update(status="build", error=(jit.failure(v) or "")[:400])
+            else:
+                us = []
+                for m in cells:
+                    out = torch.full_like(inputs(m)[0], float("nan"))
+                    run = op(module, v, m, out)
+                    run()
+                    torch.accelerator.synchronize()
+                    err = (out.float() - inputs(m)[4].float()).abs().max()
+                    if not err.item() <= tol:
+                        rec.update(status="wrong", cell=m, err=err.item())
+                        break
+                    us.append(
+                        do_bench(run, warmup=5, rep=40, return_mode="median") * 1e3
+                    )
+                else:
+                    rec.update(status="ok", us=[round(u, 2) for u in us])
+            fh.write(json.dumps(rec) + "\n")
+            fh.flush()
+            known[key] = rec
+            if (i + 1) % 20 == 0:
+                print(
+                    f"#   {i + 1}/{len(items)} points, "
+                    f"{(time.time() - t0) / 60:.1f} min",
+                    flush=True,
+                )
+    ok = {
+        k: dict(zip(cells, r["us"]))
+        for k, r in known.items()
+        if r.get("status") == "ok"
+    }
+    if not ok:
+        print(f"{tag}: no point measured correct", flush=True)
+        return
+
+    def bucket(m):
+        return max(x for x in NON_CAUSAL_STEPS if x <= m)
+
+    step_cells = {s_: [c for c in cells if bucket(c) == s_] for s_ in NON_CAUSAL_STEPS}
+
+    # 2. Finalists of each step, re-timed against Triton in turn.
+    finalists: dict[int, set[str]] = {}
+    for st in NON_CAUSAL_STEPS:
+        sc = step_cells[st]
+        fastest = {c: min(t[c] for t in ok.values()) for c in sc}
+        ranked = sorted(
+            ok,
+            key=lambda k: -weighted_speedup(
+                [weight[c] for c in sc], [fastest[c] / ok[k][c] for c in sc]
+            ),
+        )
+        finalists[st] = set(ranked[: a.top])
+        if current[st] is not None and pid(prefill_knobs_of(current[st])) in ok:
+            finalists[st].add(pid(prefill_knobs_of(current[st])))
+    for st, prev in zip(NON_CAUSAL_STEPS[1:], NON_CAUSAL_STEPS):
+        finalists[st] |= finalists[prev]
+    times: dict = {}
+    for _ in range(a.confirm_rounds):
+        for st in NON_CAUSAL_STEPS:
+            for c in step_cells[st]:
+                times.setdefault(("triton", c), []).append(
+                    do_bench(triton(c), warmup=5, rep=40, return_mode="median") * 1e3
+                )
+                for k in sorted(finalists[st]):
+                    out = torch.empty_like(inputs(c)[0])
+                    run = op(jit.load(cands[k]), cands[k], c, out)
+                    times.setdefault((k, c), []).append(
+                        do_bench(run, warmup=5, rep=40, return_mode="median") * 1e3
+                    )
+    med = {key: statistics.median(t) for key, t in times.items()}
+
+    # 3. Per step, prefer points never slower than Triton, then speedup.
+    steps, prev = [], None
+    for st in NON_CAUSAL_STEPS:
+        sc = step_cells[st]
+        w = [weight[c] for c in sc]
+        scored = {}
+        for k in finalists[st]:
+            ratio = [med[("triton", c)] / med[(k, c)] for c in sc]
+            scored[k] = (min(ratio) >= 1.0, weighted_speedup(w, ratio), ratio)
+        best = max(scored, key=lambda k: scored[k][:2])
+        if (
+            prev in scored
+            and (scored[prev][0] or not scored[best][0])
+            and scored[prev][1] * PREFILL_SLACK >= scored[best][1]
+        ):
+            best = prev
+        cur = None if current[st] is None else prefill_knobs_of(current[st])
+        steps.append(
+            {
+                "m": st,
+                "current": cur,
+                "winner": dict(json.loads(best)),
+                "speedup": scored[best][1],
+                "worst": min(scored[best][2]),
+                "cells": {
+                    str(c): {
+                        "ours": med[(best, c)],
+                        "base": med[("triton", c)],
+                        "roof": roof[c] / med[(best, c)],
+                    }
+                    for c in sc
+                },
+            }
+        )
+        prev = best
+        rf = [roof[c] / med[(best, c)] for c in sc]
+        print(
+            f"{tag} M>={st}: {prefill_label(steps[-1]['winner'])}  "
+            f"speedup {steps[-1]['speedup']:.2f}x, worst cell "
+            f"{steps[-1]['worst']:.2f}x, %roof {min(rf) * 100:.1f}-{max(rf) * 100:.1f}",
+            flush=True,
+        )
+    decision = {
+        **fixed,
+        "current": {st: s_["current"] for st, s_ in zip(NON_CAUSAL_STEPS, steps)},
+        "steps": steps,
+        "accepted": True,
+        **meta,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with open(a.decisions, "a") as out_:
+        out_.write(json.dumps(decision) + "\n")
+
+
 def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
     """Write one prefill decision into the prefill configs."""
     import jit
@@ -1048,12 +1345,13 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
     if dec["source"] != jit.source_digest(prefill=True):
         print(f"{tag}: refused, measured on another kernel source")
         return 0
-    lines, rows = read_configs(PREFILL_CONFIGS_H)
+    causal = dec.get("causal", 1)
+    lines, rows = read_configs(PREFILL_CONFIGS_H, R.PREFILL_CONFIG_FIELDS)
     col = {f: i for i, f in enumerate(R.PREFILL_CONFIG_FIELDS)}
     dtype = utils.torch_dtype(dec["dtype"])
     for step in dec["steps"]:
         now = R.prefill_variant_for(
-            hq, hkv, d, dec["block_size"], 1, win, dtype, step["m"]
+            hq, hkv, d, dec["block_size"], 1, win, dtype, step["m"], causal
         )
         if step["current"] != (None if now is None else prefill_knobs_of(now)):
             print(f"{tag}: refused, the rows changed since they were measured")
@@ -1065,7 +1363,8 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
             r[col["num_q_heads"]],
             r[col["num_kv_heads"]],
             r[col["window"]],
-        ) == (d, hq, hkv, win)
+            r[col["causal"]],
+        ) == (d, hq, hkv, win, causal)
 
     sizes = sorted({r[col["page_size"]] for r in rows if mine(r)}) or block_sizes
     rows = [r for r in rows if not mine(r)]
@@ -1084,6 +1383,7 @@ def apply_prefill(dec: dict, block_sizes: list[int]) -> int:
             step["m"],
             **step["winner"],
             dtype=torch.bfloat16 if bf16 else torch.float16,
+            causal=causal,
         )
         rows.append(R.prefill_config_fields(v))
         written += 1
@@ -1107,13 +1407,36 @@ BATCH_KV_BYTES = 1 << 30
 BATCH_WORKING_SET = 96 << 20
 
 
-def prefill_batch_cells(window, kv_bytes_per_key):
-    """((min mean M, min keys), representative batches) of every cell."""
+def prefill_batch_cells(window, kv_bytes_per_key, causal=True):
+    """((min mean M, min keys), representative batches) of every cell.
+
+    Non-causal (an encoder's segments, L = S): a batch's mean M and keys are
+    both L, so only the cells holding some L >= PREFILL_MIN_M are reached;
+    each takes batches of a total near BATCH_TOKENS and a quarter of it.
+    """
     import numpy as np
 
     import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     out = []
+    if not causal:
+        ms = (*R.PREFILL_BATCH_MEAN_M, 1 << 30)
+        ks = (*R.PREFILL_BATCH_KEYS, 1 << 30)
+        for i, m_lo in enumerate(R.PREFILL_BATCH_MEAN_M):
+            for j, k_lo in enumerate(R.PREFILL_BATCH_KEYS):
+                lo = max(m_lo, k_lo, R.PREFILL_MIN_M)
+                hi = min(ms[i + 1], ks[j + 1], 16384)
+                if lo >= hi:
+                    continue
+                length = min(hi - 1, max(lo, round(math.sqrt(lo * hi))))
+                n = max(2, BATCH_TOKENS // length)
+                specs = []
+                for nseq in dict.fromkeys((n, max(2, n // 4))):
+                    starts = np.arange(nseq + 1) * length
+                    lens = np.full(nseq, length)
+                    specs.append((starts, lens, f"{nseq}q{length}s{length}"))
+                out.append(((m_lo, k_lo), specs))
+        return out
     for i, m_lo in enumerate(R.PREFILL_BATCH_MEAN_M):
         m = BATCH_M[m_lo]
         for j, k_lo in enumerate(R.PREFILL_BATCH_KEYS):
@@ -1143,9 +1466,15 @@ def tune_prefill_batch(a) -> None:
     jit.install()
     dtype = utils.torch_dtype(a.dtype)
     hq, hkv, d, win, bs = a.hq, a.hkv, a.head_dim, a.window, a.block_size
-    tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + f" batch {a.dtype}"
+    causal = not a.non_causal
+    tag = (
+        f"{hq}/{hkv}/{d}"
+        + (f" w{win}" if win else "")
+        + ("" if causal else " non-causal")
+        + f" batch {a.dtype}"
+    )
     dev = torch.device("cuda")
-    rows = R.prefill_variants(hq, hkv, d, bs, win, dtype)
+    rows = R.prefill_variants(hq, hkv, d, bs, win, dtype, causal)
     if not rows:
         raise SystemExit(f"{tag}: no prefill rows")
     # Rows differing in max_segments or head_group build the same kernel.
@@ -1178,12 +1507,18 @@ def tune_prefill_batch(a) -> None:
 
     cells = []
     kv_bytes_per_key = hkv * 2 * d * torch.finfo(dtype).bits // 8
-    for (m_lo, k_lo), specs in prefill_batch_cells(win, kv_bytes_per_key):
+    for (m_lo, k_lo), specs in prefill_batch_cells(win, kv_bytes_per_key, causal):
         times: dict = {}
         for starts, lens, spec in specs:
             torch.manual_seed(0)
             nseq, pages = len(lens), -(-int(lens[0]) // bs)
-            kv = (torch.randn(nseq * pages, hkv, bs, 2 * d, device=dev) * 0.5).to(dtype)
+            # Causal: a paged cache; non-causal: K and V (in place).
+            shape = (
+                (nseq * pages, hkv, bs, 2 * d)
+                if causal
+                else (2, int(starts[-1]), hkv, d)
+            )
+            kv = (torch.randn(shape, device=dev) * 0.5).to(dtype)
             kvs = [kv] + [
                 kv.clone()
                 for _ in range(BATCH_WORKING_SET // (kv.numel() * kv.element_size()))
@@ -1206,6 +1541,21 @@ def tune_prefill_batch(a) -> None:
                                 q,
                                 cache,
                                 table,
+                                out,
+                                *scratch,
+                                sl,
+                                int(lens.max()),
+                                d**-0.5,
+                                plan=plan,
+                                query_start_loc=qsl,
+                                head_group=hg,
+                            )
+                            if causal
+                            else functools.partial(
+                                mod.encoder_attn,
+                                q,
+                                cache[0],
+                                cache[1],
                                 out,
                                 *scratch,
                                 sl,
@@ -1249,6 +1599,7 @@ def tune_prefill_batch(a) -> None:
                     "hkv": hkv,
                     "d": d,
                     "window": win,
+                    "causal": int(causal),
                     "dtype": a.dtype,
                     "block_size": bs,
                     "source": jit.source_digest(prefill=True),
@@ -1273,20 +1624,27 @@ def apply_prefill_batch(dec: dict, block_sizes: list[int]) -> int:
     import vllm.v1.attention.ops.rocm_rdna_hip as R
 
     hq, hkv, d, win = dec["hq"], dec["hkv"], dec["d"], dec["window"]
+    causal = dec.get("causal", 1)
     tag = f"{hq}/{hkv}/{d}" + (f" w{win}" if win else "") + " batch"
-    rows = R.prefill_variants(hq, hkv, d, dec["block_size"], win, torch.float16)
+    rows = R.prefill_variants(hq, hkv, d, dec["block_size"], win, torch.float16, causal)
     now = [prefill_knobs_of(v) | {"min_query_len": v.min_query_len} for v in rows]
     if now != dec["rows"]:
         print(f"{tag}: refused, the prefill builds changed since it was measured")
         return 0
-    lines, table = read_configs(PREFILL_BATCH_CONFIGS_H)
+    lines, table = read_configs(PREFILL_BATCH_CONFIGS_H, R.PREFILL_BATCH_CONFIG_FIELDS)
     pages = (
         sorted(
-            {k[3] for k in R._prefill_table() if k[:3] == (hq, hkv, d) and k[4] == win}
+            {
+                k[3]
+                for k in R._prefill_table()
+                if k[:3] == (hq, hkv, d) and k[4] == win and k[6] == causal
+            }
         )
         or block_sizes
     )
-    table = [r for r in table if (r[0], r[1], r[2], r[3]) != (d, hq, hkv, win)]
+    table = [
+        r for r in table if (r[0], r[1], r[2], r[3], r[9]) != (d, hq, hkv, win, causal)
+    ]
     for page in pages:
         for c in dec["cells"]:
             table.append(
@@ -1300,6 +1658,7 @@ def apply_prefill_batch(dec: dict, block_sizes: list[int]) -> int:
                     c["min_keys"],
                     c["row"],
                     c["head_group"],
+                    causal,
                 ]
             )
     write_configs(PREFILL_BATCH_CONFIGS_H, lines, table, R.PREFILL_BATCH_CONFIG_FIELDS)
@@ -1319,13 +1678,30 @@ PREFILL_BATCH_CONFIGS_H = _CSRC / "rdna_prefill_batch_configs.h"
 _ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
 
 
-def read_configs(path: Path) -> tuple[list[str], list[list[int]]]:
-    """The lines of a configs header, and its entries."""
+def read_configs(
+    path: Path, names: tuple[str, ...] | None = None
+) -> tuple[list[str], list[list[int]]]:
+    """The lines of a configs header, and its entries; with `names`, left
+    out trailing fields read as their defaults."""
     import jit
 
     lines = path.read_text().splitlines()
     rows = [jit.parse_cpp_fields(m[1]) for m in map(_ENTRY.match, lines) if m]
+    if names:
+        tail = _trailing_defaults(names)
+        rows = [r + tail[len(tail) - (len(names) - len(r)) :] for r in rows]
     return lines, rows
+
+
+def _trailing_defaults(names: tuple[str, ...]) -> list[int]:
+    """Defaults of the fields an entry may leave out, at the end of `names`."""
+    defaults = {"causal": 1, "row_tiles": 1}
+    tail: list[int] = []
+    for name in reversed(names):
+        if name not in defaults:
+            break
+        tail.insert(0, defaults[name])
+    return tail
 
 
 def write_configs(
@@ -1336,7 +1712,20 @@ def write_configs(
     import jit
 
     at = [i for i, line in enumerate(lines) if _ENTRY.match(line)]
-    entries = [f"    {{{jit.cpp_fields(r, names)}}}," for r in sorted(rows)]
+    # Trailing fields at their defaults are left out.
+    tail = _trailing_defaults(names)
+    first_tail = len(names) - len(tail)
+
+    def kept(r):
+        n = len(r)
+        while n > first_tail and r[n - 1] == tail[n - 1 - first_tail]:
+            n -= 1
+        return n
+
+    entries = [
+        f"    {{{jit.cpp_fields(r[: kept(r)], names[: kept(r)])}}},"
+        for r in sorted(rows)
+    ]
     text = lines[: at[0]] + entries + lines[at[-1] + 1 :]
     path.write_text("\n".join(text) + "\n")
 
@@ -1453,6 +1842,12 @@ def main() -> None:
         "head group of every cell of one configuration's batches",
     )
     p.add_argument(
+        "--non-causal",
+        action="store_true",
+        help="with --prefill or --prefill-batch: every query token sees every "
+        "key of its sequence (an encoder's segments, L = S)",
+    )
+    p.add_argument(
         "--prefixes",
         type=int,
         nargs="+",
@@ -1497,6 +1892,8 @@ def main() -> None:
         p.error("tuning needs --" + ", --".join(n.replace("_", "-") for n in missing))
     if a.prefill_batch:
         tune_prefill_batch(a)
+    elif a.prefill and a.non_causal:
+        tune_prefill_non_causal(a)
     elif a.prefill:
         tune_prefill(a)
     else:
