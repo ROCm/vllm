@@ -22,13 +22,13 @@ struct LaunchArgs {
   float scale;
   hipStream_t stream;
   // Multimodal ranges in device memory, read at run time so CUDA graphs
-  // follow them: mm_ranges[0] ranges, then (start, end) pairs, at most
-  // mm_capacity. Null for no ranges; batched builds take none.
+  // follow them: per sequence, a row of mm_stride ints holding its count of
+  // ranges, then (start, end) pairs, at most mm_capacity. Null for no ranges.
   const int* mm_ranges;
   int mm_capacity;
   // Batched builds: sequences, and per-sequence strides.
   int nseq;
-  int bt_stride, acc_stride, ml_stride, cnt_stride;
+  int bt_stride, acc_stride, ml_stride, cnt_stride, mm_stride;
 };
 
 using LaunchFn = void (*)(const LaunchArgs&);
