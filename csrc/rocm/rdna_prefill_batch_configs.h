@@ -18,6 +18,7 @@ struct PrefillBatchConfig {
   int min_keys;
   int min_query_len;  // of the kPrefillConfigs entry, in both dtypes
   int head_group;     // 0: the build's
+  int causal = 1;     // of the kPrefillConfigs entry; left out when 1
 };
 
 // One table per Arch (rdna_attn_types.h), each complete; a GPU family's

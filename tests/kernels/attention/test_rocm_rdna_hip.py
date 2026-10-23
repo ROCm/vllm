@@ -478,16 +478,18 @@ def test_rdna_valid_for_any_batch():
 # ---------------------------------------------------------------- prefill
 
 
-def _prefill_reference(q, kv, block_table, seq_len, window=0, mm_ranges=()):
+def _prefill_reference(
+    q, kv, block_table, seq_len, window=0, mm_ranges=(), causal=True
+):
     """Float reference of a prefill; a token in a multimodal range [start, end]
-    also sees the range's later keys."""
+    also sees the range's later keys. Non-causal: every key."""
     m, hq, hkv, hd = q.shape[0], q.shape[1], kv.shape[1], q.shape[2]
     pages = kv[block_table.long()]
     flat = pages.transpose(1, 2).reshape(-1, hkv, 2 * hd)[:seq_len].float()
     gqa = hq // hkv
     pos = torch.arange(seq_len, device=q.device).view(1, seq_len)
     lim = (seq_len - m + torch.arange(m, device=q.device)).view(m, 1)
-    masked = pos > lim
+    masked = pos > lim if causal else torch.zeros_like(pos > lim)
     for start, end in mm_ranges:
         q_in = (lim >= start) & (lim <= end)
         k_in = (pos >= start) & (pos <= end)
@@ -575,13 +577,19 @@ def _prefill_inputs(v, m, seq_len, seed=0):
 
 def _prefill_unit(v):
     dt = "bf16" if v.dtype == torch.bfloat16 else "fp16"
+    mode = "" if v.causal else "_noncausal"
     return (
         f"prefill_q{v.num_q_heads}_kv{v.num_kv_heads}_d{v.head_size}_w{v.window}_{dt}"
+        f"{mode}"
     )
 
 
 def _prefill_rows():
     return [v for rows in hip._prefill_table().values() for v in rows]
+
+
+def _causal_prefill_rows():
+    return [v for v in _prefill_rows() if v.causal]
 
 
 def test_prefill_configs_are_well_formed():
@@ -591,7 +599,7 @@ def test_prefill_configs_are_well_formed():
         pytest.skip("_rocm_C carries no RDNA variants")
     keys = {
         (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
-        + (v.dtype, v.min_query_len)
+        + (v.dtype, v.min_query_len, v.causal)
         for v in _prefill_rows()
     }
     assert len(keys) == len(_prefill_rows()), "two builds share a step"
@@ -623,7 +631,9 @@ def test_every_listed_prefill_variant_is_built_in():
     assert not missing, f"{len(missing)} prefill variants not in _rocm_C"
 
 
-@pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _prefill_rows()}))
+@pytest.mark.parametrize(
+    "unit", sorted({_prefill_unit(v) for v in _causal_prefill_rows()})
+)
 def test_built_in_prefill_variants_match_reference(unit):
     """Every built prefill variant matches the reference, with and without a
     prefix."""
@@ -668,7 +678,9 @@ def test_prefill_past_the_last_step():
     v = next(
         rows[-1]
         for rows in hip._prefill_table().values()
-        if rows[-1].dtype == torch.float16 and rows[-1].head_size == 128
+        if rows[-1].dtype == torch.float16
+        and rows[-1].head_size == 128
+        and rows[-1].causal
     )
     module = hip.load_prefill(v)
     args = (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
@@ -711,6 +723,155 @@ def test_prefill_window_never_reads_freed_pages():
     torch.accelerator.synchronize()
     assert torch.isfinite(out).all()
     _assert_prefill_close(out, q, *clean, seq_len, v.window, "freed pages")
+
+
+# ---------------------------------------------------------------- non-causal
+
+
+def _non_causal_rows():
+    return [v for v in _prefill_rows() if not v.causal]
+
+
+def _non_causal_inputs(v, lens, seed=0):
+    """Q, K and V of sequences of `lens` tokens, one after the other, as views
+    of one (tokens, 3, H, D) projection (a token stride of 3 H D)."""
+    torch.manual_seed(seed)
+    n = sum(lens)
+    qkv = torch.randn(n, 3, v.num_q_heads, v.head_size, device="cuda") * 0.5
+    qkv = qkv.to(v.dtype)
+    q, k, val = qkv[:, 0], qkv[:, 1, : v.num_kv_heads], qkv[:, 2, : v.num_kv_heads]
+    return q, k, val, np.cumsum([0] + list(lens))
+
+
+def _assert_non_causal_close(got, q, k, v, what):
+    """Within twice the error of TRITON_ATTN's mm-encoder kernel against the
+    float reference, for one sequence."""
+    from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+
+    m, hd = q.shape[0], q.shape[2]
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        *(x.float().transpose(0, 1) for x in (q, k, v)),
+        scale=hd**-0.5,
+        enable_gqa=q.shape[1] != k.shape[1],
+    ).transpose(0, 1)
+    triton = torch.empty_like(q)
+    lens = torch.tensor([m], device=q.device, dtype=torch.int32)
+    context_attention_fwd(
+        q.contiguous(), k.contiguous(), v.contiguous(), triton,
+        b_start_loc=torch.zeros_like(lens), b_seq_len=lens, max_input_len=m,
+        is_causal=False, softmax_scale=hd**-0.5,
+    )  # fmt: skip
+    err = (got.float().nan_to_num(1e9) - ref).abs().max().item()
+    bound = 2 * (triton.float() - ref).abs().max().item() + 1e-4
+    assert err <= bound, f"{what}: max error {err:.2e}, Triton's x2 {bound:.2e}"
+
+
+@pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _non_causal_rows()}))
+def test_built_in_non_causal_prefill_variants_match_reference(unit):
+    """Every non-causal build: each token sees every key of its sequence,
+    read in place, also past the last whole step."""
+    _skip_unless_rdna35_or_rdna4()
+    for v in _non_causal_rows():
+        if _prefill_unit(v) != unit:
+            continue
+        module = hip.load_prefill(v)
+        assert module is not None, v
+        args = (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
+        rows = hip.prefill_variants(*args, v.dtype, causal=False)
+        scratch = hip.make_prefill_scratch(rows, torch.device("cuda"))
+        lens = [v.min_query_len, v.min_query_len + 37]
+        if v == rows[0]:
+            lens += [hip.PREFILL_MIN_M, 100]
+        for seed, m in enumerate(lens):
+            q, k, val, _ = _non_causal_inputs(v, [m], seed)
+            out = torch.full(q.shape, float("nan"), dtype=q.dtype, device=q.device)
+            seq_lens = torch.tensor([m], device=q.device, dtype=torch.int32)
+            module.encoder_attn(
+                q, k, val, out, *scratch, seq_lens, m, v.head_size**-0.5
+            )
+            torch.accelerator.synchronize()
+            _assert_non_causal_close(out, q, k, val, f"{v}, L={m}")
+
+
+_NON_CAUSAL_BATCHES = {
+    "5 x 577": [577] * 5,
+    "mixed": [1024, 257, 9, 100, 64],
+    "windows": [64] * 20 + [16, 36, 48],
+}
+
+
+@pytest.mark.parametrize("batch", _NON_CAUSAL_BATCHES)
+@pytest.mark.parametrize(
+    "shape",
+    sorted(
+        {
+            (v.num_q_heads, v.num_kv_heads, v.head_size, v.dtype)
+            for v in _non_causal_rows()
+        },
+        key=str,
+    ),
+    ids=str,
+)
+def test_non_causal_prefill_batch_matches_reference(shape, batch):
+    """An encoder's segments in one planned launch, each against its
+    reference."""
+    _skip_unless_rdna35_or_rdna4()
+    hq, hkv, d, dtype = shape
+    lens = _NON_CAUSAL_BATCHES[batch]
+    dev = torch.device("cuda")
+    seq_lens = np.array(lens)
+    v = hip.prefill_variants(hq, hkv, d, 16, 0, dtype, causal=False)[0]
+    q, k, val, starts = _non_causal_inputs(v, lens)
+    v, head_group = hip.prefill_batch_variant_for(
+        hq, hkv, d, 16, 1, 0, dtype, starts, seq_lens, causal=False
+    )
+    plan, head_group = hip.plan_prefill(
+        starts, seq_lens, v, 0, hip.prefill_target_workgroups(dev), head_group
+    )
+    scratch = hip.make_prefill_scratch(
+        hip.prefill_variants(hq, hkv, d, 16, 0, dtype, causal=False), dev
+    )
+    out = torch.full(q.shape, float("nan"), dtype=dtype, device=dev)
+    hip.load_prefill(v).encoder_attn(
+        q, k, val, out, *scratch,
+        torch.tensor(lens, device=dev, dtype=torch.int32), max(lens), d**-0.5,
+        plan=torch.from_numpy(plan).to(dev),
+        query_start_loc=torch.from_numpy(starts.astype(np.int32)).to(dev),
+        head_group=head_group,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    for i, n in enumerate(lens):
+        rows = slice(int(starts[i]), int(starts[i + 1]))
+        _assert_non_causal_close(
+            out[rows], q[rows], k[rows], val[rows], f"{batch}: sequence {i} (L={n})"
+        )
+
+
+def test_non_causal_rows_are_full_attention():
+    """Non-causal builds have no window and run only through encoder_attn;
+    causal builds only through prefill_attn."""
+    rows = _non_causal_rows()
+    if not rows:
+        pytest.skip("_rocm_C carries no non-causal RDNA3.5 variants")
+    assert all(v.window == 0 for v in rows)
+    _skip_unless_rdna35_or_rdna4()
+    dev = torch.device("cuda")
+    v = rows[0]
+    scratch = hip.make_prefill_scratch([v], dev)
+    q, k, val, _ = _non_causal_inputs(v, [64])
+    seq_lens = torch.tensor([64], device=dev, dtype=torch.int32)
+    kv = torch.zeros(4, v.num_kv_heads, 16, 2 * v.head_size, dtype=v.dtype, device=dev)
+    table = torch.arange(4, dtype=torch.int32, device=dev)
+    out = torch.empty(q.shape, dtype=q.dtype, device=dev)
+    with pytest.raises(RuntimeError, match="rdna_encoder_attn"):
+        hip.load_prefill(v).prefill_attn(
+            q.contiguous(), kv, table, out, *scratch, seq_lens, 64, 0.1
+        )
+    causal = next(c for c in _causal_prefill_rows() if c.head_size == v.head_size)
+    with pytest.raises(RuntimeError, match="rdna_prefill_attn"):
+        hip.load_prefill(causal).encoder_attn(
+            q, k, val, out, *scratch, seq_lens, 64, 0.1
+        )
 
 
 # ---------------------------------------------------------------- prefill batches
@@ -893,7 +1054,8 @@ def test_prefill_batch_mm_prefix_matches_reference(shape):
 
 
 @pytest.mark.parametrize(
-    "unit", sorted({_prefill_unit(v) for v in _prefill_rows() if v.page_size == 16})
+    "unit",
+    sorted({_prefill_unit(v) for v in _causal_prefill_rows() if v.page_size == 16}),
 )
 def test_prefill_batch_matches_reference(unit):
     """A batch in one launch, each sequence against its reference."""
@@ -1013,25 +1175,26 @@ def test_prefill_batch_configs_are_well_formed():
     if not table:
         pytest.skip("_rocm_C carries no RDNA variants")
     seen = set()
-    for (hq, hkv, d, page, window), cells in table.items():
+    for (hq, hkv, d, page, window, causal), cells in table.items():
         for mean_m, keys, min_query_len, head_group in cells:
-            key = (hq, hkv, d, page, window, mean_m, keys)
+            key = (hq, hkv, d, page, window, causal, mean_m, keys)
             assert key not in seen, key
             seen.add(key)
             assert mean_m in hip.PREFILL_BATCH_MEAN_M
             assert keys in hip.PREFILL_BATCH_KEYS
             assert head_group == 0 or hkv % head_group == 0
             for dtype in DTYPES:
-                steps = hip.prefill_variants(hq, hkv, d, page, window, dtype)
-                assert min_query_len in {v.min_query_len for v in steps}, key
-    for config in {k[:5] for k in seen}:
+                steps = hip.prefill_variants(hq, hkv, d, page, window, dtype, causal)
+                if steps or causal:
+                    assert min_query_len in {v.min_query_len for v in steps}, key
+    for config in {k[:6] for k in seen}:
         assert (*config, hip.PREFILL_BATCH_MEAN_M[0], 0) in seen, config
 
 
 def test_prefill_batch_cell_lookup(monkeypatch):
     """A batch takes the cell of the largest steps at or below its features."""
     table = {
-        (32, 8, 128, 16, 0): [(1, 0, 16, 8), (1, 2048, 128, 1), (256, 512, 512, 4)]
+        (32, 8, 128, 16, 0, 1): [(1, 0, 16, 8), (1, 2048, 128, 1), (256, 512, 512, 4)]
     }
     monkeypatch.setattr(hip, "_prefill_batch_table", lambda: table)
     cell = functools.partial(hip.prefill_batch_cell, 32, 8, 128, 16, 0)

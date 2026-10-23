@@ -164,6 +164,14 @@ void rdna_prefill_attn(int64_t config, torch::Tensor& q,
                        const std::optional<torch::Tensor>& plan,
                        const std::optional<torch::Tensor>& query_start_loc,
                        int64_t head_group);
+void rdna_encoder_attn(int64_t config, torch::Tensor& q, torch::Tensor& k,
+                       torch::Tensor& v, torch::Tensor& out,
+                       torch::Tensor& partial_o, torch::Tensor& partial_ml,
+                       torch::Tensor& counters, torch::Tensor& seq_lens,
+                       int64_t max_seq_len, double scale,
+                       const std::optional<torch::Tensor>& plan,
+                       const std::optional<torch::Tensor>& query_start_loc,
+                       int64_t head_group);
 
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,

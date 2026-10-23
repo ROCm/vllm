@@ -67,6 +67,11 @@ struct PrefillArgs {
   int num_entries;
   int bt_stride;
   int head_group;
+  // Non-causal builds: V, and the token strides of Q, K (in `kv`) and V.
+  const void* v;
+  int q_stride;
+  int k_stride;
+  int v_stride;
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);
