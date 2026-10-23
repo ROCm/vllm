@@ -495,7 +495,8 @@ def _get_backend_priorities(
 
     backends = []
     # Its validation rejects max_num_seqs != 1 and the features it lacks.
-    if on_gfx1151():
+    # gfx1152 and gfx1153 can select it but are not tested yet.
+    if on_gfx1150() or on_gfx1151():
         backends.append(AttentionBackendEnum.ROCM_RDNA_SINGLESEQ_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)

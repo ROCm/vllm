@@ -16,25 +16,41 @@
 #include "rdna_singleseq_decode_configs.h"
 #include "rdna_singleseq_prefill_configs.h"
 
-rdna_singleseq::LaunchFn* rdna_singleseq::decode_launchers() {
-  static LaunchFn launchers[std::size(kDecodeConfigs)] = {};
-  return launchers;
+rdna_singleseq::LaunchFn* rdna_singleseq::decode_launchers(Arch arch) {
+  static LaunchFn gfx1151[std::size(kGfx1151DecodeConfigs)] = {};
+  static LaunchFn gfx1150[std::size(kGfx1150DecodeConfigs)] = {};
+  return arch == Arch::kGfx1151 ? gfx1151 : gfx1150;
 }
 
-rdna_singleseq::PrefillFn* rdna_singleseq::prefill_launchers() {
-  static PrefillFn launchers[std::size(kPrefillConfigs)] = {};
-  return launchers;
+rdna_singleseq::PrefillFn* rdna_singleseq::prefill_launchers(Arch arch) {
+  static PrefillFn gfx1151[std::size(kGfx1151PrefillConfigs)] = {};
+  static PrefillFn gfx1150[std::size(kGfx1150PrefillConfigs)] = {};
+  return arch == Arch::kGfx1151 ? gfx1151 : gfx1150;
 }
 
 namespace {
 
-constexpr int64_t kNumDecodeConfigs = std::size(rdna_singleseq::kDecodeConfigs);
-constexpr int64_t kNumPrefillConfigs =
-    std::size(rdna_singleseq::kPrefillConfigs);
-
-bool on_gfx1151() {
-  const std::string arch = at::cuda::getCurrentDeviceProperties()->gcnArchName;
-  return arch.find("gfx1151") != std::string::npos;
+// The GPU family of the current device, if this build carries code for it.
+std::optional<rdna_singleseq::Arch> current_arch() {
+  using rdna_singleseq::Arch;
+  const std::string name = at::cuda::getCurrentDeviceProperties()->gcnArchName;
+  const auto is = [&](const char* arch) {
+    return name.find(arch) != std::string::npos;
+  };
+#ifdef VLLM_RDNA_SINGLESEQ_GFX1150
+  if (is("gfx1150")) return Arch::kGfx1150;
+#endif
+#ifdef VLLM_RDNA_SINGLESEQ_GFX1151
+  if (is("gfx1151")) return Arch::kGfx1151;
+#endif
+#ifdef VLLM_RDNA_SINGLESEQ_GFX1152
+  if (is("gfx1152")) return Arch::kGfx1150;
+#endif
+#ifdef VLLM_RDNA_SINGLESEQ_GFX1153
+  if (is("gfx1153")) return Arch::kGfx1150;
+#endif
+  (void)is;
+  return std::nullopt;
 }
 
 // The kernels expect (num_pages, NUM_KV_HEADS, PAGE_SIZE, 2 * HEAD_DIM).
@@ -60,14 +76,17 @@ void check_device(const torch::Tensor& q,
 
 }  // namespace
 
-// Every decode build, its DecodeConfig fields in order; none off gfx1151.
-// Raises if a build has no instantiation unit.
+// The current GPU family's decode builds, their DecodeConfig fields in order;
+// none on a GPU the build has no code for. Raises if a build has no
+// instantiation unit.
 std::vector<int64_t> rdna_singleseq_decode_configs() {
   std::vector<int64_t> fields;
-  if (!on_gfx1151()) return fields;
-  for (int64_t i = 0; i < kNumDecodeConfigs; ++i) {
-    const rdna_singleseq::DecodeConfig& c = rdna_singleseq::kDecodeConfigs[i];
-    TORCH_CHECK(rdna_singleseq::decode_launchers()[i], "decode build ", i,
+  const auto arch = current_arch();
+  if (!arch) return fields;
+  const auto configs = rdna_singleseq::kDecodeConfigs[static_cast<int>(*arch)];
+  for (size_t i = 0; i < configs.size(); ++i) {
+    const rdna_singleseq::DecodeConfig& c = configs[i];
+    TORCH_CHECK(rdna_singleseq::decode_launchers(*arch)[i], "decode build ", i,
                 " (head dim ", static_cast<int>(c.head_dim), ", bf16 ",
                 c.dtype == rdna_singleseq::Dtype::kBf16,
                 ") has no unit in cmake/rocm_rdna_singleseq_attn.cmake");
@@ -81,15 +100,16 @@ std::vector<int64_t> rdna_singleseq_decode_configs() {
   return fields;
 }
 
-// Every prefill build, its PrefillConfig fields in order; none off gfx1151.
-// Raises if a build has no instantiation unit.
+// Likewise for prefill.
 std::vector<int64_t> rdna_singleseq_prefill_configs() {
   std::vector<int64_t> fields;
-  if (!on_gfx1151()) return fields;
-  for (int64_t i = 0; i < kNumPrefillConfigs; ++i) {
-    const rdna_singleseq::PrefillConfig& c = rdna_singleseq::kPrefillConfigs[i];
-    TORCH_CHECK(rdna_singleseq::prefill_launchers()[i], "prefill build ", i,
-                " (head dim ", static_cast<int>(c.head_dim), ", bf16 ",
+  const auto arch = current_arch();
+  if (!arch) return fields;
+  const auto configs = rdna_singleseq::kPrefillConfigs[static_cast<int>(*arch)];
+  for (size_t i = 0; i < configs.size(); ++i) {
+    const rdna_singleseq::PrefillConfig& c = configs[i];
+    TORCH_CHECK(rdna_singleseq::prefill_launchers(*arch)[i], "prefill build ",
+                i, " (head dim ", static_cast<int>(c.head_dim), ", bf16 ",
                 c.dtype == rdna_singleseq::Dtype::kBf16,
                 ") has no unit in cmake/rocm_rdna_singleseq_attn.cmake");
     fields.insert(
@@ -111,10 +131,13 @@ void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
                                 torch::Tensor& seq_lens, double scale,
                                 const std::optional<torch::Tensor>& mm_ranges) {
   using namespace rdna_singleseq;
-  TORCH_CHECK(
-      config >= 0 && config < kNumDecodeConfigs && decode_launchers()[config],
-      "no decode build ", config);
-  const DecodeConfig& c = kDecodeConfigs[config];
+  const auto arch = current_arch();
+  TORCH_CHECK(arch, "no decode builds for this GPU");
+  const auto configs = kDecodeConfigs[static_cast<int>(*arch)];
+  TORCH_CHECK(config >= 0 && config < (int64_t)configs.size() &&
+                  decode_launchers(*arch)[config],
+              "no decode build ", config);
+  const DecodeConfig& c = configs[config];
   const int maxm = c.max_query_len;
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
@@ -182,7 +205,7 @@ void rdna_singleseq_decode_attn(int64_t config, torch::Tensor& q,
     capacity = static_cast<int>(mm_ranges->numel() / 2);
   }
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
-  decode_launchers()[config](
+  decode_launchers(*arch)[config](
       {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
        acc.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(),
        cnt.data_ptr<int>(), out.data_ptr(), seq_lens.data_ptr<int>(),
@@ -198,10 +221,13 @@ void rdna_singleseq_prefill_attn(
     int64_t max_seq_len, double scale,
     const std::optional<torch::Tensor>& mm_ranges) {
   using namespace rdna_singleseq;
-  TORCH_CHECK(
-      config >= 0 && config < kNumPrefillConfigs && prefill_launchers()[config],
-      "no prefill build ", config);
-  const PrefillConfig& c = kPrefillConfigs[config];
+  const auto arch = current_arch();
+  TORCH_CHECK(arch, "no prefill builds for this GPU");
+  const auto configs = kPrefillConfigs[static_cast<int>(*arch)];
+  TORCH_CHECK(config >= 0 && config < (int64_t)configs.size() &&
+                  prefill_launchers(*arch)[config],
+              "no prefill build ", config);
+  const PrefillConfig& c = configs[config];
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
   TORCH_CHECK(
@@ -257,7 +283,7 @@ void rdna_singleseq_prefill_attn(
                 "scratch too small for this build: needs ", rows * d, ", ",
                 2 * rows, ", ", target, " elements");
   }
-  prefill_launchers()[config](
+  prefill_launchers(*arch)[config](
       {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
        out.data_ptr(), seq_lens.data_ptr<int>(), partial_o.data_ptr<float>(),
        partial_ml.data_ptr<float>(), counters.data_ptr<int>(), (int)q.size(0),
