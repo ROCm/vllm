@@ -694,6 +694,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
             AttentionBackendEnum.ROCM_AITER_FA,
             AttentionBackendEnum.TRITON_ATTN,
             AttentionBackendEnum.FLASHINFER,
+            AttentionBackendEnum.ROCM_RDNA_ATTN,
         }:
             raise RuntimeError(
                 f"Qwen2.5-VL does not support {self.attn_backend} backend now."

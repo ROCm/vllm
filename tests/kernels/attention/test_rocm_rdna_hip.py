@@ -700,12 +700,23 @@ def _assert_non_causal_close(got, q, k, v, what):
     float reference, for one sequence."""
     from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
 
-    m, hd = q.shape[0], q.shape[2]
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        *(x.float().transpose(0, 1) for x in (q, k, v)),
-        scale=hd**-0.5,
-        enable_gqa=q.shape[1] != k.shape[1],
-    ).transpose(0, 1)
+    m, hq, hd = q.shape
+    g = hq // k.shape[1]
+    # A few heads at a time: all 64 heads of a long sequence take 16 GiB.
+    step = max(1, (1 << 28) // (m * m))
+    ref = torch.cat(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                *(
+                    x[:, h : h + step].float().transpose(0, 1)
+                    for x in (q, k.repeat_interleave(g, 1), v.repeat_interleave(g, 1))
+                ),
+                scale=hd**-0.5,
+            ).transpose(0, 1)
+            for h in range(0, hq, step)
+        ],
+        dim=1,
+    )
     triton = torch.empty_like(q)
     lens = torch.tensor([m], device=q.device, dtype=torch.int32)
     context_attention_fwd(
@@ -808,7 +819,8 @@ def test_non_causal_rows_are_full_attention():
     assert all(v.window == 0 for v in rows)
     _skip_unless_gfx1151()
     dev = torch.device("cuda")
-    v = rows[0]
+    causal_sizes = {c.head_size for c in _causal_prefill_rows()}
+    v = next(v for v in rows if v.head_size in causal_sizes)
     scratch = hip.make_prefill_scratch([v], dev)
     q, k, val, _ = _non_causal_inputs(v, [64])
     seq_lens = torch.tensor([64], device=dev, dtype=torch.int32)
@@ -824,6 +836,49 @@ def test_non_causal_rows_are_full_attention():
         hip.load_prefill(causal).encoder_attn(
             q, k, val, out, *scratch, seq_lens, 64, 0.1
         )
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [[4, 8, 1, 3], [577, 5, 1024, 8, 9, 64, 8], [9] * 7, [4096], [5]],
+    ids=["short", "mixed", "first step", "one", "one short"],
+)
+def test_encoder_forward_matches_reference(segments):
+    """rocm_rdna_encoder: every segment, however short, in one non-causal
+    launch."""
+    _skip_unless_gfx1151()
+    from vllm.v1.attention.ops import rocm_rdna_encoder
+
+    shapes = sorted(
+        {
+            (v.num_q_heads, v.num_kv_heads, v.head_size, v.dtype)
+            for v in _non_causal_rows()
+        },
+        key=str,
+    )
+    if not shapes:
+        pytest.skip("_rocm_C carries no non-causal RDNA3.5 variants")
+    torch.manual_seed(0)
+    for hq, hkv, d, dtype in shapes:
+        n = sum(segments)
+        q, k, v = (
+            (torch.randn(n, h, d, device="cuda") * 0.5).to(dtype)
+            for h in (hq, hkv, hkv)
+        )
+        assert rocm_rdna_encoder.unsupported(q, hkv, segments) is None
+        out = rocm_rdna_encoder.forward(q, k, v, segments, d**-0.5)
+        start = 0
+        for i, s in enumerate(segments):
+            rows = slice(start, start + s)
+            ref = torch.nn.functional.scaled_dot_product_attention(
+                *(x[rows].float().transpose(0, 1) for x in (q, k, v)),
+                scale=d**-0.5,
+                enable_gqa=hq != hkv,
+            ).transpose(0, 1)
+            err = (out[rows].float() - ref).abs().max().item()
+            tol = 2e-2 if dtype == torch.bfloat16 else 4e-3
+            assert err <= tol, f"{hq}/{hkv}/{d} {dtype}: segment {i} (L={s}) {err:.2e}"
+            start += s
 
 
 # ---------------------------------------------------------------- prefill batches
@@ -1036,7 +1091,7 @@ def test_prefill_batch_matches_reference(unit):
     sorted(
         {
             _prefill_unit(v)
-            for v in _prefill_rows()
+            for v in _causal_prefill_rows()
             if v.page_size == 16 and v.head_size in hip.SUPPORTED_HEAD_SIZES
         }
     ),
@@ -1045,7 +1100,7 @@ def test_mixed_batch_matches_reference(unit):
     """Decodes then prefills, including a short one, each against its
     reference."""
     _skip_unless_gfx1151()
-    v = next(v for v in _prefill_rows() if _prefill_unit(v) == unit)
+    v = next(v for v in _causal_prefill_rows() if _prefill_unit(v) == unit)
     batches = [
         [(1, 3000 + v.window), (1, 77), (1, 1024), (130, 2000 + v.window), (40, 40)],
         [(1, 3000 + v.window), (1, 77), (1, 1024), (5, 2000 + v.window)],
