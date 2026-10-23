@@ -1031,14 +1031,16 @@ def invoke_fused_moe_triton_kernel(
 
     E, N, K = B.size(0), B.size(1), A.size(1)
     block_m = config["BLOCK_SIZE_M"]
-    valid_blocks = int(num_tokens_post_padded.item()) // block_m
 
     # Emit profiler annotation with kernel dimensions and distinct expert count.
-    # Expert count requires device->host sync, so only computed when enabled.
+    # Both valid_blocks and expert count require device->host sync (.item()), so
+    # guard them behind the profiling check — .item() is illegal during HIP/CUDA
+    # stream capture and would cause hipErrorStreamCaptureUnsupported.
     profiling_enabled = (
         envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
     )
     if profiling_enabled:
+        valid_blocks = int(num_tokens_post_padded.item()) // block_m
         ids = expert_ids[(expert_ids >= 0) & (expert_ids < E)]
         n_experts = int((torch.bincount(ids, minlength=E) > 0).sum().item())
         scope_str = (
