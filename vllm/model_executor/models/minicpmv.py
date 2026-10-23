@@ -1444,6 +1444,29 @@ class MiniCPMVBaseModel(nn.Module, SupportsMultiModal, SupportsPP):
         raise NotImplementedError
 
 
+def _mcpmv_patch_attention_mask(
+    tgt_sizes: torch.Tensor, device: torch.types.Device
+) -> torch.Tensor | None:
+    """Build the vpm patch attention mask for the eager encoder path.
+
+    Returns None if no slice is padded, so the encoder skips attention masking
+    and can use a fused attention backend.
+    """
+    num_patches = tgt_sizes.prod(-1)
+    with gpu_sync_allowed():
+        max_patches = num_patches.max().item()
+        if bool((num_patches == max_patches).all()):
+            return None
+    assert isinstance(max_patches, int)
+
+    patch_attn_mask = torch.zeros(
+        (len(num_patches), max_patches), dtype=torch.bool, device=device
+    )
+    for i, num_patches_item in enumerate(num_patches):
+        patch_attn_mask[i, :num_patches_item] = True
+    return patch_attn_mask.unsqueeze(1)
+
+
 # --- Encoder CUDA graph (MiniCPM-V 2.5 / 2.6 / 4.0; mixed into subclasses) ---
 # Buffer keys
 _MINICPMV_CUDAGRAPH_BUF_KEY_TGT_SIZES = "minicpmv_tgt_sizes"
@@ -2106,18 +2129,9 @@ class MiniCPMV2_5(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
             L_item = pixel_values_item.shape[-1]
             all_pixel_values[i, ..., :L_item] = pixel_values_item
 
-        num_patches = tgt_sizes.prod(-1)
-        with gpu_sync_allowed():
-            max_patches = num_patches.max().item()
-        assert isinstance(max_patches, int)
-
-        patch_attn_mask = torch.zeros((B, max_patches), dtype=torch.bool, device=device)
-        for i, num_patches_item in enumerate(num_patches):
-            patch_attn_mask[i, :num_patches_item] = True
-
         vision_embedding = self.vpm(
             all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
+            patch_attention_mask=_mcpmv_patch_attention_mask(tgt_sizes, device),
             tgt_sizes=None,
         )
 
@@ -2203,19 +2217,9 @@ class MiniCPMV2_6(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
             L_item = pixel_values_item.shape[-1]
             all_pixel_values[i, ..., :L_item] = pixel_values_item
 
-        num_patches = tgt_sizes.prod(-1)
-        # Needed as a Python int to size the mask below.
-        with gpu_sync_allowed():
-            max_patches = num_patches.max().item()
-        assert isinstance(max_patches, int)
-
-        patch_attn_mask = torch.zeros((B, max_patches), dtype=torch.bool, device=device)
-        for i, num_patches_item in enumerate(num_patches):
-            patch_attn_mask[i, :num_patches_item] = True
-
         vision_embedding = self.vpm(
             all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
+            patch_attention_mask=_mcpmv_patch_attention_mask(tgt_sizes, device),
             tgt_sizes=tgt_sizes,
         )
 
@@ -2303,18 +2307,9 @@ class MiniCPMV4_0(_MiniCPMVEncoderCudaGraphMixin, SupportsLoRA):
             L_item = pixel_values_item.shape[-1]
             all_pixel_values[i, ..., :L_item] = pixel_values_item
 
-        num_patches = tgt_sizes.prod(-1)
-        with gpu_sync_allowed():
-            max_patches = num_patches.max().item()
-        assert isinstance(max_patches, int)
-
-        patch_attn_mask = torch.zeros((B, max_patches), dtype=torch.bool, device=device)
-        for i, num_patches_item in enumerate(num_patches):
-            patch_attn_mask[i, :num_patches_item] = True
-
         vision_embedding = self.vpm(
             all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
+            patch_attention_mask=_mcpmv_patch_attention_mask(tgt_sizes, device),
             tgt_sizes=tgt_sizes,
         )
 
@@ -2407,18 +2402,9 @@ class MiniCPMV4_5(MiniCPMVBaseModel, SupportsLoRA):
             L_item = pixel_values_item.shape[-1]
             all_pixel_values[i, ..., :L_item] = pixel_values_item
 
-        num_patches = tgt_sizes.prod(-1)
-        with gpu_sync_allowed():
-            max_patches = num_patches.max().item()
-        assert isinstance(max_patches, int)
-
-        patch_attn_mask = torch.zeros((B, max_patches), dtype=torch.bool, device=device)
-        for i, num_patches_item in enumerate(num_patches):
-            patch_attn_mask[i, :num_patches_item] = True
-
         vision_embedding = self.vpm(
             all_pixel_values,
-            patch_attention_mask=patch_attn_mask.unsqueeze(1),
+            patch_attention_mask=_mcpmv_patch_attention_mask(tgt_sizes, device),
             tgt_sizes=tgt_sizes,
         )
 
