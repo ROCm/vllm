@@ -1222,7 +1222,7 @@ struct Decode {
 
 // Per-sequence strides of a batch.
 struct DecodeBatch {
-  int blockTableStride, accStride, statStride, counterStride;
+  int blockTableStride, accStride, statStride, counterStride, mmStride;
 };
 
 template <DecodeConfig C, bool kBatched, typename OutT>
@@ -1238,8 +1238,6 @@ __global__ __launch_bounds__((Decode<C, kBatched>::kThreads)) void decode_attn(
   using K = Decode<C, kBatched>;
   __shared__ __attribute__((aligned(16))) char lds[K::kLds];
   if constexpr (kBatched) {
-    // The ranges are one sequence's.
-    mmRanges = nullptr;
     const int seq = blockIdx.y;
     constexpr int kSeqElems = K::kMaxQueryLen * K::kNumQHeads * K::kHeadDim;
     q += (size_t)seq * kSeqElems;
@@ -1250,6 +1248,8 @@ __global__ __launch_bounds__((Decode<C, kBatched>::kThreads)) void decode_attn(
     partialSum += (size_t)seq * batch.statStride;
     counters += (size_t)seq * batch.counterStride;
     seqLens += seq;
+    // mmStride is 0 without ranges.
+    mmRanges += (size_t)seq * batch.mmStride;
   }
   // Load S and the first pages together.
   const int seqLen = __builtin_amdgcn_readfirstlane(*seqLens);
@@ -1323,7 +1323,7 @@ void launch_decode(const LaunchArgs& a) {
     cooperative |=
         std::max(1, (batchTarget + a.nseq * groups - 1) / (a.nseq * groups))
         << 1;
-    batch = {a.bt_stride, a.acc_stride, a.ml_stride, a.cnt_stride};
+    batch = {a.bt_stride, a.acc_stride, a.ml_stride, a.cnt_stride, a.mm_stride};
   }
   hipLaunchKernelGGL((decode_attn<C, kBatched, elem_t>), grid, threads, 0,
                      a.stream, static_cast<const elem_t*>(a.q),

@@ -227,33 +227,47 @@ void rdna_decode_attn(int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,
                   l.numel() / seqs >= rows && cnt.numel() / seqs >= counters,
               "scratch too small for this build: needs ", rows * d, ", ", rows,
               ", ", rows, ", ", counters, " elements");
-  // [count, start0, end0, ...] in device memory: CUDA graphs read the count
-  // at replay.
+  // Per sequence, [count, start0, end0, ...] in device memory: CUDA graphs
+  // read the counts at replay. One row, or a row per sequence.
   const int* ranges = nullptr;
-  int capacity = 0;
+  int capacity = 0, mm_stride = 0;
   if (mm_ranges.has_value()) {
-    TORCH_CHECK(!batched, "a batched decode build takes no multimodal ranges");
-    TORCH_CHECK(mm_ranges->scalar_type() == torch::kInt32 &&
-                    mm_ranges->is_contiguous() && mm_ranges->dim() == 1 &&
-                    mm_ranges->numel() % 2 == 1 &&
-                    mm_ranges->device() == q.device(),
-                "mm_ranges must be a contiguous int32 [count, start0, end0, "
-                "...] on ",
-                q.device(), ", got ", mm_ranges->scalar_type(), " ",
-                mm_ranges->sizes(), " on ", mm_ranges->device());
+    const bool rows = mm_ranges->dim() == 2;
+    TORCH_CHECK(
+        mm_ranges->scalar_type() == torch::kInt32 &&
+            mm_ranges->is_contiguous() && (mm_ranges->dim() == 1 || rows) &&
+            mm_ranges->size(-1) % 2 == 1 &&
+            (rows ? mm_ranges->size(0) >= nseq : nseq == 1) &&
+            mm_ranges->device() == q.device(),
+        "mm_ranges must be a contiguous int32 [count, start0, end0, "
+        "...], or one such row per sequence, on ",
+        q.device(), ", got ", mm_ranges->scalar_type(), " ", mm_ranges->sizes(),
+        " on ", mm_ranges->device(), " for ", nseq, " sequences");
     ranges = mm_ranges->data_ptr<int>();
-    capacity = static_cast<int>(mm_ranges->numel() / 2);
+    capacity = static_cast<int>(mm_ranges->size(-1) / 2);
+    mm_stride = batched && rows ? static_cast<int>(mm_ranges->stride(0)) : 0;
   }
   const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
-  launchers[config](
-      {q.data_ptr(), kv_cache.data_ptr(), block_table.data_ptr<int>(),
-       acc.data_ptr<float>(), m.data_ptr<float>(), l.data_ptr<float>(),
-       cnt.data_ptr<int>(), out.data_ptr(), seq_lens.data_ptr<int>(),
-       (int)block_table.size(-1), (float)scale,
-       at::cuda::getCurrentCUDAStream(), ranges, capacity, nseq,
-       block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
-       batched ? (int)acc.stride(0) : 0, batched ? (int)m.stride(0) : 0,
-       batched ? (int)cnt.stride(0) : 0});
+  launchers[config]({q.data_ptr(),
+                     kv_cache.data_ptr(),
+                     block_table.data_ptr<int>(),
+                     acc.data_ptr<float>(),
+                     m.data_ptr<float>(),
+                     l.data_ptr<float>(),
+                     cnt.data_ptr<int>(),
+                     out.data_ptr(),
+                     seq_lens.data_ptr<int>(),
+                     (int)block_table.size(-1),
+                     (float)scale,
+                     at::cuda::getCurrentCUDAStream(),
+                     ranges,
+                     capacity,
+                     nseq,
+                     block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
+                     batched ? (int)acc.stride(0) : 0,
+                     batched ? (int)m.stride(0) : 0,
+                     batched ? (int)cnt.stride(0) : 0,
+                     mm_stride});
 }
 
 // One sequence, or a batch with a plan; runs outside CUDA graphs, so

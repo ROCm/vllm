@@ -117,9 +117,9 @@ def _check_one(v, module, lens):
         assert _max_rel(got, ref) <= TOL[v.dtype], f"{v.name}, S={seq_len}"
 
 
-def _check_batch(v, module, lens):
-    """Check a batched build over these lengths, twice on one scratch; a
-    padded sequence (S=0) stays unwritten."""
+def _batch_inputs(v, lens):
+    """Each sequence's (q, kv, block table), and the batch's q, kv and block
+    table over one cache."""
     width = max(lens) // v.page_size + 1
     parts = [_paged_inputs(max(s, 16), v, seed=i) for i, s in enumerate(lens)]
     kv = torch.cat([p[1] for p in parts])
@@ -127,7 +127,13 @@ def _check_batch(v, module, lens):
     block_table = torch.zeros(len(lens), width, device=kv.device, dtype=torch.int32)
     for i, p in enumerate(parts):
         block_table[i, : p[1].shape[0]] = p[2] + int(first[i])
-    q = torch.cat([p[0] for p in parts])
+    return parts, torch.cat([p[0] for p in parts]), kv, block_table
+
+
+def _check_batch(v, module, lens):
+    """Check a batched build over these lengths, twice on one scratch; a
+    padded sequence (S=0) stays unwritten."""
+    parts, q, kv, block_table = _batch_inputs(v, lens)
     scratch = hip.make_scratch(v, q.device, max_seqs=len(lens))
     seq_lens = torch.tensor(lens, device=q.device, dtype=torch.int32)
     out = torch.full_like(q, 7.0)
@@ -756,10 +762,12 @@ def _prefill_batch(v, lens, seed=0):
 
 
 def _serve_batch(
-    v, q, kv, block_table, starts, seq_lens, out, decodes=0, mm_ranges=None
-):
-    """The backend's prefill of a batch; leading decodes on the decode
-    kernel. mm_ranges: each sequence's multimodal ranges."""
+    v, q, kv, block_table, starts, seq_lens, out, decodes=0, mm_ranges=None,
+    decode_m=1, mm_ranges_decode=None,
+):  # fmt: skip
+    """The backend's prefill of a batch; leading decodes of decode_m tokens on
+    the decode kernel. mm_ranges: each sequence's multimodal ranges;
+    mm_ranges_decode: the builder's rows of them for the decode kernel."""
     import types
 
     from vllm.v1.kv_cache_interface import KVQuantMode
@@ -775,7 +783,7 @@ def _serve_batch(
         query_start_loc=starts.to(q.device),
         max_seq_len=int(seq_lens.max()),
         num_decodes=decodes,
-        num_decode_tokens=decodes,
+        num_decode_tokens=decodes * decode_m,
         plans={},
     )
     width = 1 + max(map(len, mm_ranges or [[]]))
@@ -804,6 +812,7 @@ def _serve_batch(
                 dtype=torch.int32,
             ),
             "mm_future_keys": mm_ranges is not None,
+            "mm_ranges_decode": mm_ranges_decode,
         },
     )
     assert served, impl._rejected
@@ -903,6 +912,55 @@ def test_mixed_batch_matches_reference(unit):
                 v.window,
                 f"{unit}: sequence {i} (M={m}, S={s})",
             )
+
+
+def test_mixed_batch_mm_prefix_matches_reference():
+    """Decodes with their own images on the decode kernel, reading rows
+    0..nd-1 of the builder's buffer, beside a prefill chunk with more images
+    than a row holds, which leaves the decodes on the decode kernel."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_attn import (
+        RocmRdnaMetadataBuilder,
+    )
+
+    _skip_unless_gfx1151()
+    v = hip.prefill_variants(32, 8, 128, 16, 0, torch.float16)[0]
+    lens = [(4, 2000), (4, 1500), (500, 1400)]
+    # Images ending among each decode's query tokens; 40 over the chunk.
+    ranges = [
+        [(1956, 1998)],
+        [(1456, 1498)],
+        [(900 + 12 * i, 909 + 12 * i) for i in range(40)],
+    ]
+    q, kv, block_table, starts, seq_lens = _prefill_batch(v, lens)
+    md = types.SimpleNamespace(
+        mm_req_doc_ranges=dict(enumerate(ranges)),
+        seq_lens_cpu_upper_bound=seq_lens,
+        query_start_loc_cpu=starts,
+    )
+    buf = RocmRdnaMetadataBuilder._mm_ranges_decode(
+        types.SimpleNamespace(device=q.device, _mm_rows=4), md
+    )
+    assert buf is not None and buf[2, 0] == 0
+    out = torch.full_like(q, float("nan"))
+    _serve_batch(
+        v, q, kv, block_table, starts, seq_lens, out, decodes=2, mm_ranges=ranges,
+        decode_m=4, mm_ranges_decode=buf,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    for i, (m, s) in enumerate(lens):
+        rows = slice(int(starts[i]), int(starts[i + 1]))
+        pages = block_table[i, : -(-s // v.page_size)]
+        _assert_prefill_close(
+            out[rows], q[rows], kv, pages, s, 0,
+            f"sequence {i} (M={m}, S={s})", ranges[i],
+        )  # fmt: skip
+        causal = _prefill_reference(q[rows], kv, pages, s)
+        ref = _prefill_reference(q[rows], kv, pages, s, 0, ranges[i])
+        assert _max_rel(causal, ref) > 10 * TOL[v.dtype], (
+            f"sequence {i}: the image changed nothing"
+        )
 
 
 def test_prefill_batch_configs_are_well_formed():
@@ -1229,10 +1287,67 @@ def test_graph_replay_follows_mm_ranges():
         assert _max_rel(out.float(), ref) <= TOL[v.dtype], f"ranges={ranges}"
 
 
-@pytest.mark.parametrize("bad", ["even", "int64", "cpu"])
+def test_batched_decode_follows_mm_ranges_per_sequence():
+    """A batched build reads each sequence's row of ranges, eagerly and when a
+    captured graph replays after the rows and lengths are rewritten. A padding
+    sequence (S=0) stays unwritten whatever its row holds, also when the batch
+    shrinks between replays."""
+    v, module = _built(batch=1, max_query_len=lambda m: m >= 4)
+    m, full = v.max_query_len, [1024, 2000, 1500, 1200]
+    parts, q, kv, block_table = _batch_inputs(v, full)
+    scratch = hip.make_scratch(v, q.device, max_seqs=len(full))
+    seq_lens = torch.tensor(full, device=q.device, dtype=torch.int32)
+    out = torch.empty_like(q)
+    # A spare row, as the builder's buffer has one per max_num_seqs.
+    buf = torch.zeros(len(full) + 1, 9, dtype=torch.int32, device=q.device)
+
+    def launch():
+        module.decode_attn(
+            q, kv, block_table, out, *scratch, seq_lens, q.shape[2] ** -0.5, buf
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+
+    def image(s):
+        # Ending among the query tokens: the rows before its end see later keys.
+        return [(s - m - 40, s - m + m // 2)]
+
+    # (lengths, each sequence's ranges); S=0 is CUDA-graph padding, whose row
+    # keeps an earlier step's ranges.
+    stale = image(full[3])
+    steps: list[tuple[list[int], list[list[tuple[int, int]]]]] = [
+        ([1024, 2000, 1500, 0], [image(1024), [], image(1500), stale]),
+        ([1024, 2000, 0, 0], [[], image(2000), stale, stale]),
+        (full, [[], [], [], image(1200)]),
+    ]
+    for lens, step in steps:
+        seq_lens.copy_(torch.tensor(lens, dtype=torch.int32))
+        for i, ranges in enumerate(step):
+            buf[i] = _decode_mm_buf(ranges, q.device)
+        for run in (launch, graph.replay):
+            out.fill_(7.0)
+            run()
+            torch.accelerator.synchronize()
+            for i, (s, ranges) in enumerate(zip(lens, step)):
+                got = out[i * m : (i + 1) * m].float()
+                if s == 0:
+                    assert (got == 7.0).all(), f"{lens}: padding {i} was written"
+                    continue
+                ref = _reference(parts[i][0], parts[i][1], s, v.window, ranges)
+                assert _max_rel(got, ref) <= TOL[v.dtype], f"{step}, sequence {i}"
+                if ranges:
+                    causal = _reference(parts[i][0], parts[i][1], s, v.window)
+                    assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "no change"
+
+
+@pytest.mark.parametrize("bad", ["even", "int64", "cpu", "no_rows"])
 def test_decode_refuses_malformed_mm_ranges(bad):
-    """Only an odd-length int32 [count, start0, end0, ...] on the device
-    reaches the kernel, which sizes its capacity from it."""
+    """Only an odd-length int32 [count, start0, end0, ...], or a row of it per
+    sequence, on the device reaches the kernel, which sizes its capacity from
+    it."""
     v, module = _built()
     q, kv, block_table = _paged_inputs(64, v)
     good = _decode_mm_buf([(10, 40)], q.device)
@@ -1240,6 +1355,7 @@ def test_decode_refuses_malformed_mm_ranges(bad):
         "even": good[:4],
         "int64": good.long(),
         "cpu": good.cpu(),
+        "no_rows": good.view(1, -1)[:0],
     }[bad]
     seq_lens = torch.tensor([64], device=q.device, dtype=torch.int32)
     with pytest.raises(RuntimeError, match="mm_ranges must be"):
@@ -1324,7 +1440,7 @@ def test_mm_ranges_decode_buffer(ranges, seq_len, query_len, expected):
     )
 
     device = torch.device("cpu")
-    buf = mm_ranges_buffer(device)
+    buf = mm_ranges_buffer(device, 1)
     buf.fill_(7)
     md = types.SimpleNamespace(
         mm_req_doc_ranges={0: ranges},
@@ -1332,15 +1448,45 @@ def test_mm_ranges_decode_buffer(ranges, seq_len, query_len, expected):
         query_start_loc_cpu=torch.tensor([0, query_len]),
     )
     out = RocmRdnaMetadataBuilder._mm_ranges_decode(
-        types.SimpleNamespace(device=device), md
+        types.SimpleNamespace(device=device, _mm_rows=1), md
     )
     if expected is None:
         assert out is None
-        assert buf[0] == 0
+        assert buf[0, 0] == 0
     else:
-        assert out is buf
         flat = [x for span in expected for x in span]
-        assert buf[: 1 + len(flat)].tolist() == [len(expected), *flat]
+        assert buf[0, : 1 + len(flat)].tolist() == [len(expected), *flat]
+        assert out is buf
+
+
+def test_mm_ranges_decode_buffer_rows():
+    """Each request's ranges go to its own row, each filtered by its own query
+    tokens; a request without ranges gets a count of 0, whatever an earlier
+    step left in its row. A prefill's row stays empty however many ranges its
+    chunk holds, so it never empties the decodes' rows."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_attn import (
+        RocmRdnaMetadataBuilder,
+        mm_ranges_buffer,
+    )
+
+    device = torch.device("cpu")
+    buf = mm_ranges_buffer(device, 4)
+    buf.fill_(7)
+    md = types.SimpleNamespace(
+        # Request 0 inside image 5; request 2 past its only image; request 3 a
+        # 500-token chunk over all 40 images.
+        mm_req_doc_ranges={0: _MANY, 2: [(10, 20)], 3: _MANY},
+        seq_lens_cpu_upper_bound=torch.tensor([205, 300, 400, 900]),
+        query_start_loc_cpu=torch.tensor([0, 3, 6, 9, 509]),
+    )
+    out = RocmRdnaMetadataBuilder._mm_ranges_decode(
+        types.SimpleNamespace(device=device, _mm_rows=4), md
+    )
+    assert buf[0, :3].tolist() == [1, 200, 209]
+    assert buf[1, 0] == 0 and buf[2, 0] == 0 and buf[3, 0] == 0
+    assert out is buf
 
 
 @pytest.mark.parametrize("overshoot", [False, True], ids=["exact", "async_spec"])
@@ -1371,7 +1517,7 @@ def test_mm_ranges_decode_builder_feeds_kernel(overshoot):
         query_start_loc_cpu=torch.tensor([0, m]),
     )
     buf = RocmRdnaMetadataBuilder._mm_ranges_decode(
-        types.SimpleNamespace(device=q.device), md
+        types.SimpleNamespace(device=q.device, _mm_rows=1), md
     )
     assert buf is not None
     got = _decode_mm(module, v, q, kv, block_table, seq_len, buf)
@@ -1381,8 +1527,58 @@ def test_mm_ranges_decode_builder_feeds_kernel(overshoot):
     assert _max_rel(causal, ref) > 10 * TOL[v.dtype], "the image changed nothing"
 
 
-def test_forward_passes_mm_ranges_to_the_decode_kernel():
-    """Forward hands the builder's buffer to the decode kernel."""
+@pytest.mark.parametrize("overshoot", [False, True], ids=["exact", "async_spec"])
+def test_mm_ranges_decode_builder_feeds_batched_kernel(overshoot):
+    """The builder's rows give a batched build each sequence's mask, also when
+    seq_lens_cpu_upper_bound overshoots by M - 1 rejected drafts."""
+    import types
+
+    from vllm.v1.attention.backends.rocm_rdna_attn import (
+        RocmRdnaMetadataBuilder,
+    )
+
+    v, module = _built(batch=1, max_query_len=lambda m: m >= 4)
+    m, lens = v.max_query_len, [2007, 1200, 1500]
+    parts, q, kv, block_table = _batch_inputs(v, lens)
+    # 40 past images, more than a row holds, and one ending among the query
+    # tokens; none; one ending among the query tokens.
+    ranges = [
+        [(10 + 40 * i, 30 + 40 * i) for i in range(40)]
+        + [(lens[0] - m - 40, lens[0] - 2)],
+        [],
+        [(lens[2] - m - 40, lens[2] - m + m // 2)],
+    ]
+    md = types.SimpleNamespace(
+        mm_req_doc_ranges=dict(enumerate(ranges)),
+        seq_lens_cpu_upper_bound=torch.tensor(lens) + overshoot * (m - 1),
+        query_start_loc_cpu=torch.arange(len(lens) + 1) * m,
+    )
+    buf = RocmRdnaMetadataBuilder._mm_ranges_decode(
+        types.SimpleNamespace(device=q.device, _mm_rows=4), md
+    )
+    assert buf is not None
+    out = torch.full_like(q, float("nan"))
+    seq_lens = torch.tensor(lens, device=q.device, dtype=torch.int32)
+    module.decode_attn(
+        q, kv, block_table, out, *hip.make_scratch(v, q.device, max_seqs=len(lens)),
+        seq_lens, q.shape[2] ** -0.5, buf,
+    )  # fmt: skip
+    torch.accelerator.synchronize()
+    for i, s in enumerate(lens):
+        got = out[i * m : (i + 1) * m].float().nan_to_num(1e9)
+        ref = _reference(parts[i][0], parts[i][1], s, v.window, ranges[i])
+        assert _max_rel(got, ref) <= TOL[v.dtype], f"sequence {i}"
+        if ranges[i]:
+            causal = _reference(parts[i][0], parts[i][1], s, v.window)
+            assert _max_rel(causal, ref) > 10 * TOL[v.dtype], (
+                f"sequence {i}: the image changed nothing"
+            )
+
+
+@pytest.mark.parametrize("nseq", [1, 2], ids=["one_sequence", "batch"])
+def test_forward_passes_mm_ranges_to_the_decode_kernel(nseq):
+    """Forward hands the builder's buffer to the decode kernel, batched or
+    not."""
     import types
 
     from vllm.v1.attention.backends.rocm_rdna_attn import (
@@ -1395,14 +1591,14 @@ def test_forward_passes_mm_ranges_to_the_decode_kernel():
     impl.chunk_lookback = impl._kv_quant_mode = None
     passed = []
     module = types.SimpleNamespace(
-        batched=False, decode_attn=lambda *args: passed.append(args[-1])
+        batched=nseq > 1, decode_attn=lambda *args: passed.append(args[-1])
     )
     impl._prepare = lambda kv_cache, **kwargs: (module, (None,) * 4)
-    buf = torch.zeros(3, dtype=torch.int32)
+    buf = torch.zeros(4, 3, dtype=torch.int32)
     md = RocmRdnaMetadata.__new__(RocmRdnaMetadata)
     for name, value in {
-        "num_actual_tokens": 2,
-        "seq_lens": torch.tensor([100]),
+        "num_actual_tokens": 2 * nseq,
+        "seq_lens": torch.tensor([100] * nseq),
         "block_table": None,
         "max_query_len": 2,
         "causal": True,
@@ -1413,7 +1609,7 @@ def test_forward_passes_mm_ranges_to_the_decode_kernel():
         "rswa_prefix_lens": None,
     }.items():
         setattr(md, name, value)
-    q = torch.zeros(2, HQ, HEAD_DIM, dtype=torch.float16)
+    q = torch.zeros(2 * nseq, HQ, HEAD_DIM, dtype=torch.float16)
     impl.forward(types.SimpleNamespace(), q, q, q, torch.empty(0), md, q.clone())
     assert len(passed) == 1 and passed[0] is buf
 
@@ -1423,7 +1619,7 @@ def test_forward_passes_mm_ranges_to_the_decode_kernel():
     [
         (True, False, 4, True, 1, "do not fit"),
         (True, True, 4, True, 1, None),
-        (True, True, 4, True, 2, "decode batch"),
+        (True, True, 4, True, 2, None),
         (False, False, 1500, False, 1, "past the window"),
         (False, False, 1500, True, 1, None),
         (False, False, 1000, False, 1, None),

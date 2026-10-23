@@ -96,6 +96,7 @@ class _LaunchArgs(ctypes.Structure):
         ("acc_stride", ctypes.c_int),
         ("ml_stride", ctypes.c_int),
         ("cnt_stride", ctypes.c_int),
+        ("mm_stride", ctypes.c_int),
     ]
 
 
@@ -259,18 +260,18 @@ class Jit:
         nseq = q.size(0) // v.max_query_len
         if nseq * v.max_query_len != q.size(0) or (not v.batched and nseq != 1):
             raise RuntimeError(f"q has {q.size(0)} tokens for {v.name}")
-        if mm_ranges is not None and v.batched:
-            raise RuntimeError("a batched decode build takes no multimodal ranges")
+        rows = mm_ranges is not None and mm_ranges.dim() == 2
         if mm_ranges is not None and not (
             mm_ranges.dtype == torch.int32
             and mm_ranges.is_contiguous()
-            and mm_ranges.dim() == 1
-            and mm_ranges.numel() % 2 == 1
+            and mm_ranges.dim() in (1, 2)
+            and mm_ranges.size(-1) % 2 == 1
+            and (mm_ranges.size(0) >= nseq if rows else nseq == 1)
             and mm_ranges.device == q.device
         ):
             raise RuntimeError(
-                "mm_ranges must be a contiguous int32 [count, start0, end0, ...] "
-                f"on {q.device}"
+                "mm_ranges must be a contiguous int32 [count, start0, end0, ...], "
+                f"or one such row per sequence, on {q.device}"
             )
         args = _LaunchArgs(
             q.data_ptr(),
@@ -286,12 +287,13 @@ class Jit:
             scale,
             torch.cuda.current_stream(q.device).cuda_stream,
             mm_ranges.data_ptr() if mm_ranges is not None else None,
-            mm_ranges.numel() // 2 if mm_ranges is not None else 0,
+            mm_ranges.size(-1) // 2 if mm_ranges is not None else 0,
             nseq,
             block_table.stride(0) if block_table.dim() == 2 else 0,
             acc.stride(0) if v.batched else 0,
             m.stride(0) if v.batched else 0,
             cnt.stride(0) if v.batched else 0,
+            mm_ranges.stride(0) if rows and v.batched else 0,
         )
         self._launch(ctypes.byref(args))
 

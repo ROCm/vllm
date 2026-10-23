@@ -73,19 +73,19 @@ _Built = tuple[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 _SCRATCH: dict[tuple[KernelVariant, torch.device], tuple[int, Any]] = {}
 _SCRATCH_BUDGET = 64 * 1024**2
 _PREFILL_SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-# The decode kernel's multimodal ranges, [count, start0, end0, ...] per
-# device. The metadata builder rewrites them every step, so CUDA graphs replay
-# the current ones.
+# The decode kernel's multimodal ranges, a row [count, start0, end0, ...] per
+# request, per device. The metadata builder rewrites them every step, so CUDA
+# graphs replay the current ones.
 MM_RANGES_CAPACITY = 32
-_MM_RANGES: dict[torch.device, torch.Tensor] = {}
+_MM_RANGES: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
-def mm_ranges_buffer(device: torch.device) -> torch.Tensor:
-    if device not in _MM_RANGES:
-        _MM_RANGES[device] = torch.zeros(
-            1 + 2 * MM_RANGES_CAPACITY, dtype=torch.int32, device=device
+def mm_ranges_buffer(device: torch.device, rows: int) -> torch.Tensor:
+    if (device, rows) not in _MM_RANGES:
+        _MM_RANGES[device, rows] = torch.zeros(
+            rows, 1 + 2 * MM_RANGES_CAPACITY, dtype=torch.int32, device=device
         )
-    return _MM_RANGES[device]
+    return _MM_RANGES[device, rows]
 
 
 # Side stream for a mixed batch's decodes, per device.
@@ -130,8 +130,12 @@ def mm_query_overlap(md: CommonAttentionMetadata) -> tuple[bool, int]:
     return future_keys, reach
 
 
-def mm_decode_ranges(md: CommonAttentionMetadata) -> list[tuple[int, int]] | None:
-    """Request 0's non-empty ranges that may hold one of the step's query tokens.
+def mm_decode_ranges(
+    md: CommonAttentionMetadata,
+) -> list[list[tuple[int, int]]] | None:
+    """Per request the decode kernel may serve (at most MAX_M query tokens),
+    its non-empty ranges that may hold one of its query tokens; none for the
+    others, which run on the prefill kernel.
 
     The kernel only bounds the mask of query tokens, so the others change
     nothing. On async spec-decode rows seq_lens_cpu_upper_bound may overshoot
@@ -141,12 +145,18 @@ def mm_decode_ranges(md: CommonAttentionMetadata) -> list[tuple[int, int]] | Non
     """
     if md.mm_req_doc_ranges is None:
         return None
-    spans = [(s, e) for s, e in md.mm_req_doc_ranges.get(0, []) if s < e]
-    if md.seq_lens_cpu_upper_bound is not None:
-        end = int(md.seq_lens_cpu_upper_bound[0])
-        m = int(md.query_start_loc_cpu[1] - md.query_start_loc_cpu[0])
-        spans = [(s, e) for s, e in spans if s <= end - 1 and e >= end - 2 * m + 1]
-    return spans
+    starts = md.query_start_loc_cpu
+    per_request: list[list[tuple[int, int]]] = [[] for _ in range(len(starts) - 1)]
+    for i, ranges in md.mm_req_doc_ranges.items():
+        m = int(starts[i + 1] - starts[i])
+        if m > MAX_M:
+            continue
+        spans = [(s, e) for s, e in ranges if s < e]
+        if md.seq_lens_cpu_upper_bound is not None:
+            end = int(md.seq_lens_cpu_upper_bound[i])
+            spans = [(s, e) for s, e in spans if s <= end - 1 and e >= end - 2 * m + 1]
+        per_request[i] = spans
+    return per_request
 
 
 @dataclass
@@ -182,6 +192,7 @@ class RocmRdnaMetadataBuilder(TritonAttentionMetadataBuilder):
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         if self.reorder_batch_threshold is not None:
             self.reorder_batch_threshold = min(self.reorder_batch_threshold, MAX_M)
+        self._mm_rows = self.vllm_config.scheduler_config.max_num_seqs
 
     def build(
         self,
@@ -210,17 +221,23 @@ class RocmRdnaMetadataBuilder(TritonAttentionMetadataBuilder):
         )
 
     def _mm_ranges_decode(self, md: CommonAttentionMetadata) -> torch.Tensor | None:
-        """Write mm_decode_ranges to mm_ranges_buffer."""
-        spans = mm_decode_ranges(md)
-        if spans is None:
+        """Write mm_decode_ranges to mm_ranges_buffer, a row per request."""
+        per_request = mm_decode_ranges(md)
+        if per_request is None:
             return None
-        buf = mm_ranges_buffer(self.device)
-        if len(spans) > MM_RANGES_CAPACITY:
+        buf = mm_ranges_buffer(self.device, self._mm_rows)
+        if len(per_request) > buf.shape[0] or any(
+            len(spans) > MM_RANGES_CAPACITY for spans in per_request
+        ):
             # A replayed CUDA graph must not read an earlier step's ranges.
-            buf[:1].fill_(0)
+            buf[:, 0].fill_(0)
             return None
-        flat = [len(spans), *(x for span in spans for x in span)]
-        buf[: len(flat)].copy_(torch.tensor(flat, dtype=torch.int32), non_blocking=True)
+        rows = torch.zeros(len(per_request), buf.shape[1], dtype=torch.int32)
+        for i, spans in enumerate(per_request):
+            if spans:
+                rows[i, 0] = len(spans)
+                rows[i, 1 : 1 + 2 * len(spans)] = torch.tensor(spans).flatten()
+        buf[: len(per_request)].copy_(rows, non_blocking=True)
         return buf
 
 
@@ -391,17 +408,13 @@ class RocmRdnaAttentionImpl(TritonAttentionImpl):
         win = self._served_window(kwargs)
         if win is None:
             return None
-        nseq = kwargs["seqused_k"].shape[0]
-        # One sequence's decode reads the ranges from mm_ranges_decode; without
-        # it, causal is right unless a query token's range has later keys.
-        if kwargs.get("mm_future_keys"):
-            if nseq > 1:
-                self._reject("decode batch: a multimodal range has later keys")
-                return None
-            if kwargs.get("mm_ranges_decode") is None:
-                self._reject("decode: multimodal ranges with later keys do not fit")
-                return None
+        # The decode kernel reads the ranges from mm_ranges_decode; without it,
+        # causal is right unless a query token's range has later keys.
+        if kwargs.get("mm_future_keys") and kwargs.get("mm_ranges_decode") is None:
+            self._reject("decode: multimodal ranges with later keys do not fit")
+            return None
         # One build per M.
+        nseq = kwargs["seqused_k"].shape[0]
         max_query_len = kwargs["max_seqlen_q"]
         if kwargs["q"].shape[0] != nseq * max_query_len:
             self._reject("sequences of unequal query length")
@@ -732,6 +745,5 @@ class RocmRdnaAttentionImpl(TritonAttentionImpl):
             # A device tensor, so CUDA graphs follow the sequence length.
             kwargs["seqused_k"],
             kwargs["softmax_scale"],
-            # The ranges are request 0's.
-            None if module.batched else kwargs.get("mm_ranges_decode"),
+            kwargs.get("mm_ranges_decode"),
         )
