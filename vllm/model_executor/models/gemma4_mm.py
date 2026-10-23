@@ -70,6 +70,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.ops.vit_attn_wrappers import (
+    rdna_hf_segments,
+    register_rdna_hf_attention,
+)
 
 from .interfaces import (
     MultiModalEmbeddings,
@@ -86,6 +91,7 @@ from .utils import (
     init_vllm_registered_model,
     maybe_prefix,
 )
+from .vision import get_vit_attn_backend
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -1096,6 +1102,18 @@ class Gemma4ForConditionalGeneration(
         # ---- Vision tower (shared by image and video) ----
         with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.vision_tower = AutoModel.from_config(config=config.vision_config)
+            # ROCM_RDNA_ATTN, on request, through a transformers attention
+            # function; the encoder calls give it their segments.
+            self._rdna_vision = (
+                get_vit_attn_backend(
+                    config.vision_config.head_dim, vllm_config.model_config.dtype
+                )
+                == AttentionBackendEnum.ROCM_RDNA_ATTN
+            )
+            if self._rdna_vision:
+                self.vision_tower.config._attn_implementation = (
+                    register_rdna_hf_attention()
+                )
             self.embed_vision = Gemma4MultimodalEmbedder(
                 config.vision_config,
                 config.text_config,
@@ -1296,6 +1314,33 @@ class Gemma4ForConditionalGeneration(
     # Image processing
     # ------------------------------------------------------------------ #
 
+    def _vision_encoder(
+        self,
+        inputs_embeds: torch.Tensor,
+        padding: torch.Tensor,
+        pixel_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """The vision tower's encoder on (images, patches); with
+        ROCM_RDNA_ATTN each image's patches, then its padding, as segments."""
+        seg_lens: list[int] | None = None
+        # HuggingFace's mask builder probes `padding_mask.all()`, and the
+        # segments come from the host.
+        with gpu_sync_allowed():
+            if self._rdna_vision:
+                rows = padding.tolist()
+                # Each image's patches, then its padding (at the end, or SDPA).
+                valid = [r.index(True) if True in r else len(r) for r in rows]
+                if all(not any(r[:n]) and all(r[n:]) for r, n in zip(rows, valid)):
+                    seg_lens = [
+                        m for r, n in zip(rows, valid) for m in (n, len(r) - n) if m
+                    ]
+            with rdna_hf_segments(seg_lens):
+                return self.vision_tower.encoder(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=~padding,
+                    pixel_position_ids=pixel_position_ids,
+                ).last_hidden_state
+
     def _process_image_input(
         self,
         image_input: Gemma4ImageInputs,
@@ -1399,15 +1444,9 @@ class Gemma4ForConditionalGeneration(
                     pp_tensor,
                     pad_tensor,
                 ).to(self.model_dtype)
-                # HuggingFace's mask builder probes `padding_mask.all()` to
-                # decide whether the mask can be skipped, which syncs.
-                with gpu_sync_allowed():
-                    encoder_outputs = vt.encoder(
-                        inputs_embeds=inputs_embeds,
-                        attention_mask=~pad_tensor,
-                        pixel_position_ids=pp_tensor,
-                    )
-                hidden_states = encoder_outputs.last_hidden_state
+                hidden_states = self._vision_encoder(
+                    inputs_embeds, pad_tensor, pp_tensor
+                )
 
                 for i, (orig_idx, _, _) in enumerate(chunk_items):
                     last_hidden_states_map[orig_idx] = hidden_states[i]
@@ -1517,14 +1556,9 @@ class Gemma4ForConditionalGeneration(
                 pp_chunk,
                 pad_chunk,
             ).to(self.model_dtype)
-            # HuggingFace's mask builder probes `padding_mask.all()`.
-            with gpu_sync_allowed():
-                encoder_outputs = vt.encoder(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=~pad_chunk,
-                    pixel_position_ids=pp_chunk,
-                )
-            last_hidden_states_list.append(encoder_outputs.last_hidden_state)
+            last_hidden_states_list.append(
+                self._vision_encoder(inputs_embeds, pad_chunk, pp_chunk)
+            )
 
         last_hidden_states = torch.cat(last_hidden_states_list, dim=0)
 

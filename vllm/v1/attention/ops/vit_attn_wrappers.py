@@ -11,6 +11,8 @@ latencies by ~7% (see qwen2_5_vl for example usage)
 To use these ops, you must have a recent version of PyTorch installed (>= 2.4.0)
 """
 
+import contextlib
+import contextvars
 import weakref
 from typing import Any
 
@@ -583,3 +585,65 @@ def vit_flashinfer_wrapper(
         v_scale,
         o_data_type,
     )
+
+
+# ROCM_RDNA_ATTN for the Hugging Face towers a model runs as they are (Gemma
+# 4): a transformers attention function, given the call's segments by
+# rdna_hf_segments around the tower; SDPA without them.
+RDNA_HF_ATTENTION = "vllm_rocm_rdna"
+_RDNA_HF_SEGMENTS: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "rdna_hf_segments", default=None
+)
+
+
+@contextlib.contextmanager
+def rdna_hf_segments(seg_lens: list[int] | None):
+    """Segments of the (batch * tokens) rows of the attention calls within."""
+    token = _RDNA_HF_SEGMENTS.set(seg_lens)
+    try:
+        yield
+    finally:
+        _RDNA_HF_SEGMENTS.reset(token)
+
+
+def rdna_hf_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    dropout: float = 0.0,
+    scaling: float | None = None,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """An attention function of transformers: (batch, heads, tokens, D) in,
+    (batch, tokens, heads, D) out."""
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    from vllm.v1.attention.ops import rocm_rdna_encoder
+
+    seg_lens = _RDNA_HF_SEGMENTS.get()
+    b, h, s, d = query.shape
+    if seg_lens is not None and sum(seg_lens) == b * s and not dropout:
+        q, k, v = (
+            x.transpose(1, 2).reshape(b * s, x.shape[1], d) for x in (query, key, value)
+        )
+        if rocm_rdna_encoder.unsupported(q, k.shape[1], seg_lens) is None:
+            out = rocm_rdna_encoder.forward(
+                q, k, v, seg_lens, d**-0.5 if scaling is None else scaling
+            )
+            return out.view(b, s, h, d), None
+    return sdpa_attention_forward(
+        module, query, key, value, attention_mask,
+        dropout=dropout, scaling=scaling, **kwargs,
+    )  # fmt: skip
+
+
+def register_rdna_hf_attention() -> str:
+    """Register rdna_hf_attention (masks as SDPA's) with transformers."""
+    from transformers import AttentionInterface, AttentionMaskInterface
+    from transformers.masking_utils import sdpa_mask
+
+    AttentionInterface.register(RDNA_HF_ATTENTION, rdna_hf_attention)
+    AttentionMaskInterface.register(RDNA_HF_ATTENTION, sdpa_mask)
+    return RDNA_HF_ATTENTION

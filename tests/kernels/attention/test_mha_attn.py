@@ -575,3 +575,43 @@ def test_mha_attn_rdna_falls_back_to_triton(default_vllm_config, monkeypatch):
     assert served == []
     ref = ref_attention(q.float(), k.float(), v.float(), scale=40**-0.5)
     torch.testing.assert_close(out.float().view_as(ref), ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("head_size", [64, 72])
+def test_rdna_hf_attention_matches_sdpa(head_size):
+    """The transformers attention function (Gemma 4's vision tower): with
+    each image's patches and padding as segments, SDPA's masked result on the
+    patches; without segments, SDPA."""
+    from vllm.platforms.rocm import on_gfx1151
+    from vllm.v1.attention.ops import rocm_rdna_hip, vit_attn_wrappers
+
+    if not current_platform.is_rocm() or not on_gfx1151():
+        pytest.skip("ROCM_RDNA_ATTN runs on gfx1151")
+    heads = 16 if head_size == 72 else 12
+    dtype = torch.bfloat16
+    if not rocm_rdna_hip.prefill_variants(
+        heads, heads, head_size, 16, 0, dtype, causal=False
+    ):
+        pytest.skip("_rocm_C carries no non-causal build of the shape")
+    torch.manual_seed(0)
+    valid, tokens = [250, 300], 300
+    q, k, v = (
+        torch.randn(2, heads, tokens, head_size, device="cuda", dtype=dtype)
+        for _ in range(3)
+    )
+    keep = (
+        torch.arange(tokens, device="cuda")[None]
+        < torch.tensor(valid, device="cuda")[:, None]
+    )
+    mask = keep[:, None, None, :]
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+
+    module = torch.nn.Module()
+    module.is_causal = False
+    ref, _ = sdpa_attention_forward(module, q, k, v, mask, scaling=1.0)
+    segments = [n for m in valid for n in (m, tokens - m) if n]
+    with vit_attn_wrappers.rdna_hf_segments(segments):
+        out, _ = vit_attn_wrappers.rdna_hf_attention(module, q, k, v, mask, scaling=1.0)
+    torch.testing.assert_close(out[keep], ref[keep], atol=2e-2, rtol=2e-2)
+    plain, _ = vit_attn_wrappers.rdna_hf_attention(module, q, k, v, mask, scaling=1.0)
+    torch.testing.assert_close(plain, ref, atol=0, rtol=0)
