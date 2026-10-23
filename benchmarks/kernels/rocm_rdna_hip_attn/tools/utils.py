@@ -68,6 +68,7 @@ PREFILL_KNOBS = (
     "key_waves",
     "max_segments",
     "head_group",
+    "row_tiles",
 )
 
 
@@ -178,6 +179,30 @@ def roofline_us(
 ) -> float:
     """`roofline`'s floor alone, in microseconds."""
     return roofline(hq, hkv, d, m, s, itemsize, block_size, window)[0]
+
+
+def roofline_noncausal(
+    hq: int, hkv: int, d: int, segs: list[int], itemsize: int = 2
+) -> tuple[float, str]:
+    """The floor of one non-causal call over sequences of `segs` tokens, each
+    query seeing every key of its sequence, with the WMMA prefill model: Q, K,
+    V and the output at peak bandwidth against the 16x16 score tiles at peak
+    throughput, plus a dispatch and three DRAM round trips.
+
+    Returns:
+        (microseconds, "memory" or "compute").
+
+    """
+    t, g = WMMA_TILE, hq // hkv
+    n = sum(segs)
+    moved = (2 * n * hq + 2 * n * hkv) * d * itemsize
+    memory_us = moved / (PEAK_GIBS * 1024**3) * 1e6
+    tiles = sum(-(-s * g // t) * -(-s // t) for s in segs) * hkv
+    compute_us = tiles * 4 * d * t**2 / (PEAK_TFLOPS * 1e6) + (
+        tiles * SOFTMAX_CYCLES / (SIMDS * WMMA_GHZ * 1e3)
+    )
+    bound = "compute" if compute_us > memory_us else "memory"
+    return DISPATCH_US + 3 * DRAM_LATENCY_US + max(memory_us, compute_us), bound
 
 
 def add_dtype_argument(p: argparse.ArgumentParser) -> None:
