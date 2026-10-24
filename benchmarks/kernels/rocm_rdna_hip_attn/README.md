@@ -1,6 +1,7 @@
 # RDNA3.5 attention: adding, tuning and checking a configuration
 
-`ROCM_RDNA_ATTN` (gfx1151, selected by default there) runs decodes
+`ROCM_RDNA_ATTN` (gfx1150..gfx1153, selected by default on gfx1150 and gfx1151)
+runs decodes
 of up to 8 query tokens per sequence on
 `csrc/rocm/rdna_decode_attn.cu` and everything else on
 `csrc/rocm/rdna_prefill_attn.cu`. Its tables, in `csrc/rocm/`:
@@ -12,14 +13,16 @@ of up to 8 query tokens per sequence on
 | `rdna_prefill_configs.h` | prefill builds, one per step of M | one sequence |
 | `rdna_prefill_batch_configs.h` | per batch cell, a prefill build and head group | a batch of sequences |
 
-Calls without a build run on Triton.
+Calls without a build run on Triton. Each file has a table per GPU family:
+gfx1151's (1536 VGPRs a SIMD lane) and gfx1150's (1024), which gfx1152 and
+gfx1153 also use. The tools tune and write the tables of the GPU they run on.
 
 A *configuration* is `(Hq, Hkv, D, window, page size)`, in fp16 and bf16.
 
 ## Requirements
 
-- A gfx1151 GPU and a vLLM build of this tree; run from the tree root with
-  `PYTHONPATH=$PWD`.
+- A gfx1150..gfx1153 GPU and a vLLM build of this tree for it; run from the
+  tree root with `PYTHONPATH=$PWD`.
 - `D` in 64, 96, 128, 256, 512, `Hq % Hkv == 0`, and a page size that is a
   multiple of 16 (the one vLLM uses for the model, e.g. 544 for Qwen3.5-0.8B).
 - Nothing else running on the GPU.
@@ -78,7 +81,11 @@ PYTHONPATH=$PWD .venv/bin/python \
 ```
 
 An entry serves M from its `min_query_len` up to the next entry's. Steps start
-at 16, 32, ..., 4096; the first entry also serves 9 to 15 tokens.
+at 16, 32, ..., 8192 (vLLM's default chunk); the first entry also serves 9 to 15
+tokens. `--steps 8192` tunes only that step; `--apply` keeps the others. A step's
+winner loses at most `--prefill-loss-limit` (2%) to the current entry at any
+cell; `--reselect decisions.jsonl --decisions out.jsonl` chooses stored
+decisions again from their A/B samples, without timing.
 
 ## Batched prefill
 

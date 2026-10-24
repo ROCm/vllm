@@ -494,8 +494,9 @@ def _get_backend_priorities(
             ]
 
     backends = []
-    # Its validation rejects what it does not support.
-    if on_gfx1151():
+    # Its validation rejects what it does not support. gfx1152 and gfx1153 can
+    # select it but are not tested yet.
+    if on_gfx1150() or on_gfx1151():
         backends.append(AttentionBackendEnum.ROCM_RDNA_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
