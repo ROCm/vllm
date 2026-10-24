@@ -324,15 +324,34 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
       V0 += (s.x + s.y);                                             \
     }
 #elif defined(__HIP__GFX1X__)
-  // gfx1x: v_dot2_f32_f16 (VOP3-P, dot10-insts, available on gfx11+gfx12)
-  #define DOT2C(V0, V2, V3)                                               \
-    if constexpr (std::is_same_v<scalar_t, half>) {                       \
-      asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
-    } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {      \
-      float2 s = __bfloat1622float2(*((__hip_bfloat162*)(&(V2)))) *       \
-                 __bfloat1622float2(*((__hip_bfloat162*)(&(V3))));        \
-      V0 += (s.x + s.y);                                                  \
+  // gfx1x: v_dot2_f32_f16 and v_dot2_f32_bf16 (VOP3-P, gfx11 and gfx12). The
+  // bf16 dot keeps the weights packed; widening them to f32 first doubles
+  // their registers and makes the large tiles spill.
+  #define DOT2C(V0, V2, V3)                                                \
+    if constexpr (std::is_same_v<scalar_t, half>) {                        \
+      asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3));  \
+    } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {       \
+      asm("v_dot2_f32_bf16 %0, %1, %2, %0" : "+v"(V0) : "v"(V2), "v"(V3)); \
     }
+#endif
+
+#if defined(__HIP__GFX1X__)
+  // VGPRs a lane holds: 1024 on gfx1102, gfx1103 and gfx1150..gfx1153, else
+  // 1536.
+  #if defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || \
+      defined(__gfx1152__) || defined(__gfx1153__)
+inline constexpr int kLaneVgprs = 1024;
+  #else
+inline constexpr int kLaneVgprs = 1536;
+  #endif
+// The VGPRs a wave of a THREADS-thread workgroup gets: its wave32 waves share
+// a WGP's four SIMDs.
+__device__ constexpr int wave_vgprs(int threads) {
+  const int vgprs = kLaneVgprs / ((threads / 32 + 3) / 4);
+  return vgprs < 256 ? vgprs : 256;
+}
+// Registers beside the operand tiles: sums, addresses, loop state.
+inline constexpr int kOperandSlackVgprs = 64;
 #endif
 
 // To avoid LLVM silently upcasting to double
@@ -483,10 +502,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     // are being worked on by each wave.
     //----------------------------------------------------
     float sum[N][YTILE] = {};
-    scalar8 sum4[N][YTILE] = {};
+    [[maybe_unused]] scalar8 sum4[N][YTILE] = {};
 
     for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
-      bigType bigA[N][UNRL] = {};
       bigType bigB[YTILE][UNRL];
       // Fetch the weight matrix from memory!
   #pragma unroll
@@ -498,29 +516,59 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           bigB[y][k2].h8 = (loadnt((scalar8*)(&B_[min__(y + m, M - 1) * Kbp])));
       }
 
-      // Fetch activation matrix from either just LDS or from both LDS / memory
+  #if defined(__HIP__GFX1X__)
+      // Hold the activation chunks too while they fit; else read each
+      // where it is used, so only the weights' loads stay in flight.
+      constexpr bool hold_a =
+          (N + YTILE) * UNRL * (A_CHUNK / 2) + kOperandSlackVgprs <=
+          wave_vgprs(WvPrGrp * THRDS);
+  #else
+      constexpr bool hold_a = true;
+  #endif
+      if constexpr (hold_a) {
+        bigType bigA[N][UNRL] = {};
+        // Fetch activation matrix from either just LDS or from both LDS /
+        // memory
   #pragma unroll
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
-        uint32_t k_ = k + threadIdx.x * A_CHUNK;
-        if (k_ >= K) break;
-        for (int n = 0; n < N; n++) {
-          bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
+        for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+          uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+          uint32_t k_ = k + threadIdx.x * A_CHUNK;
+          if (k_ >= K) break;
+          for (int n = 0; n < N; n++) {
+            bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
+          }
         }
-      }
 
-      // Do the matrix multiplication in interleaved manner
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        for (uint32_t n = 0; n < N; n++) {
-          for (int y = 0; y < YTILE; y++) {
-            if constexpr (!use_mfma)
+        // Do the matrix multiplication in interleaved manner
+        for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+          for (uint32_t n = 0; n < N; n++) {
+            for (int y = 0; y < YTILE; y++) {
+              if constexpr (!use_mfma)
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+                }
+              else
+                for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                  sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
+                      bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0,
+                      0);
+            }
+          }
+        }
+      } else {
+  #pragma unroll
+        for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+          uint32_t k_ = k1 + k2 * THRDS * A_CHUNK + threadIdx.x * A_CHUNK;
+  #pragma unroll
+          for (uint32_t n = 0; n < N; n++) {
+            bigType a = {};
+            if (k_ < K) a = *((const bigType*)(&(s[k_ + Kap * n])));
+  #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+  #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+                DOT2C(sum[n][y], a.f[b], bigB[y][k2].f[b])
               }
-            else
-              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
-                sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
-                    bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0, 0);
           }
         }
       }
@@ -713,10 +761,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
   while (m < M) {
     float sum[N][YTILE] = {};
-    scalar8 sum4[N][YTILE] = {};
+    [[maybe_unused]] scalar8 sum4[N][YTILE] = {};
 
     for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
-      bigType bigA[N][UNRL] = {};
       bigType bigB[YTILE][UNRL];
       // Fetch the weight matrix from memory!
   #pragma unroll
@@ -728,32 +775,67 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           bigB[y][k2].h8 = (loadnt((scalar8*)(&B_[min__(y + m, M - 1) * Kbp])));
       }
 
-      // Fetch activation matrix from either just LDS or from both LDS / memory
+  #if defined(__HIP__GFX1X__)
+      // Hold the activation chunks too while they fit; else read each
+      // where it is used, so only the weights' loads stay in flight.
+      constexpr bool hold_a =
+          (N + YTILE) * UNRL * (A_CHUNK / 2) + kOperandSlackVgprs <=
+          wave_vgprs(WvPrGrp * THRDS);
+  #else
+      constexpr bool hold_a = true;
+  #endif
+      if constexpr (hold_a) {
+        bigType bigA[N][UNRL] = {};
+        // Fetch activation matrix from either just LDS or from both LDS /
+        // memory
   #pragma unroll
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
-        uint32_t k_ = k + threadIdx.x * A_CHUNK;
-        if (k_ >= K) break;
-        for (int n = 0; n < N; n++) {
-          if (k_ + Kap * n < max_lds_len)
-            bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
-          else
-            bigA[n][k2] = *((const bigType*)(&(A[k_ + Kap * n])));
-        }
-      }
-
-      // Do the matrix multiplication in interleaved manner
-      for (uint32_t n = 0; n < N; n++) {
         for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-          for (int y = 0; y < YTILE; y++) {
-            if constexpr (!use_mfma)
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
-              }
+          uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+          uint32_t k_ = k + threadIdx.x * A_CHUNK;
+          if (k_ >= K) break;
+          for (int n = 0; n < N; n++) {
+            if (k_ + Kap * n < max_lds_len)
+              bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
             else
-              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
-                sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
-                    bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0, 0);
+              bigA[n][k2] = *((const bigType*)(&(A[k_ + Kap * n])));
+          }
+        }
+
+        // Do the matrix multiplication in interleaved manner
+        for (uint32_t n = 0; n < N; n++) {
+          for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+            for (int y = 0; y < YTILE; y++) {
+              if constexpr (!use_mfma)
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+                }
+              else
+                for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                  sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
+                      bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0,
+                      0);
+            }
+          }
+        }
+      } else {
+  #pragma unroll
+        for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+          uint32_t k_ = k1 + k2 * THRDS * A_CHUNK + threadIdx.x * A_CHUNK;
+  #pragma unroll
+          for (uint32_t n = 0; n < N; n++) {
+            bigType a = {};
+            if (k_ < K) {
+              if (k_ + Kap * n < max_lds_len)
+                a = *((const bigType*)(&(s[k_ + Kap * n])));
+              else
+                a = *((const bigType*)(&(A[k_ + Kap * n])));
+            }
+  #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                DOT2C(sum[n][y], a.f[b], bigB[y][k2].f[b])
+              }
           }
         }
       }
@@ -1010,7 +1092,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     // are being worked on by each wave.
     //----------------------------------------------------
     float sum[N][YTILE] = {};
-    scalar8 sum4[N][YTILE] = {};
+    [[maybe_unused]] scalar8 sum4[N][YTILE] = {};
 
     //----------------------------------------------------
     // Fetch weight matrix B in interleaved K-split!
@@ -1030,7 +1112,6 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     // TODO: Logic below will only work when K is multiple of 8
     //----------------------------------------------------
     for (uint32_t k1 = 0; k1 < K; k1 += THRDS * A_CHUNK * UNRL) {
-      bigType bigA[N][UNRL] = {};
       bigType bigB[YTILE][UNRL];
 
   #ifdef PCML
@@ -1067,37 +1148,76 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           bigB[y][k2].h8 = (loadnt((scalar8*)(&B_[min__(y + m, M - 1) * Kbp])));
       }
 
-      // Fetch activation matrix from either just LDS or from both LDS / memory
-  #pragma unroll
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
-        uint32_t k_ = k + threadIdx.x * A_CHUNK;
-        if (k_ >= K) break;
-        for (int n = 0; n < N; n++) {
-  #ifdef PCML
-          bigA[n][k2] = *((const bigType*)(&(s[k_ - kBase + kFit * n])));
+  #if defined(__HIP__GFX1X__)
+      // Hold the activation chunks too while they fit; else read each
+      // where it is used, so only the weights' loads stay in flight.
+      constexpr bool hold_a =
+          (N + YTILE) * UNRL * (A_CHUNK / 2) + kOperandSlackVgprs <=
+          wave_vgprs(WvPrGrp * THRDS);
   #else
-          if (k_ + Kap * n < max_lds_len)
-            bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
-          else
-            bigA[n][k2] = *((const bigType*)(&(A[k_ + Kap * n])));
+      constexpr bool hold_a = true;
   #endif
-        }
-      }
-
-      // Do the matrix multiplication in interleaved manner
+      if constexpr (hold_a) {
+        bigType bigA[N][UNRL] = {};
+        // Fetch activation matrix from either just LDS or from both LDS /
+        // memory
   #pragma unroll
-      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
-        for (uint32_t n = 0; n < N; n++) {
-          for (int y = 0; y < YTILE; y++) {
-            if constexpr (!use_mfma)
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
-              }
+        for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+          uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+          uint32_t k_ = k + threadIdx.x * A_CHUNK;
+          if (k_ >= K) break;
+          for (int n = 0; n < N; n++) {
+  #ifdef PCML
+            bigA[n][k2] = *((const bigType*)(&(s[k_ - kBase + kFit * n])));
+  #else
+            if (k_ + Kap * n < max_lds_len)
+              bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
             else
-              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
-                sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
-                    bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0, 0);
+              bigA[n][k2] = *((const bigType*)(&(A[k_ + Kap * n])));
+  #endif
+          }
+        }
+
+        // Do the matrix multiplication in interleaved manner
+  #pragma unroll
+        for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+          for (uint32_t n = 0; n < N; n++) {
+            for (int y = 0; y < YTILE; y++) {
+              if constexpr (!use_mfma)
+                for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                  DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+                }
+              else
+                for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                  sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
+                      bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0,
+                      0);
+            }
+          }
+        }
+      } else {
+  #pragma unroll
+        for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+          uint32_t k_ = k1 + k2 * THRDS * A_CHUNK + threadIdx.x * A_CHUNK;
+  #pragma unroll
+          for (uint32_t n = 0; n < N; n++) {
+            bigType a = {};
+            if (k_ < K) {
+  #ifdef PCML
+              a = *((const bigType*)(&(s[k_ - kBase + kFit * n])));
+  #else
+              if (k_ + Kap * n < max_lds_len)
+                a = *((const bigType*)(&(s[k_ + Kap * n])));
+              else
+                a = *((const bigType*)(&(A[k_ + Kap * n])));
+  #endif
+            }
+  #pragma unroll
+            for (int y = 0; y < YTILE; y++)
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                DOT2C(sum[n][y], a.f[b], bigB[y][k2].f[b])
+              }
           }
         }
       }
