@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.platform_utils import is_uva_available
+from vllm.utils.platform_utils import is_pin_memory_available, is_uva_available
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
@@ -36,9 +36,11 @@ def async_copy_to_gpu(
         assert device is not None
         out = torch.empty_like(x, device=device)
 
-    # Copy directly to GPU — explicit pin_memory() causes sporadic stalls
-    # under high concurrency due to CUDA driver contention. The driver
-    # handles the transfer efficiently without manual pinning.
+    if not x.is_pinned() and is_pin_memory_available():
+        # A non_blocking copy from pageable memory is not reliable on ROCm:
+        # stage it through the caching host allocator, as async_tensor_h2d
+        # does on main.
+        x = torch.empty(x.shape, dtype=x.dtype, device="cpu", pin_memory=True).copy_(x)
     return out.copy_(x, non_blocking=True)
 
 
