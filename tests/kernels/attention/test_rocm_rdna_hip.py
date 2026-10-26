@@ -5,9 +5,11 @@ fallback to Triton for unsupported calls."""
 
 import functools
 import itertools
+from pathlib import Path
 
 import numpy as np
 import pytest
+import regex as re
 import torch
 
 from vllm.platforms import current_platform
@@ -22,11 +24,34 @@ TOL = {torch.float16: 1e-3, torch.bfloat16: 8e-3}
 DTYPES = list(TOL)
 
 
-def _skip_unless_gfx1151():
-    from vllm.platforms.rocm import on_gfx1151
+_CONFIG_ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
 
-    if not on_gfx1151():
-        pytest.skip("kernel is built for gfx1151")
+
+@pytest.mark.parametrize(
+    "kind, shape_fields",
+    [("decode", 7), ("decode_batch", 7), ("prefill", 6), ("prefill_batch", 5)],
+)
+def test_gfx1150_configs_cover_the_same_shapes(kind, shape_fields):
+    """gfx1150's tables serve the shapes gfx1151's serve."""
+    csrc = Path(__file__).resolve().parents[3] / "csrc" / "rocm"
+    text = (csrc / f"rdna_{kind}_configs.h").read_text()
+    shapes = {}
+    for table in text.split("inline constexpr ")[1:]:
+        if name := re.match(r"\w+ k(Gfx\d+)\w*Configs\[\] = \{", table):
+            entries = [
+                m[1].split(", ")
+                for m in map(_CONFIG_ENTRY.match, table.split("\n"))
+                if m
+            ]
+            shapes[name[1]] = {tuple(e[:shape_fields]) for e in entries}
+    assert shapes["Gfx1151"] and shapes["Gfx1151"] == shapes["Gfx1150"]
+
+
+def _skip_unless_gfx115x():
+    from vllm.platforms.rocm import on_gfx115x
+
+    if not on_gfx115x():
+        pytest.skip("kernels are built for gfx1150..gfx1153")
 
 
 def _built(dtype=torch.float16, batch=0, **want):
@@ -41,7 +66,7 @@ def _built(dtype=torch.float16, batch=0, **want):
         (variant, module).
 
     """
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     for v in hip.variants():
         if (
             v.dtype == dtype
@@ -181,7 +206,7 @@ def test_decode_configs_are_well_formed():
 
 
 def test_every_listed_variant_is_built_in():
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     # Raises if a build has no instantiation unit.
     assert torch.ops._rocm_C.rdna_decode_configs()
     assert torch.ops._rocm_C.rdna_decode_batch_configs()
@@ -192,7 +217,7 @@ def test_every_listed_variant_is_built_in():
 @pytest.mark.parametrize("unit", sorted({_unit(v) for v in hip.variants()}))
 def test_built_in_variants_match_reference(unit):
     """Every built decode variant matches the reference."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     for v in hip.variants():
         if _unit(v) != unit:
             continue
@@ -391,10 +416,11 @@ def test_non_decode_batches_fall_back_to_triton(nseq, tokens, max_q, reason):
     assert reason in impl._rejected
 
 
-@pytest.mark.parametrize("gfx1151", [True, False])
+@pytest.mark.parametrize("arch", ["gfx1150", "gfx1151", "gfx1152", "gfx1201"])
 @pytest.mark.parametrize("max_num_seqs", [1, 2])
-def test_rdna_first_only_on_gfx1151(gfx1151, max_num_seqs, monkeypatch):
-    """First on gfx1151 whatever max_num_seqs; elsewhere not a candidate."""
+def test_rdna_first_only_on_gfx1150_and_gfx1151(arch, max_num_seqs, monkeypatch):
+    """First on gfx1150 and gfx1151 whatever max_num_seqs; elsewhere not a
+    candidate."""
     import types
 
     import vllm.config
@@ -405,9 +431,10 @@ def test_rdna_first_only_on_gfx1151(gfx1151, max_num_seqs, monkeypatch):
         scheduler_config=types.SimpleNamespace(max_num_seqs=max_num_seqs)
     )
     monkeypatch.setattr(vllm.config, "get_current_vllm_config_or_none", lambda: config)
-    monkeypatch.setattr(rocm, "on_gfx1151", lambda: gfx1151)
+    monkeypatch.setattr(rocm, "on_gfx1150", lambda: arch == "gfx1150")
+    monkeypatch.setattr(rocm, "on_gfx1151", lambda: arch == "gfx1151")
     order = rocm._get_backend_priorities(use_mla=False, use_sparse=False)
-    if gfx1151:
+    if arch in ("gfx1150", "gfx1151"):
         assert order[0] == B.ROCM_RDNA_ATTN
     else:
         assert B.ROCM_RDNA_ATTN not in order
@@ -573,7 +600,7 @@ def test_prefill_configs_are_well_formed():
 
 
 def test_every_listed_prefill_variant_is_built_in():
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     # Raises if a build has no instantiation unit.
     assert torch.ops._rocm_C.rdna_prefill_configs()
     missing = [v for v in _prefill_rows() if hip.load_prefill(v) is None]
@@ -584,7 +611,7 @@ def test_every_listed_prefill_variant_is_built_in():
 def test_built_in_prefill_variants_match_reference(unit):
     """Every built prefill variant matches the reference, with and without a
     prefix."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     for v in _prefill_rows():
         if _prefill_unit(v) != unit:
             continue
@@ -621,7 +648,7 @@ def test_built_in_prefill_variants_match_reference(unit):
 
 def test_prefill_past_the_last_step():
     """M past the last step runs the last row."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = next(
         rows[-1]
         for rows in hip._prefill_table().values()
@@ -648,7 +675,7 @@ def test_prefill_past_the_last_step():
 
 def test_prefill_window_never_reads_freed_pages():
     """Freed pages before the window do not reach the output."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = next(v for v in _prefill_rows() if v.window and v.dtype == torch.float16)
     module = hip.load_prefill(v)
     m, seq_len = v.min_query_len, v.min_query_len + 3 * v.window
@@ -703,7 +730,7 @@ def test_prefill_plan_covers_every_tile_once(batch, window):
     """The work list covers every tile once, heaviest first, within the
     scratch's bounds."""
     target = 160
-    v = hip.prefill_variants(32, 8, 128, 16, 0, torch.float16)[2]
+    v = hip.prefill_variant_for(32, 8, 128, 16, 1, 0, torch.float16, 128)
     # The most counters and partials the bounds allow.
     lens = (
         [(1, 32768)] * 19 + [(16, 16)] if batch == "at the bound" else _BATCHES[batch]
@@ -826,7 +853,7 @@ def _serve_batch(
 )
 def test_prefill_batch_mm_prefix_matches_reference(shape):
     """A batch with each sequence's own multimodal ranges."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     hq, hkv, d, window, dtype = shape
     v = hip.prefill_variants(hq, hkv, d, 16, window, dtype)[0]
     lens = [(600, 600), (1, 2000), (700, 3700), (300, 800)]
@@ -854,7 +881,7 @@ def test_prefill_batch_mm_prefix_matches_reference(shape):
 )
 def test_prefill_batch_matches_reference(unit):
     """A batch in one launch, each sequence against its reference."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = next(v for v in _prefill_rows() if _prefill_unit(v) == unit)
     for seed, (name, lens) in enumerate(_BATCHES.items()):
         lens = [(m, s + v.window if m != s else s) for m, s in lens]
@@ -890,7 +917,7 @@ def test_prefill_batch_matches_reference(unit):
 def test_mixed_batch_matches_reference(unit):
     """Decodes then prefills, including a short one, each against its
     reference."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = next(v for v in _prefill_rows() if _prefill_unit(v) == unit)
     batches = [
         [(1, 3000 + v.window), (1, 77), (1, 1024), (130, 2000 + v.window), (40, 40)],
@@ -1064,7 +1091,7 @@ def test_prefill_batch_needs_this_steps_host_copy():
 )
 def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
     """Tokens of a multimodal range see the whole range (Gemma4's shapes)."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     hq, hkv, d, window, dtype = shape
     v = hip.prefill_variant_for(hq, hkv, d, 16, 1, window, dtype, m)
     assert v is not None, shape
@@ -1098,7 +1125,7 @@ def test_prefill_mm_prefix_matches_reference(shape, m, prefix, mm_ranges):
 def test_prefill_refuses_malformed_mm_ranges(bad):
     """Only one sequence's (ranges, 2) on the device reaches the kernel: the
     batch's (sequences, ranges, 2) would unmask other sequences' keys."""
-    _skip_unless_gfx1151()
+    _skip_unless_gfx115x()
     v = hip.prefill_variant_for(32, 16, 256, 16, 1, 1024, torch.float16, 64)
     module = hip.load_prefill(v)
     scratch = hip.make_prefill_scratch([v], torch.device("cuda"))

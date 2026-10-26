@@ -31,7 +31,14 @@ _COMMON = (
 # Not the configs headers: their entries do not change a build.
 _SOURCES = (_CSRC / "rdna_decode_attn.cu", *_COMMON)
 _PREFILL_SOURCES = (_CSRC / "rdna_prefill_attn.cu", *_COMMON)
-_ARCH = os.environ.get("RDNA_JIT_ARCH", "gfx1151")
+
+
+@functools.cache
+def _arch() -> str:
+    """The target: RDNA_JIT_ARCH, else the current device's."""
+    arch = os.environ.get("RDNA_JIT_ARCH")
+    return arch or torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
 
 _WRAPPER = """#include "rdna_decode_attn.cu"
 using namespace rdna;
@@ -202,7 +209,7 @@ def _build(v: R.KernelVariant | R.PrefillVariant) -> Path:
         *clang,
         "-x",
         "hip",
-        f"--offload-arch={_ARCH}",
+        f"--offload-arch={_arch()}",
         "-fno-gpu-rdc",
         "-O3",
         "-std=c++20",
@@ -409,8 +416,10 @@ def failure(v: R.KernelVariant | R.PrefillVariant) -> str | None:
     return _failed.get(v)
 
 
-def precompile(variants) -> None:
-    """Build variants in parallel and load them."""
+def precompile(variants) -> int:
+    """Build variants in parallel and load them, sealed or not; the number
+    built."""
+    global _sealed
     todo = [
         dataclasses.replace(v, min_query_len=R.PREFILL_MIN_M)
         if isinstance(v, R.PrefillVariant)
@@ -418,8 +427,13 @@ def precompile(variants) -> None:
         for v in variants
     ]
     todo = [v for v in dict.fromkeys(todo) if v not in _loaded]
-    with ThreadPoolExecutor(max_workers=max(1, (os.cpu_count() or 8) - 2)) as pool:
-        list(pool.map(load, todo))
+    sealed, _sealed = _sealed, False
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, (os.cpu_count() or 8) - 2)) as pool:
+            list(pool.map(load, todo))
+    finally:
+        _sealed = sealed
+    return len(todo)
 
 
 def seal() -> None:
