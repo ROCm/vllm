@@ -7,13 +7,14 @@ Mirrors ``sweep_int4g_kernel.py`` / ``sweep_w8a8_kernel.py`` for the plain
 (unquantized) wvSplitK path used by every Linear that hasn't been replaced
 by an int4/int8/AWQ wrapper.
 
-Limitation: the in-tree ``wvSplitK_sweep`` op (csrc/rocm/skinny_gemms.cu)
-currently exposes only ``(ytile, unrl)`` as runtime args; ``WvPrGrp`` and
-``A_CHUNK`` are macro-baked at 16 and 8 respectively. The script therefore
-sweeps only YTILE x UNRL. For 4-axis sweeps (the (W, AC) corner of the
-search space) use the out-of-tree HIP harness in
-``rdna35-asm-expert/microbench/wv_splitk/`` until ``wvSplitK_sweep`` is
-extended to match ``wvSplitK_int4g_sweep`` (which already takes all 4 axes).
+The in-tree ``wvSplitK_sweep`` op (csrc/rocm/skinny_gemms.cu, built with
+``VLLM_SKINNY_GEMM_SWEEP_BF16=1``) takes every launch knob of the dispatcher:
+YTILE x UNRL x A_CHUNK x WvPrGrp, for N = 1..5. Combinations that spill on
+the current arch are worth excluding from any conclusion (their speed depends
+on the process's scratch history), and A_CHUNK > 8 needs K % A_CHUNK == 0.
+Weights are padded as vLLM pads them at load on gfx11 (a row stride that is a
+multiple of 2048 B gets one more 128 B line); unpadded, a weight that lands on
+an aliasing address can run 2x slower.
 
 For each (M, K, N) cell the script also calls the production ``wvSplitK``
 op once to record the dispatcher's chosen wall-clock — useful both as a
@@ -69,9 +70,9 @@ SHAPES = [
     (1024, 4096, "K=4096 small-M sanity"),
 ]
 
-YTILES = [1, 2]
-UNRLS = [1, 2, 4]
-ACHUNKS = [8, 16]
+YTILES = [1, 2, 3, 4]
+UNRLS = [1, 2, 4, 8]
+ACHUNKS = [8, 16, 32]
 WVPRGRPS = [16, 32]
 
 # Working-set guards used by the dispatcher's variant selection
@@ -141,7 +142,9 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype, csv_path):
                 # three variants under the hood.  Just noting it for the user.
                 pass
 
-            A = torch.randn(M, K, dtype=dtype, device="cuda") * 0.01
+            pad = 64 if (K * 2) % 2048 == 0 else 0
+            A = torch.empty(M, K + pad, dtype=dtype, device="cuda")[:, :K]
+            A.copy_(torch.randn(M, K, dtype=dtype, device="cuda") * 0.01)
             B = torch.randn(N, K, dtype=dtype, device="cuda") * 0.01
             weight_bytes = M * K * A.element_size()
 
@@ -157,7 +160,7 @@ def run_sweep(shapes, batch_sizes, warmup, rep, dtype, csv_path):
             for ytile, unrl, ac, w in itertools.product(
                 YTILES, UNRLS, ACHUNKS, WVPRGRPS
             ):
-                if M % ytile != 0:
+                if K % ac != 0:
                     skipped += 1
                     continue
                 try:

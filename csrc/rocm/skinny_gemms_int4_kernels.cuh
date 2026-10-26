@@ -55,6 +55,20 @@ static bool on_gfx_int4() {
   return result;
 }
 
+// Archs with 1024 VGPRs a SIMD lane, where a wave of a 1024-thread workgroup
+// gets 128 VGPRs (192 with 1536).
+static bool on_1024_vgpr_int4() {
+  static const bool result = [] {
+    const std::string_view arch =
+        at::cuda::getCurrentDeviceProperties()->gcnArchName;
+    for (std::string_view a :
+         {"gfx1102", "gfx1103", "gfx1150", "gfx1152", "gfx1153"})
+      if (arch.starts_with(a)) return true;
+    return false;
+  }();
+  return result;
+}
+
 #if defined(NDEBUG)
   #undef NDEBUG
   #include <assert.h>
@@ -1309,64 +1323,67 @@ static int mindiv_int4(int N, int div1, int div2) {
     TORCH_CHECK(false, "Unsupported group_size=", group_size);               \
   }
 
-#define WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                               \
-  {                                                                          \
-    if (K_in * N_in > max_lds_len) {                                         \
-      /* Chunked branch.  Same wave-packing rule as the fitting branch       \
-         below, for the same reason: it is a property of M, not of           \
-         chunking. */                                                        \
-      if (_sYT < 30)                                                         \
-        WVSPLIT_INT4G_GS_CHUNKED(4, 2, __N, _HAS_ZP)                         \
-      else if (mindiv_int4(M_in, CuCount * 4, 16) < 16)                      \
-        WVSPLIT_INT4G_GS_CHUNKED(2, 2, __N, _HAS_ZP)                         \
-      else                                                                   \
-        WVSPLIT_INT4G_GS_CHUNKED(4, 1, __N, _HAS_ZP)                         \
-    } else if (__N >= 3 && _sYT >= 40 && K_in >= 4096 &&                     \
-               mindiv_int4(M_in, CuCount * 4, 16) < 16)                      \
-      /* YTILE=4 is the better tuple in this range, but only when it         \
-         does not cost wave slots.  mindiv_int4 trims WvPrGrp to even        \
-         out the m-rounds, and at YTILE=4 it can trim harder than at         \
-         YTILE=2: M=5376 gives 14 (2 of 16 wave-rows idle) against 15 at     \
-         YTILE=2.  The K bound keeps this off shallow rows, where the k1     \
-         loop is too short to amortise the extra m-tiles.  The chunked       \
-         branch above needs no such bound: it only runs when K*N exceeds     \
-         LDS, so K is always past it. */                                     \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                   \
-    else if (__N >= 4 && _sYT >= 480)                                        \
-      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                                   \
-    else if (__N >= 3 && _sYT >= 40)                                         \
-      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                                   \
-    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096))        \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                                   \
-    else if (__N >= 3 && _sYT < 40)                                          \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                   \
-    else if (__N >= 2)                                                       \
-      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                   \
-    else if (on_gfx_int4<11, 12>() && __N == 1 && K_in == 4096)              \
-      /* Tuned for gfx1151 (Qwen3.5 W4A16 decode: GDN out_proj at            \
-         M=2048, K=4096, N=1).  AC=32 doubles per-thread global load         \
-         granularity; the K=4096 row has enough work to amortize the         \
-         wider load.  W stays at 16 (vs 32 in the bf16 K=2048 branch)        \
-         because int4 dequant inflates VGPR pressure -- AC=32 + W=32         \
-         spills.  Lifts kernel ~70% -> ~84% of LPDDR5X peak post-            \
-         overhead.  K<=2048 already at ~87% by default and untouched.        \
-         Verify per shape with                                               \
-         benchmarks/kernels/sweep_int4g_kernel.py. */                        \
-      WVSPLITK_INT4G_GS_W_AC(1, 4, 16, 32, __N, _HAS_ZP)                     \
-    else if (on_gfx_int4<11, 12>() && __N == 1 && K_in % (32 * 32 * 8) == 0) \
-      /* Deep-K decode rows that divide this tuple's K step exactly          \
-         (THRDS*A_CHUNK*UNRL = 8192), e.g. gemma-4-31B down_proj at          \
-         K=8192 and K=16384, M=5376.  AC=32 issues global_load_b128          \
-         and UNRL=8 makes each row's contiguous run 4 KB.                    \
-                                                                      \      \
-         The exact-division guard is load-bearing: a K that leaves a         \
-         large ragged tail has too few k1 iterations to hide it behind       \
-         and prefers the default tuple.  Geometry and row stride have        \
-         to be tuned together; re-verify both with                           \
-         benchmarks/kernels/sweep_int4g_kernel.py. */                        \
-      WVSPLITK_INT4G_GS_W_AC(2, 8, 16, 32, __N, _HAS_ZP)                     \
-    else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */          \
-      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                                   \
+#define WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                            \
+  {                                                                       \
+    if (K_in * N_in > max_lds_len) {                                      \
+      /* Chunked branch.  Same wave-packing rule as the fitting branch    \
+         below, for the same reason: it is a property of M, not of        \
+         chunking. */                                                     \
+      if (_sYT < 30)                                                      \
+        WVSPLIT_INT4G_GS_CHUNKED(4, 2, __N, _HAS_ZP)                      \
+      else if (mindiv_int4(M_in, CuCount * 4, 16) < 16)                   \
+        WVSPLIT_INT4G_GS_CHUNKED(2, 2, __N, _HAS_ZP)                      \
+      else                                                                \
+        WVSPLIT_INT4G_GS_CHUNKED(4, 1, __N, _HAS_ZP)                      \
+    } else if (__N >= 3 && _sYT >= 40 && K_in >= 4096 &&                  \
+               mindiv_int4(M_in, CuCount * 4, 16) < 16)                   \
+      /* YTILE=4 is the better tuple in this range, but only when it      \
+         does not cost wave slots.  mindiv_int4 trims WvPrGrp to even     \
+         out the m-rounds, and at YTILE=4 it can trim harder than at      \
+         YTILE=2: M=5376 gives 14 (2 of 16 wave-rows idle) against 15 at  \
+         YTILE=2.  The K bound keeps this off shallow rows, where the k1  \
+         loop is too short to amortise the extra m-tiles.  The chunked    \
+         branch above needs no such bound: it only runs when K*N exceeds  \
+         LDS, so K is always past it. */                                  \
+      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                \
+    else if (__N >= 4 && _sYT >= 480)                                     \
+      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                                \
+    else if (__N >= 3 && _sYT >= 40)                                      \
+      WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                                \
+    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096))     \
+      WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                                \
+    else if (__N >= 3 && _sYT < 40)                                       \
+      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                \
+    else if (__N >= 2)                                                    \
+      WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                                \
+    else if constexpr (__N == 1) {                                        \
+      /* N>=2 never gets here: the N=1 tuples are not built for it. */    \
+      if (on_gfx_int4<11, 12>() && K_in == 4096)                          \
+        /* Tuned for gfx1151 (Qwen3.5 W4A16 decode: GDN out_proj at       \
+           M=2048, K=4096, N=1).  AC=32 doubles per-thread global load    \
+           granularity; the K=4096 row has enough work to amortize the    \
+           wider load.  W stays at 16 (vs 32 in the bf16 K=2048 branch)   \
+           because int4 dequant inflates VGPR pressure -- AC=32 + W=32    \
+           spills.  Lifts kernel ~70% -> ~84% of LPDDR5X peak post-       \
+           overhead.  K<=2048 already at ~87% by default and untouched.   \
+           Verify per shape with                                          \
+           benchmarks/kernels/sweep_int4g_kernel.py. */                   \
+        WVSPLITK_INT4G_GS_W_AC(1, 4, 16, 32, __N, _HAS_ZP)                \
+      else if (on_gfx_int4<11, 12>() && K_in % (32 * 32 * 8) == 0)        \
+        /* Deep-K decode rows that divide this tuple's K step exactly     \
+           (THRDS*A_CHUNK*UNRL = 8192), e.g. gemma-4-31B down_proj at     \
+           K=8192 and K=16384, M=5376.  AC=32 issues global_load_b128     \
+           and UNRL=8 makes each row's contiguous run 4 KB.               \
+                                                                        \ \
+           The exact-division guard is load-bearing: a K that leaves a    \
+           large ragged tail has too few k1 iterations to hide it behind  \
+           and prefers the default tuple.  Geometry and row stride have   \
+           to be tuned together; re-verify both with                      \
+           benchmarks/kernels/sweep_int4g_kernel.py. */                   \
+        WVSPLITK_INT4G_GS_W_AC(2, 8, 16, 32, __N, _HAS_ZP)                \
+      else /* N=1: YTILE=2 beats YTILE=1 across all CuCount values */     \
+        WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                              \
+    }                                                                     \
   }
 
 // Inner dispatch: shared by both symmetric and asymmetric paths
@@ -1699,78 +1716,79 @@ __global__ void moe_wvSplitK_int4_hf_(
     }                                                                         \
   }
 
-#define MOE_WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                    \
-  {                                                                   \
-    if (K_in * __N > max_lds_len) {                                   \
-      if (_sYT < 30)                                                  \
-        MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                      \
-      else                                                            \
-        MOE_WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                      \
-    } else if (__N >= 4 && _sYT >= 480)                               \
-      MOE_WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                        \
-    else if (__N >= 3 && _sYT >= 40)                                  \
-      MOE_WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                        \
-    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096)) \
-      MOE_WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                        \
-    else if (__N >= 3 && _sYT < 40)                                   \
-      MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                        \
-    else if (__N >= 2)                                                \
-      MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                        \
-    else /* N=1 split per K, picked from a full 4-axis (Y, U, W, AC)  \
-            Cartesian sweep on gfx1151.  Re-verified in fresh procs   \
-            against the local kernel; the two K ranges land on        \
-            different optima:                                         \
-              K >= 1024 (gemm1 K=2048): Y=4, U=4, W=16, AC=16         \
-                64.17 us/call @ 182.6 GiB/s vs Y2U4's 66.40 us;       \
-                wider YTILE keeps each CU's m-tile fully fed at       \
-                gfx1151's 20-CU width when M is comparable to         \
-                CuCount * 16 * Y.                                     \
-              K <  1024 (gemm2 K=768): Y=4, U=2, W=32, AC=32          \
-                ~10% faster than the previous (Y8 U2 W=AC=16) heur:   \
-                2 wide-load batches per k-step instead of 4 narrow    \
-                ones, fewer waitcnt boundaries amortize HBM page-mode \
-                costs.  GFX9 wave64 stays on the previous heuristic   \
-                via MOE_WVSPLIT_INT4G_GS_W_AC's fallback.             \
-              LOW-VGPR override (gfx1x_int4 only):                    \
-                On Qwen3.5-35B-A3B (gemm2 K=512), the (W=32, AC=32)   \
-                instantiation compiles to 157 VGPRs/wave; combined    \
-                with WG=1024 threads (32 wave32) this caps occupancy  \
-                at 32 active wave32/CU = 50% of peak.  Switching to   \
-                (W=16, AC=16, U=2) drops VGPRs to 113 and WG=512      \
-                threads (16 wave32) so 3 WGs fit per CU = 48 active   \
-                wave32/CU = 75% of peak.  Better latency hiding for   \
-                memory-bound kernels. */                              \
-    {                                                                 \
-      if (on_gfx_int4<11, 12>() && K_in == 2048)                      \
-        /* gfx1151 K=2048 N=1 (Qwen3.5 MoE gate_up at M=1024,         \
-         * E=256): 4-axis sweep via                                   \
-         * benchmarks/kernels/sweep_int4g_moe_kernel.py finds         \
-         * (Y=4, U=4, W=32, AC=32) at 44.6 us vs the (Y=4, U=4,       \
-         * W=16, AC=16) default at 46.5 us -- ~1.04x.  Wider per-     \
-         * thread loads (AC=32) + max WG threads (W=32) amortize the  \
-         * per-row work the K=2048 case has plenty of.  Narrow guard: \
-         * only swept at M~1024; other M at K=2048 may benefit too    \
-         * but were not measured. */                                  \
-        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 4, __N, _HAS_ZP)         \
-      else if (K_in >= 1024)                                          \
-        MOE_WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                      \
-      else if (on_gfx_int4<11, 12>() && K_in == 512)                  \
-        /* gfx1151 K=512 N=1 (Qwen3.5 MoE down-proj).  4-axis sweep   \
-         * via benchmarks/kernels/sweep_int4g_moe_kernel.py finds     \
-         * (Y=4, U=1, W=32, AC=8) at 28.1 us vs the LOW-VGPR pick     \
-         * (Y=4, U=2, W=16, AC=16) at 31.4 us -- ~1.12x at            \
-         * fuse_silu_mul=False; ~1.18x at fuse_silu_mul=True (the     \
-         * down+silu trace shape).  Pure-work %DRAM lifts ~62%        \
-         * -> ~78% post per-launch floor subtraction.  W=32 + AC=8    \
-         * keeps WG threads at 1024 (32 wv32) but the narrow per-     \
-         * iter loads avoid the (W=32, AC=32) VGPR-spill penalty the  \
-         * (W=32, AC=32) default below describes. */                  \
-        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 8, 1, __N, _HAS_ZP)          \
-      else if (on_gfx_int4<11, 12>())                                 \
-        MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                      \
-      else                                                            \
-        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 2, __N, _HAS_ZP)         \
-    }                                                                 \
+#define MOE_WVSPLIT_INT4G_TILE(_sYT, __N, _HAS_ZP)                       \
+  {                                                                      \
+    if (K_in * __N > max_lds_len) {                                      \
+      if (_sYT < 30)                                                     \
+        MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                         \
+      else                                                               \
+        MOE_WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                         \
+    } else if (__N >= 4 && _sYT >= 480)                                  \
+      MOE_WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                           \
+    else if (__N >= 3 && _sYT >= 40)                                     \
+      MOE_WVSPLIT_INT4G_GS(4, 1, __N, _HAS_ZP)                           \
+    else if (__N >= 3 && _sYT < 40 && (K_in <= 2048 || K_in >= 4096))    \
+      MOE_WVSPLIT_INT4G_GS(2, 4, __N, _HAS_ZP)                           \
+    else if (__N >= 3 && _sYT < 40)                                      \
+      MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                           \
+    else if (__N >= 2)                                                   \
+      MOE_WVSPLIT_INT4G_GS(2, 2, __N, _HAS_ZP)                           \
+    else if constexpr (__N == 1) {                                       \
+      /* N=1 split per K, picked from a full 4-axis (Y, U, W, AC)        \
+            Cartesian sweep on gfx1151.  Re-verified in fresh procs      \
+            against the local kernel; the two K ranges land on           \
+            different optima:                                            \
+              K >= 1024 (gemm1 K=2048): Y=4, U=4, W=16, AC=16            \
+                64.17 us/call @ 182.6 GiB/s vs Y2U4's 66.40 us;          \
+                wider YTILE keeps each CU's m-tile fully fed at          \
+                gfx1151's 20-CU width when M is comparable to            \
+                CuCount * 16 * Y.                                        \
+              K <  1024 (gemm2 K=768): Y=4, U=2, W=32, AC=32             \
+                ~10% faster than the previous (Y8 U2 W=AC=16) heur:      \
+                2 wide-load batches per k-step instead of 4 narrow       \
+                ones, fewer waitcnt boundaries amortize HBM page-mode    \
+                costs.  GFX9 wave64 stays on the previous heuristic      \
+                via MOE_WVSPLIT_INT4G_GS_W_AC's fallback.                \
+              LOW-VGPR override (gfx1x_int4 only):                       \
+                On Qwen3.5-35B-A3B (gemm2 K=512), the (W=32, AC=32)      \
+                instantiation compiles to 157 VGPRs/wave; combined       \
+                with WG=1024 threads (32 wave32) this caps occupancy     \
+                at 32 active wave32/CU = 50% of peak.  Switching to      \
+                (W=16, AC=16, U=2) drops VGPRs to 113 and WG=512         \
+                threads (16 wave32) so 3 WGs fit per CU = 48 active      \
+                wave32/CU = 75% of peak.  Better latency hiding for      \
+                memory-bound kernels. */                                 \
+      if (on_gfx_int4<11, 12>() && !on_1024_vgpr_int4() && K_in == 2048) \
+        /* gfx1151 K=2048 N=1 (Qwen3.5 MoE gate_up at M=1024,            \
+         * E=256): 4-axis sweep via                                      \
+         * benchmarks/kernels/sweep_int4g_moe_kernel.py finds            \
+         * (Y=4, U=4, W=32, AC=32) at 44.6 us vs the (Y=4, U=4,          \
+         * W=16, AC=16) default at 46.5 us -- ~1.04x.  Wider per-        \
+         * thread loads (AC=32) + max WG threads (W=32) amortize the     \
+         * per-row work the K=2048 case has plenty of.  Narrow guard:    \
+         * only swept at M~1024; other M at K=2048 may benefit too       \
+         * but were not measured.  Not on 1024-VGPR archs: its 128       \
+         * VGPRs a wave there spill; they take (4, 4, 16, 16). */        \
+        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 4, __N, _HAS_ZP)            \
+      else if (K_in >= 1024)                                             \
+        MOE_WVSPLIT_INT4G_GS(4, 4, __N, _HAS_ZP)                         \
+      else if (on_gfx_int4<11, 12>() && K_in == 512)                     \
+        /* gfx1151 K=512 N=1 (Qwen3.5 MoE down-proj).  4-axis sweep      \
+         * via benchmarks/kernels/sweep_int4g_moe_kernel.py finds        \
+         * (Y=4, U=1, W=32, AC=8) at 28.1 us vs the LOW-VGPR pick        \
+         * (Y=4, U=2, W=16, AC=16) at 31.4 us -- ~1.12x at               \
+         * fuse_silu_mul=False; ~1.18x at fuse_silu_mul=True (the        \
+         * down+silu trace shape).  Pure-work %DRAM lifts ~62%           \
+         * -> ~78% post per-launch floor subtraction.  W=32 + AC=8       \
+         * keeps WG threads at 1024 (32 wv32) but the narrow per-        \
+         * iter loads avoid the (W=32, AC=32) VGPR-spill penalty the     \
+         * (W=32, AC=32) default below describes. */                     \
+        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 8, 1, __N, _HAS_ZP)             \
+      else if (on_gfx_int4<11, 12>())                                    \
+        MOE_WVSPLIT_INT4G_GS(4, 2, __N, _HAS_ZP)                         \
+      else                                                               \
+        MOE_WVSPLIT_INT4G_GS_W_AC(4, 32, 32, 2, __N, _HAS_ZP)            \
+    }                                                                    \
   }
 
 #define MOE_WVSPLIT_INT4G_DISPATCH(_HAS_ZP)                \
