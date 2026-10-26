@@ -1,13 +1,16 @@
 #!/bin/bash
-# Smoke-test + lm_eval harness for the four gfx1250 models, using the exact
-# serve/eval recipes from the per-model scripts in this directory:
+# Smoke-test + lm_eval harness for the gfx1250 models. Serve/eval recipes are
+# defined inline in the tables below:
 #
-#   gptoss   <- gpt.sh          + eval_gpt.sh       (gpt-oss-120b-w-mxfp4-a-fp8)
-#   dsr1     <- dsr1.sh         + eval_dsr1.sh      (DeepSeek-R1-0528-MXFP4)
-#   dsv4f    <- dsr4_accurate_aiter.sh + eval_dsr4.sh (DeepSeek-V4-Flash, AITER W4A4 MoE)
-#   minimax  <- minimax.sh      + eval_minimax.sh   (MiniMax-M3-MXFP4)
-#   dsv41f   <- (inline recipe)      (DeepSeek-V4.1-Flash)
-#   qwen     <- (inline recipe)      (Qwen3.8-Flash-Next)
+#   gptoss     gpt-oss-120b-w-mxfp4-a-fp8
+#   dsv4f      DeepSeek-V4-Flash (AITER W4A4 MoE)
+#   dsr1       DeepSeek-R1-0528-MXFP4
+#   minimax    MiniMax-M3-MXFP4
+#   llama      Llama-3.1-405B-Instruct-MXFP4-Preview
+#   oaigptoss  openai/gpt-oss-120b (aiter_triton_mxfp4_bf16 MoE)
+#   dsv4pro    DeepSeek-V4-Pro (tp=4)
+#   dsv41f     DeepSeek-V4.1-Flash
+#   qwen       Qwen3.8-Flash-Next
 #
 # For each selected model it: starts vllm serve with that model's env+args
 # (server + lm_eval output stream to the terminal), waits for /health, runs the
@@ -15,7 +18,7 @@
 # next one.
 #
 # Usage:
-#   ./vllm_smoketest.sh                          # run all four, in order
+#   ./vllm_smoketest.sh                          # run all models, in order
 #   ./vllm_smoketest.sh --minimax                # run only minimax
 #   ./vllm_smoketest.sh --gptoss /some/other/path# run gptoss from a custom path
 #   ./vllm_smoketest.sh --dsr1 --minimax         # run a subset
@@ -30,7 +33,7 @@ declare -A MODEL_PATHS=(
   [gptoss]="/data/models/gpt-oss-120b-w-mxfp4-a-fp8"
   [dsr1]="/data/models/DeepSeek-R1-0528-MXFP4"
   [dsv4f]="/data/models/DeepSeek-V4-Flash"
-  [dsv4pro]="/data/model/DeepSeek-V4-Pro"
+  [dsv4pro]="/data/models/DeepSeek-V4-Pro"
   [dsv41f]="/data/models/DeepSeek-V4.1-Flash"
   [qwen]="/data/models/Qwen3.8-Flash-Next"
   [minimax]="/data/models/MiniMax-M3-MXFP4"
@@ -38,32 +41,32 @@ declare -A MODEL_PATHS=(
   [oaigptoss]="/data/models/gpt-oss-120b"
 )
 
-# --- serve-time environment (verbatim from each serve script) ---
+# --- serve-time environment (pruned: no-op HSA_*/USE_SVM and default-valued vars removed) ---
 declare -A MODEL_ENV=(
-  [gptoss]="HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
-  [dsr1]="TRITON_HIP_USE_ASYNC_COPY=0 VLLM_DISABLE_COMPILE_CACHE=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=0 HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0 VLLM_ROCM_USE_AITER_FP8BMM=0"
-  [dsv4f]="HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_FORCE_TORCH_BLOCK_FP8=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_TRITON_GEMM=1 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
-  [dsv4pro]="VLLM_ENGINE_READY_TIMEOUT_S=3600 HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_FORCE_TORCH_BLOCK_FP8=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_TRITON_GEMM=1 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
-  [dsv41f]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_USE_BREAKABLE_CUDAGRAPH=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER_TRITON_GEMM=1 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0 AITER_TRITON_LOG_LEVEL=ERROR"
+  [gptoss]="VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
+  [dsr1]="TRITON_HIP_USE_ASYNC_COPY=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=0 VLLM_ROCM_USE_SKINNY_GEMM=0"
+  [dsv4f]="VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
+  [dsv4pro]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
+  [dsv41f]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_USE_BREAKABLE_CUDAGRAPH=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_SKINNY_GEMM=0 AITER_TRITON_LOG_LEVEL=ERROR"
   [qwen]="VLLM_ROCM_USE_AITER=1"
-  [minimax]="VLLM_DISABLE_COMPILE_CACHE=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=0 HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0 VLLM_ROCM_USE_AITER_FP8BMM=0"
+  [minimax]="VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
   [llama]="VLLM_ROCM_USE_AITER=1"
-  [oaigptoss]="TRITON_HIP_USE_ASYNC_COPY=0 HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
+  [oaigptoss]="TRITON_HIP_USE_ASYNC_COPY=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
 )
 
 # --- serve args (everything except --model/--host/--port, which we add).
 #     NOTE: JSON values must contain NO spaces (they ride through unquoted $VAR
 #     word-splitting); the dsr1 compilation-config below is space-free. ---
 declare -A MODEL_SERVE=(
-  [gptoss]="--tensor-parallel-size 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN"
-  [dsr1]="--trust-remote-code --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 8192 --dtype auto --tensor-parallel-size 1 --distributed-executor-backend mp --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.90 --compilation-config {\"pass_config\":{\"fuse_attn_quant\":true,\"eliminate_noops\":true,\"fuse_norm_quant\":true,\"fuse_mla_dual_rms_norm\":false,\"enable_qk_norm_rope_fusion\":false},\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\",\"+quant_fp8\"]} --moe-backend aiter_triton_mxfp4_mxfp4"
-  [dsv4f]="--tensor-parallel-size 1 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768 --moe-backend aiter_triton_mxfp4_mxfp4"
-  [dsv4pro]="--tensor-parallel-size 4 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768 --moe-backend aiter_triton_mxfp4_mxfp4"
-  [dsv41f]="--tensor-parallel-size 1 --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 --max-model-len 32768 --tool-call-parser deepseek_v41 --enable-auto-tool-choice --reasoning-parser deepseek_v41 --moe-backend aiter_triton_mxfp4_mxfp4"
-  [qwen]="--max-num-seqs 256 --gpu-memory-utilization 0.90 --enable-prefix-caching --no-enable-flashinfer-autotune --tensor-parallel-size 1 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
-  [minimax]="--trust-remote-code --language-model-only --skip-mm-profiling --block-size 128 --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 32768 --dtype auto --tensor-parallel-size 1 --distributed-executor-backend mp --max-num-batched-tokens 32768 --max-num-seqs 32 --gpu-memory-utilization 0.90 --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice --moe-backend aiter_triton_mxfp4_mxfp4"
-  [llama]="--tensor-parallel-size 1 --no-enable-prefix-caching --kv-cache-dtype fp8 --max-model-len 8192 --gpu-memory-utilization 0.90 --attention-backend TRITON_ATTN --max-num-batched-tokens 512"
-  [oaigptoss]="--tensor-parallel-size 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN --moe-backend aiter_triton_mxfp4_bf16"
+  [gptoss]="-tp 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN"
+  [dsr1]="-tp 1 --trust-remote-code --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 8192 --distributed-executor-backend mp --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.90 --compilation-config {\"pass_config\":{\"fuse_attn_quant\":true,\"eliminate_noops\":true,\"fuse_norm_quant\":true,\"fuse_mla_dual_rms_norm\":false,\"enable_qk_norm_rope_fusion\":false},\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\",\"+quant_fp8\"]} --moe-backend aiter_triton_mxfp4_mxfp4"
+  [dsv4f]="-tp 1 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768 --moe-backend aiter_triton_mxfp4_mxfp4"
+  [dsv4pro]="-tp 4 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768 --moe-backend aiter_triton_mxfp4_mxfp4"
+  [dsv41f]="-tp 1 --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 --max-model-len 32768 --tool-call-parser deepseek_v41 --enable-auto-tool-choice --reasoning-parser deepseek_v41 --moe-backend aiter_triton_mxfp4_mxfp4"
+  [qwen]="-tp 1 --max-num-seqs 256 --gpu-memory-utilization 0.90 --no-enable-flashinfer-autotune --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+  [minimax]="-tp 1 --trust-remote-code --language-model-only --skip-mm-profiling --block-size 128 --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 32768 --distributed-executor-backend mp --max-num-batched-tokens 32768 --max-num-seqs 32 --gpu-memory-utilization 0.90 --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice --moe-backend aiter_triton_mxfp4_mxfp4"
+  [llama]="-tp 1 --no-enable-prefix-caching --kv-cache-dtype fp8 --max-model-len 8192 --gpu-memory-utilization 0.90 --attention-backend TRITON_ATTN --max-num-batched-tokens 512"
+  [oaigptoss]="-tp 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN --moe-backend aiter_triton_mxfp4_bf16"
 )
 
 # --- lm_eval: kind (chat=chat-completions+template, raw=completions),
@@ -148,6 +151,8 @@ stop_server() {
       sleep 3
     done
   else
+    # no rocm-smi in some images: wait for the killed vLLM workers to actually exit
+    for _ in $(seq 1 60); do pgrep -f "VLLM::|vllm serve" >/dev/null || break; sleep 2; done
     sleep 8
   fi
 }
@@ -183,7 +188,7 @@ run_model() {
   server_pid=$!
 
   local ready=0
-  for _ in $(seq 1 240); do          # up to ~20 min for load
+  for _ in $(seq 1 480); do          # up to ~40 min for load (dsv41f needs >20)
     if curl -s "http://localhost:$PORT/health" >/dev/null 2>&1; then ready=1; break; fi
     ps -p "$server_pid" >/dev/null 2>&1 || { echo "[$key] ERROR: server died (see output above)"; RESULT[$key]="FAIL (server died at load)"; stop_server; return; }
     sleep 5
