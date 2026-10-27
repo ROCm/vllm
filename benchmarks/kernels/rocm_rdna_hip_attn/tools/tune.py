@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tune the launch knobs of the RDNA3.5 attention kernels, and apply them.
+"""Tune the launch knobs of the RDNA attention kernels, and apply them.
 
 Decode, per (Hq, Hkv, D, window, M): every point of the knob grid is checked
 against a float reference and timed over --contexts; the finalists are timed
@@ -1447,6 +1447,8 @@ FAMILIES = {
     "gfx1151": "Gfx1151",
     "gfx1152": "Gfx1150",
     "gfx1153": "Gfx1150",
+    "gfx1200": "Gfx1201",
+    "gfx1201": "Gfx1201",
 }
 
 

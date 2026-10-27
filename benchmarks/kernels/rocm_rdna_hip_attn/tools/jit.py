@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Standalone builds of the RDNA3.5 attention kernels, called through ctypes.
+"""Standalone builds of the RDNA attention kernels, called through ctypes.
 
 `install()` makes ROCM_RDNA_ATTN use them, with knobs from
 `override()` on top of the built config. `paths()` reports the path the backend

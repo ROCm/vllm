@@ -141,8 +141,8 @@ void gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                  torch::Tensor& cu_seqlens, torch::Tensor& out,
                  torch::Tensor& final_state, double scale);
 
-// RDNA3.5 decode and prefill attention: the fields of every build (none off
-// gfx1151), and a launch of one build by its index.
+// RDNA decode and prefill attention: the fields of every build of the current
+// GPU's family (none on other GPUs), and a launch of one build by its index.
 std::vector<int64_t> rdna_decode_configs();
 std::vector<int64_t> rdna_decode_batch_configs();
 void rdna_decode_attn(int64_t config, torch::Tensor& q, torch::Tensor& kv_cache,

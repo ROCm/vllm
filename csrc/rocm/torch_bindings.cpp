@@ -190,7 +190,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("moe_gemm_w4a16", torch::kCUDA, &moe_gemm_w4a16);
 
 #ifdef VLLM_ROCM_RDNA_ATTN
-  // RDNA3.5 decode attention (gfx1151).
+  // RDNA decode attention (gfx1150..gfx1153, RDNA4).
   rocm_ops.def("rdna_decode_configs() -> int[]", &rdna_decode_configs);
   rocm_ops.def("rdna_decode_batch_configs() -> int[]",
                &rdna_decode_batch_configs);
@@ -200,7 +200,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor! cnt, Tensor seq_lens, float scale, Tensor? mm_ranges=None, "
       "bool batched=False) -> ()");
   rocm_ops.impl("rdna_decode_attn", torch::kCUDA, &rdna_decode_attn);
-  // RDNA3.5 prefill attention (gfx1151).
+  // RDNA prefill attention (gfx1150..gfx1153, RDNA4).
   rocm_ops.def("rdna_prefill_configs() -> int[]", &rdna_prefill_configs);
   rocm_ops.def("rdna_prefill_batch_configs() -> int[]",
                &rdna_prefill_batch_configs);
