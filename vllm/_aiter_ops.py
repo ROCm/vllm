@@ -1948,6 +1948,45 @@ def _triton_rotary_embedding_impl(
     key = key.view(key_shape)
 
 
+def _rocm_aiter_triton_mxfp8_bmm_impl(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    n_groups: int,
+) -> torch.Tensor:
+    from aiter.ops.triton.gemm.batched.batched_gemm_afp8wfp8 import (
+        batched_gemm_afp8wfp8,
+    )
+
+    # Token-major [T, G * K] x [G * N, K] -> [T, G * N]: the batched GEMM reads
+    # and writes the group-strided views in place.
+    num_tokens = x.shape[0]
+    k = x.shape[1] // n_groups
+    n = weight.shape[0] // n_groups
+    out = torch.empty((num_tokens, n_groups * n), dtype=torch.bfloat16, device=x.device)
+    batched_gemm_afp8wfp8(
+        x.view(num_tokens, n_groups, k).transpose(0, 1),
+        weight.view(n_groups, n, k),
+        x_scale.view(num_tokens, n_groups, k // 32).transpose(0, 1),
+        weight_scale.view(n_groups, -1, k // 32),
+        torch.bfloat16,
+        out.view(num_tokens, n_groups, n).transpose(0, 1),
+        w_scale_group_size=(weight.shape[0] // weight_scale.shape[0], 32),
+    )
+    return out
+
+
+def _rocm_aiter_triton_mxfp8_bmm_fake(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    n_groups: int,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)
+
+
 def _rocm_aiter_fp8_attn_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3276,6 +3315,15 @@ class rocm_aiter_ops:
                 mutates_args=["query", "key"],  # These tensors are modified in-place
             )
 
+            # An opaque op: the batched GEMM picks its tile by the token count,
+            # which a compiled caller must not freeze at its trace-time value.
+            direct_register_custom_op(
+                op_name="rocm_aiter_triton_mxfp8_bmm",
+                op_func=_rocm_aiter_triton_mxfp8_bmm_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_triton_mxfp8_bmm_fake,
+            )
+
             direct_register_custom_op(
                 op_name="rocm_aiter_fused_allreduce_rmsnorm",
                 op_func=_rocm_aiter_fused_allreduce_rmsnorm_impl,
@@ -4360,6 +4408,55 @@ class rocm_aiter_ops:
             YQ=YQ,
             transpose_bm=transpose_bm,
             config=config,
+        )
+
+    @staticmethod
+    def triton_mxfp8_bmm(
+        x: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        n_groups: int,
+    ) -> torch.Tensor:
+        """Grouped MXFP8 GEMM: ``out[t, g, :] = x[t, g, :] @ weight[g].T``.
+
+        ``x`` [T, G * K] e4m3 with ``x_scale`` [T, G * K // 32] E8M0, ``weight``
+        [G * N, K] e4m3 with [G * N, K // 32] or [G * N // 32, K // 32] E8M0
+        scales. Returns bf16 [T, G * N].
+        """
+        return torch.ops.vllm.rocm_aiter_triton_mxfp8_bmm(
+            x, x_scale, weight, weight_scale, n_groups
+        )
+
+    @staticmethod
+    def triton_inverse_rope_group_quant(
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        rope_head_dim: int,
+        out_data: torch.Tensor,
+        out_scale: torch.Tensor,
+    ) -> None:
+        """Inverse GPT-J RoPE on the last ``rope_head_dim`` dims of each head of
+        ``o`` [T, H, D], then MXFP8: ``out_data`` [T, H * D] e4m3 and
+        ``out_scale`` [T, H * D // 32] E8M0. ``cos_sin_cache`` is
+        [max_pos, rope_head_dim], the cos half then the sin half.
+        """
+        from aiter.ops.triton.rope.inverse_rope_group_quant import (
+            inverse_rope_group_quant,
+        )
+
+        half = rope_head_dim // 2
+        num_tokens = o.shape[0]
+        inverse_rope_group_quant(
+            o,
+            positions,
+            cos_sin_cache[:, :half],
+            cos_sin_cache[:, half:],
+            num_groups=1,
+            quant_group_size=32,
+            x_fp8=out_data.view(num_tokens, 1, -1),
+            x_scale=out_scale.view(num_tokens, 1, -1),
         )
 
     @staticmethod

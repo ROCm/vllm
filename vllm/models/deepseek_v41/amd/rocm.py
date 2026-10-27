@@ -38,7 +38,7 @@ from vllm.models.deepseek_v41.sparse_mla import (
     DeepseekV41SparseSWAMetadataBuilder,
 )
 from vllm.platforms import current_platform
-from vllm.platforms.rocm import _ON_GFX950, on_gfx1250
+from vllm.platforms.rocm import _ON_GFX950, _ON_GFX1250, on_gfx1250
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import execute_in_parallel
 from vllm.v1.attention.backend import (
@@ -68,6 +68,22 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+
+def _mxfp8_attn_out_enabled() -> bool:
+    """Whether the attention output is wo_a's MXFP8 input (a QuantizedActivation)
+    and wo_a runs as the grouped MXFP8 GEMM on the checkpoint weights.
+
+    gfx950 writes it from the decode reduce epilogue. gfx1250 needs AITER's FP8
+    BMM (VLLM_ROCM_USE_AITER_FP8BMM): AITER rotates and quantizes the bf16 output
+    of its (unfused) decode and prefill kernels in one pass and runs the GEMM.
+    Others keep the bf16 einsum on a dequantized copy of wo_a.
+    """
+    if _ON_GFX950:
+        return True
+    from vllm._aiter_ops import rocm_aiter_ops
+
+    return _ON_GFX1250 and rocm_aiter_ops.is_fp8bmm_enabled()
 
 
 def _trust_dsv4_extra_cache_nan_free(
@@ -562,11 +578,14 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     def __init__(self, *args, **kwargs):
         vllm_config = args[0] if args else kwargs["vllm_config"]
         super().__init__(*args, **kwargs)
-        # CUDA executes WO_A with a quantized grouped-BMM kernel.  ROCm's
-        # correctness path below dequantizes WO_A once and uses torch.einsum,
-        # so retain the ordinary MXFP8 linear kernel for post-load processing
-        # instead of asking for the CUDA-only BMM kernel.
+        # CUDA executes WO_A with a quantized grouped-BMM kernel. ROCm runs
+        # its own: rocm_mxfp8_wo_a_bmm on gfx950, and on gfx1250 with AITER's
+        # FP8 BMM (MXFP8 attention output), elsewhere a bf16 einsum on a
+        # once-dequantized WO_A. Both read the weight the ordinary MXFP8 linear
+        # kernel leaves after post-load processing, so keep that instead of the
+        # CUDA-only BMM one.
         self.wo_a.is_bmm = False
+        self._mxfp8_attn_out = _mxfp8_attn_out_enabled()
         self._has_kv_transfer = vllm_config.kv_transfer_config is not None
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
@@ -912,10 +931,11 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
     def _alloc_attn_out(
         self, num_tokens: int, hidden_states: torch.Tensor
     ) -> torch.Tensor | QuantizedActivation:
-        if not _ON_GFX950:
+        if not self._mxfp8_attn_out:
             return super()._alloc_attn_out(num_tokens, hidden_states)
-        # wo_a's MXFP8 input: the decode reduce writes it directly, prefill
-        # rows are rotated and quantized after their bf16 attention.
+        # wo_a's MXFP8 input: the gfx950 decode reduce writes it directly;
+        # prefill rows (and every gfx1250 row) are rotated and quantized after
+        # their bf16 attention.
         width = self.n_local_heads * self.head_dim
         data = torch.empty(
             (num_tokens, width), dtype=torch.float8_e4m3fn, device=hidden_states.device
@@ -1056,8 +1076,9 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 ),
             )
         if mxfp8_out is not None:
-            # The reduce epilogue rotates and quantizes every decode row and
-            # the prefill path already did its own, so nothing is owed here.
+            # The decode path rotates and quantizes every decode row (in the
+            # gfx950 reduce epilogue, or in one pass after the gfx1250 kernel)
+            # and the prefill path already did its own, so nothing is owed here.
             if num_decodes > 0:
                 self._forward_decode(
                     q=q[:num_decode_tokens],
@@ -1195,10 +1216,9 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             # The aiter kernel leaves the inverse RoPE to the caller.
             return 0
 
-        fuse_inv_rope = not on_gfx1250()
-        assert output_mxfp8 is None or fuse_inv_rope, (
-            "the MXFP8 decode output requires the fused inverse RoPE"
-        )
+        # The gfx1250 decode kernel cannot rotate into a bf16 output, but its
+        # MXFP8 output is rotated (and quantized) by rocm_sparse_attn_decode.
+        fuse_inv_rope = output_mxfp8 is not None or not on_gfx1250()
         return rocm_sparse_attn_decode(
             q=q,
             kv_cache=kv_cache,
@@ -1393,7 +1413,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         shapes: list[tuple[tuple[int, ...], torch.dtype]] = []
         if gather:
             shapes.append(((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16))
-        if _ON_GFX950:
+        if self._mxfp8_attn_out:
             shapes.append(
                 (
                     (num_prefill_tokens, self.n_local_heads, self.head_dim),
@@ -1504,7 +1524,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         """bf16 attention rows for the aiter kernel to write when the layer's
         output is MXFP8, taken from the workspace the warmup reserved."""
         shapes = self._prefill_workspace_shapes(0, num_tokens, q, gather=False)
-        assert shapes, "an MXFP8 attention output is gfx950-only"
+        assert shapes, "an MXFP8 attention output is gfx950 / gfx1250 only"
         return current_workspace_manager().get_simultaneous(*shapes)[0]
 
     def _aiter_sparse_mla(

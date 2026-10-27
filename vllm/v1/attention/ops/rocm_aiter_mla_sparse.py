@@ -1682,9 +1682,10 @@ def rocm_inverse_rope_mxfp8_rows(
     """Inverse-RoPE bf16 attention rows and MXFP8-quantize them for wo_a.
 
     The counterpart of ``rocm_inverse_rope_rows_`` for layers whose attention
-    output is MXFP8: rows the decode reduce did not emit (prefill) go through
-    here. ``o`` is [T, H, D]; ``out_data`` [T, H * D] e4m3 and ``out_scale``
-    [T, H * D // 32] E8M0, the layout the reduce epilogue writes.
+    output is MXFP8: rows the decode reduce did not emit (prefill, and on
+    gfx1250 also the decode rows, whose decode kernel has no MXFP8 epilogue)
+    go through here. ``o`` is [T, H, D]; ``out_data`` [T, H * D] e4m3 and
+    ``out_scale`` [T, H * D // 32] E8M0, the layout the reduce epilogue writes.
     """
     num_tokens, num_heads, head_dim = o.shape
     if num_tokens == 0:
@@ -1693,6 +1694,15 @@ def rocm_inverse_rope_mxfp8_rows(
     assert out_data.shape == (num_tokens, num_heads * head_dim)
     assert out_scale.shape == (num_tokens, num_heads * head_dim // 32)
     assert cos_sin_cache.shape[-1] == rope_head_dim
+    if _ON_GFX1250:
+        # Reached only with AITER's FP8 BMM on, which gates gfx1250's MXFP8
+        # wo_a input. AITER's kernel writes the same bytes as the one below.
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        rocm_aiter_ops.triton_inverse_rope_group_quant(
+            o, positions, cos_sin_cache, rope_head_dim, out_data, out_scale
+        )
+        return
     _inverse_rope_mxfp8_quant_kernel[(num_tokens, num_heads)](
         o,
         out_data,
@@ -1957,12 +1967,21 @@ def rocm_mxfp8_wo_a_bmm(
     """Grouped MXFP8 wo_a: ``out[t, g, :] = a[t, g, :] @ W[g].T``, bf16 out.
 
     ``a`` is the [T, G * K] e4m3 attention output and ``a_scale`` its
-    [T, G * K // 32] E8M0 scales, as the sparse decode reduce writes them.
+    [T, G * K // 32] E8M0 scales, as the gfx950 sparse decode reduce or
+    ``rocm_inverse_rope_mxfp8_rows`` writes them.
     The weight is the checkpoint's MXFP8 ``wo_a`` as loaded, [G * R, K] with
     either [G * R // 32, K // 32] block scales or [G * R, K // 32] per-row
     scales, so there is no dequantized copy to keep.
     Returns [T, G * R].
     """
+    if _ON_GFX1250:
+        # Reached only with AITER's FP8 BMM on, which gates gfx1250's MXFP8
+        # wo_a input: AITER's batched MXFP8 GEMM, same bytes as the one below.
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        return rocm_aiter_ops.triton_mxfp8_bmm(
+            a, a_scale, wo_a.weight, wo_a.weight_scale, n_groups
+        )
     return torch.ops.vllm.rocm_dsv41_mxfp8_wo_a_bmm(
         a, a_scale, wo_a.weight, wo_a.weight_scale, n_groups, o_lora_rank
     )
@@ -4599,8 +4618,9 @@ def rocm_sparse_attn_decode(
 
     ``output_mxfp8 = (data, scale)`` replaces ``output``: the reduce also
     MXFP8-quantizes the rotated rows for the FP8 wo_a (see
-    ``_rocm_sparse_attn_decode_ragged_triton``). It needs gfx950 and the fused
-    inverse RoPE, and always covers every row.
+    ``_rocm_sparse_attn_decode_ragged_triton``). It needs the inverse RoPE
+    positions and always covers every row. gfx950 fuses both into the reduce;
+    gfx1250 rotates and quantizes the kernel's bf16 output in one extra pass.
     """
     assert swa_k_cache.dtype == torch.uint8, (
         "ROCm Triton sparse decode expects uint8 fp8_ds_mla SWA cache, "
@@ -4630,9 +4650,18 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
+    # gfx1250 runs the un-tuned decode kernel, which has no inverse-RoPE /
+    # MXFP8 epilogue: it writes bf16 into its own buffer and one pass then
+    # rotates and quantizes that into ``output_mxfp8``.
+    unfused_mxfp8 = output_mxfp8 if _ON_GFX1250 else None
     if output_mxfp8 is not None:
         assert output is None, "output and output_mxfp8 are mutually exclusive"
         direct_out = None
+        if unfused_mxfp8 is not None:
+            assert (
+                inv_rope_positions is not None and inv_rope_cos_sin_cache is not None
+            ), "the MXFP8 output feeds wo_a, so it must be inverse-RoPE'd first"
+            output_mxfp8 = None
     else:
         assert output is not None
         direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
@@ -4655,10 +4684,22 @@ def rocm_sparse_attn_decode(
         out=direct_out,
         extra_cache_nan_free=extra_cache_nan_free,
         adaptive_splits=adaptive_splits,
-        inv_rope_positions=inv_rope_positions,
-        inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+        inv_rope_positions=None if unfused_mxfp8 is not None else inv_rope_positions,
+        inv_rope_cos_sin_cache=(
+            None if unfused_mxfp8 is not None else inv_rope_cos_sin_cache
+        ),
         out_mxfp8=output_mxfp8,
     )
+    if unfused_mxfp8 is not None:
+        rocm_inverse_rope_mxfp8_rows(
+            attn_out,
+            inv_rope_positions,
+            inv_rope_cos_sin_cache,
+            rope_head_dim,
+            unfused_mxfp8[0],
+            unfused_mxfp8[1],
+        )
+        return q.shape[0]
     if output_mxfp8 is not None:
         return q.shape[0]
     assert output is not None
