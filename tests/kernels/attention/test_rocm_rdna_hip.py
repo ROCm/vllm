@@ -28,11 +28,17 @@ _CONFIG_ENTRY = re.compile(r"^\s*\{([\w:, ]+)\},$")
 
 
 @pytest.mark.parametrize(
-    "kind, shape_fields",
-    [("decode", 7), ("decode_batch", 7), ("prefill", 6), ("prefill_batch", 5)],
+    "kind, shape_fields, causal_field",
+    [
+        ("decode", 7, None),
+        ("decode_batch", 7, None),
+        ("prefill", 6, 15),
+        ("prefill_batch", 5, 9),
+    ],
 )
-def test_gfx1150_configs_cover_the_same_shapes(kind, shape_fields):
-    """gfx1150's tables serve the shapes gfx1151's serve."""
+def test_gfx1150_configs_cover_the_same_shapes(kind, shape_fields, causal_field):
+    """gfx1150's tables serve the shapes gfx1151's serve, but for the
+    non-causal (mm-encoder) builds, gfx1151's only."""
     csrc = Path(__file__).resolve().parents[3] / "csrc" / "rocm"
     text = (csrc / f"rdna_{kind}_configs.h").read_text()
     shapes = {}
@@ -43,6 +49,12 @@ def test_gfx1150_configs_cover_the_same_shapes(kind, shape_fields):
                 for m in map(_CONFIG_ENTRY.match, table.split("\n"))
                 if m
             ]
+            if causal_field is not None:
+                entries = [
+                    e
+                    for e in entries
+                    if len(e) <= causal_field or e[causal_field] != "0"
+                ]
             shapes[name[1]] = {tuple(e[:shape_fields]) for e in entries}
     assert shapes["Gfx1151"] and shapes["Gfx1151"] == shapes["Gfx1150"]
 
