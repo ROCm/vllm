@@ -82,9 +82,6 @@ declare -A MODEL_SERVE=(
   [oaigptoss]="--tensor-parallel-size 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN --moe-backend aiter_triton_mxfp4_bf16"
 )
 
-# --- /health polls (5 s each) before giving up; models not listed get 240 (~20 min) ---
-declare -A MODEL_READY_TRIES=( [kimik3]=720 )
-
 # --- extra `vllm bench serve` args (e.g. tokenizers that need remote code) ---
 declare -A MODEL_BENCH_ARGS=( [kimik3]="--trust-remote-code" )
 
@@ -183,7 +180,7 @@ run_model() {
   server_pid=$!
 
   local ready=0
-  for _ in $(seq 1 "${MODEL_READY_TRIES[$key]:-240}"); do   # 5 s per poll
+  for _ in $(seq 1 720); do   # 5 s per poll, 1 h max
     if curl -s "http://localhost:$PORT/health" >/dev/null 2>&1; then ready=1; break; fi
     ps -p "$server_pid" >/dev/null 2>&1 || { echo "[$key] ERROR: server died (see output above)"; RESULT[$key]="FAIL (server died at load)"; stop_server; return; }
     sleep 5
