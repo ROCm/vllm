@@ -689,6 +689,77 @@ def test_rdna_hybrid_w4a16_prefill_dequant_reserves_min_kv(
                 kernel.process_weights_after_loading(layer)
 
 
+@pytest.mark.parametrize("free_after_flush_gib, fits", [(60, True), (40, False)])
+def test_rdna_hybrid_w4a16_prefill_dequant_flushes_allocator_cache(
+    free_after_flush_gib, fits, dist_init, monkeypatch
+):
+    """Cached allocator blocks are released before declaring the budget full."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP device not available")
+
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+
+    free = {"bytes": 40 * 2**30}
+    flushes = []
+
+    def empty_cache():
+        flushes.append(True)
+        free["bytes"] = free_after_flush_gib * 2**30
+
+    # 40 GiB free leaves nothing inside a 0.5 budget; 60 GiB leaves 6 GiB
+    # after the activation headroom.
+    monkeypatch.setattr(
+        hybrid_module,
+        "MemorySnapshot",
+        lambda device: SimpleNamespace(
+            free_memory=free["bytes"], total_memory=100 * 2**30
+        ),
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", empty_cache)
+    set_random_seed(0)
+    layer, kernel, *_ = _build_prefill_dequant_case(256, 128, 128, has_zp=False)
+
+    with set_current_vllm_config(_prefill_dequant_vllm_config("enable", 0.5)):
+        if fits:
+            kernel.process_weights_after_loading(layer)
+            assert hasattr(layer, _W_DEQUANT_ATTR)
+        else:
+            with pytest.raises(ValueError, match="gpu_memory_utilization"):
+                kernel.process_weights_after_loading(layer)
+    assert flushes
+
+
+def test_rdna_hybrid_w4a16_prefill_dequant_no_flush_when_fits(dist_init, monkeypatch):
+    """A layer that fits never pays for an allocator flush."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP device not available")
+
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+
+    monkeypatch.setattr(
+        hybrid_module,
+        "MemorySnapshot",
+        lambda device: SimpleNamespace(
+            free_memory=60 * 2**30, total_memory=100 * 2**30
+        ),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "empty_cache",
+        lambda: pytest.fail("empty_cache called although the layer fits"),
+    )
+    set_random_seed(0)
+    layer, kernel, *_ = _build_prefill_dequant_case(256, 128, 128, has_zp=False)
+
+    with set_current_vllm_config(_prefill_dequant_vllm_config("enable", 0.5)):
+        kernel.process_weights_after_loading(layer)
+    assert hasattr(layer, _W_DEQUANT_ATTR)
+
+
 # ---------------------------------------------------------------------------
 # can_implement enforces the supported-group-size policy
 # ---------------------------------------------------------------------------
