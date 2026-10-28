@@ -21,7 +21,10 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.utils import create_attention_profiler_scope
+from vllm.v1.utils import (
+    create_attention_profiler_scope,
+    profiler_scopes_enabled,
+)
 
 
 def flash_attn_maxseqlen_wrapper(
@@ -210,9 +213,15 @@ def triton_attn_wrapper(
     head_size = q.shape[2]
     num_kv_heads = k.shape[1]
 
-    # Compute segment lengths for block-diagonal attention in multi-segment batches.
+    # Segment lengths for the profiler label of multi-segment batches: a host
+    # read, so only when a scope records it and not under CUDA graph capture,
+    # which forbids it.
     block_diagonal_segments: list[int] | None = None
-    if cu_seqlens.numel() > 2:
+    if (
+        cu_seqlens.numel() > 2
+        and profiler_scopes_enabled()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         block_diagonal_segments = seg_lens.tolist()
 

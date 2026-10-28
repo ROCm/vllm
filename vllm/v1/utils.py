@@ -779,6 +779,14 @@ def report_usage_stats(
 _PROFILER_FUNC = None
 
 
+def profiler_scopes_enabled() -> bool:
+    """Whether record_function_or_nullcontext opens a scope, so a label that
+    costs work to build is worth building."""
+    return bool(
+        envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
+    )
+
+
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
     global _PROFILER_FUNC
 
