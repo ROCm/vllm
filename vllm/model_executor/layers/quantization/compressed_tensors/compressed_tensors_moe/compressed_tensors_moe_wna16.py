@@ -424,9 +424,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self._setup_kernel(layer)
 
     def _process_weights_hybrid_w4a16(self, layer: torch.nn.Module) -> None:
-        """Hybrid W4A16 MoE path: convert GPTQ [E, K/8, N] -> skinny
-        [E, N, K//8] int32 (ExLlama shuffle) and transpose scales to
-        [E, N, K//G].
+        """Hybrid W4A16 MoE path: repack N-first [E, N, K//8] weights with
+        the ExLlama shuffle. Scales are already [E, N, K//G].
 
         For symmetric quantization (bias=8), zero_points are not needed;
         the HIP skinny kernel uses HAS_ZERO_POINTS=false with hardcoded
@@ -476,17 +475,14 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             return buf[:, :, :k8]
 
         def convert_weights(w_packed: torch.Tensor) -> torch.Tensor:
-            """Convert [E, K/8, N] GPTQ -> [E, N, K//8] skinny
-            (ExLlama shuffle).
-            """
+            """Repack [E, N, K//8] with the ExLlama shuffle."""
             E_dim = w_packed.size(0)
             experts = []
             for e in range(E_dim):
                 unpacked = unpack_quantized_values_into_int32(
-                    w_packed[e], wtype, packed_dim=0
+                    w_packed[e], wtype, packed_dim=1
                 )
-                unpacked_t = unpacked.t().contiguous()
-                repacked = pack_int4_exllama_shuffle(unpacked_t)
+                repacked = pack_int4_exllama_shuffle(unpacked)
                 experts.append(repacked)
             return _pad_rows_off_cliff(torch.stack(experts))
 
@@ -503,15 +499,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             torch.nn.Parameter(
                 convert_weights(layer.w2_weight_packed), requires_grad=False
             ),
-        )
-
-        layer.w13_weight_scale = torch.nn.Parameter(
-            layer.w13_weight_scale.transpose(1, 2).contiguous(),
-            requires_grad=False,
-        )
-        layer.w2_weight_scale = torch.nn.Parameter(
-            layer.w2_weight_scale.transpose(1, 2).contiguous(),
-            requires_grad=False,
         )
 
         layer.use_hybrid_w4a16_moe = True
