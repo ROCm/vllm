@@ -52,12 +52,12 @@ declare -A MODEL_PATHS=(
 # --- serve-time environment (pruned: no-op HSA_*/USE_SVM and default-valued vars removed) ---
 declare -A MODEL_ENV=(
   [gptoss]="VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
-  [dsr1]="TRITON_HIP_USE_ASYNC_COPY=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=0 VLLM_ROCM_USE_SKINNY_GEMM=0"
+  [dsr1]="VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MLA=0"
   [dsv4f]="VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
   [dsv4pro]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
-  [dsv41f]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_USE_BREAKABLE_CUDAGRAPH=1 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_SKINNY_GEMM=0 AITER_TRITON_LOG_LEVEL=ERROR"
+  [dsv41f]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=0 AITER_TRITON_LOG_LEVEL=ERROR"
   [qwen]="VLLM_ROCM_USE_AITER=1"
-  [minimax]="VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
+  [minimax]="VLLM_ROCM_USE_AITER=1"
   [llama]="VLLM_ROCM_USE_AITER=1"
   [oaigptoss]="TRITON_HIP_USE_ASYNC_COPY=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0"
 )
@@ -67,12 +67,12 @@ declare -A MODEL_ENV=(
 #     word-splitting); the dsr1 compilation-config below is space-free. ---
 declare -A MODEL_SERVE=(
   [gptoss]="-tp 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN"
-  [dsr1]="-tp 1 --trust-remote-code --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 8192 --distributed-executor-backend mp --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.90 --compilation-config {\"pass_config\":{\"fuse_attn_quant\":true,\"eliminate_noops\":true,\"fuse_norm_quant\":true,\"fuse_mla_dual_rms_norm\":false,\"enable_qk_norm_rope_fusion\":false},\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\",\"+quant_fp8\"]} --moe-backend aiter_triton_mxfp4_mxfp4"
+  [dsr1]="-tp 1 --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 8192 --distributed-executor-backend mp --max-num-batched-tokens 8192 --max-num-seqs 32 --gpu-memory-utilization 0.90 --compilation-config {\"pass_config\":{\"fuse_attn_quant\":true,\"eliminate_noops\":true,\"fuse_norm_quant\":true,\"fuse_mla_dual_rms_norm\":false,\"enable_qk_norm_rope_fusion\":false},\"custom_ops\":[\"+rms_norm\",\"+silu_and_mul\",\"+quant_fp8\"]} --moe-backend aiter_triton_mxfp4_mxfp4"
   [dsv4f]="-tp 1 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768 --moe-backend aiter_triton_mxfp4_mxfp4"
   [dsv4pro]="-tp 4 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768 --moe-backend aiter_triton_mxfp4_mxfp4"
   [dsv41f]="-tp 1 --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 --max-model-len 32768 --tool-call-parser deepseek_v41 --enable-auto-tool-choice --reasoning-parser deepseek_v41 --moe-backend aiter_triton_mxfp4_mxfp4"
-  [qwen]="-tp 1 --max-num-seqs 256 --gpu-memory-utilization 0.90 --no-enable-flashinfer-autotune --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
-  [minimax]="-tp 1 --trust-remote-code --language-model-only --skip-mm-profiling --block-size 128 --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 32768 --distributed-executor-backend mp --max-num-batched-tokens 32768 --max-num-seqs 32 --gpu-memory-utilization 0.90 --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice --moe-backend aiter_triton_mxfp4_mxfp4"
+  [qwen]="-tp 1 --max-num-seqs 256 --gpu-memory-utilization 0.90 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+  [minimax]="-tp 1 --language-model-only --skip-mm-profiling --block-size 128 --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 32768 --distributed-executor-backend mp --max-num-seqs 32 --gpu-memory-utilization 0.90 --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice --moe-backend aiter_triton_mxfp4_mxfp4"
   [llama]="-tp 1 --no-enable-prefix-caching --kv-cache-dtype fp8 --max-model-len 8192 --gpu-memory-utilization 0.90 --attention-backend TRITON_ATTN --max-num-batched-tokens 512"
   [oaigptoss]="-tp 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN --moe-backend aiter_triton_mxfp4_bf16"
 )
