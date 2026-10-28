@@ -635,6 +635,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DFlareDraftModel": ("dflare", "DFlareForCausalLM"),
     "DFlareQwen3ForCausalLM": ("qwen3_dflare", "DFlareQwen3ForCausalLM"),
+    "LiLiCorrDraftModel": ("lilicorr", "LiLiCorrForCausalLM"),
     "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
     # Muse Glimmer's DFlash draft head, reusing the generic qwen3_dflash
     # implementation. EAGLEConfig rewrites a dflash draft's architecture to
