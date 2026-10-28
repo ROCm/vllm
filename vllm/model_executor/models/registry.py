@@ -91,7 +91,7 @@ _TEXT_GENERATION_MODELS = {
     "DeciLMForCausalLM": ("nemotron_nas", "DeciLMForCausalLM"),
     "DeepseekForCausalLM": ("deepseek_v2", "DeepseekForCausalLM"),
     "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
-    "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
+    "DeepseekV3ForCausalLM": ("vllm.models.deepseek_v2", "DeepseekV3ForCausalLM"),
     "DeepseekV32ForCausalLM": (
         "vllm.models.deepseek_v32",
         "DeepseekV32ForCausalLM",
@@ -484,7 +484,10 @@ _MULTIMODAL_MODELS = {
         "KeyeVL1_5ForConditionalGeneration",
     ),
     "KimiVLForConditionalGeneration": ("kimi_vl", "KimiVLForConditionalGeneration"),
-    "KimiK25ForConditionalGeneration": ("kimi_k25", "KimiK25ForConditionalGeneration"),
+    "KimiK25ForConditionalGeneration": (
+        "vllm.models.kimi_k25",
+        "KimiK25ForConditionalGeneration",
+    ),
     "KimiK3ForConditionalGeneration": (
         "vllm.models.kimi_k3",
         "KimiK3ForConditionalGeneration",
@@ -712,7 +715,7 @@ _SPECULATIVE_DECODING_MODELS = {
     "Eagle3DeepseekV2ForCausalLM": ("deepseek_eagle3", "Eagle3DeepseekV2ForCausalLM"),
     "Eagle3DeepseekV3ForCausalLM": ("deepseek_eagle3", "Eagle3DeepseekV2ForCausalLM"),
     "EagleDeepSeekMTPModel": ("deepseek_eagle", "EagleDeepseekV3ForCausalLM"),
-    "DeepSeekMTPModel": ("deepseek_mtp", "DeepSeekMTP"),
+    "DeepSeekMTPModel": ("vllm.models.deepseek_v2", "DeepSeekMTP"),
     "DeepseekV32MTPModel": ("vllm.models.deepseek_v32", "DeepseekV32MTP"),
     "Dots3NoteMTPModel": ("vllm.models.dots3_note", "Dots3NoteMTP"),
     "DeepSeekV4MTPModel": ("vllm.models.deepseek_v4", "DeepSeekV4MTP"),

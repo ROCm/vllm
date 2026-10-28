@@ -307,6 +307,8 @@ class KimiK25ForConditionalGeneration(
     supports_encoder_tp_data = True
     supports_encoder_cudagraph: ClassVar[Literal[True]] = True
     supports_mm_device_do_normalize = True
+    # Registry architecture the text backbone is built with.
+    language_model_architecture: ClassVar[str] = "DeepseekV2ForCausalLM"
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -377,7 +379,7 @@ class KimiK25ForConditionalGeneration(
                 vllm_config=vllm_config,
                 hf_config=config.text_config,
                 prefix=maybe_prefix(prefix, "language_model"),
-                architectures=["DeepseekV2ForCausalLM"],
+                architectures=[self.language_model_architecture],
             )
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
