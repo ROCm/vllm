@@ -488,3 +488,58 @@ def test_mha_attn_fp8_rejects_wrong_backend(default_vllm_config):
             MMEncoderAttention(4, 64)
     finally:
         vllm_config.model_config = old_model_config
+
+
+def _varlen_reference(q, k, v, segments, scale):
+    """Attention within each segment, in float."""
+    return torch.cat(
+        [
+            ref_attention(q_i.float(), k_i.float(), v_i.float(), scale)
+            for q_i, k_i, v_i in zip(
+                *(torch.split(x, segments, dim=1) for x in (q, k, v))
+            )
+        ],
+        dim=1,
+    )
+
+
+def _check_cuda_graph_replay(attn, head_size, capture, replays):
+    """Capture attn on cu_seqlens of the `capture` segments, with their total
+    as max_seqlen (a bound, as encoder CUDA graphs pass), then replay it on
+    each list of `replays` (the same total, padded with empty segments)."""
+    tokens, slots = sum(capture), max(map(len, [capture, *replays]))
+    q, k, v = (torch.randn(1, tokens, 16, head_size) for _ in range(3))
+
+    def bounds(segments):
+        padded = [*segments, *[0] * (slots - len(segments))]
+        return torch.tensor([0, *itertools.accumulate(padded)], dtype=torch.int32)
+
+    cu_seqlens = bounds(capture)
+    max_seqlen = torch.tensor(tokens, dtype=torch.int32, device="cpu")
+    attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    for segments in replays:
+        cu_seqlens.copy_(bounds(segments))
+        graph.replay()
+        ref = _varlen_reference(q, k, v, segments, head_size**-0.5)
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="CUDA graphs")
+def test_mha_attn_triton_varlen_cuda_graph(default_vllm_config):
+    """TRITON_ATTN's varlen path is captured once and replayed on other
+    segment lists: nothing it reads on the host is baked into the graph."""
+    set_random_seed(0)
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(torch.float16)
+    with patch(
+        "vllm.model_executor.layers.attention.mm_encoder_attention."
+        "get_vit_attn_backend",
+        return_value=AttentionBackendEnum.TRITON_ATTN,
+    ):
+        attn = MMEncoderAttention(16, 64, scale=64**-0.5)
+    _check_cuda_graph_replay(
+        attn, 64, [100, 150, 50], [[40, 220, 40], [300], [1, 2, 297]]
+    )

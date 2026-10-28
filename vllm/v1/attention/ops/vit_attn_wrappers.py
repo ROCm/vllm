@@ -210,9 +210,10 @@ def triton_attn_wrapper(
     head_size = q.shape[2]
     num_kv_heads = k.shape[1]
 
-    # Compute segment lengths for block-diagonal attention in multi-segment batches.
+    # Compute segment lengths for block-diagonal attention in multi-segment
+    # batches; not under CUDA graph capture, which forbids the host read.
     block_diagonal_segments: list[int] | None = None
-    if cu_seqlens.numel() > 2:
+    if cu_seqlens.numel() > 2 and not torch.cuda.is_current_stream_capturing():
         seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         block_diagonal_segments = seg_lens.tolist()
 
