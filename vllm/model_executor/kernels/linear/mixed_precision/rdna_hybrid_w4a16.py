@@ -4,21 +4,29 @@
 
 Routes based on batch size M:
   M <= MAX_SKINNY_BATCH_SIZE: HIP skinny GEMM (wvSplitK_int4_g)
-  M > MAX_SKINNY_BATCH_SIZE:  Triton W4A16 fused dequant GEMM
+  M >= MIN_DENSE_M: dense GEMM on a cached dequantized copy, when
+      ``KernelConfig.rdna_hybrid_w4a16_prefill_dequant`` is "enable"
+  otherwise: Triton W4A16 fused dequant GEMM
 
 Stores weights ONCE in skinny layout [N, K//8] int32 (ExLlama shuffle).
 Both the HIP skinny kernel and the triton kernel read from this single
-weight copy. The triton kernel transposes tiles in-register.
+weight copy. The triton kernel transposes tiles in-register. An optional
+dense copy is cached when ``rdna_hybrid_w4a16_prefill_dequant`` is enabled.
 """
 
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 
 import torch
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
+)
+from vllm.model_executor.layers.utils import (
+    cache_cliff_pad_elems,
+    rocm_unquantized_gemm_impl,
 )
 from vllm.model_executor.parameter import (
     permute_param_layout_,
@@ -26,6 +34,8 @@ from vllm.model_executor.parameter import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.mem_utils import MemorySnapshot
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -76,6 +86,35 @@ def _on_gfx1151() -> bool:
     return on_gfx1151()
 
 
+def _fits_in_memory_budget(nbytes: int, device: torch.device) -> bool:
+    # Same budget the KV cache is later sized from. Keep room for the
+    # activation peak and for KV of one max_model_len request (the floor the
+    # engine enforces), else startup fails later with a generic KV-cache error.
+    from vllm.v1.core.kv_cache_utils import max_memory_usage_bytes
+    from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
+
+    vllm_config = get_current_vllm_config()
+    util = vllm_config.cache_config.gpu_memory_utilization
+    min_kv_bytes = max_memory_usage_bytes(
+        vllm_config, get_kv_cache_spec(vllm_config).values()
+    )
+    # Peak activation + CUDA graph pool measured on gfx1151 at max_model_len
+    # 4096: 0.85 GiB (Qwen3-4B) to 3.27 GiB (Gemma-4-31B, MTP-3).
+    activation_headroom_bytes = 4 * GiB_bytes
+    snapshot = MemorySnapshot(device=device)
+    reserved = (
+        snapshot.total_memory * (1.0 - util) + activation_headroom_bytes + min_kv_bytes
+    )
+    return snapshot.free_memory - reserved >= nbytes
+
+
+def _profile_scope(name: str) -> AbstractContextManager:
+    # record_function is not torch.compile-safe.
+    if torch.compiler.is_compiling():
+        return nullcontext()
+    return torch.profiler.record_function(name)
+
+
 def _resolved_group_size(group_size: int, K: int) -> int:
     """Resolve the -1 per-channel sentinel to K for the Triton prefill path.
 
@@ -91,6 +130,8 @@ def _resolved_group_size(group_size: int, K: int) -> int:
 # K*M bound: the skinny kernel reads whatever does not fit in LDS from global
 # memory itself, so the batch size is the only thing that has to be bounded.
 MAX_SKINNY_BATCH_SIZE = 5
+# Dense GEMMs read 4x the weight bytes, so reserve them for large batches.
+MIN_DENSE_M = 256
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +741,27 @@ def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
     return w_q_skinny, w_q_skinny_i32
 
 
+def dequantize_w4a16(
+    unpacked: torch.Tensor,
+    scales: torch.Tensor,
+    zp: torch.Tensor | None,
+    group_size: int,
+    zp_bias: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize [N, K] int32 uint4 values (natural K order) to [N, K] dtype.
+
+    ``scales`` and ``zp`` are [N, K//G]; without ``zp`` the constant
+    ``zp_bias`` is subtracted.
+    """
+    N_dim, K_dim = unpacked.shape
+    w = unpacked.view(N_dim, K_dim // group_size, group_size).to(dtype)
+    # q - zp is a small exact integer, so a single rounding in `dtype` is
+    # bit-identical to fp32 math and avoids [N, K] fp32 temporaries.
+    w.sub_(zp[..., None] if zp is not None else zp_bias).mul_(scales[..., None])
+    return w.view(N_dim, K_dim)
+
+
 # ---------------------------------------------------------------------------
 # Hybrid dispatch logic
 # ---------------------------------------------------------------------------
@@ -729,8 +791,8 @@ def _rdna_hybrid_w4a16_apply_impl(
                single format: dequant = (nibble - zp_raw) * scale.
       packed_scale_zp: [N, K//G] fp32 carrier packing scale + zero-point per
                group (Triton prefill, asymmetric only), or None for symmetric.
-      w_dequant:  [N, K] dense dequantized weight (--w4a16-prefill-dequant), or None.
-               When present, prefill (M > MAX_SKINNY_BATCH_SIZE) runs a dense GEMM
+      w_dequant:  [N, K] optional dense dequantized weight.
+               When present, prefill (M >= MIN_DENSE_M) runs a dense GEMM
                on it. Passed as an op arg (not branched on in apply_weights) so the
                M-branch stays out of the compiled graph -- decode (small M) replays
                the same int4 cudagraph whether or not the dequantized copy exists.
@@ -759,37 +821,14 @@ def _rdna_hybrid_w4a16_apply_impl(
     # part of the activation that does not fit in LDS is read from global), so
     # the batch size is the only thing that has to be bounded.
     if M <= MAX_SKINNY_BATCH_SIZE:
-        ctx = (
-            nullcontext()
-            if torch.compiler.is_compiling()
-            else torch.profiler.record_function(f"wvsplitk_int4 {M}x{N}x{K} {_gz}")
-        )
-        with ctx:
+        with _profile_scope(f"wvsplitk_int4 {M}x{N}x{K} {_gz}"):
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
 
-    # Prefill with the pre-dequantized dense copy (load-time cached), if present.
-    if w_dequant is not None:
-        ctx = (
-            nullcontext()
-            if torch.compiler.is_compiling()
-            else torch.profiler.record_function(
-                f"hybrid_dequant_w4a16 {M}x{N}x{K} {_gz}"
-            )
-        )
-        with ctx:
-            # Route through the unquantized GEMM dispatch so the dense dequant copy
-            # reuses the same skinny/aiter/tgemm/BLAS selection (and stride-aware
-            # cliff handling) as UnquantizedLinearMethod.
-            from vllm.model_executor.layers.utils import rocm_unquantized_gemm_impl
-
+    if w_dequant is not None and M >= MIN_DENSE_M:
+        with _profile_scope(f"hybrid_dequant_w4a16 {M}x{N}x{K} {_gz}"):
             return rocm_unquantized_gemm_impl(x_2d, w_dequant, bias)
 
-    ctx = (
-        nullcontext()
-        if torch.compiler.is_compiling()
-        else torch.profiler.record_function(f"hybrid_triton_w4a16 {M}x{N}x{K} {_gz}")
-    )
-    with ctx:
+    with _profile_scope(f"hybrid_triton_w4a16 {M}x{N}x{K} {_gz}"):
         # Asymmetric layers carry the packed scale/zp carrier (scale + zero-point folded
         # into one load); symmetric layers pass packed_scale_zp=None and the kernel
         # reads scales directly with a constant -8 offset (no carrier overhead).
@@ -835,13 +874,16 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
     Stores weights once in skinny layout [N, K//8] (ExLlama shuffle packed).
     Both the HIP skinny kernel and the triton kernel read from this single
-    weight copy, eliminating the memory overhead of dual weight storage.
+    weight copy, with an optional dense prefill copy when
+    ``rdna_hybrid_w4a16_prefill_dequant`` is enabled.
     """
 
     SUPPORTED_QUANT_TYPES = [
         scalar_types.uint4b8,  # symmetric GPTQ (bias=8)
         scalar_types.uint4,  # asymmetric (zero_points)
     ]
+
+    DEQUANT_WEIGHT_NAME = "_rdna_hybrid_w4a16_prefill_dequant"
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -898,6 +940,54 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             )
 
         return True, None
+
+    def _cache_dequant_weight(
+        self,
+        layer: torch.nn.Module,
+        unpacked: torch.Tensor,
+        w_s: torch.Tensor,
+        zp: torch.Tensor | None,
+    ) -> None:
+        c = self.config
+        N, K = unpacked.shape
+        pad_elems = cache_cliff_pad_elems(K, c.act_type.itemsize) if _on_gfx1x() else 0
+        nbytes = N * (K + pad_elems) * c.act_type.itemsize
+        # All-or-nothing: the compile cache key does not record which layers
+        # hold a copy, so a partial cache can crash or silently skip copies.
+        if not _fits_in_memory_budget(nbytes, unpacked.device):
+            raise ValueError(
+                "Not enough room in the gpu_memory_utilization budget to cache "
+                "a dequantized W4A16 prefill weight "
+                "(kernel_config.rdna_hybrid_w4a16_prefill_dequant) while "
+                "keeping KV cache for one max_model_len request. Increase "
+                "`gpu_memory_utilization`, lower `max_model_len`, or disable it."
+            )
+
+        logger.info_once(
+            "Caching dense %s copies of W4A16 weights for prefill "
+            "(kernel_config.rdna_hybrid_w4a16_prefill_dequant). Each copy "
+            "is 4x its int4 weight and is reported in the model loading memory, "
+            "at the expense of KV cache.",
+            c.act_type,
+        )
+
+        w_dequant = dequantize_w4a16(
+            unpacked,
+            w_s,
+            zp,
+            _resolved_group_size(c.group_size, K),
+            c.weight_type.bias,
+            c.act_type,
+        )
+        # Let UnquantizedLinearMethod apply its dense-weight layout (e.g. gfx11
+        # row-stride padding) so the copy matches what an fp16 checkpoint gets.
+        dense = torch.nn.Module()
+        dense.weight = torch.nn.Parameter(w_dequant, requires_grad=False)
+        UnquantizedLinearMethod().process_weights_after_loading(dense)
+        # Derived from the int4 weight, so keep it out of state_dict.
+        layer.register_buffer(
+            self.DEQUANT_WEIGHT_NAME, dense.weight.data, persistent=False
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Never divides by group_size -- the group count comes from the
@@ -1004,109 +1094,9 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
                 torch.nn.Parameter(packed_scale_zp, requires_grad=False),
             )
 
-        # ---- Optional: cache a dequantized copy of the weight (in the model's
-        # activation dtype, fp16 or bf16) so the
-        # prefill path (M > MAX_SKINNY_BATCH_SIZE) can run a dense hipBLASLt GEMM
-        # and skip the in-kernel int4 unpack. Decode still uses the int4 weights
-        # (bandwidth-bound at small M). The copy costs ~4x the int4 weight, so it
-        # is gated per-weight on the gpu_memory_utilization budget: weights are
-        # cached greedily until the budget is exhausted, after which the rest keep
-        # the int4 prefill path. Allocating here (before the memory profiler runs)
-        # lets the KV-cache sizing account for the copies.
-        model_config = get_current_vllm_config().model_config
-        dequant_mode = (
-            model_config.w4a16_prefill_dequant if model_config is not None else "off"
-        )
-        if dequant_mode != "off" and unpacked.device.type == "cuda":
-            self._maybe_cache_dequant_prefill_weight(
-                layer, unpacked, w_s_skinny, zp_unpacked, dequant_mode
-            )
-
-    def _maybe_cache_dequant_prefill_weight(
-        self,
-        layer: torch.nn.Module,
-        unpacked: torch.Tensor,
-        w_s_skinny: torch.Tensor,
-        w_zp: torch.Tensor | None,
-        mode: str = "soft",
-    ) -> None:
-        """Cache a dense dequantized copy of the weight for the prefill GEMM.
-
-        ``mode`` controls behavior when the gpu_memory_utilization budget is
-        exhausted:
-          - ``"soft"``: warn once and fall back to the int4 prefill path.
-          - ``"hard"``: raise ``RuntimeError`` so the user knows the dequant
-            cache could not be fully applied.
-        """
-        from vllm.utils.mem_utils import MemorySnapshot
-
-        c = self.config
-        N, K = unpacked.shape
-        elem_size = torch.empty((), dtype=c.act_type).element_size()
-        # Account for the gfx11x cache-line pad applied to the cached copy below
-        # (pad_weights_avoid_cache_cliff_on_gfx11) so the gpu_memory_utilization
-        # gate stays honest.
-        from vllm.model_executor.layers.utils import cache_cliff_pad_elems
-
-        pad_elems = (
-            cache_cliff_pad_elems(K, elem_size)
-            if _on_gfx1x() and unpacked.device.type == "cuda"
-            else 0
-        )
-        dequant_bytes = N * (K + pad_elems) * elem_size
-
-        util = get_current_vllm_config().cache_config.gpu_memory_utilization
-        # MemorySnapshot mirrors vLLM's own KV-cache profiler: on integrated/UMA
-        # GPUs (e.g. gfx1151 Strix Halo) cudaMemGetInfo underreports free memory,
-        # so it falls back to psutil there -- keeping this gate consistent with
-        # how the KV-cache budget is actually sized.
-        snapshot = MemorySnapshot(device=unpacked.device)
-        free_bytes, total_bytes = snapshot.free_memory, snapshot.total_memory
-        # Memory vLLM deliberately leaves untouched outside its budget.
-        out_of_budget = total_bytes * (1.0 - util)
-        # Room still free within the budget right now.
-        spendable = free_bytes - out_of_budget
-        if spendable < dequant_bytes:
-            need_mib = dequant_bytes / 2**20
-            have_mib = max(0, spendable) / 2**20
-            msg = (
-                f"--w4a16-prefill-dequant: no room left in the "
-                f"gpu_memory_utilization={util:.2f} budget to cache a "
-                f"dequantized prefill copy (need {need_mib:.1f} MiB, "
-                f"have {have_mib:.1f} MiB). "
-            )
-            if mode == "hard":
-                raise RuntimeError(
-                    msg + "Reduce model size, raise gpu_memory_utilization, "
-                    "or use --w4a16-prefill-dequant soft."
-                )
-            logger.warning_once(
-                msg + "Affected W4A16 weights use the int4 prefill path. "
-                "Raise gpu_memory_utilization to cache more.",
-            )
-            return
-
-        G = _resolved_group_size(c.group_size, K)
-        u = unpacked.to(torch.float32)  # [N, K] natural order, nibble 0..15
-        scale_exp = w_s_skinny.to(torch.float32).repeat_interleave(G, dim=1)
-        if w_zp is not None:
-            zp_exp = w_zp.to(torch.float32).repeat_interleave(G, dim=1)
-            w_dequant = ((u - zp_exp) * scale_exp).to(c.act_type)
-        else:
-            w_dequant = ((u - 8.0) * scale_exp).to(c.act_type)
-        # Buffer (not a Parameter): this is a derived, recomputable cache, so it
-        # should move with the module but stay out of .parameters() and, with
-        # persistent=False, out of state_dict(). Pad the row stride off the
-        # gfx11x 2048-byte cliff (shared with the unquantized linear path).
-        from vllm.model_executor.layers.utils import (
-            pad_weights_avoid_cache_cliff_on_gfx11,
-        )
-
-        layer.register_buffer(
-            "_hybrid_w_dequant",
-            pad_weights_avoid_cache_cliff_on_gfx11(w_dequant.contiguous()),
-            persistent=False,
-        )
+        kernel_config = get_current_vllm_config().kernel_config
+        if kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable":
+            self._cache_dequant_weight(layer, unpacked, w_s_skinny, zp_unpacked)
 
     def apply_weights(
         self,
@@ -1126,14 +1116,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         N = w_q.shape[0]
         out_shape = x.shape[:-1] + (N,)
 
-        # Dequantized copy cached at load time (opt-in via
-        # --w4a16-prefill-dequant, subject to the free-VRAM gate), or None when
-        # absent/skipped. Passed straight to the op; the M-branch (prefill ->
-        # dense dequant, decode -> int4) lives INSIDE the opaque op so it never
-        # enters the compiled graph -- decode replays the same int4 cudagraph
-        # whether or not the dequantized copy exists.
-        w_dequant = getattr(layer, "_hybrid_w_dequant", None)
-
         cu_count = num_compute_units()
         output = torch.ops.vllm.rdna_hybrid_w4a16_apply(
             x_2d,
@@ -1145,6 +1127,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             cu_count,
             c.group_size,
             packed_scale_zp,
-            w_dequant,
+            getattr(layer, self.DEQUANT_WEIGHT_NAME, None),
         )
         return output.reshape(out_shape)

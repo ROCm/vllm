@@ -256,10 +256,6 @@ class ModelConfig:
 
     NOTE: This disables both `torch.compile` and CUDA graphs, and is
     equivalent to setting `-cc.mode=none -cc.cudagraph_mode=none`."""
-    w4a16_prefill_dequant: str = "off"
-    """Cache dequantized W4A16 weights for the prefill GEMM.
-    'off': no caching (default). 'soft': cache until budget exhausted, warn on
-    skip. 'hard': cache, error if budget exhausted."""
     return_sampling_mask: bool = False
     """Whether to return the post-processing token support for each sample."""
     max_logprobs: int = Field(default=20, ge=-1)
@@ -453,7 +449,6 @@ class ModelConfig:
             "tokenizer_revision",
             "spec_target_max_model_len",
             "enforce_eager",
-            "w4a16_prefill_dequant",
             "return_sampling_mask",
             "logprobs_mode",
             "use_fp64_gumbel",

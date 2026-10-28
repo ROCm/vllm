@@ -621,7 +621,6 @@ class EngineArgs:
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     dynamic_lm_head_quantization: str | None = ModelConfig.dynamic_lm_head_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
-    w4a16_prefill_dequant: str = ModelConfig.w4a16_prefill_dequant
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
     language_model_only: bool = MultiModalConfig.language_model_only
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
@@ -964,15 +963,6 @@ class EngineArgs:
             **model_kwargs["dynamic_lm_head_quantization"],
         )
         model_group.add_argument("--enforce-eager", **model_kwargs["enforce_eager"])
-        model_group.add_argument(
-            "--w4a16-prefill-dequant",
-            type=str,
-            default="off",
-            choices=["off", "soft", "hard"],
-            help="Cache dequantized W4A16 weights for prefill GEMM. "
-            "'soft' warns if budget exhausted, 'hard' errors out. "
-            "Default: off.",
-        )
         model_group.add_argument(
             "--enable-return-routed-experts",
             **aux_output_kwargs["enable_return_routed_experts"],
@@ -1955,7 +1945,6 @@ class EngineArgs:
             allow_deprecated_quantization=self.allow_deprecated_quantization,
             dynamic_lm_head_quantization=self.dynamic_lm_head_quantization,
             enforce_eager=self.enforce_eager,
-            w4a16_prefill_dequant=self.w4a16_prefill_dequant,
             return_sampling_mask=self.return_sampling_mask,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
