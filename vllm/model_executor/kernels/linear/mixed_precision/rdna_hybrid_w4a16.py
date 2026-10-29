@@ -105,14 +105,12 @@ def _fits_in_memory_budget(nbytes: int, device: torch.device) -> bool:
     reserved = (
         snapshot.total_memory * (1.0 - util) + activation_headroom_bytes + min_kv_bytes
     )
-    if snapshot.free_memory - reserved >= nbytes:
-        return True
-    # Blocks the torch allocator caches after load-time temporaries still count
-    # as used device memory: 15 GiB by the last layer of Gemma-4-31B MTP-3,
-    # enough to fail on its own. Flush only when short, since flushing every
-    # layer adds ~11 s to that model's load.
-    torch.accelerator.empty_cache()
-    return MemorySnapshot(device=device).free_memory - reserved >= nbytes
+    # free_memory counts blocks the torch allocator cached after load-time
+    # temporaries as used (15 GiB by the last layer of Gemma-4-31B MTP-3), but
+    # the allocator reuses them, or releases them on an allocation failure, and
+    # KV sizing excludes them too.
+    cached_free = snapshot.torch_memory - snapshot.torch_allocated
+    return snapshot.free_memory + cached_free - reserved >= nbytes
 
 
 def _profile_scope(name: str) -> AbstractContextManager:
