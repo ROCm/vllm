@@ -11,6 +11,9 @@
 #   dsv4pro    DeepSeek-V4-Pro (tp=4)
 #   dsv41f     DeepSeek-V4.1-Flash
 #   qwen       Qwen3.8-Flash-Next
+#   glm        GLM-5.3-Flash
+#   kimik3     Kimi-K3 (tp=4)
+#   musespark  Muse-Spark-Open-816B-A42B-Quark-MXFP4 (tp=4)
 #
 # For each selected model it: starts vllm serve with that model's env+args
 # (server + lm_eval output stream to the terminal), waits for /health, runs the
@@ -22,11 +25,11 @@
 #   ./vllm_smoketest.sh --minimax                # run only minimax
 #   ./vllm_smoketest.sh --gptoss /some/other/path# run gptoss from a custom path
 #   ./vllm_smoketest.sh --dsr1 --minimax         # run a subset
-# Each of --gptoss / --dsr1 / --dsv4f / --dsv41f / --qwen / --minimax takes an OPTIONAL model path.
+# Each of --gptoss / --dsr1 / --dsv4f / --dsv41f / --qwen / --glm / --kimik3 / --musespark / --minimax takes an OPTIONAL model path.
 set -uo pipefail
 
 PORT=8000
-CANONICAL_ORDER=(gptoss dsv4f dsr1 minimax llama oaigptoss dsv4pro dsv41f qwen)
+CANONICAL_ORDER=(gptoss dsv4f dsr1 minimax llama oaigptoss dsv4pro dsv41f qwen glm kimik3 musespark)
 
 # --- default model paths (from the per-model serve scripts) ---
 declare -A MODEL_PATHS=(
@@ -36,6 +39,9 @@ declare -A MODEL_PATHS=(
   [dsv4pro]="/data/models/DeepSeek-V4-Pro"
   [dsv41f]="/data/models/DeepSeek-V4.1-Flash"
   [qwen]="/data/models/Qwen3.8-Flash-Next"
+  [glm]="/data/models/GLM-5.3-Flash"
+  [kimik3]="/data/models/Kimi-K3"
+  [musespark]="/data/models/Muse-Spark-Open-816B-A42B-Quark-MXFP4"
   [minimax]="/data/models/MiniMax-M3-MXFP4"
   [llama]="/data/models/Llama-3.1-405B-Instruct-MXFP4-Preview"
   [oaigptoss]="/data/models/gpt-oss-120b"
@@ -49,6 +55,9 @@ declare -A MODEL_ENV=(
   [dsv4pro]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
   [dsv41f]="VLLM_ENGINE_READY_TIMEOUT_S=3600 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=0 AITER_TRITON_LOG_LEVEL=ERROR"
   [qwen]="VLLM_ROCM_USE_AITER=1"
+  [glm]="VLLM_ENGINE_READY_TIMEOUT_S=3600 HSA_ENABLE_SDMA=0 USE_SVM=0 HSA_XNACK=0 VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_LINEAR=0 VLLM_ROCM_USE_SKINNY_GEMM=0 VLLM_ROCM_USE_AITER_RMSNORM=0"
+  [kimik3]="AITER_FORCE_A8W4=1 VLLM_ROCM_USE_AITER=1 SAFETENSORS_FAST_GPU=1 VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_ROCM_USE_SKINNY_GEMM=0"
+  [musespark]="VLLM_ROCM_USE_AITER=1 VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE=bf16"
   [minimax]="VLLM_ROCM_USE_AITER=1"
   [llama]="VLLM_ROCM_USE_AITER=1"
   [oaigptoss]="VLLM_ROCM_USE_AITER=1"
@@ -64,6 +73,9 @@ declare -A MODEL_SERVE=(
   [dsv4pro]="-tp 4 --gpu_memory_utilization 0.7 --kv-cache-dtype fp8 --max-model-len 32768 --moe-backend aiter_triton_mxfp4_mxfp4"
   [dsv41f]="-tp 1 --gpu-memory-utilization 0.9 --kv-cache-dtype fp8 --max-model-len 32768 --tool-call-parser deepseek_v41 --enable-auto-tool-choice --reasoning-parser deepseek_v41 --moe-backend aiter_triton_mxfp4_mxfp4"
   [qwen]="-tp 1 --max-num-seqs 256 --gpu-memory-utilization 0.90 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3"
+  [glm]="--tensor-parallel-size 1 --max-num-seqs 512 --attention-backend ROCM_AITER_MLA_SPARSE --moe-backend triton --max-model-len 32768 --max-num-batched-tokens 32768 --no-enable-chunked-prefill --no-enable-prefix-caching --kernel-config.enable_jit_warmup=False --tool-call-parser glm47 --enable-auto-tool-choice --reasoning-parser glm47"
+  [kimik3]="--trust-remote-code --tensor-parallel-size 4 --load-format auto --gpu-memory-utilization 0.95 --mm-encoder-tp-mode data --max-num-seqs 128 --max-num-batched-tokens 4096 --max-model-len 262144 --moe-backend aiter_flydsl_mxfp4_bf16 --kda-prefill-backend triton --compilation-config {\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"custom_ops\":[\"+fused_rms_norm_gated\"]} --enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --attention-backend TRITON_MLA"
+  [musespark]="--tokenizer-mode hf --config-format auto --load-format safetensors --generation-config vllm --language-model-only --dtype bfloat16 --tensor-parallel-size 4 --distributed-executor-backend mp --moe-backend aiter_triton_mxfp4_mxfp4 --attention-backend TRITON_ATTN --max-model-len 32768 --max-num-seqs 64 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --enable-chunked-prefill --reasoning-parser musespark1x --tool-call-parser musespark1x --enable-auto-tool-choice"
   [minimax]="-tp 1 --language-model-only --skip-mm-profiling --block-size 128 --no-enable-prefix-caching --no-enable-chunked-prefill --max-model-len 32768 --distributed-executor-backend mp --max-num-seqs 32 --gpu-memory-utilization 0.90 --reasoning-parser minimax_m3 --tool-call-parser minimax_m3 --enable-auto-tool-choice --moe-backend aiter_triton_mxfp4_mxfp4"
   [llama]="-tp 1 --no-enable-prefix-caching --kv-cache-dtype fp8 --max-model-len 8192 --gpu-memory-utilization 0.90 --attention-backend TRITON_ATTN --max-num-batched-tokens 512"
   [oaigptoss]="-tp 1 --gpu_memory_utilization 0.7 --attention-backend TRITON_ATTN --moe-backend aiter_triton_mxfp4_bf16"
@@ -71,7 +83,7 @@ declare -A MODEL_SERVE=(
 
 # --- lm_eval: kind (chat=chat-completions+template, raw=completions),
 #     extra model_args, and gen_kwargs (verbatim from each eval_*.sh) ---
-declare -A EVAL_KIND=( [gptoss]="chat" [dsr1]="chat" [dsv4f]="raw" [dsv4pro]="raw" [dsv41f]="raw" [qwen]="chat" [minimax]="chat" [llama]="chat" [oaigptoss]="chat" )
+declare -A EVAL_KIND=( [gptoss]="chat" [dsr1]="chat" [dsv4f]="raw" [dsv4pro]="raw" [dsv41f]="raw" [qwen]="chat" [glm]="chat" [kimik3]="raw" [musespark]="chat" [minimax]="chat" [llama]="chat" [oaigptoss]="chat" )
 declare -A EVAL_MARGS=(
   [gptoss]="num_concurrent=64,max_retries=3,tokenized_requests=False,max_length=8192"
   [dsr1]="num_concurrent=64,max_retries=3,tokenized_requests=False,max_length=8192,timeout=3600"
@@ -79,6 +91,9 @@ declare -A EVAL_MARGS=(
   [dsv4pro]="num_concurrent=8,max_retries=3,tokenized_requests=False,max_length=32768,timeout=1200"
   [dsv41f]="num_concurrent=8,max_retries=3,tokenized_requests=False,max_length=32768,timeout=1200"
   [qwen]="num_concurrent=32,max_retries=3,tokenized_requests=False,max_length=32768,timeout=3600"
+  [glm]="num_concurrent=32,max_retries=3,tokenized_requests=False,max_length=32768,timeout=3600"
+  [kimik3]="num_concurrent=64,max_retries=3,tokenized_requests=False,trust_remote_code=True"
+  [musespark]="num_concurrent=32,max_retries=3,tokenized_requests=False,max_length=32768,timeout=3600"
   [minimax]="num_concurrent=32,max_retries=3,tokenized_requests=False,max_length=32768,timeout=3600"
   [llama]="num_concurrent=32,max_retries=3,tokenized_requests=False,max_length=8192,timeout=3600"
   [oaigptoss]="num_concurrent=64,max_retries=3,tokenized_requests=False,max_length=8192"
@@ -90,6 +105,9 @@ declare -A EVAL_GEN=(
   [dsv4pro]="max_gen_toks=2048,do_sample=True,temperature=1.0,top_p=0.95"
   [dsv41f]="max_gen_toks=2048,do_sample=True,temperature=1.0,top_p=0.95"
   [qwen]="max_gen_toks=2048,do_sample=True,temperature=0.6,top_p=0.95"
+  [glm]="max_gen_toks=2048,do_sample=True,temperature=1.0,top_p=0.95"
+  [kimik3]="max_gen_toks=256"
+  [musespark]="max_gen_toks=2048"
   [minimax]="max_gen_toks=2048,do_sample=True,temperature=1.0,top_p=0.95"
   [llama]="max_gen_toks=1024"
   [oaigptoss]="max_gen_toks=4096"
@@ -97,19 +115,22 @@ declare -A EVAL_GEN=(
 
 usage() {
   cat <<EOF
-Usage: ./vllm_smoketest.sh [--gptoss [PATH]] [--dsr1 [PATH]] [--dsv4f [PATH]] [--dsv4pro [PATH]] [--dsv41f [PATH]] [--qwen [PATH]] [--minimax [PATH]] [--llama [PATH]] [--oaigptoss [PATH]] [--port N] [--list]
+Usage: ./vllm_smoketest.sh [--gptoss [PATH]] [--dsr1 [PATH]] [--dsv4f [PATH]] [--dsv4pro [PATH]] [--dsv41f [PATH]] [--qwen [PATH]] [--glm [PATH]] [--kimik3 [PATH]] [--musespark [PATH]] [--minimax [PATH]] [--llama [PATH]] [--oaigptoss [PATH]] [--port N] [--list]
   --gptoss  [PATH]   run gpt-oss-120b-w-mxfp4-a-fp8   (optional model-path override)
   --dsr1    [PATH]   run DeepSeek-R1-0528-MXFP4        (optional model-path override)
   --dsv4f    [PATH]   run DeepSeek-V4-Flash             (optional model-path override)
   --dsv4pro  [PATH]   run DeepSeek-V4-Pro (tp=4)         (optional model-path override)
   --dsv41f   [PATH]   run DeepSeek-V4.1-Flash           (optional model-path override)
   --qwen     [PATH]   run Qwen3.8-Flash-Next            (optional model-path override)
+  --glm      [PATH]   run GLM-5.3-Flash                 (optional model-path override)
+  --kimik3   [PATH]   run Kimi-K3 (tp=4)                (optional model-path override)
+  --musespark [PATH] run Muse-Spark-Open-816B-A42B-Quark-MXFP4 (tp=4) (optional model-path override)
   --minimax [PATH]   run MiniMax-M3-MXFP4              (optional model-path override)
   --llama   [PATH]   run Llama-3.1-405B-Instruct-MXFP4-Preview (optional model-path override)
   --oaigptoss [PATH] run openai/gpt-oss-120b (aiter_triton_mxfp4_bf16 MoE) (optional model-path override)
   --port N           server port (default: $PORT)
   --list             list models + default paths and exit
-With no model flag, all nine run in order: ${CANONICAL_ORDER[*]}
+With no model flag, all twelve run in order: ${CANONICAL_ORDER[*]}
 Each model: serve -> gsm8k lm_eval (5-shot, limit 100) -> shutdown. Logs stream to this terminal.
 EOF
 }
@@ -119,7 +140,7 @@ declare -A PATH_OVERRIDE=()
 SELECTED=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --gptoss|--dsr1|--dsv4f|--dsv4pro|--dsv41f|--qwen|--minimax|--llama|--oaigptoss)
+    --gptoss|--dsr1|--dsv4f|--dsv4pro|--dsv41f|--qwen|--glm|--kimik3|--musespark|--minimax|--llama|--oaigptoss)
       key="${1#--}"
       SELECTED+=("$key")
       if [[ $# -ge 2 && "$2" != -* ]]; then PATH_OVERRIDE[$key]="$2"; shift 2; else shift; fi
@@ -188,7 +209,7 @@ run_model() {
   server_pid=$!
 
   local ready=0
-  for _ in $(seq 1 480); do          # up to ~40 min for load (dsv41f needs >20)
+  for _ in $(seq 1 720); do   # 5 s per poll, 1 h max
     if curl -s "http://localhost:$PORT/health" >/dev/null 2>&1; then ready=1; break; fi
     ps -p "$server_pid" >/dev/null 2>&1 || { echo "[$key] ERROR: server died (see output above)"; RESULT[$key]="FAIL (server died at load)"; stop_server; return; }
     sleep 5
