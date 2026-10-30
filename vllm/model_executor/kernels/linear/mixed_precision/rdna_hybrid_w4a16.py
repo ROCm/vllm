@@ -17,6 +17,7 @@ dense copy is cached when ``rdna_hybrid_w4a16_prefill_dequant`` is enabled.
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
+from packaging.version import Version
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
@@ -178,6 +179,28 @@ def _int4_pair_to_fp16x2(x):
     )
 
 
+_TRITON_GE_3_9 = Version(triton.__version__).release[:2] >= (3, 9)
+
+
+@triton.jit
+def _layout_barrier(x):
+    """Return ``x`` unchanged through an opaque, non-pure op.
+
+    Emits no instructions (empty asm, output tied to input), but Triton does not
+    rematerialize the op (triton-lang/triton#11001), so layout conversions are
+    not hoisted across it.
+    """
+    tl.static_assert(x.dtype.primitive_bitwidth == 16)
+    return tl.inline_asm_elementwise(
+        asm="",
+        constraints="=v,0",
+        args=[x],
+        dtype=x.dtype,
+        is_pure=False,
+        pack=2,
+    )
+
+
 @triton.jit
 def _triton_w4a16_skinny_fmt_kernel(
     # Pointers
@@ -202,6 +225,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    LAYOUT_BARRIER: tl.constexpr,
 ):
     """Fused W4A16 GEMM reading skinny weights [N, K//8].
 
@@ -335,6 +359,13 @@ def _triton_w4a16_skinny_fmt_kernel(
             else:
                 # bf16: (nibble - 8) * scale, int subtract before the cast.
                 b_fp = (b - 8).to(scales.dtype) * scales[:, None]
+
+        if LAYOUT_BARRIER:
+            # Triton 3.9's RemoveLayoutConversions would otherwise hoist the
+            # dot-operand conversion above the unpack and dequant, so they run
+            # in the WMMA operand layout, where each warp holds the whole B tile
+            # (4x the dequant work at 4 warps).
+            b_fp = _layout_barrier(b_fp)
 
         # ---- Transpose to [BLOCK_K, BLOCK_N] for matmul ----
         b_fp_t = tl.trans(b_fp)
@@ -602,6 +633,11 @@ def triton_w4a16_skinny_fmt_gemm(
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     extra_kwargs = {} if num_stages is None else {"num_stages": num_stages}
+    # Triton < 3.9 does not hoist the conversion that the barrier blocks, and
+    # with one warp the barrier measured slower on most shapes on gfx1151.
+    layout_barrier = (
+        _TRITON_GE_3_9 and a.dtype == torch.bfloat16 and num_warps > 1 and _on_gfx1x()
+    )
     # The kernel picks the packed (fp16/gfx1x) vs scalar unpack itself.
     _triton_w4a16_skinny_fmt_kernel[grid](
         a,
@@ -623,6 +659,7 @@ def triton_w4a16_skinny_fmt_gemm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        LAYOUT_BARRIER=layout_barrier,
         num_warps=num_warps,
         **extra_kwargs,
     )
