@@ -321,6 +321,36 @@ SHAPES: list[dict[str, Any]] = [
         "group_size": 32,
         "comment": "Gemma4-31B decode",
     },
+    # Decode shapes of the Strix Halo GEMM dashboard (gfx1151 nightly) that
+    # the entries above do not cover.
+    *(
+        {"in_features": k, "out_features": n, "group_size": g, "comment": c}
+        for k, n, g, c in [
+            (2048, 64, 128, "Qwen3.5/3.6-35B-A3B W4A16"),
+            (2048, 128, 128, "Qwen3-30B-A3B-2507 w4a16"),
+            (2048, 5120, 128, "Qwen3-30B-A3B-2507 w4a16"),
+            (896, 896, 128, "Qwen2.5-0.5B"),
+            (896, 1152, 128, "Qwen2.5-0.5B"),
+            (896, 9728, 128, "Qwen2.5-0.5B"),
+            (4864, 896, 128, "Qwen2.5-0.5B down_proj"),
+            (256, 2560, 32, "Gemma-4-E4B QAT-INT4"),
+            (2560, 256, 32, "Gemma-4-E4B QAT-INT4"),
+            (2560, 2048, 32, "Gemma-4-E4B AWQ/QAT-INT4"),
+            (2560, 3072, 32, "Gemma-4-E4B AWQ/QAT-INT4"),
+            (2560, 4096, 32, "Gemma-4-E4B AWQ/QAT-INT4"),
+            (2048, 2560, 32, "Gemma-4-E4B AWQ/QAT-INT4"),
+            (1536, 2048, 32, "Gemma-4-E2B AWQ-INT4"),
+            (1536, 2560, 32, "Gemma-4-E2B AWQ-INT4"),
+            (1536, 4096, 32, "Gemma-4-E2B AWQ-INT4"),
+            (1536, 5120, 32, "Gemma-4-E2B AWQ-INT4"),
+            (1536, 8960, 32, "Gemma-4-E2B AWQ-INT4"),
+            (1536, 12288, 32, "Gemma-4-E2B AWQ-INT4"),
+            (1536, 24576, 32, "Gemma-4-E2B AWQ-INT4"),
+            (2048, 1536, 32, "Gemma-4-E2B AWQ-INT4"),
+            (4096, 1536, 32, "Gemma-4-E2B AWQ-INT4"),
+            (6144, 1536, 32, "Gemma-4-E2B AWQ-INT4"),
+        ]
+    ),
 ]
 
 # Provider naming convention: "<base>[-zp][-bf16]". Suffix -zp selects the
