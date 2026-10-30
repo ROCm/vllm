@@ -27,6 +27,7 @@ from vllm.utils.math_utils import round_up_to
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.worker.encoder_cudagraph_defs import (
     ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG,
+    CudaGraphCaptureUnsupportedError,
     EncoderCudaGraphConfig,
     EncoderItemSpec,
 )
@@ -181,6 +182,9 @@ class EncoderCudaGraphManager:
         )
 
         self.budget_graphs: dict[str, dict[BudgetGraphMapKey, BudgetGraphMetadata]] = {}
+        # Set when the encoder cannot be captured (e.g. its attention backend
+        # reads packed sequence lengths on the host); it then runs eager.
+        self._capture_unsupported = False
         self.graph_pool: Any | None = None
         self.graph_hits = 0
         self.graph_misses = 0
@@ -231,7 +235,7 @@ class EncoderCudaGraphManager:
 
     def supports_modality(self, modality: str) -> bool:
         """Check if a modality is supported by this manager."""
-        return modality in self.config.modalities
+        return not self._capture_unsupported and modality in self.config.modalities
 
     def is_captured(self) -> bool:
         """Return whether a CUDA graph pool is active."""
@@ -245,6 +249,9 @@ class EncoderCudaGraphManager:
 
     def capture(self, graph_pool: Any):
         """Capture CUDA graphs for every configured path and token budget."""
+        if not self.config.modalities or self._capture_unsupported:
+            # The encoder runs eager; nothing would replay.
+            return
         self.graph_pool = graph_pool
 
         num_graphs = self.get_num_graphs_to_capture()
@@ -255,16 +262,26 @@ class EncoderCudaGraphManager:
                 num_graphs,
             )
 
-        for path, budgets in self.path_token_budgets.items():
-            for token_budget in sorted(budgets, reverse=True):
-                if token_budget == 0:
-                    continue
-                for axis_keys in itertools.product(*self._capture_axes):
-                    self._capture_budget_graph(
-                        token_budget,
-                        path=path,
-                        axis_keys=axis_keys,
-                    )
+        try:
+            for path, budgets in self.path_token_budgets.items():
+                for token_budget in sorted(budgets, reverse=True):
+                    if token_budget == 0:
+                        continue
+                    for axis_keys in itertools.product(*self._capture_axes):
+                        self._capture_budget_graph(
+                            token_budget,
+                            path=path,
+                            axis_keys=axis_keys,
+                        )
+        except CudaGraphCaptureUnsupportedError as e:
+            logger.warning_once(
+                "Encoder CUDA graphs are disabled and the encoder runs eager: "
+                "%s Set another --mm-encoder-attn-backend to capture it.",
+                e,
+            )
+            self._capture_unsupported = True
+            self.clear()
+            return
 
         logger.info(
             "Encoder CUDA graph capture complete. Captured %d graphs across %d paths.",
@@ -277,6 +294,8 @@ class EncoderCudaGraphManager:
         return num_budgets * math.prod(len(axis) for axis in self._capture_axes)
 
     def get_num_graphs_to_capture(self) -> int:
+        if not self.config.modalities or self._capture_unsupported:
+            return 0
         return sum(
             self._num_graphs_for_budgets(budgets)
             for budgets in self.path_token_budgets.values()
@@ -471,7 +490,11 @@ class EncoderCudaGraphManager:
         per_item_out_tokens = [spec.output_tokens for spec in item_specs]
         max_path_budgets = {path: max(self.path_token_budgets[path]) for path in paths}
 
-        sorted_indices = sorted(range(num_items), key=lambda i: per_item_out_tokens[i])
+        eager_indices = [i for i, spec in enumerate(item_specs) if spec.eager_only]
+        sorted_indices = sorted(
+            (i for i, spec in enumerate(item_specs) if not spec.eager_only),
+            key=lambda i: per_item_out_tokens[i],
+        )
         batches: list[tuple[list[int], dict[str, int | None]]] = []
         current_batch: list[int] = []
         current_tokens = dict.fromkeys(paths, 0)
@@ -521,6 +544,8 @@ class EncoderCudaGraphManager:
                 current_tokens[path] += item_tokens[path]
 
         append_current_batch()
+        if eager_indices:
+            batches.append((eager_indices, dict.fromkeys(paths, None)))
 
         outputs_by_orig_idx: dict[int, torch.Tensor] = {}
         for batch_indices, path_budgets in batches:

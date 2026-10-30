@@ -163,6 +163,7 @@ def _make_manager_with_budgets(budgets: list[int]) -> EncoderCudaGraphManager:
     from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
     mgr = object.__new__(EncoderCudaGraphManager)
+    mgr._capture_unsupported = False
     mgr.token_budgets = sorted(budgets)
     mgr.path_token_budgets = {"default": mgr.token_budgets}
     mgr.max_batch_size = 16
@@ -360,6 +361,17 @@ class TestExecuteLocalPacking:
         assert runs == [([0], "default", 256)]
         assert mgr.graph_misses == 1
 
+    def test_eager_only_item_skips_graphs(self):
+        mgr = _make_manager_with_budgets([256, 4096])
+        specs = [
+            self._spec(100),
+            EncoderItemSpec(input_size=50, output_tokens=50, eager_only=True),
+            self._spec(100),
+        ]
+        runs = _run_packing(mgr, specs)
+        assert runs == [([0, 2], "default", 256)]
+        assert mgr.graph_misses == 1
+
     def test_multi_path_deferral_skips_zero_token_paths(self):
         mgr = _make_manager_with_budgets([256, 4096, 8192])
         mgr.path_token_budgets = {
@@ -386,6 +398,28 @@ class TestExecuteLocalPacking:
             ([0], "b", 256),
             ([1], "b", 4096),
         ]
+
+
+def test_unsupported_capture_falls_back_to_eager():
+    """An encoder whose attention cannot be captured runs eager instead of
+    failing at startup."""
+    from vllm.v1.worker.encoder_cudagraph_defs import (
+        CudaGraphCaptureUnsupportedError,
+    )
+
+    mgr = _make_manager_with_budgets([256, 4096])
+    with patch.object(
+        mgr,
+        "_capture_budget_graph",
+        side_effect=CudaGraphCaptureUnsupportedError("packed SDPA"),
+    ):
+        mgr.capture(graph_pool=object())
+    assert not mgr.is_captured()
+    assert not mgr.supports_modality("image")
+    assert mgr.get_num_graphs_to_capture() == 0
+    # A later capture (e.g. after the profiling run) stays a no-op.
+    mgr.capture(graph_pool=object())
+    assert not mgr.is_captured()
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +648,7 @@ def _make_manager_for_gpu(
 ) -> EncoderCudaGraphManager:
     """Create EncoderCudaGraphManager bypassing VllmConfig for GPU tests."""
     mgr = object.__new__(EncoderCudaGraphManager)
+    mgr._capture_unsupported = False
     mgr.token_budgets = sorted(token_budgets)
     mgr.path_token_budgets = {"default": mgr.token_budgets}
     mgr.max_batch_size = max_batch_size
