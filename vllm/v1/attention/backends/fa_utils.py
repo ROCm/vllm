@@ -18,6 +18,8 @@ FA4_HD256_PAGE_SIZE = 128
 # This module-level flag avoids repeated import attempts and ensures
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
+# aiter's flash_attn_varlen_func takes k_pe / lse_out / o_init / lse_init.
+AITER_FLASH_ATTN_TAKES_MLA_ARGS = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
@@ -45,8 +47,14 @@ elif current_platform.is_rocm():
     compile_flash_attn_varlen_func_from_specs = None  # type: ignore[assignment]
     try:
         if on_gfx1250():
+            import inspect
+
             from aiter.ops.triton.mha import (  # type: ignore[no-redef]
                 flash_attn_varlen_func,
+            )
+
+            AITER_FLASH_ATTN_TAKES_MLA_ARGS = (
+                "k_pe" in inspect.signature(flash_attn_varlen_func).parameters
             )
         else:
             from flash_attn import flash_attn_varlen_func  # type: ignore[no-redef]

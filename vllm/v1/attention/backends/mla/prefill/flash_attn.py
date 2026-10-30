@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.warmup.jit_warmup import VllmJitKernel, zip_inputs
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends import fa_utils
 from vllm.v1.attention.backends.fa_utils import (
     compile_flash_attn_varlen_func_from_specs,
     get_flash_attn_version,
@@ -400,6 +401,13 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             from vllm.platforms.rocm import on_gfx1250
 
             self._is_aiter_triton_fa = on_gfx1250()
+        # aiter takes k_pe and an unpadded v, writes out / lse_out in place and
+        # merges into o_init / lse_init.
+        self._aiter_mla_args = (
+            self._is_aiter_triton_fa and fa_utils.AITER_FLASH_ATTN_TAKES_MLA_ARGS
+        )
+        if self._aiter_mla_args:
+            self.requires_v_padding = False
 
     def supports_quant_output(self, quant_key: "QuantKey") -> bool:
         device_capability = current_platform.get_device_capability()
@@ -436,7 +444,8 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
                 kwargs["num_splits"] = 1
         elif self._is_aiter_triton_fa:
             kwargs["return_lse"] = return_softmax_lse
-            assert out is None and output_scale is None
+            assert output_scale is None and (out is None or self._aiter_mla_args)
+            kwargs["out"] = out
         else:
             # ROCm leverages the upstream flash_attn, which takes a parameter
             # called "return_attn_probs" instead of return_softmax_lse
@@ -456,7 +465,11 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         lse = None
         if isinstance(attn_out, tuple):
             attn_out, lse = attn_out[0], attn_out[1]
-        if self._is_aiter_triton_fa and lse is not None:
+        if (
+            self._is_aiter_triton_fa
+            and lse is not None
+            and kwargs.get("lse_out") is None  # lse_out is already [H, T]
+        ):
             lse = lse.transpose(0, 1).contiguous()
 
         # Remain consistent with old `flash_attn_varlen_func` where there
@@ -470,6 +483,9 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         # a v_head_dim `out`; only the unpadded path honors `out`.
         return not self.requires_v_padding
 
+    def supports_k_pe_and_merge(self) -> bool:
+        return self._aiter_mla_args
+
     def run_prefill_new_tokens(
         self,
         q: torch.Tensor,
@@ -478,6 +494,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         return_softmax_lse: bool,
         out: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -492,6 +509,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             return_softmax_lse=return_softmax_lse,
             out=out,
             output_scale=output_scale,
+            **kwargs,
         )
 
     def run_prefill_context_chunk(
@@ -501,6 +519,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         out: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self._flash_attn_varlen_diff_headdims(
             q=q,
@@ -514,6 +533,7 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             causal=False,  # Context is unmasked
             return_softmax_lse=True,
             out=out,
+            **kwargs,
         )
 
 

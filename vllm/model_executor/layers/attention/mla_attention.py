@@ -2969,7 +2969,12 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
+        out: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
     ):
+        """Attention over the gathered context. With ``out``/``lse`` (a backend
+        that supports_k_pe_and_merge), each chunk is merged into them in place
+        and nothing is returned."""
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.prefill_backend is not None
@@ -3049,6 +3054,22 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 kv_nope = kv_nope.to(prefill_metadata.q_data_type)
                 k_pe = k_pe.to(prefill_metadata.q_data_type)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+            if out is not None:
+                assert lse is not None
+                ts = chunk.token_slice
+                prefill_metadata.prefill_backend.run_prefill_context_chunk(  # type: ignore[call-arg]
+                    chunk=chunk,
+                    q=q[ts],
+                    k=k_nope,
+                    v=v,
+                    out=out[ts],
+                    k_pe=k_pe,
+                    lse_out=lse[:, ts],
+                    o_init=out[ts],
+                    lse_init=lse[:, ts],
+                )
+                continue
 
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
@@ -3253,6 +3274,36 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        if (
+            prefill_metadata.prefill_backend.supports_k_pe_and_merge()
+            and not use_fp8_prefill
+            and output_scale is None
+            and self.dcp_world_size <= 1
+        ):
+            # The new tokens are written straight into output, and each context
+            # chunk is merged into (output, lse) in place.
+            output = output.view(-1, self.num_heads, self.v_head_dim)
+            lse = None
+            if has_context:
+                lse = torch.empty(
+                    (self.num_heads, q.shape[0]), dtype=torch.float32, device=q.device
+                )
+            prefill_metadata.prefill_backend.run_prefill_new_tokens(  # type: ignore[call-arg]
+                q=q,
+                k=k_nope,
+                v=v,
+                return_softmax_lse=False,
+                out=output,
+                k_pe=k_pe,
+                lse_out=lse,
+            )
+            if has_context:
+                self._compute_prefill_context(
+                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale, out=output, lse=lse
+                )
+            return
+
         k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
         if use_fp8_prefill:
