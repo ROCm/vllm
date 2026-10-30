@@ -252,8 +252,8 @@ def _hip_skinny_reference(
         (1, 512, 256, 128),
         (2, 512, 256, 64),
         (3, 256, 512, 64),
-        # (1, 4096, *, 128): exercises the gfx11 K=4096 N=1 dispatch branch
-        # that routes to the tuned (W=16, AC=32, YT=1, UN=4) template.
+        # (1, 4096, *, 128): N=1 at K=4096 -- gfx11's small-tile decode rule
+        # (W=16, AC=32, YT=1, UN=2); the K=4096 branch on gfx12.
         (1, 4096, 256, 128),
     ],
 )

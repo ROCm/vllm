@@ -73,6 +73,12 @@ torch::Tensor wvSplitK_int4g_sweep(
     const int64_t CuCount, const int64_t group_size, const int64_t ytile,
     const int64_t unrl, const int64_t achunk, const int64_t wvprgrp);
 
+torch::Tensor wvSplitK_int4g_sweep_n1(
+    const at::Tensor& in_w, const at::Tensor& in_x, const at::Tensor& in_scale,
+    const std::optional<at::Tensor>& in_zero_points, const int64_t CuCount,
+    const int64_t group_size, const int64_t ytile, const int64_t unrl,
+    const int64_t achunk, const int64_t wvprgrp);
+
 torch::Tensor wvSplitK_int4g_hf_sweep(
     const at::Tensor& in_w, const at::Tensor& in_x, const at::Tensor& in_scale,
     const int64_t CuCount, const int64_t group_size, const int64_t ytile,
