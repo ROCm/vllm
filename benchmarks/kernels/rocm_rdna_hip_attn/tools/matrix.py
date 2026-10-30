@@ -7,8 +7,9 @@ Decode specs run under CUDA graphs, prefill specs without, as in vLLM.
 `path` is what ran (`kernel`, `prefill` or `triton`); %roof is against
 utils.roofline. --batch takes batch specs or SPECS names; --baselines adds
 backends to compare. Forcing a knob, --ablate or --jit builds the variants
-with jit.py. --non-causal times the mm-encoder path (rocm_rdna_encoder, the
-packing included) against TRITON_ATTN's on segments of L = S tokens.
+with jit.py. --non-causal times the mm-encoder path against TRITON_ATTN's,
+TORCH_SDPA's and, with flash-attn installed, FLASH_ATTN's on segments of
+L = S tokens, each through the wrapper MMEncoderAttention calls.
 
     PYTHONPATH=$PWD python \\
         benchmarks/kernels/rocm_rdna_hip_attn/tools/matrix.py
@@ -216,35 +217,60 @@ def _segments(spec: str) -> list[int]:
 
 
 def _encoder_runs(hq, hkv, d, segs, dtype):
-    """(TRITON_ATTN's, ours) over 10 layers of inputs, and the first Q."""
+    """The baselines' runs by backend name and ours, over 10 layers of
+    inputs, and the first Q. Each through the wrapper MMEncoderAttention
+    calls, given what the encoder gives it: cu_seqlens on the device, its
+    host lengths noted as maybe_recompute_cu_seqlens does, max_seqlen on the
+    host. FLASH_ATTN only with flash-attn installed."""
+    import numpy as np
     import torch
 
-    from vllm.v1.attention.ops import rocm_rdna_encoder
-    from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+    from vllm.v1.attention.backends import fa_utils
+    from vllm.v1.attention.ops.vit_attn_wrappers import (
+        flash_attn_maxseqlen_wrapper,
+        rdna_attn_wrapper,
+        remember_rdna_cu_seqlens,
+        torch_sdpa_wrapper,
+        triton_attn_wrapper,
+    )
 
     n = sum(segs)
     layers = [
         [
-            (torch.randn(n, h, d, device="cuda") * 0.5).to(dtype)
-            for h in (hq, hkv, hkv, hq)
+            (torch.randn(1, n, h, d, device="cuda") * 0.5).to(dtype)
+            for h in (hq, hkv, hkv)
         ]
         for _ in range(10)
     ]
-    lens = torch.tensor(segs, dtype=torch.int32, device="cuda")
-    starts = torch.cumsum(lens, 0) - lens
+    host = np.concatenate([[0], np.cumsum(segs)]).astype(np.int32)
+    cu_seqlens = torch.from_numpy(host).cuda()
+    remember_rdna_cu_seqlens(cu_seqlens, host)
+    max_seqlen = torch.tensor(max(segs), dtype=torch.int32)
+    scale = d**-0.5
 
     def triton():
-        for q, k, v, o in layers:
-            context_attention_fwd(
-                q, k, v, o, b_start_loc=starts, b_seq_len=lens,
-                max_input_len=max(segs), is_causal=False, softmax_scale=d**-0.5,
-            )  # fmt: skip
+        for q, k, v in layers:
+            triton_attn_wrapper(q, k, v, 1, scale, cu_seqlens, max_seqlen)
+
+    def sdpa():
+        for q, k, v in layers:
+            torch_sdpa_wrapper(q, k, v, scale, cu_seqlens, enable_gqa=hq != hkv)
+
+    def flash():
+        for q, k, v in layers:
+            flash_attn_maxseqlen_wrapper(
+                q, k, v, 1, False, None, scale, cu_seqlens, max_seqlen
+            )
 
     def ours():
-        for q, k, v, _ in layers:
-            rocm_rdna_encoder.forward(q, k, v, segs, d**-0.5)
+        for q, k, v in layers:
+            rdna_attn_wrapper(q, k, v, 1, scale, cu_seqlens, max_seqlen)
 
-    return triton, ours, layers[0][0]
+    runs = {"TRITON_ATTN": triton, "TORCH_SDPA": sdpa}
+    if fa_utils._ROCM_FLASH_ATTN_AVAILABLE:
+        runs["FLASH_ATTN"] = flash
+    # The cu_seqlens tensor lives with the runs, so its lengths stay noted.
+    return runs, ours, layers[0][0][0]
 
 
 def non_causal(args: argparse.Namespace, shapes: list[Shape]) -> None:
@@ -273,11 +299,18 @@ def non_causal(args: argparse.Namespace, shapes: list[Shape]) -> None:
                 t.append(a.elapsed_time(b) * 1e3 / layers)
         return [statistics.median(t) for t in ts]
 
-    print(f"<!-- non-causal, {args.dtype}, ours as the encoder runs it; 10 layers -->")
-    columns = ["segments", "Hq", "Hkv", "D", "bound", "roofline", "TRITON_ATTN"]
-    columns += ["ours", "x TRITON_ATTN", "%roof", "TRITON_ATTN %roof"]
+    from vllm.v1.attention.backends import fa_utils
+
+    baselines = ["TRITON_ATTN", "TORCH_SDPA"]
+    if fa_utils._ROCM_FLASH_ATTN_AVAILABLE:
+        baselines.append("FLASH_ATTN")
+    print(f"<!-- non-causal, {args.dtype}, as the encoder runs each; 10 layers -->")
+    columns = ["segments", "Hq", "Hkv", "D", "bound", "roofline", *baselines]
+    columns += ["ours", *(f"x {b}" for b in baselines), "%roof"]
+    columns += [f"{b} %roof" for b in baselines]
     print("| " + " | ".join(columns) + " |")
     print("| --- " * len(columns) + "|")
+    ratios: dict[str, list[float]] = {b: [] for b in baselines}
     for spec in specs:
         segs = _segments(spec)
         for hq, hkv, d, window in shapes:
@@ -286,17 +319,34 @@ def non_causal(args: argparse.Namespace, shapes: list[Shape]) -> None:
             roof, bound = utils.roofline_noncausal(
                 hq, hkv, d, segs, torch.finfo(dtype).bits // 8
             )
-            triton, ours, q = _encoder_runs(hq, hkv, d, segs, dtype)
+            runs, ours, q = _encoder_runs(hq, hkv, d, segs, dtype)
             why = rocm_rdna_encoder.unsupported(q, hkv)
-            base, *mine = timed([triton] if why else [triton, ours])
-            head = [spec, hq, hkv, d, bound, f"{roof:.2f}", f"{base:.2f}"]
+            base_runs = [runs[b] for b in baselines]
+            served = []
+            for run in base_runs:
+                try:
+                    run()
+                    served.append(run)
+                except Exception:  # noqa: BLE001 - e.g. SDPA's math path OOMs
+                    torch.accelerator.empty_cache()
+            times = iter(timed(served if why else [*served, ours]))
+            base = [next(times) if run in served else None for run in base_runs]
+            head = [spec, hq, hkv, d, bound, f"{roof:.2f}"]
+            head += ["-" if t is None else f"{t:.2f}" for t in base]
             if why:
                 print(f"| {' | '.join(map(str, head))} | {why} |", flush=True)
                 continue
-            us = mine[0]
-            cells = [*head, f"{us:.2f}", f"{base / us:.2f}x"]
-            cells += [f"{roof / us * 100:.1f} %", f"{roof / base * 100:.1f} %"]
+            us = next(times)
+            for b, t in zip(baselines, base):
+                if t is not None:
+                    ratios[b].append(t / us)
+            cells = [*head, f"{us:.2f}"]
+            cells += ["-" if t is None else f"{t / us:.2f}x" for t in base]
+            cells += [
+                "-" if t is None else f"{roof / t * 100:.1f} %" for t in (us, *base)
+            ]
             print("| " + " | ".join(map(str, cells)) + " |", flush=True)
+    summary(baselines, ratios)
 
 
 def main() -> None:
