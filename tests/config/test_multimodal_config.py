@@ -49,6 +49,21 @@ def test_mm_encoder_attn_backend_invalid():
         MultiModalConfig(mm_encoder_attn_backend="not_a_backend")  # type: ignore[arg-type]
 
 
+def test_rocm_rdna_mm_encoder_rejects_encoder_cudagraph():
+    """ROCM_RDNA_ATTN plans each launch on the host, so a captured encoder
+    graph would replay stale plans: the combination fails at startup."""
+    from vllm.config.compilation import CompilationConfig
+
+    model_config = ModelConfig(
+        _MULTIMODAL_MODEL, mm_encoder_attn_backend="ROCM_RDNA_ATTN"
+    )
+    with pytest.raises(ValueError, match="ROCM_RDNA_ATTN is incompatible"):
+        VllmConfig(
+            model_config=model_config,
+            compilation_config=CompilationConfig(cudagraph_mm_encoder=True),
+        )
+
+
 def test_mm_hasher_algorithm_invalid():
     with pytest.raises(ValueError, match="mm_hasher_algorithm"):
         MultiModalConfig(mm_hasher_algorithm="md5")  # type: ignore[arg-type]

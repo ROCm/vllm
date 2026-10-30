@@ -1458,6 +1458,24 @@ class VllmConfig:
                 "disable one of them."
             )
 
+        mm_backend = (
+            self.model_config.multimodal_config.mm_encoder_attn_backend
+            if self.model_config is not None
+            and self.model_config.multimodal_config is not None
+            else None
+        )
+        if (
+            mm_backend is not None
+            and mm_backend.name == "ROCM_RDNA_ATTN"
+            and self.compilation_config.cudagraph_mm_encoder
+        ):
+            raise ValueError(
+                "--mm-encoder-attn-backend ROCM_RDNA_ATTN is incompatible with "
+                "cudagraph_mm_encoder=True: its kernels are planned on the host "
+                "from each call's segment lengths, which a CUDA graph would "
+                "replay unchanged. Please disable one of them."
+            )
+
         self._verify_sampling_replay_config()
         self._verify_trace_replay_config()
 

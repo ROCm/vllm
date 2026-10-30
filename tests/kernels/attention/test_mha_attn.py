@@ -488,3 +488,145 @@ def test_mha_attn_fp8_rejects_wrong_backend(default_vllm_config):
             MMEncoderAttention(4, 64)
     finally:
         vllm_config.model_config = old_model_config
+
+
+def _rdna_mm_encoder(head_size: int, monkeypatch):
+    """An MMEncoderAttention on ROCM_RDNA_ATTN, and the calls its kernels
+    served (not TRITON_ATTN's fallback)."""
+    from vllm.platforms.rocm import on_gfx1151
+    from vllm.v1.attention.ops import rocm_rdna_encoder
+
+    if not current_platform.is_rocm() or not on_gfx1151():
+        pytest.skip("ROCM_RDNA_ATTN's kernels are built for gfx1151")
+    served = []
+    forward = rocm_rdna_encoder.forward
+
+    def spy(q, k, v, seg_lens, scale):
+        served.append(list(seg_lens))
+        return forward(q, k, v, seg_lens, scale)
+
+    monkeypatch.setattr(rocm_rdna_encoder, "forward", spy)
+    with patch(
+        "vllm.model_executor.layers.attention.mm_encoder_attention."
+        "get_vit_attn_backend",
+        return_value=AttentionBackendEnum.ROCM_RDNA_ATTN,
+    ):
+        attn = MMEncoderAttention(16, head_size, scale=head_size**-0.5)
+    assert attn.attn_backend == AttentionBackendEnum.ROCM_RDNA_ATTN
+    return attn, served
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [[4096], [577] * 5, [1024, 257, 9, 4, 7, 64, 8, 1], [4, 8, 4, 1]],
+    ids=["one", "equal", "mixed", "short"],
+)
+@pytest.mark.parametrize("head_size", [72, 64, 80])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_mha_attn_rdna_varlen_forward(
+    default_vllm_config, segments, head_size, dtype, monkeypatch
+):
+    """ROCM_RDNA_ATTN serves an encoder's segments, however short, in one
+    non-causal prefill launch, as the reference."""
+    set_random_seed(0)
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(dtype)
+    attn, served = _rdna_mm_encoder(head_size, monkeypatch)
+    q, k, v = (torch.randn(1, sum(segments), 16, head_size) for _ in range(3))
+    cu_seqlens = torch.tensor([0, *itertools.accumulate(segments)], dtype=torch.int32)
+    out = attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=torch.tensor(max(segments)))
+    assert served == [segments], "the call fell back to TRITON_ATTN"
+    ref = torch.cat(
+        [
+            ref_attention(q_i.float(), k_i.float(), v_i.float(), head_size**-0.5)
+            for q_i, k_i, v_i in zip(
+                *(torch.split(x, segments, dim=1) for x in (q, k, v))
+            )
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("head_size", [72, 64])
+def test_mha_attn_rdna_forward_without_cu_seqlens(
+    default_vllm_config, head_size, monkeypatch
+):
+    """Without cu_seqlens each batch row is a segment."""
+    set_random_seed(0)
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(torch.float16)
+    attn, served = _rdna_mm_encoder(head_size, monkeypatch)
+    q, k, v = (torch.randn(2, 320, 16, head_size) for _ in range(3))
+    out = attn(q, k, v)
+    assert served == [[320, 320]]
+    ref = ref_attention(q.float(), k.float(), v.float(), scale=head_size**-0.5)
+    torch.testing.assert_close(out.float().view_as(ref), ref, atol=1e-2, rtol=1e-2)
+
+
+def test_mha_attn_rdna_falls_back_to_triton(default_vllm_config, monkeypatch):
+    """A head size without builds runs on TRITON_ATTN, with the same result."""
+    set_random_seed(0)
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(torch.float16)
+    attn, served = _rdna_mm_encoder(40, monkeypatch)
+    q, k, v = (torch.randn(1, 300, 16, 40) for _ in range(3))
+    out = attn(q, k, v)
+    assert served == []
+    ref = ref_attention(q.float(), k.float(), v.float(), scale=40**-0.5)
+    torch.testing.assert_close(out.float().view_as(ref), ref, atol=1e-2, rtol=1e-2)
+
+
+def _varlen_reference(q, k, v, segments, scale):
+    """Attention within each segment, in float."""
+    return torch.cat(
+        [
+            ref_attention(q_i.float(), k_i.float(), v_i.float(), scale)
+            for q_i, k_i, v_i in zip(
+                *(torch.split(x, segments, dim=1) for x in (q, k, v))
+            )
+        ],
+        dim=1,
+    )
+
+
+def _check_cuda_graph_replay(attn, head_size, capture, replays):
+    """Capture attn on cu_seqlens of the `capture` segments, with their total
+    as max_seqlen (a bound, as encoder CUDA graphs pass), then replay it on
+    each list of `replays` (the same total, padded with empty segments)."""
+    tokens, slots = sum(capture), max(map(len, [capture, *replays]))
+    q, k, v = (torch.randn(1, tokens, 16, head_size) for _ in range(3))
+
+    def bounds(segments):
+        padded = [*segments, *[0] * (slots - len(segments))]
+        return torch.tensor([0, *itertools.accumulate(padded)], dtype=torch.int32)
+
+    cu_seqlens = bounds(capture)
+    max_seqlen = torch.tensor(tokens, dtype=torch.int32, device="cpu")
+    attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = attn(q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+    for segments in replays:
+        cu_seqlens.copy_(bounds(segments))
+        graph.replay()
+        ref = _varlen_reference(q, k, v, segments, head_size**-0.5)
+        torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda_alike(), reason="CUDA graphs")
+def test_mha_attn_triton_varlen_cuda_graph(default_vllm_config):
+    """TRITON_ATTN's varlen path is captured once and replayed on other
+    segment lists: nothing it reads on the host is baked into the graph."""
+    set_random_seed(0)
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(torch.float16)
+    with patch(
+        "vllm.model_executor.layers.attention.mm_encoder_attention."
+        "get_vit_attn_backend",
+        return_value=AttentionBackendEnum.TRITON_ATTN,
+    ):
+        attn = MMEncoderAttention(16, 64, scale=64**-0.5)
+    _check_cuda_graph_replay(
+        attn, 64, [100, 150, 50], [[40, 220, 40], [300], [1, 2, 297]]
+    )

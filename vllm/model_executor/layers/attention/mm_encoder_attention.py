@@ -33,9 +33,11 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.ops.vit_attn_wrappers import (
+    remember_rdna_cu_seqlens,
     vit_aiter_fp8_attn_wrapper,
     vit_flash_attn_wrapper,
     vit_flashinfer_wrapper,
+    vit_rdna_attn_wrapper,
     vit_torch_sdpa_wrapper,
     vit_triton_attn_wrapper,
 )
@@ -234,6 +236,7 @@ class MMEncoderAttention(CustomOp):
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.ROCM_AITER_FA,
                 AttentionBackendEnum.TRITON_ATTN,
+                AttentionBackendEnum.ROCM_RDNA_ATTN,
                 AttentionBackendEnum.FLASHINFER,
             )
             and len(cu_seqlens) >= 2
@@ -312,7 +315,10 @@ class MMEncoderAttention(CustomOp):
                 )
                 cu_seqlens = np.concatenate([cu_seqlens_qko, cu_seqlens_v])
 
+        host = cu_seqlens
         cu_seqlens = async_tensor_h2d(cu_seqlens, device=device)
+        if attn_backend == AttentionBackendEnum.ROCM_RDNA_ATTN:
+            remember_rdna_cu_seqlens(cu_seqlens, host)
         return cu_seqlens
 
     def __init__(
@@ -675,6 +681,33 @@ class MMEncoderAttention(CustomOp):
             output = output.reshape(bsz, q_len, -1)
         return output
 
+    def _forward_rdna(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """ROCM_RDNA_ATTN's kernels (gfx1151); TRITON_ATTN's for calls they
+        cannot serve. Input shapes as _forward_triton."""
+        bsz, q_len = query.size()[:2]
+        kv_len = key.size(1)
+        is_reshaped = query.dim() != 4
+        query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
+        output = vit_rdna_attn_wrapper(
+            q=query,
+            k=key,
+            v=value,
+            batch_size=bsz,
+            scale=self.scale,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        if is_reshaped:
+            output = output.reshape(bsz, q_len, -1)
+        return output
+
     @torch.no_grad()
     def _record_amax_and_update_scales(
         self,
@@ -843,6 +876,8 @@ class MMEncoderAttention(CustomOp):
             return self._forward_fa(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.TRITON_ATTN:
             return self._forward_triton(query, key, value, cu_seqlens, max_seqlen)
+        elif self.attn_backend == AttentionBackendEnum.ROCM_RDNA_ATTN:
+            return self._forward_rdna(query, key, value, cu_seqlens, max_seqlen)
         elif self.attn_backend == AttentionBackendEnum.FLASHINFER:
             return self._forward_flashinfer(
                 query, key, value, cu_seqlens, max_seqlen, sequence_lengths

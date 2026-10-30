@@ -190,7 +190,7 @@ std::vector<int64_t> rdna_prefill_configs() {
         {static_cast<int>(c.head_dim), c.num_q_heads, c.num_kv_heads, c.window,
          static_cast<int>(c.dtype), c.page_size, c.min_query_len, c.waves,
          c.key_tile, c.head_dim_split, c.v_t, c.double_buffer, c.key_waves,
-         c.max_segments, c.head_group});
+         c.max_segments, c.head_group, c.causal, c.row_tiles});
   }
   return fields;
 }
@@ -209,7 +209,7 @@ std::vector<int64_t> rdna_prefill_batch_configs() {
             return c.head_dim == b.head_dim && c.num_q_heads == b.num_q_heads &&
                    c.num_kv_heads == b.num_kv_heads && c.window == b.window &&
                    c.page_size == b.page_size && c.dtype == dtype &&
-                   c.min_query_len == b.min_query_len;
+                   c.min_query_len == b.min_query_len && c.causal == b.causal;
           });
       TORCH_CHECK(built, "prefill batch cell of ", b.num_q_heads, "/",
                   b.num_kv_heads, "/", static_cast<int>(b.head_dim), " window ",
@@ -217,10 +217,10 @@ std::vector<int64_t> rdna_prefill_batch_configs() {
                   " names no prefill build with min_query_len ",
                   b.min_query_len, ", bf16 ", dtype == Dtype::kBf16);
     }
-    fields.insert(
-        fields.end(),
-        {static_cast<int>(b.head_dim), b.num_q_heads, b.num_kv_heads, b.window,
-         b.page_size, b.min_mean_m, b.min_keys, b.min_query_len, b.head_group});
+    fields.insert(fields.end(),
+                  {static_cast<int>(b.head_dim), b.num_q_heads, b.num_kv_heads,
+                   b.window, b.page_size, b.min_mean_m, b.min_keys,
+                   b.min_query_len, b.head_group, b.causal});
   }
   return fields;
 }
@@ -361,6 +361,7 @@ void rdna_prefill_attn(int64_t config, torch::Tensor& q,
       config >= 0 && config < t.num_prefill && t.prefill_launchers[config],
       "no prefill build ", config);
   const PrefillConfig& c = t.prefill[config];
+  TORCH_CHECK(c.causal, "a non-causal build runs through rdna_encoder_attn");
   TORCH_CHECK(q.is_contiguous() && out.is_contiguous(),
               "q and out must be contiguous");
   TORCH_CHECK(
@@ -429,7 +430,8 @@ void rdna_prefill_attn(int64_t config, torch::Tensor& q,
     // As PrefillVariant.scratch_rows.
     const int64_t target =
         4 * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-    const int64_t block_rows = c.waves / (c.head_dim_split * c.key_waves) * 16;
+    const int64_t block_rows =
+        c.waves / (c.head_dim_split * c.key_waves) * 16 * c.row_tiles;
     const int64_t rows = 2 * target * block_rows;
     TORCH_CHECK(partial_o.numel() >= rows * d &&
                     partial_ml.numel() >= 2 * rows &&
@@ -447,4 +449,100 @@ void rdna_prefill_attn(int64_t config, torch::Tensor& q,
        plan ? (int)plan->size(0) : 0,
        block_table.dim() == 2 ? (int)block_table.stride(0) : 0,
        (int)head_group});
+}
+
+void rdna_encoder_attn(int64_t config, torch::Tensor& q, torch::Tensor& k,
+                       torch::Tensor& v, torch::Tensor& out,
+                       torch::Tensor& partial_o, torch::Tensor& partial_ml,
+                       torch::Tensor& counters, torch::Tensor& seq_lens,
+                       int64_t max_seq_len, double scale,
+                       const std::optional<torch::Tensor>& plan,
+                       const std::optional<torch::Tensor>& query_start_loc,
+                       int64_t head_group) {
+  using namespace rdna;
+  const Table t = device_table();
+  TORCH_CHECK(
+      config >= 0 && config < t.num_prefill && t.prefill_launchers[config],
+      "no prefill build ", config);
+  const PrefillConfig& c = t.prefill[config];
+  TORCH_CHECK(!c.causal, "a causal build runs through rdna_prefill_attn");
+  const int d = static_cast<int>(c.head_dim);
+  // (tokens, heads, D), each token's heads contiguous; any token stride.
+  auto check = [&](const torch::Tensor& x, int heads, const char* name) {
+    TORCH_CHECK(x.dim() == 3 && x.size(0) == q.size(0) && x.size(1) == heads &&
+                    x.size(2) == d && x.stride(2) == 1 && x.stride(1) == d,
+                name, " must be (", q.size(0), ", ", heads, ", ", d,
+                ") with each token's heads contiguous, got ", x.sizes(),
+                " strides ", x.strides());
+  };
+  check(q, c.num_q_heads, "q");
+  check(k, c.num_kv_heads, "k");
+  check(v, c.num_kv_heads, "v");
+  TORCH_CHECK(out.is_contiguous() && out.sizes() == q.sizes(),
+              "out must be contiguous and shaped as q");
+  const auto dtype = c.dtype == Dtype::kBf16 ? at::kBFloat16 : at::kHalf;
+  TORCH_CHECK(q.scalar_type() == dtype && k.scalar_type() == dtype &&
+                  v.scalar_type() == dtype && out.scalar_type() == dtype,
+              "kernel built for ", dtype);
+  TORCH_CHECK(seq_lens.scalar_type() == torch::kInt32 && seq_lens.numel() >= 1,
+              "seq_lens must be int32, a length per sequence");
+  TORCH_CHECK(plan.has_value() == query_start_loc.has_value(),
+              "a batch takes both a plan and query_start_loc");
+  if (plan) {
+    TORCH_CHECK(plan->scalar_type() == torch::kInt32 && plan->dim() == 2 &&
+                    plan->size(1) == 4 && plan->is_contiguous(),
+                "plan must be plan_prefill's contiguous int32 [entries, 4]");
+    TORCH_CHECK(query_start_loc->scalar_type() == torch::kInt32 &&
+                    query_start_loc->numel() >= 2 &&
+                    seq_lens.numel() >= query_start_loc->numel() - 1,
+                "query_start_loc must be int32, one entry per sequence and "
+                "one, with a length per sequence");
+    TORCH_CHECK(head_group >= 0 &&
+                    (head_group == 0 || c.num_kv_heads % head_group == 0),
+                "head_group must divide the kv heads");
+  } else {
+    TORCH_CHECK(q.size(0) > 0 && max_seq_len == q.size(0),
+                "one sequence: max_seq_len is its tokens");
+  }
+  TORCH_CHECK(partial_o.scalar_type() == torch::kFloat32 &&
+                  partial_ml.scalar_type() == torch::kFloat32 &&
+                  counters.scalar_type() == torch::kInt32,
+              "scratch must be float32 partials and int32 counters");
+  check_device(q,
+               {&k, &v, &out, &partial_o, &partial_ml, &counters, &seq_lens});
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+  if (c.max_segments > 1) {
+    // As PrefillVariant.scratch_rows.
+    const int64_t target =
+        4 * at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const int64_t block_rows =
+        c.waves / (c.head_dim_split * c.key_waves) * 16 * c.row_tiles;
+    const int64_t rows = 2 * target * block_rows;
+    TORCH_CHECK(partial_o.numel() >= rows * d &&
+                    partial_ml.numel() >= 2 * rows &&
+                    counters.numel() >= target,
+                "scratch too small for this build: needs ", rows * d, ", ",
+                2 * rows, ", ", target, " elements");
+  }
+  PrefillArgs args{};
+  args.q = q.data_ptr();
+  args.kv = k.data_ptr();
+  args.out = out.data_ptr();
+  args.seq_lens = seq_lens.data_ptr<int>();
+  args.partial_o = partial_o.data_ptr<float>();
+  args.partial_ml = partial_ml.data_ptr<float>();
+  args.counters = counters.data_ptr<int>();
+  args.num_tokens = (int)q.size(0);
+  args.max_seq_len = (int)max_seq_len;
+  args.scale = (float)scale;
+  args.stream = at::cuda::getCurrentCUDAStream();
+  args.plan = plan ? plan->data_ptr<int>() : nullptr;
+  args.query_start = plan ? query_start_loc->data_ptr<int>() : nullptr;
+  args.num_entries = plan ? (int)plan->size(0) : 0;
+  args.head_group = (int)head_group;
+  args.v = v.data_ptr();
+  args.q_stride = (int)q.stride(0);
+  args.k_stride = (int)k.stride(0);
+  args.v_stride = (int)v.stride(0);
+  t.prefill_launchers[config](args);
 }

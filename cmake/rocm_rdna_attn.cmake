@@ -10,7 +10,7 @@
 #
 function(rdna_attn_target TARGET FAMILY ARCHES)
   set(_KERNELS decode decode_batch prefill)
-  set(_HEAD_DIMS 64 96 128 256 512)
+  set(_HEAD_DIMS 32 48 64 72 80 96 128 256 512)
   set(_DTYPES Fp16 Bf16)
   string(TOLOWER ${FAMILY} _FAMILY_NAME)
   set(_OUT ${CMAKE_CURRENT_BINARY_DIR}/rdna_attn/${_FAMILY_NAME})

@@ -56,6 +56,8 @@ struct Prefill {
   static constexpr int kNumQHeads = C.num_q_heads;
   static constexpr int kNumKvHeads = C.num_kv_heads;
   static constexpr int kWindow = C.window;
+  // Non-causal: every query token sees every key of its sequence.
+  static constexpr bool kCausal = C.causal;
   static constexpr bool kBf16 = C.dtype == Dtype::kBf16;
   static constexpr int kPageSize = C.page_size;
   static constexpr int kWaves = C.waves;
@@ -68,6 +70,8 @@ struct Prefill {
   static constexpr bool kDoubleBuffer = C.double_buffer;
   static constexpr int kKeyWaves = C.key_waves;
   static constexpr int kMaxSegments = C.max_segments;
+  // 16-row tiles per wave: two share every K and V operand read (non-causal).
+  static constexpr int kRowTiles = C.row_tiles;
 
   // Fewest steps per KV segment.
   static constexpr int kMinSegmentSteps = 16;
@@ -76,10 +80,13 @@ struct Prefill {
   static constexpr int kThreads = kWaves * kWaveSize;
   static constexpr int kG = kNumQHeads / kNumKvHeads;
   static constexpr int kRowWaves = kWaves / (kDimParts * kKeyWaves);
-  static constexpr int kBlockRows = kRowWaves * 16;
+  static constexpr int kBlockRows = kRowWaves * 16 * kRowTiles;
   static constexpr int kSubTiles = kKeyTile / 16;
   static constexpr int kWaveSubTiles = kSubTiles / kKeyWaves;
-  static constexpr int kPartDims = kHeadDim / kDimParts;
+  // The head dim padded to whole 16-dim chunks (D=72: 80). Q, the K tile and
+  // V_T hold zeros past D; loads past D are clamped and stored as zeros.
+  static constexpr int kHeadDimP = (kHeadDim + 15) / 16 * 16;
+  static constexpr int kPartDims = kHeadDimP / kDimParts;
   static constexpr int kPartChunks = kPartDims / 16;
   // Consecutive dims of a V row per lane.
   static constexpr int kLaneDims = kPartDims / 16;
@@ -87,17 +94,22 @@ struct Prefill {
   static constexpr int kKvRowElems = 2 * kHeadDim;
   static constexpr int kPageElems = kPageSize * kNumKvHeads * kKvRowElems;
   // LDS rows are padded by 16 bytes to avoid bank conflicts.
-  static constexpr int kRowPitch = kHeadDim + 8;
+  static constexpr int kRowPitch = kHeadDimP + 8;
   // V_T row pitch, chosen to avoid bank conflicts: an odd number of 16-byte
   // units on gfx12, where a 6-unit pitch halves the LDS read rate.
   static constexpr int kVtPitch = kGfx12           ? kKeyTile + 8
                                   : kKeyTile == 16 ? 16
                                                    : kKeyTile + 16;
   // The V tile: V rows or V^T rows; a placeholder when v_t 2 skips it.
-  static constexpr int kVTileRows = kVTr ? 1 : kVT ? kHeadDim : kKeyTile;
+  static constexpr int kVTileRows = kVTr ? 1 : kVT ? kHeadDimP : kKeyTile;
   static constexpr int kVTilePitch = kVTr ? 8 : kVT ? kVtPitch : kRowPitch;
   static constexpr int kBuffers = kDoubleBuffer ? 2 : 1;
-  static constexpr int kRowChunks = kHeadDim / 8;
+  // Elements per load unit: 8, or 4 where a 16-key sub-tile of 8-element
+  // units would not be whole waves (D=48, 80). Non-causal builds load 8 of
+  // the D real dims of K and V in place (the padding is zeroed once).
+  static constexpr int kUnitElems = !kCausal || kHeadDimP / 8 % 4 == 0 ? 8 : 4;
+  static constexpr int kRowChunks =
+      (kCausal ? kHeadDimP : kHeadDim) / kUnitElems;
   static constexpr int kKUnits = kKeyTile * kRowChunks;
   // With V_T a V unit is keys kk and kk + 2 of a sub-tile.
   static constexpr int kVUnits = (kVT ? kKeyTile / 2 : kKeyTile) * kRowChunks;
@@ -111,8 +123,10 @@ struct Prefill {
       kKeyTile > kPageSize ? kKeyTile / kPageSize : 1;
   static constexpr float kLog2e = 1.44269504088896340736f;
   static constexpr float kMaxSlack = 8.f;
-  // D=512 uses buffer loads to save the registers of 64-bit addresses.
-  static constexpr bool kBufferLoads = kHeadDim >= 512;
+  // Buffer loads save the registers of 64-bit addresses: D=512, and the
+  // non-causal builds.
+  static constexpr bool kBufferLoads =
+      !kCausal || (kHeadDim >= 512 && kUnitElems == 8);
   // Raw buffer word 3: OOB_SELECT 3, format 4. Bit 24 is reserved on gfx11
   // and enables write compression on gfx12.
   static constexpr unsigned kRsrcWord3 = kGfx12 ? 0x30004000u : 0x31004000u;
@@ -121,14 +135,28 @@ struct Prefill {
       largest_divisor_up_to(kNumKvHeads, C.head_group);
 
   static_assert(kNumQHeads % kNumKvHeads == 0, "GQA must be integral");
+  static_assert(kCausal || kWindow == 0, "a non-causal build has no window");
+  static_assert(kRowTiles == 1 || (kRowTiles == 2 && !kCausal &&
+                                   kDimParts == 1 && kKeyWaves == 1),
+                "two row tiles per wave: non-causal, one part, one key wave");
+  // Not yet ported to gfx12's operand layout.
+  static_assert(kRowTiles == 1 || !kGfx12, "two row tiles per wave: gfx11");
+  static_assert(kCausal || !kVTr, "v_t 2 reads V from the paged cache");
   static_assert(kWaves % (kDimParts * kKeyWaves) == 0, "whole row tiles");
-  static_assert(kHeadDim % (16 * kDimParts) == 0, "whole chunks per part");
+  static_assert(kHeadDimP % (16 * kDimParts) == 0, "whole chunks per part");
+  static_assert(kHeadDimP == kHeadDim || (kDimParts == 1 && kVT),
+                "a padded head dim is one part with V transposed");
+  static_assert(!kVTr || kHeadDimP / 8 % 4 == 0,
+                "v_t 2 loads whole 16-dim chunks of 8-element units");
   static_assert(kSubTiles % kKeyWaves == 0, "whole sub-tiles per key wave");
-  static_assert(kLaneDims % 2 == 0, "a lane's V slice is whole dwords");
+  static_assert(kVT || kLaneDims % 2 == 0,
+                "a lane's V slice is whole dwords, or V is transposed");
   static_assert(kKeyTile % 16 == 0 && kPageSize % 16 == 0,
                 "a 16-key sub-tile sits inside one page");
-  static_assert(kRowChunks % 4 == 0,
+  static_assert(!kCausal || kRowChunks % 4 == 0,
                 "a wave's keys of one load sit in one sub-tile, so one page");
+  static_assert(kCausal || kHeadDim % 8 == 0,
+                "non-causal: whole 8-element units");
 
   using elem_t = typename Elem<kBf16>::type;
   using e16 = typename Elem<kBf16>::v16;
@@ -136,6 +164,29 @@ struct Prefill {
   using op_t = typename Elem<kBf16>::op;
   using opw_t = typename Elem<kBf16>::opw;
   static constexpr int kOpWords = Elem<kBf16>::kOpWords;
+  typedef elem_t e4 __attribute__((ext_vector_type(4)));
+  // One load unit.
+  using eu = std::conditional_t<kUnitElems == 8, e8, e4>;
+  using uu = std::conditional_t<kUnitElems == 8, u4v, u2v>;
+
+  // A buffer load's 8 elements as a unit (buffer loads are 8-element units).
+  static __device__ __forceinline__ eu as_unit(e8 x) {
+    if constexpr (kUnitElems == 8)
+      return x;
+    else
+      return __builtin_shufflevector(x, x, 0, 1, 2, 3);
+  }
+  // The operand of a chunk with 8 real dims at `row` (D=72's last), zeros
+  // after.
+  static __device__ __forceinline__ op_t padded_op(const elem_t* row,
+                                                   int laneHalf) {
+#if defined(__GFX12__)
+    return laneHalf ? op_t{} : *(const op_t*)row;
+#else
+    return __builtin_shufflevector(*(const e8*)row, e8{}, 0, 1, 2, 3, 4, 5, 6,
+                                   7, 8, 9, 10, 11, 12, 13, 14, 15);
+#endif
+  }
   using e2 = typename Elem<kBf16>::v2;
 
   static __device__ __forceinline__ elem_t to_elem(float x) {
@@ -237,7 +288,9 @@ struct Prefill {
                const int* __restrict__ mmRanges, int numMmRanges,
                const int4* __restrict__ plan,
                const int* __restrict__ queryStart, int numEntries,
-               int blockTableStride, int headGroup) {
+               int blockTableStride, int headGroup,
+               const elem_t* __restrict__ vIn, int qStride, int kStride,
+               int vStride) {
     __shared__ __attribute__((
         aligned(16))) elem_t kTile[kBuffers][kKeyTile][kRowPitch];
     __shared__ __attribute__((
@@ -273,11 +326,18 @@ struct Prefill {
       groupSlot = (size_t)entry.w * kNumKvHeads + kvHead * numSegments;
       const int queryBegin = queryStart[seq];
       numTokens = queryStart[seq + 1] - queryBegin;
-      q += (size_t)queryBegin * kNumQHeads * kHeadDim;
       out += (size_t)queryBegin * kNumQHeads * kHeadDim;
-      blockTable += (size_t)seq * blockTableStride;
+      if constexpr (kCausal) {
+        q += (size_t)queryBegin * kNumQHeads * kHeadDim;
+        blockTable += (size_t)seq * blockTableStride;
+        mmRanges += (size_t)seq * 2 * numMmRanges;
+      } else {
+        // The sequence's K and V start with its queries.
+        q += (size_t)queryBegin * qStride;
+        kv += (size_t)queryBegin * kStride;
+        vIn += (size_t)queryBegin * vStride;
+      }
       seqLens += seq;
-      mmRanges += (size_t)seq * 2 * numMmRanges;
     } else {
       // A tile's segments are adjacent; the heaviest tiles (last tokens) go
       // first, interleaving kHeadGroup kv heads.
@@ -301,6 +361,7 @@ struct Prefill {
     // The last key any of tokens first..last sees: the last token, or the end
     // of a multimodal range they reach into.
     auto last_key = [&](int first, int last) __attribute__((always_inline)) {
+      if constexpr (!kCausal) return seqLen - 1;
       int key = context + last;
       if (numMmRanges == 0) return key;
       for (int r = 0; r < numMmRanges; ++r) {
@@ -323,7 +384,7 @@ struct Prefill {
                                                         numSegments * kKeyTile);
     const int lastPage = (seqLen - 1) / kPageSize;
 
-    const int waveRow = tileRow + rowWave * 16;
+    const int waveRow = tileRow + rowWave * 16 * kRowTiles;
     const int row = min(waveRow + laneRow, numRows - 1);
     const int rowToken = row / kG;
     const int rowHead = kvHead * kG + row % kG;
@@ -339,15 +400,18 @@ struct Prefill {
           1, kBlockRows * kHeadDim * (int)sizeof(elem_t) * 3 / (2 * 8192));
       const int place = __builtin_amdgcn_readfirstlane((int)blockIdx.x);
       // Only when tile lengths differ and the KV is not split.
-      const bool unequal = numSegments == 1 && __builtin_amdgcn_readfirstlane(
-                                                   *seqLens) <= 2 * numTokens;
+      const bool unequal =
+          kCausal && numSegments == 1 &&
+          __builtin_amdgcn_readfirstlane(*seqLens) <= 2 * numTokens;
       if (unequal && place < firstRound)
         for (int i = 0; i < place * kStaggerUnits; ++i)
           __builtin_amdgcn_s_sleep(1);
     }
 
     // Lane l holds page l % kStepPages of a step, fetched a step ahead.
+    // Non-causal builds read K and V in place, without pages.
     auto step_pages = [&](int keyStart) __attribute__((always_inline)) {
+      if constexpr (!kCausal) return 0;
       return blockTable[min(keyStart / kPageSize + lane % kStepPages,
                             lastPage)];
     };
@@ -355,15 +419,50 @@ struct Prefill {
 
     op_t qOperand[kPartChunks];
 #pragma unroll
-    for (int c = 0; c < kPartChunks; ++c)
-      qOperand[c] = Elem<kBf16>::load_op(
-          q + ((size_t)rowToken * kNumQHeads + rowHead) * kHeadDim +
-              (firstChunk + c) * 16,
-          laneHalf);
+    for (int c = 0; c < kPartChunks; ++c) {
+      const elem_t* qRow =
+          (kCausal ? q + ((size_t)rowToken * kNumQHeads + rowHead) * kHeadDim
+                   : q + (size_t)rowToken * qStride + rowHead * kHeadDim) +
+          (firstChunk + c) * 16;
+      if (kHeadDimP != kHeadDim && (firstChunk + c) * 16 + 16 > kHeadDim) {
+        // The padded chunk: 8 real dims (D=72), zeros after.
+        qOperand[c] = padded_op(qRow, laneHalf);
+      } else {
+        qOperand[c] = Elem<kBf16>::load_op(qRow, laneHalf);
+      }
+    }
 
-    const elem_t* kvHeadBase = kv + (size_t)kvHead * (kPageSize * kKvRowElems);
-    e8 kStaged[kKLoads];
-    e8 vStaged[kVLoads][kVPerUnit];
+    // The second row tile's rows and Q (kRowTiles == 2).
+    const int row1 = min(waveRow + 16 + laneRow, numRows - 1);
+    op_t qOperand1[kRowTiles > 1 ? kPartChunks : 1];
+    if constexpr (kRowTiles > 1) {
+#pragma unroll
+      for (int c = 0; c < kPartChunks; ++c) {
+        const elem_t* qRow = q + (size_t)(row1 / kG) * qStride +
+                             (kvHead * kG + row1 % kG) * kHeadDim + c * 16;
+        qOperand1[c] = kHeadDimP != kHeadDim && c * 16 + 16 > kHeadDim
+                           ? padded_op(qRow, laneHalf)
+                           : Elem<kBf16>::load_op(qRow, laneHalf);
+      }
+    }
+
+    if constexpr (!kCausal && kHeadDimP != kHeadDim) {
+      // Staging never writes the padding: zero it once.
+      static_assert(kHeadDimP - kHeadDim == kUnitElems);
+      for (int i = thread; i < kBuffers * kKeyTile; i += kThreads)
+        *(eu*)&kTile[i / kKeyTile][i % kKeyTile][kHeadDim] = eu{};
+      for (int i = thread; i < kBuffers * kUnitElems * kKeyTile; i += kThreads)
+        vTile[i / (kUnitElems * kKeyTile)]
+             [vt_row(kHeadDim + i / kKeyTile % kUnitElems)][i % kKeyTile] =
+                 elem_t{};
+    }
+
+    const elem_t* kvHeadBase =
+        kCausal ? kv + (size_t)kvHead * (kPageSize * kKvRowElems)
+                : kv + kvHead * kHeadDim;
+    const elem_t* vHeadBase = kCausal ? nullptr : vIn + kvHead * kHeadDim;
+    eu kStaged[kKLoads];
+    eu vStaged[kVLoads][kVPerUnit];
     auto v_unit_pair = [&](int unit) __attribute__((always_inline)) {
       if constexpr (kVT)
         return unit / (8 * kRowChunks) * 8 + unit % 8;
@@ -372,9 +471,9 @@ struct Prefill {
     };
     auto v_unit_col = [&](int unit) __attribute__((always_inline)) {
       if constexpr (kVT)
-        return unit / 8 % kRowChunks * 8;
+        return unit / 8 % kRowChunks * kUnitElems;
       else
-        return unit % kRowChunks * 8;
+        return unit % kRowChunks * kUnitElems;
     };
     auto v_unit_key = [&](int unit) __attribute__((always_inline)) {
       const int pair = v_unit_pair(unit);
@@ -399,7 +498,7 @@ struct Prefill {
             kvHeadBase +
             (size_t)__builtin_amdgcn_readlane(pages, slot) * kPageElems +
             (first - slot * kPageSize) * kKvRowElems;
-        return *(const e8*)(base + (unsigned)(key * kKvRowElems + col));
+        return *(const eu*)(base + (unsigned)(key * kKvRowElems + col));
       }
       const int position = min(keyStart + key, seqLen - 1);
       const int slot = __builtin_amdgcn_readfirstlane(position / kPageSize -
@@ -408,12 +507,33 @@ struct Prefill {
           kvHeadBase +
           (size_t)__builtin_amdgcn_readlane(pages, slot) * kPageElems;
       return *(
-          const e8*)(page +
+          const eu*)(page +
                      (unsigned)((position % kPageSize) * kKvRowElems + col));
     };
-    // Per-lane byte offsets of the buffer loads, kept in registers.
+    // Per-lane byte offsets of the buffer loads, kept in registers: from the
+    // wave's first key, or (non-causal) the step's.
     int kOff[kKLoads], vOff[kVLoads][kVPerUnit];
-    if constexpr (kBufferLoads) {
+    if constexpr (!kCausal) {
+#pragma unroll
+      for (int i = 0; i < kKLoads; ++i) {
+        const int unit = i * kThreads + thread;
+        kOff[i] =
+            (unit / kRowChunks * kStride + unit % kRowChunks * kUnitElems) *
+            (int)sizeof(elem_t);
+        asm volatile("" : "+v"(kOff[i]));
+      }
+#pragma unroll
+      for (int i = 0; i < kVLoads; ++i) {
+        const int unit = i * kThreads + thread;
+#pragma unroll
+        for (int x = 0; x < kVPerUnit; ++x) {
+          vOff[i][x] =
+              ((v_unit_key(unit) + 2 * x) * vStride + v_unit_col(unit)) *
+              (int)sizeof(elem_t);
+          asm volatile("" : "+v"(vOff[i][x]));
+        }
+      }
+    } else if constexpr (kBufferLoads) {
 #pragma unroll
       for (int i = 0; i < kKLoads; ++i) {
         const int unit = i * kThreads + thread;
@@ -450,6 +570,30 @@ struct Prefill {
       return __builtin_bit_cast(
           e8, __builtin_amdgcn_raw_buffer_load_b128(rsrc, offset, 0, 0));
     };
+    // Non-causal: the step's units from its first key, each range ending
+    // with its last key's row so later keys load as zeros.
+    auto issue_noncausal = [&](int keyStart) __attribute__((always_inline)) {
+      const int last = min(seqLen - keyStart, kKeyTile) - 1;
+      const __amdgpu_buffer_rsrc_t kRsrc = __builtin_amdgcn_make_buffer_rsrc(
+          (void*)(kvHeadBase + (size_t)keyStart * kStride), 0,
+          (last * kStride + kHeadDim) * (int)sizeof(elem_t), kRsrcWord3);
+      const __amdgpu_buffer_rsrc_t vRsrc = __builtin_amdgcn_make_buffer_rsrc(
+          (void*)(vHeadBase + (size_t)keyStart * vStride), 0,
+          (last * vStride + kHeadDim) * (int)sizeof(elem_t), kRsrcWord3);
+#pragma unroll
+      for (int i = 0; i < kKLoads; ++i)
+        if (kKUnits % kThreads == 0 || i * kThreads + thread < kKUnits)
+          kStaged[i] = as_unit(__builtin_bit_cast(
+              e8, __builtin_amdgcn_raw_buffer_load_b128(kRsrc, kOff[i], 0, 0)));
+#pragma unroll
+      for (int i = 0; i < kVLoads; ++i)
+        if (kVUnits % kThreads == 0 || i * kThreads + thread < kVUnits)
+#pragma unroll
+          for (int x = 0; x < kVPerUnit; ++x)
+            vStaged[i][x] = as_unit(
+                __builtin_bit_cast(e8, __builtin_amdgcn_raw_buffer_load_b128(
+                                           vRsrc, vOff[i][x], 0, 0)));
+    };
     // Load the step at keyStart into registers.
     auto issue_step =
         [&]<bool kEdge>(int keyStart) __attribute__((always_inline)) {
@@ -459,17 +603,17 @@ struct Prefill {
 #pragma unroll
             for (int i = 0; i < kKLoads; ++i)
               if (kKUnits % kThreads == 0 || i * kThreads + thread < kKUnits)
-                kStaged[i] = load_buffer(
+                kStaged[i] = as_unit(load_buffer(
                     pages, keyStart,
-                    (i * kThreads + wave * kWaveSize) / kRowChunks, kOff[i]);
+                    (i * kThreads + wave * kWaveSize) / kRowChunks, kOff[i]));
 #pragma unroll
             for (int i = 0; i < kVIssue; ++i)
               if (kVUnits % kThreads == 0 || i * kThreads + thread < kVUnits) {
                 const int waveKey = v_unit_key(i * kThreads + wave * kWaveSize);
 #pragma unroll
                 for (int x = 0; x < kVPerUnit; ++x)
-                  vStaged[i][x] =
-                      load_buffer(pages, keyStart, waveKey + 2 * x, vOff[i][x]);
+                  vStaged[i][x] = as_unit(load_buffer(
+                      pages, keyStart, waveKey + 2 * x, vOff[i][x]));
               }
             return;
           }
@@ -478,7 +622,8 @@ struct Prefill {
             const int unit = i * kThreads + thread;
             if (kKUnits % kThreads == 0 || unit < kKUnits)
               kStaged[i] = load_row.template operator()<kEdge>(
-                  pages, keyStart, unit / kRowChunks, unit % kRowChunks * 8);
+                  pages, keyStart, unit / kRowChunks,
+                  min(unit % kRowChunks * kUnitElems, kHeadDim - kUnitElems));
           }
 #pragma unroll
           for (int i = 0; i < kVIssue; ++i) {
@@ -488,7 +633,8 @@ struct Prefill {
 #pragma unroll
               for (int x = 0; x < kVPerUnit; ++x)
                 vStaged[i][x] = load_row.template operator()<kEdge>(
-                    pages, keyStart, key + 2 * x, kHeadDim + col);
+                    pages, keyStart, key + 2 * x,
+                    kHeadDim + min(col, kHeadDim - kUnitElems));
             }
           }
         };
@@ -503,9 +649,11 @@ struct Prefill {
       for (int i = 0; i < (kDoK ? kKLoads : 0); ++i) {
         const int unit = i * kThreads + thread;
         if (kKUnits % kThreads == 0 || unit < kKUnits) {
-          const int key = unit / kRowChunks, col = unit % kRowChunks * 8;
-          *(e8*)&kTile[buffer][key][col] =
-              !kEdge || valid(keyStart + key) ? kStaged[i] : e8{};
+          const int key = unit / kRowChunks,
+                    col = unit % kRowChunks * kUnitElems;
+          *(eu*)&kTile[buffer][key][col] =
+              (!kEdge || valid(keyStart + key)) && col < kHeadDim ? kStaged[i]
+                                                                  : eu{};
         }
       }
 #pragma unroll
@@ -514,46 +662,52 @@ struct Prefill {
         if (kVUnits % kThreads == 0 || unit < kVUnits) {
           const int key = v_unit_key(unit), col = v_unit_col(unit);
           if constexpr (kVT) {
-            const e8 a = !kEdge || valid(keyStart + key) ? vStaged[i][0] : e8{};
-            const e8 b =
-                !kEdge || valid(keyStart + key + 2) ? vStaged[i][1] : e8{};
-            const u4v aw = __builtin_bit_cast(u4v, a),
-                      bw = __builtin_bit_cast(u4v, b);
+            const eu a = (!kEdge || valid(keyStart + key)) && col < kHeadDim
+                             ? vStaged[i][0]
+                             : eu{};
+            const eu b = (!kEdge || valid(keyStart + key + 2)) && col < kHeadDim
+                             ? vStaged[i][1]
+                             : eu{};
+            const uu aw = __builtin_bit_cast(uu, a),
+                     bw = __builtin_bit_cast(uu, b);
             const int slot = key / 16 * 16 + vt_slot(key % 16);
 #pragma unroll
-            for (int d = 0; d < 8; ++d)
+            for (int d = 0; d < kUnitElems; ++d)
               *(unsigned*)&vTile[buffer][vt_row(col + d)][slot] =
                   __builtin_amdgcn_perm(bw[d >> 1], aw[d >> 1],
                                         (d & 1) ? 0x07060302u : 0x05040100u);
           } else {
-            *(e8*)&vTile[buffer][key][col] =
-                !kEdge || valid(keyStart + key) ? vStaged[i][0] : e8{};
+            *(eu*)&vTile[buffer][key][col] =
+                !kEdge || valid(keyStart + key) ? vStaged[i][0] : eu{};
           }
         }
       }
     };
     auto issue = [&](int keyStart) __attribute__((always_inline)) {
-      if (edge_step(keyStart))
+      if constexpr (!kCausal)
+        issue_noncausal(keyStart);
+      else if (edge_step(keyStart))
         issue_step.template operator()<true>(keyStart);
       else
         issue_step.template operator()<false>(keyStart);
     };
+    // Non-causal steps past S loaded zeros: no masking.
     auto stage = [&](int buffer, int keyStart) __attribute__((always_inline)) {
-      if (edge_step(keyStart))
+      if (kCausal && edge_step(keyStart))
         stage_step.template operator()<true>(buffer, keyStart);
       else
         stage_step.template operator()<false>(buffer, keyStart);
     };
     auto stage_k = [&](int buffer,
                        int keyStart) __attribute__((always_inline)) {
-      if (edge_step(keyStart))
+      if (kCausal && edge_step(keyStart))
         stage_step.template operator()<true, true, false>(buffer, keyStart);
       else
         stage_step.template operator()<false, true, false>(buffer, keyStart);
     };
     auto stage_v = [&](int buffer,
                        int keyStart) __attribute__((always_inline)) {
-      if (edge_step(keyStart))
+      if (kCausal && edge_step(keyStart))
         stage_step.template operator()<true, false, true>(buffer, keyStart);
       else
         stage_step.template operator()<false, false, true>(buffer, keyStart);
@@ -567,11 +721,103 @@ struct Prefill {
     f8 accum[kLaneDims];
 #pragma unroll
     for (int j = 0; j < kLaneDims; ++j) accum[j] = f8{};
+    float runMax1 = -INFINITY, runSum1 = 0.f;
+    f8 accum1[kRowTiles > 1 ? kLaneDims : 1];
+#pragma unroll
+    for (int j = 0; j < (kRowTiles > 1 ? kLaneDims : 1); ++j) accum1[j] = f8{};
 
     // Q@K, softmax update and P@V for the step at keyStart in `buffer`. Lane
     // holds row laneRow, keys keyStart + 16 st + 2e + laneHalf.
+    // Online softmax of one row tile's scores: rescales its O, returns P.
+    auto softmax = [&](f8* scores, float& rowMax, float& rowSum, f8* acc,
+                       op_t* p) __attribute__((always_inline)) {
+      float tileMax = -INFINITY;
+#pragma unroll
+      for (int ls = 0; ls < kWaveSubTiles; ++ls)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) tileMax = fmaxf(tileMax, scores[ls][e]);
+      tileMax = fmaxf(tileMax, xhalf(tileMax)) * scaleLog2;
+      const float newMax = tileMax > rowMax + kMaxSlack ? tileMax : rowMax;
+      const float safeMax = newMax == -INFINITY ? 0.f : newMax;
+      const float rescale = __builtin_amdgcn_exp2f(rowMax - safeMax);
+      rowMax = newMax;
+      if (__builtin_amdgcn_ballot_w32(rescale != 1.f))
+#pragma unroll
+        for (int j = 0; j < kLaneDims; ++j) acc[j] *= rescale;
+      float tileSum = 0.f;
+#pragma unroll
+      for (int ls = 0; ls < kWaveSubTiles; ++ls) {
+        float probs[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          probs[e] = __builtin_amdgcn_exp2f(
+              __builtin_fmaf(scores[ls][e], scaleLog2, -safeMax));
+          tileSum += probs[e];
+        }
+        p[ls] = p_frag(probs);
+      }
+      rowSum = rowSum * rescale + tileSum + xhalf(tileSum);
+    };
+    // Two row tiles (non-causal): each K and V operand read feeds both.
+    auto compute2 = [&](int buffer,
+                        int keyStart) __attribute__((always_inline)) {
+      if constexpr (kRowTiles > 1) {
+        bool live[kWaveSubTiles];
+        bool allLive = true;
+#pragma unroll
+        for (int ls = 0; ls < kWaveSubTiles; ++ls) {
+          live[ls] = keyStart + ls * 16 < seqLen;
+          allLive = allLive && live[ls];
+        }
+        allLive = __builtin_amdgcn_readfirstlane((int)allLive);
+        f8 s0[kWaveSubTiles], s1[kWaveSubTiles];
+#pragma unroll
+        for (int ls = 0; ls < kWaveSubTiles; ++ls) s0[ls] = s1[ls] = f8{};
+#pragma unroll
+        for (int c = 0; c < kPartChunks; ++c)
+#pragma unroll
+          for (int ls = 0; ls < kWaveSubTiles; ++ls) {
+            const e16 kOperand =
+                *(const e16*)&kTile[buffer][ls * 16 + laneRow][c * 16];
+            if (allLive || live[ls]) {
+              s0[ls] = wmma(kOperand, qOperand[c], s0[ls]);
+              s1[ls] = wmma(kOperand, qOperand1[c], s1[ls]);
+            }
+          }
+        if (__builtin_expect(keyStart + kKeyTile > seqLen, 0)) {
+#pragma unroll
+          for (int ls = 0; ls < kWaveSubTiles; ++ls)
+#pragma unroll
+            for (int e = 0; e < 8; ++e)
+              if (keyStart + ls * 16 + 2 * e + laneHalf >= seqLen)
+                s0[ls][e] = s1[ls][e] = -INFINITY;
+        }
+        op_t p0[kWaveSubTiles], p1[kWaveSubTiles];
+        softmax(s0, runMax, runSum, accum, p0);
+        softmax(s1, runMax1, runSum1, accum1, p1);
+#pragma unroll
+        for (int ls = 0; ls < kWaveSubTiles; ++ls)
+#pragma unroll
+          for (int j = 0; j < kLaneDims; ++j) {
+            const elem_t* vRow = &vTile[buffer][j * 16 + laneRow][ls * 16];
+            const e8 own = *(const e8*)(vRow + laneHalf * 8);
+            const e8 other = *(const e8*)(vRow + (1 - laneHalf) * 8);
+            const e16 vOperand =
+                __builtin_shufflevector(own, other, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+                                        9, 10, 11, 12, 13, 14, 15);
+            if (allLive || live[ls]) {
+              accum[j] = wmma(vOperand, p0[ls], accum[j]);
+              accum1[j] = wmma(vOperand, p1[ls], accum1[j]);
+            }
+          }
+      }
+    };
     auto compute = [&](int buffer, int keyStart,
                        int stageNext = -1) __attribute__((always_inline)) {
+      if constexpr (kRowTiles > 1) {
+        compute2(buffer, keyStart);
+        return;
+      }
       // v_t 2: the step's pages, read now so Q@K hides the latency.
       const int vPages = kVTr ? step_pages(keyStart) : 0;
       // The global address of key `first` + k of a 16-key sub-tile.
@@ -710,8 +956,10 @@ struct Prefill {
       }
 
       // Mask only diagonal and window-edge steps. No row's last key is before
-      // the first token's.
-      const bool causalEdge = keyStart + kKeyTile - 1 > context + firstToken;
+      // the first token's. Non-causal: only the step past the last key.
+      const bool causalEdge =
+          kCausal ? keyStart + kKeyTile - 1 > context + firstToken
+                  : keyStart + kKeyTile > seqLen;
       const bool windowEdge =
           kWindow && keyStart < context + lastToken - (kWindow - 1);
       if (__builtin_expect(causalEdge || windowEdge, 0)) {
@@ -907,6 +1155,41 @@ struct Prefill {
     }
     const bool owner = kKeyWaves == 1 || keyWave == 0;
 
+    if constexpr (kRowTiles > 1) {
+      // The second row tile first: the first's store may return.
+      if (numSegments == 1) {
+        if (waveRow + 16 + laneRow < numRows) {
+          const float inv = __builtin_amdgcn_rcpf(runSum1);
+          elem_t* dst = out + ((size_t)(row1 / kG) * kNumQHeads + kvHead * kG +
+                               row1 % kG) *
+                                  kHeadDim;
+#pragma unroll
+          for (int e = 0; e < 8; ++e)
+#pragma unroll
+            for (int j = 0; j < kLaneDims; ++j)
+              if (kHeadDimP == kHeadDim ||
+                  kLaneDims * acc_row(e, laneHalf) + j < kHeadDim)
+                dst[kLaneDims * acc_row(e, laneHalf) + j] =
+                    to_elem(accum1[j][e] * inv);
+        }
+      } else {
+        const size_t partialRow = (groupSlot + segment) * kBlockRows +
+                                  rowWave * 16 * kRowTiles + 16 + laneRow;
+        float* dst = partialO + partialRow * kHeadDim;
+#pragma unroll
+        for (int e = 0; e < 8; ++e)
+#pragma unroll
+          for (int j = 0; j < kLaneDims; ++j)
+            if (kHeadDimP == kHeadDim ||
+                kLaneDims * acc_row(e, laneHalf) + j < kHeadDim)
+              dst[kLaneDims * acc_row(e, laneHalf) + j] = accum1[j][e];
+        if (laneHalf == 0) {
+          partialML[partialRow * 2] = runMax1;
+          partialML[partialRow * 2 + 1] = runSum1;
+        }
+      }
+    }
+
     if (numSegments == 1) {
       if (!owner || waveRow + laneRow >= numRows) return;
       const float inv = __builtin_amdgcn_rcpf(runSum);
@@ -928,10 +1211,18 @@ struct Prefill {
         elem_t x[kLaneDims];
 #pragma unroll
         for (int j = 0; j < kLaneDims; ++j) x[j] = to_elem(accum[j][e] * inv);
-        unsigned* d = (unsigned*)(dst + kLaneDims * acc_row(e, laneHalf));
+        if constexpr (kLaneDims % 2) {
 #pragma unroll
-        for (int w = 0; w < kLaneWords; ++w)
-          d[w] = __builtin_bit_cast(unsigned, e2{x[2 * w], x[2 * w + 1]});
+          for (int j = 0; j < kLaneDims; ++j)
+            if (kHeadDimP == kHeadDim ||
+                kLaneDims * acc_row(e, laneHalf) + j < kHeadDim)
+              dst[kLaneDims * acc_row(e, laneHalf) + j] = x[j];
+        } else {
+          unsigned* d = (unsigned*)(dst + kLaneDims * acc_row(e, laneHalf));
+#pragma unroll
+          for (int w = 0; w < kLaneWords; ++w)
+            d[w] = __builtin_bit_cast(unsigned, e2{x[2 * w], x[2 * w + 1]});
+        }
       }
       return;
     }
@@ -940,14 +1231,17 @@ struct Prefill {
     // resets the counter.
     const size_t partialBase = (groupSlot + segment) * kBlockRows;
     if (owner) {
-      const size_t partialRow = partialBase + rowWave * 16 + laneRow;
+      const size_t partialRow =
+          partialBase + rowWave * 16 * kRowTiles + laneRow;
       float* dst = partialO + partialRow * kHeadDim + dimPart * kPartDims;
 #pragma unroll
       for (int e = 0; e < 8; ++e)
 #pragma unroll
         for (int j = 0; j < kLaneDims; ++j)
-          dst[kVTr ? 16 * j + acc_row(e, laneHalf)
-                   : kLaneDims * acc_row(e, laneHalf) + j] = accum[j][e];
+          if (kHeadDimP == kHeadDim ||
+              kLaneDims * acc_row(e, laneHalf) + j < kHeadDim)
+            dst[kVTr ? 16 * j + acc_row(e, laneHalf)
+                     : kLaneDims * acc_row(e, laneHalf) + j] = accum[j][e];
       if (laneHalf == 0 && dimPart == 0) {
         partialML[partialRow * 2] = runMax;
         partialML[partialRow * 2 + 1] = runSum;
@@ -1047,7 +1341,8 @@ void launch_prefill(const PrefillArgs& a) {
         a.seq_lens, 0, a.scale, a.partial_o, a.partial_ml, a.counters, 1,
         wgpWorkgroups * numWgps, a.mm_ranges, a.num_mm_ranges,
         reinterpret_cast<const int4*>(a.plan), a.query_start, a.num_entries,
-        a.bt_stride, headGroup);
+        a.bt_stride, headGroup, static_cast<const elem_t*>(a.v), a.q_stride,
+        a.k_stride, a.v_stride);
     return;
   }
   // A workgroup per SIMD.
@@ -1073,7 +1368,8 @@ void launch_prefill(const PrefillArgs& a) {
       static_cast<const elem_t*>(a.kv), a.bt, static_cast<elem_t*>(a.out),
       a.seq_lens, a.num_tokens, a.scale, a.partial_o, a.partial_ml, a.counters,
       segments, wgpWorkgroups * numWgps, a.mm_ranges, a.num_mm_ranges, nullptr,
-      nullptr, 0, 0, P::kHeadGroup);
+      nullptr, 0, 0, P::kHeadGroup, static_cast<const elem_t*>(a.v), a.q_stride,
+      a.k_stride, a.v_stride);
 }
 
 }  // namespace
