@@ -212,6 +212,21 @@ def _aiter_mla_native_h24_supported() -> bool:
     )
 
 
+@functools.lru_cache
+def _aiter_gluon_mla_decode_serves(
+    num_heads: int, max_qo_len: int, q_dtype: torch.dtype, kv_dtype: torch.dtype
+) -> bool:
+    """Whether aiter's mla_decode_fwd (no DCP) runs this decode with its gfx1250
+    Gluon kernel, which takes the native head count (no padding to 16)."""
+    try:
+        from aiter.mla import gluon_mla_decode_route_enabled
+    except ImportError:
+        return False
+    return gluon_mla_decode_route_enabled(
+        num_heads, 1, max_qo_len, 1, q_dtype, kv_dtype
+    )
+
+
 def _aiter_mla_non_causal_asm_kernels() -> bool:
     """Whether this arch ships non-causal MLA decode ASM kernels.
 
@@ -1747,7 +1762,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             metadata_num_heads = (
                 self._asm_dcp_verify_heads
                 if dcp_route is _DCPDecodeRoute.CPRR
-                else AiterMLAHelper.get_actual_mla_num_heads(self._decode_num_heads)
+                else AiterMLAHelper.get_actual_mla_num_heads(
+                    self._decode_num_heads,
+                    int(max_qo_len) if self.dcp_world_size == 1 else None,
+                    self._mla_q_dtype,
+                    self._mla_kv_dtype,
+                )
             )
             get_mla_metadata_v1(
                 qo_indptr,
@@ -2049,8 +2069,17 @@ class AiterMLAHelper:
         return kernel_heads in AiterMLAHelper._AITER_FP8_NON_CAUSAL_QLEN2_HEADS
 
     @staticmethod
-    def get_actual_mla_num_heads(num_heads: int) -> int:
+    def get_actual_mla_num_heads(
+        num_heads: int,
+        max_qo_len: int | None = None,
+        q_dtype: torch.dtype | None = None,
+        kv_dtype: torch.dtype | None = None,
+    ) -> int:
         if num_heads == 24 and _aiter_mla_native_h24_supported():
+            return num_heads
+        if max_qo_len is not None and _aiter_gluon_mla_decode_serves(
+            num_heads, max_qo_len, q_dtype, kv_dtype
+        ):
             return num_heads
         m = AiterMLAHelper._AITER_MIN_MLA_HEADS
         return -(-num_heads // m) * m
@@ -2948,9 +2977,14 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 self._decode_num_heads, q, target_heads=mla_num_heads
             )
         else:
-            mla_padded_q = AiterMLAHelper.get_mla_padded_q(self._decode_num_heads, q)
             mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(
-                self._decode_num_heads
+                self._decode_num_heads,
+                decode.max_qo_len if self.dcp_world_size == 1 else None,
+                q.dtype,
+                kv_c_and_k_pe_cache.dtype,
+            )
+            mla_padded_q = AiterMLAHelper.get_mla_padded_q(
+                self._decode_num_heads, q, target_heads=mla_num_heads
             )
         o = torch.empty(
             B,
@@ -3036,6 +3070,8 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             output = o[:, : self._decode_num_heads]
             if lse is not None:
                 lse = lse[:, : self._decode_num_heads, ...]
+        elif mla_num_heads == self._decode_num_heads:
+            output = o
         else:
             output = AiterMLAHelper.get_mla_unpadded_o(self._decode_num_heads, o)
             if lse is not None:
