@@ -548,58 +548,58 @@ def triton_w4a16_skinny_fmt_gemm(
         # Tuned on gfx1201 (Radeon AI PRO R9700, 32 CUs, 32-wide wavefronts)
         # using Llama-3.1-8B AWQ weight shapes with group_size=128.
         if M <= 32:
-            block_m, block_n, block_k, num_warps = 16, 16, 128, 4
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 16, 16, 128, 4
         elif M <= 64:
             if K >= 2 * N:  # tall K (e.g. down_proj)
-                block_m, block_n, block_k, num_warps = 64, 32, 128, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 128, 8
             elif N > K:  # wide N (e.g. qkv_proj, gate_up_proj)
-                block_m, block_n, block_k, num_warps = 64, 32, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 8
             else:  # N ~= K (e.g. o_proj)
-                block_m, block_n, block_k, num_warps = 32, 64, 128, 4
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 64, 128, 4
         elif M <= 128:
             if K >= 2 * N:  # tall K (e.g. down_proj)
-                block_m, block_n, block_k, num_warps = 64, 16, 64, 1
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 16, 64, 1
             elif N >= 2 * K:  # very wide N (e.g. gate_up_proj)
-                block_m, block_n, block_k, num_warps = 64, 128, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 64, 8
             else:  # N ~= K (e.g. o_proj, qkv_proj)
-                block_m, block_n, block_k, num_warps = 64, 64, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 8
         elif M <= 512:
             if K >= 2 * N:  # tall K (e.g. down_proj)
-                block_m, block_n, block_k, num_warps = 128, 64, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
             elif N >= 4 * K:  # very wide N (e.g. gate_up_proj)
-                block_m, block_n, block_k, num_warps = 128, 128, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 128, 64, 8
             else:
-                block_m, block_n, block_k, num_warps = 64, 128, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 64, 8
         else:
             if K >= 2 * N:  # tall K (e.g. down_proj)
-                block_m, block_n, block_k, num_warps = 128, 64, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
             elif N >= 4 * K:  # very wide N (e.g. gate_up_proj)
-                block_m, block_n, block_k, num_warps = 256, 64, 64, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 256, 64, 64, 8
             else:
-                block_m, block_n, block_k, num_warps = 128, 128, 32, 8
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 128, 32, 8
         # The kernel loads one scale per BLOCK_K tile, so BLOCK_K must not
         # exceed group_size — otherwise elements in the tile that belong to
         # a different group would get the wrong scale.
-        block_k = min(block_k, group_size)
+        BLOCK_K = min(BLOCK_K, group_size)
     elif _on_gfx1x():
         # gfx11: per-(M, N, K) tile config from the dtype-aware table (see
         # _select_skinny_gfx11_config). BLOCK_K is capped to group_size there
         # so a K-block never straddles a quant group (no scale aliasing).
-        block_m, block_n, block_k, num_warps = _select_skinny_gfx11_config(
+        BLOCK_M, BLOCK_N, BLOCK_K, num_warps = _select_skinny_gfx11_config(
             M, N, K, group_size, a.dtype
         )
         num_stages = 1  # >1 regresses badly for this kernel (no SW pipeline)
     else:
         num_warps = 4
         if M <= 32:
-            block_m, block_n, block_k = 32, 64, 32
+            BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
         elif M <= 64:
-            block_m, block_n, block_k = 64, 64, 32
+            BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         else:
-            block_m, block_n, block_k = 128, 128, 32
-        block_k = min(block_k, group_size)
+            BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
+        BLOCK_K = min(BLOCK_K, group_size)
 
-    grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     extra_kwargs = {} if num_stages is None else {"num_stages": num_stages}
     # The kernel picks the packed (fp16/gfx1x) vs scalar unpack itself.
@@ -619,9 +619,9 @@ def triton_w4a16_skinny_fmt_gemm(
         stride_pn,
         group_size=group_size,
         HAS_ZP=has_zp,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
         num_warps=num_warps,
         **extra_kwargs,
     )
