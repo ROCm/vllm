@@ -498,7 +498,7 @@ def prepare_hybrid_weights(
     # the gfx1151 cliff row-pad -- with no duplicated stride logic here. Values
     # are random (irrelevant to timing); only shape/stride/dtype matter.
     unpacked = torch.randint(0, 16, (N, K), dtype=torch.int32, device=device)
-    w_q_skinny, w_q_skinny_i32 = pack_skinny_int4(unpacked)
+    w_q_skinny = pack_skinny_int4(unpacked)
     w_s_skinny = torch.randn(N, num_groups, dtype=dtype, device=device) * 0.01
     # Raw 0..15 values, in the two layouts production keeps separate: the HIP op
     # reads them packed 8-to-an-int32 down N, while the Triton carrier is built
@@ -516,7 +516,6 @@ def prepare_hybrid_weights(
     return {
         "w_q_skinny": w_q_skinny,
         "w_s_skinny": w_s_skinny,
-        "w_q_skinny_i32": w_q_skinny_i32,
         "w_zp": w_zp,
         "w_zp_raw": w_zp_raw,
     }
@@ -639,21 +638,18 @@ def measure_tflops(
     )
 
     # Build N rotating copies of the (cold) weight operands; the dominant read is
-    # w_q_skinny_i32 (N*K/2 bytes), so size the rotation off it. run() advances a
+    # w_q_skinny (N*K/2 bytes), so size the rotation off it. run() advances a
     # buffer index per call; do_bench_cudagraph unrolls n_repeat = rep/est calls
     # into the graph, so at small M (tiny est) n_repeat far exceeds n_buf and the
     # rotation is complete -- exactly where cache residency matters. At large M
     # the kernel is compute-bound (cache-insensitive), so partial rotation there
     # is immaterial.
-    w_bytes = (
-        weights["w_q_skinny_i32"].numel() * weights["w_q_skinny_i32"].element_size()
-    )
+    w_bytes = weights["w_q_skinny"].numel() * weights["w_q_skinny"].element_size()
     n_buf = max(2, min(_ROTATE_MAX, -(-_ROTATE_TARGET_BYTES // w_bytes)))
     bufs = [
         {
             "w_q_skinny": _clone_strided(weights["w_q_skinny"]),
             "w_s_skinny": _clone_strided(weights["w_s_skinny"]),
-            "w_q_skinny_i32": _clone_strided(weights["w_q_skinny_i32"]),
             "w_zp": _clone_strided(weights["w_zp"]) if use_zp else None,
             "packed_scale_zp": _clone_strided(packed_scale_zp),
         }
@@ -668,7 +664,6 @@ def measure_tflops(
             a,
             w["w_q_skinny"],
             w["w_s_skinny"],
-            w["w_q_skinny_i32"],
             w["w_zp"],
             None,  # bias
             cu_count,
