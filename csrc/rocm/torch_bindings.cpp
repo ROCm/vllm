@@ -212,6 +212,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? plan=None, Tensor? query_start_loc=None, int head_group=0) -> "
       "()");
   rocm_ops.impl("rdna_prefill_attn", torch::kCUDA, &rdna_prefill_attn);
+  // The non-causal builds, on an encoder's Q, K and V in place.
+  rocm_ops.def(
+      "rdna_encoder_attn(int config, Tensor q, Tensor k, Tensor v, "
+      "Tensor! out, Tensor! partial_o, Tensor! partial_ml, Tensor! counters, "
+      "Tensor seq_lens, int max_seq_len, float scale, Tensor? plan=None, "
+      "Tensor? query_start_loc=None, int head_group=0) -> ()");
+  rocm_ops.impl("rdna_encoder_attn", torch::kCUDA, &rdna_encoder_attn);
 #endif
 
   // Custom attention op

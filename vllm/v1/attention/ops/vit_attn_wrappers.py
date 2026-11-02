@@ -11,17 +11,26 @@ latencies by ~7% (see qwen2_5_vl for example usage)
 To use these ops, you must have a recent version of PyTorch installed (>= 2.4.0)
 """
 
+import weakref
 from typing import Any
 
 import einops
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.utils import create_attention_profiler_scope
+from vllm.v1.attention.ops import rocm_rdna_encoder
+from vllm.v1.utils import (
+    create_attention_profiler_scope,
+    profiler_scopes_enabled,
+)
+
+logger = init_logger(__name__)
 
 
 def flash_attn_maxseqlen_wrapper(
@@ -210,9 +219,15 @@ def triton_attn_wrapper(
     head_size = q.shape[2]
     num_kv_heads = k.shape[1]
 
-    # Compute segment lengths for block-diagonal attention in multi-segment batches.
+    # Segment lengths for the profiler label of multi-segment batches: a host
+    # read, so only when a scope records it and not under CUDA graph capture,
+    # which forbids it.
     block_diagonal_segments: list[int] | None = None
-    if cu_seqlens.numel() > 2:
+    if (
+        cu_seqlens.numel() > 2
+        and profiler_scopes_enabled()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         block_diagonal_segments = seg_lens.tolist()
 
@@ -283,6 +298,100 @@ def vit_triton_attn_wrapper(
         scale,
         cu_seqlens,
         max_seqlen,
+    )
+
+
+# Segment lengths per live cu_seqlens tensor, which nothing changes in place:
+# the host lengths MMEncoderAttention.maybe_recompute_cu_seqlens made it from,
+# else read back from the device once. An entry goes with its tensor.
+_RDNA_SEG_LENS: dict[int, list[int]] = {}
+
+
+def _remember_rdna_seg_lens(cu_seqlens: torch.Tensor, seg_lens: list[int]) -> None:
+    key = id(cu_seqlens)
+    if key not in _RDNA_SEG_LENS:
+        weakref.finalize(cu_seqlens, _RDNA_SEG_LENS.pop, key, None)
+    _RDNA_SEG_LENS[key] = seg_lens
+
+
+def remember_rdna_cu_seqlens(cu_seqlens: torch.Tensor, host: np.ndarray) -> None:
+    """Note the host lengths of cu_seqlens."""
+    _remember_rdna_seg_lens(cu_seqlens, np.diff(host).tolist())
+
+
+def _rdna_segment_lengths(cu_seqlens: torch.Tensor) -> list[int]:
+    seg_lens = _RDNA_SEG_LENS.get(id(cu_seqlens))
+    if seg_lens is None:
+        # The plan follows the host, as Triton's segment lengths do.
+        with gpu_sync_allowed():
+            bounds = cu_seqlens.tolist()
+        seg_lens = [b - a for a, b in zip(bounds, bounds[1:])]
+        _remember_rdna_seg_lens(cu_seqlens, seg_lens)
+    return seg_lens
+
+
+def rdna_attn_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """ROCM_RDNA_ATTN's kernels, else triton_attn_wrapper."""
+    # VllmConfig refuses cudagraph_mm_encoder with this backend: its launches
+    # follow the host's segment lengths, which a graph would replay unchanged.
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("ROCM_RDNA_ATTN cannot run under CUDA graph capture")
+
+    if scale is None:
+        scale = q.shape[-1] ** -0.5
+    qf, kf, vf = (einops.rearrange(x, "b s ... -> (b s) ...") for x in (q, k, v))
+    why = rocm_rdna_encoder.unsupported(qf, kf.shape[1])
+    if why is not None:
+        logger.info_once("ROCM_RDNA_ATTN mm-encoder call on TRITON_ATTN: %s", why)
+        return triton_attn_wrapper(q, k, v, batch_size, scale, cu_seqlens, max_seqlen)
+    seg_lens = (
+        [q.size(1)] * batch_size
+        if cu_seqlens is None
+        else _rdna_segment_lengths(cu_seqlens)
+    )
+    with create_attention_profiler_scope(
+        backend_name="ROCM_RDNA_ATTN",
+        batch_size=batch_size,
+        max_query_len=max(seg_lens, default=0),
+        max_seq_len=max(seg_lens, default=0),
+        num_heads=qf.shape[1],
+        head_size=qf.shape[2],
+        num_kv_heads=kf.shape[1],
+        dtype=q.dtype,
+        is_causal=False,
+        v_token_stride=vf.stride(0),
+        block_diagonal_segments=seg_lens if len(seg_lens) > 1 else None,
+    ):
+        output = rocm_rdna_encoder.forward(qf, kf, vf, seg_lens, scale)
+    return einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+
+
+direct_register_custom_op(
+    op_name="rdna_attn_wrapper",
+    op_func=rdna_attn_wrapper,
+    fake_impl=triton_attn_wrapper_fake,
+)
+
+
+def vit_rdna_attn_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch_size: int,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.rdna_attn_wrapper(
+        q, k, v, batch_size, scale, cu_seqlens, max_seqlen
     )
 
 
