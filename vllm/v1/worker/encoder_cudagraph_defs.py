@@ -9,6 +9,12 @@ import torch
 
 EncoderCudaGraphPaddingLogic = Callable[[torch.Tensor, torch.Tensor], None]
 
+
+class CudaGraphCaptureUnsupportedError(RuntimeError):
+    """An encoder path that cannot run under CUDA graph capture; the encoder
+    CUDA graph manager then runs that encoder eager."""
+
+
 # Reserved mm_kwargs key: models with ``EncoderCudaGraphConfig.capture_axes``
 # put the resolved per-axis keys (one per axis, in order) into the dict
 # returned by ``select_encoder_cudagraph_items()``; the manager pops it before
@@ -38,6 +44,10 @@ class EncoderItemSpec:
     Single-path encoders leave this empty and use ``output_tokens`` for the
     default path.
     """
+
+    eager_only: bool = False
+    """Whether the item must run eager, e.g. because it exceeds a shape the
+    captured graphs assume."""
 
     def get_path_output_tokens(self, path: str) -> int:
         if path == "default" and not self.path_output_tokens:

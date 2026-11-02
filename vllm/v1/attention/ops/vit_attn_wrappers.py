@@ -11,6 +11,7 @@ latencies by ~7% (see qwen2_5_vl for example usage)
 To use these ops, you must have a recent version of PyTorch installed (>= 2.4.0)
 """
 
+import itertools
 from typing import Any
 
 import einops
@@ -21,6 +22,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.worker.encoder_cudagraph_defs import CudaGraphCaptureUnsupportedError
 
 
 def flash_attn_maxseqlen_wrapper(
@@ -241,6 +243,11 @@ def vit_triton_attn_wrapper(
     )
 
 
+# Bound on the attention scores of one packed SDPA call (the math kernel
+# materializes them in fp32).
+_SDPA_MAX_SCORE_BYTES = 1 << 30
+
+
 def apply_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -287,19 +294,56 @@ def torch_sdpa_wrapper(
     if cu_seqlens is None:
         return apply_sdpa(q, k, v, scale=scale, enable_gqa=enable_gqa).contiguous()
 
-    outputs = []
+    if current_platform.is_cuda_alike() and torch.cuda.is_current_stream_capturing():
+        raise CudaGraphCaptureUnsupportedError(
+            "TORCH_SDPA reads packed sequence lengths on the host and cannot "
+            "be captured in a CUDA graph."
+        )
 
     # `torch.split` needs Python int sizes.
     with gpu_sync_allowed():
         lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-    q_chunks = torch.split(q, lens, dim=1)
-    k_chunks = torch.split(k, lens, dim=1)
-    v_chunks = torch.split(v, lens, dim=1)
-    for q_i, k_i, v_i in zip(q_chunks, k_chunks, v_chunks):
-        output_i = apply_sdpa(q_i, k_i, v_i, scale=scale, enable_gqa=enable_gqa)
-        outputs.append(output_i)
-    context_layer = torch.cat(outputs, dim=1)
-    return context_layer
+    starts = list(itertools.accumulate(lens, initial=0))
+    by_len: dict[int, list[int]] = {}
+    for i, seq_len in enumerate(lens):
+        if seq_len > 0:
+            by_len.setdefault(seq_len, []).append(i)
+
+    # One call per sequence length (e.g. a video's frames, same-size images),
+    # in chunks whose attention scores (if SDPA materializes them) stay
+    # within _SDPA_MAX_SCORE_BYTES.
+    batch_size, num_heads = q.shape[0], q.shape[2]
+    outputs: list[torch.Tensor | None] = [None] * len(lens)
+    calls: list[torch.Tensor] = []
+    for seq_len, all_seqs in by_len.items():
+        score_bytes = batch_size * num_heads * seq_len * seq_len * 4
+        seqs_per_call = max(1, _SDPA_MAX_SCORE_BYTES // score_bytes)
+        for c in range(0, len(all_seqs), seqs_per_call):
+            seqs = all_seqs[c : c + seqs_per_call]
+            first, last = seqs[0], seqs[-1]
+            if last - first + 1 == len(seqs):  # adjacent: slice without copying
+                q_i, k_i, v_i = (
+                    x[:, starts[first] : starts[last + 1]] for x in (q, k, v)
+                )
+            else:
+                q_i, k_i, v_i = (
+                    torch.cat([x[:, starts[i] : starts[i + 1]] for i in seqs], dim=1)
+                    for x in (q, k, v)
+                )
+            q_i, k_i, v_i = (
+                x.reshape(batch_size * len(seqs), seq_len, *x.shape[2:])
+                for x in (q_i, k_i, v_i)
+            )
+            out = apply_sdpa(q_i, k_i, v_i, scale=scale, enable_gqa=enable_gqa)
+            out = out.reshape(batch_size, len(seqs) * seq_len, *q.shape[2:])
+            calls.append(out)
+            for i, out_i in zip(seqs, out.split(seq_len, dim=1)):
+                outputs[i] = out_i
+    if not calls:
+        return q.new_empty((batch_size, 0, *q.shape[2:]))
+    if len(calls) == 1:  # one call covered every sequence, in order
+        return calls[0]
+    return torch.cat([out for out in outputs if out is not None], dim=1)
 
 
 def torch_sdpa_wrapper_fake(

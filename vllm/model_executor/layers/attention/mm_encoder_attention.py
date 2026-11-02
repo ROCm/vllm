@@ -304,6 +304,11 @@ class MMEncoderAttention(CustomOp):
         device: torch.device,
         fp8_padded_hidden_size: int | None = None,
     ) -> torch.Tensor:
+        """``cu_seqlens`` in the layout ``attn_backend`` reads.
+
+        On ``device``, except for ``TORCH_SDPA``, which splits the sequences
+        on the host: there it stays on the CPU (no device sync per layer).
+        """
         if (oot_class := maybe_get_oot_by_class(cls)) is not cls:
             return oot_class.maybe_recompute_cu_seqlens(  # type: ignore[attr-defined]
                 attn_backend,
@@ -344,8 +349,9 @@ class MMEncoderAttention(CustomOp):
                 )
                 cu_seqlens = np.concatenate([cu_seqlens_qko, cu_seqlens_v])
 
-        cu_seqlens = async_tensor_h2d(cu_seqlens, device=device)
-        return cu_seqlens
+        if attn_backend == AttentionBackendEnum.TORCH_SDPA:
+            return torch.from_numpy(cu_seqlens)
+        return async_tensor_h2d(cu_seqlens, device=device)
 
     @classmethod
     def cu_seqlens_buffer_padding(

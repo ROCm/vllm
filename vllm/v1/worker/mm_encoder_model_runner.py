@@ -91,6 +91,10 @@ class MMEncoderModelRunner(GPUModelRunner):
 
         manager = encoder_runner.cudagraph_manager
         assert manager is not None
+        if not manager.is_captured():
+            # Capture fell back to eager: what the warmup forward left in the
+            # caching allocator is not graph memory.
+            graph_memory = 0
         logger.info(
             "Encoder graph capturing finished in %.0f secs, took %.2f GiB (%d graphs)",
             time.perf_counter() - start_time,

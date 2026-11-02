@@ -484,3 +484,52 @@ def test_mha_attn_fp8_rejects_wrong_backend(default_vllm_config):
             MMEncoderAttention(4, 64)
     finally:
         vllm_config.model_config = old_model_config
+
+
+def test_torch_sdpa_varlen_rejects_cuda_graph_capture():
+    """Splitting packed sequences reads cu_seqlens on the host, which a CUDA
+    graph cannot capture: fail with a clear error instead of a capture one."""
+    from vllm.v1.attention.ops.vit_attn_wrappers import torch_sdpa_wrapper
+    from vllm.v1.worker.encoder_cudagraph_defs import (
+        CudaGraphCaptureUnsupportedError,
+    )
+
+    q = k = v = torch.randn(1, 8, 2, 16)
+    cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
+    with (
+        patch.object(current_platform, "is_cuda_alike", return_value=True),
+        patch("torch.cuda.is_current_stream_capturing", return_value=True),
+        pytest.raises(CudaGraphCaptureUnsupportedError),
+    ):
+        torch_sdpa_wrapper(q, k, v, cu_seqlens=cu_seqlens)
+
+
+@pytest.mark.parametrize("max_score_bytes", [1 << 30, 1])
+def test_torch_sdpa_varlen_groups_equal_lengths(max_score_bytes: int):
+    """Sequences of equal length, adjacent or not, share SDPA calls (in chunks
+    under a score-memory bound) and match one call per sequence."""
+    from vllm.v1.attention.ops import vit_attn_wrappers
+
+    lens = [3, 3, 0, 5, 3, 2]
+    q, k, v = (torch.randn(1, sum(lens), 2, 16) for _ in range(3))
+    cu_seqlens = torch.tensor(
+        list(itertools.accumulate(lens, initial=0)), dtype=torch.int32
+    )
+    with patch.object(vit_attn_wrappers, "_SDPA_MAX_SCORE_BYTES", max_score_bytes):
+        out = vit_attn_wrappers.torch_sdpa_wrapper(q, k, v, cu_seqlens=cu_seqlens)
+    starts = cu_seqlens.tolist()
+    ref = torch.cat(
+        [
+            vit_attn_wrappers.apply_sdpa(*(x[:, a:b] for x in (q, k, v)))
+            for a, b in zip(starts[:-1], starts[1:])
+            if b > a
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(out, ref)
+
+    empty = torch.zeros(3, dtype=torch.int32)
+    out = vit_attn_wrappers.torch_sdpa_wrapper(
+        q[:, :0], k[:, :0], v[:, :0], cu_seqlens=empty
+    )
+    assert out.shape == (1, 0, 2, 16)

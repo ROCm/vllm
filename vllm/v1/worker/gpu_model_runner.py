@@ -6371,12 +6371,15 @@ class GPUModelRunner(
                     encoder_cudagraph_manager.capture(graph_pool=encoder_profiling_pool)
                     torch.accelerator.synchronize()
                     free_after = torch.accelerator.get_memory_info()[0]
-                    encoder_memory_estimate = max(mem_before - free_after, 0)
+                    # Capture fell back to eager: what the warmup forward left in
+                    # the caching allocator is not graph memory.
+                    if encoder_cudagraph_manager.is_captured():
+                        encoder_memory_estimate = max(mem_before - free_after, 0)
 
                     logger.debug(
                         "Estimated encoder CUDA graph memory: %.2f MiB for %d graphs",
                         encoder_memory_estimate / (1 << 20),
-                        encoder_graphs,
+                        encoder_cudagraph_manager.get_num_graphs_to_capture(),
                     )
         finally:
             set_cudagraph_capturing_enabled(False)
