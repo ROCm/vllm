@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from vllm import envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -133,7 +134,12 @@ class KimiMLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if isinstance(self.act_fn, SituAndMul) and rocm_aiter_ops.is_enabled():
+            from aiter.ops.triton.fusions.fused_situ_mul import fused_situ_mul
+
+            x = fused_situ_mul(gate_up, self.act_fn.beta, self.act_fn.linear_beta)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
