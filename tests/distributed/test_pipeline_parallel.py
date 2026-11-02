@@ -19,7 +19,11 @@ from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
 
 from ..models.registry import HF_EXAMPLE_MODELS
-from ..utils import compare_two_settings, create_new_process_for_each_test
+from ..utils import (
+    compare_all_settings,
+    compare_two_settings,
+    create_new_process_for_each_test,
+)
 
 logger = init_logger("test_pipeline_parallel")
 
@@ -90,10 +94,22 @@ class PPTestSettings:
 
     def iter_params(self, model_id: str):
         opts = self.test_options
+        # Skip at collection: each case runs in a fresh process, which costs
+        # seconds to start even when the case only skips.
+        marks = pytest.mark.skipif(
+            opts.multi_node_only and not VLLM_MULTI_NODE,
+            reason="Not in multi-node setting",
+        )
 
         for parallel_setup in self.parallel_setups:
-            for backend in self.distributed_backends:
-                yield (model_id, parallel_setup, backend, self.runner, opts)
+            yield pytest.param(
+                model_id,
+                parallel_setup,
+                ",".join(self.distributed_backends),
+                self.runner,
+                opts,
+                marks=marks,
+            )
 
 
 # NOTE: You can adjust tp_base and/or pp_base locally to fit the model in GPU
@@ -202,7 +218,7 @@ TEST_MODELS = [
 def _compare_tp(
     model_id: str,
     parallel_setup: ParallelSetup,
-    distributed_backend: str,
+    distributed_backends: str,
     runner: RunnerOption,
     test_options: PPTestOptions,
     num_gpus_available: int,
@@ -252,7 +268,12 @@ def _compare_tp(
 
     if num_gpus_available < tp_size * pp_size:
         pytest.skip(f"Need at least {tp_size} x {pp_size} GPUs")
-    if VLLM_MULTI_NODE and distributed_backend == "mp":
+    backends = [
+        backend
+        for backend in distributed_backends.split(",")
+        if not (VLLM_MULTI_NODE and backend == "mp")
+    ]
+    if not backends:
         pytest.skip(
             "Skipping multi-node pipeline parallel test for "
             "multiprocessing distributed backend"
@@ -297,14 +318,17 @@ def _compare_tp(
     pp_env = None
     tp_env = None
 
-    pp_args = [
-        *common_args,
-        "--pipeline-parallel-size",
-        str(pp_size),
-        "--tensor-parallel-size",
-        str(tp_size),
-        "--distributed-executor-backend",
-        distributed_backend,
+    all_pp_args = [
+        [
+            *common_args,
+            "--pipeline-parallel-size",
+            str(pp_size),
+            "--tensor-parallel-size",
+            str(tp_size),
+            "--distributed-executor-backend",
+            backend,
+        ]
+        for backend in backends
     ]
 
     # compare without pipeline parallelism
@@ -320,18 +344,17 @@ def _compare_tp(
         "mp",
     ]
 
-    compare_two_settings(
+    # The TP-only reference is the same for every PP backend, so it runs once.
+    compare_all_settings(
         model_id,
-        pp_args,
-        tp_args,
-        pp_env,
-        tp_env,
+        [tp_args, *all_pp_args],
+        [tp_env] + [pp_env] * len(all_pp_args),
         method=method,
     )
 
 
 @pytest.mark.parametrize(
-    ("model_id", "parallel_setup", "distributed_backend", "runner", "test_options"),
+    ("model_id", "parallel_setup", "distributed_backends", "runner", "test_options"),
     [
         params
         for model_id, settings in TEXT_GENERATION_MODELS.items()
@@ -343,7 +366,7 @@ def _compare_tp(
 def test_tp_language_generation(
     model_id: str,
     parallel_setup: ParallelSetup,
-    distributed_backend: str,
+    distributed_backends: str,
     runner: RunnerOption,
     test_options: PPTestOptions,
     num_gpus_available,
@@ -351,7 +374,7 @@ def test_tp_language_generation(
     _compare_tp(
         model_id,
         parallel_setup,
-        distributed_backend,
+        distributed_backends,
         runner,
         test_options,
         num_gpus_available,
@@ -361,7 +384,7 @@ def test_tp_language_generation(
 
 
 @pytest.mark.parametrize(
-    ("model_id", "parallel_setup", "distributed_backend", "runner", "test_options"),
+    ("model_id", "parallel_setup", "distributed_backends", "runner", "test_options"),
     [
         params
         for model_id, settings in EMBEDDING_MODELS.items()
@@ -373,7 +396,7 @@ def test_tp_language_generation(
 def test_tp_language_embedding(
     model_id: str,
     parallel_setup: ParallelSetup,
-    distributed_backend: str,
+    distributed_backends: str,
     runner: RunnerOption,
     test_options: PPTestOptions,
     num_gpus_available,
@@ -381,7 +404,7 @@ def test_tp_language_embedding(
     _compare_tp(
         model_id,
         parallel_setup,
-        distributed_backend,
+        distributed_backends,
         runner,
         test_options,
         num_gpus_available,
@@ -391,7 +414,7 @@ def test_tp_language_embedding(
 
 
 @pytest.mark.parametrize(
-    ("model_id", "parallel_setup", "distributed_backend", "runner", "test_options"),
+    ("model_id", "parallel_setup", "distributed_backends", "runner", "test_options"),
     [
         params
         for model_id, settings in MULTIMODAL_MODELS.items()
@@ -403,7 +426,7 @@ def test_tp_language_embedding(
 def test_tp_multimodal_generation(
     model_id: str,
     parallel_setup: ParallelSetup,
-    distributed_backend: str,
+    distributed_backends: str,
     runner: RunnerOption,
     test_options: PPTestOptions,
     num_gpus_available,
@@ -411,7 +434,7 @@ def test_tp_multimodal_generation(
     _compare_tp(
         model_id,
         parallel_setup,
-        distributed_backend,
+        distributed_backends,
         runner,
         test_options,
         num_gpus_available,
