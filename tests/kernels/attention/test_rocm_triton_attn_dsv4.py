@@ -48,6 +48,35 @@ requires_gfx950 = pytest.mark.skipif(
     reason="optimized sparse decode partial is gfx950-only",
 )
 
+
+def _on_gfx1250() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    try:
+        from vllm.platforms.rocm import _ON_GFX1250
+
+        return _ON_GFX1250
+    except ImportError:
+        return False
+
+
+def _has_aiter() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("aiter") is not None
+
+
+# gfx1250 runs the MXFP8 wo_a path on AITER's kernels.
+requires_gfx1250 = pytest.mark.skipif(
+    not (_on_gfx1250() and _has_aiter()),
+    reason="gfx1250 rotates + quantizes after its decode kernel, with AITER",
+)
+# Archs whose wo_a consumes an MXFP8 attention output (rocm_mxfp8_wo_a_bmm).
+requires_mxfp8_wo_a = pytest.mark.skipif(
+    not (_on_gfx950() or (_on_gfx1250() and _has_aiter())),
+    reason="the MXFP8 wo_a path runs on gfx950, and on gfx1250 with AITER",
+)
+
 NOPE_HEAD_DIM = 448
 ROPE_HEAD_DIM = 64
 HEAD_DIM = NOPE_HEAD_DIM + ROPE_HEAD_DIM
@@ -1407,9 +1436,10 @@ def test_sparse_attn_decode_reduce_mxfp8_epilogue() -> None:
     )
 
 
-@requires_gfx950
+@requires_mxfp8_wo_a
+@pytest.mark.parametrize("num_tokens, num_heads", [(7, 4), (1, 64), (193, 64)])
 @torch.inference_mode()
-def test_inverse_rope_mxfp8_rows() -> None:
+def test_inverse_rope_mxfp8_rows(num_tokens: int, num_heads: int) -> None:
     """Prefill rows get the same inverse RoPE + MXFP8 as the decode epilogue."""
     from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
         _mxfp8_e4m3_quantize_torch,
@@ -1420,7 +1450,6 @@ def test_inverse_rope_mxfp8_rows() -> None:
 
     device = torch.device("cuda")
     torch.manual_seed(5)
-    num_tokens, num_heads = 7, 4
     o = torch.randn(num_tokens, num_heads, HEAD_DIM, device=device).bfloat16()
     positions = torch.randint(0, 64, (num_tokens,), device=device)
     cos_sin_cache = _random_cos_sin_cache(64, device)
@@ -1484,26 +1513,124 @@ def test_sparse_attn_decode_mxfp8_output() -> None:
     )
 
 
-@requires_gfx950
+@requires_gfx1250
+@torch.inference_mode()
+def test_sparse_attn_decode_mxfp8_output_gfx1250() -> None:
+    """gfx1250 has no MXFP8 decode epilogue: ``output_mxfp8`` rotates and
+    quantizes the bf16 rows of its decode kernel in one pass, eagerly and under
+    CUDA-graph replay, matching the bf16 decode + inverse RoPE + MXFP8 quant."""
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        _mxfp8_e4m3_quantize_torch,
+    )
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        build_ragged_indices_from_dense,
+        rocm_sparse_attn_decode,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    num_queries, num_heads, block_size, width = 6, 64, 4, 5
+    q = torch.randn(num_queries, num_heads, HEAD_DIM, device=device).bfloat16() * 0.125
+    kv = torch.randn(32, HEAD_DIM, device=device).bfloat16() * 0.125
+    swa_cache = _pack_fp8_ds_mla_cache(kv, block_size, current_platform.is_fp8_fnuz())
+    swa_indices = torch.randint(
+        0, 32, (num_queries, width), dtype=torch.int32, device=device
+    )
+    swa_lens = torch.tensor([5, 3, 1, 5, 4, 2], dtype=torch.int32, device=device)
+    ragged, indptr = build_ragged_indices_from_dense(swa_indices, swa_lens, 32)
+    positions = torch.randint(0, 64, (num_queries,), device=device)
+    cos_sin_cache = _random_cos_sin_cache(64, device)
+    decode = functools.partial(
+        rocm_sparse_attn_decode,
+        q=q,
+        kv_cache=None,
+        swa_k_cache=swa_cache,
+        swa_only=True,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        swa_ragged_indices=ragged,
+        swa_ragged_indptr=indptr,
+        topk_ragged_indices=None,
+        topk_ragged_indptr=None,
+        attn_sink=torch.linspace(-0.1, 0.1, num_heads, device=device),
+        scale=HEAD_DIM**-0.5,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+    )
+
+    bf16 = torch.empty_like(q)
+    assert decode(output=bf16) == 0  # the gfx1250 bf16 output is not rotated
+    ref = bf16.float()
+    cos, sin = cos_sin_cache[positions, None].chunk(2, dim=-1)
+    even, odd = ref[..., NOPE_HEAD_DIM::2].clone(), ref[..., NOPE_HEAD_DIM + 1 :: 2]
+    ref[..., NOPE_HEAD_DIM::2] = even * cos + odd * sin
+    ref[..., NOPE_HEAD_DIM + 1 :: 2] = odd * cos - even * sin
+    ref = ref.view(num_queries, -1)
+    _, expected_scale = _mxfp8_e4m3_quantize_torch(ref)
+
+    data = torch.empty_like(ref, dtype=torch.float8_e4m3fn)
+    scale = torch.empty_like(expected_scale)
+
+    def run() -> int:
+        return decode(
+            output=None,
+            output_mxfp8=(data, scale),
+            inv_rope_positions=positions,
+            inv_rope_cos_sin_cache=cos_sin_cache,
+        )
+
+    assert run() == num_queries
+    torch.accelerator.synchronize()
+    assert torch.equal(scale, expected_scale)
+    half_step = 16.0 * torch.exp2(scale.float() - 127.0).repeat_interleave(32, -1)
+    assert bool(((_mxfp8_dequant(data, scale) - ref).abs() <= half_step).all())
+
+    eager_data, eager_scale = data.clone(), scale.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    data.zero_()
+    scale.zero_()
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(data.view(torch.uint8), eager_data.view(torch.uint8))
+    assert torch.equal(scale, eager_scale)
+
+
+@requires_mxfp8_wo_a
 @pytest.mark.parametrize(
-    "num_tokens, n_groups",
-    # One case per tile tier of _mxfp8_wo_a_bmm_config, with partial M tiles.
+    "num_tokens, n_groups, o_lora_rank, group_dim",
+    # One case per tile tier of _mxfp8_wo_a_bmm_config, with partial M tiles,
+    # plus the DeepSeek-V4.1 shape (8 x 1024 x 4096) from decode to prefill sizes.
     [
-        (1, 4),
-        (20, 4),
-        (48, 4),
-        (77, 4),
-        (130, 4),
-        (300, 4),
-        (700, 4),
-        (1000, 4),
-        (1100, 8),
+        (1, 4, 128, 2048),
+        (20, 4, 128, 2048),
+        (48, 4, 128, 2048),
+        (77, 4, 128, 2048),
+        (130, 4, 128, 2048),
+        (300, 4, 128, 2048),
+        (700, 4, 128, 2048),
+        (1000, 4, 128, 2048),
+        (1100, 8, 128, 2048),
+        (1, 8, 1024, 4096),
+        (17, 8, 1024, 4096),
+        (192, 8, 1024, 4096),
+        (385, 8, 1024, 4096),
+        (2234, 8, 1024, 4096),
+        (4097, 8, 1024, 4096),
     ],
 )
 @pytest.mark.parametrize("block_scales", [False, True])
 @torch.inference_mode()
 def test_rocm_mxfp8_wo_a_bmm(
-    num_tokens: int, n_groups: int, block_scales: bool
+    num_tokens: int,
+    n_groups: int,
+    o_lora_rank: int,
+    group_dim: int,
+    block_scales: bool,
 ) -> None:
     from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
         _as_block32_scale,
@@ -1515,7 +1642,6 @@ def test_rocm_mxfp8_wo_a_bmm(
 
     device = torch.device("cuda")
     torch.manual_seed(3)
-    o_lora_rank, group_dim = 128, 2048
     a, a_scale = _mxfp8_e4m3_quantize_torch(
         torch.randn(num_tokens, n_groups * group_dim, device=device)
     )
