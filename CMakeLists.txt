@@ -1543,6 +1543,14 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     # skinny_gemms_int4_kernels.cuh header).
     list(APPEND VLLM_ROCM_EXT_SRC
       "csrc/rocm/skinny_gemms_int4_sweep_wvsplitk.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_f16.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_f16_zp.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_bf16.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_bf16_zp.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_n2.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_n3.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_n4.cu"
+      "csrc/rocm/skinny_gemms_int4_sweep_skinny_n5.cu"
       "csrc/rocm/skinny_gemms_int4_sweep_wvsplitk_hf.cu"
       "csrc/rocm/skinny_gemms_int4_sweep_moe.cu")
   endif()
