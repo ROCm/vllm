@@ -4,14 +4,14 @@
 // sweep TUs compile in parallel.
 #include "skinny_gemms_int4_kernels.cuh"
 
-torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
+torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
                               const at::Tensor& in_scale,
                               const std::optional<at::Tensor>& in_zero_points,
                               const std::optional<at::Tensor>& in_bias,
                               const int64_t CuCount, const int64_t group_size) {
-  auto M_in = in_w.size(0);
-  auto K_in = in_x.size(1);
-  auto N_in = in_x.size(0);
+  auto M_in = in_a.size(0);
+  auto K_in = in_b.size(1);
+  auto N_in = in_b.size(0);
   auto Bx_in =
       (in_bias.has_value() && in_bias->numel() > 0)
           ? (in_bias->sizes().size() == 2) ? in_bias->size(1) : in_bias->size(0)
@@ -21,7 +21,7 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
                    ? in_bias->size(0)
                    : 1;
 
-  const int64_t b_row_stride_bytes = in_w.stride(0) * in_w.element_size();
+  const int64_t b_row_stride_bytes = in_a.stride(0) * in_a.element_size();
   TORCH_CHECK(b_row_stride_bytes >= K_in / 2, "B row stride (",
               b_row_stride_bytes, " bytes) must hold at least K/2=", K_in / 2,
               " bytes per row");
@@ -29,9 +29,9 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
               b_row_stride_bytes, " bytes) exceeds int range");
   const int b_row_stride_bytes_i32 = static_cast<int>(b_row_stride_bytes);
   TORCH_CHECK(
-      in_x.dtype() == torch::kFloat16 || in_x.dtype() == torch::kBFloat16,
+      in_b.dtype() == torch::kFloat16 || in_b.dtype() == torch::kBFloat16,
       "Activation must be float16 or bfloat16");
-  TORCH_CHECK(in_scale.dtype() == in_x.dtype(),
+  TORCH_CHECK(in_scale.dtype() == in_b.dtype(),
               "Scale dtype must match activation dtype");
   // group_size == -1 is the per-channel sentinel: one scale per output row,
   // mapped to the kernel's internal GROUP_SIZE=0 template parameter below.
@@ -102,7 +102,7 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
   TORCH_CHECK(K_in % 16 == 0, "K must be divisible by 16");
   // load_act_into_lds walks the activation as one flat K*N run, i.e. it
   // assumes stride(0) == K.
-  TORCH_CHECK(in_x.is_contiguous(), "Activation must be contiguous");
+  TORCH_CHECK(in_b.is_contiguous(), "Activation must be contiguous");
 
   // Scale and packed zero points share one row stride, in groups.  It is not
   // required to equal num_groups: the layer pads it so the row does not land
@@ -128,7 +128,7 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
   // gates below have to use that.  get_lds_size_int4() reports what the device
   // allows -- 160 KB on gfx950 -- which would pick the sml body for shapes
   // whose activation does not fit the array that body actually declares.
-  const int max_lds_len = static_cast<int>(LDS_SIZE / in_x.element_size());
+  const int max_lds_len = static_cast<int>(LDS_SIZE / in_b.element_size());
   // No upper bound on K*N: the medium body reads whatever does not fit in LDS
   // straight from global (see the `k_ + K * n < max_lds_len` split in
   // wvSplitK_int4_compute_), so it is correct for any K*N -- just slower the
@@ -136,18 +136,18 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
 
   auto out_c = torch::empty(
       {N_in, M_in},
-      torch::TensorOptions().dtype(in_x.dtype()).device(in_x.device()));
+      torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
 
   dim3 grid(CuCount);
 
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_w));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(
-      in_x.scalar_type(), "wvSplitK_int4_g", [&] {
+      in_b.scalar_type(), "wvSplitK_int4_g", [&] {
         using fptype = typename scalar<scalar_t>::type;
-        const uint8_t* wptr = reinterpret_cast<const uint8_t*>(in_w.data_ptr());
-        const fptype* aptr = reinterpret_cast<const fptype*>(in_x.data_ptr());
+        const uint8_t* wptr = reinterpret_cast<const uint8_t*>(in_a.data_ptr());
+        const fptype* aptr = reinterpret_cast<const fptype*>(in_b.data_ptr());
         const fptype* sptr =
             reinterpret_cast<const fptype*>(in_scale.data_ptr());
         const uint32_t* zpptr =
