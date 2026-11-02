@@ -132,8 +132,10 @@ def _rdna_hybrid_w4a16_reference(
     ids=["M=1_decode", "M=5_decode", "M=6_prefill", "M=64_prefill", "M=256_dense"],
 )
 @pytest.mark.parametrize("use_dequant", [False, True])
+# Decode dispatch switches tile at 512 (gfx1151) / 1024 (gfx1150) output rows.
+@pytest.mark.parametrize("N", [256, 2560])
 def test_rdna_hybrid_w4a16_apply_matches_reference(
-    dtype, group_size, has_zp, M, use_dequant
+    dtype, group_size, has_zp, M, use_dequant, N
 ):
     """Smoke test the registered custom op for both decode and prefill batches.
 
@@ -154,7 +156,7 @@ def test_rdna_hybrid_w4a16_apply_matches_reference(
 
     set_random_seed(0)
 
-    K, N = 1024, 256
+    K = 1024
     G = K if group_size == -1 else group_size
     assert K % G == 0 and K % 8 == 0 and N % 8 == 0
 
@@ -804,6 +806,11 @@ def _hip_skinny_reference(
         (1, 256, 256, 32),
         (1, 256, 256, 64),
         (1, 512, 256, 128),
+        # >= 1024 output rows take the wide-tile decode tuple (gfx1150 and
+        # gfx1151); a K that is not a multiple of its K step exercises the
+        # ragged tail.
+        (1, 1536, 2560, 32),
+        (1, 896, 1152, 128),
         (2, 512, 256, 64),
         (3, 256, 512, 64),
         (1, 256, 256, -1),
