@@ -191,7 +191,7 @@ def run_sweep(shapes, batch_sizes, warmup, rep, csv_path, medium_only=False):
             # rows get the same treatment, since the layer pads them off the
             # same cliff.
             values_int4 = torch.randint(0, 16, (M, K), dtype=torch.int32, device="cuda")
-            weight_packed, _ = pack_skinny_int4(values_int4)
+            weight_packed = pack_skinny_int4(values_int4)
             scale = torch.rand(M, num_groups, dtype=dtype, device="cuda") * 0.02 - 0.01
             scale = _pad_group_rows(
                 scale, _group_stride_pad(num_groups, scale.element_size())

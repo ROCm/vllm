@@ -320,7 +320,7 @@ def test_hybrid_w4a16_dispatch(dtype, M, K, N, G, random_seed: int):
 
     cu_count = num_compute_units()
     out = torch.ops.vllm.rdna_hybrid_w4a16_apply(
-        a, b_packed_i8, scales, b_packed_i32, None, None, cu_count, G
+        a, b_packed_i8, scales, None, None, cu_count, G
     )
 
     ref = _hip_skinny_reference(a, w_int4_nk, scales, group_size=G, zp_bias=8)

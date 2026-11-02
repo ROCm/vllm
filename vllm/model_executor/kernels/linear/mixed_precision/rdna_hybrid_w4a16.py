@@ -713,7 +713,7 @@ def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
     return buf[:, :cols]  # inherits stride(0) = cols + pad_groups
 
 
-def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def pack_skinny_int4(unpacked: torch.Tensor) -> torch.Tensor:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
     Single source of truth for the skinny weight memory layout: ExLlama shuffle
@@ -737,13 +737,10 @@ def pack_skinny_int4(unpacked: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor
             (n_rows, k8 + pad_int32), dtype=torch.int32, device=shuffled.device
         )
         padded[:, :k8].copy_(shuffled)
-        # Both views inherit stride(0) = k8 + pad_int32.
-        w_q_skinny_i32 = padded[:, :k8]
         w_q_skinny = padded.view(torch.int8)[:, : k8 * 4]
     else:
-        w_q_skinny_i32 = shuffled.contiguous()
-        w_q_skinny = w_q_skinny_i32.view(torch.int8)
-    return w_q_skinny, w_q_skinny_i32
+        w_q_skinny = shuffled.contiguous().view(torch.int8)
+    return w_q_skinny
 
 
 def dequantize_w4a16(
@@ -776,7 +773,6 @@ def _rdna_hybrid_w4a16_apply_impl(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
-    w_q_i32: torch.Tensor,
     w_zp: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
@@ -787,8 +783,7 @@ def _rdna_hybrid_w4a16_apply_impl(
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
     Both paths read from the same skinny-format weights:
-      w_q:     [N, K//8] int8 (ExLlama shuffle, for skinny kernel)
-      w_q_i32: [N, K//8] int32 (same data viewed as int32, for triton)
+      w_q:     [N, K//2] int8 (ExLlama shuffle, for skinny kernel)
       w_s:     [N, K//G] fp16/bf16 (skinny-layout scales)
       w_zp:    [N//8, K//G] int32, raw zero-points packed 8x uint4 along N
                (row n -> word[n/8], bits 4*(n%8)),
@@ -839,7 +834,7 @@ def _rdna_hybrid_w4a16_apply_impl(
         # reads scales directly with a constant -8 offset (no carrier overhead).
         output = triton_w4a16_skinny_fmt_gemm(
             x_2d,
-            w_q_i32,
+            w_q.view(torch.int32),
             w_s,
             _resolved_group_size(group_size, K),
             packed_scale_zp=packed_scale_zp,
@@ -853,7 +848,6 @@ def _rdna_hybrid_w4a16_apply_fake(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
-    w_q_i32: torch.Tensor,
     w_zp: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
@@ -1014,7 +1008,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             unpacked = unpacked.t().contiguous()
 
         # ---- Pack into skinny [N, K//8] (ExLlama shuffle + gfx1151 cliff pad) ----
-        w_q_skinny, w_q_skinny_i32 = pack_skinny_int4(unpacked)
+        w_q_skinny = pack_skinny_int4(unpacked)
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
         permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
@@ -1060,12 +1054,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         self._transform_param(layer, self.w_q_name, lambda x: w_q_skinny)
         # Replace w_s with skinny scales
         self._transform_param(layer, self.w_s_name, lambda x: w_s_skinny)
-
-        # Store int32 view for triton kernel
-        layer.register_parameter(
-            "_hybrid_w_q_i32",
-            torch.nn.Parameter(w_q_skinny_i32, requires_grad=False),
-        )
 
         # Packed scale/zp carrier for the Triton prefill path — built ONLY
         # for asymmetric layers, where it folds the two per-group loads (scale +
@@ -1113,7 +1101,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         c = self.config
         w_q, w_s, w_zp = self._get_weight_params(layer)
-        w_q_i32 = layer._hybrid_w_q_i32
         # Packed scale/zp carrier (asymmetric layers only; None for sym).
         packed_scale_zp = getattr(layer, "_hybrid_w_packed_scale_zp", None)
 
@@ -1126,7 +1113,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             x_2d,
             w_q,
             w_s,
-            w_q_i32,
             w_zp,
             bias,
             cu_count,

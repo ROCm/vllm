@@ -196,7 +196,6 @@ def test_rdna_hybrid_w4a16_apply_matches_reference(
         x_mk,
         w_q,
         scales_nkg,
-        w_q_i32,
         w_zp,
         None,  # bias
         num_compute_units(),
@@ -238,7 +237,6 @@ def test_rdna_hybrid_w4a16_apply_with_bias(dtype, M):
         x_mk,
         w_q,
         scales_nkg,
-        w_q_i32,
         None,
         bias,
         num_compute_units(),
@@ -510,7 +508,7 @@ def test_rdna_hybrid_w4a16_dense_dispatch(M, has_dense, expected_path, monkeypat
     monkeypatch.setattr(hybrid_module, "triton_w4a16_skinny_fmt_gemm", fake("triton"))
     monkeypatch.setattr(hybrid_module, "rocm_unquantized_gemm_impl", fake("dense"))
     hybrid_module._rdna_hybrid_w4a16_apply_impl(
-        x_mk, w_q, scales, w_q.view(torch.int32), None, None, 40, G, None, w_dequant
+        x_mk, w_q, scales, None, None, 40, G, None, w_dequant
     )
 
     assert called == [expected_path]
@@ -892,7 +890,7 @@ def test_rdna_hybrid_w4a16_dispatch(dtype, M, K, N, G):
 
     cu_count = num_compute_units()
     out = torch.ops.vllm.rdna_hybrid_w4a16_apply(
-        a, b_packed_i8, scales, b_packed_i32, None, None, cu_count, G
+        a, b_packed_i8, scales, None, None, cu_count, G
     )
 
     ref = _hip_skinny_reference(a, w_int4_nk, scales, group_size=G, zp_bias=8)
