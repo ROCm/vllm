@@ -191,8 +191,8 @@ def _triton_w4a16_skinny_fmt_kernel(
     N,
     K,
     K8,  # K // 8
-    stride_bn,  # per-row stride of b_ptr (in int32 elements)
     num_groups,  # K // group_size
+    stride_bn,  # per-row stride of b_ptr (in int32 elements)
     stride_sn,  # per-row stride of scales_ptr
     stride_pn,  # per-row stride of packed_scale_zp_ptr
     group_size,
@@ -613,8 +613,8 @@ def triton_w4a16_skinny_fmt_gemm(
         N,
         K,
         K8,
-        stride_bn,
         num_groups,
+        stride_bn,
         stride_sn,
         stride_pn,
         group_size=group_size,
