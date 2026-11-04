@@ -343,7 +343,13 @@ def _triton_w4a16_skinny_fmt_kernel(
                 # before the single bf16 multiply (RDNA3 has no v_pk_fma_bf16).
                 scale = (psz_u & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
                 zp_int = ((psz_u >> 16) & 0xFFFF).to(b.dtype)
-                b_fp = (b - zp_int[:, None]).to(scale.dtype) * scale[:, None]
+                # b - zp_int is in [-15, 15], which is exact in bf16.
+                b_fp = (
+                    (b - zp_int[:, None])
+                    .to(tl.float32)
+                    .to(tl.bfloat16, fp_downcast_rounding="rtz")
+                )
+                b_fp *= scale[:, None]
         else:
             # Symmetric: the -8 offset is constant (no zp to fold), so read the
             # scale directly — no carrier overhead.
@@ -357,8 +363,11 @@ def _triton_w4a16_skinny_fmt_kernel(
                 c = tl.full((), float(1024 + 8), tl.float16)
                 b_fp = (b_raw - c) * scales[:, None]
             else:
-                # bf16: (nibble - 8) * scale, int subtract before the cast.
-                b_fp = (b - 8).to(scales.dtype) * scales[:, None]
+                # b - 8 is in [-8, 7], which is exact in bf16.
+                b_fp = (
+                    (b - 8).to(tl.float32).to(tl.bfloat16, fp_downcast_rounding="rtz")
+                )
+                b_fp *= scales[:, None]
 
         if LAYOUT_BARRIER:
             # Triton 3.9's RemoveLayoutConversions would otherwise hoist the
