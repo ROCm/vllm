@@ -179,7 +179,7 @@ def _int4_pair_to_fp16x2(x):
     )
 
 
-_TRITON_GE_3_9 = Version(triton.__version__).release[:2] >= (3, 9)
+_TRITON_GE_3_9 = tl.constexpr(Version(triton.__version__).release[:2] >= (3, 9))
 
 
 @triton.jit
@@ -344,16 +344,11 @@ def _triton_w4a16_skinny_fmt_kernel(
                 scale = (psz_u & 0xFFFF).to(tl.uint16).to(tl.bfloat16, bitcast=True)
                 zp_int = ((psz_u >> 16) & 0xFFFF).to(b.dtype)
                 # b - zp_int is in [-15, 15], which is exact in bf16.
-                b_fp = (
-                    (b - zp_int[:, None])
-                    .to(tl.float32)
-                    .to(tl.bfloat16, fp_downcast_rounding="rtz")
-                )
-                b_fp *= scale[:, None]
+                w_int = b - zp_int[:, None]
         else:
             # Symmetric: the -8 offset is constant (no zp to fold), so read the
             # scale directly — no carrier overhead.
-            scales = tl.load(
+            scale = tl.load(
                 scales_ptr + offs_n * stride_sn + group_idx, mask=scale_mask, other=1.0
             )
             if a.dtype == tl.float16:
@@ -361,13 +356,25 @@ def _triton_w4a16_skinny_fmt_kernel(
                 if not _target_is_gfx1x():
                     b_raw = (b | 0x6400).to(tl.uint16).to(tl.float16, bitcast=True)
                 c = tl.full((), float(1024 + 8), tl.float16)
-                b_fp = (b_raw - c) * scales[:, None]
+                b_fp = (b_raw - c) * scale[:, None]
             else:
                 # b - 8 is in [-8, 7], which is exact in bf16.
-                b_fp = (
-                    (b - 8).to(tl.float32).to(tl.bfloat16, fp_downcast_rounding="rtz")
-                )
-                b_fp *= scales[:, None]
+                w_int = b - 8
+
+        if a.dtype != tl.float16:  # scale bf16 weights
+            if _TRITON_GE_3_9 and _target_is_gfx1x():
+                # bf16 multiplication, but not handling NaN.  Triton 3.9 lowers a bf16
+                # multiply to an fp32 multiply and a rounding sequence that handles NaN.
+                # Triton < 3.9 lowers a bf16 multiply to a single truncating
+                # ``v_dot2_bf16_bf16``.  Truncation was deemed a defect, so that
+                # lowering was reverted by triton-lang/triton#11227.
+                b_fp32 = w_int.to(tl.float32) * scale[:, None].to(tl.float32)
+                b_u = b_fp32.to(tl.uint32, bitcast=True)
+                b_u = b_u + 0x7FFF + ((b_u >> 16) & 1)  # round
+                b_fp = (b_u >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+            else:
+                b_fp = w_int.to(tl.float32).to(tl.bfloat16, fp_downcast_rounding="rtz")
+                b_fp *= scale[:, None]
 
         if LAYOUT_BARRIER:
             # Triton 3.9's RemoveLayoutConversions would otherwise hoist the
