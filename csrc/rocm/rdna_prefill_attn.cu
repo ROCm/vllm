@@ -865,8 +865,12 @@ struct Prefill {
       for (int ls = 0; ls < kWaveSubTiles; ++ls) allLive = allLive && live[ls];
       if constexpr (kWaveSubTiles == 1) {
         if (live[0]) qk.template operator()<false>();
-      } else if (__builtin_amdgcn_readfirstlane((int)allLive)) {
+      } else if (!kCausal || __builtin_amdgcn_readfirstlane((int)allLive)) {
         // All sub-tiles live; read operands at most four WMMAs ahead.
+        // Non-causal builds take this path on every step: a sub-tile is dead
+        // only past S on the last step, whose keys loaded as zeros and are
+        // masked. Skipping it below miscompiles with key_tile 32: the live
+        // sub-tile's first WMMA accumulates onto stale registers, not zeros.
 #pragma unroll
         for (int c = 0; c < kPartChunks; ++c)
 #pragma unroll
