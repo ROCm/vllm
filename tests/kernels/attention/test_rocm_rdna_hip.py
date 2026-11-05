@@ -792,7 +792,8 @@ def _assert_non_causal_close(got, q, k, v, what):
 @pytest.mark.parametrize("unit", sorted({_prefill_unit(v) for v in _non_causal_rows()}))
 def test_built_in_non_causal_prefill_variants_match_reference(unit):
     """Every non-causal build: each token sees every key of its sequence,
-    read in place, also past the last whole step."""
+    read in place, also past the last whole step, including a last step whose
+    later 16-key sub-tiles hold no key."""
     _skip_unless_rdna35_or_rdna4()
     for v in _non_causal_rows():
         if _prefill_unit(v) != unit:
@@ -802,7 +803,8 @@ def test_built_in_non_causal_prefill_variants_match_reference(unit):
         args = (v.num_q_heads, v.num_kv_heads, v.head_size, v.page_size, v.window)
         rows = hip.prefill_variants(*args, v.dtype, causal=False)
         scratch = hip.make_prefill_scratch(rows, torch.device("cuda"))
-        lens = [v.min_query_len, v.min_query_len + 37]
+        whole = -(-v.min_query_len // v.key_tile) * v.key_tile
+        lens = [v.min_query_len, v.min_query_len + 37, whole + 8, whole + 16]
         if v == rows[0]:
             lens += [hip.PREFILL_MIN_M, 100]
         for seed, m in enumerate(lens):
