@@ -439,7 +439,15 @@ def rocm_unquantized_gemm_impl(
 
         return linear_batch_invariant(x, weight, bias)
 
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx11, on_gfx950
+    from vllm.platforms.rocm import (
+        on_gfx1x,
+        on_gfx9,
+        on_gfx11,
+        on_gfx115x,
+        on_gfx950,
+        on_gfx1151,
+        on_rdna4,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -522,6 +530,32 @@ def rocm_unquantized_gemm_impl(
         out = ops.LLMM1(weight, x_view, 4)
         return out.reshape(*x.shape[:-1], weight.shape[0])
 
+    # A single-output GEMM (e.g. the MoE shared-expert gate) runs faster on gfx115X
+    # and gfx120X with the operands swapped: the [1, n] result is laid out like
+    # [n, 1], so no transpose is needed, and the single bias element broadcasts over
+    # it. wvSplitK takes the activations as its weight operand; past 640 tokens the
+    # swapped torch GEMM is faster, except on the gfx1150 class, where it is not.
+    operand_swap = (
+        (on_gfx115x() or on_rdna4())
+        and m == 1
+        and n > 5
+        and x.dtype in [torch.float16, torch.bfloat16]
+    )
+    gfx1150_class = on_gfx115x() and not on_gfx1151()
+
+    use_wvsplitk_operand_swap = (
+        operand_swap
+        and skinny_gemm_enabled
+        and n > 8
+        and (gfx1150_class or n <= 640)
+        and weight.stride(1) == 1
+    )
+
+    if use_wvsplitk_operand_swap:
+        x_view = x.reshape(-1, k).contiguous()
+        out = ops.wvSplitK(x_view, weight, cu_count, bias)
+        return out.reshape(*x.shape[:-1], 1)
+
     # AITER's gfx950 FlyDSL A16W16 kernel addresses C with int32 offsets and
     # reads A/B through 4 GiB buffer descriptors (ROCm/aiter#6853).
     aiter_hgemm_unsafe = n * m >= 1 << 31 or max(n, m) * k * x.element_size() >= 1 << 32
@@ -529,6 +563,10 @@ def rocm_unquantized_gemm_impl(
         from aiter.tuned_gemm import tgemm
 
         return tgemm.mm(x, weight, bias)
+
+    if operand_swap and not gfx1150_class:
+        out = torch.nn.functional.linear(weight, x.reshape(-1, k), bias)
+        return out.reshape(*x.shape[:-1], 1)
 
     return torch.nn.functional.linear(x, weight, bias)
 
