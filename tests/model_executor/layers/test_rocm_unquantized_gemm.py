@@ -26,6 +26,21 @@ def _on_gfx11() -> bool:
     return on_gfx11()
 
 
+def _on_operand_swap_arch() -> bool:
+    """gfx115X/gfx120X check that is safe to evaluate at collection time."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx115x, on_rdna4
+
+    return on_gfx115x() or on_rdna4()
+
+
+def _on_gfx1150_class() -> bool:
+    from vllm.platforms.rocm import on_gfx115x, on_gfx1151
+
+    return on_gfx115x() and not on_gfx1151()
+
+
 @pytest.mark.parametrize("m", [1, 128])
 def test_rocm_unquantized_gemm_gfx1x_wvsplitk_path(monkeypatch, m):
     x = torch.randn(1, 64, dtype=torch.float16)
@@ -285,6 +300,36 @@ def test_rocm_unquantized_gemm_padded_weight_real_kernel(monkeypatch, dtype):
     ref = torch.nn.functional.linear(x, weight, None)
 
     wvsplitk_mock.assert_called_once()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not _on_operand_swap_arch(), reason="operand swap only applies on gfx115X/gfx120X"
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("n", [6, 8, 9, 412, 640, 641, 1056])
+def test_rocm_unquantized_gemm_single_output_operand_swap_real_kernel(
+    monkeypatch, dtype, use_bias, n
+):
+    # The shared-expert gate: [n, 2048] activations against a padded [1, 2048]
+    # weight, taking wvSplitK or the torch GEMM with swapped operands.
+    expect_wvsplitk = n > 8 and (n <= 640 or _on_gfx1150_class())
+    torch.manual_seed(0)
+    x = torch.randn(n, 2048, device="cuda", dtype=dtype)
+    weight = _row_stride_padded(torch.randn(1, 2048, device="cuda", dtype=dtype), 64)
+    bias = torch.randn(1, device="cuda", dtype=dtype) if use_bias else None
+
+    monkeypatch.setattr(utils.envs, "VLLM_ROCM_USE_SKINNY_GEMM", True)
+    original_wvsplitk = utils.ops.wvSplitK
+    wvsplitk_mock = MagicMock(side_effect=original_wvsplitk)
+    monkeypatch.setattr(utils.ops, "wvSplitK", wvsplitk_mock)
+
+    out = utils.rocm_unquantized_gemm_impl(x, weight, bias)
+    ref = torch.nn.functional.linear(x, weight, bias)
+
+    assert wvsplitk_mock.called == expect_wvsplitk
+    assert out.shape == ref.shape
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
