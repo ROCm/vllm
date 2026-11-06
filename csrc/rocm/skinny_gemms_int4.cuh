@@ -56,14 +56,10 @@ inline bool on_gfx1151_int4() {
   return result;
 }
 
-#if defined(NDEBUG)
-  #undef NDEBUG
-  #include <assert.h>
-  #define UNREACHABLE_CODE assert(false);
-  #define NDEBUG
-#else
-  #define UNREACHABLE_CODE assert(false);
-#endif
+// Traps unconditionally, so it does not depend on NDEBUG or on where <assert.h>
+// is included. The stubs that use it are never launched: they only exist so
+// the launchers have something to call on non-RDNA archs.
+#define UNREACHABLE_CODE __builtin_trap()
 
 template <typename T>
 __device__ __forceinline__ float __s2float(T v);
@@ -600,7 +596,7 @@ __global__ void wvSplitK_int4_hf_sml_(
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, const int group_stride, const int B_row_stride_bytes) {
-  UNREACHABLE_CODE
+  UNREACHABLE_CODE;
 }
 #endif  // defined(__HIP__GFX1X__)
 
@@ -881,7 +877,7 @@ __global__ void wvSplitK_int4_hf_(
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, const int group_stride, const int B_row_stride_bytes) {
-  UNREACHABLE_CODE
+  UNREACHABLE_CODE;
 }
 #endif  // defined(__HIP__GFX1X__)
 
