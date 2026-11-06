@@ -180,10 +180,10 @@ class RDNAHybridW4A16Experts(mk.FusedMoEExpertsModular):
                 "num_stages": 1,
             }
         # Long contraction: wider N tiles only pay off once enough rows are
-        # routed.
+        # routed. BLOCK_SIZE_N=64 is slower than 16 or 32 at every size.
         return {
             "BLOCK_SIZE_M": self.TRITON_BLOCK_SIZE_M,
-            "BLOCK_SIZE_N": 64 if M_routed >= 4096 else 16,
+            "BLOCK_SIZE_N": 32 if M_routed >= 8192 else 16,
             "BLOCK_SIZE_K": self._group_size,
             "GROUP_SIZE_M": 4,
             "num_warps": 2,
