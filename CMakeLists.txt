@@ -1771,7 +1771,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   if(VLLM_GPU_ARCHES MATCHES "gfx115[0-3]")
     set(VLLM_ROCM_HAS_GFX115X ON)
     list(APPEND VLLM_ROCM_EXT_SRC
-      "csrc/rocm/rdna35_gdn_chunked.cu")
+      "csrc/rocm/rdna35_gdn_chunked.cu"
+      "csrc/rocm/moe_wmma_int4_gemm.cu")
   endif()
 
   define_extension_target(
