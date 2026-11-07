@@ -164,6 +164,12 @@ __device__ __forceinline__ __hip_bfloat162 __float22s2_rn(float2 v) {
   return __float22bfloat162_rn(v);
 }
 
+// fp32 output (wvSplitK with out_dtype=float32): store the accumulator as is.
+template <>
+__device__ __forceinline__ float __float2s(float v) {
+  return v;
+}
+
 template <typename T>
 __device__ __forceinline__ T loadnt(T* addr) {
   return __builtin_nontemporal_load(addr);
@@ -409,18 +415,20 @@ __device__ __forceinline__ void load_act_into_lds_silu_mul_bf16(
 // This version targets cases where A[] fits LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, bool FUSED_SILU_MUL = false,
-          bool FUSED_GATE_MUL = false>
+          bool FUSED_GATE_MUL = false, typename out_t = scalar_t>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap, const int M,
                      const int Bx, const int By, const scalar_t* B,
                      const scalar_t* __restrict__ A,
-                     const scalar_t* __restrict__ BIAS, scalar_t* C,
+                     const scalar_t* __restrict__ BIAS, out_t* C,
                      const int _WvPrGrp, const int CuCount,
                      const scalar_t* __restrict__ GATE = nullptr) {
   static_assert(!FUSED_SILU_MUL || N == 1,
                 "FUSED_SILU_MUL is only supported with N=1");
   static_assert(!FUSED_GATE_MUL || N == 1,
                 "FUSED_GATE_MUL is only supported with N=1");
+  static_assert(!FUSED_GATE_MUL || std::is_same_v<out_t, scalar_t>,
+                "FUSED_GATE_MUL is only supported with out_t == scalar_t");
   constexpr int max_lds_len = LDS_SIZE / 2;
   #if defined(__HIP__MI3XX__)
   constexpr bool use_mfma = (std::is_same_v<scalar_t, __hip_bfloat16>);
@@ -586,7 +594,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
             } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {
               sum[n][y] += __bfloat162float(biases[n][y]);
             }
-            scalar_t out_val = __float2s<scalar_t>(sum[n][y]);
+            out_t out_val = __float2s<out_t>(sum[n][y]);
             if constexpr (FUSED_GATE_MUL) {
               // META3-2 Phase 2: per-token scalar mul (mirrors the
               // unfused `F.sigmoid(expert_gate(x)) * out` in scalar_t).
@@ -638,7 +646,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         for (int n = 0; n < N; n++) {
           for (int y = 0; y < YTILE; y++) {
             sum4[n][y][0] += __bfloat162float(biases[n][y]);
-            scalar_t out_val = __float2bfloat16(sum4[n][y][0]);
+            out_t out_val = __float2s<out_t>(sum4[n][y][0]);
             if constexpr (FUSED_GATE_MUL) {
               // META3-2 Phase 2: per-token scalar mul.
               out_val = out_val * GATE[n];
@@ -655,12 +663,12 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 #else
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, bool FUSED_SILU_MUL = false,
-          bool FUSED_GATE_MUL = false>
+          bool FUSED_GATE_MUL = false, typename out_t = scalar_t>
 __global__ void wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap,
                                  const int M, const int Bx, const int By,
                                  const scalar_t* B,
                                  const scalar_t* __restrict__ A,
-                                 const scalar_t* __restrict__ BIAS, scalar_t* C,
+                                 const scalar_t* __restrict__ BIAS, out_t* C,
                                  const int _WvPrGrp, const int CuCount,
                                  const scalar_t* __restrict__ GATE = nullptr) {
   UNREACHABLE_CODE
@@ -670,12 +678,12 @@ __global__ void wvSplitK_hf_sml_(const int K, const int Kbp, const int Kap,
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets cases where A[] marginally exceeds LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+          int UNRL, int N, typename out_t = scalar_t>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_(const int K, const int Kbp, const int Kap, const int M,
                  const int Bx, const int By, const scalar_t* B,
                  const scalar_t* __restrict__ A,
-                 const scalar_t* __restrict__ BIAS, scalar_t* C,
+                 const scalar_t* __restrict__ BIAS, out_t* C,
                  const int _WvPrGrp, const int CuCount) {
   constexpr int max_lds_len = LDS_SIZE / 2;
   #if defined(__HIP__MI3XX__)
@@ -820,7 +828,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
               } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {
                 sum[n][y] += __bfloat162float(biases[n][y]);
               }
-              C[m + y + n * M] = __float2s<scalar_t>(sum[n][y]);
+              C[m + y + n * M] = __float2s<out_t>(sum[n][y]);
             }
           }
         }
@@ -866,7 +874,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           for (int y = 0; y < YTILE; y++) {
             if (commitColumn[y]) {
               sum4[n][y][0] += __bfloat162float(biases[n][y]);
-              C[m + y + n * M] = __float2bfloat16(sum4[n][y][0]);
+              C[m + y + n * M] = __float2s<out_t>(sum4[n][y][0]);
             }
           }
         }
@@ -890,11 +898,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
 #else
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+          int UNRL, int N, typename out_t = scalar_t>
 __global__ void wvSplitK_hf_(const int K, const int Kbp, const int Kap,
                              const int M, const int Bx, const int By,
                              const scalar_t* B, const scalar_t* __restrict__ A,
-                             const scalar_t* __restrict__ BIAS, scalar_t* C,
+                             const scalar_t* __restrict__ BIAS, out_t* C,
                              const int _WvPrGrp, const int CuCount) {
   UNREACHABLE_CODE
 }
@@ -903,12 +911,12 @@ __global__ void wvSplitK_hf_(const int K, const int Kbp, const int Kap,
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 // This version targets big A[] cases, where it is much larger than LDS capacity
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+          int UNRL, int N, typename out_t = scalar_t>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_hf_big_(const int K, const int Kbp, const int Kap, const int M,
                      const int Bx, const int By, const scalar_t* B,
                      const scalar_t* __restrict__ A,
-                     const scalar_t* __restrict__ BIAS, scalar_t* C,
+                     const scalar_t* __restrict__ BIAS, out_t* C,
                      const int _WvPrGrp, const int CuCount) {
   constexpr int max_lds_len = LDS_SIZE / 2;
   #if defined(__HIP__MI3XX__)
@@ -1172,7 +1180,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
               } else if constexpr (std::is_same_v<scalar_t, __hip_bfloat16>) {
                 sum[n][y] += __bfloat162float(biases[n][y]);
               }
-              C[m + y + n * M] = __float2s<scalar_t>(sum[n][y]);
+              C[m + y + n * M] = __float2s<out_t>(sum[n][y]);
             }
           }
         }
@@ -1215,7 +1223,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
           for (int y = 0; y < YTILE; y++) {
             if (commitColumn[y]) {
               sum4[n][y][0] += __bfloat162float(biases[n][y]);
-              C[m + y + n * M] = __float2bfloat16(sum4[n][y][0]);
+              C[m + y + n * M] = __float2s<out_t>(sum4[n][y][0]);
             }
           }
         }
@@ -1239,12 +1247,12 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 }
 #else
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
-          int UNRL, int N>
+          int UNRL, int N, typename out_t = scalar_t>
 __global__ void wvSplitK_hf_big_(const int K, const int Kbp, const int Kap,
                                  const int M, const int Bx, const int By,
                                  const scalar_t* B,
                                  const scalar_t* __restrict__ A,
-                                 const scalar_t* __restrict__ BIAS, scalar_t* C,
+                                 const scalar_t* __restrict__ BIAS, out_t* C,
                                  const int _WvPrGrp, const int CuCount) {
   UNREACHABLE_CODE
 }
@@ -1265,7 +1273,8 @@ int mindiv(int N, int div1, int div2) {
 
 torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
                        const std::optional<at::Tensor>& in_bias,
-                       const int64_t CuCount) {
+                       const int64_t CuCount,
+                       const std::optional<at::ScalarType> out_dtype) {
   auto M_in = in_a.size(0);
   auto K_in = in_a.size(1);
   auto N_in = in_b.size(0);
@@ -1284,10 +1293,14 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
   TORCH_CHECK(K_in % 8 == 0, "k % 8 == 0");
   TORCH_CHECK(in_a.dtype() == torch::kFloat16 ||
               in_a.dtype() == torch::kBFloat16);
+  const at::ScalarType out_type = out_dtype.value_or(in_b.scalar_type());
+  TORCH_CHECK(out_type == in_b.scalar_type() || out_type == at::kFloat,
+              "wvSplitK out_dtype must be the input dtype or float32, got ",
+              out_type);
 
   auto out_c = torch::empty(
       {N_in, M_in},
-      torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
+      torch::TensorOptions().dtype(out_type).device(in_b.device()));
 
   dim3 grid(CuCount);
 
@@ -1307,20 +1320,20 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     dim3 block(_THRDS, _WVPRGRP);                                             \
     int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, _WVPRGRP);                 \
     if ((Kbp_in * N_in <= max_lds_len) && (M_in % _YTILE == 0))               \
-      wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N>      \
-          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
-                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
-                                       CuCount);                              \
+      wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N,      \
+                       false, false, outtype><<<grid, block, 0, stream>>>(    \
+          K_in, Kap_in, Kbp_in, M_in, Bx_in, By_in, af4, bf4, biasf4, c,      \
+          __wvPrGrp, CuCount);                                                \
     else if (Kbp_in * N_in <= max_lds_len * 1.2)                              \
-      wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N>          \
+      wvSplitK_hf_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N, outtype> \
           <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
                                        By_in, af4, bf4, biasf4, c, __wvPrGrp, \
                                        CuCount);                              \
     else                                                                      \
-      wvSplitK_hf_big_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N>      \
-          <<<grid, block, 0, stream>>>(K_in, Kap_in, Kbp_in, M_in, Bx_in,     \
-                                       By_in, af4, bf4, biasf4, c, __wvPrGrp, \
-                                       CuCount);                              \
+      wvSplitK_hf_big_<fptype, _THRDS, _YTILE, _WVPRGRP, _AC, _UNRL, _N,      \
+                       outtype><<<grid, block, 0, stream>>>(                  \
+          K_in, Kap_in, Kbp_in, M_in, Bx_in, By_in, af4, bf4, biasf4, c,      \
+          __wvPrGrp, CuCount);                                                \
   }
 
 #define WVSPLITK_CFG(_THRDS, _WVPRGRP, _YTILE, _UNRL, _N) \
@@ -1391,33 +1404,40 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
         (in_bias.has_value() && in_bias->numel() > 0)
             ? reinterpret_cast<const fptype*>(in_bias->data_ptr())
             : nullptr;
-    fptype* c = reinterpret_cast<fptype*>(out_c.data_ptr());
 
     // first shoot for biggest tile-size that keeps all simd busy,
     // then cut the active waves to balance their distribution...
     int sYT = (M_in + CuCount * 4 - 1) / (CuCount * 4);
 
-    switch (N_in) {
-      case 1:
-        WVSPLIT_TILE(sYT, 1)
-        break;
-      case 2:
-        WVSPLIT_TILE(sYT, 2)
-        break;
-      case 3:
-        WVSPLIT_TILE(sYT, 3)
-        break;
-      case 4:
-        WVSPLIT_TILE(sYT, 4)
-        break;
-      case 5:
-        WVSPLIT_TILE(sYT, 5)
-        break;
-      default:
-        throw std::runtime_error(
-            "Unsupported N value: " + std::to_string(M_in) + "," +
-            std::to_string(K_in) + "," + std::to_string(N_in));
-    }
+    auto launch = [&](auto out_tag) {
+      using outtype = decltype(out_tag);
+      outtype* c = reinterpret_cast<outtype*>(out_c.data_ptr());
+      switch (N_in) {
+        case 1:
+          WVSPLIT_TILE(sYT, 1)
+          break;
+        case 2:
+          WVSPLIT_TILE(sYT, 2)
+          break;
+        case 3:
+          WVSPLIT_TILE(sYT, 3)
+          break;
+        case 4:
+          WVSPLIT_TILE(sYT, 4)
+          break;
+        case 5:
+          WVSPLIT_TILE(sYT, 5)
+          break;
+        default:
+          throw std::runtime_error(
+              "Unsupported N value: " + std::to_string(M_in) + "," +
+              std::to_string(K_in) + "," + std::to_string(N_in));
+      }
+    };
+    if (out_type == at::kFloat)
+      launch(float{});
+    else
+      launch(fptype{});
   });
   return out_c;
 }
