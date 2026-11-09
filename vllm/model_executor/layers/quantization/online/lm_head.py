@@ -86,6 +86,13 @@ _LM_HEAD_METHODS: dict[str, type[OnlineLinearBase]] = {
 }
 
 
+def lm_head_quant_method(quantization: Literal["fp8", "nvfp4"]) -> OnlineLinearBase:
+    """The online method of a `quantization` lm_head, for a drafter that builds
+    its own head quantized (`ParallelLMHead(..., quant_method=...)`) instead of
+    sharing the target's."""
+    return _LM_HEAD_METHODS[quantization]()
+
+
 def _quantize_copy(lm_head: ParallelLMHead, quantization: str) -> ParallelLMHead:
     if (
         not isinstance(
