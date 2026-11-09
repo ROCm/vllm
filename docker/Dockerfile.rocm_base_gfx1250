@@ -50,14 +50,15 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install Python and other dependencies
-RUN apt-get update -y \
-    && apt-get install -y software-properties-common git curl sudo vim less libgfortran5 libopenmpi-dev libpci-dev liblzma-dev libnuma-dev libdrm-dev pkg-config g++ \
+ARG APT_RETRY_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+RUN apt-get update -y ${APT_RETRY_OPTS} \
+    && apt-get install -y ${APT_RETRY_OPTS} software-properties-common git curl sudo vim less libgfortran5 libopenmpi-dev libpci-dev liblzma-dev libnuma-dev libdrm-dev pkg-config g++ \
     && for i in 1 2 3; do \
     add-apt-repository -y ppa:deadsnakes/ppa && break || \
     { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
     done \
-    && apt-get update -y \
-    && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+    && apt-get update -y ${APT_RETRY_OPTS} \
+    && apt-get install -y ${APT_RETRY_OPTS} python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
     python${PYTHON_VERSION}-lib2to3 python-is-python3  \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
     && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
@@ -70,7 +71,7 @@ RUN python${PYTHON_VERSION} -m venv "${VIRTUAL_ENV}" && \
 ENV PATH=${VIRTUAL_ENV}/bin:$PATH
 
 RUN pip install -U packaging 'cmake<4' ninja wheel 'setuptools<80' pybind11 Cython
-RUN apt-get update && apt-get install -y libgrpc++-dev protobuf-compiler-grpc libjpeg-dev libsox-dev libsox-fmt-all sox && rm -rf /var/lib/apt/lists/*
+RUN apt-get update ${APT_RETRY_OPTS} && apt-get install -y ${APT_RETRY_OPTS} libgrpc++-dev protobuf-compiler-grpc libjpeg-dev libsox-dev libsox-fmt-all sox && rm -rf /var/lib/apt/lists/*
 
 # Install sccache if USE_SCCACHE is enabled (for release builds)
 ARG USE_SCCACHE
