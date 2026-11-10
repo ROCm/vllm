@@ -84,7 +84,7 @@ def test_rotary_embedding_torch_compile_with_custom_op(monkeypatch, use_aiter):
             importlib.reload(pass_manager)
         with set_current_vllm_config(vllm_config):
             model = RotaryEmbeddingCompileModule(vllm_config=vllm_config).to(device)
-            assert model.rotary_emb.use_aiter == use_aiter
+            assert bool(model.rotary_emb.use_aiter) == use_aiter
             table = model.rotary_emb.cos_sin_cache
             saved_table = table.clone()
             ref_query, ref_key = query.clone(), key.clone()
