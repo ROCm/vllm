@@ -670,6 +670,20 @@ struct Decode {
                          blockTableWidth);
   }
 
+  // The zero accumulator of a Q@K chain. On gfx11 it is made in the KV loop,
+  // so the compiler cannot hoist it out of the loop, where it would pin 8 VGPRs
+  // and make the decode kernels spill. gfx12 takes the zero as an inline
+  // constant.
+  static __device__ __forceinline__ f8 opaque_zero() {
+#if defined(__GFX11__)
+    float zero = 0.f;
+    asm volatile("" : "+v"(zero));
+    return zero;
+#else
+    return f8{};
+#endif
+  }
+
   template <typename OutT>
   static __device__ __forceinline__ void wmma_body(
       const elem_t* __restrict__ q, const elem_t* __restrict__ kv,
@@ -899,7 +913,8 @@ struct Decode {
           const op_t qOperand = Elem<kBf16>::load_op(
               &qShared[rt * 16 + laneRow][(firstChunk + c) * 16], laneHalf);
           if (!(kAblate & 16) || c == 0)
-            scores[rt] = wmma(kOperand, qOperand, scores[rt]);
+            scores[rt] =
+                wmma(kOperand, qOperand, c == 0 ? opaque_zero() : scores[rt]);
         }
       }
       if constexpr (kHeadDimSplit > 1 && !(kAblate & 128)) {
