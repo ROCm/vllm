@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm.config import CacheConfig, KernelConfig, ParallelConfig, VllmConfig
+from vllm.config import CacheConfig, KernelConfig, VllmConfig
 from vllm.forward_context import ForwardContext, override_forward_context
 from vllm.models.deepseek_v41 import attention as attention_module
 from vllm.models.deepseek_v41.amd import model as amd_model_module
@@ -261,11 +261,13 @@ def test_pcp_rejects_speculation_other_than_fixed_length_dspark(method, adaptive
 
 
 def _rocm_pcp_config() -> VllmConfig:
-    return VllmConfig(
+    config = VllmConfig(
         cache_config=CacheConfig(enable_prefix_caching=False),
-        parallel_config=ParallelConfig(prefill_context_parallel_size=2),
         kernel_config=KernelConfig(),
     )
+    # Set after construction: ParallelConfig rejects world size 2 on a 1-GPU runner.
+    config.parallel_config.prefill_context_parallel_size = 2
+    return config
 
 
 @pytest.mark.parametrize(
