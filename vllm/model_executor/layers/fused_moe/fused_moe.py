@@ -9,6 +9,7 @@ import os
 from typing import Any
 
 import torch
+from packaging.version import Version
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -41,6 +42,38 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+_TRITON_GE_3_9 = tl.constexpr(Version(triton.__version__).release[:2] >= (3, 9))
+
+
+@tl.target_info.constexpr_function
+def _target_is_gfx1x() -> bool:
+    """Compile-time True on RDNA gfx11/gfx12."""
+    target = tl.target_info.current_target()
+    if target is None or target.backend != "hip":
+        return False
+    arch = str(target.arch)
+    return arch.startswith("gfx11") or arch.startswith("gfx12")
+
+
+@triton.jit
+def _layout_barrier(x):
+    """Return ``x`` unchanged through an opaque, non-pure op.
+
+    Emits no instructions (empty asm, output tied to input), but Triton does not
+    rematerialize the op (triton-lang/triton#11001), so layout conversions are
+    not hoisted across it.
+    """
+    tl.static_assert(x.dtype.primitive_bitwidth == 16)
+    return tl.inline_asm_elementwise(
+        asm="",
+        constraints="=v,0",
+        args=[x],
+        dtype=x.dtype,
+        is_pure=False,
+        pack=2,
+    )
 
 
 @triton.jit
@@ -112,6 +145,7 @@ def fused_moe_kernel_gptq_awq(
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     use_shuffle_w4a16: tl.constexpr = False,
+    LAYOUT_BARRIER: tl.constexpr = False,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -276,7 +310,15 @@ def fused_moe_kernel_gptq_awq(
             )
             b_scale = tl.load(b_scale_ptrs).to(tl.float32)
             # Dequant: (nibble - 8) * scale
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale[None, :]).to(compute_type)
+            b_fp32 = (b.to(tl.float32) - b_zp_num) * b_scale[None, :]
+            if compute_type == tl.bfloat16 and _TRITON_GE_3_9 and _target_is_gfx1x():
+                # Round to bf16, but not handling NaN.  Triton lowers the
+                # conversion to a rounding sequence that handles NaN.
+                b_u = b_fp32.to(tl.uint32, bitcast=True)
+                b_u = b_u + 0x7FFF + ((b_u >> 16) & 1)  # round
+                b = (b_u >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+            else:
+                b = b_fp32.to(compute_type)
         else:
             b = tl.load(b_ptrs)
             if use_int4_w4a16:
@@ -318,6 +360,12 @@ def fused_moe_kernel_gptq_awq(
                 b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
             else:
                 b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+
+        if LAYOUT_BARRIER:
+            # Triton 3.9's RemoveLayoutConversions would otherwise hoist the
+            # dot-operand conversion above the unpack and dequant, so they run
+            # in the WMMA operand layout, which duplicates the dequant work.
+            b = _layout_barrier(b)
 
         accumulator = tl.dot(a, b, acc=accumulator)
 
@@ -877,6 +925,13 @@ def invoke_fused_moe_kernel_hybrid_triton(
         f"group_size {group_size} must be a multiple of 8 for shuffle kernel"
     )
 
+    from vllm.platforms.rocm import on_gfx1x
+
+    # Triton < 3.9 does not hoist the conversion that the barrier blocks.
+    layout_barrier = (
+        _TRITON_GE_3_9 and A.dtype in (torch.bfloat16, torch.float16) and on_gfx1x()
+    )
+
     with record_function_or_nullcontext(
         # Always "sym": this wrapper is symmetric-only by construction (it
         # passes b_zp_ptr=None / has_zp=False and folds the zero-point bias
@@ -921,6 +976,7 @@ def invoke_fused_moe_kernel_hybrid_triton(
             use_int4_w4a16=True,
             use_int8_w8a16=False,
             use_shuffle_w4a16=True,
+            LAYOUT_BARRIER=layout_barrier,
             BLOCK_SIZE_K=BLOCK_SIZE_K,
             **config,
         )
