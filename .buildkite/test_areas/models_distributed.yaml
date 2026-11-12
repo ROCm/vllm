@@ -98,6 +98,7 @@ steps:
       - VLLM_ROCM_USE_AITER=1 pytest -v -s models/test_hyv4_rocm.py -m 'distributed(num_gpus=2)'
       - pytest models/multimodal -v -s -m 'distributed(num_gpus=2)' --ignore models/multimodal/generation/test_whisper.py
       - VLLM_WORKER_MULTIPROC_METHOD=spawn pytest models/multimodal/generation/test_whisper.py -v -s -m 'distributed(num_gpus=2)'
+      - VLLM_TRITON_FORCE_FIRST_CONFIG=1 pytest -v -s models/test_pp_equivalence.py -m 'distributed(num_gpus=2)'
 
 - label: ":nvidia: (L4) [Nightly] PP Equivalence"
   key: pp-equivalence-4-gpus
