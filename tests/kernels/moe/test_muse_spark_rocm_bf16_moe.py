@@ -1094,3 +1094,27 @@ def test_token_sharded_stream_keeps_only_the_current_ranks_finalized_rows(
     expected = reference.apply(None, routed[4:], weights[4:], ids[4:], False)
     torch.testing.assert_close(output[4:], expected)
     assert output[:4].isnan().all()
+
+
+@pytest.mark.skipif(not ROCM_AVAILABLE, reason="requires a ROCm GPU")
+def test_unit_weights_outgrown_buffer_stays_valid_for_captured_graphs() -> None:
+    """A CUDA graph captured on the cached unit-weights buffer must keep reading
+    ones after a later eager call grows the cache (the old buffer must not be
+    freed and its memory reused)."""
+    experts = MuseSparkAiterExperts(
+        _moe_config(parallel_config=_parallel_config(tp_size=8)),
+        _quant_config(_rms_norm, MuseSparkQuarkOCPMXMoEQuantConfig),
+    )
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    out = torch.empty((64, 2), dtype=torch.float32, device=device)
+    out.copy_(experts._unit_weights(64, 2, device))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out.copy_(experts._unit_weights(64, 2, device))
+    experts._unit_weights(64 * 1024, 2, device)
+    scratch = [torch.full((64, 2), 7.0, device=device) for _ in range(64)]
+    out.zero_()
+    graph.replay()
+    torch.accelerator.synchronize()
+    del scratch
+    assert torch.all(out == 1.0)

@@ -472,18 +472,23 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             )
         if quant_config.post_expert_norm_fn is None:
             raise ValueError("Muse Spark post-expert norm is not configured.")
-        self._unit_weights_bufs: dict[int, torch.Tensor] = {}
+        self._unit_weights_bufs: dict[int, list[torch.Tensor]] = {}
 
     def _unit_weights(
         self, num_routes: int, width: int, device: torch.device
     ) -> torch.Tensor:
-        """A cached `[num_routes, width]` fp32 ones buffer (grown on demand)."""
-        buf = self._unit_weights_bufs.get(width)
+        """A cached `[num_routes, width]` fp32 ones buffer (grown by doubling).
+
+        Outgrown buffers stay referenced: CUDA graphs captured while one was
+        current keep reading it, so freeing it would hand graph-read memory back
+        to the allocator.
+        """
+        bufs = self._unit_weights_bufs.setdefault(width, [])
+        buf = bufs[-1] if bufs else None
         if buf is None or buf.shape[0] < num_routes or buf.device != device:
-            buf = torch.ones(
-                (max(num_routes, 1), width), dtype=torch.float32, device=device
-            )
-            self._unit_weights_bufs[width] = buf
+            rows = max(num_routes, 1 if buf is None else 2 * buf.shape[0])
+            buf = torch.ones((rows, width), dtype=torch.float32, device=device)
+            bufs.append(buf)
         return buf[:num_routes]
 
     def workspace_shapes(
@@ -541,7 +546,28 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
                 f"{tuple(output.shape)}, expected {expected_output_shape}."
             )
 
-        expanded_hidden_states = take_expanded(hidden_states, top_k)
+        from .decode_moe import prequant_routes_experts
+        from .ulysses_sp import expand_rows, take_prequant
+
+        # One pre-quantized row per token (Ulysses FP4 gather), or None.
+        prequant = take_prequant(hidden_states)
+        if prequant is not None:
+            a1, a1_scale = prequant
+            if expert_map is not None:
+                routes = prequant_routes_experts(
+                    a1, a1_scale, topk_ids, w1, w2, self.quant_config, expert_map
+                )
+                if routes is not None:
+                    self._park_route_output(*routes)
+                    return
+            expanded_hidden_states = expand_rows(a1.view(torch.uint8), top_k).view(
+                a1.dtype
+            )
+            a1q_scale = expand_rows(a1_scale.view(torch.uint8), top_k).view(
+                a1_scale.dtype
+            )
+        else:
+            expanded_hidden_states = take_expanded(hidden_states, top_k)
         if expanded_hidden_states is None:
             expanded_hidden_states = (
                 hidden_states[:, None, :]
@@ -596,6 +622,7 @@ class MuseSparkAiterExperts(_RouteOutputHandoff, AiterMxfp4Experts):
             quant_config.post_expert_norm_fn,
             pre_norm_all_reduce=self.moe_config.moe_parallel_config.tp_size > 1,
             take_route_output=self._take_route_output,
+            take_route_expert_map=self._take_route_expert_map,
         )
 
 
