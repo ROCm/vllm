@@ -292,7 +292,7 @@ struct Prefill {
                const int* __restrict__ queryStart, int numEntries,
                int blockTableStride, int headGroup,
                const elem_t* __restrict__ vIn, int qStride, int kStride,
-               int vStride) {
+               int vStride, const int* __restrict__ keyStart) {
     __shared__ __attribute__((
         aligned(16))) elem_t kTile[kBuffers][kKeyTile][kRowPitch];
     __shared__ __attribute__((
@@ -334,10 +334,12 @@ struct Prefill {
         blockTable += (size_t)seq * blockTableStride;
         mmRanges += (size_t)seq * 2 * numMmRanges;
       } else {
-        // The sequence's K and V start with its queries.
+        // The sequence's K and V start with its queries, or (cross-attention)
+        // at keyStart, seqLens[seq] keys of them.
+        const int firstKey = keyStart ? keyStart[seq] : queryBegin;
         q += (size_t)queryBegin * qStride;
-        kv += (size_t)queryBegin * kStride;
-        vIn += (size_t)queryBegin * vStride;
+        kv += (size_t)firstKey * kStride;
+        vIn += (size_t)firstKey * vStride;
       }
       seqLens += seq;
     } else {
@@ -1348,7 +1350,7 @@ void launch_prefill(const PrefillArgs& a) {
         wgpWorkgroups * numWgps, a.mm_ranges, a.num_mm_ranges,
         reinterpret_cast<const int4*>(a.plan), a.query_start, a.num_entries,
         a.bt_stride, headGroup, static_cast<const elem_t*>(a.v), a.q_stride,
-        a.k_stride, a.v_stride);
+        a.k_stride, a.v_stride, a.key_start);
     return;
   }
   // A workgroup per SIMD.
@@ -1375,7 +1377,7 @@ void launch_prefill(const PrefillArgs& a) {
       a.seq_lens, a.num_tokens, a.scale, a.partial_o, a.partial_ml, a.counters,
       segments, wgpWorkgroups * numWgps, a.mm_ranges, a.num_mm_ranges, nullptr,
       nullptr, 0, 0, P::kHeadGroup, static_cast<const elem_t*>(a.v), a.q_stride,
-      a.k_stride, a.v_stride);
+      a.k_stride, a.v_stride, nullptr);
 }
 
 }  // namespace

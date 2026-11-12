@@ -72,6 +72,9 @@ struct PrefillArgs {
   int q_stride;
   int k_stride;
   int v_stride;
+  // Non-causal batches: each sequence's first key token, or null when its K
+  // and V start with its queries (self-attention).
+  const int* key_start;
 };
 
 using PrefillFn = void (*)(const PrefillArgs&);
