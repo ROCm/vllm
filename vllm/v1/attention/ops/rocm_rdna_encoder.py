@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """ROCM_RDNA_ATTN for MMEncoderAttention (gfx115x, RDNA4): an
 encoder's segments, each token seeing every key of its segment, in one launch
-of the non-causal prefill builds, which read Q, K and V in place.
+of the non-causal prefill builds, which read Q, K and V in place. A segment's
+keys may be its own (cross-attention): K and V then hold kv_seg_lens tokens.
 """
 
 import functools
@@ -49,11 +50,15 @@ class _Layout(NamedTuple):
     """How one list of segment lengths runs, on the device."""
 
     variant: PrefillVariant
+    # Each segment's keys.
     seq_lens: torch.Tensor
     # The plan and query starts; None for one segment.
     plan: torch.Tensor | None
     query_starts: torch.Tensor | None
+    # The key starts (cross-attention); None when keys start with queries.
+    key_starts: torch.Tensor | None
     head_group: int
+    # Most keys of a segment.
     longest: int
 
 
@@ -61,6 +66,7 @@ class _Layout(NamedTuple):
 @functools.lru_cache(maxsize=128)
 def _layout(
     seg_lens: tuple[int, ...],
+    kv_seg_lens: tuple[int, ...] | None,
     hq: int,
     hkv: int,
     d: int,
@@ -71,6 +77,7 @@ def _layout(
         return async_tensor_h2d(np.ascontiguousarray(x), dev, torch.int32)
 
     lens = np.asarray(seg_lens, dtype=np.int64)
+    keys = lens if kv_seg_lens is None else np.asarray(kv_seg_lens, dtype=np.int64)
     shape = (hq, hkv, d, PAGE_SIZE)
     if len(lens) == 1:
         # The first row also serves fewer than PREFILL_MIN_M tokens.
@@ -78,18 +85,21 @@ def _layout(
             *shape, _HND, 0, dtype, max(int(lens[0]), PREFILL_MIN_M), causal=False
         )
         assert variant is not None, "unsupported() checks the builds"
-        return _Layout(variant, to_dev(lens), None, None, 0, int(lens[0]))
+        return _Layout(variant, to_dev(keys), None, None, None, 0, int(keys[0]))
     starts = np.concatenate([[0], np.cumsum(lens)])
     variant, head_group = prefill_batch_variant_for(
-        *shape, _HND, 0, dtype, starts, lens, causal=False
+        *shape, _HND, 0, dtype, starts, keys, causal=False
     )
     assert variant is not None, "unsupported() checks the builds"
     plan, head_group = plan_prefill(
-        starts, lens, variant, 0, prefill_target_workgroups(dev), head_group
+        starts, keys, variant, 0, prefill_target_workgroups(dev), head_group
+    )
+    key_starts = (
+        None if kv_seg_lens is None else to_dev(np.concatenate([[0], np.cumsum(keys)]))
     )
     return _Layout(
-        variant, to_dev(lens), to_dev(plan), to_dev(starts), head_group,
-        int(lens.max()),
+        variant, to_dev(keys), to_dev(plan), to_dev(starts), key_starts,
+        head_group, int(keys.max()),
     )  # fmt: skip
 
 
@@ -104,15 +114,18 @@ def forward(
     v: torch.Tensor,
     seg_lens: list[int],
     scale: float,
+    kv_seg_lens: list[int] | None = None,
 ) -> torch.Tensor:
     """Attention of each segment's tokens over its keys, no mask.
 
     Args:
         q: (tokens, Hq, D), the segments one after the other.
-        k: (tokens, Hkv, D).
-        v: (tokens, Hkv, D).
+        k: (key tokens, Hkv, D).
+        v: (key tokens, Hkv, D).
         seg_lens: Each segment's tokens, on the host.
         scale: Softmax scale.
+        kv_seg_lens: Each segment's keys, on the host, when K and V hold
+            their own tokens (cross-attention); None for seg_lens.
 
     Returns:
         (tokens, Hq, D). `unsupported` must have returned None.
@@ -122,8 +135,14 @@ def forward(
     out = torch.empty(q.shape, dtype=dtype, device=dev)
     if not seg_lens:
         return out
+    if kv_seg_lens is not None:
+        assert len(kv_seg_lens) == len(seg_lens) and min(kv_seg_lens) > 0
+        assert sum(kv_seg_lens) == k.shape[0] == v.shape[0]
+        if list(kv_seg_lens) == list(seg_lens):
+            kv_seg_lens = None
     hq, d, hkv = q.shape[1], q.shape[2], k.shape[1]
-    lay = _layout(tuple(seg_lens), hq, hkv, d, dtype, dev)
+    kv_lens = None if kv_seg_lens is None else tuple(kv_seg_lens)
+    lay = _layout(tuple(seg_lens), kv_lens, hq, hkv, d, dtype, dev)
     q, k, v = _in_place(q), _in_place(k), _in_place(v)
     prefill = load_prefill(lay.variant)
     assert prefill is not None
@@ -138,6 +157,6 @@ def forward(
         prefill.encoder_attn(
             q, k, v, out, *scratch, lay.seq_lens, lay.longest, scale,
             plan=lay.plan, query_start_loc=lay.query_starts,
-            head_group=lay.head_group,
+            head_group=lay.head_group, key_start_loc=lay.key_starts,
         )  # fmt: skip
     return out

@@ -453,11 +453,14 @@ def prefill_batch_features(
     window: int,
     causal: bool = True,
 ) -> tuple[float, float]:
-    """(mean query tokens, mean keys per token) of a batch, padding left out."""
+    """(mean query tokens, mean keys per token) of a batch, padding left out.
+    Non-causal: seq_lens are the keys, any number (cross-attention)."""
     q_lens = np.diff(query_start_loc.astype(np.int64))
     seq_lens = seq_lens[: q_lens.shape[0]].astype(np.int64)
     live = q_lens > 0
-    q_lens, seq_lens = q_lens[live], np.maximum(seq_lens[live], q_lens[live])
+    q_lens, seq_lens = q_lens[live], seq_lens[live]
+    if causal:
+        seq_lens = np.maximum(seq_lens, q_lens)
     tokens = int(q_lens.sum())
     if not tokens:
         return 0.0, 0.0
@@ -572,7 +575,8 @@ def plan_prefill(
 
     Args:
         query_start_loc: The batch's query starts.
-        seq_lens: Each sequence's length, or an upper bound.
+        seq_lens: Each sequence's length, or an upper bound; non-causal, its
+            keys, any number (cross-attention).
         variant: The build that runs the launch.
         window: Sliding window in keys, 0 for full causal (or non-causal).
         target_workgroups: One per SIMD (prefill_target_workgroups).
@@ -596,8 +600,12 @@ def plan_prefill(
     tile = np.repeat(starts + tiles - 1, tiles) - np.arange(seq.shape[0])
     first = tile * rows // g
     last = np.minimum(q_lens[seq] - 1, ((tile + 1) * rows - 1) // g)
-    # Non-causal: every token sees its whole sequence.
-    key_end = context[seq] + last + 1 if variant.causal else context[seq] + q_lens[seq]
+    # Non-causal: every token sees all of its sequence's keys.
+    key_end = (
+        context[seq] + last + 1
+        if variant.causal
+        else seq_lens[:nseq].astype(np.int64)[seq]
+    )
     key_begin = (
         np.maximum(0, context[seq] + first - window + 1) // key_tile * key_tile
         if window
@@ -685,6 +693,7 @@ class _BuiltinPrefill:
         plan=None,
         query_start_loc=None,
         head_group=0,
+        key_start_loc=None,
     ):
         torch.ops._rocm_C.rdna_encoder_attn(
             self.index,
@@ -696,6 +705,7 @@ class _BuiltinPrefill:
             plan=plan,
             query_start_loc=query_start_loc,
             head_group=head_group,
+            key_start_loc=key_start_loc,
         )
 
 
