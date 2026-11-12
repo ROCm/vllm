@@ -186,10 +186,9 @@ def run_sweep(shapes, batch_sizes, warmup, rep, csv_path, medium_only=False):
                     skipped += len(YTILES) * len(UNRLS) * len(ACHUNKS) * len(WVPRGRPS)
                     continue
 
-            # pack_skinny_int4 applies the gfx1151 row-stride padding, so the
+            # pack_skinny_int4 applies the gfx115x row-stride padding, so the
             # sweep measures the layout production actually runs.  The scale
-            # rows get the same treatment, since the layer pads them off the
-            # same cliff.
+            # rows get the same padding the layer applies on gfx1151.
             values_int4 = torch.randint(0, 16, (M, K), dtype=torch.int32, device="cuda")
             weight_packed = pack_skinny_int4(values_int4)
             scale = torch.rand(M, num_groups, dtype=dtype, device="cuda") * 0.02 - 0.01

@@ -330,10 +330,11 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, scalar_t (&s)[LDS_ELEMS], const int B_row_stride_bytes,
-    const int group_stride) {
+    const int group_stride, const int C_row_stride) {
   // B_row_stride_bytes is the per-row byte stride of the packed weights;
   // pass K/2 for the contiguous default, or K/2 + pad for the padded layout
-  // (see gfx1151 K%2048 cliff workaround).
+  // (see padded_row_stride_bytes in rdna_hybrid_w4a16.py).  C_row_stride is
+  // the per-token stride of C in elements: M when dense, more when padded.
   //
   // CHUNKED walks K in LDS-sized chunks so that all N activation rows can be
   // read from LDS even when K*N exceeds it.  LDS_ELEMS is deduced from the
@@ -728,7 +729,7 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
               sum[n][i] *= __s2float(scale[m + i]);
             }
             if (BIAS) sum[n][i] += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
-            C[m + i + n * M] = __float2s<scalar_t>(sum[n][i]);
+            C[m + i + n * C_row_stride] = __float2s<scalar_t>(sum[n][i]);
           }
         }
       }
@@ -763,7 +764,7 @@ __device__ __forceinline__ void wvSplitK_int4_compute_sml_(
               sum[n][i] *= __s2float(scale[m + i]);
             }
             if (BIAS) sum[n][i] += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
-            C[m + i + n * M] = __float2s<scalar_t>(sum[n][i]);
+            C[m + i + n * C_row_stride] = __float2s<scalar_t>(sum[n][i]);
           }
         }
       }
@@ -790,8 +791,8 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                           const uint32_t* zero_points,
                           const scalar_t* __restrict__ BIAS, scalar_t* C,
                           const int _WvPrGrp, const int CuCount,
-                          const int B_row_stride_bytes,
-                          const int group_stride) {
+                          const int B_row_stride_bytes, const int group_stride,
+                          const int C_row_stride) {
   constexpr int max_lds_len = LDS_SIZE / sizeof(scalar_t);
   __shared__ scalar_t s[max_lds_len];
   // CHUNKED fills s[] itself, once per chunk, from inside the compute body.
@@ -801,7 +802,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   wvSplitK_int4_compute_sml_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
                              GROUP_SIZE, HAS_ZERO_POINTS, CHUNKED>(
       K, M, Bx, By, B_packed, A, scale, zero_points, BIAS, C, _WvPrGrp, CuCount,
-      s, B_row_stride_bytes, group_stride);
+      s, B_row_stride_bytes, group_stride, C_row_stride);
 }
 #else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
@@ -812,7 +813,8 @@ __global__ void wvSplitK_int4_hf_sml_(
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
-    const int CuCount, const int B_row_stride_bytes, const int group_stride) {
+    const int CuCount, const int B_row_stride_bytes, const int group_stride,
+    const int C_row_stride) {
   UNREACHABLE_CODE
 }
 #endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
@@ -832,7 +834,7 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
     const int CuCount, scalar_t (&s)[LDS_ELEMS], const int B_row_stride_bytes,
-    const int group_stride) {
+    const int group_stride, const int C_row_stride) {
   // How much of the activation is staged in LDS; the rest is read from global.
   // Deduced from the caller's array so the split cannot drift from it.
   constexpr int max_lds_len = LDS_ELEMS;
@@ -1058,7 +1060,7 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
               }
               if (BIAS)
                 sum[n][i] += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
-              C[m + i + n * M] = __float2s<scalar_t>(sum[n][i]);
+              C[m + i + n * C_row_stride] = __float2s<scalar_t>(sum[n][i]);
             }
           }
         }
@@ -1096,7 +1098,7 @@ __device__ __forceinline__ void wvSplitK_int4_compute_(
               }
               if (BIAS)
                 sum[n][i] += __s2float(BIAS[(m + i) % Bx + (n % By) * M]);
-              C[m + i + n * M] = __float2s<scalar_t>(sum[n][i]);
+              C[m + i + n * C_row_stride] = __float2s<scalar_t>(sum[n][i]);
             }
           }
         }
@@ -1130,14 +1132,15 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                       const scalar_t* scale, const uint32_t* zero_points,
                       const scalar_t* __restrict__ BIAS, scalar_t* C,
                       const int _WvPrGrp, const int CuCount,
-                      const int B_row_stride_bytes, const int group_stride) {
+                      const int B_row_stride_bytes, const int group_stride,
+                      const int C_row_stride) {
   constexpr int max_lds_len = LDS_SIZE / sizeof(scalar_t);
   __shared__ scalar_t s[max_lds_len];
   load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(s, A, K, max_lds_len);
   wvSplitK_int4_compute_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
                          GROUP_SIZE, HAS_ZERO_POINTS>(
       K, M, Bx, By, B_packed, A, scale, zero_points, BIAS, C, _WvPrGrp, CuCount,
-      s, B_row_stride_bytes, group_stride);
+      s, B_row_stride_bytes, group_stride, C_row_stride);
 }
 #else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
@@ -1147,7 +1150,8 @@ __global__ void wvSplitK_int4_hf_(
     const uint8_t* B_packed, const scalar_t* __restrict__ A,
     const scalar_t* scale, const uint32_t* zero_points,
     const scalar_t* __restrict__ BIAS, scalar_t* C, const int _WvPrGrp,
-    const int CuCount, const int B_row_stride_bytes, const int group_stride) {
+    const int CuCount, const int B_row_stride_bytes, const int group_stride,
+    const int C_row_stride) {
   UNREACHABLE_CODE
 }
 #endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
@@ -1179,7 +1183,8 @@ static int mindiv_int4(int N, int div1, int div2) {
 // fused_moe_wvSplitK_int4_gemm.
 //
 // Required local variables: M_in, K_in, N_in, CuCount, group_size,
-//   wptr, aptr, sptr, zpptr, biasptr, cptr, grid, stream, max_lds_len
+//   wptr, aptr, sptr, zpptr, biasptr, cptr, grid, stream, max_lds_len,
+//   b_row_stride_bytes_i32, group_stride_i32, c_row_stride_i32
 // Required type: fptype
 
 // Like WVSPLITK_INT4G_LAUNCH but the caller picks WvPrGrp and A_CHUNK.
@@ -1197,12 +1202,14 @@ static int mindiv_int4(int N, int div1, int div2) {
       wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS, \
                             _HAS_ZP><<<grid, block, 0, stream>>>(            \
           K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,  \
-          __wvPrGrp, CuCount, b_row_stride_bytes_i32, group_stride_i32);     \
+          __wvPrGrp, CuCount, b_row_stride_bytes_i32, group_stride_i32,      \
+          c_row_stride_i32);                                                 \
     else                                                                     \
       wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,     \
                         _HAS_ZP><<<grid, block, 0, stream>>>(                \
           K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,  \
-          __wvPrGrp, CuCount, b_row_stride_bytes_i32, group_stride_i32);     \
+          __wvPrGrp, CuCount, b_row_stride_bytes_i32, group_stride_i32,      \
+          c_row_stride_i32);                                                 \
   }
 
 // Backwards-compatible wrapper: existing call sites get WvPrGrp=16, AC=16.
@@ -1234,12 +1241,13 @@ static int mindiv_int4(int N, int div1, int div2) {
           <<<grid, block, 0, stream>>>(K_in, M_in, Bx_in, By_in, wptr, aptr,   \
                                        sptr, zpptr, biasptr, cptr, __wvPrGrp,  \
                                        CuCount, b_row_stride_bytes_i32,        \
-                                       group_stride_i32);                      \
+                                       group_stride_i32, c_row_stride_i32);    \
     else                                                                       \
       wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,       \
                         _HAS_ZP><<<grid, block, 0, stream>>>(                  \
           K_in, M_in, Bx_in, By_in, wptr, aptr, sptr, zpptr, biasptr, cptr,    \
-          __wvPrGrp, CuCount, b_row_stride_bytes_i32, group_stride_i32);       \
+          __wvPrGrp, CuCount, b_row_stride_bytes_i32, group_stride_i32,        \
+          c_row_stride_i32);                                                   \
   }
 
 #define WVSPLITK_INT4G_CHUNKED(_YTILE, _UNRL, _N, _GS, _HAS_ZP)             \
@@ -1583,7 +1591,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
                                N, GROUP_SIZE, HAS_ZERO_POINTS,
                                /*CHUNKED=*/false>(
         K, M, 1, 1, B, A, S, ZP, nullptr, C, _WvPrGrp, CuCount, s,
-        b_row_stride_bytes, K / GROUP_SIZE);
+        b_row_stride_bytes, K / GROUP_SIZE, M);
   }
 }
 
@@ -1646,7 +1654,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     wvSplitK_int4_compute_<scalar_t, THRDS, YTILE, WvPrGrp, A_CHUNK, UNRL, N,
                            GROUP_SIZE, HAS_ZERO_POINTS>(
         K, M, 1, 1, B, A, S, ZP, nullptr, C, _WvPrGrp, CuCount, s,
-        b_row_stride_bytes, K / GROUP_SIZE);
+        b_row_stride_bytes, K / GROUP_SIZE, M);
   }
 }
 #else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
