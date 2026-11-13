@@ -177,9 +177,10 @@ class GateLinear(ReplicatedLinear):
         self.allow_rocm_bf16x3_router_gemm = (
             self._rocm_bf16x3_weight_eligible and self.out_dtype == torch.float32
         )
-        # Filled in by process_weights_after_loading. Not persistent: it is
-        # derived from `weight` rather than loaded from a checkpoint.
-        self.register_buffer("_bf16x3_weight", None, persistent=False)
+        # Filled in by process_weights_after_loading. A plain attribute, not a
+        # buffer: it is derived from `weight`, and a weight reload refills it
+        # in place (see refill_derived).
+        self._bf16x3_weight: torch.Tensor | None = None
         if self._rocm_bf16x3_weight_eligible:
             # Safe to swap after create_weights() because
             # UnquantizedLinearMethod holds no per-layer state. Asserted

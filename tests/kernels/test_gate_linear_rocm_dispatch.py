@@ -12,12 +12,34 @@ term; a biased gate must fall back so the bias is not silently dropped.
 """
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.router.gate_linear as gate_linear_mod
+from vllm.model_executor.layers.fused_moe.router import (
+    bf16x3_router_gemm_rocm as rocm_bf16x3,
+)
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.model_loader.reload import (
+    finish_reload,
+    record_metadata_for_reloading,
+    start_reload,
+)
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+
+def _mock_tp(monkeypatch, world_size: int = 1) -> None:
+    for target in (
+        "vllm.model_executor.layers.linear",
+        "vllm.model_executor.parameter",
+    ):
+        monkeypatch.setattr(f"{target}.get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(
+            f"{target}.get_tensor_model_parallel_world_size", lambda: world_size
+        )
 
 
 def _make_gate(
@@ -34,19 +56,7 @@ def _make_gate(
     parallel_world_size: int = 1,
 ) -> GateLinear:
     """Build a GateLinear with platform predicates mocked, no GPU needed."""
-    for target in (
-        "vllm.model_executor.layers.linear",
-        "vllm.model_executor.parameter",
-    ):
-        monkeypatch.setattr(
-            f"{target}.get_tensor_model_parallel_rank",
-            lambda: 0,
-        )
-        monkeypatch.setattr(
-            f"{target}.get_tensor_model_parallel_world_size",
-            lambda: parallel_world_size,
-        )
-
+    _mock_tp(monkeypatch, parallel_world_size)
     platform = gate_linear_mod.current_platform
     monkeypatch.setattr(platform, "is_cuda", lambda: is_cuda)
     monkeypatch.setattr(platform, "is_rocm", lambda: is_rocm)
@@ -186,10 +196,6 @@ def test_rocm_fp32_router_gemm_rejects_unsupported_configs(
 # ---------------------------------------------------------------------------
 def _make_bf16x3_gate(monkeypatch, *, supported=True, **kwargs):
     """Build a gate with the ROCm bf16x3 platform check mocked."""
-    from vllm.model_executor.layers.fused_moe.router import (
-        bf16x3_router_gemm_rocm as rocm_bf16x3,
-    )
-
     monkeypatch.setattr(rocm_bf16x3, "platform_supported", lambda: supported)
     kwargs.setdefault("params_dtype", torch.float32)
     return _make_gate(monkeypatch, is_rocm=True, **kwargs)
@@ -199,9 +205,7 @@ def test_rocm_bf16x3_enabled_for_fp32_weight(monkeypatch):
     gate = _make_bf16x3_gate(monkeypatch)
     assert gate.allow_rocm_bf16x3_router_gemm
     # Built by process_weights_after_loading, not lazily in forward().
-    # Registered up front but still None, so named_buffers() skips it.
     assert gate._bf16x3_weight is None
-    assert "_bf16x3_weight" in gate._buffers
 
 
 def test_rocm_bf16x3_disabled_by_bias(monkeypatch):
@@ -267,3 +271,92 @@ def test_rocm_bf16x3_is_reachable_for_low_m_shapes(monkeypatch):
     assert source.index("allow_rocm_bf16x3_router_gemm") < source.index(
         "allow_fp32_router_gemm"
     )
+
+
+# ---------------------------------------------------------------------------
+# Weight reload of the ROCm BF16x3 split
+# ---------------------------------------------------------------------------
+_MODEL_CONFIG = SimpleNamespace(
+    word_embeddings_untied_by_checkpoint=False, quantization=None, dtype=torch.float32
+)
+
+
+class _GateModel(torch.nn.Module):
+    def __init__(self, gate: GateLinear):
+        super().__init__()
+        self.gate = gate
+
+    def load_weights(self, weights):
+        params = dict(self.named_parameters())
+        for name, weight in weights:
+            param = params[name]
+            getattr(param, "weight_loader", default_weight_loader)(param, weight)
+        return set(params)
+
+
+def _gate_checkpoint(gate: GateLinear, seed: int) -> dict[str, torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    return {"gate.weight": torch.randn(gate.weight.shape, generator=gen) * 0.05}
+
+
+def _reload_gate(model: _GateModel, device: torch.device) -> torch.Tensor:
+    """Cold load, then a checkpoint-format reload with different weights, as
+    `reload_weights` does. Returns the reloaded weight."""
+    gate = model.gate
+    model.load_weights(_gate_checkpoint(gate, seed=0).items())
+    process_weights_after_loading(model, _MODEL_CONFIG, device)
+    split = gate._bf16x3_weight
+    assert split is not None
+    ptr = split.data_ptr()
+
+    start_reload(model)
+    new = _gate_checkpoint(gate, seed=1)
+    model.load_weights(new.items())
+    finish_reload(model, _MODEL_CONFIG, device)
+
+    w = new["gate.weight"].to(device)
+    split = gate._bf16x3_weight
+    assert split is not None
+    assert torch.equal(gate.weight, w)
+    assert torch.equal(split.float().sum(0), w)
+    # Refilled in place: captured graphs keep reading the same storage.
+    assert split.data_ptr() == ptr
+    return w
+
+
+@pytest.mark.parametrize("mode", ["direct", "layerwise"])
+def test_rocm_bf16x3_split_survives_weight_reload(monkeypatch, mode):
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    model = _GateModel(_make_bf16x3_gate(monkeypatch))
+    record_metadata_for_reloading(model)
+    _reload_gate(model, torch.device("cpu"))
+
+
+@pytest.mark.skipif(
+    not (torch.accelerator.is_available() and rocm_bf16x3.platform_supported()),
+    reason="ROCm bf16x3 router GEMM requires gfx950",
+)
+@pytest.mark.parametrize("mode", ["direct", "layerwise"])
+def test_rocm_bf16x3_weight_reload_gfx950(monkeypatch, mode):
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    _mock_tp(monkeypatch)
+    device = torch.device("cuda", 0)
+    with device:  # the loader builds and records under the target device
+        model = _GateModel(
+            GateLinear(
+                input_size=6144,
+                output_size=128,
+                bias=False,
+                out_dtype=torch.float32,
+                params_dtype=torch.float32,
+            )
+        )
+        record_metadata_for_reloading(model)
+    assert model.gate.allow_rocm_bf16x3_router_gemm
+    w = _reload_gate(model, device)
+
+    x = torch.randn(rocm_bf16x3.MIN_TOKENS, 6144, device=device).to(torch.bfloat16)
+    out = model.gate(x)
+    out = out[0] if isinstance(out, tuple) else out
+    ref = x.double() @ w.double().T
+    assert (out.double() - ref).norm() / ref.norm() < 2e-6
