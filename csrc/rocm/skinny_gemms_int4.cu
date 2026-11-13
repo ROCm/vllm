@@ -8,7 +8,8 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
                               const at::Tensor& in_scale,
                               const std::optional<at::Tensor>& in_zero_points,
                               const std::optional<at::Tensor>& in_bias,
-                              const int64_t CuCount, const int64_t group_size) {
+                              const int64_t CuCount, const int64_t group_size,
+                              const int64_t out_row_stride) {
   auto M_in = in_a.size(0);
   auto K_in = in_b.size(1);
   auto N_in = in_b.size(0);
@@ -138,9 +139,19 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
   // wvSplitK_int4_compute_), so it is correct for any K*N -- just slower the
   // further past LDS it goes.
 
-  auto out_c = torch::empty(
-      {N_in, M_in},
-      torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()));
+  // out_row_stride == 0 means dense; otherwise the output is an [N, M] view
+  // of an [N, out_row_stride] allocation (see padded_row_stride_bytes).
+  const int64_t c_row_stride = out_row_stride ? out_row_stride : M_in;
+  TORCH_CHECK(c_row_stride >= M_in, "Output row stride (", c_row_stride,
+              ") must be at least M=", M_in);
+  TORCH_CHECK(std::in_range<int>(c_row_stride), "Output row stride (",
+              c_row_stride, ") exceeds int range");
+  const int c_row_stride_i32 = static_cast<int>(c_row_stride);
+  auto out_c =
+      torch::empty(
+          {N_in, c_row_stride},
+          torch::TensorOptions().dtype(in_b.dtype()).device(in_b.device()))
+          .narrow(1, 0, M_in);
 
   dim3 grid(CuCount);
 

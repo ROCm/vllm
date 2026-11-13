@@ -220,6 +220,44 @@ def test_act_and_mul(
         opcheck(fn, (out, x))
 
 
+@pytest.mark.parametrize(
+    "make_layer,gated",
+    [
+        (lambda: SiluAndMul(compile_native=False), True),
+        (MulAndSilu, True),
+        (lambda: GeluAndMul(approximate="none"), True),
+        (lambda: GeluAndMul(approximate="tanh"), True),
+        (lambda: FatreluAndMul(0.1), True),
+        (lambda: SiluAndMulWithClamp(7.0, compile_native=False), True),
+        (SwigluOAIAndMul, True),
+        (NewGELU, False),
+        (FastGELU, False),
+        (QuickGELU, False),
+        (lambda: ReLUSquaredActivation(compile_native=False), False),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@torch.inference_mode()
+def test_activation_row_padded_input(
+    default_vllm_config, make_layer, gated: bool, dtype: torch.dtype
+) -> None:
+    """The _C kernels assume row t starts at t * width. A view of a row-padded
+    GEMM output does not, and must give the same result as a dense input."""
+    set_random_seed(0)
+    device = CUDA_DEVICES[0]
+    num_tokens, d = 83, 512
+    width = 2 * d if gated else d
+    x = torch.randn(num_tokens, width, dtype=dtype, device=device)
+    x_padded = torch.empty(num_tokens, width + 64, dtype=dtype, device=device)
+    x_padded = x_padded[:, :width]
+    x_padded.copy_(x)
+    layer = make_layer()
+
+    torch.testing.assert_close(
+        layer.forward_cuda(x_padded), layer.forward_cuda(x), atol=0.0, rtol=0.0
+    )
+
+
 SWIGLU_LIMITS = [3.0, 7.0, 15.0]
 
 

@@ -2221,9 +2221,11 @@ def wvSplitK_int4_g(
     group_size: int,
     zero_points: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
+    out_row_stride: int = 0,
 ) -> torch.Tensor:
+    """``out_row_stride`` > 0 returns a view of a row-padded output."""
     return torch.ops._rocm_C.wvSplitK_int4_g(
-        a, b, scale, zero_points, bias, cu_count, group_size
+        a, b, scale, zero_points, bias, cu_count, group_size, out_row_stride
     )
 
 
@@ -2238,10 +2240,14 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g
         in_bias: torch.Tensor | None,
         CuCount: int,
         group_size: int,
+        out_row_stride: int = 0,
     ) -> torch.Tensor:
         N = in_x.size(0)
         M = in_w.size(0)
-        return torch.empty((N, M), dtype=in_x.dtype, device=in_x.device)
+        out = torch.empty(
+            (N, out_row_stride or M), dtype=in_x.dtype, device=in_x.device
+        )
+        return out[:, :M]
 
 
 def fused_moe_wvSplitK_int4_gemm(

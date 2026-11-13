@@ -82,7 +82,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.def(
       "wvSplitK_int4_g(Tensor in_w, Tensor in_x, Tensor in_scale, "
       "Tensor? in_zero_points, Tensor? in_bias, int CuCount, "
-      "int group_size) -> Tensor");
+      "int group_size, int out_row_stride=0) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
   // Fused MoE wrapper around wvSplitK_int4_g: iterates expert runs in C++

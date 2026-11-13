@@ -61,7 +61,8 @@ torch::Tensor wvSplitK_int4g_sweep(
       wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, \
                             _N, _GS><<<grid, block, 0, stream>>>(             \
           K_in, M_in, 1, 1, wptr, aptr, sptr, nullptr, biasptr, cptr,         \
-          __wvPrGrp, CuCount, b_row_stride_bytes_i32, in_scale.stride(0));    \
+          __wvPrGrp, CuCount, b_row_stride_bytes_i32, in_scale.stride(0),     \
+          M_in);                                                              \
     }
 
   #define SWEEP_G_N(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _GS)       \
