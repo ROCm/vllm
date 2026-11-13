@@ -138,6 +138,7 @@ MoEBackend = Literal[
     "flydsl",
     "hpc",
     "emulation",
+    "hipblaslt",
 ]
 
 LinearBackend = Literal[
@@ -214,6 +215,8 @@ class KernelConfig:
     - "hpc": Use HPC kernels (FP8 and Hopper only)
     - "emulation": use BF16/FP16 GEMM, dequantizing weights and
                    running QDQ on activations.
+    - "hipblaslt": Use hipBLASLt W4A16 GEMMs (ROCm, int4 weight-only;
+                   requires cudagraph_mode NONE)
     """
 
     linear_backend: LinearBackend = "auto"

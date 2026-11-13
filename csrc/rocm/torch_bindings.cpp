@@ -216,6 +216,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "hipblaslt_w4a16_gemm(Tensor a, Tensor b_q, Tensor scale,"
       "                     int group_size, bool has_zp) -> Tensor");
   rocm_ops.impl("hipblaslt_w4a16_gemm", torch::kCUDA, &hipblaslt_w4a16_gemm);
+  rocm_ops.def(
+      "hipblaslt_w4a16_moe_gemm(Tensor(a!) out, Tensor x, Tensor w,"
+      "                         Tensor scale, Tensor counts, int group_size,"
+      "                         bool has_zp) -> bool");
+  rocm_ops.impl("hipblaslt_w4a16_moe_gemm", torch::kCUDA,
+                &hipblaslt_w4a16_moe_gemm);
 #endif
 }
 

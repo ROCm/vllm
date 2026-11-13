@@ -25,10 +25,12 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
 
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <vector>
 
 namespace {
 
@@ -198,6 +200,88 @@ void* workspace_for(size_t bytes, const torch::Tensor& like) {
   return ws.data_ptr();
 }
 
+// Runs one planned GEMM: out (N x M) = dequant(w) * x (K x M).
+void run_plan(Plan& plan, const void* w, const void* x, void* out, int64_t M,
+              const void* scale_ptr, const torch::Tensor& like) {
+  LT_CHECK(hipblasLtMatmulDescSetAttribute(
+      plan.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_ptr,
+      sizeof(scale_ptr)));
+  // B and D are (K x M) and (N x M): only the column count varies per call.
+  const uint64_t cols = static_cast<uint64_t>(M);
+  LT_CHECK(hipblasLtMatrixLayoutSetAttribute(
+      plan.layout_b, HIPBLASLT_MATRIX_LAYOUT_COLS, &cols, sizeof(cols)));
+  LT_CHECK(hipblasLtMatrixLayoutSetAttribute(
+      plan.layout_d, HIPBLASLT_MATRIX_LAYOUT_COLS, &cols, sizeof(cols)));
+  const float alpha = 1.0f, beta = 0.0f;
+  LT_CHECK(hipblasLtMatmul(
+      lt_handle(), plan.desc, &alpha, w, plan.layout_a, x, plan.layout_b, &beta,
+      out, plan.layout_d, out, plan.layout_d, &plan.algo,
+      workspace_for(plan.workspace_bytes, like), plan.workspace_bytes,
+      at::cuda::getCurrentCUDAStream()));
+}
+
+// One hipblaslt_ext::GroupedGemm over the experts in `experts`. Returns false
+// if hipBLASLt rejects the problem or has no grouped solution. Uses the typed
+// API: the descriptor-based GroupedGemm constructor requires typeA == typeB.
+bool run_grouped(const torch::Tensor& out, const torch::Tensor& x,
+                 const torch::Tensor& w, const torch::Tensor& scale,
+                 const std::vector<int64_t>& experts,
+                 const std::vector<int64_t>& offsets,
+                 const std::vector<int64_t>& counts, int64_t group_size,
+                 bool has_zp, int64_t lda) {
+  const int64_t N = out.size(1), K = x.size(1);
+  const size_t G = experts.size();
+  const hipDataType act = hip_type_of(x.scalar_type());
+  const float one = 1.0f, zero = 0.0f;
+  std::vector<int64_t> m(G, N), n(counts), k(G, K), batch(G, 1);
+  std::vector<int64_t> v_lda(G, lda), v_ldb(G, K), v_ldc(G, N);
+  std::vector<int64_t> s_a(G, lda * N), s_b(G), s_c(G);
+  std::vector<hipblaslt_ext::GemmEpilogue> epilogue(G);
+  std::vector<hipblaslt_ext::GemmInputs> inputs(G);
+  const auto mode = scale_mode_of(x.scalar_type(), group_size, has_zp);
+  for (size_t i = 0; i < G; ++i) {
+    s_b[i] = K * n[i];
+    s_c[i] = N * n[i];
+    epilogue[i].setScalingAType(mode);
+    void* o = static_cast<char*>(out.data_ptr()) +
+              offsets[i] * N * out.element_size();
+    inputs[i].setA(w[experts[i]].const_data_ptr());
+    inputs[i].setB(static_cast<const char*>(x.const_data_ptr()) +
+                   offsets[i] * K * x.element_size());
+    inputs[i].setC(o);
+    inputs[i].setD(o);
+    inputs[i].setAlpha(&one);
+    inputs[i].setBeta(&zero);
+    inputs[i].setScaleA(scale[experts[i]].const_data_ptr());
+  }
+  try {
+    hipblaslt_ext::GemmProblemType type(HIPBLAS_OP_T, HIPBLAS_OP_N, HIP_R_4I,
+                                        act, act, act, HIPBLAS_COMPUTE_32F);
+    type.setInt4EncodingA(HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT);
+    hipblaslt_ext::GroupedGemm gg(lt_handle(), HIPBLAS_OP_T, HIPBLAS_OP_N,
+                                  HIP_R_4I, act, act, act, HIPBLAS_COMPUTE_32F);
+    if (gg.setProblem(m, n, k, batch, v_lda, v_ldb, v_ldc, v_ldc, s_a, s_b, s_c,
+                      s_c, epilogue, inputs, type) != HIPBLAS_STATUS_SUCCESS)
+      return false;
+    hipblaslt_ext::GemmPreference pref;
+    pref.setMaxWorkspaceBytes(kMaxWorkspaceBytes);
+    std::vector<hipblasLtMatmulHeuristicResult_t> res;
+    if (gg.algoGetHeuristic(1, pref, res) != HIPBLAS_STATUS_SUCCESS ||
+        res.empty())
+      return false;
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    LT_CHECK(gg.initialize(res[0].algo, workspace_for(res[0].workspaceSize, x),
+                           false, stream));
+    LT_CHECK(gg.run(stream));
+    return true;
+  } catch (const std::exception& e) {
+    TORCH_WARN_ONCE("hipBLASLt GroupedGemm failed: ", e.what());
+  } catch (...) {
+    TORCH_WARN_ONCE("hipBLASLt GroupedGemm threw a non-std exception");
+  }
+  return false;
+}
+
 }  // namespace
 
 torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a, const torch::Tensor& b_q,
@@ -246,24 +330,65 @@ torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a, const torch::Tensor& 
   Plan& plan =
       get_plan(a.scalar_type(), M, N, K, lda, group_size, has_zp, scale_ptr);
 
-  LT_CHECK(hipblasLtMatmulDescSetAttribute(
-      plan.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_POINTER, &scale_ptr,
-      sizeof(scale_ptr)));
-
-  // B and D are (K x M) and (N x M): only the column count varies per call.
-  const uint64_t cols = static_cast<uint64_t>(M);
-  LT_CHECK(hipblasLtMatrixLayoutSetAttribute(
-      plan.layout_b, HIPBLASLT_MATRIX_LAYOUT_COLS, &cols, sizeof(cols)));
-  LT_CHECK(hipblasLtMatrixLayoutSetAttribute(
-      plan.layout_d, HIPBLASLT_MATRIX_LAYOUT_COLS, &cols, sizeof(cols)));
-
-  const float alpha = 1.0f, beta = 0.0f;
-  LT_CHECK(hipblasLtMatmul(lt_handle(), plan.desc, &alpha, b_q.const_data_ptr(),
-                           plan.layout_a, a.const_data_ptr(), plan.layout_b, &beta,
-                           out.data_ptr(), plan.layout_d, out.data_ptr(),
-                           plan.layout_d, &plan.algo,
-                           workspace_for(plan.workspace_bytes, a),
-                           plan.workspace_bytes,
-                           at::cuda::getCurrentCUDAStream()));
+  run_plan(plan, b_q.const_data_ptr(), a.const_data_ptr(), out.data_ptr(), M,
+           scale_ptr, a);
   return out;
+}
+
+// MoE expert GEMMs. Rows of x are sorted by expert; counts (CPU int64 [E]) is
+// the number of rows per expert. w: [E, N, K/2] int8, nibbles in K order.
+// scale: [E, bytes] uint8, one scale (+ zero-point) allocation per expert in
+// the layout of hipblaslt_w4a16_gemm. Tries one grouped GEMM over the active
+// experts, else one dense GEMM per expert. Returns whether grouped ran.
+bool hipblaslt_w4a16_moe_gemm(torch::Tensor& out, const torch::Tensor& x,
+                              const torch::Tensor& w,
+                              const torch::Tensor& scale,
+                              const torch::Tensor& counts, int64_t group_size,
+                              bool has_zp) {
+  TORCH_CHECK(x.dim() == 2 && out.dim() == 2 && w.dim() == 3);
+  TORCH_CHECK(x.is_contiguous() && out.is_contiguous(),
+              "x and out must be contiguous");
+  TORCH_CHECK(w.scalar_type() == at::kChar && w.stride(2) == 1,
+              "packed weights must be int8 with contiguous rows");
+  TORCH_CHECK(scale.dim() == 2 && scale.size(0) == w.size(0));
+  TORCH_CHECK(counts.device().is_cpu() && counts.scalar_type() == at::kLong &&
+                  counts.numel() == w.size(0),
+              "counts must be a CPU int64 tensor with one entry per expert");
+  const int64_t N = out.size(1), K = x.size(1);
+  TORCH_CHECK(w.size(1) == N && w.size(2) * 2 == K, "w must be [E, N, K/2]");
+  TORCH_CHECK(group_size > 0 && K % group_size == 0);
+  const int64_t lda = w.stride(1) * 2;
+
+  const int64_t* c = counts.const_data_ptr<int64_t>();
+  std::vector<int64_t> experts, offsets, ns;
+  int64_t off = 0;
+  for (int64_t e = 0; e < counts.numel(); ++e) {
+    if (c[e] > 0) {
+      experts.push_back(e);
+      offsets.push_back(off);
+      ns.push_back(c[e]);
+    }
+    off += c[e];
+  }
+  TORCH_CHECK(off == x.size(0) && off == out.size(0), "counts sum to ", off,
+              ", x has ", x.size(0), " rows");
+  if (experts.empty()) return false;
+
+  const at::cuda::OptionalCUDAGuard guard(device_of(x));
+  if (run_grouped(out, x, w, scale, experts, offsets, ns, group_size, has_zp,
+                  lda))
+    return true;
+
+  for (size_t i = 0; i < experts.size(); ++i) {
+    const void* scale_ptr = scale[experts[i]].const_data_ptr();
+    Plan& plan = get_plan(x.scalar_type(), ns[i], N, K, lda, group_size, has_zp,
+                          scale_ptr);
+    run_plan(plan, w[experts[i]].const_data_ptr(),
+             static_cast<const char*>(x.const_data_ptr()) +
+                 offsets[i] * K * x.element_size(),
+             static_cast<char*>(out.data_ptr()) +
+                 offsets[i] * N * out.element_size(),
+             ns[i], scale_ptr, x);
+  }
+  return false;
 }

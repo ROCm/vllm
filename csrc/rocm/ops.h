@@ -158,4 +158,9 @@ torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a,
                                    const torch::Tensor& b_q,
                                    const torch::Tensor& scale,
                                    int64_t group_size, bool has_zp);
+bool hipblaslt_w4a16_moe_gemm(torch::Tensor& out, const torch::Tensor& x,
+                              const torch::Tensor& w,
+                              const torch::Tensor& scale,
+                              const torch::Tensor& counts, int64_t group_size,
+                              bool has_zp);
 #endif
