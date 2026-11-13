@@ -271,7 +271,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     # num_tokens·top_k + E·(BLOCK_M−1); for large-E models (Qwen3.5-
     # A3B has E=256) the second term dominates, so a smaller BLOCK_M
     # shrinks num_slots dramatically (33536 → 8960 = 4×) and slashes
-    # padding-block dispatch overhead.  Per-shape sweep on Strix Halo
+    # padding-block dispatch overhead.  Per-shape sweep on gfx1151
     # (Qwen3.5-A3B gemm1 K=2048 N=1024 + gemm2 K=512 N=2048, E=256)
     # found BLOCK_M=32 wins ~2× on gemm1 and ~4-5× on gemm2 across the
     # full routing-density range, reproducible via
@@ -282,10 +282,15 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     # neutral (not measured in this PR).
     TRITON_BLOCK_SIZE_M = 32
 
-    # Alignment for the group_size <= SMALL_GROUP_SIZE_THRESHOLD branch
-    # of _triton_config.  Must be lcm of the BLOCK_SIZE_M values that
-    # branch emits (128 for gemm1, 64 for gemm2).
-    TRITON_BLOCK_SIZE_M_SMALL_GS = 128
+    # Alignments for the group_size <= SMALL_GROUP_SIZE_THRESHOLD branch
+    # of _triton_config; each must be a multiple of the BLOCK_SIZE_M values
+    # that branch emits for it.  moe_align_block_size pads every touched
+    # expert to a full block, and all-padding blocks still run the full
+    # K-contraction, so a short prefill on a large-E model mostly computes
+    # padding.  Use the smaller alignment until experts average a full
+    # block; below 64 the M-tile can't amortize the INT4 dequant.
+    TRITON_BLOCK_SIZE_M_SMALL_GS = 64
+    TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE = 128
 
     # group_size <= THRESHOLD uses the small-gs _triton_config branch;
     # > THRESHOLD uses the default.  Boundary between 32 and 128.
@@ -296,12 +301,17 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
 
         Decode (num_tokens <= MAX_SKINNY_BATCH_SIZE): small block sizes
         compatible with the wvSplitK_int4 HIP kernel.
-        Prefill: TRITON_BLOCK_SIZE_M (or TRITON_BLOCK_SIZE_M_SMALL_GS for small
-        group_size). The rdna_moe_gemm WMMA gemm1 and the Triton gemm2 share this one
-        alignment.
+        Prefill: TRITON_BLOCK_SIZE_M, or for small group_size the
+        padding-aware pair TRITON_BLOCK_SIZE_M_SMALL_GS{,_LARGE} chosen on
+        routed tokens per expert (see those constants). The rdna_moe_gemm WMMA
+        gemm1 and the Triton gemm2 share this one alignment.
         """
         if num_tokens > HybridW4A16MoEExperts.MAX_SKINNY_BATCH_SIZE:
             if self._group_size <= HybridW4A16MoEExperts.SMALL_GROUP_SIZE_THRESHOLD:
+                large = HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE
+                # Average routed rows per expert.
+                if num_tokens * topk / E >= large:
+                    return large
                 return HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M_SMALL_GS
             return HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M
         if num_tokens > 1:
@@ -375,7 +385,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     ) -> dict:
         """Return Triton kernel config for shuffle-packed MoE prefill.
 
-        Returns a per-K config tuned on Strix Halo (gfx1151) for the
+        Returns a per-K config tuned on gfx1151 for the
         Qwen3.5-A3B prefill MoE shapes (gemm1: K=hidden=2048; gemm2:
         K=intermediate=512).  See the K<1024 and K>=1024 branches below
         for the exact (BN, BK, GM, nw, ns) tuples and their per-shape
@@ -386,36 +396,53 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         sized for the alignment block_size_m used by moe_align_block_size.
         apply() handles the BLOCK_M < align_block_size_m case by
         repeat-interleaving expert_ids; for that to be valid we require
-        BLOCK_SIZE_M divides align_block_size_m.  Today we only emit
-        BLOCK_SIZE_M = align_block_size_m so this is a no-op, but the
-        infrastructure stays in place to enable future per-gemm BLOCK_M
-        tuning when paired with per-gemm alignment.
+        BLOCK_SIZE_M divides align_block_size_m.  The small-group-size
+        branch below relies on that (BLOCK_SIZE_M=64 for gemm2 at either
+        alignment) and picks its gemm1 tile from align_block_size_m.
         """
         BLOCK_SIZE_K = self._group_size  # = 128 for the Qwen3.5-A3B path
         assert BLOCK_SIZE_K % 8 == 0
 
         if self._group_size <= HybridW4A16MoEExperts.SMALL_GROUP_SIZE_THRESHOLD:
-            # gemm2 BM=64 < alignment=128; apply()'s _expert_ids_for
-            # repeat_interleaves expert_ids to compensate.
+            # Tuned on gfx1151 for Qwen3-30B-A3B AWQ (group_size=32, E=128)
+            # across the whole prefill batch range.  Unlike the narrower tiles
+            # in the large-group branch below, these benefit from num_stages>1.
+            align = align_block_size_m or self.TRITON_BLOCK_SIZE_M_SMALL_GS
+            small_align = align <= self.TRITON_BLOCK_SIZE_M_SMALL_GS
             if K < 1024:
+                # gemm2, same tile at both alignments.  BLOCK_SIZE_M=64 <
+                # alignment 128 is handled by apply()'s _expert_ids_for.
                 return dict(
                     BLOCK_SIZE_M=64,
-                    BLOCK_SIZE_N=64,
+                    BLOCK_SIZE_N=128,
                     BLOCK_SIZE_K=BLOCK_SIZE_K,
                     GROUP_SIZE_M=1,
-                    num_warps=4,
-                    num_stages=1,
+                    num_warps=8,
+                    num_stages=4,
                 )
+            if small_align:
+                # gemm1 at alignment 64: with the padding gone it is bound
+                # by the per-block INT4 load + dequant, so it wants a
+                # narrower tile than at alignment 128.
+                return dict(
+                    BLOCK_SIZE_M=64,
+                    BLOCK_SIZE_N=32,
+                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    GROUP_SIZE_M=1,
+                    num_warps=2,
+                    num_stages=4,
+                )
+            # gemm1 at alignment 128
             return dict(
                 BLOCK_SIZE_M=128,
                 BLOCK_SIZE_N=64,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 GROUP_SIZE_M=1,
                 num_warps=8,
-                num_stages=1,
+                num_stages=2,
             )
 
-        # Per-shape sweep on Strix Halo (gfx1151) at BLOCK_M=32 (the
+        # Per-shape sweep on gfx1151 at BLOCK_M=32 (the
         # current alignment), using benchmarks/kernels/
         # sweep_int4g_moe_kernel.py + a per-shape direct call to
         # invoke_fused_moe_kernel_hybrid_triton.  The two K ranges
@@ -441,7 +468,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             )
         # gemm1-style: long contraction (K >= 1024).  The best tile
         # grows with M (M_routed = num_tokens * top_k; see apply()), per
-        # a bf16/fp16 sweep on Strix Halo (gfx1151) of gemm1 with K=2048,
+        # a bf16/fp16 sweep on gfx1151 of gemm1 with K=2048,
         # N=1024/1536, E=256/128, group=128.
         if M is None or M < 8192:
             block_n, block_k = 16, BLOCK_SIZE_K

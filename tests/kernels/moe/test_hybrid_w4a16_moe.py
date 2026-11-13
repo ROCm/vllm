@@ -245,6 +245,19 @@ def test_hybrid_w4a16_moe(m: int, n: int, k: int, e: int, topk: int, group_size:
     not current_platform.is_rocm(),
     reason="HybridW4A16MoEExperts requires ROCm",
 )
+def test_hybrid_w4a16_moe_small_gs_large_alignment():
+    """Small group_size at >= one full alignment block of routed rows per
+    expert, so prefill takes the alignment-128 tiles (K >= 1024 for gemm1)."""
+    m, n, k, e, topk, group_size = 512, 768, 2048, 8, 2, 32
+    assert m * topk / e >= HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE
+    hybrid_out, torch_output = _run_hybrid_moe(m, n, k, e, topk, group_size)
+    torch.testing.assert_close(hybrid_out, torch_output, atol=2e-2, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="HybridW4A16MoEExperts requires ROCm",
+)
 @pytest.mark.parametrize("m", [1, 4, 16])
 @pytest.mark.parametrize("n,k", [(256, 256)])
 @pytest.mark.parametrize("e,topk", [(8, 2)])
