@@ -9,6 +9,12 @@ import pytest
 import torch
 
 import vllm.models.muse_spark.amd.model as amd_model
+from vllm.model_executor.model_loader.reload import (
+    finish_reload,
+    record_metadata_for_reloading,
+    start_reload,
+)
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.models.muse_spark.amd.model import (
     MuseSparkForCausalLM,
     MuseSparkModel,
@@ -17,6 +23,7 @@ from vllm.models.muse_spark.amd.multimodal import MuseSparkForConditionalGenerat
 from vllm.models.muse_spark.amd.muse_moe_runner import (
     MuseSparkRoutedExperts,
 )
+from vllm.models.muse_spark.common.layers import MuseSparkQKVOGateParallelLinear
 from vllm.models.muse_spark.common.moe import MuseSparkConsolidatedRoutedExperts
 from vllm.platforms import current_platform
 
@@ -235,6 +242,69 @@ def test_router_weight_reload_refolds_and_preserves_planes(monkeypatch) -> None:
         moe.fold_router_output_multiplier()
         torch.testing.assert_close(moe.router.weight, expected)
         assert moe._router_planes.data_ptr() == planes_ptr
+
+
+class _QKVOModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.qkv_proj = MuseSparkQKVOGateParallelLinear(
+            hidden_size=8,
+            head_size=4,
+            total_num_heads=4,
+            total_num_kv_heads=2,
+            tp_rank=1,
+            tp_size=2,
+        )
+
+    def load_weights(self, weights) -> set[str]:
+        def with_shard_ids():
+            for shard_id, weight in weights:
+                weight.shard_id = shard_id
+                yield "weight", weight
+
+        return set(self.qkv_proj.load_weights(with_shard_ids()))
+
+
+def _qkvo_checkpoint(seed: int) -> dict[str, torch.Tensor]:
+    gen = torch.Generator().manual_seed(seed)
+    rows = {"q": 16, "k": 8, "v": 8, "o_gate": 16}
+    return {shard: torch.randn(n, 8, generator=gen) for shard, n in rows.items()}
+
+
+def _qkvo_rank1_rows(checkpoint: dict[str, torch.Tensor]) -> torch.Tensor:
+    return torch.cat([t[t.shape[0] // 2 :] for t in checkpoint.values()])
+
+
+@pytest.mark.parametrize("mode", ["direct", "layerwise"])
+def test_qkvo_gate_reload_loads_new_weights(monkeypatch, mode) -> None:
+    """A reload with different weights updates the fused QKV+O-gate rows in
+    place, in both reload modes."""
+    monkeypatch.setenv("VLLM_RELOAD_MODE", mode)
+    for target in (
+        "vllm.model_executor.layers.linear",
+        "vllm.model_executor.parameter",
+    ):
+        monkeypatch.setattr(f"{target}.get_tensor_model_parallel_rank", lambda: 1)
+        monkeypatch.setattr(f"{target}.get_tensor_model_parallel_world_size", lambda: 2)
+    model_config = SimpleNamespace(
+        word_embeddings_untied_by_checkpoint=False,
+        quantization=None,
+        dtype=torch.float32,
+    )
+    device = torch.device("cpu")
+    model = _QKVOModel()
+    record_metadata_for_reloading(model)
+    model.load_weights(_qkvo_checkpoint(seed=0).items())
+    process_weights_after_loading(model, model_config, device)
+    ptr = model.qkv_proj.weight.data_ptr()
+
+    start_reload(model)
+    new = _qkvo_checkpoint(seed=1)
+    model.load_weights(new.items())
+    finish_reload(model, model_config, device)
+
+    torch.testing.assert_close(model.qkv_proj.weight, _qkvo_rank1_rows(new))
+    assert model.qkv_proj.weight.data_ptr() == ptr
 
 
 @pytest.mark.parametrize(
