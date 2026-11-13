@@ -818,7 +818,8 @@ def invoke_fused_moe_wna16_triton_kernel(
 
     E, N, K = B.size(0), B.size(1), A.size(1)
     with record_function_or_nullcontext(
-        f"fused_moe_gptq_awq {M}x{N}x{K} E={E} top_k={top_k}"
+        f"fused_moe_gptq_awq {M}x{N}x{K} E={E} top_k={top_k} "
+        f"g={block_shape[1]} {'asym' if B_zp is not None else 'sym'}"
     ):
         fused_moe_kernel_gptq_awq[grid](
             A,
