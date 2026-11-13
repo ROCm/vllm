@@ -9,7 +9,6 @@ from compressed_tensors.quantization import (
     QuantizationArgs,
 )
 
-import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
@@ -431,75 +430,29 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         the HIP skinny kernel uses HAS_ZERO_POINTS=false with hardcoded
         bias=8, and the Triton kernel uses ZP_BIAS=8.
         """
-        from vllm.model_executor.kernels.linear.mixed_precision import (
-            rdna_hybrid_w4a16,
-        )
-
-        pack_int4_exllama_shuffle = rdna_hybrid_w4a16.pack_int4_exllama_shuffle
-        from vllm.model_executor.layers.fused_moe.all2all_utils import (
-            maybe_make_prepare_finalize,
-        )
         from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
-            HybridW4A16MoEExperts,
+            make_hybrid_w4a16_moe_kernel,
+            pack_hybrid_w4a16_moe_weight,
         )
         from vllm.model_executor.layers.quantization.utils.quant_utils import (
             unpack_quantized_values_into_int32,
         )
         from vllm.scalar_type import scalar_types
 
-        wtype = scalar_types.uint4
+        def unpack(w: torch.Tensor) -> torch.Tensor:
+            return unpack_quantized_values_into_int32(
+                w, scalar_types.uint4, packed_dim=1
+            )
 
-        from vllm.platforms.rocm import on_gfx1151
-
-        def _pad_rows_off_cliff(w: torch.Tensor) -> torch.Tensor:
-            """gfx11x cache cliff: the skinny weight row stride K//8 (and the
-            per-expert stride N*K//8) land on power-of-2 byte alignments that
-            collide in L2/MALL. Offset the row stride by one cache line (+128 B
-            = +32 int32) via a padded buffer, returning a view of logical shape
-            [E, N, K//8] -- the stride jumps over the pad, the kernels iterate
-            only the real K//8 (zero extra FLOPs). Stride-aware on both paths:
-            the Triton kernel reads B.stride(0/1/2); the HIP skinny kernel takes
-            an explicit B_row_stride_bytes.
-            """
-            E_dim, N_dim, k8 = w.shape
-            if not (on_gfx1151() and w.device.type == "cuda"):
-                return w
-            # The cliff is at a 2048-byte row stride: only those collide in
-            # L2/MALL, off-cliff shapes gain nothing and padding them just
-            # wastes memory + a copy. The row byte stride is k8 * element width.
-            if (k8 * w.element_size()) % 2048 != 0:
-                return w
-            pad = 32
-            buf = torch.empty((E_dim, N_dim, k8 + pad), dtype=w.dtype, device=w.device)
-            buf[:, :, :k8].copy_(w)
-            return buf[:, :, :k8]
-
-        def convert_weights(w_packed: torch.Tensor) -> torch.Tensor:
-            """Repack [E, N, K//8] with the ExLlama shuffle."""
-            E_dim = w_packed.size(0)
-            experts = []
-            for e in range(E_dim):
-                unpacked = unpack_quantized_values_into_int32(
-                    w_packed[e], wtype, packed_dim=1
-                )
-                repacked = pack_int4_exllama_shuffle(unpacked)
-                experts.append(repacked)
-            return _pad_rows_off_cliff(torch.stack(experts))
-
-        replace_parameter(
-            layer,
-            "w13_weight_packed",
-            torch.nn.Parameter(
-                convert_weights(layer.w13_weight_packed), requires_grad=False
-            ),
-        )
-        replace_parameter(
-            layer,
-            "w2_weight_packed",
-            torch.nn.Parameter(
-                convert_weights(layer.w2_weight_packed), requires_grad=False
-            ),
-        )
+        for name in ("w13_weight_packed", "w2_weight_packed"):
+            replace_parameter(
+                layer,
+                name,
+                torch.nn.Parameter(
+                    pack_hybrid_w4a16_moe_weight(getattr(layer, name), unpack),
+                    requires_grad=False,
+                ),
+            )
 
         layer.use_hybrid_w4a16_moe = True
 
@@ -507,23 +460,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         assert self.moe_quant_config is not None
         layer.w13_weight = layer.w13_weight_packed
         layer.w2_weight = layer.w2_weight_packed
-
-        # Build the modular kernel directly so the runner uses the hybrid
-        # experts even on single-GPU deployments (no DP/EP), where the
-        # legacy select_gemm_impl path is not invoked.
-        prepare_finalize = maybe_make_prepare_finalize(
-            moe=self.moe,
-            quant_config=self.moe_quant_config,
-            routing_tables=layer._expert_routing_tables(),
-            allow_new_interface=True,
-            use_monolithic=False,
-        )
-        assert prepare_finalize is not None
-        self.moe_kernel = mk.FusedMoEKernel(
-            prepare_finalize,
-            HybridW4A16MoEExperts(
-                moe_config=self.moe, quant_config=self.moe_quant_config
-            ),
+        self.moe_kernel = make_hybrid_w4a16_moe_kernel(
+            self.moe, self.moe_quant_config, layer
         )
 
     def get_fused_moe_quant_config(

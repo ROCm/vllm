@@ -4,7 +4,7 @@
 
 Validates the hybrid MoE kernel by:
 1. Creating random fp16 MoE weights
-2. Quantizing them to symmetric 4-bit with group_size=32 or 128
+2. Quantizing them to symmetric (or asymmetric) 4-bit, group_size=32 or 128
 3. Packing into ExLlama shuffle format [E, N, K//8] int32
 4. Running HybridW4A16MoEExperts via FusedMoEModularKernel
 5. Comparing against torch_experts reference using dequantized weights
@@ -45,36 +45,49 @@ NUM_BITS = 4
 PACK_FACTOR = 32 // NUM_BITS  # 8 nibbles per int32
 
 
-def _symmetric_quantize_4bit_skinny(
+def _quantize_4bit_skinny(
     w: torch.Tensor,
     group_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Symmetric 4-bit quantization → skinny ExLlama format.
+    asym: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """4-bit quantization → skinny ExLlama format.
 
-    Input:  w [K, N] fp16
+    Input:  w [K, N]
+
     Returns:
       q_skinny: [N, K//8] int32 (ExLlama shuffle packed)
-      scales:   [N, K//G] fp16 (skinny layout)
-      w_ref:    [K, N] fp16 (dequantized reference)
+      scales:   [N, K//G] (skinny layout)
+      w_ref:    [K, N] (dequantized reference)
+      zp:       [N//8, K//G] int32 packed zero points (asym), else None
+
     """
     K, N = w.shape
     assert K % group_size == 0
     num_groups = K // group_size
 
     w_grouped = w.reshape(num_groups, group_size, N)
-    abs_max = w_grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)
-    scales = abs_max / 7.0
-
-    # Quantize to unsigned [0, 15] with zero_point = 8
-    w_q = torch.round(w_grouped / scales).clamp(-7, 7).int() + 8
-    w_q = w_q.reshape(K, N)
+    if asym:
+        w_min = w_grouped.amin(dim=1, keepdim=True)
+        w_max = w_grouped.amax(dim=1, keepdim=True)
+        scales = ((w_max - w_min) / 15.0).clamp(min=1e-5)
+        zp = torch.round(-w_min / scales).clamp(0, 15).int()
+        w_q = (torch.round(w_grouped / scales).int() + zp).clamp(0, 15)
+    else:
+        abs_max = w_grouped.abs().amax(dim=1, keepdim=True).clamp(min=1e-5)
+        scales = abs_max / 7.0
+        zp = torch.full_like(scales, 8, dtype=torch.int32)
+        w_q = torch.round(w_grouped / scales).clamp(-7, 7).int() + 8
 
     # Dequantized reference
-    w_ref = (
-        ((w_q.float() - 8.0).reshape(num_groups, group_size, N) * scales)
-        .reshape(K, N)
-        .half()
-    )
+    w_ref = ((w_q - zp).float() * scales).reshape(K, N).to(w.dtype)
+    w_q = w_q.reshape(K, N)
+
+    zp_packed = None
+    if asym:
+        # [G, 1, N] -> [N//8, 8, G]; row n at nibble n % 8.
+        zp_n = zp.squeeze(1).t().reshape(N // 8, 8, num_groups)
+        shifts = (4 * torch.arange(8, device=w.device, dtype=torch.int32))[:, None]
+        zp_packed = (zp_n << shifts).sum(dim=1, dtype=torch.int32)
 
     # Pack into ExLlama shuffle: transpose to [N, K], pack to [N, K//8]
     w_q_uint4 = w_q.to(torch.uint8)  # values in [0, 15]
@@ -84,7 +97,7 @@ def _symmetric_quantize_4bit_skinny(
     # Scales: [num_groups, N] → [N, num_groups] (skinny layout)
     scales_skinny = scales.squeeze(1).t().contiguous()  # [N, K//G]
 
-    return q_skinny, scales_skinny, w_ref
+    return q_skinny, scales_skinny, w_ref, zp_packed
 
 
 def _make_hybrid_moe_weights(
@@ -93,30 +106,28 @@ def _make_hybrid_moe_weights(
     N: int,
     group_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dtype: torch.dtype = torch.float16,
+    asym: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Create fake skinny-packed MoE weights for E experts.
 
-    Returns (w_skinny, scales, w_ref) where:
+    Returns (w_skinny, scales, w_ref, zp) where:
     - w_skinny: [E, N, K//8] int32 (ExLlama shuffle packed)
-    - scales:   [E, N, K//G] fp16 (skinny layout)
-    - w_ref:    [E, N, K] fp16 (torch_experts convention)
+    - scales:   [E, N, K//G] (skinny layout)
+    - w_ref:    [E, N, K] (torch_experts convention)
+    - zp:       [E, N//8, K//G] int32 (asym), else None
     """
-    all_skinny = []
-    all_scales = []
-    all_ref = []
-
+    experts = []
     for _ in range(E):
-        w_fp = torch.randn(K, N, device=device, dtype=torch.float16) / 10.0
-        q_skinny, scales, w_ref = _symmetric_quantize_4bit_skinny(w_fp, group_size)
-        all_skinny.append(q_skinny)
-        all_scales.append(scales)
-        all_ref.append(w_ref.t())  # transpose to [N, K] for torch_experts
+        w_fp = torch.randn(K, N, device=device, dtype=dtype) / 10.0
+        experts.append(_quantize_4bit_skinny(w_fp, group_size, asym))
 
-    w_skinny = torch.stack(all_skinny)  # [E, N, K//8]
-    w_scales = torch.stack(all_scales)  # [E, N, K//G]
-    w_ref = torch.stack(all_ref)  # [E, N, K]
+    w_skinny = torch.stack([x[0] for x in experts])
+    w_scales = torch.stack([x[1] for x in experts])
+    w_ref = torch.stack([x[2].t() for x in experts])  # [N, K] for torch_experts
+    w_zp = torch.stack([x[3] for x in experts]) if asym else None
 
-    return w_skinny, w_scales, w_ref
+    return w_skinny, w_scales, w_ref, w_zp
 
 
 def _run_hybrid_moe(
@@ -128,6 +139,8 @@ def _run_hybrid_moe(
     group_size: int,
     force_triton: bool = False,
     force_hip: bool = False,
+    dtype: torch.dtype = torch.float16,
+    asym: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build weights, run HybridW4A16MoEExperts and torch_experts reference.
 
@@ -144,22 +157,24 @@ def _run_hybrid_moe(
     assert k % group_size == 0
 
     # w1: gate+up projection [E, 2*N, K//8], ref [E, 2*N, K]
-    w1_skinny, w1_scales, w1_ref = _make_hybrid_moe_weights(
-        e, k, 2 * n, group_size, device
+    w1_skinny, w1_scales, w1_ref, w1_zp = _make_hybrid_moe_weights(
+        e, k, 2 * n, group_size, device, dtype, asym
     )
     # w2: down projection [E, K, N//8], ref [E, K, N]
-    w2_skinny, w2_scales, w2_ref = _make_hybrid_moe_weights(e, n, k, group_size, device)
+    w2_skinny, w2_scales, w2_ref, w2_zp = _make_hybrid_moe_weights(
+        e, n, k, group_size, device, dtype, asym
+    )
 
-    hidden = torch.randn(m, k, device=device, dtype=torch.float16) / 10
-    scores = torch.randn(m, e, device=device, dtype=torch.float16)
+    hidden = torch.randn(m, k, device=device, dtype=dtype) / 10
+    scores = torch.randn(m, e, device=device, dtype=dtype)
 
     topk_weights, topk_ids, _ = fused_topk(hidden, scores, topk, False)
 
     quant_config = int4_w4a16_moe_quant_config(
         w1_scale=w1_scales,
         w2_scale=w2_scales,
-        w1_zp=None,
-        w2_zp=None,
+        w1_zp=w1_zp,
+        w2_zp=w2_zp,
         block_shape=[0, group_size],
     )
 
@@ -168,7 +183,7 @@ def _run_hybrid_moe(
         experts_per_token=topk,
         hidden_dim=k,
         intermediate_size=n,
-        in_dtype=torch.float16,
+        in_dtype=dtype,
     )
 
     experts = HybridW4A16MoEExperts(
@@ -286,5 +301,24 @@ def test_hybrid_w4a16_moe_force_hip(
     """Force the HIP wvSplitK path for all batch sizes (including m=64)."""
     hybrid_out, torch_output = _run_hybrid_moe(
         m, n, k, e, topk, group_size, force_hip=True
+    )
+    torch.testing.assert_close(hybrid_out, torch_output, atol=2e-2, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="HybridW4A16MoEExperts requires ROCm",
+)
+# m=64 / m=512 reach both small-group-size prefill alignments (64 and 128).
+@pytest.mark.parametrize("m", [1, 4, 64, 512])
+@pytest.mark.parametrize("n,k", [(256, 256), (1024, 2048), (2048, 512)])
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_hybrid_w4a16_moe_asym(
+    m: int, n: int, k: int, group_size: int, dtype: torch.dtype
+):
+    """Per-group zero points (AWQ) on both the HIP decode and Triton paths."""
+    hybrid_out, torch_output = _run_hybrid_moe(
+        m, n, k, 16, 4, group_size, dtype=dtype, asym=True
     )
     torch.testing.assert_close(hybrid_out, torch_output, atol=2e-2, rtol=0)

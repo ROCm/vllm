@@ -260,11 +260,14 @@ def fused_moe_kernel_gptq_awq(
             + offs_bn[None, :] * stride_bn
         )
 
-    if use_shuffle_w4a16 or not has_zp and use_int4_w4a16:
+    if not has_zp and use_int4_w4a16:
         b_zp_num = 8
     if not has_zp and use_int8_w8a16:
         b_zp_num = 128
-    elif has_zp and use_int4_w4a16 and not use_shuffle_w4a16:
+    elif has_zp and use_shuffle_w4a16:
+        # Packed zero points [E, N//8, K//G] int32, row n at nibble n % 8.
+        b_zp_shifter = (offs_bn % 8) * 4
+    elif has_zp and use_int4_w4a16:
         b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
     # -----------------------------------------------------------
@@ -309,8 +312,17 @@ def fused_moe_kernel_gptq_awq(
                 + g_idx * stride_bsk
             )
             b_scale = tl.load(b_scale_ptrs).to(tl.float32)
-            # Dequant: (nibble - 8) * scale
-            b_fp32 = (b.to(tl.float32) - b_zp_num) * b_scale[None, :]
+            if has_zp:
+                b_zp_ptrs = (
+                    b_zp_ptr
+                    + off_experts * stride_bze
+                    + (offs_bn // 8) * stride_bzn
+                    + g_idx * stride_bzk
+                )
+                b_zp = ((tl.load(b_zp_ptrs) >> b_zp_shifter) & 0xF).to(tl.float32)
+                b_fp32 = (b.to(tl.float32) - b_zp[None, :]) * b_scale[None, :]
+            else:
+                b_fp32 = (b.to(tl.float32) - b_zp_num) * b_scale[None, :]
             if compute_type == tl.bfloat16 and _TRITON_GE_3_9 and _target_is_gfx1x():
                 # Round to bf16, but not handling NaN.  Triton lowers the
                 # conversion to a rounding sequence that handles NaN.
@@ -875,15 +887,17 @@ def invoke_fused_moe_kernel_hybrid_triton(
     compute_type: tl.dtype,
     group_size: int,
     align_block_size_m: int,
+    B_zp: torch.Tensor | None = None,
 ):
     """Invoke fused MoE kernel for shuffle-packed INT4 weights [E, N, K//8].
 
     Uses fused_moe_kernel_gptq_awq with use_shuffle_w4a16=True to read
-    ExLlama-shuffle packed INT4 weights.  Symmetric quantization only
-    (zero-point bias = 8).
+    ExLlama-shuffle packed INT4 weights.
 
     B: [E, N, K//8] int32 — shuffle-packed weights
     B_scale: [E, N, K//G] fp16/bf16 — per-group scales
+    B_zp: [E, N//8, K//G] int32 — packed zero points (asymmetric), or None
+        for symmetric (zero-point bias = 8)
     align_block_size_m: padding alignment used by moe_align_block_size.
         Must be a multiple of config["BLOCK_SIZE_M"].  When the caller
         runs with BLOCK_SIZE_M < align_block_size_m, the EM tiny-batch
@@ -933,20 +947,24 @@ def invoke_fused_moe_kernel_hybrid_triton(
         _TRITON_GE_3_9 and A.dtype in (torch.bfloat16, torch.float16) and on_gfx1x()
     )
 
+    has_zp = B_zp is not None
+    zp_strides = (
+        (B_zp.stride(0), B_zp.stride(2), B_zp.stride(1))
+        if B_zp is not None
+        else (0, 0, 0)
+    )
     with record_function_or_nullcontext(
-        # Always "sym": this wrapper is symmetric-only by construction (it
-        # passes b_zp_ptr=None / has_zp=False and folds the zero-point bias
-        # into the constant 8), so there is no asymmetric variant to
-        # distinguish.  The marker is emitted anyway so the roofline tool can
-        # account the per-group scale bytes, which it cannot infer from MxNxK.
-        f"hybrid_triton_moe {M}x{N}x{K} E={E} top_k={top_k} g={group_size} sym"
+        # sym/asym lets the roofline tool account the per-group scale (and
+        # zero-point) bytes, which it cannot infer from MxNxK.
+        f"hybrid_triton_moe {M}x{N}x{K} E={E} top_k={top_k} g={group_size} "
+        f"{'asym' if has_zp else 'sym'}"
     ):
         fused_moe_kernel_gptq_awq[grid](
             A,
             B,
             C,
             B_scale,
-            None,  # b_zp_ptr — symmetric only
+            B_zp,
             topk_weights,
             sorted_token_ids,
             expert_ids,
@@ -965,15 +983,13 @@ def invoke_fused_moe_kernel_hybrid_triton(
             B_scale.stride(0),  # stride_bse
             B_scale.stride(2),  # stride_bsk
             B_scale.stride(1),  # stride_bsn
-            0,  # stride_bze (no zero-points)
-            0,  # stride_bzk
-            0,  # stride_bzn
+            *zp_strides,  # stride_bze, stride_bzk, stride_bzn
             block_k_diviable=K % BLOCK_SIZE_K == 0,
             group_size=group_size,
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
-            has_zp=False,
+            has_zp=has_zp,
             use_int4_w4a16=True,
             use_int8_w8a16=False,
             use_shuffle_w4a16=True,

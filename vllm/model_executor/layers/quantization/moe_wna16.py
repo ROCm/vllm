@@ -422,7 +422,66 @@ class MoeWNA16Method(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
 
+    def _use_hybrid_w4a16(self, layer: RoutedExperts) -> bool:
+        import vllm.envs as envs
+
+        return (
+            envs.VLLM_MOE_HYBRID_W4A16
+            and current_platform.is_rocm()
+            and self.quant_config.linear_quant_method in ("awq", "awq_marlin")
+            and self.quant_config.weight_bits == 4
+            and layer.group_size in (32, 128)
+        )
+
+    def _process_weights_hybrid_w4a16(self, layer: RoutedExperts) -> None:
+        """Repack [E, N, K//2] uint8 weights into the hybrid W4A16 MoE layout
+        and [E, N//2, K//G] uint8 zero points into [E, N//8, K//G] int32.
+        """
+        from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+            make_hybrid_w4a16_moe_kernel,
+            pack_hybrid_w4a16_moe_weight,
+        )
+
+        def unpack(w: torch.Tensor) -> torch.Tensor:
+            # Low nibble holds the even K element.
+            return torch.stack((w & 0xF, w >> 4), dim=-1).view(w.size(0), -1)
+
+        for name in ("w13_qweight", "w2_qweight"):
+            replace_parameter(
+                layer,
+                name,
+                torch.nn.Parameter(
+                    pack_hybrid_w4a16_moe_weight(getattr(layer, name), unpack),
+                    requires_grad=False,
+                ),
+            )
+        if self.quant_config.has_zp:
+            for name in ("w13_qzeros", "w2_qzeros"):
+                zp = getattr(layer, name)
+                assert zp.size(1) % 4 == 0
+                # Little-endian bytes along N -> one int32 per 8 rows.
+                zp = zp.transpose(1, 2).contiguous().view(torch.int32)
+                replace_parameter(
+                    layer,
+                    name,
+                    torch.nn.Parameter(
+                        zp.transpose(1, 2).contiguous(), requires_grad=False
+                    ),
+                )
+
+        layer.w13_weight = layer.w13_qweight
+        layer.w2_weight = layer.w2_qweight
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.moe_quant_config is not None
+        self.moe_kernel = make_hybrid_w4a16_moe_kernel(
+            self.moe, self.moe_quant_config, layer
+        )
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if self._use_hybrid_w4a16(layer):
+            self._process_weights_hybrid_w4a16(layer)
+            return
+
         has_zp = self.quant_config.has_zp
         converted = convert_to_wna16_moe_kernel_format(
             backend=self.wna16_backend,
