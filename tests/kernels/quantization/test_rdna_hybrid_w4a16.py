@@ -986,47 +986,8 @@ def test_wvsplitk_int4_g_rejects_undersized_weight_view():
 
 
 # ---------------------------------------------------------------------------
-# gfx11 weight row-stride padding
+# gfx115x weight row-stride padding
 # ---------------------------------------------------------------------------
-
-_weight_pad_bytes = hybrid_module._weight_pad_bytes
-_act_pad_bytes = hybrid_module._act_pad_bytes
-_WEIGHT_CLIFF_BYTES = hybrid_module._WEIGHT_CLIFF_BYTES
-_ACT_CLIFF_BYTES = hybrid_module._ACT_CLIFF_BYTES
-_STRIDE_PAD_BYTES = hybrid_module._STRIDE_PAD_BYTES
-
-
-def test_weight_pad_bytes_only_moves_strides_on_the_cliff():
-    """Pad 512-B multiples, leave everything else dense."""
-    # On the cliff (K % 512 == 0): 512-B multiples.
-    for row_bytes in (512, 1024, 1536, 2048, 2560, 3072, 3584):
-        assert _weight_pad_bytes(row_bytes) == _STRIDE_PAD_BYTES
-
-    # Off it, including strides that are 128-B multiples but not 512-B ones:
-    for row_bytes in (128, 384, 640, 896, 1152, 1408):
-        assert _weight_pad_bytes(row_bytes) == 0
-
-    # The padded stride is never back on the cliff.
-    for row_bytes in range(16, 16384, 16):
-        padded = row_bytes + _weight_pad_bytes(row_bytes)
-        assert padded % _WEIGHT_CLIFF_BYTES != 0 or row_bytes % _WEIGHT_CLIFF_BYTES
-
-
-def test_act_pad_bytes_only_moves_strides_on_the_cliff():
-    """Activations sit on a wider cliff than the packed weight: 2048 B."""
-    # On the cliff (K % 1024 == 0 for a 2-byte dtype): 2048 B multiples.
-    for row_bytes in (2048, 4096, 8192, 16384, 20480, 24576, 43008):
-        assert _act_pad_bytes(row_bytes) == _STRIDE_PAD_BYTES
-
-    # Off it, including 1024 B multiples that are not 2048 B ones -- the
-    # weight cliff must not be applied to activations.
-    for row_bytes in (1024, 3072, 5120, 10752, 19456, 37888):
-        assert _act_pad_bytes(row_bytes) == 0
-
-    # The padded stride is never back on the cliff.
-    for row_bytes in range(16, 65536, 16):
-        padded = row_bytes + _act_pad_bytes(row_bytes)
-        assert padded % _ACT_CLIFF_BYTES != 0 or row_bytes % _ACT_CLIFF_BYTES
 
 
 def _row_padded_copy(t: torch.Tensor, pad_cols: int) -> torch.Tensor:
@@ -1067,9 +1028,10 @@ def test_weight_row_padding_does_not_change_results(dtype, has_zp, M):
         else None
     )
 
-    # 32 int32 columns = 128 B of pad, the production pad size.
+    # 32 int32 columns = 128 B of pad: K/2 = 256 B -> 384 B, an odd multiple
+    # of 128 B as on gfx115x.
     w_q_pad = _row_padded_copy(w_q.view(torch.int32), 32).view(torch.int8)
-    assert w_q_pad.stride(0) == w_q.stride(0) + _STRIDE_PAD_BYTES
+    assert w_q_pad.stride(0) == w_q.stride(0) + 128
 
     cu_count = num_compute_units()
     dense = torch.ops.vllm.rdna_hybrid_w4a16_apply(
@@ -1082,14 +1044,15 @@ def test_weight_row_padding_does_not_change_results(dtype, has_zp, M):
 
 
 @pytest.mark.skipif(
-    not hybrid_module._on_gfx1151(),
-    reason="row-stride padding is only enabled on gfx1151",
+    not hybrid_module._on_gfx115x(),
+    reason="row-stride padding is only enabled on gfx115x",
 )
 @pytest.mark.parametrize(
     "K,expected_weight_stride",
     [
-        (512, 256),  # 256 B row: off the cliff, stored dense
-        (8192, 4096 + 128),  # 4096 B row: on the cliff, padded
+        (1792, 896),  # 896 B row: already an odd multiple of 128 B
+        (512, 256 + 128),  # 256 B row: even multiple, padded
+        (8192, 4096 + 128),  # 4096 B row: even multiple, padded
     ],
 )
 def test_process_weights_pads_cliff_rows(K, expected_weight_stride, dist_init):
