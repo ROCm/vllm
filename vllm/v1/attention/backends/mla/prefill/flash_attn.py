@@ -479,7 +479,11 @@ def is_kimi_k3_on_gfx1250(vllm_config: "VllmConfig") -> bool:
         on_gfx1250()
         and model_config is not None
         and getattr(model_config, "_architecture", None)
-        == "KimiK3ForConditionalGeneration"
+        in (
+            "KimiK3ForConditionalGeneration",
+            "KimiK31ForConditionalGeneration",
+            "K3DSparkModel",
+        )
     )
 
 

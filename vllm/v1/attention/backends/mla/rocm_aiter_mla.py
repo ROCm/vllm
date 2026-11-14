@@ -3800,9 +3800,19 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             dtype=decode.attn_out_dtype,
             device=q.device,
         )
+        page_kwargs = {}
+        if kv_cache.stride(0) != kv_cache.shape[1] * kv_cache.stride(1):
+            page_kwargs["pages_per_block"] = (
+                kv_cache.shape[1] // _GFX1250_DECODE_PAGE_SIZE
+            )
+            kv_cache = kv_cache.unsqueeze(2)
+        else:
+            kv_cache = kv_cache.view(
+                -1, _GFX1250_DECODE_PAGE_SIZE, 1, kv_cache.shape[-1]
+            )
         mla_decode_fwd(
             q,
-            kv_cache.view(-1, _GFX1250_DECODE_PAGE_SIZE, 1, kv_cache.shape[-1]),
+            kv_cache,
             o,
             decode.qo_indptr,
             decode.seq_lens,
@@ -3814,6 +3824,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             True,
             layer._q_scale if q.dtype == fp8_dtype else None,
             layer._k_scale if kv_cache.dtype == fp8_dtype else None,
+            **page_kwargs,
         )
         return o, None
 
