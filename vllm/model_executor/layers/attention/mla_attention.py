@@ -764,7 +764,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             query_dtype = (
                 current_platform.fp8_dtype()
                 if is_quantized_kv_cache(self.kv_cache_dtype)
-                and self.kv_cache_dtype != "fp8_ds_mla"
+                and self.kv_cache_dtype not in ("fp8_ds_mla", "fp8_k3_mla_640")
                 and self.impl.supports_quant_query_input
                 else dtype
             )
@@ -3495,6 +3495,15 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             block_table = prefill_metadata.block_table[chunk.request_slice]
             if self.kv_cache_dtype == "fp8_ds_mla":
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace[:toks],
+                    block_table=block_table,
+                    workspace_starts=padded_local_cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+            elif self.kv_cache_dtype == "fp8_k3_mla_640":
+                rocm_aiter_ops.k3_mla_640().k3_mla_640_cp_gather_and_upconvert(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace[:toks],
                     block_table=block_table,

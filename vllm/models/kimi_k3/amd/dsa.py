@@ -135,6 +135,7 @@ def _indexer(
     rank: int,
     world: int,
     interleave: int,
+    skip_insert: bool = False,
 ) -> None:
     metadata = get_forward_context().attn_metadata
     m = (
@@ -157,6 +158,7 @@ def _indexer(
             max_model_len,
             max_keys,
             out,
+            skip_insert,
             cache_layout="NORMAL",
             dcp_rank=rank,
             dcp_world_size=world,
@@ -166,14 +168,15 @@ def _indexer(
 
     rows = m.num_decode_tokens
     assert rows <= scores.shape[0]
-    indexer_k_quant_and_cache_triton(
-        k[: m.slot_mapping.numel()],
-        cache,
-        m.slot_mapping,
-        128,
-        "ue8m0",
-        cache_layout="NORMAL",
-    )
+    if not skip_insert:
+        indexer_k_quant_and_cache_triton(
+            k[: m.slot_mapping.numel()],
+            cache,
+            m.slot_mapping,
+            128,
+            "ue8m0",
+            cache_layout="NORMAL",
+        )
     # Tracking already prepares causal token rows once in the shared builder.
     decode = m.decode
     assert decode is not None and not decode.requires_padding
@@ -219,6 +222,7 @@ def _fake(
     rank: int,
     world: int,
     interleave: int,
+    skip_insert: bool = False,
 ) -> None:
     pass
 
@@ -498,10 +502,8 @@ class KimiK3DSAIndexer(nn.Module):
                 dtype=torch.float32,
                 device=topk_indices_buffer.device,
             )
-        self.fuse_k_norm = (
-            not self.use_fp4
-            and self.dcp_scores is None
-            and isinstance(self.k_index_norm, KimiK3DSAIndexerKNorm)
+        self.fuse_k_norm = not self.use_fp4 and isinstance(
+            self.k_index_norm, KimiK3DSAIndexerKNorm
         )
         self.indexer_op = (
             None
@@ -598,6 +600,8 @@ class KimiK3DSAIndexer(nn.Module):
         indexer_op = self.indexer_op
         assert indexer_op is not None
         if self.dcp_scores is not None:
+            if self.fuse_k_norm:
+                _insert_normed_keys(index_k, self.k_cache, self.k_index_norm)
             torch.ops.vllm.kimi_dcp_score_indexer(
                 hidden_states,
                 q_fp8,
@@ -612,6 +616,7 @@ class KimiK3DSAIndexer(nn.Module):
                 indexer_op.dcp_rank,
                 indexer_op.dcp_world_size,
                 indexer_op._parallel_config.cp_kv_cache_interleave_size,
+                self.fuse_k_norm,
             )
             return self.topk_indices_buffer
         if self.fuse_k_norm:

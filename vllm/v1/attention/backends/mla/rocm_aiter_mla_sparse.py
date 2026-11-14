@@ -1059,10 +1059,10 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         )
         self.softmax_scale = scale
         if self.dcp_world_size > 1 and (
-            self.kv_cache_dtype != "fp8_ds_mla" or sinks is not None
+            self.kv_cache_dtype not in _PACKED_RECORD_DTYPES or sinks is not None
         ):
             raise NotImplementedError(
-                "ROCm sparse DCP requires fp8_ds_mla without sinks"
+                "ROCm sparse DCP requires fp8_ds_mla or fp8_k3_mla_640 without sinks"
             )
         if self.kv_cache_dtype == "fp8_ds_mla":
             # The fp8_ds_mla branch of forward_mqa routes to aiter's Triton
@@ -1556,6 +1556,9 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 dtype=attn_metadata.attn_out_dtype,
                 device=q.device,
             )
+            k3_640 = self.kv_cache_dtype == "fp8_k3_mla_640"
+            if k3_640 and not q.is_contiguous():
+                q = q.contiguous()
             lse = rocm_aiter_ops.triton_sparse_mla_fwd(
                 q,
                 kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
@@ -1567,6 +1570,16 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 has_invalid=not compact,
                 return_lse=True,
+                **(
+                    {
+                        "kv_format": self.kv_cache_dtype,
+                        "keys_per_row": -(
+                            -attn_metadata.topk_tokens // self.dcp_world_size
+                        ),
+                    }
+                    if k3_640
+                    else {}
+                ),
             )
             return output, lse
 

@@ -3090,10 +3090,14 @@ class rocm_aiter_ops:
             seq_lens: Valid width of each row.
             topk_indices: Output buffer for the selected column indices.
             topk_tokens: Number of entries selected per row.
-            stable: Emit in descending score order with a smallest-index
-                tie-break, so every rank selects and orders the same KV set.
+            stable: Smallest-index tie-break, so every rank selects the same
+                KV set. The output order is the kernel's (aiter's gfx1250
+                radix kernel emits ascending index, not descending score):
+                consumers must not rely on it.
             values: Optional float32 buffer shaped like `topk_indices` that
-                receives the selected logits; short rows pad with `-inf`.
+                receives the selected logits; short rows pad with `-inf`. A
+                `-inf` logit inside the row's width can come back with its
+                real index, so a `-inf` value means padding either way.
 
         """
         from aiter.ops.topk import top_k_per_row_decode
@@ -4004,6 +4008,7 @@ class rocm_aiter_ops:
         return_lse: bool = False,
         dot_precision: str | None = None,
         kv_format: str | None = None,
+        keys_per_row: int | None = None,
     ) -> torch.Tensor | None:
         """Sparse MLA read straight from the KV cache, for prefill and decode.
 
@@ -4018,7 +4023,9 @@ class rocm_aiter_ops:
         make the store apply the inverse RoPE; out_mxfp8 = (data, scale)
         replaces o with MXFP8 rows. dot_precision overrides the default
         selected from q's dtype. kv_format names a cache format that cannot be
-        inferred from the shape (fp8_k3_mla_640).
+        inferred from the shape (fp8_k3_mla_640). keys_per_row is the
+        fp8_k3_mla_640 split-K hint: the expected keys per row when the CSR
+        rows are shorter than the top-k (DCP).
 
         With VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA, the calls the FlyDSL
         kernel supports (bf16 q, fp8_ds_mla, no scales/sink/extra) run there.
@@ -4036,6 +4043,7 @@ class rocm_aiter_ops:
             and inv_rope_positions is None
             and inv_rope_cos_sin_cache is None
             and kv_format is None
+            and keys_per_row is None
         )
         if flydsl_eligible:
             handled, lse = rocm_aiter_ops._flydsl_sparse_mla_fwd(
@@ -4084,6 +4092,7 @@ class rocm_aiter_ops:
             out_mxfp8=out_mxfp8,
             return_lse=return_lse,
             **({} if kv_format is None else {"kv_format": kv_format}),
+            **({} if keys_per_row is None else {"keys_per_row": keys_per_row}),
         )
         return lse
 
