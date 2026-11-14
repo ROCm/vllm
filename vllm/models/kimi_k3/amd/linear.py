@@ -1145,6 +1145,11 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             ]
             if self.config.mla_use_output_gate:
                 stacked_params_mapping.append((".fused_qkv_a_proj", ".g_proj", 2))
+        if self.config.dsa_config is not None:
+            stacked_params_mapping += [
+                (".dsa_indexer.wkv_index", ".indexer.wk", 0),
+                (".dsa_indexer.wkv_index", ".indexer.weights_proj", 1),
+            ]
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
             # (param_name, weight_name, expert_id, shard_id)

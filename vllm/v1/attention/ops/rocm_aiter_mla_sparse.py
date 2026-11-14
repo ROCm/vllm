@@ -183,6 +183,11 @@ def _indexer_k_quant_and_cache_kernel(
     HEAD_TILE_SIZE: tl.constexpr,
     IS_FNUZ: tl.constexpr,
     USE_UE8M0: tl.constexpr,
+    k_stride,
+    norm_w_ptr,
+    norm_b_ptr,
+    norm_eps,
+    HAS_NORM: tl.constexpr,
 ):
     tid = tl.program_id(0)
     offset = tl.arange(0, head_dim)
@@ -195,7 +200,7 @@ def _indexer_k_quant_and_cache_kernel(
         tile_offset = offset
     tile_store_offset = tile_offset
     # for idx in tl.range(tid, num_tokens, n_program):
-    src_ptr = k_ptr + tid * head_dim
+    src_ptr = k_ptr + tid * k_stride
     slot_id = tl.load(slot_mapping_ptr + tid)
     if slot_id < 0:
         return
@@ -206,6 +211,12 @@ def _indexer_k_quant_and_cache_kernel(
     tile_block_id = block_offset // BLOCK_TILE_SIZE
     tile_block_offset = block_offset % BLOCK_TILE_SIZE
     val = tl.load(src_ptr + offset)
+    if HAS_NORM:
+        x = val.to(tl.float32)
+        x -= tl.sum(x, axis=0) / head_dim
+        x *= tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + norm_eps)
+        w = tl.load(norm_w_ptr + offset).to(tl.float32)
+        val = (x * w + tl.load(norm_b_ptr + offset).to(tl.float32)).to(val.dtype)
     amax = tl.max(val.abs(), axis=-1).to(tl.float32)
     if IS_FNUZ:
         scale = tl.maximum(1e-4, amax) / 224.0
@@ -241,7 +252,10 @@ def indexer_k_quant_and_cache_triton(
     block_tile_size=16,
     head_tile_size=16,
     cache_layout: str | None = None,
+    k_norm: tuple[torch.Tensor, torch.Tensor, float] | None = None,
 ):
+    """`k_norm` = (weight, bias, eps): LayerNorm each key row before quantizing."""
+    norm_w, norm_b, norm_eps = k_norm or (None, None, 0.0)
     num_blocks = kv_cache.shape[0]
     head_dim = k.shape[-1]
     num_tokens = slot_mapping.shape[0]
@@ -272,6 +286,11 @@ def indexer_k_quant_and_cache_triton(
         head_tile_size,
         IS_FNUZ=torch.float8_e4m3fnuz == FP8_DTYPE,
         USE_UE8M0=scale_fmt == "ue8m0",
+        k_stride=k.stride(0),
+        norm_w_ptr=norm_w,
+        norm_b_ptr=norm_b,
+        norm_eps=norm_eps,
+        HAS_NORM=k_norm is not None,
     )
 
 
@@ -1506,7 +1525,9 @@ def rocm_aiter_sparse_attn_indexer(
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    k31 = _ON_GFX1250 and cache_layout == "NORMAL"
+    if not k31 or dcp_world_size > 1:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
@@ -1748,7 +1769,12 @@ def rocm_aiter_sparse_attn_indexer(
             max_compressed_seq_len = decode_max_model_len
         else:
             max_compressed_seq_len = layer_attn_metadata.max_seq_len // compress_ratio
-        if rocm_aiter_ops.is_indexer_top_k_supported(
+        if (
+            k31
+            and rocm_aiter_ops.is_enabled()
+            and num_rows <= 256
+            and logits.shape[1] >= 32768
+        ) or rocm_aiter_ops.is_indexer_top_k_supported(
             is_prefill=False,
             compress_ratio=compress_ratio,
             num_rows=num_rows,

@@ -25,14 +25,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    KimiK3MergedQKVGateLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.layers.mla import (
-    MLAModules,
-    MultiHeadLatentAttentionWrapper,
-)
+from vllm.model_executor.layers.mla import MLAModules
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
@@ -53,6 +51,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_fp8_paged_mqa_logits,
 )
 
+from .mla import KimiK3MultiHeadLatentAttentionWrapper
 from .ops.fp4_indexer import decode_layout, decode_tile_size, score_paged, store_keys
 from .ops.fp4_indexer_prefill import prefill_chunks, prefill_workspace_bytes
 
@@ -230,6 +229,24 @@ direct_register_custom_op(
     mutates_args=["cache", "out", "scores"],
     fake_impl=_fake,
 )
+
+
+@eager_break_during_capture
+def _insert_normed_keys(k: torch.Tensor, cache: KimiK3IndexerCache, norm) -> None:
+    """LayerNorm + FP8 quant + cache write of the indexer keys in one kernel
+    (the indexer op is built with skip_k_cache_insert). No metadata in the
+    profiling run, where the op only reserves memory."""
+    metadata = get_forward_context().attn_metadata
+    if isinstance(metadata, dict):
+        indexer_k_quant_and_cache_triton(
+            k,
+            cache.kv_cache,
+            metadata[cache.prefix].slot_mapping,
+            128,
+            "ue8m0",
+            cache_layout="NORMAL",
+            k_norm=(norm.weight, norm.bias, norm.eps),
+        )
 
 
 def _select(logits, lengths, out, values=None):
@@ -428,19 +445,13 @@ class KimiK3DSAIndexer(nn.Module):
         # The indexer query projection (wq_index) may be quantized in fp8
         # checkpoints, while the shared-key (wk_index) and per-head weights
         # (wv_index) projections are stored in bf16.
-        self.wk_index = ReplicatedLinear(
+        self.wkv_index = MergedColumnParallelLinear(
             hidden_size,
-            self.index_head_dim,
+            [self.index_head_dim, self.index_num_heads],
             bias=False,
             quant_config=None,
-            prefix=f"{prefix}.wk_index",
-        )
-        self.wv_index = ReplicatedLinear(
-            hidden_size,
-            self.index_num_heads,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.wv_index",
+            prefix=f"{prefix}.wkv_index",
+            disable_tp=True,
         )
         self.k_index_norm: nn.Module
         if index_k_norm_type == "layernorm":
@@ -487,6 +498,11 @@ class KimiK3DSAIndexer(nn.Module):
                 dtype=torch.float32,
                 device=topk_indices_buffer.device,
             )
+        self.fuse_k_norm = (
+            not self.use_fp4
+            and self.dcp_scores is None
+            and isinstance(self.k_index_norm, KimiK3DSAIndexerKNorm)
+        )
         self.indexer_op = (
             None
             if self.use_fp4
@@ -499,6 +515,7 @@ class KimiK3DSAIndexer(nn.Module):
                 self.max_model_len,
                 self.max_total_seq_len,
                 topk_indices_buffer,
+                skip_k_cache_insert=self.fuse_k_norm,
                 cache_layout="NORMAL",
             )
         )
@@ -553,8 +570,11 @@ class KimiK3DSAIndexer(nn.Module):
         index_q = self.wq_index(index_q_input)[0].view(
             -1, self.index_num_heads, self.index_head_dim
         )
-        index_k = self.k_index_norm(self.wk_index(hidden_states)[0])
-        index_v = self.wv_index(hidden_states)[0]
+        index_k, index_v = self.wkv_index(hidden_states)[0].split(
+            [self.index_head_dim, self.index_num_heads], dim=-1
+        )
+        if not self.fuse_k_norm:
+            index_k = self.k_index_norm(index_k.contiguous())
         if self.use_fp4:
             dcp = get_dcp_group()
             torch.ops.vllm.kimi_fp4_indexer(
@@ -594,6 +614,9 @@ class KimiK3DSAIndexer(nn.Module):
                 indexer_op._parallel_config.cp_kv_cache_interleave_size,
             )
             return self.topk_indices_buffer
+        if self.fuse_k_norm:
+            _insert_normed_keys(index_k, self.k_cache, self.k_index_norm)
+            index_k = None
         return indexer_op.forward_hip(hidden_states, q_fp8, index_k, weights)
 
 
@@ -652,7 +675,18 @@ class KimiK3DSAAttention(nn.Module):
 
         self.scaling = self.qk_head_dim**-0.5
 
-        if self.q_lora_rank is not None:
+        if self.q_lora_rank is not None and config.mla_use_output_gate:
+            self.fused_qkv_a_proj = KimiK3MergedQKVGateLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                self.num_heads,
+                self.v_head_dim,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fused_qkv_a_proj",
+            )
+        elif self.q_lora_rank is not None:
             self.fused_qkv_a_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -661,6 +695,7 @@ class KimiK3DSAAttention(nn.Module):
                 prefix=f"{prefix}.fused_qkv_a_proj",
                 disable_tp=True,
             )
+        if self.q_lora_rank is not None:
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 self.q_lora_rank,
@@ -723,7 +758,7 @@ class KimiK3DSAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        if config.mla_use_output_gate:
+        if config.mla_use_output_gate and self.q_lora_rank is None:
             self.g_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.v_head_dim * self.num_heads,
@@ -802,10 +837,7 @@ class KimiK3DSAAttention(nn.Module):
             is_sparse=True,
             topk_indices_buffer=self.topk_indices_buffer,
         )
-        # The plain wrapper, not the AMD KimiK3MultiHeadLatentAttentionWrapper:
-        # its fused decode Q-prep path writes dense 576-wide rows, which the
-        # 656-byte fp8_ds_mla records cannot take.
-        self.mla_attn = MultiHeadLatentAttentionWrapper(
+        self.mla_attn = KimiK3MultiHeadLatentAttentionWrapper(
             self.hidden_size,
             self.num_local_heads,
             self.scaling,
