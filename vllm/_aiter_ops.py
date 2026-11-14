@@ -4003,6 +4003,7 @@ class rocm_aiter_ops:
         out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
         return_lse: bool = False,
         dot_precision: str | None = None,
+        kv_format: str | None = None,
     ) -> torch.Tensor | None:
         """Sparse MLA read straight from the KV cache, for prefill and decode.
 
@@ -4016,7 +4017,8 @@ class rocm_aiter_ops:
         compressed tokens here. inv_rope_positions and inv_rope_cos_sin_cache
         make the store apply the inverse RoPE; out_mxfp8 = (data, scale)
         replaces o with MXFP8 rows. dot_precision overrides the default
-        selected from q's dtype.
+        selected from q's dtype. kv_format names a cache format that cannot be
+        inferred from the shape (fp8_k3_mla_640).
 
         With VLLM_ROCM_USE_AITER_FLYDSL_SPARSE_MLA, the calls the FlyDSL
         kernel supports (bf16 q, fp8_ds_mla, no scales/sink/extra) run there.
@@ -4033,6 +4035,7 @@ class rocm_aiter_ops:
             and out_mxfp8 is None
             and inv_rope_positions is None
             and inv_rope_cos_sin_cache is None
+            and kv_format is None
         )
         if flydsl_eligible:
             handled, lse = rocm_aiter_ops._flydsl_sparse_mla_fwd(
@@ -4080,8 +4083,27 @@ class rocm_aiter_ops:
             inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
             out_mxfp8=out_mxfp8,
             return_lse=return_lse,
+            **({} if kv_format is None else {"kv_format": kv_format}),
         )
         return lse
+
+    @staticmethod
+    @functools.cache
+    def k3_mla_640() -> Any:
+        """The aiter module with Kimi-K3.1's fp8_k3_mla_640 kernels (gfx1250):
+        `k3_mla_640_concat_and_cache` (KV insert), `k3_mla_640_q_pack` and
+        `k3_mla_640_cp_gather_and_upconvert` (context gather to bf16). Nothing
+        else reads or writes that record, so an aiter without them raises."""
+        try:
+            from aiter.ops.triton.quant import fused_mxfp8_quant
+
+            fused_mxfp8_quant.k3_mla_640_cp_gather_and_upconvert  # noqa: B018
+        except (ImportError, AttributeError) as e:
+            raise RuntimeError(
+                "kv_cache_dtype=fp8_k3_mla_640 needs an aiter build with the "
+                "Kimi-K3.1 640 B record kernels (k3_mla_640_*); update aiter."
+            ) from e
+        return fused_mxfp8_quant
 
     @staticmethod
     def gather_kv_b_proj(

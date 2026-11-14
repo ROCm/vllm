@@ -868,7 +868,7 @@ def rocm_fp8_paged_mqa_logits(
     # Block-flat (NORMAL) caches take the Triton path: C4A by ratio, others
     # by explicit cache_layout. Flash/DSv3.2 also skip insert but write SHUFFLE.
     if (
-        (_ON_GFX950 or _ON_GFX942)
+        (_ON_GFX950 or _ON_GFX942 or (_ON_GFX1250 and cache_layout == "NORMAL"))
         and block_size > 1
         and (cache_layout == "NORMAL" or _indexer_k_is_c4a_block_flat(compress_ratio))
     ):
@@ -1451,7 +1451,12 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
-        if _ON_GFX942 or _ON_GFX950 or _ON_RDNA:
+        if (
+            _ON_GFX942
+            or _ON_GFX950
+            or _ON_RDNA
+            or (_ON_GFX1250 and cache_layout == "NORMAL")
+        ):
             _decode_logits_workspace(decode_rows, decode_max_model_len)
         else:
             workspace_manager.get_simultaneous(

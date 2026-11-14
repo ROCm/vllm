@@ -29,7 +29,11 @@ logger = init_logger(__name__)
 
 # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token blob,
 # so the page size is not derivable from head_size.
-DS_MLA_STATE_CONTENT_BYTES = {"fp8_ds_mla": 656, "nvfp4_ds_mla": 352}
+DS_MLA_STATE_CONTENT_BYTES = {
+    "fp8_ds_mla": 656,
+    "nvfp4_ds_mla": 352,
+    "fp8_k3_mla_640": 640,
+}
 
 
 # ---------------------------------------------------------------------------

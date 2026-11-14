@@ -1122,6 +1122,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Opaque per-token byte formats stay as raw uint8
             "fp8_ds_mla",
             "nvfp4_ds_mla",
+            "fp8_k3_mla_640",
         ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -3342,6 +3343,15 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                     )
                 elif self.kv_cache_dtype == "nvfp4_ds_mla":
                     ops.cp_gather_and_upconvert_nvfp4_kv_cache(
+                        src_cache=kv_c_and_k_pe_cache,
+                        dst=workspace[:toks],
+                        block_table=chunk_block_table,
+                        workspace_starts=chunk.cu_seq_lens,
+                        batch_size=chunk.num_requests,
+                        seq_starts=chunk.starts,
+                    )
+                elif self.kv_cache_dtype == "fp8_k3_mla_640":
+                    rocm_aiter_ops.k3_mla_640().k3_mla_640_cp_gather_and_upconvert(
                         src_cache=kv_c_and_k_pe_cache,
                         dst=workspace[:toks],
                         block_table=chunk_block_table,
