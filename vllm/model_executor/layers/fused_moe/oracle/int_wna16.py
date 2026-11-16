@@ -168,10 +168,18 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
     if backend == WNA16MoEBackend.FLYDSL:
-        if not isinstance(quant_config, MoeWNA16Config):
-            return "only the MoeWNA16 checkpoint layout is supported"
-        if quant_config.weight_bits != 4 or quant_config.group_size != 32:
-            return "only 4-bit weights with group size 32 are supported"
+        if isinstance(quant_config, MoeWNA16Config):
+            num_bits, group_size = quant_config.weight_bits, quant_config.group_size
+        elif isinstance(quant_config, QuantizationArgs):
+            if may_have_zp:
+                return "asymmetric compressed-tensors checkpoints are not supported"
+            if quant_config.actorder == "group":
+                return "group activation ordering is not supported"
+            num_bits, group_size = quant_config.num_bits, quant_config.group_size
+        else:
+            return "only MoeWNA16 and compressed-tensors checkpoints are supported"
+        if num_bits != 4 or not group_size or group_size % 16 != 0:
+            return "only 4-bit weights with a group size multiple of 16 are supported"
 
     if backend == WNA16MoEBackend.TRITON:
         if may_have_bias:
@@ -1446,17 +1454,20 @@ def _process_weights_flydsl(
     w13_qzeros: torch.Tensor | None,
     w2_qzeros: torch.Tensor | None,
 ) -> tuple:
-    """Repack MoeWNA16 int4 weights for the FlyDSL RDNA kernel.
+    """Repack N-first int4 weights for the FlyDSL RDNA kernel.
 
-    Inputs are uint8 with two nibbles per byte: weights ``[E, N, K // 2]``,
-    zero points ``[E, N // 2, K // gs]``, and scales ``[E, N, K // gs]``. The
-    zero points are folded into the returned scale coefficients.
+    Weights are ``[E, N, K // 2]`` uint8 or ``[E, N, K // 8]`` int32 with the
+    nibbles of a row in little-endian order, zero points are uint8
+    ``[E, N // 2, K // gs]`` (8 when absent), and scales are
+    ``[E, N, K // gs]``. The zero points are folded into the returned scale
+    coefficients.
     """
     from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
         pack_w4a16_weights,
     )
 
     def _nibbles(packed: torch.Tensor, dim: int) -> torch.Tensor:
+        packed = packed.contiguous().view(torch.uint8)
         return torch.stack((packed & 0xF, packed >> 4), dim=dim + 1).flatten(
             dim, dim + 1
         )

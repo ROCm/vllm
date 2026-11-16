@@ -6,7 +6,6 @@ import importlib.util
 
 import torch
 
-import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -24,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
+)
+from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
+    moe_unpermute,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -57,6 +59,17 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+        self._arange: torch.Tensor | None = None
+
+    def _route(
+        self, topk_ids: torch.Tensor, num_experts: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
+        """Group the routed rows into BLOCK_M-row blocks per expert."""
+        if topk_ids.size(0) == 1 and topk_ids.dtype == torch.int32:
+            # One token: its experts are distinct, so every row is its own
+            # block and the alignment kernel is not needed.
+            return None, topk_ids.view(-1), None
+        return moe_align_block_size(topk_ids, BLOCK_M, num_experts)
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -151,6 +164,8 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
         if global_num_experts == -1:
             global_num_experts = E
 
+        assert self.block_shape is not None
+        group_size = self.block_shape[1]
         gate_up = w1.size(1) * TILE_N
         rows = M * top_k
         widths = (gate_up, N, K)
@@ -159,9 +174,7 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             t.view(rows, n)
             for t, n in zip(workspace2.view(-1)[: sum(sizes)].split(sizes), widths)
         )
-        sorted_ids, expert_ids, num_valid = moe_align_block_size(
-            topk_ids, BLOCK_M, global_num_experts
-        )
+        sorted_ids, expert_ids, num_valid = self._route(topk_ids, global_num_experts)
         flydsl_rdna_moe_gemm(
             gate_up_out,
             hidden_states,
@@ -171,12 +184,29 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             expert_ids,
             num_valid,
             top_k,
+            group_size,
         )
         self.activation(activation, act_out, gate_up_out)
         flydsl_rdna_moe_gemm(
-            down_out, act_out, w2, self.w2_scale, sorted_ids, expert_ids, num_valid, 1
+            down_out,
+            act_out,
+            w2,
+            self.w2_scale,
+            sorted_ids,
+            expert_ids,
+            num_valid,
+            1,
+            group_size,
         )
 
-        down_out = down_out.view(M, top_k, K)
-        down_out.mul_(topk_weights.view(M, top_k, 1))
-        ops.moe_sum(down_out, output)
+        # Rows are in routing order, so the top-k reduction needs no permutation.
+        if self._arange is None or self._arange.size(0) < rows:
+            self._arange = torch.arange(
+                rows, dtype=torch.int32, device=hidden_states.device
+            )
+        moe_unpermute(
+            out=output,
+            permuted_hidden_states=down_out,
+            topk_weights=topk_weights,
+            inv_permuted_idx=self._arange[:rows],
+        )

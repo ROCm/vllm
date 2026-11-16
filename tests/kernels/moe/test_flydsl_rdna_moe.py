@@ -17,7 +17,6 @@ if not (on_gfx11() and importlib.util.find_spec("flydsl") is not None):
 
 from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (  # noqa: E402
     BLOCK_M,
-    GROUP_SIZE,
     flydsl_rdna_moe_gemm,
     pack_w4a16_weights,
 )
@@ -33,14 +32,17 @@ from vllm.utils.torch_utils import set_random_seed  # noqa: E402
     [(256, 512, 4), (512, 128, 1)],
     ids=["gate_up", "down"],
 )
-def test_flydsl_rdna_moe_gemm(num_tokens: int, n_out: int, n_in: int, x_row_div: int):
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_flydsl_rdna_moe_gemm(
+    num_tokens: int, n_out: int, n_in: int, x_row_div: int, group_size: int
+):
     """The grouped GEMM matches dequantize-then-matmul for asymmetric int4,
     including blocks padded with rows that belong to no token.
     """
     set_random_seed(0)
     device = "cuda"
     num_experts, top_k = 8, 4
-    groups = n_in // GROUP_SIZE
+    groups = n_in // group_size
     q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
     scale = torch.rand((num_experts, n_out, groups), device=device) * 0.02 + 0.001
     scale = scale.to(torch.bfloat16)
@@ -56,10 +58,47 @@ def test_flydsl_rdna_moe_gemm(num_tokens: int, n_out: int, n_in: int, x_row_div:
 
     out = torch.empty((rows, n_out), device=device, dtype=torch.bfloat16)
     w, coef = pack_w4a16_weights(q, scale, zp)
-    flydsl_rdna_moe_gemm(out, x, w, coef, sorted_ids, expert_ids, num_valid, x_row_div)
+    flydsl_rdna_moe_gemm(
+        out, x, w, coef, sorted_ids, expert_ids, num_valid, x_row_div, group_size
+    )
 
-    dequant = (q - zp.repeat_interleave(GROUP_SIZE, dim=2)).float()
-    dequant *= scale.float().repeat_interleave(GROUP_SIZE, dim=2)
+    dequant = (q - zp.repeat_interleave(group_size, dim=2)).float()
+    dequant *= scale.float().repeat_interleave(group_size, dim=2)
     x_rows = x.float()[torch.arange(rows, device=device) // x_row_div]
     ref = torch.einsum("rnk,rk->rn", dequant[topk_ids.reshape(-1)], x_rows)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
+
+
+def test_flydsl_rdna_moe_gemm_single_token():
+    """Without routing buffers, row ``r`` runs on ``expert_ids[r]`` and rows
+    whose expert id is -1 are left untouched.
+    """
+    set_random_seed(0)
+    device = "cuda"
+    num_experts, top_k, n_out, n_in, group_size = 8, 4, 256, 512, 128
+    groups = n_in // group_size
+    q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
+    scale = torch.rand((num_experts, n_out, groups), device=device) * 0.02 + 0.001
+    zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
+    w, coef = pack_w4a16_weights(q, scale.to(torch.bfloat16), zp)
+    x = torch.randn((1, n_in), device=device, dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[5, -1, 0, 3]], dtype=torch.int32, device=device)
+
+    routed = topk_ids.clamp(min=0)
+    ref = torch.full((top_k, n_out), 7.0, device=device, dtype=torch.bfloat16)
+    flydsl_rdna_moe_gemm(
+        ref,
+        x,
+        w,
+        coef,
+        *moe_align_block_size(routed, BLOCK_M, num_experts),
+        top_k,
+        group_size,
+    )
+    ref[1] = 7.0
+
+    out = torch.full_like(ref, 7.0)
+    flydsl_rdna_moe_gemm(
+        out, x, w, coef, None, topk_ids.view(-1), None, top_k, group_size
+    )
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
