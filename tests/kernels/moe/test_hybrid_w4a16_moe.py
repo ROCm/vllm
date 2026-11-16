@@ -14,6 +14,9 @@ Tests exercise both paths:
 - Prefill (M>5): Triton fused_moe kernel with use_shuffle_w4a16
 """
 
+import dataclasses
+from collections.abc import Callable
+
 import pytest
 import torch
 
@@ -30,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
     HybridW4A16MoEExperts,
+    hybrid_w4a16_moe_enabled,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEKernelModularImpl,
@@ -37,6 +41,12 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
     MoEPrepareAndFinalizeNoDPEPModular,
 )
+from vllm.model_executor.layers.quantization.moe_wna16 import (
+    awq_moe_qzeros_to_hybrid,
+    awq_moe_weight_to_hybrid,
+    convert_awq_tensor,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import awq_pack
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -130,6 +140,41 @@ def _make_hybrid_moe_weights(
     return w_skinny, w_scales, w_ref, w_zp
 
 
+def _make_awq_moe_weights(
+    E: int,
+    K: int,
+    N: int,
+    group_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float16,
+    asym: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AutoAWQ checkpoint tensors through the MoeWNA16 loader conversion and
+    the hybrid repack. Same return contract as _make_hybrid_moe_weights.
+    """
+    G = K // group_size
+    q = torch.randint(0, 16, (E, K, N), dtype=torch.int32)
+    zp = torch.randint(0, 16, (E, G, N), dtype=torch.int32)
+    scales = torch.rand(E, G, N, dtype=dtype) / 50 + 1e-3
+    w_ref = (q - zp.repeat_interleave(group_size, 1)).to(dtype) * (
+        scales.repeat_interleave(group_size, 1)
+    )
+    # Checkpoint: qweight [K, N//8], qzeros [G, N//8], scales [G, N] per expert.
+    # Loader: qweight -> [N, K//2] uint8, qzeros -> [N//2, G] uint8, scales.T.
+    qweight = torch.stack(
+        [convert_awq_tensor(awq_pack(q[e], 4, K, N), "qweight") for e in range(E)]
+    )
+    qzeros = torch.stack(
+        [convert_awq_tensor(awq_pack(zp[e], 4, G, N), "qzeros") for e in range(E)]
+    )
+    return (
+        awq_moe_weight_to_hybrid(qweight.to(device)),
+        scales.transpose(1, 2).contiguous().to(device),
+        w_ref.transpose(1, 2).contiguous().to(device),
+        awq_moe_qzeros_to_hybrid(qzeros.to(device)),
+    )
+
+
 def _run_hybrid_moe(
     m: int,
     n: int,
@@ -141,6 +186,7 @@ def _run_hybrid_moe(
     force_hip: bool = False,
     dtype: torch.dtype = torch.float16,
     asym: bool = False,
+    make_weights: Callable = _make_hybrid_moe_weights,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build weights, run HybridW4A16MoEExperts and torch_experts reference.
 
@@ -157,11 +203,11 @@ def _run_hybrid_moe(
     assert k % group_size == 0
 
     # w1: gate+up projection [E, 2*N, K//8], ref [E, 2*N, K]
-    w1_skinny, w1_scales, w1_ref, w1_zp = _make_hybrid_moe_weights(
+    w1_skinny, w1_scales, w1_ref, w1_zp = make_weights(
         e, k, 2 * n, group_size, device, dtype, asym
     )
     # w2: down projection [E, K, N//8], ref [E, K, N]
-    w2_skinny, w2_scales, w2_ref, w2_zp = _make_hybrid_moe_weights(
+    w2_skinny, w2_scales, w2_ref, w2_zp = make_weights(
         e, n, k, group_size, device, dtype, asym
     )
 
@@ -322,3 +368,33 @@ def test_hybrid_w4a16_moe_asym(
         m, n, k, 16, 4, group_size, dtype=dtype, asym=True
     )
     torch.testing.assert_close(hybrid_out, torch_output, atol=2e-2, rtol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="HybridW4A16MoEExperts requires ROCm",
+)
+@pytest.mark.parametrize("m", [1, 64])
+@pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_hybrid_w4a16_moe_awq_checkpoint(m: int, group_size: int, dtype: torch.dtype):
+    """AutoAWQ-packed qweight/qzeros through the MoeWNA16 loader conversion and
+    the hybrid repack match the dequantized reference (layout regressions)."""
+    hybrid_out, torch_output = _run_hybrid_moe(
+        m, 256, 512, 8, 2, group_size, dtype=dtype, make_weights=_make_awq_moe_weights
+    )
+    # Reference uses the same quantized values; a swapped nibble gives >2.6e-2.
+    torch.testing.assert_close(hybrid_out, torch_output, atol=5e-3, rtol=0)
+
+
+def test_hybrid_w4a16_moe_gate(monkeypatch: pytest.MonkeyPatch):
+    """Enabled by default on gfx11/gfx12; an explicit --moe-backend or
+    VLLM_MOE_HYBRID_W4A16=0 turns it off."""
+    from vllm.platforms.rocm import on_gfx1x
+
+    moe = make_dummy_moe_config()
+    if current_platform.is_rocm() and on_gfx1x():
+        assert hybrid_w4a16_moe_enabled(moe)
+    assert not hybrid_w4a16_moe_enabled(dataclasses.replace(moe, moe_backend="triton"))
+    monkeypatch.setenv("VLLM_MOE_HYBRID_W4A16", "0")
+    assert not hybrid_w4a16_moe_enabled(moe)

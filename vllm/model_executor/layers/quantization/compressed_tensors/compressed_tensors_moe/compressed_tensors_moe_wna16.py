@@ -351,9 +351,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        import vllm.envs as envs
+        from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+            hybrid_w4a16_moe_enabled,
+        )
 
-        if envs.VLLM_MOE_HYBRID_W4A16 and self.num_bits == 4:
+        if self.num_bits == 4 and hybrid_w4a16_moe_enabled(self.moe):
             self._process_weights_hybrid_w4a16(layer)
             return
 

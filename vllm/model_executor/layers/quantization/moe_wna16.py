@@ -224,6 +224,65 @@ def is_layer_skipped_quant(prefix: str, modules_to_not_convert: list[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
 
 
+def convert_awq_tensor(tensor: torch.Tensor, tensor_type: str) -> torch.Tensor:
+    # convert awq qweight/qzeros to a standard format (assume int4)
+    # qweight: (k, n // pack_factor_bit32) -> (n, k // pack_factor_bit8)
+    # qzeros: (k // group_size, n // pack_factor_bit32) ->
+    #         (n // pack_factor_bit8, k // group_size)
+    # pack_factor_bit32 = 32 // weight_bits
+    # pack_factor_bit8 = 8 // weight_bits
+
+    # 0. suppose origin shape (a, b), dtype int32
+    # 1. convert to uint8, shape (a, b) -> (a, 4 * b)
+    size0 = tensor.size(0)
+    tensor = tensor.view(torch.uint8)
+
+    # 2. unpack to uint4 (only when weight_bits == 4)
+    #    shape (a, 4 * b) -> (a, 4 * b, 2)
+    shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
+    tensor = (tensor[:, :, None] >> shifter) & 0xF
+
+    # 3. change order, see
+    # https://github.com/casper-hansen/AutoAWQ/blob/v0.2.8/awq/utils/quant_utils.py
+    # shape -> (a, 4 * b * pack_factor_bit8)
+    reverse_awq_pack_order = [0, 4, 1, 5, 2, 6, 3, 7]
+    tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
+    tensor = tensor.view(size0, -1)
+
+    # 4. transpose, shape -> (4 * b * pack_factor_bit8, a)
+    tensor = tensor.T.contiguous()
+
+    # 5. repack (only when weight_bits == 4)
+    # qweight shape -> (4 * b * pack_factor_bit8, a // pack_factor_bit8)
+    # qzeros shape -> (4 * b, a)
+
+    if tensor_type == "qweight":
+        tensor = tensor[:, 1::2] * 16 + tensor[:, ::2]
+    elif tensor_type == "qzeros":
+        tensor = tensor[1::2, :] * 16 + tensor[::2, :]
+    return tensor
+
+
+def awq_moe_weight_to_hybrid(w: torch.Tensor) -> torch.Tensor:
+    """[E, N, K//2] uint8 (low nibble = even K) -> hybrid [E, N, K//8] int32."""
+    from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+        pack_hybrid_w4a16_moe_weight,
+    )
+
+    def unpack(we: torch.Tensor) -> torch.Tensor:
+        return torch.stack((we & 0xF, we >> 4), dim=-1).view(we.size(0), -1)
+
+    return pack_hybrid_w4a16_moe_weight(w, unpack)
+
+
+def awq_moe_qzeros_to_hybrid(zp: torch.Tensor) -> torch.Tensor:
+    """[E, N//2, K//G] uint8 -> [E, N//8, K//G] int32, row n at nibble n % 8."""
+    assert zp.size(1) % 4 == 0
+    # Little-endian bytes along N -> one int32 per 8 rows.
+    zp = zp.transpose(1, 2).contiguous().view(torch.int32)
+    return zp.transpose(1, 2).contiguous()
+
+
 class MoeWNA16Method(FusedMoEMethodBase):
     """Linear method for MOE WNA16 (W8A16/W4A16) quantization.
 
@@ -423,11 +482,12 @@ class MoeWNA16Method(FusedMoEMethodBase):
         )
 
     def _use_hybrid_w4a16(self, layer: RoutedExperts) -> bool:
-        import vllm.envs as envs
+        from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+            hybrid_w4a16_moe_enabled,
+        )
 
         return (
-            envs.VLLM_MOE_HYBRID_W4A16
-            and current_platform.is_rocm()
+            hybrid_w4a16_moe_enabled(self.moe)
             and self.quant_config.linear_quant_method in ("awq", "awq_marlin")
             and self.quant_config.weight_bits == 4
             and layer.group_size in (32, 128)
@@ -439,33 +499,25 @@ class MoeWNA16Method(FusedMoEMethodBase):
         """
         from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
             make_hybrid_w4a16_moe_kernel,
-            pack_hybrid_w4a16_moe_weight,
         )
-
-        def unpack(w: torch.Tensor) -> torch.Tensor:
-            # Low nibble holds the even K element.
-            return torch.stack((w & 0xF, w >> 4), dim=-1).view(w.size(0), -1)
 
         for name in ("w13_qweight", "w2_qweight"):
             replace_parameter(
                 layer,
                 name,
                 torch.nn.Parameter(
-                    pack_hybrid_w4a16_moe_weight(getattr(layer, name), unpack),
+                    awq_moe_weight_to_hybrid(getattr(layer, name)),
                     requires_grad=False,
                 ),
             )
         if self.quant_config.has_zp:
             for name in ("w13_qzeros", "w2_qzeros"):
-                zp = getattr(layer, name)
-                assert zp.size(1) % 4 == 0
-                # Little-endian bytes along N -> one int32 per 8 rows.
-                zp = zp.transpose(1, 2).contiguous().view(torch.int32)
                 replace_parameter(
                     layer,
                     name,
                     torch.nn.Parameter(
-                        zp.transpose(1, 2).contiguous(), requires_grad=False
+                        awq_moe_qzeros_to_hybrid(getattr(layer, name)),
+                        requires_grad=False,
                     ),
                 )
 
@@ -594,44 +646,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
     @staticmethod
     def get_weight_loader(layer, weight_loader):
-        def convert_awq_tensor(tensor, tensor_type):
-            # convert awq qweight/qzeros to a standard format (assume int4)
-            # qweight: (k, n // pack_factor_bit32) -> (n, k // pack_factor_bit8)
-            # qzeros: (k // group_size, n // pack_factor_bit32) ->
-            #         (n // pack_factor_bit8, k // group_size)
-            # pack_factor_bit32 = 32 // weight_bits
-            # pack_factor_bit8 = 8 // weight_bits
-
-            # 0. suppose origin shape (a, b), dtype int32
-            # 1. convert to uint8, shape (a, b) -> (a, 4 * b)
-            size0 = tensor.size(0)
-            tensor = tensor.view(torch.uint8)
-
-            # 2. unpack to uint4 (only when weight_bits == 4)
-            #    shape (a, 4 * b) -> (a, 4 * b, 2)
-            shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)
-            tensor = (tensor[:, :, None] >> shifter) & 0xF
-
-            # 3. change order, see
-            # https://github.com/casper-hansen/AutoAWQ/blob/v0.2.8/awq/utils/quant_utils.py
-            # shape -> (a, 4 * b * pack_factor_bit8)
-            reverse_awq_pack_order = [0, 4, 1, 5, 2, 6, 3, 7]
-            tensor = tensor.view(-1, 8)[:, reverse_awq_pack_order]
-            tensor = tensor.view(size0, -1)
-
-            # 4. transpose, shape -> (4 * b * pack_factor_bit8, a)
-            tensor = tensor.T.contiguous()
-
-            # 5. repack (only when weight_bits == 4)
-            # qweight shape -> (4 * b * pack_factor_bit8, a // pack_factor_bit8)
-            # qzeros shape -> (4 * b, a)
-
-            if tensor_type == "qweight":
-                tensor = tensor[:, 1::2] * 16 + tensor[:, ::2]
-            elif tensor_type == "qzeros":
-                tensor = tensor[1::2, :] * 16 + tensor[::2, :]
-            return tensor
-
         def convert_gptq_int4_qzeros(tensor):
             tensor = tensor.view(torch.uint8)
             shifter = torch.tensor([0, 4], dtype=torch.uint8, device=tensor.device)

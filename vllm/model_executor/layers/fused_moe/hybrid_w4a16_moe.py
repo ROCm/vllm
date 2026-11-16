@@ -811,6 +811,25 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         )
 
 
+def hybrid_w4a16_moe_enabled(moe: FusedMoEConfig) -> bool:
+    """Whether a 4-bit MoE layer should use HybridW4A16MoEExperts: gfx11/gfx12
+    with the HIP op built, VLLM_MOE_HYBRID_W4A16 set, and no explicit
+    --moe-backend.
+    """
+    if not (
+        envs.VLLM_MOE_HYBRID_W4A16
+        and moe.moe_backend == "auto"
+        and current_platform.is_rocm()
+    ):
+        return False
+    import vllm._custom_ops  # noqa: F401  registers torch.ops._rocm_C
+    from vllm.platforms.rocm import on_gfx1x
+
+    return on_gfx1x() and hasattr(
+        getattr(torch.ops, "_rocm_C", None), "fused_moe_wvSplitK_int4_gemm"
+    )
+
+
 def _pad_rows_off_cliff(w: torch.Tensor) -> torch.Tensor:
     """gfx1151 cache cliff: a 2048-byte weight row stride (and the per-expert
     stride N*K//8) collides in L2/MALL. Offset the row stride by one cache line
