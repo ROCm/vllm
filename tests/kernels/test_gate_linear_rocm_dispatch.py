@@ -5,7 +5,8 @@
 These assert the dispatch flags directly, so they run device-free by mocking
 the platform predicates. ``allow_cublas_router_gemm`` selects the
 bf16xbf16->fp32 ``torch.mm`` epilogue, while ``allow_fp32_router_gemm`` selects
-the gfx950 low-M kernel with fp32 weights and output.
+the gfx950 low-M kernel with fp32 weights and output. On gfx1x the same tier
+runs wvSplitK with an fp32 store (``allow_rocm_skinny_router_gemm``).
 
 The ROCm branch is guarded on ``not bias`` because ``torch.mm`` has no bias
 term; a biased gate must fall back so the bias is not silently dropped.
@@ -16,6 +17,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.router.gate_linear as gate_linear_mod
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.platforms import current_platform
 
 
 def _make_gate(
@@ -29,6 +31,7 @@ def _make_gate(
     input_size: int = 2048,
     output_size: int = 64,
     on_gfx950: bool = False,
+    on_gfx1x: bool = False,
     parallel_world_size: int = 1,
 ) -> GateLinear:
     """Build a GateLinear with platform predicates mocked, no GPU needed."""
@@ -54,6 +57,7 @@ def _make_gate(
         import vllm.platforms.rocm as rocm_platform
 
         monkeypatch.setattr(rocm_platform, "on_gfx950", lambda: on_gfx950)
+        monkeypatch.setattr(rocm_platform, "on_gfx1x", lambda: on_gfx1x)
 
     return GateLinear(
         input_size=input_size,
@@ -168,3 +172,61 @@ def test_rocm_fp32_router_gemm_rejects_unsupported_configs(
         on_gfx950=on_gfx950,
     )
     assert not gate.allow_fp32_router_gemm
+
+
+def test_rocm_gfx1x_enables_skinny_router_gemm(monkeypatch):
+    gate = _make_gate(monkeypatch, is_rocm=True, on_gfx1x=True)
+    assert gate.allow_cublas_router_gemm
+    assert gate.allow_rocm_skinny_router_gemm
+
+
+def test_rocm_gfx1x_set_out_dtype_enables_skinny_router_gemm(monkeypatch):
+    gate = _make_gate(monkeypatch, is_rocm=True, on_gfx1x=True, out_dtype=None)
+    assert not gate.allow_rocm_skinny_router_gemm
+    gate.set_out_dtype(torch.float32)
+    assert gate.allow_rocm_skinny_router_gemm
+
+
+@pytest.mark.parametrize(
+    ("on_gfx1x", "bias", "input_size"),
+    [
+        pytest.param(False, False, 2048, id="not-gfx1x"),
+        pytest.param(True, True, 2048, id="bias"),
+        pytest.param(True, False, 2052, id="k-not-multiple-of-8"),
+    ],
+)
+def test_rocm_skinny_router_gemm_rejects_unsupported_configs(
+    monkeypatch, on_gfx1x: bool, bias: bool, input_size: int
+) -> None:
+    gate = _make_gate(
+        monkeypatch,
+        is_rocm=True,
+        on_gfx1x=on_gfx1x,
+        bias=bias,
+        input_size=input_size,
+    )
+    assert not gate.allow_rocm_skinny_router_gemm
+
+
+def _on_gfx1x_gpu() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1x
+
+    return on_gfx1x()
+
+
+@pytest.mark.skipif(not _on_gfx1x_gpu(), reason="needs a gfx1x GPU")
+@pytest.mark.parametrize("num_tokens", [1, 5, 6])
+def test_rocm_skinny_router_gemm_matches_fp32_reference(num_tokens: int) -> None:
+    """Gemma-4-26B-A4B router shape. num_tokens=6 exercises the torch.mm
+    fallback; both paths must return fp32 logits from fp32 accumulation."""
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, 2816, dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn(128, 2816, dtype=torch.bfloat16, device="cuda") * 0.02
+
+    out = gate_linear_mod.rocm_skinny_router_gemm_impl(x, weight)
+
+    assert out.dtype == torch.float32
+    ref = x.float() @ weight.float().T
+    torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)

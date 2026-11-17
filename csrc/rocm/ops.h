@@ -7,7 +7,8 @@ torch::Tensor LLMM1(at::Tensor& in_a, at::Tensor& in_b,
 
 torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
                        const std::optional<at::Tensor>& in_bias,
-                       const int64_t CuCount);
+                       const int64_t CuCount,
+                       const std::optional<at::ScalarType> out_dtype);
 
 // META3-2: bf16/fp16 wvSplitK that fuses a silu_and_mul preamble.
 // in_b is laid out as [N=1, 2*K] = [gate(K) | up(K)]; the kernel writes

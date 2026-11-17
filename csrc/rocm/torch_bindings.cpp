@@ -26,8 +26,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
 
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
-      "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
-      "Tensor");
+      "wvSplitK(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount, "
+      "ScalarType? out_dtype=None) -> Tensor");
   rocm_ops.impl("wvSplitK", torch::kCUDA, &wvSplitK);
 
   // META3-2: bf16/fp16 skinny GEMM with fused silu_and_mul preamble.
