@@ -36,7 +36,7 @@ Already in `main`, so no longer listed as dependencies:
 | #67381 | off | `--quantization-config '{"linear": "fp8_per_channel", "ignore": ["*o_proj"]}'` | gfx950, not with `--monokernel` | decode step -8% (1 request), -5% (8-24) |
 | #67191 | off | `--quantization-config '{"targets": {"*layers.0.feed_forward.experts*": "mxfp4", "*layers.61.feed_forward.experts*": "mxfp4"}}'` | routed experts only | AgentX c24 +2.8%, c40 +3.0% (ITL -7%) |
 | #67306 | on | none | gfx950, EP, MXFP4 experts, <= 2048 tokens per call | decode step -4..-5% |
-| #67380 | off | `--additional-config '{"ulysses_prefill": true}'` | TEP (TP > 1 with EP), gfx950 | TTFT 8k/16k -18%; KV -12 GiB per GPU |
+| #67380 | off | `--additional-config '{"ulysses_prefill": true}'`; at TEP8 also `VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584` | TEP (TP > 1 with EP), gfx950 | TEP4: TTFT 8k/16k -18%, KV -12 GiB per GPU. TEP8 c28: TTFT -18%, ITL p99 -20% |
 | #67153 | on | none | all models | AgentX TTFT -7..-12% (c10-c24) |
 | #67382 | on | none | gfx950, not `--monokernel` | decode step -1..-2% |
 | #67340 | off | `--speculative-config` keys `"quantization": "fp8_per_channel"`, `"draft_lm_head_quantization": "fp8"` | ROCm | decode step -1% (1 request) |
@@ -77,13 +77,15 @@ vllm serve $M --tensor-parallel-size 8 --enable-expert-parallel --monokernel --b
   --quantization-config '{"targets":{"*layers.0.feed_forward.experts*":"mxfp4","*layers.61.feed_forward.experts*":"mxfp4"}}'
 ```
 
-**TEP8, FP8 stack, cap 8 (about 240 tok/s per user).**
+**TEP8, FP8 stack, cap 8 (about 240 tok/s per user).** Ulysses prefill also pays at TEP8, but only above about 3.3k new tokens, so raise the token-sharding threshold from its default of 1024 with `VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584`.
 
 ```bash
+VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584 \
 vllm serve $M --tensor-parallel-size 8 --enable-expert-parallel --max-num-seqs 8 "${COMMON[@]}" \
   --kv-cache-dtype fp8 --gpu-memory-utilization 0.90 --max-num-batched-tokens 16384 --prefill-schedule-interval 48 \
   --speculative-config "{$SPEC,\"quantization\":\"fp8_per_channel\",\"draft_lm_head_quantization\":\"fp8\"}" \
-  --attention-config '{"use_prefill_query_quantization": true}' --quantization-config "$QCFG"
+  --additional-config '{"ulysses_prefill": true}' --attention-config '{"use_prefill_query_quantization": true}' \
+  --quantization-config "$QCFG"
 ```
 
 ## Results
@@ -95,6 +97,7 @@ How these were measured:
     - TEP4 runs use 4 GPUs, two servers per 8x MI355X node.
     - TEP8 runs use a whole node.
 - DSpark with 7 draft tokens and synthetic acceptance length 4.05, as in the InferenceX CI.
+- The TEP8 c28 row predates the TEP8 Ulysses recipe above (it ran without Ulysses). With Ulysses and `VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584`, the same point measured 23,546 tok/s/GPU at ITL p50 3.98 ms on a 2026-11-14 research build.
 - Interactivity = median tok/s per user, as on the InferenceX dashboard.
 - vLLM main = `083fbac02` with an FP8 KV cache and the same scheduler settings, without these PRs.
 - Product = (throughput ratio) x (ITL ratio), at ITL p50, against SGLang's public InferenceX 1106 points at the same concurrency. Above 1 means faster.
