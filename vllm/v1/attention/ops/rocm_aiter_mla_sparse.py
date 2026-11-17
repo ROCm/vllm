@@ -1670,10 +1670,11 @@ def rocm_aiter_sparse_attn_indexer(
                     topk_tokens,
                 )
             else:
+                # The kernel writes out of bounds when ke < ks.
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
                     chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    torch.maximum(chunk.cu_seqlen_ke, chunk.cu_seqlen_ks),
                     topk_indices,
                     num_rows,
                     logits.stride(0),
