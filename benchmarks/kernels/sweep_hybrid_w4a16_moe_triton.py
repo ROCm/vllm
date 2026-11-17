@@ -285,8 +285,8 @@ def launch_gemm2(W, problem: AlignedMoEProblem, cfg: dict) -> Callable[[], None]
 
 def build_weights(args, dtype=torch.float16, device="cuda") -> dict:
     gs = args.group_size
-    w1, w1_s, _ = _make_hybrid_moe_weights(args.e, args.k, 2 * args.n, gs, device)
-    w2, w2_s, _ = _make_hybrid_moe_weights(args.e, args.n, args.k, gs, device)
+    w1, w1_s, _, _ = _make_hybrid_moe_weights(args.e, args.k, 2 * args.n, gs, device)
+    w2, w2_s, _, _ = _make_hybrid_moe_weights(args.e, args.n, args.k, gs, device)
     return dict(
         w1=w1,
         w1_s=w1_s,

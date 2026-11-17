@@ -11,11 +11,13 @@ CUDA-graph compatible.
 """
 
 import contextlib
+from collections.abc import Callable
 
 import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -41,6 +43,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.utils import record_function_or_nullcontext
+
+logger = init_logger(__name__)
 
 
 def _moe_gemm_triton_scope(
@@ -198,7 +202,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
       w1: [E, N, K//8] int32 (ExLlama shuffle packed)
       w2: [E, K_hidden, K_inter//8] int32 (ExLlama shuffle packed)
       scales: [E, N, K//G] fp16/bf16
-      zero_points: [E, N, K//G] fp16/bf16 (raw, optional) or None
+      zero_points: [E, N//8, K//G] int32, 8 uint4 packed along N, or None
     """
 
     def __init__(
@@ -330,8 +334,12 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         """Whether the rdna_moe_gemm WMMA kernel can run gemm1 for this shape+dtype
         (gemm1 K-by-N top_k; gemm2 down proj also checked since both must be
         supported). Gates the gemm1 rdna_moe_gemm-vs-Triton dispatch in apply().
+        The WMMA kernel has no zero-point input, so asymmetric layers use Triton.
         """
         from vllm.model_executor.layers.fused_moe import moe_hip_w4a16
+
+        if self.quant_config.w1_zp is not None:
+            return False
 
         act_dim = self.adjust_N_for_activation(N, activation)
         return moe_hip_w4a16.prefill_uses_rdna_moe_gemm(
@@ -668,6 +676,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                         compute_type=compute_type,
                         group_size=self._group_size,
                         align_block_size_m=block_size_m,
+                        B_zp=self.quant_config.w1_zp,
                     )
 
             # Activation (only the [0:P] real rows; padding rows unread)
@@ -702,6 +711,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                     compute_type=compute_type,
                     group_size=self._group_size,
                     align_block_size_m=block_size_m,
+                    B_zp=self.quant_config.w2_zp,
                 )
         else:
             from vllm._custom_ops import fused_moe_wvSplitK_int4_gemm
@@ -799,3 +809,88 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
             topk_weights=unpermute_weights,
             inv_permuted_idx=inv_permuted_idx,
         )
+
+
+def hybrid_w4a16_moe_enabled(moe: FusedMoEConfig) -> bool:
+    """Whether a 4-bit MoE layer should use HybridW4A16MoEExperts: gfx11/gfx12
+    with the HIP op built, VLLM_MOE_HYBRID_W4A16 set, and no explicit
+    --moe-backend.
+    """
+    if not (
+        envs.VLLM_MOE_HYBRID_W4A16
+        and moe.moe_backend == "auto"
+        and current_platform.is_rocm()
+    ):
+        return False
+    import vllm._custom_ops  # noqa: F401  registers torch.ops._rocm_C
+    from vllm.platforms.rocm import on_gfx1x
+
+    return on_gfx1x() and hasattr(
+        getattr(torch.ops, "_rocm_C", None), "fused_moe_wvSplitK_int4_gemm"
+    )
+
+
+def _pad_rows_off_cliff(w: torch.Tensor) -> torch.Tensor:
+    """gfx1151 cache cliff: a 2048-byte weight row stride (and the per-expert
+    stride N*K//8) collides in L2/MALL. Offset the row stride by one cache line
+    (+128 B = +32 int32) via a padded buffer and return a view of logical shape
+    [E, N, K//8]. Both kernels are stride-aware and iterate only the real K//8.
+    """
+    from vllm.platforms.rocm import on_gfx1151
+
+    E_dim, N_dim, k8 = w.shape
+    if not (on_gfx1151() and w.device.type == "cuda"):
+        return w
+    if (k8 * w.element_size()) % 2048 != 0:
+        return w
+    pad = 32
+    buf = torch.empty((E_dim, N_dim, k8 + pad), dtype=w.dtype, device=w.device)
+    buf[:, :, :k8].copy_(w)
+    return buf[:, :, :k8]
+
+
+def pack_hybrid_w4a16_moe_weight(
+    w: torch.Tensor, unpack: Callable[[torch.Tensor], torch.Tensor]
+) -> torch.Tensor:
+    """Repack int4 expert weights into the hybrid [E, N, K//8] int32 layout
+    (ExLlama shuffle). ``unpack`` maps one expert's packed weight to [N, K]
+    uint4 values.
+    """
+    from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (  # noqa: E501
+        pack_int4_exllama_shuffle,
+    )
+
+    return _pad_rows_off_cliff(
+        torch.stack([pack_int4_exllama_shuffle(unpack(w[e])) for e in range(w.size(0))])
+    )
+
+
+def make_hybrid_w4a16_moe_kernel(
+    moe: FusedMoEConfig,
+    quant_config: FusedMoEQuantConfig,
+    layer: torch.nn.Module,
+) -> mk.FusedMoEKernel:
+    """Build the modular kernel directly so the runner uses the hybrid experts
+    even on single-GPU deployments (no DP/EP), where the legacy
+    select_gemm_impl path is not invoked.
+    """
+    from vllm.model_executor.layers.fused_moe.all2all_utils import (
+        maybe_make_prepare_finalize,
+    )
+
+    prepare_finalize = maybe_make_prepare_finalize(
+        moe=moe,
+        quant_config=quant_config,
+        routing_tables=layer._expert_routing_tables(),
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    assert prepare_finalize is not None
+    logger.info_once(
+        "Using HybridW4A16MoEExperts (%s)",
+        "asym" if quant_config.w1_zp is not None else "sym",
+    )
+    return mk.FusedMoEKernel(
+        prepare_finalize,
+        HybridW4A16MoEExperts(moe_config=moe, quant_config=quant_config),
+    )
