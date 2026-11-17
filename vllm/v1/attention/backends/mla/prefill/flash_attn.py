@@ -492,7 +492,8 @@ def aiter_fp8_mla_prefill_available(vllm_config: "VllmConfig") -> bool:
     gfx1250 with an FP8 KV cache and an aiter that has the kernel."""
     return (
         is_kimi_k3_on_gfx1250(vllm_config)
-        and vllm_config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
+        and vllm_config.cache_config.cache_dtype
+        in ("fp8", "fp8_e4m3", "fp8_k3_mla_640")
         and _aiter_fp8_mla_varlen_importable()
     )
 

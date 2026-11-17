@@ -288,6 +288,19 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self._prefill_backend = (
             layer_prefill_backend.clone() if layer_prefill_backend is not None else None
         )
+        # Dense-MHA prefill (seq_len <= topk) runs on the MLA prefill backend;
+        # let it use FP8 queries when the backend supports them (ROCm gfx1250).
+        self._prefill_q_data_type = self.model_config.dtype
+        if self._prefill_backend is not None:
+            from vllm.model_executor.layers.attention.mla_attention import (
+                MLACommonMetadataBuilder,
+            )
+
+            self._prefill_q_data_type = (
+                MLACommonMetadataBuilder.determine_prefill_query_data_type(
+                    vllm_config, self.model_config.dtype
+                )
+            )
         layers = vllm_config.compilation_config.static_forward_context
         self.use_shardq = any(
             getattr(layers[name], "use_shardq", False) for name in layer_names
@@ -439,7 +452,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                 max_query_len=prefill_max_query_len,
                 query_lens_cpu=prefill_query_lens_cpu,
                 chunked_context=chunked_context,
-                q_data_type=self.model_config.dtype,
+                q_data_type=self._prefill_q_data_type,
                 output_dtype=self.model_config.dtype,
                 prefill_backend=self._prefill_backend,
                 use_dense_mha=(
