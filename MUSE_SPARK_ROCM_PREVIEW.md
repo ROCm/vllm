@@ -27,7 +27,7 @@ Already in `main`, so no longer listed as dependencies:
 - [#65985](https://github.com/vllm-project/vllm/pull/65985): DSpark draft layers as one launch under `--monokernel`. It needs BF16 draft weights; with #67340's FP8 draft it logs `drafter off` and the stock draft layers run.
 - [#59098](https://github.com/vllm-project/vllm/pull/59098): AITER FA context fix for out-of-order batches.
 
-## Knobs, by estimated impact (replay model; measured leave-one-out pending)
+## Knobs, by estimated impact (replay model)
 
 | PR | default | knob | gate | estimated AgentX TEP4 p90 product: c40 (c24) | measured impact (MI355X) |
 | --- | --- | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ Already in `main`, so no longer listed as dependencies:
 - Estimated impact = how much higher the product vs SGLang-1106 at p90 (InferenceX `itl`) is with the PR than with the TEP4 recipe below minus that PR, at concurrency 40 (24 in parentheses).
     - It comes from a replay of the vLLM scheduler over measured AgentX steps, rescaled to this preview (it reproduces the TEP4 c24/c40 rows below within 3%). The inputs are each PR's measured step-time savings.
     - The inputs carry roughly -40%/+30% uncertainty. #67381/#67145, #67306/#67191 and #67382/#67340 are ties.
-- These are estimates; a measured leave-one-out is pending. #67153's gain is TTFT, which `itl` does not count.
+- #67153's gain is TTFT, which `itl` does not count.
 
 To use #67381 and #67191 together, put both in one `targets` map (a `targets` map replaces `linear`, so do not combine the two keys):
 `{"targets": {"re:.*\\.(qkv_proj|pooler|unpooler)$": "fp8_per_channel", "*layers.0.feed_forward.experts*": "mxfp4", "*layers.61.feed_forward.experts*": "mxfp4"}}`.
