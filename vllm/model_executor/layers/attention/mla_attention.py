@@ -250,6 +250,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
@@ -308,6 +309,7 @@ from vllm.v1.attention.ops.pcp import (
     maybe_gather_mla_latent_cache_inputs,
 )
 from vllm.v1.attention.ops.shardq import allocate_shardq_buffers, shard_q, unshard_out
+from vllm.v1.attention.ops.triton_mla_context_gather import gather_mla_context_fp8
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
@@ -762,7 +764,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             query_dtype = (
                 current_platform.fp8_dtype()
                 if is_quantized_kv_cache(self.kv_cache_dtype)
-                and self.kv_cache_dtype != "fp8_ds_mla"
+                and self.kv_cache_dtype not in ("fp8_ds_mla", "fp8_k3_mla_640")
                 and self.impl.supports_quant_query_input
                 else dtype
             )
@@ -1120,6 +1122,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Opaque per-token byte formats stay as raw uint8
             "fp8_ds_mla",
             "nvfp4_ds_mla",
+            "fp8_k3_mla_640",
         ):
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
@@ -2187,16 +2190,29 @@ def backend_supports_prefill_query_quantization() -> bool:
     Not supported:
     - FlashAttention (FA3/FA4)
     - Non-GB200 devices (FP8 prefill requires device capability 100)
+
+    On ROCm gfx1250, FlashAttention runs FP8 prefill on aiter's
+    mha_fwd_mla_varlen when the KV cache is FP8.
     """
+    from vllm.config import get_current_vllm_config
+    from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
+
+    vllm_config = get_current_vllm_config()
+    if current_platform.is_rocm():
+        from vllm.v1.attention.backends.mla.prefill.flash_attn import (
+            aiter_fp8_mla_prefill_available,
+        )
+
+        return (
+            aiter_fp8_mla_prefill_available(vllm_config)
+            and get_mla_prefill_backend(vllm_config).get_name() == "FLASH_ATTN"
+        )
+
     # FP8 prefill query quantization requires GB200 (device capability 100)
     # for the necessary FP8 kernels at the moment.
     if not current_platform.is_device_capability_family(100):
         return False
 
-    from vllm.config import get_current_vllm_config
-    from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
-
-    vllm_config = get_current_vllm_config()
     backend_cls = get_mla_prefill_backend(vllm_config)
     return backend_cls.get_name() in (
         "FLASHINFER",
@@ -2642,7 +2658,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         """
         use_fp8 = (
             is_quantized_kv_cache(vllm_config.cache_config.cache_dtype)
-            and vllm_config.attention_config.use_prefill_query_quantization
+            and (
+                vllm_config.attention_config.use_prefill_query_quantization
+                or current_platform.is_rocm()
+            )
             and backend_supports_prefill_query_quantization()
         )
 
@@ -3243,13 +3262,35 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             k[..., k_nope.shape[-1] :] = k_pe
         return k
 
+    def _kv_b_proj_fp8(self, x: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
+        """kv_b_proj(x) in fp8. An unquantized bf16 kv_b_proj on ROCm writes fp8
+        from the GEMM, so no separate cast runs."""
+        weight = getattr(self.kv_b_proj, "weight", None)
+        if (
+            current_platform.is_rocm()
+            and isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
+            and weight is not None
+            and weight.dtype == torch.bfloat16 == x.dtype
+            and getattr(self.kv_b_proj, "bias", None) is None
+            and x.dim() == 2
+        ):
+            from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+
+            return gemm_a16w16(x, weight, dtype=fp8_dtype)
+        return self.kv_b_proj(x)[0].to(fp8_dtype)
+
     def _compute_prefill_context(
         self,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
+        out: torch.Tensor | None = None,
+        lse: torch.Tensor | None = None,
     ):
+        """Attention over the gathered context. With ``out``/``lse`` (a backend
+        that supports_k_pe_and_merge), each chunk is merged into them in place
+        and nothing is returned."""
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.prefill_backend is not None
@@ -3265,79 +3306,125 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         if use_fp8_prefill:
             q = q.to(prefill_metadata.q_data_type)
 
+        gather_fp8_context = (
+            out is not None
+            and use_fp8_prefill
+            and self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+        )
         output = None
         output_lse = None
         for chunk in chunked_context.chunks:
             toks = chunk.num_context_tokens
             chunk_block_table = prefill_metadata.block_table[chunk.request_slice]
-            if self.kv_cache_dtype == "fp8_ds_mla":
-                ops.cp_gather_and_upconvert_fp8_kv_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
-                    block_table=chunk_block_table,
-                    workspace_starts=chunk.cu_seq_lens,
-                    batch_size=chunk.num_requests,
-                    seq_starts=chunk.starts,
+            if gather_fp8_context:
+                kv_c_normed, k_pe = gather_mla_context_fp8(
+                    kv_c_and_k_pe_cache,
+                    chunk_block_table,
+                    chunk.cu_seq_lens,
+                    chunk.starts,
+                    chunk.token_to_seq,
+                    toks,
+                    k_scale,
+                    self.kv_lora_rank,
+                    prefill_metadata.q_data_type,
                 )
-            elif self.kv_cache_dtype == "nvfp4_ds_mla":
-                ops.cp_gather_and_upconvert_nvfp4_kv_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
-                    block_table=chunk_block_table,
-                    workspace_starts=chunk.cu_seq_lens,
-                    batch_size=chunk.num_requests,
-                    seq_starts=chunk.starts,
-                )
-            elif current_platform.is_cpu():
-                assert not is_quantized_kv_cache(self.kv_cache_dtype), (
-                    "CPU MLA context gather fallback only supports "
-                    f"non-quantized KV cache, got {self.kv_cache_dtype}"
-                )
-                cpu_ops.gather_mla_context_cache_cpu(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
-                    block_table=chunk_block_table,
-                    starts=chunk.starts,
-                    cu_seq_lens=chunk.cu_seq_lens,
-                )
-            elif not use_fp8_prefill:
-                ops.gather_and_maybe_dequant_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace,
-                    block_table=chunk_block_table,
-                    cu_seq_lens=chunk.cu_seq_lens,
-                    token_to_seq=chunk.token_to_seq,
-                    num_tokens=toks,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale=k_scale,
-                    seq_starts=chunk.starts,
-                )
+                kv_nope = self._kv_b_proj_fp8(
+                    kv_c_normed, prefill_metadata.q_data_type
+                ).view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             else:
-                # FP8 path: gather cache without dequantization
-                ops.cp_gather_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace[:toks],
-                    block_table=chunk_block_table,
-                    cu_seq_lens=chunk.cu_seq_lens,
-                    batch_size=chunk.num_requests,
-                    seq_starts=chunk.starts,
+                if self.kv_cache_dtype == "fp8_ds_mla":
+                    ops.cp_gather_and_upconvert_fp8_kv_cache(
+                        src_cache=kv_c_and_k_pe_cache,
+                        dst=workspace[:toks],
+                        block_table=chunk_block_table,
+                        workspace_starts=chunk.cu_seq_lens,
+                        batch_size=chunk.num_requests,
+                        seq_starts=chunk.starts,
+                    )
+                elif self.kv_cache_dtype == "nvfp4_ds_mla":
+                    ops.cp_gather_and_upconvert_nvfp4_kv_cache(
+                        src_cache=kv_c_and_k_pe_cache,
+                        dst=workspace[:toks],
+                        block_table=chunk_block_table,
+                        workspace_starts=chunk.cu_seq_lens,
+                        batch_size=chunk.num_requests,
+                        seq_starts=chunk.starts,
+                    )
+                elif self.kv_cache_dtype == "fp8_k3_mla_640":
+                    rocm_aiter_ops.k3_mla_640().k3_mla_640_cp_gather_and_upconvert(
+                        src_cache=kv_c_and_k_pe_cache,
+                        dst=workspace[:toks],
+                        block_table=chunk_block_table,
+                        workspace_starts=chunk.cu_seq_lens,
+                        batch_size=chunk.num_requests,
+                        seq_starts=chunk.starts,
+                    )
+                elif current_platform.is_cpu():
+                    assert not is_quantized_kv_cache(self.kv_cache_dtype), (
+                        "CPU MLA context gather fallback only supports "
+                        f"non-quantized KV cache, got {self.kv_cache_dtype}"
+                    )
+                    cpu_ops.gather_mla_context_cache_cpu(
+                        src_cache=kv_c_and_k_pe_cache,
+                        dst=workspace[:toks],
+                        block_table=chunk_block_table,
+                        starts=chunk.starts,
+                        cu_seq_lens=chunk.cu_seq_lens,
+                    )
+                elif not use_fp8_prefill:
+                    ops.gather_and_maybe_dequant_cache(
+                        src_cache=kv_c_and_k_pe_cache,
+                        dst=workspace,
+                        block_table=chunk_block_table,
+                        cu_seq_lens=chunk.cu_seq_lens,
+                        token_to_seq=chunk.token_to_seq,
+                        num_tokens=toks,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=k_scale,
+                        seq_starts=chunk.starts,
+                    )
+                else:
+                    # FP8 path: gather cache without dequantization
+                    ops.cp_gather_cache(
+                        src_cache=kv_c_and_k_pe_cache,
+                        dst=workspace[:toks],
+                        block_table=chunk_block_table,
+                        cu_seq_lens=chunk.cu_seq_lens,
+                        batch_size=chunk.num_requests,
+                        seq_starts=chunk.starts,
+                    )
+
+                # Extract kv_c_normed from workspace
+                kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
+                if kv_b_proj_input_dtype is not None:
+                    kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
+
+                k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
                 )
 
-            # Extract kv_c_normed from workspace
-            kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
-            if kv_b_proj_input_dtype is not None:
-                kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
-
-            k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-
-            # To Do: Use epilogue of kv_b_proj to generate fp8 kv_nope.
-            if use_fp8_prefill:
-                kv_nope = kv_nope.to(prefill_metadata.q_data_type)
-                k_pe = k_pe.to(prefill_metadata.q_data_type)
+                # To Do: Use epilogue of kv_b_proj to generate fp8 kv_nope.
+                if use_fp8_prefill:
+                    kv_nope = kv_nope.to(prefill_metadata.q_data_type)
+                    k_pe = k_pe.to(prefill_metadata.q_data_type)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+            if out is not None:
+                assert lse is not None
+                ts = chunk.token_slice
+                prefill_metadata.prefill_backend.run_prefill_context_chunk(  # type: ignore[call-arg]
+                    chunk=chunk,
+                    q=q[ts],
+                    k=k_nope,
+                    v=v,
+                    out=out[ts],
+                    k_pe=k_pe,
+                    lse_out=lse[:, ts],
+                    o_init=out[ts],
+                    lse_init=lse[:, ts],
+                )
+                continue
 
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
@@ -3408,6 +3495,15 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             block_table = prefill_metadata.block_table[chunk.request_slice]
             if self.kv_cache_dtype == "fp8_ds_mla":
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace[:toks],
+                    block_table=block_table,
+                    workspace_starts=padded_local_cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+            elif self.kv_cache_dtype == "fp8_k3_mla_640":
+                rocm_aiter_ops.k3_mla_640().k3_mla_640_cp_gather_and_upconvert(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace[:toks],
                     block_table=block_table,
@@ -3538,10 +3634,44 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             "Fused FP8 output is only wired for the non-chunked-context path"
         )
 
-        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+        use_k_pe_and_merge = (
+            prefill_metadata.prefill_backend.supports_k_pe_and_merge()
+            and use_fp8_prefill
+            and output_scale is None
+            and self.dcp_world_size <= 1
+        )
+        if use_k_pe_and_merge:
+            kv_nope = self._kv_b_proj_fp8(kv_c_normed, prefill_metadata.q_data_type)
+        else:
+            kv_nope = self.kv_b_proj(kv_c_normed)[0]
+        kv_nope = kv_nope.view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
         k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+
+        if use_k_pe_and_merge:
+            k_pe = k_pe.to(prefill_metadata.q_data_type)
+            output = output.view(-1, self.num_heads, self.v_head_dim)
+            lse = None
+            if has_context:
+                lse = torch.empty(
+                    (self.num_heads, q.shape[0]), dtype=torch.float32, device=q.device
+                )
+            prefill_metadata.prefill_backend.run_prefill_new_tokens(  # type: ignore[call-arg]
+                q=q,
+                k=k_nope,
+                v=v,
+                return_softmax_lse=False,
+                out=output,
+                k_pe=k_pe,
+                lse_out=lse,
+            )
+            if has_context:
+                self._compute_prefill_context(
+                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale, out=output, lse=lse
+                )
+            return
+
         k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
         if use_fp8_prefill:

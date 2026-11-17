@@ -561,6 +561,7 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
         "fp8_e4m3",
         "mxfp4_mla",
         "fp8_ds_mla",
+        "fp8_k3_mla_640",
     ]
 
     @staticmethod
@@ -605,6 +606,8 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
 
         return on_mi3xx()
 
+
+_PACKED_RECORD_DTYPES = ("fp8_ds_mla", "fp8_k3_mla_640")
 
 # Indexer writes per shared top-k buffer, in layer construction order.
 _INDEX_EPOCHS: dict[int, int] = {}
@@ -679,7 +682,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             getattr(attention_context[name].impl, "sinks", None) is None
             and not getattr(attention_context[name].impl, "use_aiter_sparse_mla", False)
             and getattr(attention_context[name].impl, "kv_cache_dtype", None)
-            != "fp8_ds_mla"
+            not in _PACKED_RECORD_DTYPES
             for name in layer_names
         )
         # Bounds the KV-split heuristic (see `_sparse_decode_max_split`).
@@ -1056,10 +1059,10 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         )
         self.softmax_scale = scale
         if self.dcp_world_size > 1 and (
-            self.kv_cache_dtype != "fp8_ds_mla" or sinks is not None
+            self.kv_cache_dtype not in _PACKED_RECORD_DTYPES or sinks is not None
         ):
             raise NotImplementedError(
-                "ROCm sparse DCP requires fp8_ds_mla without sinks"
+                "ROCm sparse DCP requires fp8_ds_mla or fp8_k3_mla_640 without sinks"
             )
         if self.kv_cache_dtype == "fp8_ds_mla":
             # The fp8_ds_mla branch of forward_mqa routes to aiter's Triton
@@ -1072,6 +1075,14 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                     "requires gfx950 (aiter Triton sparse_mla_fwd, "
                     "fp8_dsv32_mla layout)."
                 )
+        elif self.kv_cache_dtype == "fp8_k3_mla_640":
+            from vllm.platforms.rocm import on_gfx1250
+
+            if not on_gfx1250():
+                raise NotImplementedError(
+                    "kv_cache_dtype=fp8_k3_mla_640 requires gfx1250."
+                )
+            rocm_aiter_ops.k3_mla_640()
         # Dense-MHA prefill gathers cache rows into a bf16 workspace and would
         # misread packed mxfp4_mla rows.
         self.supports_dense_mha_prefill = (  # type: ignore[misc]
@@ -1139,6 +1150,12 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         k_scale: torch.Tensor,
         skip_scale: bool = False,
     ) -> None:
+        if kv_cache_dtype == "fp8_k3_mla_640":
+            if kv_cache.numel() > 0:
+                rocm_aiter_ops.k3_mla_640().k3_mla_640_concat_and_cache(
+                    kv_c_normed, k_pe.squeeze(1), kv_cache, slot_mapping.flatten()
+                )
+            return
         if kv_cache_dtype != "mxfp4_mla":
             return super().do_kv_cache_update(
                 kv_c_normed,
@@ -1455,10 +1472,12 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
         # fp8_ds_mla is an opaque per-token byte format (fp8 latent + per-128
         # fp32 scales + bf16 rope); only the Triton sparse MLA kernel reads it,
         # and it wants a bf16 query.
-        fp8_ds_mla_cache = self.kv_cache_dtype == "fp8_ds_mla"
+        fp8_ds_mla_cache = self.kv_cache_dtype in _PACKED_RECORD_DTYPES
         if isinstance(q, tuple):
             ql_nope, q_pe = q
-            if fp8_attention and not fp8_ds_mla_cache:
+            if self.kv_cache_dtype == "fp8_k3_mla_640":
+                q = rocm_aiter_ops.k3_mla_640().k3_mla_640_q_pack(ql_nope, q_pe)
+            elif fp8_attention and not fp8_ds_mla_cache:
                 q = layer._decode_concat_quant_fp8_op(  # type: ignore[attr-defined]
                     ql_nope, q_pe, layer._q_scale
                 )
@@ -1537,6 +1556,9 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 dtype=attn_metadata.attn_out_dtype,
                 device=q.device,
             )
+            k3_640 = self.kv_cache_dtype == "fp8_k3_mla_640"
+            if k3_640 and not q.is_contiguous():
+                q = q.contiguous()
             lse = rocm_aiter_ops.triton_sparse_mla_fwd(
                 q,
                 kv_c_and_k_pe_cache.view(torch.uint8).unsqueeze(1),
@@ -1548,6 +1570,16 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 has_invalid=not compact,
                 return_lse=True,
+                **(
+                    {
+                        "kv_format": self.kv_cache_dtype,
+                        "keys_per_row": -(
+                            -attn_metadata.topk_tokens // self.dcp_world_size
+                        ),
+                    }
+                    if k3_640
+                    else {}
+                ),
             )
             return output, lse
 
@@ -1581,7 +1613,7 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
             assert self.sinks is None, (
                 "the fp8_ds_mla sparse MLA path does not support attention sinks"
             )
-            if q.dtype != torch.bfloat16:
+            if q.dtype != torch.bfloat16 and self.kv_cache_dtype == "fp8_ds_mla":
                 # A packed fp8 query would need a q_scale the aiter wrapper
                 # does not accept; only the dequantized bf16 form is supported.
                 raise NotImplementedError(
@@ -1609,6 +1641,9 @@ class ROCMAiterMLASparseImpl(SparseMLACommonImpl[ROCMAiterMLASparseMetadata]):
                 # for an invalid top-k entry, so no slot in the stream is
                 # negative.
                 has_invalid=False,
+                kv_format=(
+                    None if self.kv_cache_dtype == "fp8_ds_mla" else self.kv_cache_dtype
+                ),
             )
             return output, None
 

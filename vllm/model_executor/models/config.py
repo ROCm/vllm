@@ -844,6 +844,11 @@ class KimiK3ForConditionalGenerationConfig(VerifyAndUpdateConfig):
             "fp8"
         ):
             cache_config.cache_dtype = "fp8_ds_mla"
+            if current_platform.is_rocm():
+                from vllm.platforms.rocm import on_gfx1250
+
+                if on_gfx1250():
+                    cache_config.cache_dtype = "fp8_k3_mla_640"
         if vllm_config.speculative_config is not None:
             from vllm.models.kimi_k3.nvidia.dense_draft import configure_dense_draft
 

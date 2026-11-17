@@ -89,6 +89,8 @@ class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             return False
         if attn.hisparse_cache is not None or attn.q_pad_num_heads is not None:
             return False
+        if self.indexer is not None:
+            return False
         # Only the W_UK variants reproduced in _fused_decode are supported.
         return (
             attn.is_aiter_triton_fp4_bmm_enabled
@@ -347,6 +349,7 @@ class KimiK3MultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
             q_proj_input, kv_c_normed = self._normalize_q_kv(q_c, kv_c)
+            q_c = q_proj_input
             q_proj_layer = self.q_b_proj
         else:
             assert self.kv_a_proj_with_mqa is not None, (

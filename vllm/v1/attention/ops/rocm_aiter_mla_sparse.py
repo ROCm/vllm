@@ -151,6 +151,42 @@ def _localize_aiter_prefill_topk(
     )
 
 
+@functools.cache
+def _gluon_prefill_top_k_fn():
+    try:
+        from aiter.ops.triton.topk_prefill import top_k_per_row_prefill
+    except ImportError:
+        return None
+    return top_k_per_row_prefill
+
+
+def _gluon_prefill_top_k(topk_tokens: int, max_seqlen_k: int):
+    """aiter's gfx1250 Gluon prefill top-k (same contract as torch.ops._C.top_k_per_row_prefill)
+    or None. VLLM_ROCM_DSA_GLUON_TOPK:
+
+    * auto (default): only chunks whose rows all fit in topk_tokens (packed or short prompts),
+      where it is 1.4-1.9x faster than the C++ kernel on any logits;
+    * 1: every prefill chunk. Its speed does not depend on the logit values: 8-28x faster on
+      tied logits (e.g. many exact zeros), but 0.5-1.1x on fully distinct ones;
+    * 0: off.
+    """
+    import os
+
+    from vllm.platforms.rocm import on_gfx1250
+
+    mode = os.environ.get("VLLM_ROCM_DSA_GLUON_TOPK", "auto")
+    if mode == "0" or not on_gfx1250():
+        return None
+    if topk_tokens & (topk_tokens - 1) or topk_tokens > 4096:
+        return None
+    if mode != "1" and max_seqlen_k > topk_tokens:
+        return None
+    fn = _gluon_prefill_top_k_fn()
+    if fn is None and mode == "1":
+        logger.warning_once("VLLM_ROCM_DSA_GLUON_TOPK=1 but aiter has no Gluon prefill top-k")
+    return fn
+
+
 def _launch_aiter_top_k_per_row_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -183,6 +219,11 @@ def _indexer_k_quant_and_cache_kernel(
     HEAD_TILE_SIZE: tl.constexpr,
     IS_FNUZ: tl.constexpr,
     USE_UE8M0: tl.constexpr,
+    k_stride,
+    norm_w_ptr,
+    norm_b_ptr,
+    norm_eps,
+    HAS_NORM: tl.constexpr,
 ):
     tid = tl.program_id(0)
     offset = tl.arange(0, head_dim)
@@ -195,7 +236,7 @@ def _indexer_k_quant_and_cache_kernel(
         tile_offset = offset
     tile_store_offset = tile_offset
     # for idx in tl.range(tid, num_tokens, n_program):
-    src_ptr = k_ptr + tid * head_dim
+    src_ptr = k_ptr + tid * k_stride
     slot_id = tl.load(slot_mapping_ptr + tid)
     if slot_id < 0:
         return
@@ -206,6 +247,12 @@ def _indexer_k_quant_and_cache_kernel(
     tile_block_id = block_offset // BLOCK_TILE_SIZE
     tile_block_offset = block_offset % BLOCK_TILE_SIZE
     val = tl.load(src_ptr + offset)
+    if HAS_NORM:
+        x = val.to(tl.float32)
+        x -= tl.sum(x, axis=0) / head_dim
+        x *= tl.rsqrt(tl.sum(x * x, axis=0) / head_dim + norm_eps)
+        w = tl.load(norm_w_ptr + offset).to(tl.float32)
+        val = (x * w + tl.load(norm_b_ptr + offset).to(tl.float32)).to(val.dtype)
     amax = tl.max(val.abs(), axis=-1).to(tl.float32)
     if IS_FNUZ:
         scale = tl.maximum(1e-4, amax) / 224.0
@@ -241,7 +288,10 @@ def indexer_k_quant_and_cache_triton(
     block_tile_size=16,
     head_tile_size=16,
     cache_layout: str | None = None,
+    k_norm: tuple[torch.Tensor, torch.Tensor, float] | None = None,
 ):
+    """`k_norm` = (weight, bias, eps): LayerNorm each key row before quantizing."""
+    norm_w, norm_b, norm_eps = k_norm or (None, None, 0.0)
     num_blocks = kv_cache.shape[0]
     head_dim = k.shape[-1]
     num_tokens = slot_mapping.shape[0]
@@ -272,6 +322,11 @@ def indexer_k_quant_and_cache_triton(
         head_tile_size,
         IS_FNUZ=torch.float8_e4m3fnuz == FP8_DTYPE,
         USE_UE8M0=scale_fmt == "ue8m0",
+        k_stride=k.stride(0),
+        norm_w_ptr=norm_w,
+        norm_b_ptr=norm_b,
+        norm_eps=norm_eps,
+        HAS_NORM=k_norm is not None,
     )
 
 
@@ -868,7 +923,7 @@ def rocm_fp8_paged_mqa_logits(
     # Block-flat (NORMAL) caches take the Triton path: C4A by ratio, others
     # by explicit cache_layout. Flash/DSv3.2 also skip insert but write SHUFFLE.
     if (
-        (_ON_GFX950 or _ON_GFX942)
+        (_ON_GFX950 or _ON_GFX942 or (_ON_GFX1250 and cache_layout == "NORMAL"))
         and block_size > 1
         and (cache_layout == "NORMAL" or _indexer_k_is_c4a_block_flat(compress_ratio))
     ):
@@ -1451,7 +1506,12 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
-        if _ON_GFX942 or _ON_GFX950 or _ON_RDNA:
+        if (
+            _ON_GFX942
+            or _ON_GFX950
+            or _ON_RDNA
+            or (_ON_GFX1250 and cache_layout == "NORMAL")
+        ):
             _decode_logits_workspace(decode_rows, decode_max_model_len)
         else:
             workspace_manager.get_simultaneous(
@@ -1501,7 +1561,9 @@ def rocm_aiter_sparse_attn_indexer(
     has_decode = layer_attn_metadata.num_decodes > 0
     has_prefill = layer_attn_metadata.num_prefills > 0
     num_decode_tokens = layer_attn_metadata.num_decode_tokens
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    k31 = _ON_GFX1250 and cache_layout == "NORMAL"
+    if not k31 or dcp_world_size > 1:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
 
     # during speculative decoding, k may be padded to the CUDA graph batch
     # size while slot_mapping only covers actual tokens.
@@ -1643,11 +1705,22 @@ def rocm_aiter_sparse_attn_indexer(
                     topk_indices,
                     topk_tokens,
                 )
-            else:
-                torch.ops._C.top_k_per_row_prefill(
+            elif (
+                gluon_topk := _gluon_prefill_top_k(topk_tokens, chunk.max_seqlen_k)
+            ) is not None:
+                gluon_topk(
                     logits,
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
+                    topk_indices,
+                    topk_tokens,
+                )
+            else:
+                # The kernel writes out of bounds when ke < ks.
+                torch.ops._C.top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    torch.maximum(chunk.cu_seqlen_ke, chunk.cu_seqlen_ks),
                     topk_indices,
                     num_rows,
                     logits.stride(0),
@@ -1743,7 +1816,12 @@ def rocm_aiter_sparse_attn_indexer(
             max_compressed_seq_len = decode_max_model_len
         else:
             max_compressed_seq_len = layer_attn_metadata.max_seq_len // compress_ratio
-        if rocm_aiter_ops.is_indexer_top_k_supported(
+        if (
+            k31
+            and rocm_aiter_ops.is_enabled()
+            and num_rows <= 256
+            and logits.shape[1] >= 32768
+        ) or rocm_aiter_ops.is_indexer_top_k_supported(
             is_prefill=False,
             compress_ratio=compress_ratio,
             num_rows=num_rows,
