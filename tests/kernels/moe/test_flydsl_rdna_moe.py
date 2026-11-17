@@ -18,6 +18,8 @@ if not (on_gfx11() and importlib.util.find_spec("flydsl") is not None):
 from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (  # noqa: E402
     BLOCK_M,
     flydsl_rdna_moe_gemm,
+    flydsl_rdna_moe_gemm_reduce,
+    gate_up_tile_order,
     pack_w4a16_weights,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
@@ -102,3 +104,66 @@ def test_flydsl_rdna_moe_gemm_single_token():
         out, x, w, coef, None, topk_ids.view(-1), None, top_k, group_size
     )
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 20])
+def test_flydsl_rdna_moe_gemm_silu_mul(num_tokens: int):
+    """With the gate / up columns packed per tile, the GEMM returns
+    ``silu(gate) * up`` of the plain GEMM's output.
+    """
+    set_random_seed(0)
+    device = "cuda"
+    num_experts, top_k, n_out, n_in, group_size = 8, 4, 256, 512, 128
+    groups = n_in // group_size
+    q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
+    scale = torch.rand((num_experts, n_out, groups), device=device) * 0.02 + 0.001
+    scale = scale.to(torch.bfloat16)
+    zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
+    x = torch.randn((num_tokens, n_in), device=device, dtype=torch.bfloat16)
+    topk_ids = torch.rand((num_tokens, num_experts), device=device).topk(top_k).indices
+    topk_ids = topk_ids.to(torch.int32)
+    if num_tokens == 1:
+        route = (None, topk_ids.view(-1), None)
+    else:
+        route = moe_align_block_size(topk_ids, BLOCK_M, num_experts)
+
+    rows = num_tokens * top_k
+    gate_up = torch.empty((rows, n_out), device=device, dtype=torch.bfloat16)
+    flydsl_rdna_moe_gemm(
+        gate_up, x, *pack_w4a16_weights(q, scale, zp), *route, top_k, group_size
+    )
+    gate, up = gate_up.float().chunk(2, dim=1)
+    ref = torch.nn.functional.silu(gate) * up
+
+    order = gate_up_tile_order(n_out, device)
+    packed = pack_w4a16_weights(q[:, order], scale[:, order], zp[:, order])
+    out = torch.empty((rows, n_out // 2), device=device, dtype=torch.bfloat16)
+    flydsl_rdna_moe_gemm(out, x, *packed, *route, top_k, group_size, silu_mul=True)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
+
+
+def test_flydsl_rdna_moe_gemm_reduce():
+    """The one-token GEMM with the fused top-k sum matches the plain GEMM
+    followed by the weighted sum, and skips experts with id -1.
+    """
+    set_random_seed(0)
+    device = "cuda"
+    num_experts, top_k, n_out, n_in, group_size = 16, 8, 256, 512, 128
+    groups = n_in // group_size
+    q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
+    scale = torch.rand((num_experts, n_out, groups), device=device) * 0.02 + 0.001
+    zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
+    w, coef = pack_w4a16_weights(q, scale.to(torch.bfloat16), zp)
+    x = torch.randn((top_k, n_in), device=device, dtype=torch.bfloat16)
+    expert_ids = torch.tensor(
+        [5, -1, 0, 3, 15, 9, -1, 11], dtype=torch.int32, device=device
+    )
+    weights = torch.rand((1, top_k), device=device)
+
+    rows = torch.zeros((top_k, n_out), device=device, dtype=torch.bfloat16)
+    flydsl_rdna_moe_gemm(rows, x, w, coef, None, expert_ids, None, 1, group_size)
+    ref = (rows.float() * weights.view(-1, 1)).sum(dim=0, keepdim=True)
+
+    out = torch.empty((1, n_out), device=device, dtype=torch.bfloat16)
+    flydsl_rdna_moe_gemm_reduce(out, x, w, coef, expert_ids, weights, group_size)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())

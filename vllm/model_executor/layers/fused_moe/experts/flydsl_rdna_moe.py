@@ -18,8 +18,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
     BLOCK_M,
+    MAX_REDUCE_ROWS,
     TILE_N,
     flydsl_rdna_moe_gemm,
+    flydsl_rdna_moe_gemm_reduce,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
@@ -36,6 +38,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kInt4Static32,
 )
 from vllm.platforms import current_platform
+
+
+def fuses_silu_mul(moe_config: FusedMoEConfig) -> bool:
+    """Whether GEMM1 applies the activation itself; ``w1`` is then packed in
+    ``gate_up_tile_order``."""
+    return moe_config.activation == MoEActivation.SILU and (
+        moe_config.swiglu_limit is None
+    )
 
 
 class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
@@ -60,6 +70,8 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             num_dispatchers=num_dispatchers,
         )
         self._arange: torch.Tensor | None = None
+        self._silu_mul = fuses_silu_mul(moe_config)
+        assert not self._silu_mul or self.activation_config.clamp_limit is None
 
     def _route(
         self, topk_ids: torch.Tensor, num_experts: int
@@ -176,7 +188,7 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
         )
         sorted_ids, expert_ids, num_valid = self._route(topk_ids, global_num_experts)
         flydsl_rdna_moe_gemm(
-            gate_up_out,
+            act_out if self._silu_mul else gate_up_out,
             hidden_states,
             w1,
             self.w1_scale,
@@ -185,8 +197,20 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             num_valid,
             top_k,
             group_size,
+            silu_mul=self._silu_mul,
         )
-        self.activation(activation, act_out, gate_up_out)
+        if not self._silu_mul:
+            self.activation(activation, act_out, gate_up_out)
+        if (
+            sorted_ids is None
+            and top_k <= MAX_REDUCE_ROWS
+            and topk_weights.dtype == torch.float32
+        ):
+            # One token: GEMM2 also does the weighted sum over its experts.
+            flydsl_rdna_moe_gemm_reduce(
+                output, act_out, w2, self.w2_scale, expert_ids, topk_weights, group_size
+            )
+            return
         flydsl_rdna_moe_gemm(
             down_out,
             act_out,

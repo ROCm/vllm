@@ -1447,6 +1447,7 @@ def _process_weights_emulation_awq(
 
 
 def _process_weights_flydsl(
+    layer: torch.nn.Module,
     w13: torch.Tensor,
     w2: torch.Tensor,
     w13_scale: torch.Tensor,
@@ -1460,9 +1461,14 @@ def _process_weights_flydsl(
     nibbles of a row in little-endian order, zero points are uint8
     ``[E, N // 2, K // gs]`` (8 when absent), and scales are
     ``[E, N, K // gs]``. The zero points are folded into the returned scale
-    coefficients.
+    coefficients. When the kernel applies the activation, the w13 outputs are
+    reordered so that a tile holds gate columns and their up columns.
     """
+    from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
+        fuses_silu_mul,
+    )
     from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
+        gate_up_tile_order,
         pack_w4a16_weights,
     )
 
@@ -1472,7 +1478,7 @@ def _process_weights_flydsl(
             dim, dim + 1
         )
 
-    def _pack(w, scale, qzeros):
+    def _pack(w, scale, qzeros, order=None):
         # Chunked over experts to bound the unpacked intermediates.
         packed = []
         for i in range(0, w.size(0), 8):
@@ -1482,10 +1488,16 @@ def _process_weights_flydsl(
                 if qzeros is None
                 else _nibbles(qzeros[sl], 1)
             )
-            packed.append(pack_w4a16_weights(_nibbles(w[sl], 2), scale[sl], zp))
+            parts = (_nibbles(w[sl], 2), scale[sl], zp)
+            if order is not None:
+                parts = tuple(t[:, order] for t in parts)
+            packed.append(pack_w4a16_weights(*parts))
         return (torch.cat(t) for t in zip(*packed))
 
-    w13_packed, w13_coef = _pack(w13, w13_scale, w13_qzeros)
+    order = None
+    if fuses_silu_mul(layer.moe_config):
+        order = gate_up_tile_order(w13.size(1), w13.device)
+    w13_packed, w13_coef = _pack(w13, w13_scale, w13_qzeros, order)
     w2_packed, w2_coef = _pack(w2, w2_scale, w2_qzeros)
     # Zero points live in the coefficients; hand back empty placeholders.
     return (
@@ -1656,7 +1668,7 @@ def convert_to_wna16_moe_kernel_format(
         )
     elif backend == WNA16MoEBackend.FLYDSL:
         return _process_weights_flydsl(
-            w13, w2, w13_scale, w2_scale, w13_qzeros, w2_qzeros
+            layer, w13, w2, w13_scale, w2_scale, w13_qzeros, w2_qzeros
         )
     elif backend == WNA16MoEBackend.CPU:
         return _process_weights_cpu(
