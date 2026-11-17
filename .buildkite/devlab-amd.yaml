@@ -1,0 +1,43 @@
+# DevLab gfx1201 (Navi4) test lane (amd-rocm/devlab).
+#
+# DevLab Dispatch gives each job a fresh VM with a single-use buildkite-agent
+# and Docker on the host. No Kubernetes, so these are plain Docker steps
+# instead of test-template-amd.j2's pod specs.
+#
+# The per-build CI image compiles vLLM only for CI_ARCH (gfx90a;gfx942;gfx950),
+# so this lane runs the ROCm nightly, which is compiled for every arch. The
+# checkout's Python sources are laid over the installed package: Python and
+# Triton code come from this commit, compiled ops from the nightly. The host's
+# pip/uv index config is mounted when present.
+#
+# Upload with: buildkite-agent pipeline upload .buildkite/devlab-amd.yaml
+steps:
+  - label: ":amd: (gfx1201) Segmented Attention"
+    agents:
+      queue: amd_gfx1201
+    timeout_in_minutes: 60
+    command: |
+      set -euo pipefail
+      hostname
+      mounts=()
+      for f in /etc/pip.conf /etc/uv/uv.toml; do
+        if [ -f "$$f" ]; then mounts+=(-v "$$f:$$f:ro"); fi
+      done
+      docker run --rm \
+        --device=/dev/kfd --device=/dev/dri \
+        --ipc=host --shm-size=16g \
+        -v "$$PWD:/src:ro" "$${mounts[@]}" \
+        -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+        -e PYTHONPATH=/work \
+        --entrypoint bash \
+        vllm/vllm-openai-rocm:nightly-rocm100 \
+        -c 'set -e
+          site=$$(python3 -c "import importlib.util, os; print(os.path.dirname(importlib.util.find_spec(\"vllm\").origin))")
+          cp -a /src/. /work; rm -rf /work/.git
+          cp -an "$$site/." /work/vllm/
+          cd /work
+          uv pip install --system -q -r requirements/test/rocm.txt
+          uv pip install --system -q tests/vllm_test_utils
+          cd tests
+          python3 -c "import vllm; assert vllm.__file__.startswith(\"/work/\"), vllm.__file__"
+          python3 -m pytest -v -s kernels/attention/test_segmented_attention.py'
