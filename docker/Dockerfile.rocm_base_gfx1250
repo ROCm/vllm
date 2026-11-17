@@ -26,8 +26,12 @@ ARG SCCACHE_S3_NO_CREDENTIALS=0
 FROM ${BASE_IMAGE} AS base
 
 ARG PYTORCH_ROCM_ARCH=gfx1250
+# AITER build targets. May include AITER-only identities such as gfx1250-strict
+# (MI450 A0), which have no torch/rocm device wheel and are not valid hipcc
+# offload arches. Empty = same as PYTORCH_ROCM_ARCH.
+ARG AITER_ROCM_ARCH=
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
-ENV AITER_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
+ENV AITER_ROCM_ARCH=${AITER_ROCM_ARCH:-${PYTORCH_ROCM_ARCH}}
 ENV MORI_GPU_ARCHS=gfx942;gfx950
 ENV FA_GPU_ARCHS=gfx942;gfx950;gfx1250
 
@@ -117,12 +121,18 @@ ENV PYTHONPATH=${SITE_PACKAGES}/_rocm_sdk_core/share/amd_smi
 # (same +rocm... suffix) or the C++ ops break at import (ABI skew). The rocm
 # sdk version is derived from torch's own dependency pin unless overridden,
 # which keeps the set consistent and avoids pip backtracking.
-RUN pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
+# One device extra per real arch in PYTORCH_ROCM_ARCH (e.g. gfx942;gfx950;gfx1250 ->
+# device-gfx942,device-gfx950,device-gfx1250). Variants such as gfx1250-strict are
+# skipped: they have no device wheel on the index.
+RUN DEVICE_EXTRAS=$(echo "${PYTORCH_ROCM_ARCH}" | tr ';,' '\n\n' | grep -E '^gfx[0-9a-z]+$' | sed 's/^/device-/' | paste -sd, -) \
+    && echo "Installing device extras: ${DEVICE_EXTRAS}" \
+    && test -n "${DEVICE_EXTRAS}" \
+    && pip install --pre --index-url "${ROCM_WHEEL_INDEX}" \
     --extra-index-url https://pypi.org/simple \
-    "torch[device-gfx1250]==${TORCH_VERSION}" \
-    "torchvision[device-gfx1250]==${TORCHVISION_VERSION}" \
+    "torch[${DEVICE_EXTRAS}]==${TORCH_VERSION}" \
+    "torchvision[${DEVICE_EXTRAS}]==${TORCHVISION_VERSION}" \
     "torchaudio==${TORCHAUDIO_VERSION}" \
-    "rocm[libraries,devel,device-gfx1250]==${ROCM_SDK_VERSION}" && \
+    "rocm[libraries,devel,${DEVICE_EXTRAS}]==${ROCM_SDK_VERSION}" && \
     rocm-sdk init
  
 # Torch runtime deps that may not be published on the ROCm wheel index;
