@@ -96,11 +96,12 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps=8, scale_kwidth=4):
         from triton_kernels.tensor_details.layout import CDNA4MXScaleLayout
 
         value_layout = StridedLayout(-2)
-        scale_layout = (
-            CDNA4MXScaleLayout()
-            if should_use_cdna4_mx_scale_swizzle()
-            else StridedLayout()
-        )
+        if should_use_cdna4_mx_scale_swizzle():
+            scale_layout = CDNA4MXScaleLayout()
+        elif should_use_gfx1250_mx_scale_swizzle():
+            scale_layout = StridedLayout(-2)
+        else:
+            scale_layout = StridedLayout()
     elif current_platform.is_rocm():
         value_layout = StridedLayout
         if should_use_cdna4_mx_scale_swizzle():
