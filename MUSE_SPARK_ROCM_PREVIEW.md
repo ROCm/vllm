@@ -9,14 +9,14 @@ It is not for production. The branch is rebuilt as the PRs change. Please send f
 | PR | title | head | knob |
 | --- | --- | --- | --- |
 | [#67133](https://github.com/vllm-project/vllm/pull/67133) | AITER FA: split-KV kernels for decode and speculative-decode verify | `9e20f1b71b` | always on (gate below) |
-| [#67145](https://github.com/vllm-project/vllm/pull/67145) | AITER FA: FP8-query prefill attention | `83a4decec3` | `--attention-config '{"use_prefill_query_quantization": true}'` |
-| [#67381](https://github.com/vllm-project/vllm/pull/67381) | Online `fp8_per_channel` dense linears on tuned FP8 kernels | `0be24e50c1` | `--quantization-config` (below) |
-| [#67191](https://github.com/vllm-project/vllm/pull/67191) | Online MXFP4 for the BF16 first/last-layer experts | `d578da7732` | `--quantization-config` (below) |
-| [#67306](https://github.com/vllm-project/vllm/pull/67306) | Decode MoE on native routes | `caae34db45` | always on (gate below) |
 | [#67380](https://github.com/vllm-project/vllm/pull/67380) | Ulysses sequence parallelism for TEP prefill | `4fb0a7b070` | `--additional-config '{"ulysses_prefill": true}'` |
-| [#67153](https://github.com/vllm-project/vllm/pull/67153) | Seed the fast detokenizer with a prompt tail | `c2f685aa8c` | always on |
+| [#67381](https://github.com/vllm-project/vllm/pull/67381) | Online `fp8_per_channel` dense linears on tuned FP8 kernels | `0be24e50c1` | `--quantization-config` (below) |
+| [#67145](https://github.com/vllm-project/vllm/pull/67145) | AITER FA: FP8-query prefill attention | `83a4decec3` | `--attention-config '{"use_prefill_query_quantization": true}'` |
+| [#67306](https://github.com/vllm-project/vllm/pull/67306) | Decode MoE on native routes | `caae34db45` | always on (gate below) |
+| [#67191](https://github.com/vllm-project/vllm/pull/67191) | Online MXFP4 for the BF16 first/last-layer experts | `d578da7732` | `--quantization-config` (below) |
 | [#67382](https://github.com/vllm-project/vllm/pull/67382) | Fuse the DSpark Markov sampling steps | `f3c1f23a12` | always on (gate below) |
 | [#67340](https://github.com/vllm-project/vllm/pull/67340) | FP8 DSpark draft through the speculative config | `1001c6467c` | `--speculative-config` keys (below) |
+| [#67153](https://github.com/vllm-project/vllm/pull/67153) | Seed the fast detokenizer with a prompt tail | `c2f685aa8c` | always on |
 
 PRs #67306, #67380 and #67381 are a stack: #67381 contains #67380, which contains #67306.
 
@@ -27,19 +27,24 @@ Already in `main`, so no longer listed as dependencies:
 - [#65985](https://github.com/vllm-project/vllm/pull/65985): DSpark draft layers as one launch under `--monokernel`. It needs BF16 draft weights; with #67340's FP8 draft it logs `drafter off` and the stock draft layers run.
 - [#59098](https://github.com/vllm-project/vllm/pull/59098): AITER FA context fix for out-of-order batches.
 
-## Knobs, by measured impact
+## Knobs, by estimated impact (replay model; measured leave-one-out pending)
 
-| PR | default | knob | gate | measured impact (MI355X) |
-| --- | --- | --- | --- | --- |
-| #67133 | on | none | gfx950, `ROCM_AITER_FA`, FP8 KV, head 64, GQA 8, decode q_len 1-8, FlyDSL | AgentX TEP4 vs main: c24 +54% tok/s/GPU (ITL 21.0 -> 7.4 ms), c40 +99% (41.5 -> 11.3 ms) |
-| #67145 | off | `--attention-config '{"use_prefill_query_quantization": true}'` | gfx950, FP8 e4m3 KV, full-attention layers | AgentX c24 +3.1%, c40 +5.4%; prefill TTFT -13..-16% |
-| #67381 | off | `--quantization-config '{"linear": "fp8_per_channel", "ignore": ["*o_proj"]}'` | gfx950, not with `--monokernel` | decode step -8% (1 request), -5% (8-24) |
-| #67191 | off | `--quantization-config '{"targets": {"*layers.0.feed_forward.experts*": "mxfp4", "*layers.61.feed_forward.experts*": "mxfp4"}}'` | routed experts only | AgentX c24 +2.8%, c40 +3.0% (ITL -7%) |
-| #67306 | on | none | gfx950, EP, MXFP4 experts, <= 2048 tokens per call | decode step -4..-5% |
-| #67380 | off | `--additional-config '{"ulysses_prefill": true}'`; at TEP8 also `VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584` | TEP (TP > 1 with EP), gfx950 | TEP4: TTFT 8k/16k -18%, KV -12 GiB per GPU. TEP8 c28: TTFT -18%, ITL p99 -20% |
-| #67153 | on | none | all models | AgentX TTFT -7..-12% (c10-c24) |
-| #67382 | on | none | gfx950, not `--monokernel` | decode step -1..-2% |
-| #67340 | off | `--speculative-config` keys `"quantization": "fp8_per_channel"`, `"draft_lm_head_quantization": "fp8"` | ROCm | decode step -1% (1 request) |
+| PR | default | knob | gate | estimated AgentX TEP4 p90 product: c40 (c24) | measured impact (MI355X) |
+| --- | --- | --- | --- | --- | --- |
+| #67133 | on | none | gfx950, `ROCM_AITER_FA`, FP8 KV, head 64, GQA 8, decode q_len 1-8, FlyDSL | x2.9 (x2.4) | AgentX TEP4 vs main: c24 +54% tok/s/GPU (ITL 21.0 -> 7.4 ms), c40 +99% (41.5 -> 11.3 ms) |
+| #67380 | off | `--additional-config '{"ulysses_prefill": true}'`; at TEP8 also `VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584` | TEP (TP > 1 with EP), gfx950 | +34% (+15%) | TEP4: TTFT 8k/16k -18%; costs 12.6 GiB of KV cache per GPU (its FP8 QKV/O copies; not binding at c40). TEP8 c28: TTFT -18%, ITL p99 -20% |
+| #67381 | off | `--quantization-config '{"linear": "fp8_per_channel", "ignore": ["*o_proj"]}'` | gfx950, not with `--monokernel` | +21% (+14%) | decode step -8% (1 request), -5% (8-24) |
+| #67145 | off | `--attention-config '{"use_prefill_query_quantization": true}'` | gfx950, FP8 e4m3 KV, full-attention layers | +21% (+9%) | AgentX c24 +3.1%, c40 +5.4%; prefill TTFT -13..-16% |
+| #67306 | on | none | gfx950, EP, MXFP4 experts, <= 2048 tokens per call | +14% (+10%) | decode step -4..-5% |
+| #67191 | off | `--quantization-config '{"targets": {"*layers.0.feed_forward.experts*": "mxfp4", "*layers.61.feed_forward.experts*": "mxfp4"}}'` | routed experts only | +13% (+10%) | AgentX c24 +2.8%, c40 +3.0% (ITL -7%) |
+| #67382 | on | none | gfx950, not `--monokernel` | +4% (+3%) | decode step -1..-2% |
+| #67340 | off | `--speculative-config` keys `"quantization": "fp8_per_channel"`, `"draft_lm_head_quantization": "fp8"` | ROCm | +3% (+2%) | decode step -1% (1 request) |
+| #67153 | on | none | all models | ~0 (~0); TTFT only | AgentX TTFT -7..-12% (c10-c24) |
+
+- Estimated impact = how much higher the product vs SGLang-1106 at p90 (InferenceX `itl`) is with the PR than with the TEP4 recipe below minus that PR, at concurrency 40 (24 in parentheses).
+    - It comes from a replay of the vLLM scheduler over measured AgentX steps, rescaled to this preview (it reproduces the TEP4 c24/c40 rows below within 3%). The inputs are each PR's measured step-time savings.
+    - The inputs carry roughly -40%/+30% uncertainty. #67381/#67145, #67306/#67191 and #67382/#67340 are ties.
+- These are estimates; a measured leave-one-out is pending. #67153's gain is TTFT, which `itl` does not count.
 
 To use #67381 and #67191 together, put both in one `targets` map (a `targets` map replaces `linear`, so do not combine the two keys):
 `{"targets": {"re:.*\\.(qkv_proj|pooler|unpooler)$": "fp8_per_channel", "*layers.0.feed_forward.experts*": "mxfp4", "*layers.61.feed_forward.experts*": "mxfp4"}}`.
