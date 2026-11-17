@@ -2122,6 +2122,15 @@ _GFX950_C4A_AITER_MAX_COMPRESSED_SEQ_LEN = 64 * 1024
 _GFX950_C4A_NATIVE_MAX_ROWS = 256
 _GFX950_DSV4_NATIVE_MAX_COLUMNS = 1024 * 1024
 _GFX950_DSA_AITER_MIN_PREFILL_SEQ_LEN = 32 * 1024
+_GFX1250_DSA_AITER_MAX_PREFILL_ROWS = 256
+_GFX1250_DSA_AITER_MIN_PREFILL_SEQ_LEN = 32 * 1024
+
+
+@functools.cache
+def _on_gfx1250_cached() -> bool:
+    from vllm.platforms.rocm import on_gfx1250
+
+    return on_gfx1250()
 
 
 def _flat_sigmoid_bias_topk_is_profitable(
@@ -3027,6 +3036,23 @@ class rocm_aiter_ops:
     ) -> bool:
         """Whether AITER's sparse indexer top-k beats the in-tree kernel for
         this shape."""
+        if (
+            is_prefill
+            and compress_ratio == 1
+            and topk_tokens == 2048
+            and cls._AITER_ENABLED
+            and _on_gfx1250_cached()
+        ):
+            # gfx1250 uncompressed DSA prefill (Kimi-K3.1): AITER (FlyDSL radix
+            # one-block) beats topKPerRowPrefill only on small prefill pieces of
+            # long rows (1.1-1.35x at <=256 rows, 32K keys); from 512 rows, or
+            # on short rows, the in-tree kernel is 1.3-6x faster. Mirrors the
+            # decode rule (<=256 rows, >=32K) in rocm_aiter_sparse_attn_indexer.
+            return (
+                num_rows <= _GFX1250_DSA_AITER_MAX_PREFILL_ROWS
+                and max_valid_seq_len is not None
+                and max_valid_seq_len >= _GFX1250_DSA_AITER_MIN_PREFILL_SEQ_LEN
+            )
         if compress_ratio < 1 or not cls.is_indexer_top_k_enabled():
             return False
 
