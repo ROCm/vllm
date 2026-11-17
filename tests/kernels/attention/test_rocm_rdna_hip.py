@@ -943,6 +943,60 @@ def test_encoder_forward_matches_reference(segments):
             start += s
 
 
+@pytest.mark.parametrize(
+    ("segments", "kv_segments"),
+    [
+        ([1], [1500]),
+        ([176], [6]),
+        ([768], [512]),
+        ([1] * 5, [1500] * 5),
+        ([336, 336], [512, 512]),
+        ([49, 3, 600], [551, 1024, 7]),
+    ],
+    ids=["decode", "fewer keys", "more queries", "beams", "batch", "mixed"],
+)
+def test_encoder_forward_cross_attention(segments, kv_segments):
+    """rocm_rdna_encoder: each segment's queries over keys of their own."""
+    _skip_unless_rdna35_or_rdna4()
+    from vllm.v1.attention.ops import rocm_rdna_encoder
+
+    shapes = sorted(
+        {
+            (v.num_q_heads, v.num_kv_heads, v.head_size, v.dtype)
+            for v in _non_causal_rows()
+        },
+        key=str,
+    )
+    if not shapes:
+        pytest.skip("_rocm_C carries no non-causal RDNA3.5 variants")
+    torch.manual_seed(0)
+    for hq, hkv, d, dtype in shapes:
+        q = (torch.randn(sum(segments), hq, d, device="cuda") * 0.5).to(dtype)
+        k, v = (
+            (torch.randn(sum(kv_segments), hkv, d, device="cuda") * 0.5).to(dtype)
+            for _ in range(2)
+        )
+        assert rocm_rdna_encoder.unsupported(q, hkv) is None
+        out = rocm_rdna_encoder.forward(q, k, v, segments, d**-0.5, kv_segments)
+        start = key_start = 0
+        for i, (s, n) in enumerate(zip(segments, kv_segments)):
+            rows, keys = slice(start, start + s), slice(key_start, key_start + n)
+            ref = torch.nn.functional.scaled_dot_product_attention(
+                q[rows].float().transpose(0, 1),
+                k[keys].float().transpose(0, 1),
+                v[keys].float().transpose(0, 1),
+                scale=d**-0.5,
+                enable_gqa=hq != hkv,
+            ).transpose(0, 1)
+            err = (out[rows].float() - ref).abs().max().item()
+            tol = 2e-2 if dtype == torch.bfloat16 else 4e-3
+            assert err <= tol, (
+                f"{hq}/{hkv}/{d} {dtype}: segment {i} ({s}/{n}) {err:.2e}"
+            )
+            start += s
+            key_start += n
+
+
 # ---------------------------------------------------------------- prefill batches
 
 # (M, S) per sequence.

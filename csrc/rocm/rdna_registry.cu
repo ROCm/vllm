@@ -458,7 +458,8 @@ void rdna_encoder_attn(int64_t config, torch::Tensor& q, torch::Tensor& k,
                        int64_t max_seq_len, double scale,
                        const std::optional<torch::Tensor>& plan,
                        const std::optional<torch::Tensor>& query_start_loc,
-                       int64_t head_group) {
+                       int64_t head_group,
+                       const std::optional<torch::Tensor>& key_start_loc) {
   using namespace rdna;
   const Table t = device_table();
   TORCH_CHECK(
@@ -467,17 +468,19 @@ void rdna_encoder_attn(int64_t config, torch::Tensor& q, torch::Tensor& k,
   const PrefillConfig& c = t.prefill[config];
   TORCH_CHECK(!c.causal, "a causal build runs through rdna_prefill_attn");
   const int d = static_cast<int>(c.head_dim);
-  // (tokens, heads, D), each token's heads contiguous; any token stride.
-  auto check = [&](const torch::Tensor& x, int heads, const char* name) {
-    TORCH_CHECK(x.dim() == 3 && x.size(0) == q.size(0) && x.size(1) == heads &&
+  // (tokens, heads, D), each token's heads contiguous; any token stride. K and
+  // V may hold a number of tokens of their own (cross-attention).
+  auto check = [&](const torch::Tensor& x, int64_t tokens, int heads,
+                   const char* name) {
+    TORCH_CHECK(x.dim() == 3 && x.size(0) == tokens && x.size(1) == heads &&
                     x.size(2) == d && x.stride(2) == 1 && x.stride(1) == d,
-                name, " must be (", q.size(0), ", ", heads, ", ", d,
+                name, " must be (", tokens, ", ", heads, ", ", d,
                 ") with each token's heads contiguous, got ", x.sizes(),
                 " strides ", x.strides());
   };
-  check(q, c.num_q_heads, "q");
-  check(k, c.num_kv_heads, "k");
-  check(v, c.num_kv_heads, "v");
+  check(q, q.size(0), c.num_q_heads, "q");
+  check(k, k.size(0), c.num_kv_heads, "k");
+  check(v, k.size(0), c.num_kv_heads, "v");
   TORCH_CHECK(out.is_contiguous() && out.sizes() == q.sizes(),
               "out must be contiguous and shaped as q");
   const auto dtype = c.dtype == Dtype::kBf16 ? at::kBFloat16 : at::kHalf;
@@ -500,9 +503,20 @@ void rdna_encoder_attn(int64_t config, torch::Tensor& q, torch::Tensor& k,
     TORCH_CHECK(head_group >= 0 &&
                     (head_group == 0 || c.num_kv_heads % head_group == 0),
                 "head_group must divide the kv heads");
+    if (key_start_loc) {
+      TORCH_CHECK(key_start_loc->scalar_type() == torch::kInt32 &&
+                      key_start_loc->numel() == query_start_loc->numel(),
+                  "key_start_loc must be int32, shaped as query_start_loc");
+      check_device(q, {&*key_start_loc});
+    } else {
+      TORCH_CHECK(k.size(0) == q.size(0),
+                  "without key_start_loc a sequence's keys start with its "
+                  "queries: k must have q's tokens");
+    }
   } else {
-    TORCH_CHECK(q.size(0) > 0 && max_seq_len == q.size(0),
-                "one sequence: max_seq_len is its tokens");
+    TORCH_CHECK(!key_start_loc, "key_start_loc goes with a plan");
+    TORCH_CHECK(q.size(0) > 0 && k.size(0) > 0 && max_seq_len == k.size(0),
+                "one sequence: max_seq_len is its keys");
   }
   TORCH_CHECK(partial_o.scalar_type() == torch::kFloat32 &&
                   partial_ml.scalar_type() == torch::kFloat32 &&
@@ -545,5 +559,6 @@ void rdna_encoder_attn(int64_t config, torch::Tensor& q, torch::Tensor& k,
   args.q_stride = (int)q.stride(0);
   args.k_stride = (int)k.stride(0);
   args.v_stride = (int)v.stride(0);
+  args.key_start = key_start_loc ? key_start_loc->data_ptr<int>() : nullptr;
   t.prefill_launchers[config](args);
 }
