@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (  # noqa
     flydsl_rdna_moe_gemm_reduce,
     gate_up_tile_order,
     pack_w4a16_weights,
+    pad_expert_stride,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
     moe_align_block_size,
@@ -144,7 +145,8 @@ def test_flydsl_rdna_moe_gemm_silu_mul(num_tokens: int):
 
 def test_flydsl_rdna_moe_gemm_reduce():
     """The one-token GEMM with the fused top-k sum matches the plain GEMM
-    followed by the weighted sum, and skips experts with id -1.
+    followed by the weighted sum, with a padded expert stride, and skips
+    experts with id -1.
     """
     set_random_seed(0)
     device = "cuda"
@@ -153,7 +155,9 @@ def test_flydsl_rdna_moe_gemm_reduce():
     q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
     scale = torch.rand((num_experts, n_out, groups), device=device) * 0.02 + 0.001
     zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
-    w, coef = pack_w4a16_weights(q, scale.to(torch.bfloat16), zp)
+    w, coef = map(
+        pad_expert_stride, pack_w4a16_weights(q, scale.to(torch.bfloat16), zp)
+    )
     x = torch.randn((top_k, n_in), device=device, dtype=torch.bfloat16)
     expert_ids = torch.tensor(
         [5, -1, 0, 3, 15, 9, -1, 11], dtype=torch.int32, device=device

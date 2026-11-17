@@ -39,12 +39,34 @@ _BF16_ONE_PAIR = 0x3F803F80
 # their tiles in lockstep, so tile strides that are a multiple of 512 B would
 # make them all pull from the same channel at the same time.
 _CHANNEL_BYTES = 256
+# The same holds across experts: the one-token reduce kernel reads the same
+# tile offset of every routed expert at once, so the expert stride gets one
+# more granule.
+_EXPERT_PAD_DWORDS = _CHANNEL_BYTES // 4
+# slc | dlc: weights of one token are read once, so they are loaded without
+# being kept in the caches, like a non-temporal load.
+_NON_TEMPORAL = 6
+_LDS_BYTES = 65536
 
 
 def _tile_stride(payload_dwords: int) -> int:
     """Dwords per tile, padded to an odd multiple of the channel granule."""
     granules = -(-payload_dwords * 4 // _CHANNEL_BYTES)
     return (granules | 1) * _CHANNEL_BYTES // 4
+
+
+def pad_expert_stride(t: torch.Tensor) -> torch.Tensor:
+    """Return ``t`` (``[E, tiles, tile stride]``) as a view of a buffer whose
+    expert stride is ``_EXPERT_PAD_DWORDS`` longer."""
+    E, flat = t.size(0), t[0].numel()
+    extra = _EXPERT_PAD_DWORDS * 4 // t.element_size()
+    buf = t.new_zeros((E, flat + extra))
+    buf[:, :flat] = t.reshape(E, flat)
+    return buf[:, :flat].view(t.shape)
+
+
+def _expert_stride_dwords(t: torch.Tensor) -> int:
+    return t.stride(0) * t.element_size() // 4
 
 
 def _w_tile_dwords(K: int) -> int:
@@ -108,7 +130,13 @@ def pack_w4a16_weights(
 
 @functools.cache
 def _build_gemm(
-    K: int, N: int, x_row_div: int, group: int, single_row: bool, silu_mul: bool
+    K: int,
+    N: int,
+    x_row_div: int,
+    group: int,
+    silu_mul: bool,
+    w_expert: int,
+    c_expert: int,
 ):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -126,11 +154,6 @@ def _build_gemm(
     # With ``silu_mul`` a tile holds gate columns then the matching up columns.
     out_reg = REG_N // 2 if silu_mul else REG_N
     n_out = N // 2 if silu_mul else N
-
-    def routed_or_single(routed, single):
-        """Emit only one of the two: the routing buffers are not valid to read
-        with ``single_row``."""
-        return single() if single_row else routed()
 
     @flyc.kernel
     def gemm_kernel(
@@ -157,29 +180,20 @@ def _build_gemm(
         eid_rsrc = buffer_ops.create_buffer_resource(arg_expert_ids, max_size=True)
         nv_rsrc = buffer_ops.create_buffer_resource(arg_num_valid, max_size=True)
 
-        # With ``single_row`` block ``b`` holds only row ``b`` and the routing
-        # buffers are not read.
-        num_valid = routed_or_single(
-            lambda: buffer_ops.buffer_load(nv_rsrc, 0, vec_width=1, dtype=fx.Int32),
-            lambda: fx.Int32(2**30),
-        )
+        num_valid = buffer_ops.buffer_load(nv_rsrc, 0, vec_width=1, dtype=fx.Int32)
         row0 = block_m * BLOCK_M
         # Padding blocks and blocks without an expert (id -1) run zero groups
         # and store nothing.
         expert = buffer_ops.buffer_load(eid_rsrc, block_m, vec_width=1, dtype=fx.Int32)
         block_valid = (row0 < num_valid) & (expert >= 0)
         expert = block_valid.select(expert, fx.Int32(0))
-        rid = routed_or_single(
-            lambda: buffer_ops.buffer_load(
-                ids_rsrc, row0 + lane16, vec_width=1, dtype=fx.Int32
-            ),
-            lambda: (lane16 == 0).select(block_m, n_rows),
+        rid = buffer_ops.buffer_load(
+            ids_rsrc, row0 + lane16, vec_width=1, dtype=fx.Int32
         )
         x_row = (block_valid & (rid < n_rows)).select(rid // x_row_div, fx.Int32(0))
         x_base = x_row * k_dwords
-        tile = expert * (N // TILE_N) + tile_n
-        w_base = tile * w_tile + lane16 * 2
-        c_base = tile * c_tile + lane16
+        w_base = expert * w_expert + tile_n * w_tile + lane16 * 2
+        c_base = expert * c_expert + tile_n * c_tile + lane16
 
         ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
         zero = fx.full(8, 0.0, fx.Float32)
@@ -267,11 +281,8 @@ def _build_gemm(
             ]
 
         for si in range_constexpr(8):
-            out_rid = routed_or_single(
-                lambda si=si: buffer_ops.buffer_load(
-                    ids_rsrc, row0 + 2 * si + klane, vec_width=1, dtype=fx.Int32
-                ),
-                lambda si=si: (n_rows, (klane == 0).select(block_m, n_rows))[si == 0],
+            out_rid = buffer_ops.buffer_load(
+                ids_rsrc, row0 + 2 * si + klane, vec_width=1, dtype=fx.Int32
             )
             # RDNA buffer resources are not bounds checked, so padding rows
             # have to be skipped rather than masked.
@@ -309,9 +320,9 @@ def _build_gemm(
     return launch
 
 
-def _copy_to_lds(lds, rsrc, n_dwords: int, lane) -> None:
-    """Copy the first ``n_dwords`` of a buffer to LDS, 4 dwords per lane and
-    round."""
+def _copy_to_lds(lds, rsrc, n_dwords: int, lane, base=0, lds0=0) -> None:
+    """Copy ``n_dwords`` of a buffer from dword ``base`` to LDS dword ``lds0``,
+    4 dwords per lane and round."""
     import flydsl.expr as fx
     from flydsl.expr import arith, buffer_ops, range_constexpr, vector
     from flydsl.expr.typing import T
@@ -319,12 +330,205 @@ def _copy_to_lds(lds, rsrc, n_dwords: int, lane) -> None:
     for j in range_constexpr(-(-n_dwords // 128)):
         idx = lane * 4 + j * 128
         idx = (idx < n_dwords).select(idx, fx.Int32(n_dwords - 4))
-        v = buffer_ops.buffer_load(rsrc, idx, vec_width=4, dtype=fx.Int32)
-        vector.store(v, lds, [arith.index_cast(T.index, idx)])
+        v = buffer_ops.buffer_load(rsrc, base + idx, vec_width=4, dtype=fx.Int32)
+        vector.store(v, lds, [arith.index_cast(T.index, lds0 + idx)])
 
 
 @functools.cache
-def _build_gemm_reduce(K: int, N: int, group: int, top_k: int):
+def _build_gemm_row(
+    K: int,
+    N: int,
+    x_row_div: int,
+    group: int,
+    silu_mul: bool,
+    w_expert: int,
+    c_expert: int,
+):
+    """``out[r] = W[expert_ids[r]] @ x[r // x_row_div]``, one row per block.
+
+    A wave needs each weight in two lanes, as WMMA operands are laid out, but
+    it loads a group of K-steps with 32 distinct lanes (512 B per load) into
+    LDS and reads the operands from there. The activations are in LDS too.
+    """
+    import flydsl.compiler as flyc
+    import flydsl.expr as fx
+    from flydsl._mlir import ir
+    from flydsl.compiler.kernel_function import CompilationContext
+    from flydsl.expr import arith, buffer_ops, gpu, math, range_constexpr, rocdl, vector
+    from flydsl.expr.typing import T, Vector
+    from flydsl.runtime.device import get_rocm_arch
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
+    assert K % group == 0 and group % 16 == 0 and N % TILE_N == 0
+    n_groups = K // group
+    steps = group // 16
+    k_dwords = K // 2
+    w_step = 16 * 2 * REG_N
+    chunk = steps * w_step  # dwords of one group of one tile
+    w_tile = _tile_stride(_w_tile_dwords(K))
+    c_group = 16 * REG_N
+    c_tile = _tile_stride(_coef_tile_dwords(K, group))
+    out_reg = REG_N // 2 if silu_mul else REG_N
+    n_out = N // 2 if silu_mul else N
+    allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_row")
+    lds_wave = k_dwords + chunk  # LDS dwords per wave
+    # Waves per workgroup. GEMM1 of a token runs next to another kernel of the
+    # layer, and workgroups of several waves keep their share of the GPU.
+    wg = next(
+        w
+        for w in (8, 4, 2, 1)
+        if (N // TILE_N) % w == 0 and lds_wave * 4 * w <= _LDS_BYTES
+    )
+    allocator.ptr = lds_wave * 4 * wg
+
+    @flyc.kernel(known_block_size=[32 * wg, 1, 1])
+    def row_kernel(
+        arg_out: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_w: fx.Tensor,
+        arg_coef: fx.Tensor,
+        arg_expert_ids: fx.Tensor,
+    ):
+        lane = gpu.thread_idx.x % 32
+        wave = gpu.thread_idx.x // 32
+        tile_n = gpu.block_idx.x * wg + wave
+        row = gpu.block_idx.y
+        lane16 = lane % 16
+        klane = lane // 16
+
+        out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
+        x_rsrc = buffer_ops.create_buffer_resource(arg_x, max_size=True)
+        w_rsrc = buffer_ops.create_buffer_resource(arg_w, max_size=True)
+        c_rsrc = buffer_ops.create_buffer_resource(arg_coef, max_size=True)
+        eid_rsrc = buffer_ops.create_buffer_resource(arg_expert_ids, max_size=True)
+
+        # Rows without an expert (id -1) run zero groups and store nothing.
+        expert = buffer_ops.buffer_load(eid_rsrc, row, vec_width=1, dtype=fx.Int32)
+        valid = expert >= 0
+        expert = valid.select(expert, fx.Int32(0))
+        w_base = expert * w_expert + tile_n * w_tile
+        c_base = expert * c_expert + tile_n * c_tile + lane16
+
+        lds = SmemPtr(allocator.get_base(), 0, T.i32, shape=(lds_wave * wg,)).get()
+        lds0 = wave * lds_wave
+        _copy_to_lds(lds, x_rsrc, k_dwords, lane, (row // x_row_div) * k_dwords, lds0)
+
+        def lds_at(dword):
+            return [arith.index_cast(T.index, lds0 + dword)]
+
+        def load_chunk(start, spread):
+            """Loads of one group; with ``spread`` 0 all lanes load the same
+            16 B, for the group after the last."""
+            return [
+                buffer_ops.buffer_load(
+                    w_rsrc,
+                    w_base + start + (lane * 4 + s * w_step) * spread,
+                    vec_width=4,
+                    dtype=fx.Int32,
+                    cache_modifier=_NON_TEMPORAL,
+                )
+                for s in range_constexpr(steps)
+            ]
+
+        def load_coef(g):
+            return [
+                buffer_ops.buffer_load(
+                    c_rsrc, c_base + g * c_group + rn * 16, vec_width=1, dtype=fx.Int32
+                )
+                for rn in range_constexpr(REG_N)
+            ]
+
+        def unpack(wv):
+            words = []
+            for i in range_constexpr(2):
+                w = wv[i]
+                words.append(((w << 3) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
+                for p in range_constexpr(1, 4):
+                    words.append(((w >> (4 * p - 3)) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
+            return Vector.from_elements(words, fx.Int32).bitcast(fx.Int16)
+
+        def wmma(a, b, acc):
+            return rocdl.wmma_f32_16x16x16_bf16(acc.type, a, b, acc).result
+
+        ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
+        zero = fx.full(8, 0.0, fx.Float32)
+        n_iter = valid.select(fx.Int32(n_groups), fx.Int32(0))
+        init = [zero for _ in range_constexpr(REG_N)]
+        init = init + load_chunk(fx.Int32(0), fx.Int32(1)) + load_coef(fx.Int32(0))
+        for i, state in range(0, n_iter, 1, init=init):  # type: ignore[call-overload]
+            tot = list(state[:REG_N])
+            cur = list(state[REG_N:-REG_N])
+            coef = list(state[-REG_N:])
+            g = fx.Int32(i)
+            for s in range_constexpr(steps):
+                vector.store(cur[s], lds, lds_at(lane * 4 + (k_dwords + s * w_step)))
+            more = g + 1 < n_groups
+            nxt = load_chunk(
+                more.select((g + 1) * chunk, fx.Int32(0)),
+                more.select(fx.Int32(1), fx.Int32(0)),
+            )
+            coef_next = load_coef(more.select(g + 1, g))
+
+            acc = [zero for _ in range_constexpr(REG_N)]
+            xsum = zero
+            for s in range_constexpr(steps):
+                a = vector.load_op(
+                    T.vec(8, T.i32), lds, lds_at((g * steps + s) * 8)
+                ).bitcast(fx.Int16)
+                xsum = wmma(a, ones, xsum)
+                for rn in range_constexpr(REG_N):
+                    wv = vector.load_op(
+                        T.vec(2, T.i32),
+                        lds,
+                        lds_at(lane16 * 2 + (k_dwords + s * w_step + rn * 32)),
+                    )
+                    acc[rn] = wmma(a, unpack(wv), acc[rn])
+            for rn in range_constexpr(REG_N):
+                cf = Vector.from_elements([coef[rn]], fx.Int32)
+                cf = cf.bitcast(fx.Float16).to(fx.Float32)
+                s16 = fx.full(8, cf[0], fx.Float32)
+                szp = fx.full(8, cf[1], fx.Float32)
+                tot[rn] = math.fma(acc[rn], s16, math.fma(xsum, szp, tot[rn]))
+            results = yield tot + nxt + coef_next
+        tot = list(results[:REG_N])
+        if silu_mul:
+            tot = [
+                tot[rn] / (1.0 + math.exp(-tot[rn])) * tot[rn + out_reg]
+                for rn in range_constexpr(out_reg)
+            ]
+
+        # Row 0 of the WMMA result is element 0 of the first 16 lanes.
+        if valid & (klane == 0):
+            out_base = row * n_out + tile_n * (16 * out_reg) + lane16
+            for rn in range_constexpr(out_reg):
+                buffer_ops.buffer_store(
+                    tot[rn][0].to(fx.BFloat16), out_rsrc, out_base + rn * 16
+                )
+
+    @flyc.jit
+    def launch(
+        arg_out: fx.Tensor,
+        arg_x: fx.Tensor,
+        arg_w: fx.Tensor,
+        arg_coef: fx.Tensor,
+        arg_expert_ids: fx.Tensor,
+        n_rows: fx.Int32,
+        stream: fx.Stream,
+    ):
+        allocator.finalized = False
+        with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
+            allocator.finalize()
+        row_kernel(arg_out, arg_x, arg_w, arg_coef, arg_expert_ids).launch(
+            grid=(N // TILE_N // wg, n_rows, 1), block=(32 * wg, 1, 1), stream=stream
+        )
+
+    return launch
+
+
+@functools.cache
+def _build_gemm_reduce(
+    K: int, N: int, group: int, top_k: int, w_expert: int, c_expert: int
+):
     """One token: ``out[n] = sum_e weight_e * (W[expert_e] @ x[e])[n]``.
 
     Row ``2 e`` of the WMMA A operand holds ``x[e]``, so one WMMA per expert
@@ -397,9 +601,9 @@ def _build_gemm_reduce(K: int, N: int, group: int, top_k: int):
             )
             # Experts with id -1 contribute nothing (the engine warm-up).
             weight.append(valid.select(tw, fx.Float32(0.0)))
-            tile = valid.select(expert, fx.Int32(0)) * (N // TILE_N) + tile_n
-            w_base.append(tile * w_tile + rn * 32 + lane16 * 2)
-            c_base.append(tile * c_tile + rn * 16 + lane16)
+            expert = valid.select(expert, fx.Int32(0))
+            w_base.append(expert * w_expert + tile_n * w_tile + rn * 32 + lane16 * 2)
+            c_base.append(expert * c_expert + tile_n * c_tile + rn * 16 + lane16)
 
         ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
         zero = fx.full(8, 0.0, fx.Float32)
@@ -407,7 +611,11 @@ def _build_gemm_reduce(K: int, N: int, group: int, top_k: int):
         def load_w(kstep):
             return [
                 buffer_ops.buffer_load(
-                    w_rsrc, w_base[e] + kstep * w_step, vec_width=2, dtype=fx.Int32
+                    w_rsrc,
+                    w_base[e] + kstep * w_step,
+                    vec_width=2,
+                    dtype=fx.Int32,
+                    cache_modifier=_NON_TEMPORAL,
                 )
                 for e in range_constexpr(top_k)
             ]
@@ -502,7 +710,14 @@ def flydsl_rdna_moe_gemm_reduce(
 
     ``weights`` is float32; at most ``MAX_REDUCE_ROWS`` experts.
     """
-    launch = _build_gemm_reduce(x.shape[1], out.shape[1], group_size, x.shape[0])
+    launch = _build_gemm_reduce(
+        x.shape[1],
+        out.shape[1],
+        group_size,
+        x.shape[0],
+        _expert_stride_dwords(w),
+        _expert_stride_dwords(coef),
+    )
     launch(out, x, w, coef, expert_ids, weights, torch.cuda.current_stream())
 
 
@@ -531,10 +746,15 @@ def flydsl_rdna_moe_gemm(
     n_rows, N = out.shape
     if silu_mul:
         N *= 2
-    single_row = sorted_ids is None
-    if single_row:
-        sorted_ids = num_valid = expert_ids
-    launch = _build_gemm(x.shape[1], N, x_row_div, group_size, single_row, silu_mul)
+    strides = (_expert_stride_dwords(w), _expert_stride_dwords(coef))
+    stream = torch.cuda.current_stream()
+    if sorted_ids is None:
+        launch = _build_gemm_row(
+            x.shape[1], N, x_row_div, group_size, silu_mul, *strides
+        )
+        launch(out, x, w, coef, expert_ids, expert_ids.numel(), stream)
+        return
+    launch = _build_gemm(x.shape[1], N, x_row_div, group_size, silu_mul, *strides)
     launch(
         out,
         x,
@@ -545,5 +765,5 @@ def flydsl_rdna_moe_gemm(
         num_valid,
         n_rows,
         expert_ids.numel(),
-        torch.cuda.current_stream(),
+        stream,
     )

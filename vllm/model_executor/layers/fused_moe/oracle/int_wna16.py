@@ -1470,6 +1470,7 @@ def _process_weights_flydsl(
     from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
         gate_up_tile_order,
         pack_w4a16_weights,
+        pad_expert_stride,
     )
 
     def _nibbles(packed: torch.Tensor, dim: int) -> torch.Tensor:
@@ -1492,7 +1493,7 @@ def _process_weights_flydsl(
             if order is not None:
                 parts = tuple(t[:, order] for t in parts)
             packed.append(pack_w4a16_weights(*parts))
-        return (torch.cat(t) for t in zip(*packed))
+        return (pad_expert_stride(torch.cat(t)) for t in zip(*packed))
 
     order = None
     if fuses_silu_mul(layer.moe_config):
