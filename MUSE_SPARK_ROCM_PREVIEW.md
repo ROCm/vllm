@@ -98,21 +98,23 @@ How these were measured:
     - TEP8 runs use a whole node.
 - DSpark with 7 draft tokens and synthetic acceptance length 4.05, as in the InferenceX CI.
 - The TEP8 c28 row predates the TEP8 Ulysses recipe above (it ran without Ulysses). With Ulysses and `VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584`, the same point measured 23,546 tok/s/GPU at ITL p50 3.98 ms on a 2026-11-14 research build.
-- Interactivity = median tok/s per user, as on the InferenceX dashboard.
+- Interactivity = 1 / ITL, from aiperf's `inter_token_latency` (InferenceX `itl`), at p90 as on the InferenceX dashboard.
 - vLLM main = `083fbac02` with an FP8 KV cache and the same scheduler settings, without these PRs.
-- Product = (throughput ratio) x (ITL ratio), at ITL p50, against SGLang's public InferenceX 1106 points at the same concurrency. Above 1 means faster.
+- Product = (throughput ratio) x (interactivity ratio) against SGLang's public InferenceX 1106 points at the same concurrency. Above 1 means faster.
+    - The headline is at p90, computed as InferenceX does. The p50 product is shown for context.
+    - Under AgentX's `ignore_eos`, `full_response_itl` reads ~2% higher than `itl` for vLLM (not for SGLang).
 
-| point | tok/s/GPU | ITL p50 / p90 (ms) | interactivity (tok/s/user) | vs vLLM main (tok/s/GPU) | product vs SGLang-1106 |
-| --- | --- | --- | --- | --- | --- |
-| TEP4 c10 | 16,522 | 4.00 / 4.79 | 246 | +25% | 1.10 (vs TP8 c10 cap 2) |
-| TEP4 c16 | 26,114 | 4.52 / 6.00 | 217 | +63% | - |
-| TEP4 c24 | 38,583 | 5.63 / 7.73 | 174 | +91% | - |
-| TEP4 c28 | 42,189 | 6.14 / 8.97 | 159 | +100% | 1.03 |
-| TEP4 c36 | 49,144 | 7.08 / 10.53 | 137 | - | 1.28 |
-| TEP4 c40 | 51,088 | 7.68 / 11.69 | 127 | +152% | 1.41 |
-| TEP8 c6, cap 1, monokernel | 4,968 | 2.00 / 2.10 | 497 | - | 0.84 |
-| TEP8 c10, cap 2, monokernel | 8,375 | 2.85 / 3.21 | 347 | - | 0.78 |
-| TEP8 c28, cap 8, FP8 stack | 22,868 | 4.09 / 5.40 | 238 | - | 0.99 |
+| point | tok/s/GPU | ITL p50 / p90 (ms) | interactivity at p90 (tok/s/user) | product vs SGLang-1106 at p90 | product at p50 | vs vLLM main (tok/s/GPU) |
+| --- | --- | --- | --- | --- | --- | --- |
+| TEP4 c10 | 16,522 | 4.00 / 4.79 | 209 | **1.05** (vs TP8 c10 cap 2) | 1.10 | +25% |
+| TEP4 c16 | 26,114 | 4.52 / 6.00 | 167 | - | - | +63% |
+| TEP4 c24 | 38,583 | 5.63 / 7.73 | 129 | - | - | +91% |
+| TEP4 c28 | 42,189 | 6.14 / 8.97 | 111 | **0.94** | 1.04 | +100% |
+| TEP4 c36 | 49,144 | 7.08 / 10.53 | 95 | **1.08** | 1.28 | - |
+| TEP4 c40 | 51,088 | 7.68 / 11.69 | 86 | **1.25** | 1.41 | +152% |
+| TEP8 c6, cap 1, monokernel | 4,968 | 2.00 / 2.10 | 476 | **0.90** | 0.84 | - |
+| TEP8 c10, cap 2, monokernel | 8,375 | 2.85 / 3.21 | 311 | **0.80** | 0.78 | - |
+| TEP8 c28, cap 8, FP8 stack | 22,868 | 4.09 / 5.40 | 185 | **0.89** | 0.99 | - |
 
 ## Accuracy
 
