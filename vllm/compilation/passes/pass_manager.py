@@ -132,6 +132,13 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
         self.post_cleanup(graph)
         VllmInductorPass.dump_prefix += 1
 
+        # After lowering, so it sees which IR ops became opaque kernels.
+        if self.w4a16_row_pad is not None and (
+            self.w4a16_row_pad.is_applicable_for_range(compile_range)
+        ):
+            self.w4a16_row_pad(graph)
+            VllmInductorPass.dump_prefix += 1
+
         # always run fix_functionalization last
         self.fix_functionalization(graph)
         VllmInductorPass.dump_prefix = None  # Cleanup index
@@ -229,6 +236,12 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             self.post_cleanup = PostCleanupPass(config)
             self.fix_functionalization = FixFunctionalizationPass(config)
 
+            self.w4a16_row_pad: InductorPass | None = None
+            if self.pass_config.pad_w4a16_rows:
+                from .utility.w4a16_row_pad import W4A16RowPadPass
+
+                self.w4a16_row_pad = W4A16RowPadPass(config)
+
     def add(self, pass_: InductorPass) -> None:
         assert isinstance(pass_, InductorPass)
         self.passes.append(pass_)
@@ -248,6 +261,8 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
         passes.append(self.ir_lowering.uuid())
         passes.append(self.clone_elimination.uuid())
         passes.append(self.post_cleanup.uuid())
+        if self.w4a16_row_pad is not None:
+            passes.append(self.w4a16_row_pad.uuid())
         passes.append(self.fix_functionalization.uuid())
 
         # Include the compile range in the uuid to ensure that inductor

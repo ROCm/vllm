@@ -36,11 +36,76 @@ triton_w4a16_skinny_fmt_gemm = hybrid_w4a16_module.triton_w4a16_skinny_fmt_gemm
 
 
 pack_int4_exllama_shuffle = hybrid_w4a16_module.pack_int4_exllama_shuffle
+padded_row_stride_bytes = hybrid_w4a16_module.padded_row_stride_bytes
 
 
 def _pack_exllama_shuffle(w_int4_kn: torch.Tensor) -> torch.Tensor:
     """Pack [K, N] int4 values into ExLlama shuffle format [N, K//8] int32."""
     return pack_int4_exllama_shuffle(w_int4_kn.t().contiguous())
+
+
+def _row_padded_empty(rows: int, cols: int, dtype: torch.dtype) -> torch.Tensor:
+    """[rows, cols] view whose row stride follows padded_row_stride_bytes."""
+    elem = torch.empty((), dtype=dtype).element_size()
+    ld = padded_row_stride_bytes(cols * elem) // elem
+    return torch.empty((rows, ld), device=device, dtype=dtype)[:, :cols]
+
+
+@pytest.mark.parametrize(
+    "row_bytes,expected",
+    [
+        (128, 128),
+        (129, 384),
+        (1024, 1152),  # weights, K = 2048
+        (1792, 1920),  # weights, K = 3584
+        (2048, 2176),  # weights, K = 4096
+        (7168, 7296),  # weights K = 14336 / bf16 activations K = 3584
+        (8192, 8320),  # bf16 activations or output, K or N = 4096
+        (28672, 28800),  # bf16 output, N = 14336
+    ],
+)
+def test_padded_row_stride_bytes(row_bytes, expected):
+    """Smallest stride >= row_bytes with stride % 256 == 128."""
+    assert padded_row_stride_bytes(row_bytes) == expected
+
+
+@pytest.mark.parametrize("K", [1536, 2048, 3584, 4096])
+def test_pack_skinny_int4_row_stride_gfx115x(K):
+    """gfx115x weight rows are padded to an odd multiple of 128 B, data intact."""
+    from vllm.platforms.rocm import on_gfx115x
+
+    if not on_gfx115x():
+        pytest.skip("gfx115x only")
+    unpacked = torch.randint(0, 16, (64, K), device=device, dtype=torch.int32)
+
+    w_q = hybrid_w4a16_module.pack_skinny_int4(unpacked)
+
+    assert w_q.stride(0) == padded_row_stride_bytes(K // 2)
+    torch.testing.assert_close(
+        w_q.view(torch.int32), pack_int4_exllama_shuffle(unpacked)
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M,K,N,G", [(17, 256, 512, 32), (64, 1024, 256, 128)])
+def test_triton_w4a16_skinny_fmt_gemm_row_padded(dtype, M, K, N, G, random_seed: int):
+    """Row-padded activations and output give the same result as dense ones."""
+    set_random_seed(random_seed)
+
+    a = _row_padded_empty(M, K, dtype)
+    a.copy_(0.25 * torch.randn((M, K), device=device, dtype=torch.float32))
+    w_int4 = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
+    scales = (0.05 * torch.rand((N, K // G), device=device, dtype=torch.float32)).to(
+        dtype
+    )
+    out = _row_padded_empty(M, N, dtype)
+
+    triton_w4a16_skinny_fmt_gemm(
+        a=a, b_q=_pack_exllama_shuffle(w_int4), scales=scales, group_size=G, out=out
+    )
+    ref = _w4a16_skinny_reference(a, w_int4, scales, group_size=G, zp_bias=8)
+
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)
 
 
 def _w4a16_skinny_reference(
@@ -323,6 +388,88 @@ def test_hybrid_w4a16_dispatch(dtype, M, K, N, G, random_seed: int):
         a, b_packed_i8, scales, None, None, cu_count, G
     )
 
+    ref = _hip_skinny_reference(a, w_int4_nk, scales, group_size=G, zp_bias=8)
+
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "M,dequant",
+    [(32, False), (256, True)],
+    ids=["triton_prefill", "dequant_prefill"],
+)
+def test_hybrid_w4a16_dispatch_row_padded_output(dtype, M, dequant, random_seed):
+    """Both prefill paths write the output with the requested row stride, and
+    the fake impl reports the same layout (opcheck)."""
+    from tests.kernels.utils import opcheck
+    from vllm.utils.platform_utils import num_compute_units
+
+    set_random_seed(random_seed)
+    K, N, G = 512, 256, 64
+    ld = padded_row_stride_bytes(N * 2) // 2
+
+    a = (0.25 * torch.randn((M, K), device=device, dtype=torch.float32)).to(dtype)
+    w_int4_nk = torch.randint(0, 16, (N, K), device=device, dtype=torch.int32)
+    b_packed_i32 = pack_int4_exllama_shuffle(w_int4_nk)
+    scales = (0.05 * torch.rand((N, K // G), device=device, dtype=torch.float32)).to(
+        dtype
+    )
+    bias = torch.randn(N, device=device, dtype=dtype)
+    ref = _hip_skinny_reference(a, w_int4_nk, scales, group_size=G, zp_bias=8) + bias
+    w_dequant = (
+        ((w_int4_nk - 8).float().view(N, K // G, G) * scales.float().unsqueeze(-1))
+        .view(N, K)
+        .to(dtype)
+        if dequant
+        else None
+    )
+    args = (
+        a,
+        b_packed_i32.view(torch.int8),
+        scales,
+        None,
+        bias,
+        num_compute_units(),
+        G,
+        None,
+        w_dequant,
+        ld,
+    )
+
+    out = torch.ops.vllm.rdna_hybrid_w4a16_apply(*args)
+
+    assert out.shape == (M, N) and out.stride() == (ld, 1)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)
+    opcheck(torch.ops.vllm.rdna_hybrid_w4a16_apply, args)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("M", [32, 256])
+def test_hybrid_w4a16_dispatch_row_padded_activation(dtype, M, random_seed: int):
+    """The prefill path accepts a row-padded activation."""
+    from vllm.utils.platform_utils import num_compute_units
+
+    set_random_seed(random_seed)
+    K, N, G = 512, 256, 64
+
+    a = _row_padded_empty(M, K, dtype)
+    a.copy_(0.25 * torch.randn((M, K), device=device, dtype=torch.float32))
+    w_int4_nk = torch.randint(0, 16, (N, K), device=device, dtype=torch.int32)
+    b_packed_i32 = pack_int4_exllama_shuffle(w_int4_nk)
+    scales = (0.05 * torch.rand((N, K // G), device=device, dtype=torch.float32)).to(
+        dtype
+    )
+
+    out = torch.ops.vllm.rdna_hybrid_w4a16_apply(
+        a,
+        b_packed_i32.view(torch.int8),
+        scales,
+        None,
+        None,
+        num_compute_units(),
+        G,
+    )
     ref = _hip_skinny_reference(a, w_int4_nk, scales, group_size=G, zp_bias=8)
 
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=5e-2)

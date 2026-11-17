@@ -158,6 +158,10 @@ class PassConfig:
     kernel. Supersedes both enable_qk_norm_rope_fusion and fuse_rope_kvcache
     for layers that support it. Auto-enabled at O2+ on ROCm for models
     with QK-norm (e.g. Qwen3-MoE and Qwen3-VL-class architectures)."""
+    pad_w4a16_rows: bool = None  # type: ignore[assignment]
+    """Row-pad the inputs and outputs of the gfx115x hybrid W4A16 GEMMs in
+    prefill graphs, where every consumer is compiled by Inductor. Auto-enabled
+    at O1+ on gfx115x for quantized models."""
 
     rope_kvcache_fusion_max_token_num: int = 256
     """The threshold for ROCm AITER RoPE+KVCache fusion e.g. for small batch decode.
@@ -240,6 +244,7 @@ class PassConfig:
         "fuse_qk_norm_rope_kvcache",
         "enable_qk_norm_rope_fusion",
         "fuse_rope_kvcache_cat_mla",
+        "pad_w4a16_rows",
         mode="wrap",
     )
     @classmethod
@@ -305,6 +310,11 @@ class PassConfig:
                 "The fusion will be disabled."
             )
             self.fuse_qk_norm_rope_kvcache = False
+        if self.pad_w4a16_rows and not current_platform.is_rocm():
+            logger.warning_once(
+                "W4A16 row padding is only implemented on ROCm. It will be disabled."
+            )
+            self.pad_w4a16_rows = False
         if self.fuse_rope_kvcache_cat_mla and not current_platform.is_cuda_alike():
             logger.warning_once(
                 "MLA KV cache update with RoPE fusion enabled but the "

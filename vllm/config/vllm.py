@@ -252,6 +252,19 @@ def enable_qk_norm_rope_kvcache(cfg: "VllmConfig") -> bool:
     return cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
 
 
+def enable_w4a16_row_pad(cfg: "VllmConfig") -> bool:
+    """Enable on gfx115x for quantized models (the hybrid W4A16 kernel)."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx115x
+
+    return (
+        on_gfx115x() and cfg.model_config is not None and cfg.model_config.is_quantized
+    )
+
+
 OPTIMIZATION_LEVEL_00 = {
     "compilation_config": {
         "pass_config": {
@@ -267,6 +280,7 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_qk_norm_rope_kvcache": False,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "pad_w4a16_rows": False,
         },
         "cudagraph_mode": CUDAGraphMode.NONE,
         "use_inductor_graph_partition": False,
@@ -290,6 +304,7 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_qk_norm_rope_kvcache": False,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": False,
+            "pad_w4a16_rows": enable_w4a16_row_pad,
         },
         "cudagraph_mode": CUDAGraphMode.PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -313,6 +328,7 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "pad_w4a16_rows": enable_w4a16_row_pad,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -336,6 +352,7 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_qk_norm_rope_kvcache": enable_qk_norm_rope_kvcache,
             "enable_qk_norm_rope_fusion": False,
             "fuse_rope_kvcache_cat_mla": enable_rope_kvcache_mla_fusion,
+            "pad_w4a16_rows": enable_w4a16_row_pad,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
         "use_inductor_graph_partition": False,
@@ -2765,6 +2782,18 @@ class VllmConfig:
                         "num_tokens <= %d.",
                         compile_range_end,
                     )
+
+        if compilation_config.pass_config.pad_w4a16_rows:
+            from vllm.model_executor.kernels.linear.mixed_precision.rdna_hybrid_w4a16 import (  # noqa: E501
+                MAX_SKINNY_BATCH_SIZE,
+            )
+
+            # Decode graphs (the skinny W4A16 path) keep dense layouts; only
+            # graphs for larger batches get row padding.
+            if compile_range_end is not None and (
+                compile_range_end > MAX_SKINNY_BATCH_SIZE
+            ):
+                computed_compile_ranges_endpoints.append(MAX_SKINNY_BATCH_SIZE)
 
         if compilation_config.compile_ranges_endpoints is not None:
             for x in compilation_config.compile_ranges_endpoints:
