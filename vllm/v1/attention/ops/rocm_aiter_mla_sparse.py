@@ -151,6 +151,30 @@ def _localize_aiter_prefill_topk(
     )
 
 
+@functools.cache
+def _gluon_prefill_top_k(topk_tokens: int):
+    """aiter's gfx1250 Gluon prefill top-k, opt-in via VLLM_ROCM_DSA_GLUON_TOPK=1.
+
+    Same contract as torch.ops._C.top_k_per_row_prefill. Its speed does not depend on the
+    logit values: much faster than the C++ kernel on tied logits (e.g. many exact zeros), up
+    to about 2x slower on fully distinct ones. None when off, not on gfx1250, or unavailable.
+    """
+    import os
+
+    from vllm.platforms.rocm import on_gfx1250
+
+    if os.environ.get("VLLM_ROCM_DSA_GLUON_TOPK", "0") != "1" or not on_gfx1250():
+        return None
+    if topk_tokens & (topk_tokens - 1) or topk_tokens > 4096:
+        return None
+    try:
+        from aiter.ops.triton.topk_prefill import top_k_per_row_prefill
+    except ImportError:
+        logger.warning_once("VLLM_ROCM_DSA_GLUON_TOPK=1 but aiter has no Gluon prefill top-k")
+        return None
+    return top_k_per_row_prefill
+
+
 def _launch_aiter_top_k_per_row_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -1663,6 +1687,14 @@ def rocm_aiter_sparse_attn_indexer(
                 topk_tokens=topk_tokens,
             ):
                 _launch_aiter_top_k_per_row_prefill(
+                    logits,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                    topk_indices,
+                    topk_tokens,
+                )
+            elif (gluon_topk := _gluon_prefill_top_k(topk_tokens)) is not None:
+                gluon_topk(
                     logits,
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
