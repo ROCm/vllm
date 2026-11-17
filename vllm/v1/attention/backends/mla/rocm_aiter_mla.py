@@ -2749,7 +2749,11 @@ class AiterMLAHelper:
         m = AiterMLAHelper._AITER_MIN_MLA_HEADS
         if aligned <= m:
             return aligned
-        from aiter import get_mla_decode_shape_support
+        try:
+            from aiter import get_mla_decode_shape_support
+        except ImportError:
+            # Older aiter (no shape-support query): keep the aligned count.
+            return aligned
 
         qlens = range(1, max_qlen + 1)
         shapes = [(qlen, dcp, True) for qlen in ((1,) if dcp else qlens)]
