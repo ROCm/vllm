@@ -69,12 +69,28 @@ def _expert_stride_dwords(t: torch.Tensor) -> int:
     return t.stride(0) * t.element_size() // 4
 
 
+def _check_coef(coef: torch.Tensor, K: int, group: int, pairs: bool) -> None:
+    stride = _tile_stride(_coef_tile_dwords(K, group, pairs))
+    assert coef.size(-1) * coef.element_size() == stride * 4, "coefficient layout"
+
+
 def _w_tile_dwords(K: int) -> int:
     return (K // 16) * 16 * 2 * REG_N
 
 
-def _coef_tile_dwords(K: int, group: int) -> int:
-    return (K // group) * 16 * REG_N
+def _coef_tile_dwords(K: int, group: int, pairs: bool) -> int:
+    return (K // group) * 16 * REG_N * (2 if pairs else 1) // 2
+
+
+def _scale_terms(c, pairs: bool):
+    """Float32 ``(16 s, -s (16 + zp))`` from the loaded coefficient(s)."""
+    import flydsl.expr as fx
+
+    if pairs:
+        cf = c.to(fx.Float32)
+        return cf[0], cf[1]
+    s16 = fx.Float16(c).to(fx.Float32)
+    return s16, s16 * -1.5
 
 
 def gate_up_tile_order(n_out: int, device: torch.device) -> torch.Tensor:
@@ -86,7 +102,7 @@ def gate_up_tile_order(n_out: int, device: torch.device) -> torch.Tensor:
 
 
 def pack_w4a16_weights(
-    q: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor
+    q: torch.Tensor, scale: torch.Tensor, zp: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack unsigned int4 weights for the kernel.
 
@@ -94,13 +110,15 @@ def pack_w4a16_weights(
         q: ``[E, N, K]`` unsigned nibbles (0..15).
         scale: ``[E, N, K // group]`` group scales; the group size is a
             multiple of 16.
-        zp: ``[E, N, K // group]`` group zero points (0..15).
+        zp: ``[E, N, K // group]`` group zero points (0..15), or None for
+            symmetric weights (zero point 8).
 
     Returns:
         Per ``(expert, 64-column tile)`` rows of dwords: ``w`` int32 with the
         nibbles ordered ``[K/16, REG_N, 16, 2]`` and ``coef`` float16 pairs
         ``(16 s, -s (16 + zp))`` ordered ``[K/group, REG_N, 16]``. Rows are padded
-        to the tile stride.
+        to the tile stride. Without ``zp`` only ``16 s`` is stored: the second
+        coefficient is -1.5 times the first.
 
     """
     E, N, K = q.shape
@@ -116,8 +134,10 @@ def pack_w4a16_weights(
     w = w.permute(0, 1, 4, 2, 3, 5).reshape(E, tiles, -1)
 
     s = scale.to(torch.float32)
-    coef = torch.stack((16.0 * s, -s * (16.0 + zp.to(torch.float32))), dim=-1)
-    coef = coef.view(E, tiles, REG_N, 16, G, 2).permute(0, 1, 4, 2, 3, 5)
+    coef = (16.0 * s).unsqueeze(-1)
+    if zp is not None:
+        coef = torch.cat((coef, -s.unsqueeze(-1) * (16.0 + zp.unsqueeze(-1))), dim=-1)
+    coef = coef.view(E, tiles, REG_N, 16, G, -1).permute(0, 1, 4, 2, 3, 5)
     coef = coef.to(torch.float16).reshape(E, tiles, -1)
 
     def _pad(t: torch.Tensor, dwords: int) -> torch.Tensor:
@@ -125,7 +145,10 @@ def pack_w4a16_weights(
         extra = (_tile_stride(dwords) - dwords) * per_dword
         return torch.nn.functional.pad(t, (0, extra)).contiguous()
 
-    return _pad(w, _w_tile_dwords(K)), _pad(coef, _coef_tile_dwords(K, K // G))
+    return (
+        _pad(w, _w_tile_dwords(K)),
+        _pad(coef, _coef_tile_dwords(K, K // G, zp is not None)),
+    )
 
 
 @functools.cache
@@ -137,6 +160,7 @@ def _build_gemm(
     silu_mul: bool,
     w_expert: int,
     c_expert: int,
+    coef_pairs: bool,
 ):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -149,8 +173,11 @@ def _build_gemm(
     k_dwords = K // 2
     w_step = 16 * 2 * REG_N  # dwords per K-step of one output tile
     w_tile = _tile_stride(_w_tile_dwords(K))
-    c_group = 16 * REG_N
-    c_tile = _tile_stride(_coef_tile_dwords(K, group))
+    # Coefficient offsets are in float16 elements.
+    cw = 2 if coef_pairs else 1
+    c_group = 16 * REG_N * cw
+    c_tile = 2 * _tile_stride(_coef_tile_dwords(K, group, coef_pairs))
+    c_expert *= 2
     # With ``silu_mul`` a tile holds gate columns then the matching up columns.
     out_reg = REG_N // 2 if silu_mul else REG_N
     n_out = N // 2 if silu_mul else N
@@ -193,7 +220,7 @@ def _build_gemm(
         x_row = (block_valid & (rid < n_rows)).select(rid // x_row_div, fx.Int32(0))
         x_base = x_row * k_dwords
         w_base = expert * w_expert + tile_n * w_tile + lane16 * 2
-        c_base = expert * c_expert + tile_n * c_tile + lane16
+        c_base = expert * c_expert + tile_n * c_tile + lane16 * cw
 
         ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
         zero = fx.full(8, 0.0, fx.Float32)
@@ -220,7 +247,10 @@ def _build_gemm(
         def load_coef(g):
             return [
                 buffer_ops.buffer_load(
-                    c_rsrc, c_base + g * c_group + rn * 16, vec_width=1, dtype=fx.Int32
+                    c_rsrc,
+                    c_base + g * c_group + rn * (16 * cw),
+                    vec_width=cw,
+                    dtype=fx.Float16,
                 )
                 for rn in range_constexpr(REG_N)
             ]
@@ -267,10 +297,9 @@ def _build_gemm(
                     wv = cur[2 + rn]
                     acc[rn] = wmma(a, unpack(wv[0], wv[1]), acc[rn])
             for rn in range_constexpr(REG_N):
-                cf = Vector.from_elements([coef[rn]], fx.Int32)
-                cf = cf.bitcast(fx.Float16).to(fx.Float32)
-                s16 = fx.full(8, cf[0], fx.Float32)
-                szp = fx.full(8, cf[1], fx.Float32)
+                s16, szp = _scale_terms(coef[rn], coef_pairs)
+                s16 = fx.full(8, s16, fx.Float32)
+                szp = fx.full(8, szp, fx.Float32)
                 tot[rn] = math.fma(acc[rn], s16, math.fma(xsum, szp, tot[rn]))
             results = yield tot + queue + coef_next
         tot = list(results[:REG_N])
@@ -343,6 +372,7 @@ def _build_gemm_row(
     silu_mul: bool,
     w_expert: int,
     c_expert: int,
+    coef_pairs: bool,
 ):
     """``out[r] = W[expert_ids[r]] @ x[r // x_row_div]``, one row per block.
 
@@ -366,8 +396,11 @@ def _build_gemm_row(
     w_step = 16 * 2 * REG_N
     chunk = steps * w_step  # dwords of one group of one tile
     w_tile = _tile_stride(_w_tile_dwords(K))
-    c_group = 16 * REG_N
-    c_tile = _tile_stride(_coef_tile_dwords(K, group))
+    # Coefficient offsets are in float16 elements.
+    cw = 2 if coef_pairs else 1
+    c_group = 16 * REG_N * cw
+    c_tile = 2 * _tile_stride(_coef_tile_dwords(K, group, coef_pairs))
+    c_expert *= 2
     out_reg = REG_N // 2 if silu_mul else REG_N
     n_out = N // 2 if silu_mul else N
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_row")
@@ -407,7 +440,7 @@ def _build_gemm_row(
         valid = expert >= 0
         expert = valid.select(expert, fx.Int32(0))
         w_base = expert * w_expert + tile_n * w_tile
-        c_base = expert * c_expert + tile_n * c_tile + lane16
+        c_base = expert * c_expert + tile_n * c_tile + lane16 * cw
 
         lds = SmemPtr(allocator.get_base(), 0, T.i32, shape=(lds_wave * wg,)).get()
         lds0 = wave * lds_wave
@@ -433,7 +466,10 @@ def _build_gemm_row(
         def load_coef(g):
             return [
                 buffer_ops.buffer_load(
-                    c_rsrc, c_base + g * c_group + rn * 16, vec_width=1, dtype=fx.Int32
+                    c_rsrc,
+                    c_base + g * c_group + rn * (16 * cw),
+                    vec_width=cw,
+                    dtype=fx.Float16,
                 )
                 for rn in range_constexpr(REG_N)
             ]
@@ -484,10 +520,9 @@ def _build_gemm_row(
                     )
                     acc[rn] = wmma(a, unpack(wv), acc[rn])
             for rn in range_constexpr(REG_N):
-                cf = Vector.from_elements([coef[rn]], fx.Int32)
-                cf = cf.bitcast(fx.Float16).to(fx.Float32)
-                s16 = fx.full(8, cf[0], fx.Float32)
-                szp = fx.full(8, cf[1], fx.Float32)
+                s16, szp = _scale_terms(coef[rn], coef_pairs)
+                s16 = fx.full(8, s16, fx.Float32)
+                szp = fx.full(8, szp, fx.Float32)
                 tot[rn] = math.fma(acc[rn], s16, math.fma(xsum, szp, tot[rn]))
             results = yield tot + nxt + coef_next
         tot = list(results[:REG_N])
@@ -527,7 +562,13 @@ def _build_gemm_row(
 
 @functools.cache
 def _build_gemm_reduce(
-    K: int, N: int, group: int, top_k: int, w_expert: int, c_expert: int
+    K: int,
+    N: int,
+    group: int,
+    top_k: int,
+    w_expert: int,
+    c_expert: int,
+    coef_pairs: bool,
 ):
     """One token: ``out[n] = sum_e weight_e * (W[expert_e] @ x[e])[n]``.
 
@@ -555,8 +596,11 @@ def _build_gemm_reduce(
     k_dwords = K // 2
     w_step = 16 * 2 * REG_N
     w_tile = _tile_stride(_w_tile_dwords(K))
-    c_group = 16 * REG_N
-    c_tile = _tile_stride(_coef_tile_dwords(K, group))
+    # Coefficient offsets are in float16 elements.
+    cw = 2 if coef_pairs else 1
+    c_group = 16 * REG_N * cw
+    c_tile = 2 * _tile_stride(_coef_tile_dwords(K, group, coef_pairs))
+    c_expert *= 2
     x_dwords = top_k * k_dwords
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_x")
     allocator.ptr = x_dwords * 4
@@ -603,7 +647,7 @@ def _build_gemm_reduce(
             weight.append(valid.select(tw, fx.Float32(0.0)))
             expert = valid.select(expert, fx.Int32(0))
             w_base.append(expert * w_expert + tile_n * w_tile + rn * 32 + lane16 * 2)
-            c_base.append(expert * c_expert + tile_n * c_tile + rn * 16 + lane16)
+            c_base.append(expert * c_expert + tile_n * c_tile + (rn * 16 + lane16) * cw)
 
         ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
         zero = fx.full(8, 0.0, fx.Float32)
@@ -623,7 +667,7 @@ def _build_gemm_reduce(
         def load_coef(g):
             return [
                 buffer_ops.buffer_load(
-                    c_rsrc, c_base[e] + g * c_group, vec_width=1, dtype=fx.Int32
+                    c_rsrc, c_base[e] + g * c_group, vec_width=cw, dtype=fx.Float16
                 )
                 for e in range_constexpr(top_k)
             ]
@@ -667,9 +711,8 @@ def _build_gemm_reduce(
                     acc[e] = wmma(a, unpack(queue[e]), acc[e])
                 queue = queue[top_k:]
             for e in range_constexpr(top_k):
-                cf = Vector.from_elements([coef[e]], fx.Int32)
-                cf = cf.bitcast(fx.Float16).to(fx.Float32)
-                val = math.fma(acc[e][e], cf[0], xsum[e] * cf[1])
+                s16, szp = _scale_terms(coef[e], coef_pairs)
+                val = math.fma(acc[e][e], s16, xsum[e] * szp)
                 tot = math.fma(val, weight[e], tot)
             results = yield [tot] + queue + coef_next
         tot = fx.Float32(results[0])
@@ -705,11 +748,14 @@ def flydsl_rdna_moe_gemm_reduce(
     expert_ids: torch.Tensor,
     weights: torch.Tensor,
     group_size: int,
+    coef_pairs: bool = True,
 ) -> None:
     """One token: ``out[0] = sum_e weights[e] * W[expert_ids[e]] @ x[e]``.
 
-    ``weights`` is float32; at most ``MAX_REDUCE_ROWS`` experts.
+    ``weights`` is float32; at most ``MAX_REDUCE_ROWS`` experts. ``coef_pairs``
+    is False for weights packed without zero points.
     """
+    _check_coef(coef, x.shape[1], group_size, coef_pairs)
     launch = _build_gemm_reduce(
         x.shape[1],
         out.shape[1],
@@ -717,6 +763,7 @@ def flydsl_rdna_moe_gemm_reduce(
         x.shape[0],
         _expert_stride_dwords(w),
         _expert_stride_dwords(coef),
+        coef_pairs,
     )
     launch(out, x, w, coef, expert_ids, weights, torch.cuda.current_stream())
 
@@ -732,6 +779,7 @@ def flydsl_rdna_moe_gemm(
     x_row_div: int,
     group_size: int,
     silu_mul: bool = False,
+    coef_pairs: bool = True,
 ) -> None:
     """Run ``out[r] = W[expert(r)] @ x[r // x_row_div]`` for all routed rows.
 
@@ -742,11 +790,13 @@ def flydsl_rdna_moe_gemm(
 
     With ``silu_mul`` the weights are in ``gate_up_tile_order`` and ``out``
     receives ``silu(gate) * up``, half as many columns as the weights have.
+    ``coef_pairs`` is False for weights packed without zero points.
     """
+    _check_coef(coef, x.shape[1], group_size, coef_pairs)
     n_rows, N = out.shape
     if silu_mul:
         N *= 2
-    strides = (_expert_stride_dwords(w), _expert_stride_dwords(coef))
+    strides = (_expert_stride_dwords(w), _expert_stride_dwords(coef), coef_pairs)
     stream = torch.cuda.current_stream()
     if sorted_ids is None:
         launch = _build_gemm_row(

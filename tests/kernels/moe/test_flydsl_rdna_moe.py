@@ -36,11 +36,18 @@ from vllm.utils.torch_utils import set_random_seed  # noqa: E402
     ids=["gate_up", "down"],
 )
 @pytest.mark.parametrize("group_size", [32, 128])
+@pytest.mark.parametrize("symmetric", [False, True])
 def test_flydsl_rdna_moe_gemm(
-    num_tokens: int, n_out: int, n_in: int, x_row_div: int, group_size: int
+    num_tokens: int,
+    n_out: int,
+    n_in: int,
+    x_row_div: int,
+    group_size: int,
+    symmetric: bool,
 ):
-    """The grouped GEMM matches dequantize-then-matmul for asymmetric int4,
-    including blocks padded with rows that belong to no token.
+    """The grouped GEMM matches dequantize-then-matmul for int4 with zero
+    points and for symmetric int4 packed without them, including blocks
+    padded with rows that belong to no token.
     """
     set_random_seed(0)
     device = "cuda"
@@ -51,6 +58,8 @@ def test_flydsl_rdna_moe_gemm(
     scale = scale.to(torch.bfloat16)
     scale[0, 0, 0] = 0
     zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
+    if symmetric:
+        zp.fill_(8)
 
     rows = num_tokens * top_k
     x = torch.randn((rows // x_row_div, n_in), device=device, dtype=torch.bfloat16)
@@ -60,9 +69,18 @@ def test_flydsl_rdna_moe_gemm(
     )
 
     out = torch.empty((rows, n_out), device=device, dtype=torch.bfloat16)
-    w, coef = pack_w4a16_weights(q, scale, zp)
+    w, coef = pack_w4a16_weights(q, scale, None if symmetric else zp)
     flydsl_rdna_moe_gemm(
-        out, x, w, coef, sorted_ids, expert_ids, num_valid, x_row_div, group_size
+        out,
+        x,
+        w,
+        coef,
+        sorted_ids,
+        expert_ids,
+        num_valid,
+        x_row_div,
+        group_size,
+        coef_pairs=not symmetric,
     )
 
     dequant = (q - zp.repeat_interleave(group_size, dim=2)).float()
@@ -72,7 +90,8 @@ def test_flydsl_rdna_moe_gemm(
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
 
 
-def test_flydsl_rdna_moe_gemm_single_token():
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_flydsl_rdna_moe_gemm_single_token(symmetric: bool):
     """Without routing buffers, row ``r`` runs on ``expert_ids[r]`` and rows
     whose expert id is -1 are left untouched.
     """
@@ -82,7 +101,9 @@ def test_flydsl_rdna_moe_gemm_single_token():
     groups = n_in // group_size
     q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
     scale = torch.rand((num_experts, n_out, groups), device=device) * 0.02 + 0.001
-    zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
+    zp = None
+    if not symmetric:
+        zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
     w, coef = pack_w4a16_weights(q, scale.to(torch.bfloat16), zp)
     x = torch.randn((1, n_in), device=device, dtype=torch.bfloat16)
     topk_ids = torch.tensor([[5, -1, 0, 3]], dtype=torch.int32, device=device)
@@ -97,12 +118,22 @@ def test_flydsl_rdna_moe_gemm_single_token():
         *moe_align_block_size(routed, BLOCK_M, num_experts),
         top_k,
         group_size,
+        coef_pairs=not symmetric,
     )
     ref[1] = 7.0
 
     out = torch.full_like(ref, 7.0)
     flydsl_rdna_moe_gemm(
-        out, x, w, coef, None, topk_ids.view(-1), None, top_k, group_size
+        out,
+        x,
+        w,
+        coef,
+        None,
+        topk_ids.view(-1),
+        None,
+        top_k,
+        group_size,
+        coef_pairs=not symmetric,
     )
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
 
@@ -143,7 +174,8 @@ def test_flydsl_rdna_moe_gemm_silu_mul(num_tokens: int):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
 
 
-def test_flydsl_rdna_moe_gemm_reduce():
+@pytest.mark.parametrize("symmetric", [False, True])
+def test_flydsl_rdna_moe_gemm_reduce(symmetric: bool):
     """The one-token GEMM with the fused top-k sum matches the plain GEMM
     followed by the weighted sum, with a padded expert stride, and skips
     experts with id -1.
@@ -154,10 +186,13 @@ def test_flydsl_rdna_moe_gemm_reduce():
     groups = n_in // group_size
     q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
     scale = torch.rand((num_experts, n_out, groups), device=device) * 0.02 + 0.001
-    zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
+    zp = None
+    if not symmetric:
+        zp = torch.randint(0, 16, (num_experts, n_out, groups), device=device)
     w, coef = map(
         pad_expert_stride, pack_w4a16_weights(q, scale.to(torch.bfloat16), zp)
     )
+    pairs = not symmetric
     x = torch.randn((top_k, n_in), device=device, dtype=torch.bfloat16)
     expert_ids = torch.tensor(
         [5, -1, 0, 3, 15, 9, -1, 11], dtype=torch.int32, device=device
@@ -165,9 +200,13 @@ def test_flydsl_rdna_moe_gemm_reduce():
     weights = torch.rand((1, top_k), device=device)
 
     rows = torch.zeros((top_k, n_out), device=device, dtype=torch.bfloat16)
-    flydsl_rdna_moe_gemm(rows, x, w, coef, None, expert_ids, None, 1, group_size)
+    flydsl_rdna_moe_gemm(
+        rows, x, w, coef, None, expert_ids, None, 1, group_size, coef_pairs=pairs
+    )
     ref = (rows.float() * weights.view(-1, 1)).sum(dim=0, keepdim=True)
 
     out = torch.empty((1, n_out), device=device, dtype=torch.bfloat16)
-    flydsl_rdna_moe_gemm_reduce(out, x, w, coef, expert_ids, weights, group_size)
+    flydsl_rdna_moe_gemm_reduce(
+        out, x, w, coef, expert_ids, weights, group_size, coef_pairs=pairs
+    )
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())

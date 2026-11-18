@@ -1459,7 +1459,7 @@ def _process_weights_flydsl(
 
     Weights are ``[E, N, K // 2]`` uint8 or ``[E, N, K // 8]`` int32 with the
     nibbles of a row in little-endian order, zero points are uint8
-    ``[E, N // 2, K // gs]`` (8 when absent), and scales are
+    ``[E, N // 2, K // gs]`` (symmetric when absent), and scales are
     ``[E, N, K // gs]``. The zero points are folded into the returned scale
     coefficients. When the kernel applies the activation, the w13 outputs are
     reordered so that a tile holds gate columns and their up columns.
@@ -1484,15 +1484,13 @@ def _process_weights_flydsl(
         packed = []
         for i in range(0, w.size(0), 8):
             sl = slice(i, i + 8)
-            zp = (
-                torch.full_like(scale[sl], 8, dtype=torch.uint8)
-                if qzeros is None
-                else _nibbles(qzeros[sl], 1)
-            )
-            parts = (_nibbles(w[sl], 2), scale[sl], zp)
+            parts = [_nibbles(w[sl], 2), scale[sl]]
+            if qzeros is not None:
+                parts.append(_nibbles(qzeros[sl], 1))
             if order is not None:
-                parts = tuple(t[:, order] for t in parts)
-            packed.append(pack_w4a16_weights(*parts))
+                parts = [t[:, order] for t in parts]
+            zp = parts[2] if qzeros is not None else None
+            packed.append(pack_w4a16_weights(parts[0], parts[1], zp))
         return (pad_expert_stride(torch.cat(t)) for t in zip(*packed))
 
     order = None

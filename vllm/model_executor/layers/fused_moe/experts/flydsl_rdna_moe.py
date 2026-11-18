@@ -71,6 +71,9 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
         )
         self._arange: torch.Tensor | None = None
         self._silu_mul = fuses_silu_mul(moe_config)
+        # Without zero points the packer stores one coefficient per group.
+        self._w1_pairs = quant_config.w1_zp is not None
+        self._w2_pairs = quant_config.w2_zp is not None
         assert not self._silu_mul or self.activation_config.clamp_limit is None
 
     def _route(
@@ -198,6 +201,7 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             top_k,
             group_size,
             silu_mul=self._silu_mul,
+            coef_pairs=self._w1_pairs,
         )
         if not self._silu_mul:
             self.activation(activation, act_out, gate_up_out)
@@ -208,7 +212,14 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
         ):
             # One token: GEMM2 also does the weighted sum over its experts.
             flydsl_rdna_moe_gemm_reduce(
-                output, act_out, w2, self.w2_scale, expert_ids, topk_weights, group_size
+                output,
+                act_out,
+                w2,
+                self.w2_scale,
+                expert_ids,
+                topk_weights,
+                group_size,
+                coef_pairs=self._w2_pairs,
             )
             return
         flydsl_rdna_moe_gemm(
@@ -221,6 +232,7 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             num_valid,
             1,
             group_size,
+            coef_pairs=self._w2_pairs,
         )
 
         # Rows are in routing order, so the top-k reduction needs no permutation.
