@@ -1,6 +1,6 @@
 # Muse Spark Open on ROCm (MI355X): optimization preview
 
-This branch is a preview of the Muse Spark Open optimizations for ROCm (MI355X, gfx950) that are under review in vLLM. The open PRs are merged on `main` at [`bf5567a306`](https://github.com/vllm-project/vllm/commit/bf5567a306) (2026-11-17).
+This branch is a preview of the Muse Spark Open optimizations for ROCm (MI355X, gfx950) that are under review in vLLM. The open PRs are merged on `main` at [`bf5567a306`](https://github.com/vllm-project/vllm/commit/bf5567a306) (2026-11-17); #67380 and #67381 carry their 2026-11-18 updates.
 
 It is not for production. The branch is rebuilt as the PRs change. Please send feedback on the individual PRs.
 
@@ -9,8 +9,8 @@ It is not for production. The branch is rebuilt as the PRs change. Please send f
 | PR | title | head | knob |
 | --- | --- | --- | --- |
 | [#67133](https://github.com/vllm-project/vllm/pull/67133) | AITER FA: split-KV kernels for decode and speculative-decode verify | `9e20f1b71b` | always on (gate below) |
-| [#67380](https://github.com/vllm-project/vllm/pull/67380) | Ulysses sequence parallelism for TEP prefill | `4fb0a7b070` | `--additional-config '{"ulysses_prefill": true}'` |
-| [#67381](https://github.com/vllm-project/vllm/pull/67381) | Online `fp8_per_channel` dense linears on tuned FP8 kernels | `0be24e50c1` | `--quantization-config` (below) |
+| [#67380](https://github.com/vllm-project/vllm/pull/67380) | Ulysses sequence parallelism for TEP prefill | `a95433e224` | `--additional-config '{"ulysses_prefill": true}'` |
+| [#67381](https://github.com/vllm-project/vllm/pull/67381) | Online `fp8_per_channel` dense linears on tuned FP8 kernels | `8b88e9d047` | `--quantization-config` (below) |
 | [#67145](https://github.com/vllm-project/vllm/pull/67145) | AITER FA: FP8-query prefill attention | `83a4decec3` | `--attention-config '{"use_prefill_query_quantization": true}'` |
 | [#67306](https://github.com/vllm-project/vllm/pull/67306) | Decode MoE on native routes | `caae34db45` | always on (gate below) |
 | [#67191](https://github.com/vllm-project/vllm/pull/67191) | Online MXFP4 for the BF16 first/last-layer experts | `d578da7732` | `--quantization-config` (below) |
@@ -27,13 +27,26 @@ Already in `main`, so no longer listed as dependencies:
 - [#65985](https://github.com/vllm-project/vllm/pull/65985): DSpark draft layers as one launch under `--monokernel`. It needs BF16 draft weights; with #67340's FP8 draft it logs `drafter off` and the stock draft layers run.
 - [#59098](https://github.com/vllm-project/vllm/pull/59098): AITER FA context fix for out-of-order batches.
 
+## AITER configs for #67381
+
+[#67381](https://github.com/vllm-project/vllm/pull/67381) runs the dense linears on vLLM's AITER per-token FP8 kernel class, which uses AITER's Triton `gemm_a8w8_per_token_scale` for these shapes. Its small-M speedup needs tuned configs for the Muse shapes, from the ROCm/aiter branch [`mawong/muse-spark-gemm-a8w8-per-token-configs`](https://github.com/ROCm/aiter/tree/mawong/muse-spark-gemm-a8w8-per-token-configs). Without them, these layers fall back to `torch._scaled_mm`. Either install AITER from that branch, or copy its 4 JSON files into the installed AITER:
+
+```bash
+git clone --depth 1 -b mawong/muse-spark-gemm-a8w8-per-token-configs https://github.com/ROCm/aiter /tmp/aiter-cfg
+SUB=ops/triton/configs/gfx950/triton/gemm/gemm_a8w8_per_token_scale
+DST=$(python -c 'import aiter, os; print(os.path.dirname(aiter.__file__))')/$SUB
+cp /tmp/aiter-cfg/aiter/$SUB/GEMM-A8W8_PER_TOKEN_SCALE-N=*-K=*.json "$DST"/
+```
+
+With the configs, the server log shows `AITER per-token FP8 GEMM for N=4608 K=8192: Triton gemm_a8w8_per_token_scale` (TEP4 QKV; also the pooler and unpooler shapes).
+
 ## Knobs, by estimated impact (replay model)
 
 | PR | default | knob | gate | estimated AgentX TEP4 p90 product: c40 (c24) | measured impact (MI355X) |
 | --- | --- | --- | --- | --- | --- |
 | #67133 | on | none | gfx950, `ROCM_AITER_FA`, FP8 KV, head 64, GQA 8, decode q_len 1-8, FlyDSL | x2.9 (x2.4) | AgentX TEP4 vs main: c24 +54% tok/s/GPU (ITL 21.0 -> 7.4 ms), c40 +99% (41.5 -> 11.3 ms) |
 | #67380 | off | `--additional-config '{"ulysses_prefill": true}'`; at TEP8 also `VLLM_ROCM_MUSE_SP_MIN_TOKENS=3584` | TEP (TP > 1 with EP), gfx950 | +34% (+15%) | TEP4: TTFT 8k/16k -18%; costs 12.6 GiB of KV cache per GPU (its FP8 QKV/O copies; not binding at c40). TEP8 c28: TTFT -18%, ITL p99 -20% |
-| #67381 | off | `--quantization-config '{"linear": "fp8_per_channel", "ignore": ["*o_proj"]}'` | gfx950, not with `--monokernel` | +21% (+14%) | decode step -8% (1 request), -5% (8-24) |
+| #67381 | off | `--quantization-config '{"linear": "fp8_per_channel", "ignore": ["*o_proj"]}'` | gfx950, not with `--monokernel` | +21% (+14%) | decode step -8% (1 request), -5% (8-24), with the AITER configs above |
 | #67145 | off | `--attention-config '{"use_prefill_query_quantization": true}'` | gfx950, FP8 e4m3 KV, full-attention layers | +21% (+9%) | AgentX c24 +3.1%, c40 +5.4%; prefill TTFT -13..-16% |
 | #67306 | on | none | gfx950, EP, MXFP4 experts, <= 2048 tokens per call | +14% (+10%) | decode step -4..-5% |
 | #67191 | off | `--quantization-config '{"targets": {"*layers.0.feed_forward.experts*": "mxfp4", "*layers.61.feed_forward.experts*": "mxfp4"}}'` | routed experts only | +13% (+10%) | AgentX c24 +2.8%, c40 +3.0% (ITL -7%) |
