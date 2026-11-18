@@ -25,6 +25,7 @@ void fused_moe_wvSplitK_int4_gemm_sweep(
 
   bool scattered = sorted_token_ids.numel() > 0;
   int top_k_in = scattered ? static_cast<int>(top_k) : 1;
+  const bool plain_k = false;  // the sweep uses ExLlama-shuffled weights
 
   if (fuse_silu_mul) {
     TORCH_CHECK(N_in == 1, "fuse_silu_mul requires block_size_m == 1, got ",

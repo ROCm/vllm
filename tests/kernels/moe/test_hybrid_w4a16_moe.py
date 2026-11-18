@@ -389,12 +389,18 @@ def test_hybrid_w4a16_moe_awq_checkpoint(m: int, group_size: int, dtype: torch.d
 
 def test_hybrid_w4a16_moe_gate(monkeypatch: pytest.MonkeyPatch):
     """Enabled by default on gfx11/gfx12; an explicit --moe-backend or
-    VLLM_MOE_HYBRID_W4A16=0 turns it off."""
+    VLLM_MOE_HYBRID_W4A16=0 turns it off. The hipblaslt query matches only
+    --moe-backend hipblaslt (HIP decode + hipBLASLt prefill)."""
     from vllm.platforms.rocm import on_gfx1x
 
     moe = make_dummy_moe_config()
+    hbl = dataclasses.replace(moe, moe_backend="hipblaslt")
     if current_platform.is_rocm() and on_gfx1x():
         assert hybrid_w4a16_moe_enabled(moe)
+        assert hybrid_w4a16_moe_enabled(hbl, "hipblaslt")
     assert not hybrid_w4a16_moe_enabled(dataclasses.replace(moe, moe_backend="triton"))
+    assert not hybrid_w4a16_moe_enabled(hbl)
+    assert not hybrid_w4a16_moe_enabled(moe, "hipblaslt")
     monkeypatch.setenv("VLLM_MOE_HYBRID_W4A16", "0")
     assert not hybrid_w4a16_moe_enabled(moe)
+    assert not hybrid_w4a16_moe_enabled(hbl, "hipblaslt")

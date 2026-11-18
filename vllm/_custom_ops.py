@@ -2256,6 +2256,7 @@ def fused_moe_wvSplitK_int4_gemm(
     zero_points: torch.Tensor | None = None,
     sorted_token_ids: torch.Tensor | None = None,
     top_k: int = 1,
+    plain_k: bool = False,
 ) -> None:
     if zero_points is None:
         zero_points = torch.empty(0, dtype=scales.dtype, device=a.device)
@@ -2273,6 +2274,7 @@ def fused_moe_wvSplitK_int4_gemm(
         zero_points,
         sorted_token_ids,
         top_k,
+        plain_k,
     )
 
 

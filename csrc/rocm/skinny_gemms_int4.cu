@@ -188,13 +188,15 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
 // CuCount:     number of compute units
 // group_size:  32 or 128
 // zero_points: [E, N_weight, K//group_size] or empty tensor
+// plain_k:     w nibbles in K order (hipBLASLt HIP_R_4I) instead of ExLlama
+//              shuffle; only the LDS kernel supports it
 void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   torch::Tensor scales, torch::Tensor c,
                                   torch::Tensor expert_ids,
                                   int64_t block_size_m, int64_t CuCount,
                                   int64_t group_size, torch::Tensor zero_points,
-                                  torch::Tensor sorted_token_ids,
-                                  int64_t top_k) {
+                                  torch::Tensor sorted_token_ids, int64_t top_k,
+                                  bool plain_k) {
   // MOE_WVSPLIT_INT4G_GS[_W_AC] is a 2-way 32-vs-else demux, so group_size=64
   // would silently dequantize with the 128 kernel's (wrong) scale stride --
   // every read stays in-bounds, so nothing faults.  Per-channel isn't

@@ -481,13 +481,13 @@ class MoeWNA16Method(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
 
-    def _use_hybrid_w4a16(self, layer: RoutedExperts) -> bool:
+    def _use_hybrid_w4a16(self, layer: RoutedExperts, backend: str = "auto") -> bool:
         from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
             hybrid_w4a16_moe_enabled,
         )
 
         return (
-            hybrid_w4a16_moe_enabled(self.moe)
+            hybrid_w4a16_moe_enabled(self.moe, backend)
             and self.quant_config.linear_quant_method in ("awq", "awq_marlin")
             and self.quant_config.weight_bits == 4
             and layer.group_size in (32, 128)
@@ -529,7 +529,82 @@ class MoeWNA16Method(FusedMoEMethodBase):
             self.moe, self.moe_quant_config, layer
         )
 
+    def _process_weights_hybrid_hipblaslt(self, layer: RoutedExperts) -> None:
+        """Hybrid decode + hipBLASLt prefill from one weight copy in
+        hipBLASLt's layout: plain K-order nibbles with padded rows, scales and
+        zero-points in one buffer per expert, read by the HIP decode kernel
+        through views.
+        """
+        from vllm.model_executor.layers.fused_moe.experts.hipblaslt_moe import (
+            HipblasltWNA16Experts,
+            moe_scale_buffer_views,
+            pack_moe_scale_buffers,
+            pad_moe_weight_rows,
+        )
+        from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+            HybridHipblasltW4A16MoEExperts,
+            make_hybrid_w4a16_moe_kernel,
+        )
+
+        has_zp = self.quant_config.has_zp
+        views = {}
+        for p in ("w13", "w2"):
+            scale = getattr(layer, f"{p}_scales")
+            _, n, groups = scale.shape
+            buf = pack_moe_scale_buffers(
+                scale, getattr(layer, f"{p}_qzeros") if has_zp else None
+            )
+            views[p] = moe_scale_buffer_views(buf, n, groups, scale.dtype, has_zp)
+            w = getattr(layer, f"{p}_qweight").contiguous().view(torch.uint8)
+            replace_parameter(
+                layer,
+                f"{p}_qweight",
+                torch.nn.Parameter(pad_moe_weight_rows(w), requires_grad=False),
+            )
+            replace_parameter(
+                layer, f"{p}_scales", torch.nn.Parameter(buf, requires_grad=False)
+            )
+            if has_zp:
+                # Zero-points live in the scale buffer; empty marks asym.
+                replace_parameter(
+                    layer,
+                    f"{p}_qzeros",
+                    torch.nn.Parameter(buf.new_empty(0), requires_grad=False),
+                )
+
+        layer.w13_weight = layer.w13_qweight
+        layer.w2_weight = layer.w2_qweight
+        common = dict(
+            group_size=layer.group_size, num_bits=self.quant_config.weight_bits
+        )
+        prefill = HipblasltWNA16Experts(
+            self.moe,
+            make_wna16_moe_quant_config(
+                w1_scale=layer.w13_scales,
+                w2_scale=layer.w2_scales,
+                w1_zp=layer.w13_qzeros if has_zp else None,
+                w2_zp=layer.w2_qzeros if has_zp else None,
+                **common,
+            ),
+        )
+        self.moe_quant_config = make_wna16_moe_quant_config(
+            w1_scale=views["w13"][0],
+            w2_scale=views["w2"][0],
+            w1_zp=views["w13"][1],
+            w2_zp=views["w2"][1],
+            **common,
+        )
+        self.moe_kernel = make_hybrid_w4a16_moe_kernel(
+            self.moe,
+            self.moe_quant_config,
+            layer,
+            HybridHipblasltW4A16MoEExperts(self.moe, self.moe_quant_config, prefill),
+        )
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if self._use_hybrid_w4a16(layer, "hipblaslt"):
+            self._process_weights_hybrid_hipblaslt(layer)
+            return
         if self._use_hybrid_w4a16(layer):
             self._process_weights_hybrid_w4a16(layer)
             return

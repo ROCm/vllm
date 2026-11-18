@@ -101,6 +101,21 @@ def pack_moe_scale_buffers(
     return buf
 
 
+def moe_scale_buffer_views(
+    buf: torch.Tensor, n: int, groups: int, dtype: torch.dtype, has_zp: bool
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Views into `pack_moe_scale_buffers` output: scales `[E, N, K // G]` and
+    zero-points `[E, N // 8, K // G]` int32 (row n in nibble n % 8), or None."""
+    E = buf.size(0)
+    scale_bytes = n * groups * dtype.itemsize
+    scale = buf[:, :scale_bytes].view(dtype).view(E, n, groups)
+    if not has_zp:
+        return scale, None
+    zp_off = _align(scale_bytes)
+    zp = buf[:, zp_off : zp_off + n // 8 * groups * 4].view(torch.int32)
+    return scale, zp.view(E, n // 8, groups)
+
+
 # Up to this many routed rows, each row is its own group (n <= 1); above it,
 # each expert is a group. Small batches thus get a grid sized for their rows.
 _MAX_ROW_GROUPS = 64

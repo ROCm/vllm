@@ -193,11 +193,16 @@ def test_hipblaslt_w4a16_moe_s_bound(num_tokens: int, n_out: int, n_in: int):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
 
 
-@pytest.mark.parametrize("m", [1, 2, 9, 96])
-def test_hipblaslt_wna16_experts_vs_torch(m: int):
+@pytest.mark.parametrize("hybrid", [False, True], ids=["hipblaslt", "hybrid"])
+@pytest.mark.parametrize("m", [1, 2, 4, 9, 96])
+def test_hipblaslt_wna16_experts_vs_torch(m: int, hybrid: bool):
     """HipblasltWNA16Experts end to end (routing, both GEMMs, activation and
     the weighted reduction) against the dequantized torch reference; m <= 8
-    takes the slot-order decode path, larger m the expert-sorted path."""
+    takes the slot-order decode path, larger m the expert-sorted path.
+
+    hybrid: HybridHipblasltW4A16MoEExperts on the same weights, i.e. the HIP
+    wvSplitK decode kernel reading plain K-order nibbles and the packed scale
+    buffers (m <= VLLM_MOE_MAX_SKINNY_BATCH_SIZE), hipBLASLt above."""
     from tests.kernels.moe.utils import make_dummy_moe_config
     from tests.kernels.utils import torch_experts
     from vllm.config import VllmConfig, set_current_vllm_config
@@ -208,6 +213,10 @@ def test_hipblaslt_wna16_experts_vs_torch(m: int):
     )
     from vllm.model_executor.layers.fused_moe.experts.hipblaslt_moe import (
         HipblasltWNA16Experts,
+        moe_scale_buffer_views,
+    )
+    from vllm.model_executor.layers.fused_moe.hybrid_w4a16_moe import (
+        HybridHipblasltW4A16MoEExperts,
     )
     from vllm.model_executor.layers.fused_moe.modular_kernel import (
         FusedMoEKernelModularImpl,
@@ -253,8 +262,22 @@ def test_hipblaslt_wna16_experts_vs_torch(m: int):
         intermediate_size=n,
         in_dtype=torch.bfloat16,
     )
+    experts = HipblasltWNA16Experts(moe_config, quant_config)
+    if hybrid:
+        (s1v, z1v), (s2v, z2v) = (
+            moe_scale_buffer_views(buf, n_out, n_in // GROUP_SIZE, torch.bfloat16, True)
+            for buf, n_out, n_in in ((s1, 2 * n, k), (s2, k, n))
+        )
+        decode_config = int4_w4a16_moe_quant_config(
+            w1_scale=s1v,
+            w2_scale=s2v,
+            w1_zp=z1v,
+            w2_zp=z2v,
+            block_shape=[0, GROUP_SIZE],
+        )
+        experts = HybridHipblasltW4A16MoEExperts(moe_config, decode_config, experts)
     kernel = FusedMoEKernelModularImpl(
-        fused_experts=HipblasltWNA16Experts(moe_config, quant_config),
+        fused_experts=experts,
         prepare_finalize=MoEPrepareAndFinalizeNoDPEPModular(),
     )
     init_workspace_manager(device)
