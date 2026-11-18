@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlyDSL W4A16 grouped (MoE) GEMM for RDNA3 / RDNA3.5 (gfx11*, wave32).
+"""FlyDSL W4A16 grouped (MoE) GEMM for RDNA3.5 (gfx115x, wave32).
 
 One kernel serves both MoE GEMMs: ``out[r, :] = W[expert(r)] @ x[row(r), :]``
 for every routed row ``r``, with rows grouped by expert into 16-row blocks by

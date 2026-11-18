@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Fused MoE W4A16 experts on the FlyDSL WMMA kernel for RDNA3 / RDNA3.5."""
+"""Fused MoE W4A16 experts on the FlyDSL WMMA kernels for RDNA3.5 (gfx115x)."""
 
 import importlib.util
 
@@ -49,7 +49,7 @@ def fuses_silu_mul(moe_config: FusedMoEConfig) -> bool:
 
 
 class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
-    """W4A16 experts backed by ``flydsl_rdna_moe_gemm`` (gfx11).
+    """W4A16 experts backed by ``flydsl_rdna_moe_gemm`` (gfx115x).
 
     ``w1`` / ``w2`` and their scales are in the ``pack_w4a16_weights`` layout;
     zero points are folded into the scale coefficients.
@@ -98,9 +98,9 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
         if not current_platform.is_rocm():
             return False
 
-        from vllm.platforms.rocm import on_gfx11
+        from vllm.platforms.rocm import on_gfx115x
 
-        return on_gfx11() and importlib.util.find_spec("flydsl") is not None
+        return on_gfx115x() and importlib.util.find_spec("flydsl") is not None
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -120,7 +120,8 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
         return not (
-            moe_parallel_config.use_fi_nvl_two_sided_kernels
+            moe_parallel_config.use_ep
+            or moe_parallel_config.use_fi_nvl_two_sided_kernels
             or moe_parallel_config.use_fi_nvl_one_sided_kernels
         )
 

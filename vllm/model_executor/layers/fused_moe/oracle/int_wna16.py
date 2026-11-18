@@ -60,7 +60,8 @@ class WNA16MoEBackend(Enum):
     XPU = "XPU"
     EMULATION = "EMULATION"
     RDNA3 = "RDNA3"
-    FLYDSL = "FLYDSL"
+    # FlyDSL WMMA kernels for RDNA3.5 (gfx115x).
+    RDNA_FLYDSL = "RDNA_FLYDSL"
 
 
 def backend_to_kernel_cls(
@@ -111,7 +112,7 @@ def backend_to_kernel_cls(
         )
 
         return [Rdna3WNA16Experts]
-    elif backend == WNA16MoEBackend.FLYDSL:
+    elif backend == WNA16MoEBackend.RDNA_FLYDSL:
         from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
             FlydslRdnaWNA16Experts,
         )
@@ -167,7 +168,7 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
-    if backend == WNA16MoEBackend.FLYDSL:
+    if backend == WNA16MoEBackend.RDNA_FLYDSL:
         if isinstance(quant_config, MoeWNA16Config):
             num_bits, group_size = quant_config.weight_bits, quant_config.group_size
         elif isinstance(quant_config, QuantizationArgs):
@@ -180,6 +181,21 @@ def _backend_incompatibility_reason(
             return "only MoeWNA16 and compressed-tensors checkpoints are supported"
         if num_bits != 4 or not group_size or group_size % 16 != 0:
             return "only 4-bit weights with a group size multiple of 16 are supported"
+        if moe_config.in_dtype != torch.bfloat16:
+            return "only bfloat16 activations are supported"
+        if moe_config.moe_parallel_config.use_ep:
+            return "expert parallelism is not supported"
+        from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
+            TILE_N,
+        )
+
+        hidden = moe_config.hidden_dim
+        inter = moe_config.intermediate_size_per_partition
+        gate_up = inter * (2 if moe_config.activation.is_gated else 1)
+        if hidden % TILE_N != 0 or gate_up % TILE_N != 0:
+            return f"layer widths have to be multiples of {TILE_N}"
+        if hidden % group_size != 0 or inter % group_size != 0:
+            return "layer widths have to be multiples of the group size"
 
     if backend == WNA16MoEBackend.TRITON:
         if may_have_bias:
@@ -234,7 +250,7 @@ def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
         "rdna3": WNA16MoEBackend.RDNA3,
-        "flydsl": WNA16MoEBackend.FLYDSL,
+        "rdna_flydsl": WNA16MoEBackend.RDNA_FLYDSL,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -1665,7 +1681,7 @@ def convert_to_wna16_moe_kernel_format(
             w2_scale,
             quant_config.group_size,
         )
-    elif backend == WNA16MoEBackend.FLYDSL:
+    elif backend == WNA16MoEBackend.RDNA_FLYDSL:
         return _process_weights_flydsl(
             layer, w13, w2, w13_scale, w2_scale, w13_qzeros, w2_qzeros
         )

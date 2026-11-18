@@ -10,10 +10,10 @@ from vllm.platforms import current_platform
 if not current_platform.is_rocm():
     pytest.skip("This test can only run on ROCm.", allow_module_level=True)
 
-from vllm.platforms.rocm import on_gfx11  # noqa: E402
+from vllm.platforms.rocm import on_gfx115x  # noqa: E402
 
-if not (on_gfx11() and importlib.util.find_spec("flydsl") is not None):
-    pytest.skip("These tests require gfx11 and FlyDSL.", allow_module_level=True)
+if not (on_gfx115x() and importlib.util.find_spec("flydsl") is not None):
+    pytest.skip("These tests require gfx115x and FlyDSL.", allow_module_level=True)
 
 from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (  # noqa: E402
     BLOCK_M,
