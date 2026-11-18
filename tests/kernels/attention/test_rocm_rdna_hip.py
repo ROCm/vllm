@@ -487,6 +487,38 @@ def test_rdna_valid_for_any_batch():
     assert 512 in backend.get_supported_head_sizes()
 
 
+def test_window_covering_max_model_len_runs_kernels(vllm_runner, monkeypatch):
+    """Phi-4-mini sets sliding_window 262144, past its max_model_len; such a
+    window is full attention, so no call falls back to Triton."""
+    _skip_unless_rdna35_or_rdna4()
+    from vllm.model_executor.layers.attention import Attention
+    from vllm.v1.attention.backends.rocm_rdna_attn import RocmRdnaAttentionImpl
+
+    # For apply_model.
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    def calls(model):
+        impls = [
+            m.impl
+            for m in model.modules()
+            if isinstance(m, Attention) and isinstance(m.impl, RocmRdnaAttentionImpl)
+        ]
+        return sum(i.kernel_calls for i in impls), sum(i.fallback_calls for i in impls)
+
+    with vllm_runner(
+        "microsoft/Phi-4-mini-instruct",
+        load_format="dummy",
+        attention_backend="ROCM_RDNA_ATTN",
+        enforce_eager=True,
+        gpu_memory_utilization=0.5,
+    ) as llm:
+        # A prefill (more than MAX_M query tokens), then decodes.
+        llm.generate_greedy(["Hello my name is " * 8], max_tokens=4)
+        [(kernel, fallback)] = llm.apply_model(calls)
+    assert kernel > 0
+    assert fallback == 0
+
+
 # ---------------------------------------------------------------- prefill
 
 
