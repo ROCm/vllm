@@ -356,7 +356,6 @@ class DraftStep:
 
 
 _DRAFT_PARAMS = "x_in out wtab dtab pos slot_tab scratch epoch health rank"
-_DESC_WORDS = 10
 
 
 class _StockDraftKernel:
@@ -404,7 +403,10 @@ class _StockDraftKernel:
         h = model.config.hidden_size
         tab = _device_view(a["wtab"], (self.TAB_ROWS, self.TAB_WORDS), torch.int64)
         tab = tab.tolist()
-        desc = _device_view(a["dtab"], (64, _DESC_WORDS), torch.int64).tolist()
+        from vllm.models.muse_spark.amd.mono.kernels import attn_frag
+
+        words = attn_frag.DESC_WORDS
+        desc = _device_view(a["dtab"], (64, words), torch.int64).tolist()
 
         def f32(ptr: int) -> torch.Tensor:
             return _device_view(ptr, (h,), torch.float32)
