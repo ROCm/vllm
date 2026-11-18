@@ -1592,6 +1592,55 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_SRC "csrc/rocm/rdna_registry.cu")
   endif()
 
+  #
+  # hipBLASLt W4A16.
+  #
+  # The API is enumerators and one typedef -- no feature macro, and no version
+  # that implies it, since it is not upstream yet. Nothing in the preprocessor
+  # or in C++ can test for a missing enumerator (naming it is a hard error, and
+  # SFINAE cannot help a non-dependent name), so the only way to detect it is to
+  # try compiling against the headers and let CMake turn the answer into a
+  # define.
+  #
+  # hipblaslt.h includes hipblas-common and hip/hip_runtime.h, so the probe
+  # must define __HIP_PLATFORM_AMD__ -- it compiles as plain C++, and
+  # hip_runtime.h #errors without it. Getting this wrong makes the probe fail
+  # closed on its own prerequisites and report "no w4a16 API" for a ROCm that
+  # has one.
+  #
+  # VLLM_HIPBLASLT_W4A16_ROOT optionally names a hipBLASLt install prefix
+  # (include/, lib/) to build against instead of the one in ROCM_PATH. Its
+  # headers must match the library loaded at runtime: the hipblaslt_ext
+  # classes carry inline data members.
+  set(VLLM_HIPBLASLT_W4A16_ROOT "$ENV{VLLM_HIPBLASLT_W4A16_ROOT}" CACHE PATH
+      "hipBLASLt install prefix for the W4A16 path (default: ROCM_PATH)")
+  set(VLLM_HIPBLASLT_INCLUDE "${ROCM_PATH}/include")
+  if(VLLM_HIPBLASLT_W4A16_ROOT)
+    set(VLLM_HIPBLASLT_INCLUDE "${VLLM_HIPBLASLT_W4A16_ROOT}/include")
+  endif()
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES "${VLLM_HIPBLASLT_INCLUDE};${ROCM_PATH}/include")
+  set(CMAKE_REQUIRED_DEFINITIONS "-D__HIP_PLATFORM_AMD__")
+  set(CMAKE_REQUIRED_QUIET ON)
+  check_cxx_source_compiles("
+    #include <hipblaslt/hipblaslt.h>
+    int main() {
+      hipblasLtInt4Encoding_t e = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;
+      return (int)e + (int)HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT
+                    + (int)HIPBLASLT_MATMUL_MATRIX_SCALE_VEC32_16F_ZP_EXT;
+    }" VLLM_HIPBLASLT_HAS_W4A16)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_DEFINITIONS)
+  unset(CMAKE_REQUIRED_QUIET)
+
+  if(VLLM_HIPBLASLT_HAS_W4A16)
+    message(STATUS "hipBLASLt in ${VLLM_HIPBLASLT_INCLUDE} exposes the W4A16 API; building that path")
+    list(APPEND VLLM_ROCM_EXT_SRC "csrc/rocm/hipblaslt_w4a16.cu")
+  else()
+    message(STATUS "hipBLASLt in ${VLLM_HIPBLASLT_INCLUDE} has no W4A16 API; skipping that path")
+  endif()
+
+
   define_extension_target(
     _rocm_C
     DESTINATION vllm
@@ -1607,6 +1656,18 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   else()
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
   endif()
+
+  if(VLLM_HIPBLASLT_HAS_W4A16)
+    if(VLLM_HIPBLASLT_W4A16_ROOT)
+      target_include_directories(_rocm_C BEFORE PRIVATE "${VLLM_HIPBLASLT_INCLUDE}")
+      target_link_libraries(_rocm_C PRIVATE
+        "${VLLM_HIPBLASLT_W4A16_ROOT}/lib/libhipblaslt.so")
+    else()
+      target_link_libraries(_rocm_C PRIVATE hipblaslt)
+    endif()
+    target_compile_definitions(_rocm_C PRIVATE VLLM_HIPBLASLT_HAS_W4A16=1)
+  endif()
+
 
   rocm_arch_list_definition(VLLM_ROCM_ARCH_LIST_DEF ${VLLM_GPU_ARCHES})
   target_compile_definitions(_rocm_C PRIVATE "${VLLM_ROCM_ARCH_LIST_DEF}")

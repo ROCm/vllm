@@ -189,3 +189,20 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+#ifdef VLLM_HIPBLASLT_HAS_W4A16
+torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a,
+                                   const torch::Tensor& b_q,
+                                   const torch::Tensor& scale,
+                                   int64_t group_size, bool has_zp);
+bool hipblaslt_w4a16_moe_gemm(torch::Tensor& out, const torch::Tensor& x,
+                              const torch::Tensor& w,
+                              const torch::Tensor& scale,
+                              const torch::Tensor& counts, int64_t group_size,
+                              bool has_zp);
+bool hipblaslt_w4a16_moe_grouped_gemm(
+    torch::Tensor& out, const torch::Tensor& x, const torch::Tensor& w,
+    const torch::Tensor& scale, const torch::Tensor& expert,
+    const torch::Tensor& count, const torch::Tensor& offset, int64_t max_n,
+    int64_t group_size, bool has_zp, bool zero_tail, int64_t x_row_div);
+#endif
