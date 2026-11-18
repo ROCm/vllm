@@ -45,6 +45,7 @@ from .hipblaslt_w4a16 import (
     MODE_PREFILL,
     build_scale_buffer,
     hipblaslt_w4a16_gemm,
+    hipblaslt_w4a16_has_solution,
     use_for_layer,
 )
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -790,6 +791,12 @@ def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
     return buf[:, :cols]  # inherits stride(0) = cols + pad_groups
 
 
+def _skinny_row_int32(k8: int) -> int:
+    """Row stride, in int32 words, of the buffer pack_skinny_int4 returns."""
+    pad_int32 = _weight_pad_bytes(k8 * 4) // 4
+    return k8 + (pad_int32 if _on_gfx1151() else 0)
+
+
 def pack_skinny_int4(unpacked: torch.Tensor, shuffle: bool = True) -> torch.Tensor:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
@@ -802,12 +809,10 @@ def pack_skinny_int4(unpacked: torch.Tensor, shuffle: bool = True) -> torch.Tens
     """
     shuffled = (pack_int4_exllama_shuffle if shuffle else pack_int4_plain)(unpacked)
     n_rows, k8 = shuffled.shape
-    pad_int32 = _weight_pad_bytes(k8 * 4) // 4
-    if not (pad_int32 and _on_gfx1151()):
+    row_int32 = _skinny_row_int32(k8)
+    if row_int32 == k8:
         return shuffled.contiguous().view(torch.int8)
-    padded = torch.empty(
-        (n_rows, k8 + pad_int32), dtype=torch.int32, device=shuffled.device
-    )
+    padded = torch.empty((n_rows, row_int32), dtype=torch.int32, device=shuffled.device)
     padded[:, :k8].copy_(shuffled)
     # The int8 view keeps stride(0) = 4 * (k8 + pad_int32) bytes, and
     # .view(torch.int32) at apply time recovers the [N, K//8] int32 view.
@@ -1162,8 +1167,26 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         # layer), so "enable" means this layer will hold a copy.
         kernel_config = get_current_vllm_config().kernel_config
         cache_dense = kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable"
+        N, K = unpacked.shape
+
+        def _hipblaslt_has_solution() -> bool:
+            return hipblaslt_w4a16_has_solution(
+                w_s_raw.data,
+                c.act_type,
+                N,
+                K,
+                _skinny_row_int32(K // 8) * 8,
+                c.group_size,
+                c.zero_points,
+                get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+            )
+
         use_hipblaslt = unpacked.device.type == "cuda" and use_for_layer(
-            c.group_size, cache_dense
+            c.group_size,
+            cache_dense,
+            _hipblaslt_has_solution,
+            f"N={N} K={K} group_size={c.group_size} "
+            f"{'asym' if c.zero_points else 'sym'} {c.act_type}",
         )
         w_q_skinny = pack_skinny_int4(unpacked, shuffle=not use_hipblaslt)
 

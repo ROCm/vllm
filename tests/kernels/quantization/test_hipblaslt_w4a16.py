@@ -125,3 +125,30 @@ def test_build_scale_buffer_zero_point_layout(group_size):
     word = zp_region.view(torch.int32)[(n // 8) * num_groups + g]
     got = ((word >> (4 * (n % 8)).to(torch.int32)) & 0xF).to(torch.int32)
     torch.testing.assert_close(got, zp_nkg.cpu().reshape(-1))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("group_size", hybrid_module.SUPPORTED_GROUP_SIZES)
+@pytest.mark.parametrize("has_zp", [False, True])
+def test_hipblaslt_w4a16_has_solution_matches_gemm(dtype, group_size, has_zp):
+    """The load-time probe agrees with what the GEMM can actually run."""
+    K, N = 1024, 256
+    probe_ok = None
+    for M in (1, 5, 64, 256):
+        x_mk, _, w_q, _, _, scale_buf = _build_inputs(
+            M, N, K, group_size, dtype, has_zp
+        )
+        if probe_ok is None:
+            probe_ok = hipblaslt_module.hipblaslt_w4a16_has_solution(
+                scale_buf, dtype, N, K, w_q.stride(0) * 2, group_size, has_zp, 1
+            )
+        try:
+            hipblaslt_module.hipblaslt_w4a16_gemm(
+                x_mk, w_q, scale_buf, group_size, has_zp
+            )
+        except RuntimeError as e:
+            if "no solution for" not in str(e):
+                raise
+            assert not probe_ok, f"probe found a kernel but M={M} has none"
+            return
+    assert probe_ok, "probe found no kernel but the GEMM ran at every M"

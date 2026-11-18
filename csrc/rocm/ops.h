@@ -195,4 +195,8 @@ torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a,
                                    const torch::Tensor& b_q,
                                    const torch::Tensor& scale,
                                    int64_t group_size, bool has_zp);
+bool hipblaslt_w4a16_has_solution(const torch::Tensor& scale,
+                                  at::ScalarType dtype, int64_t N, int64_t K,
+                                  int64_t lda, int64_t group_size, bool has_zp,
+                                  int64_t max_m);
 #endif

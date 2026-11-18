@@ -532,27 +532,34 @@ def test_rdna_hybrid_w4a16_dense_dispatch(
 
 
 @pytest.mark.parametrize(
-    "setting,built,group_size,has_dense,expected",
+    "setting,built,group_size,has_dense,probe,expected",
     [
-        ("auto", True, 128, False, True),
-        ("auto", True, 128, True, False),
-        ("auto", False, 128, False, False),
-        ("auto", True, -1, False, False),
-        ("all", True, 128, True, True),
-        ("off", True, 128, False, False),
+        ("auto", True, 128, False, True, True),
+        ("auto", True, 128, True, True, False),
+        ("auto", False, 128, False, True, False),
+        ("auto", True, -1, False, True, False),
+        ("auto", True, 128, False, False, False),
+        ("all", True, 128, True, True, True),
+        ("all", True, 128, False, False, RuntimeError),
+        ("off", True, 128, False, True, False),
     ],
 )
 def test_hipblaslt_use_for_layer(
-    setting, built, group_size, has_dense, expected, monkeypatch
+    setting, built, group_size, has_dense, probe, expected, monkeypatch
 ):
-    """Auto mode keeps layers with a dense prefill copy on in-tree kernels."""
+    """Auto mode keeps dense-copy and kernel-less layers on in-tree kernels."""
     from vllm.model_executor.kernels.linear.mixed_precision import hipblaslt_w4a16
 
     monkeypatch.setenv("VLLM_ROCM_W4A16_HIPBLASLT", setting)
     monkeypatch.setattr(hipblaslt_w4a16, "is_built", lambda: built)
     hipblaslt_w4a16.hipblaslt_w4a16_mode.cache_clear()
     try:
-        assert hipblaslt_w4a16.use_for_layer(group_size, has_dense) is expected
+        args = (group_size, has_dense, lambda: probe, "test layer")
+        if expected is RuntimeError:
+            with pytest.raises(RuntimeError, match="no w4a16 kernel"):
+                hipblaslt_w4a16.use_for_layer(*args)
+        else:
+            assert hipblaslt_w4a16.use_for_layer(*args) is expected
     finally:
         hipblaslt_w4a16.hipblaslt_w4a16_mode.cache_clear()
 

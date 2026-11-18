@@ -18,6 +18,7 @@ both prefill and decode.
 """
 
 import functools
+from collections.abc import Callable
 
 import torch
 
@@ -80,16 +81,64 @@ def hipblaslt_w4a16_mode() -> int:
     return mode
 
 
-def use_for_layer(group_size: int, has_dense_prefill: bool) -> bool:
+def use_for_layer(
+    group_size: int,
+    has_dense_prefill: bool,
+    has_solution: Callable[[], bool],
+    layer_desc: str,
+) -> bool:
     """Whether hipBLASLt owns this layer's GEMMs.
 
     Under "auto", layers that cache a dense prefill copy stay on the in-tree
     kernels: the dense GEMM beats hipBLASLt for prefill and wvSplitK_int4_g
     beats it for decode. "all" takes every supported layer regardless.
+
+    ``has_solution`` asks hipBLASLt whether it has a kernel for the layer on
+    this arch. Under "auto" a miss falls back to the in-tree kernels; under
+    "all" it is an error, since the GEMM would fail at its first call.
     """
     if not hipblaslt_w4a16_mode() or not supports_layer(group_size):
         return False
-    return envs.VLLM_ROCM_W4A16_HIPBLASLT == "all" or not has_dense_prefill
+    forced = envs.VLLM_ROCM_W4A16_HIPBLASLT == "all"
+    if has_dense_prefill and not forced:
+        return False
+    if has_solution():
+        return True
+    if forced:
+        raise RuntimeError(
+            "VLLM_ROCM_W4A16_HIPBLASLT=all but hipBLASLt has no w4a16 kernel "
+            f"for {layer_desc} on this GPU. Use 'auto' or 'off'."
+        )
+    logger.info_once(
+        "hipBLASLt has no w4a16 kernel for %s on this GPU; using the in-tree "
+        "W4A16 kernels for it.",
+        layer_desc,
+    )
+    return False
+
+
+# Probe at least this far: encoder towers can exceed max_num_batched_tokens.
+MIN_PROBE_M = 1 << 16
+
+
+def hipblaslt_w4a16_has_solution(
+    scale: torch.Tensor,  # any device tensor; supplies device + scale pointer
+    dtype: torch.dtype,
+    N: int,
+    K: int,
+    lda: int,  # weight row stride in int4 elements
+    group_size: int,
+    has_zp: bool,
+    max_m: int,
+) -> bool:
+    """Whether hipBLASLt has a kernel for every batch-size bucket up to max_m.
+
+    Only queries the heuristic (host side, no launch), so it is cheap enough to
+    run per layer at load time; the plans it finds are kept for the GEMM.
+    """
+    return torch.ops._rocm_C.hipblaslt_w4a16_has_solution(
+        scale, dtype, N, K, lda, group_size, has_zp, max(max_m, MIN_PROBE_M)
+    )
 
 
 def supports_layer(group_size: int) -> bool:

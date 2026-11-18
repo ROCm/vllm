@@ -255,6 +255,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "hipblaslt_w4a16_gemm(Tensor a, Tensor b_q, Tensor scale,"
       "                     int group_size, bool has_zp) -> Tensor");
   rocm_ops.impl("hipblaslt_w4a16_gemm", torch::kCUDA, &hipblaslt_w4a16_gemm);
+  // Host-side heuristic query; the scale tensor only supplies device and a
+  // non-null scale pointer, which the heuristic requires.
+  rocm_ops.def(
+      "hipblaslt_w4a16_has_solution(Tensor scale, ScalarType dtype, int N,"
+      "                             int K, int lda, int group_size,"
+      "                             bool has_zp, int max_m) -> bool");
+  rocm_ops.impl("hipblaslt_w4a16_has_solution", torch::kCUDA,
+                &hipblaslt_w4a16_has_solution);
 #endif
 }
 

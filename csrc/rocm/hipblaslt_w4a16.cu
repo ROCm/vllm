@@ -26,15 +26,16 @@
 
 #include <hipblaslt/hipblaslt.h>
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <tuple>
 
 namespace {
 
-#define LT_CHECK(expr)                                             \
-  do {                                                             \
-    hipblasStatus_t _s = (expr);                                   \
+#define LT_CHECK(expr)                                                \
+  do {                                                                \
+    hipblasStatus_t _s = (expr);                                      \
     TORCH_CHECK(_s == HIPBLAS_STATUS_SUCCESS, #expr " failed: ", _s); \
   } while (0)
 
@@ -88,7 +89,8 @@ hipblasLtMatmulMatrixScale_t scale_mode_of(at::ScalarType dtype,
                   : (has_zp ? HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_16F_ZP_EXT
                             : HIPBLASLT_MATMUL_MATRIX_SCALE_VEC128_16F_EXT);
     default:
-      TORCH_CHECK(false, "hipblaslt_w4a16: unsupported group_size ", group_size);
+      TORCH_CHECK(false, "hipblaslt_w4a16: unsupported group_size ",
+                  group_size);
   }
 }
 
@@ -122,14 +124,24 @@ struct Plan {
 using PlanKey =
     std::tuple<int, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
 
-Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K, int64_t lda,
-               int64_t group_size, bool has_zp, const void* scale_ptr) {
+void destroy_plan(Plan& plan) {
+  if (plan.layout_a) hipblasLtMatrixLayoutDestroy(plan.layout_a);
+  if (plan.layout_b) hipblasLtMatrixLayoutDestroy(plan.layout_b);
+  if (plan.layout_d) hipblasLtMatrixLayoutDestroy(plan.layout_d);
+  if (plan.desc) hipblasLtMatmulDescDestroy(plan.desc);
+}
+
+// The plan for one batch-size bucket, or nullptr when the heuristic has no
+// solution -- including when this hipBLASLt has no w4a16 kernels for the arch,
+// which some versions report as an error status rather than zero results.
+Plan* find_plan(at::ScalarType dtype, int64_t bucket, int64_t N, int64_t K,
+                int64_t lda, int64_t group_size, bool has_zp,
+                const void* scale_ptr) {
   static std::map<PlanKey, Plan> cache;
-  const int64_t bucket = batch_bucket(M);
-  const PlanKey key{static_cast<int>(dtype), N,       K,     lda,
-                    group_size,              has_zp,  bucket};
+  const PlanKey key{
+      static_cast<int>(dtype), N, K, lda, group_size, has_zp, bucket};
   auto it = cache.find(key);
-  if (it != cache.end()) return it->second;
+  if (it != cache.end()) return &it->second;
 
   const hipDataType act = hip_type_of(dtype);
   Plan plan;
@@ -140,19 +152,21 @@ Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K, int64_t ld
   LT_CHECK(hipblasLtMatrixLayoutCreate(&plan.layout_b, act, K, bucket, K));
   LT_CHECK(hipblasLtMatrixLayoutCreate(&plan.layout_d, act, N, bucket, N));
 
-  LT_CHECK(hipblasLtMatmulDescCreate(&plan.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+  LT_CHECK(
+      hipblasLtMatmulDescCreate(&plan.desc, HIPBLAS_COMPUTE_32F, HIP_R_32F));
   hipblasOperation_t op_a = HIPBLAS_OP_T, op_b = HIPBLAS_OP_N;
-  LT_CHECK(hipblasLtMatmulDescSetAttribute(plan.desc, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                           &op_a, sizeof(op_a)));
-  LT_CHECK(hipblasLtMatmulDescSetAttribute(plan.desc, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                           &op_b, sizeof(op_b)));
+  LT_CHECK(hipblasLtMatmulDescSetAttribute(
+      plan.desc, HIPBLASLT_MATMUL_DESC_TRANSA, &op_a, sizeof(op_a)));
+  LT_CHECK(hipblasLtMatmulDescSetAttribute(
+      plan.desc, HIPBLASLT_MATMUL_DESC_TRANSB, &op_b, sizeof(op_b)));
 
   int32_t encoding = HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT;
   LT_CHECK(hipblasLtMatmulDescSetAttribute(
       plan.desc, HIPBLASLT_MATMUL_DESC_A_INT4_ENCODING_EXT, &encoding,
       sizeof(encoding)));
 
-  // Mode before pointer: a pointer set while the mode is None defaults to Scalar.
+  // Mode before pointer: a pointer set while the mode is None defaults to
+  // Scalar.
   hipblasLtMatmulMatrixScale_t mode = scale_mode_of(dtype, group_size, has_zp);
   LT_CHECK(hipblasLtMatmulDescSetAttribute(
       plan.desc, HIPBLASLT_MATMUL_DESC_A_SCALE_MODE, &mode, sizeof(mode)));
@@ -166,24 +180,36 @@ Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K, int64_t ld
   LT_CHECK(hipblasLtMatmulPreferenceCreate(&pref));
   size_t max_ws = kMaxWorkspaceBytes;
   LT_CHECK(hipblasLtMatmulPreferenceSetAttribute(
-      pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws)));
+      pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws,
+      sizeof(max_ws)));
 
   hipblasLtMatmulHeuristicResult_t heuristic[1];
   int found = 0;
-  LT_CHECK(hipblasLtMatmulAlgoGetHeuristic(lt_handle(), plan.desc, plan.layout_a,
-                                           plan.layout_b, plan.layout_d,
-                                           plan.layout_d, pref, 1, heuristic,
-                                           &found));
+  const hipblasStatus_t status = hipblasLtMatmulAlgoGetHeuristic(
+      lt_handle(), plan.desc, plan.layout_a, plan.layout_b, plan.layout_d,
+      plan.layout_d, pref, 1, heuristic, &found);
   LT_CHECK(hipblasLtMatmulPreferenceDestroy(pref));
-  TORCH_CHECK(found > 0, "hipblaslt_w4a16: no solution for M=", M,
-              " (queried at ", bucket, ") N=", N,
-              " K=", K, " lda=", lda, " group_size=", group_size, " ",
-              (has_zp ? "asym" : "sym"), " ", dtype,
-              " -- this hipBLASLt has no kernel for that combination");
+  if (status != HIPBLAS_STATUS_SUCCESS || found == 0) {
+    destroy_plan(plan);
+    return nullptr;
+  }
 
   plan.algo = heuristic[0].algo;
   plan.workspace_bytes = heuristic[0].workspaceSize;
-  return cache.emplace(key, plan).first->second;
+  return &cache.emplace(key, plan).first->second;
+}
+
+Plan& get_plan(at::ScalarType dtype, int64_t M, int64_t N, int64_t K,
+               int64_t lda, int64_t group_size, bool has_zp,
+               const void* scale_ptr) {
+  const int64_t bucket = batch_bucket(M);
+  Plan* plan =
+      find_plan(dtype, bucket, N, K, lda, group_size, has_zp, scale_ptr);
+  TORCH_CHECK(plan != nullptr, "hipblaslt_w4a16: no solution for M=", M,
+              " (queried at ", bucket, ") N=", N, " K=", K, " lda=", lda,
+              " group_size=", group_size, " ", (has_zp ? "asym" : "sym"), " ",
+              dtype, " -- this hipBLASLt has no kernel for that combination");
+  return *plan;
 }
 
 // Allocated once and kept, so that a call made during CUDA-graph capture does
@@ -193,16 +219,18 @@ void* workspace_for(size_t bytes, const torch::Tensor& like) {
   static torch::Tensor ws;
   if (bytes == 0) return nullptr;
   if (!ws.defined() || static_cast<size_t>(ws.numel()) < bytes) {
-    ws = at::empty({static_cast<int64_t>(bytes)}, like.options().dtype(at::kByte));
+    ws = at::empty({static_cast<int64_t>(bytes)},
+                   like.options().dtype(at::kByte));
   }
   return ws.data_ptr();
 }
 
 }  // namespace
 
-torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a, const torch::Tensor& b_q,
-                                   const torch::Tensor& scale, int64_t group_size,
-                                   bool has_zp) {
+torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a,
+                                   const torch::Tensor& b_q,
+                                   const torch::Tensor& scale,
+                                   int64_t group_size, bool has_zp) {
   TORCH_CHECK(a.dim() == 2 && b_q.dim() == 2, "a and b_q must be 2-D");
   TORCH_CHECK(a.is_contiguous(), "activations must be contiguous");
   TORCH_CHECK(b_q.scalar_type() == at::kChar, "packed weights must be int8");
@@ -218,9 +246,8 @@ torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a, const torch::Tensor& 
 
   const int64_t num_groups = K / group_size;
   if (has_zp) {
-    const int64_t zp_offset =
-        (num_groups * N * 2 + kZeroPointAlignment - 1) / kZeroPointAlignment *
-        kZeroPointAlignment;
+    const int64_t zp_offset = (num_groups * N * 2 + kZeroPointAlignment - 1) /
+                              kZeroPointAlignment * kZeroPointAlignment;
     TORCH_CHECK(scale.scalar_type() == at::kByte && scale.dim() == 1,
                 "asymmetric scale buffer must be a 1-D uint8 tensor");
     TORCH_CHECK(scale.numel() >= zp_offset + ((N + 1) / 2) * num_groups,
@@ -258,12 +285,27 @@ torch::Tensor hipblaslt_w4a16_gemm(const torch::Tensor& a, const torch::Tensor& 
       plan.layout_d, HIPBLASLT_MATRIX_LAYOUT_COLS, &cols, sizeof(cols)));
 
   const float alpha = 1.0f, beta = 0.0f;
-  LT_CHECK(hipblasLtMatmul(lt_handle(), plan.desc, &alpha, b_q.const_data_ptr(),
-                           plan.layout_a, a.const_data_ptr(), plan.layout_b, &beta,
-                           out.data_ptr(), plan.layout_d, out.data_ptr(),
-                           plan.layout_d, &plan.algo,
-                           workspace_for(plan.workspace_bytes, a),
-                           plan.workspace_bytes,
-                           at::cuda::getCurrentCUDAStream()));
+  LT_CHECK(hipblasLtMatmul(
+      lt_handle(), plan.desc, &alpha, b_q.const_data_ptr(), plan.layout_a,
+      a.const_data_ptr(), plan.layout_b, &beta, out.data_ptr(), plan.layout_d,
+      out.data_ptr(), plan.layout_d, &plan.algo,
+      workspace_for(plan.workspace_bytes, a), plan.workspace_bytes,
+      at::cuda::getCurrentCUDAStream()));
   return out;
+}
+
+bool hipblaslt_w4a16_has_solution(const torch::Tensor& scale,
+                                  at::ScalarType dtype, int64_t N, int64_t K,
+                                  int64_t lda, int64_t group_size, bool has_zp,
+                                  int64_t max_m) {
+  // Every bucket a call up to max_m can land in; found plans stay cached.
+  const at::cuda::OptionalCUDAGuard guard(device_of(scale));
+  const void* scale_ptr = scale.const_data_ptr();
+  const int64_t last = batch_bucket(std::max<int64_t>(max_m, 1));
+  for (int64_t bucket = 1; bucket <= last; bucket <<= 1) {
+    if (!find_plan(dtype, bucket, N, K, lda, group_size, has_zp, scale_ptr)) {
+      return false;
+    }
+  }
+  return true;
 }
