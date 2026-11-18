@@ -45,8 +45,7 @@ from .hipblaslt_w4a16 import (
     MODE_PREFILL,
     build_scale_buffer,
     hipblaslt_w4a16_gemm,
-    hipblaslt_w4a16_mode,
-    supports_layer,
+    use_for_layer,
 )
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
@@ -965,12 +964,12 @@ def _rdna_hybrid_w4a16_apply_impl(
         with _profile_scope(f"wvsplitk_int4 {M}x{N}x{K} {_gz}"):
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
 
-    if hipblaslt_mode & MODE_PREFILL:
-        return _hipblaslt()
-
     if w_dequant is not None and M >= MIN_DENSE_M:
         with _profile_scope(f"hybrid_dequant_w4a16 {M}x{N}x{K} {_gz}"):
             return rocm_unquantized_gemm_impl(x_2d, w_dequant, bias)
+
+    if hipblaslt_mode & MODE_PREFILL:
+        return _hipblaslt()
 
     with _profile_scope(f"hybrid_triton_w4a16 {M}x{N}x{K} {_gz}"):
         # Asymmetric layers carry the packed scale/zp carrier (scale + zero-point folded
@@ -1159,10 +1158,12 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         # wvSplitK_int4_g nor the Triton kernel is then reached for this layer
         # -- they read the ExLlama shuffle -- so the choice is made once, here,
         # and holds for both prefill and decode.
-        use_hipblaslt = (
-            bool(hipblaslt_w4a16_mode())
-            and supports_layer(c.group_size)
-            and unpacked.device.type == "cuda"
+        # The dense cache is all-or-nothing (it raises rather than skipping a
+        # layer), so "enable" means this layer will hold a copy.
+        kernel_config = get_current_vllm_config().kernel_config
+        cache_dense = kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable"
+        use_hipblaslt = unpacked.device.type == "cuda" and use_for_layer(
+            c.group_size, cache_dense
         )
         w_q_skinny = pack_skinny_int4(unpacked, shuffle=not use_hipblaslt)
 
@@ -1240,8 +1241,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
                 ),
             )
 
-        kernel_config = get_current_vllm_config().kernel_config
-        if kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable":
+        if cache_dense:
             self._cache_dequant_weight(layer, unpacked, w_s_skinny, zp_unpacked)
 
     def apply_weights(

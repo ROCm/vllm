@@ -49,14 +49,15 @@ def is_built() -> bool:
 def hipblaslt_w4a16_mode() -> int:
     """Bitmask of the paths ``VLLM_ROCM_W4A16_HIPBLASLT`` routes to hipBLASLt.
 
-    "auto" uses hipBLASLt wherever it has a kernel and the in-tree kernels
-    elsewhere; "off" and "all" force the choice. The per-path modes are not
-    usable: hipBLASLt dropped the ExLlama int4 encoding, so its weights must be
-    packed in plain K order, while ``wvSplitK_int4_g`` and the Triton kernel
-    read the ExLlama shuffle. One buffer cannot serve both, and duplicating it
-    costs a second copy of the whole weight -- so a mode that splits the GEMMs
-    of one layer between them would either read garbage or double the weight
-    footprint. The choice is therefore per layer, not per call.
+    "auto" uses hipBLASLt for layers it has a kernel for, except those with a
+    dense prefill copy (see ``use_for_layer``); "off" and "all" force the
+    choice. The per-path modes are not usable: hipBLASLt dropped the ExLlama
+    int4 encoding, so its weights must be packed in plain K order, while
+    ``wvSplitK_int4_g`` and the Triton kernel read the ExLlama shuffle. One
+    buffer cannot serve both, and duplicating it costs a second copy of the
+    whole weight -- so a mode that splits the GEMMs of one layer between them
+    would either read garbage or double the weight footprint. The choice is
+    therefore per layer, not per call.
     """
     setting = envs.VLLM_ROCM_W4A16_HIPBLASLT
     if setting == "auto":
@@ -77,6 +78,18 @@ def hipblaslt_w4a16_mode() -> int:
             "use 'off'."
         )
     return mode
+
+
+def use_for_layer(group_size: int, has_dense_prefill: bool) -> bool:
+    """Whether hipBLASLt owns this layer's GEMMs.
+
+    Under "auto", layers that cache a dense prefill copy stay on the in-tree
+    kernels: the dense GEMM beats hipBLASLt for prefill and wvSplitK_int4_g
+    beats it for decode. "all" takes every supported layer regardless.
+    """
+    if not hipblaslt_w4a16_mode() or not supports_layer(group_size):
+        return False
+    return envs.VLLM_ROCM_W4A16_HIPBLASLT == "all" or not has_dense_prefill
 
 
 def supports_layer(group_size: int) -> bool:

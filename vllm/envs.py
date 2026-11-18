@@ -1432,9 +1432,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Route the gfx11/gfx12 W4A16 GEMM through hipBLASLt instead of the
     # RDNAHybrid kernels. "auto" (default) uses hipBLASLt for every layer it
-    # has a kernel for, when vLLM was built against a hipBLASLt exposing the
-    # w4a16 API; "off" and "all" force the choice. The per-path modes are
-    # rejected -- see hipblaslt_w4a16_mode().
+    # has a kernel for that does not cache a dense prefill copy, when vLLM was
+    # built against a hipBLASLt exposing the w4a16 API; "off" and "all" force
+    # the choice. The per-path modes are rejected -- see hipblaslt_w4a16_mode().
     "VLLM_ROCM_W4A16_HIPBLASLT": env_with_choices(
         "VLLM_ROCM_W4A16_HIPBLASLT",
         "auto",

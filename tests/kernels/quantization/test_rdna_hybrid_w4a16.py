@@ -32,6 +32,7 @@ dequantize_w4a16 = hybrid_module.dequantize_w4a16
 SUPPORTED_GROUP_SIZES = hybrid_module.SUPPORTED_GROUP_SIZES
 MAX_SKINNY_BATCH_SIZE = hybrid_module.MAX_SKINNY_BATCH_SIZE
 MIN_DENSE_M = hybrid_module.MIN_DENSE_M
+MODE_ALL = hybrid_module.MODE_ALL
 
 # Per-channel (-1) is symmetric-only (see can_implement's zero_points guard),
 # so it is only added to the group-size axis of tests that stay on the
@@ -476,16 +477,31 @@ def test_rdna_hybrid_w4a16_process_weights_asymmetric_repack(group_size, dist_in
 
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
 @pytest.mark.parametrize(
-    "M,has_dense,expected_path",
+    "M,has_dense,hbl_mode,expected_path",
     [
-        (MAX_SKINNY_BATCH_SIZE, True, "hip"),
-        (MIN_DENSE_M - 1, True, "triton"),
-        (MIN_DENSE_M, True, "dense"),
-        (MIN_DENSE_M, False, "triton"),
+        (MAX_SKINNY_BATCH_SIZE, True, 0, "hip"),
+        (MIN_DENSE_M - 1, True, 0, "triton"),
+        (MIN_DENSE_M, True, 0, "dense"),
+        (MIN_DENSE_M, False, 0, "triton"),
+        (MAX_SKINNY_BATCH_SIZE, True, MODE_ALL, "hipblaslt"),
+        (MIN_DENSE_M - 1, True, MODE_ALL, "hipblaslt"),
+        (MIN_DENSE_M, True, MODE_ALL, "dense"),
+        (MIN_DENSE_M, False, MODE_ALL, "hipblaslt"),
     ],
-    ids=["decode", "below_dense_threshold", "at_dense_threshold", "off"],
+    ids=[
+        "decode",
+        "below_dense_threshold",
+        "at_dense_threshold",
+        "off",
+        "hbl_decode",
+        "hbl_below_dense_threshold",
+        "hbl_dense_wins",
+        "hbl_no_dense",
+    ],
 )
-def test_rdna_hybrid_w4a16_dense_dispatch(M, has_dense, expected_path, monkeypatch):
+def test_rdna_hybrid_w4a16_dense_dispatch(
+    M, has_dense, hbl_mode, expected_path, monkeypatch
+):
     """Memory-bound batches stay on int4 even when a dense copy exists."""
     import vllm._custom_ops as ops
 
@@ -507,11 +523,38 @@ def test_rdna_hybrid_w4a16_dense_dispatch(M, has_dense, expected_path, monkeypat
     monkeypatch.setattr(ops, "wvSplitK_int4_g", fake("hip"))
     monkeypatch.setattr(hybrid_module, "triton_w4a16_skinny_fmt_gemm", fake("triton"))
     monkeypatch.setattr(hybrid_module, "rocm_unquantized_gemm_impl", fake("dense"))
+    monkeypatch.setattr(hybrid_module, "hipblaslt_w4a16_gemm", fake("hipblaslt"))
     hybrid_module._rdna_hybrid_w4a16_apply_impl(
-        x_mk, w_q, scales, None, None, 40, G, None, w_dequant
+        x_mk, w_q, scales, None, None, 40, G, None, w_dequant, scales, hbl_mode
     )
 
     assert called == [expected_path]
+
+
+@pytest.mark.parametrize(
+    "setting,built,group_size,has_dense,expected",
+    [
+        ("auto", True, 128, False, True),
+        ("auto", True, 128, True, False),
+        ("auto", False, 128, False, False),
+        ("auto", True, -1, False, False),
+        ("all", True, 128, True, True),
+        ("off", True, 128, False, False),
+    ],
+)
+def test_hipblaslt_use_for_layer(
+    setting, built, group_size, has_dense, expected, monkeypatch
+):
+    """Auto mode keeps layers with a dense prefill copy on in-tree kernels."""
+    from vllm.model_executor.kernels.linear.mixed_precision import hipblaslt_w4a16
+
+    monkeypatch.setenv("VLLM_ROCM_W4A16_HIPBLASLT", setting)
+    monkeypatch.setattr(hipblaslt_w4a16, "is_built", lambda: built)
+    hipblaslt_w4a16.hipblaslt_w4a16_mode.cache_clear()
+    try:
+        assert hipblaslt_w4a16.use_for_layer(group_size, has_dense) is expected
+    finally:
+        hipblaslt_w4a16.hipblaslt_w4a16_mode.cache_clear()
 
 
 # ---------------------------------------------------------------------------
