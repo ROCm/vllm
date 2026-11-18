@@ -11,6 +11,7 @@ CUDA-graph compatible.
 """
 
 import contextlib
+import math
 from collections.abc import Callable
 
 import torch
@@ -262,6 +263,9 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
+
+    # Decode weights in plain K nibble order instead of the ExLlama shuffle.
+    _plain_k = False
 
     # Maximum batch size for the HIP wvSplitK kernel path.  Above this
     # threshold the Triton prefill kernel is used instead.
@@ -739,6 +743,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                     self.quant_config.w1_zp,
                     sorted_token_ids if scattered else None,
                     top_k_num,
+                    self._plain_k,
                 )
 
             # Activation
@@ -767,6 +772,7 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
                     self.quant_config.w2_zp,
                     sorted_token_ids if scattered else None,
                     1,
+                    self._plain_k,
                 )
 
         # ---- Reduce via moe_unpermute ----
@@ -811,14 +817,15 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         )
 
 
-def hybrid_w4a16_moe_enabled(moe: FusedMoEConfig) -> bool:
+def hybrid_w4a16_moe_enabled(moe: FusedMoEConfig, backend: str = "auto") -> bool:
     """Whether a 4-bit MoE layer should use HybridW4A16MoEExperts: gfx11/gfx12
-    with the HIP op built, VLLM_MOE_HYBRID_W4A16 set, and no explicit
-    --moe-backend.
+    with the HIP op built, VLLM_MOE_HYBRID_W4A16 set, and --moe-backend equal
+    to `backend` ("auto": none given; "hipblaslt": HIP decode with hipBLASLt
+    prefill, see HybridHipblasltW4A16MoEExperts).
     """
     if not (
         envs.VLLM_MOE_HYBRID_W4A16
-        and moe.moe_backend == "auto"
+        and moe.moe_backend == backend
         and current_platform.is_rocm()
     ):
         return False
@@ -865,10 +872,90 @@ def pack_hybrid_w4a16_moe_weight(
     )
 
 
+class HybridHipblasltW4A16MoEExperts(HybridW4A16MoEExperts):
+    """HIP wvSplitK decode as in the parent, prefill on hipBLASLt instead of
+    Triton, both from hipBLASLt's weights: `w1` / `w2` are `[E, N, K // 2]`
+    uint8 in plain K order with padded rows. `quant_config` holds the decode
+    views into the packed scale buffers (see `moe_scale_buffer_views`).
+    """
+
+    _plain_k = True
+
+    def __init__(
+        self,
+        moe_config: FusedMoEConfig,
+        quant_config: FusedMoEQuantConfig,
+        prefill: mk.FusedMoEExpertsModular,
+    ):
+        super().__init__(moe_config, quant_config)
+        self._prefill = prefill
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        activation: MoEActivation,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        rest = (global_num_experts, local_num_experts, expert_tokens_meta, activation)
+        own = super().workspace_shapes(M, N, K, topk, *rest)
+        # Our N is the full gate_up width; hipBLASLt takes it per shard.
+        pre = self._prefill.workspace_shapes(
+            M, N // self.moe_config.w13_num_shards, K, topk, *rest
+        )
+        ws1, ws2 = (
+            (max(math.prod(a), math.prod(b)),) for a, b in zip(own[:2], pre[:2])
+        )
+        return (ws1, ws2, own[2])
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: mk.ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+    ):
+        rest = (
+            topk_weights,
+            topk_ids,
+            activation,
+            global_num_experts,
+            expert_map,
+            a1q_scale,
+            a2_scale,
+            workspace13,
+            workspace2,
+            expert_tokens_meta,
+            apply_router_weight_on_input,
+        )
+        if hidden_states.size(0) > self.MAX_SKINNY_BATCH_SIZE:
+            return self._prefill.apply(output, hidden_states, w1, w2, *rest)
+        # The HIP decode reads the same bytes as [E, N, K // 8] int32.
+        return super().apply(
+            output, hidden_states, w1.view(torch.int32), w2.view(torch.int32), *rest
+        )
+
+
 def make_hybrid_w4a16_moe_kernel(
     moe: FusedMoEConfig,
     quant_config: FusedMoEQuantConfig,
     layer: torch.nn.Module,
+    experts: mk.FusedMoEExpertsModular | None = None,
 ) -> mk.FusedMoEKernel:
     """Build the modular kernel directly so the runner uses the hybrid experts
     even on single-GPU deployments (no DP/EP), where the legacy
@@ -886,11 +973,12 @@ def make_hybrid_w4a16_moe_kernel(
         use_monolithic=False,
     )
     assert prepare_finalize is not None
+    experts = experts or HybridW4A16MoEExperts(
+        moe_config=moe, quant_config=quant_config
+    )
     logger.info_once(
-        "Using HybridW4A16MoEExperts (%s)",
+        "Using %s (%s)",
+        type(experts).__name__,
         "asym" if quant_config.w1_zp is not None else "sym",
     )
-    return mk.FusedMoEKernel(
-        prepare_finalize,
-        HybridW4A16MoEExperts(moe_config=moe, quant_config=quant_config),
-    )
+    return mk.FusedMoEKernel(prepare_finalize, experts)

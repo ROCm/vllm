@@ -90,7 +90,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "fused_moe_wvSplitK_int4_gemm(Tensor a, Tensor w, Tensor scales, "
       "Tensor c, Tensor expert_ids, int block_size_m, int CuCount, "
       "int group_size, Tensor zero_points, Tensor sorted_token_ids, "
-      "int top_k) -> ()");
+      "int top_k, bool plain_k=False) -> ()");
   rocm_ops.impl("fused_moe_wvSplitK_int4_gemm", torch::kCUDA,
                 &fused_moe_wvSplitK_int4_gemm);
 
@@ -247,6 +247,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+#ifdef VLLM_HIPBLASLT_HAS_W4A16
+  // Only defined when CMake found a hipBLASLt exposing the w4a16 API, so the
+  // Python side gates on hasattr() rather than on a build flag.
+  rocm_ops.def(
+      "hipblaslt_w4a16_gemm(Tensor a, Tensor b_q, Tensor scale,"
+      "                     int group_size, bool has_zp) -> Tensor");
+  rocm_ops.impl("hipblaslt_w4a16_gemm", torch::kCUDA, &hipblaslt_w4a16_gemm);
+  rocm_ops.def(
+      "hipblaslt_w4a16_moe_gemm(Tensor(a!) out, Tensor x, Tensor w,"
+      "                         Tensor scale, Tensor counts, int group_size,"
+      "                         bool has_zp) -> bool");
+  rocm_ops.impl("hipblaslt_w4a16_moe_gemm", torch::kCUDA,
+                &hipblaslt_w4a16_moe_gemm);
+  rocm_ops.def(
+      "hipblaslt_w4a16_moe_grouped_gemm(Tensor(a!) out, Tensor x, Tensor w,"
+      "    Tensor scale, Tensor expert, Tensor count, Tensor offset,"
+      "    int max_n, int group_size, bool has_zp, bool zero_tail=False,"
+      "    int x_row_div=1) -> bool");
+  rocm_ops.impl("hipblaslt_w4a16_moe_grouped_gemm", torch::kCUDA,
+                &hipblaslt_w4a16_moe_grouped_gemm);
+#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

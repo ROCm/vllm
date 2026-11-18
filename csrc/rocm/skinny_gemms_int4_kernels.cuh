@@ -163,10 +163,31 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
 // __shared__ declaration; max_lds_len caps the per-call copy so the
 // preload never overruns it.
 #if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
+// Plain-order int4 weights (8 K values per 32-bit word in K order, as
+// hipBLASLt's HIP_R_4I) instead of the ExLlama shuffle [0,2,4,6,1,3,5,7]:
+// the unchanged dequant then yields the K pairs (0,4),(1,5),(2,6),(3,7) of
+// each word, so the activation is staged in LDS in that order instead.
+// Within-8 permutation only: scale groups, act sums and LDS offsets stay put.
+template <typename scalar_t, int A_CHUNK>
+__device__ __forceinline__ void permute8_plain_k(scalar_t (&h)[A_CHUNK]) {
+  static_assert(A_CHUNK % 8 == 0);
+  #pragma unroll
+  for (int g = 0; g < A_CHUNK; g += 8) {
+    scalar_t t[8];
+  #pragma unroll
+    for (int j = 0; j < 8; j++) t[j] = h[g + j];
+  #pragma unroll
+    for (int j = 0; j < 4; j++) {
+      h[g + 2 * j] = t[j];
+      h[g + 2 * j + 1] = t[j + 4];
+    }
+  }
+}
+
 template <typename scalar_t, int THRDS, int WvPrGrp, int A_CHUNK, int N>
 __device__ __forceinline__ void load_act_into_lds(
     scalar_t* s, const scalar_t* __restrict__ A, const int K,
-    const int max_lds_len) {
+    const int max_lds_len, const bool plain_k = false) {
   union bigTypeA {
     scalar_t h[A_CHUNK];
     float f[A_CHUNK / 2];
@@ -175,7 +196,9 @@ __device__ __forceinline__ void load_act_into_lds(
        k += THRDS * WvPrGrp * A_CHUNK) {
     uint32_t k_in = k + ((threadIdx.y * THRDS + threadIdx.x) * A_CHUNK);
     if (k_in >= min__(K * N, max_lds_len)) break;
-    *((bigTypeA*)(&s[k_in])) = *((bigTypeA*)(&A[k_in]));
+    bigTypeA v = *((bigTypeA*)(&A[k_in]));
+    if (plain_k) permute8_plain_k<scalar_t, A_CHUNK>(v.h);
+    *((bigTypeA*)(&s[k_in])) = v;
   }
   __syncthreads();
 }
@@ -259,7 +282,7 @@ __device__ __forceinline__ void load_act_chunk_into_lds(
 template <typename scalar_t, int THRDS, int WvPrGrp, int A_CHUNK, int N>
 __device__ __forceinline__ void load_act_into_lds_silu_mul(
     scalar_t* s, const scalar_t* __restrict__ A, const int K,
-    const int max_lds_len) {
+    const int max_lds_len, const bool plain_k = false) {
   static_assert(N == 1,
                 "load_act_into_lds_silu_mul only supports N=1; the gate|up "
                 "packing isn't well-defined across multiple rows.");
@@ -287,6 +310,7 @@ __device__ __forceinline__ void load_act_into_lds_silu_mul(
       scalar_t silu_g = __float2s<scalar_t>(g / (1.0f + expf(-g)));
       out.h[i] = silu_g * up.h[i];
     }
+    if (plain_k) permute8_plain_k<scalar_t, A_CHUNK>(out.h);
     *((bigTypeA*)(&s[k_in])) = out;
   }
   __syncthreads();
@@ -1507,7 +1531,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
     const int* __restrict__ sorted_token_ids, const int top_k,
     const long expert_stride_w, const long expert_stride_s,
     const long expert_stride_zp, const int _WvPrGrp, const int CuCount,
-    const int num_expert_blocks) {
+    const int num_expert_blocks, const bool plain_k) {
   // Walk every expert block in order.  All CuCount workgroups cooperate on
   // each expert block in turn (full M-split parallelism per expert).
   // compute_sml_ is re-entrant thanks to the trailing __syncthreads() at
@@ -1568,10 +1592,10 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) moe_wvSplitK_int4_hf_sml_(
     if (src_row != last_src_row) {
       if constexpr (FUSED_SILU_MUL) {
         load_act_into_lds_silu_mul<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(
-            s, A, K, MOE_LDS_ELEMS);
+            s, A, K, MOE_LDS_ELEMS, plain_k);
       } else {
-        load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(s, A, K,
-                                                                MOE_LDS_ELEMS);
+        load_act_into_lds<scalar_t, THRDS, WvPrGrp, A_CHUNK, N>(
+            s, A, K, MOE_LDS_ELEMS, plain_k);
       }
       last_src_row = src_row;
     }
@@ -1661,7 +1685,7 @@ __global__ void moe_wvSplitK_int4_hf_sml_(
     const int* __restrict__ sorted_token_ids, const int top_k,
     const long expert_stride_w, const long expert_stride_s,
     const long expert_stride_zp, const int _WvPrGrp, const int CuCount,
-    const int num_expert_blocks) {
+    const int num_expert_blocks, const bool plain_k) {
   UNREACHABLE_CODE
 }
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
@@ -1715,14 +1739,16 @@ __global__ void moe_wvSplitK_int4_hf_(
               <<<grid, block, 0, stream>>>(                                   \
                   K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr, \
                   top_k_in, expert_stride_w, expert_stride_s,                 \
-                  expert_stride_zp, __wvPrGrp, moe_cu, num_expert_blocks);    \
+                  expert_stride_zp, __wvPrGrp, moe_cu, num_expert_blocks,     \
+                  plain_k);                                                   \
         } else {                                                              \
           moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL,   \
                                     _N, _GS, _HAS_ZP, false>                  \
               <<<grid, block, 0, stream>>>(                                   \
                   K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr, \
                   top_k_in, expert_stride_w, expert_stride_s,                 \
-                  expert_stride_zp, __wvPrGrp, moe_cu, num_expert_blocks);    \
+                  expert_stride_zp, __wvPrGrp, moe_cu, num_expert_blocks,     \
+                  plain_k);                                                   \
         }                                                                     \
       } else {                                                                \
         moe_wvSplitK_int4_hf_sml_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, \
@@ -1730,11 +1756,16 @@ __global__ void moe_wvSplitK_int4_hf_(
             <<<grid, block, 0, stream>>>(                                     \
                 K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,   \
                 top_k_in, expert_stride_w, expert_stride_s, expert_stride_zp, \
-                __wvPrGrp, moe_cu, num_expert_blocks);                        \
+                __wvPrGrp, moe_cu, num_expert_blocks, plain_k);               \
       }                                                                       \
     } else {                                                                  \
       /* Non-sml path: fuse_silu_mul not supported here; the caller must      \
-         only request fusion when the sml condition is met. */                \
+         only request fusion when the sml condition is met.  It also reads    \
+         part of A from global memory, so it has no plain_k staging. */       \
+      TORCH_CHECK(!plain_k,                                                   \
+                  "plain-order int4 MoE weights need the LDS "                \
+                  "kernel: K * block_size_m <= ",                             \
+                  MOE_LDS_ELEMS, " and M % YTILE == 0");                      \
       moe_wvSplitK_int4_hf_<fptype, _THRDS, _YTILE, _W, _AC, _UNRL, _N, _GS,  \
                             _HAS_ZP><<<grid, block, 0, stream>>>(             \
           K_in, M_in, wptr, aptr, sptr, zpptr, cptr, eidptr, stidptr,         \

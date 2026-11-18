@@ -60,6 +60,7 @@ class WNA16MoEBackend(Enum):
     XPU = "XPU"
     EMULATION = "EMULATION"
     RDNA3 = "RDNA3"
+    HIPBLASLT = "HIPBLASLT"
 
 
 def backend_to_kernel_cls(
@@ -110,6 +111,12 @@ def backend_to_kernel_cls(
         )
 
         return [Rdna3WNA16Experts]
+    elif backend == WNA16MoEBackend.HIPBLASLT:
+        from vllm.model_executor.layers.fused_moe.experts.hipblaslt_moe import (
+            HipblasltWNA16Experts,
+        )
+
+        return [HipblasltWNA16Experts]
     else:
         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
 
@@ -160,7 +167,7 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
-    if backend == WNA16MoEBackend.TRITON:
+    if backend in (WNA16MoEBackend.TRITON, WNA16MoEBackend.HIPBLASLT):
         if may_have_bias:
             return "expert bias is not supported"
         if isinstance(quant_config, AutoAWQConfig):
@@ -213,6 +220,7 @@ def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
         "rdna3": WNA16MoEBackend.RDNA3,
+        "hipblaslt": WNA16MoEBackend.HIPBLASLT,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -394,6 +402,9 @@ def make_wna16_moe_kernel(
     from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
         CPUExpertsInt4,
     )
+    from vllm.model_executor.layers.fused_moe.experts.hipblaslt_moe import (
+        HipblasltWNA16Experts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
         Int4EmulationTritonExperts,
     )
@@ -416,6 +427,7 @@ def make_wna16_moe_kernel(
         CPUExpertsInt4,
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
+        HipblasltWNA16Experts,
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
@@ -1644,7 +1656,7 @@ def convert_to_wna16_moe_kernel_format(
             w13_qzeros,
             w2_qzeros,
         )
-    elif backend == WNA16MoEBackend.TRITON:
+    elif backend in (WNA16MoEBackend.TRITON, WNA16MoEBackend.HIPBLASLT):
         # All inputs arrive in canonical N-first format; view as uint8.
         w13_uint8 = w13.contiguous().view(torch.uint8)
         w2_uint8 = w2.contiguous().view(torch.uint8)
@@ -1671,6 +1683,23 @@ def convert_to_wna16_moe_kernel_format(
                 .reshape(E2, Np2 * 4, Kg2)
                 .contiguous()
             )
+        if backend == WNA16MoEBackend.HIPBLASLT:
+            from vllm.model_executor.layers.fused_moe.experts.hipblaslt_moe import (
+                pack_moe_scale_buffers,
+                pad_moe_weight_rows,
+            )
+
+            w13_uint8 = pad_moe_weight_rows(w13_uint8)
+            w2_uint8 = pad_moe_weight_rows(w2_uint8)
+
+            # Zero-points move into the scale buffers; an empty placeholder
+            # keeps the layer marked as asymmetric.
+            w13_scale = pack_moe_scale_buffers(w13_scale, w13_qzeros)
+            w2_scale = pack_moe_scale_buffers(w2_scale, w2_qzeros)
+            if w13_qzeros is not None:
+                w13_qzeros = w13_qzeros.new_empty(0)
+            if w2_qzeros is not None:
+                w2_qzeros = w2_qzeros.new_empty(0)
 
         return (
             w13_uint8,
