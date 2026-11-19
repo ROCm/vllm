@@ -178,6 +178,7 @@ class TinyDraft:
     lm: Any
     vllm_config: Any
     spec: Any
+    kv_fp8: bool
 
     @property
     def model(self):
@@ -188,8 +189,8 @@ class TinyDraft:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
 
-@pytest.fixture(scope="module")
-def tiny_draft(tmp_path_factory):
+@pytest.fixture(scope="module", params=["auto", "fp8"], ids=["kv-bf16", "kv-fp8"])
+def tiny_draft(request, tmp_path_factory):
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
         ensure_model_parallel_initialized,
@@ -215,7 +216,9 @@ def tiny_draft(tmp_path_factory):
         rocm_aiter_ops.refresh_env_variables()
         device = torch.device("cuda", 0)
         torch.accelerator.set_device_index(device)
-        vllm_config = _vllm_config(root / "tiny", root / "dspark")
+        vllm_config = _vllm_config(
+            root / "tiny", root / "dspark", cache_dtype=request.param
+        )
         with set_current_vllm_config(vllm_config):
             init_distributed_environment(
                 world_size=1,
@@ -239,13 +242,15 @@ def tiny_draft(tmp_path_factory):
                         )
             lm.process_weights_after_loading()
             assert lm.mono is None  # --monokernel off in this config
+            kv_fp8 = request.param == "fp8"
             spec = AttentionSpec(
                 block_size=16,
                 num_kv_heads=TINY_DSPARK["num_key_value_heads"],
                 head_size=64,
-                dtype=torch.bfloat16,
+                # vLLM allocates an fp8 cache as uint8
+                dtype=torch.uint8 if kv_fp8 else torch.bfloat16,
             )
-            yield TinyDraft(lm, vllm_config, spec)
+            yield TinyDraft(lm, vllm_config, spec, kv_fp8)
         cleanup_dist_env_and_memory()
 
 
@@ -253,6 +258,23 @@ def tiny_draft(tmp_path_factory):
 def test_layer_guards_accept_the_tiny_draft(tiny_draft) -> None:
     dims = draft_dims(tiny_draft.lm.config, 1)
     assert draft_layer_refusals(tiny_draft.model, dims) == []
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    ("cache_dtype", "accepted"),
+    [("auto", True), ("bfloat16", True), ("fp8", True), ("fp8_e4m3", True),
+     ("fp8_e5m2", False)],
+)  # fmt: skip
+def test_deployment_guard_takes_bf16_and_e4m3_kv_caches(
+    tiny_draft, monkeypatch, cache_dtype, accepted
+) -> None:
+    from vllm.models.muse_spark.amd.mono.drafter import static_refusals
+
+    cache = tiny_draft.lm.vllm_config.cache_config
+    monkeypatch.setattr(cache, "cache_dtype", cache_dtype)
+    reasons = static_refusals(tiny_draft.lm, 8)
+    assert any(r.startswith("kv_cache_dtype=") for r in reasons) != accepted
 
 
 class DraftStep:
@@ -322,9 +344,10 @@ class DraftStep:
                 raw, tiny.spec, num_blocks, 1, KVCacheLayout.LBHNC
             )
             self.kv_caches[name] = view
-            self.kv_init[name] = torch.randn(view.shape, generator=generator).to(
-                device, torch.bfloat16
-            )
+            init = torch.randn(view.shape, generator=generator)
+            if tiny.kv_fp8:
+                init = init.to(torch.float8_e4m3fn).view(torch.uint8)
+            self.kv_init[name] = init.to(device, view.dtype)
         self.tokens = sum(query_lens)
         self.input_ids = torch.randint(
             0, TINY_DSPARK["vocab_size"], (self.tokens,), generator=generator
@@ -370,6 +393,7 @@ class _StockDraftKernel:
     def __init__(self, tiny: TinyDraft) -> None:
         self.tiny = tiny
         self.calls: list[dict] = []
+        self.kv_fp8: list[bool] = []
 
     def peer_layout(self, S, world=8):
         return {}, 4096
@@ -377,7 +401,8 @@ class _StockDraftKernel:
     def scratch_layout(self, S, world=8):
         return {}, 4096
 
-    def build_vllm(self, S, W):
+    def build_vllm(self, S, W, kv_fp8=False):
+        self.kv_fp8.append(kv_fp8)
         return S
 
     def build(self, S):
@@ -455,6 +480,11 @@ class _StockDraftKernel:
                 md.seq_lens.data_ptr(),
             ]
             assert desc[i][8] == rows // QUERY_ROWS
+            impl = attn.attn
+            assert desc[i][10:12] == [
+                impl._k_scale.data_ptr(),
+                impl._v_scale.data_ptr(),
+            ]
         assert (
             tab[self.T_G][self.G_Q + 2]
             == layers[0].self_attn.rotary_emb.cos_sin_cache.data_ptr()
@@ -481,7 +511,9 @@ def _run_drafter(tiny: TinyDraft, step: DraftStep, **kw):
         group=get_tp_group().cpu_group,
         device=torch.device("cuda", 0),
         dims=draft_dims(tiny.lm.config, 1),
+        kv_fp8=tiny.kv_fp8,
     )
+    assert kernel.kv_fp8 and set(kernel.kv_fp8) == {tiny.kv_fp8}
     try:
         return kernel, step.run(tiny, **kw)
     finally:
@@ -529,6 +561,7 @@ def test_second_step_reuses_the_descriptor_table(tiny_draft) -> None:
         group=get_tp_group().cpu_group,
         device=torch.device("cuda", 0),
         dims=draft_dims(tiny_draft.lm.config, 1),
+        kv_fp8=tiny_draft.kv_fp8,
     )
     try:
         first, second = step.run(tiny_draft), step.run(tiny_draft)

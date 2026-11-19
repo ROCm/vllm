@@ -54,9 +54,11 @@ from .dev import (
     bf_hi,
     bf_lo,
     butterfly,
+    e4m3_dword,
     fresh,
     hw_exp2,
     hw_rsq,
+    inv_kv_scale,
     ld_f32,
     ld_i32,
     ld_i32_if,
@@ -148,6 +150,7 @@ def sfresh64(v):
 @dataclass(frozen=True)
 class Build:
     S: int = 8  # rows: 8 (1 request) or 16 (2 requests)
+    kv_fp8: bool = False  # e4m3 draft KV cache (insert and attention); else bf16
 
 
 def scratch_layout(S, world=W):
@@ -216,10 +219,11 @@ def build(key: Build):
     CO = OK_K // KCH // WAVES  # o_proj chunks a wave
     CD = FF // KCH // WAVES  # down_proj chunks a wave
     assert CO >= 1 and CD >= 1 and NQT == 5 and NH <= 32
-    FA = attn_frag.make(NR, True, nq=NQ, qcm=CM_DEV, kvcm=CM_DEV)
+    KV8 = key.kv_fp8
+    FA = attn_frag.make(NR, True, kv_fp8=KV8, nq=NQ, qcm=CM_DEV, kvcm=CM_DEV)
     FaLds = FA.Lds
     _KEYSTR = _KEYSTR + FA.key
-    name = f"muse_dspark_s{S}"
+    name = f"muse_dspark_s{S}" + ("_kv8" if KV8 else "")
     tag_par = lambda tag: tag & 1
 
     @fx.struct
@@ -529,7 +533,7 @@ def build(key: Build):
         return out
 
     @traced
-    def finish(w2, hh, tt, p, q_out, kvc, kvs, slots, cos_sin, pos):
+    def finish(w2, hh, tt, p, q_out, kvc, kvs, slots, cos_sin, pos, ksc, vsc):
         """Head hh (uniform), token tt (uniform in the wave), lane p = pair (2p, 2p + 1): as
         vLLM's fused qk-norm / RoPE / KV insert (k3 vllm_finish), the KV through the draft
         group's slot_mapping (rows >= R and slot < 0 skipped), stores at device scope."""
@@ -561,17 +565,24 @@ def build(key: Build):
             kv = hh - HQ - isv.select(fx.Int32(HKV), fx.Int32(0))
             slot = uniform(ld_i32(slots, tr * 2))  # int64 slot_mapping: low word
             slot = (tt < R).select(slot, fx.Int32(-1))
+            if const_expr(KV8):
+                # e4m3 bytes scaled by 1 / *k_scale or *v_scale (k3.vllm_finish's insert);
+                # both lanes of a pair are active here
+                w8 = e4m3_dword(o0, o1, inv_kv_scale(isv.select(vsc, ksc)))
             if slot >= 0:
                 eoff = fx.Int64(slot >> 4) * kvs + fx.Int64(
                     (kv * 16 + (slot & 15)) * 128
                     + isv.select(fx.Int32(HD), fx.Int32(0))
                 )
-                bo.buffer_store(
-                    bf16_pair(o0, o1),
-                    rsrc(kvc + eoff * fx.Int64(2)),
-                    p,
-                    cache_modifier=CM_DEV,
-                )
+                if const_expr(KV8):
+                    st_if(p % 2 == 0, w8, kvc + eoff, p // 2, CM_DEV)
+                else:
+                    bo.buffer_store(
+                        bf16_pair(o0, o1),
+                        rsrc(kvc + eoff * fx.Int64(2)),
+                        p,
+                        cache_modifier=CM_DEV,
+                    )
 
     @traced
     def stage_qkv(
@@ -584,6 +595,8 @@ def build(key: Build):
         slots,
         cos_sin,
         pos,
+        ksc,
+        vsc,
         tag,
         health,
         tid,
@@ -700,7 +713,7 @@ def build(key: Build):
                 CM_DEV,
             )
             if head & (p < 32):
-                finish(w2, gq, tt, p, q_out, kvc, kvs, slots, cos_sin, pos)
+                finish(w2, gq, tt, p, q_out, kvc, kvs, slots, cos_sin, pos, ksc, vsc)
         rocdl.s_waitcnt(vmcnt=0, expcnt=0, lgkmcnt=0)
         gpu.barrier()
         if tid == 0:
@@ -1042,6 +1055,7 @@ def build(key: Build):
         tid, lane, wave, bid = ids(A)
         gw = tab_ptrs(wtab, T_G, G_Q, 4)  # q, g, cos_sin
         kw = ld_vec(dptr, 2, 4)  # descriptor words 1 (KV cache), 2 (block stride)
+        sw = ld_vec(dptr, 20, 4)  # descriptor words 10, 11 (k_scale, v_scale pointers)
         stage_qkv(
             qo,
             scratch,
@@ -1052,6 +1066,8 @@ def build(key: Build):
             p64(ld_vec(A["slot_tab"], 2 * layer, 2), 0),  # the layer's slot_mapping
             gw[2],
             A["pos"],
+            p64(sw, 0),
+            p64(sw, 1),
             tl,
             health,
             tid,
@@ -1235,7 +1251,8 @@ def build(key: Build):
     return launch
 
 
-def build_vllm(S=8, W=8):
-    """The draft build vLLM launches for S rows (8 / 16: 1 / 2 requests of 7 rows), TP = 8."""
+def build_vllm(S=8, W=8, kv_fp8=False):
+    """The draft build vLLM launches for S rows (8 / 16: 1 / 2 requests of 7 rows), TP = 8;
+    kv_fp8: e4m3 draft KV cache."""
     assert W == 8 and S in (8, 16), (S, W)
-    return Build(S=S)
+    return Build(S=S, kv_fp8=bool(kv_fp8))

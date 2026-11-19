@@ -32,6 +32,8 @@ from vllm.models.muse_spark.common.layers import (
 )
 
 from .decoder import (
+    BF16_KV_DTYPES,
+    FP8_KV_DTYPES,
     HEALTH_POLL_INTERVAL,
     NUM_CUS,
     SLIDING_WINDOW,
@@ -196,9 +198,12 @@ class _DraftBuild:
         dims: MonoDims,
         device: torch.device,
         group: Any,
+        kv_fp8: bool = False,
     ) -> None:
         self.S = S
-        self.launch = kernel.build(kernel.build_vllm(S=S, W=dims.world_size))
+        self.launch = kernel.build(
+            kernel.build_vllm(S=S, W=dims.world_size, kv_fp8=kv_fp8)
+        )
         self.peers = PeerBuffer(kernel.peer_layout(S)[1] + 256, group)
         self.scratch = torch.zeros(
             kernel.scratch_layout(S)[1] // 4 + 64, dtype=torch.int32, device=device
@@ -233,9 +238,11 @@ class DSparkDrafter:
         group: Any,
         device: torch.device,
         dims: MonoDims,
+        kv_fp8: bool = False,
     ) -> None:
         self.rank = rank
         self.dims = dims
+        self.kv_fp8 = kv_fp8
         self.kernel, attn_frag = kernels["draft"], kernels["attn_frag"]
         self.layer_names = [layer.self_attn.attn.layer_name for layer in model.layers]
         scales = {
@@ -246,7 +253,15 @@ class DSparkDrafter:
         table = self._weight_table(model, device)
         self.builds = {
             S: _DraftBuild(
-                self.kernel, attn_frag, S, table, scales, self.dims, device, group
+                self.kernel,
+                attn_frag,
+                S,
+                table,
+                scales,
+                self.dims,
+                device,
+                group,
+                kv_fp8=kv_fp8,
             )
             for S in sorted(set(DRAFT_BUILDS.values()))
         }
@@ -347,7 +362,9 @@ class DSparkDrafter:
             if md is None:
                 return "attn-metadata"
             _, _, kv_cache, slots = get_attention_context(name)
-            reason = kv_cache_refusal(kv_cache, self.dims.local_kv_heads, kv_fp8=False)
+            reason = kv_cache_refusal(
+                kv_cache, self.dims.local_kv_heads, kv_fp8=self.kv_fp8
+            )
             if reason is not None:
                 return reason
             # uniform causal decodes of QUERY_ROWS rows (host counts of the metadata)
@@ -491,8 +508,8 @@ def static_refusals(lm: nn.Module, tp_size: int) -> list[str]:
     if not getattr(lm.config, "sample_from_anchor", True):
         reasons.append("DSpark without sample_from_anchor (1 + N query rows)")
     cache = lm.vllm_config.cache_config
-    if cache.cache_dtype not in ("auto", "bfloat16"):
-        reasons.append(f"kv_cache_dtype={cache.cache_dtype} (kernel: bf16)")
+    if cache.cache_dtype not in BF16_KV_DTYPES + FP8_KV_DTYPES:
+        reasons.append(f"kv_cache_dtype={cache.cache_dtype} (kernel: bf16, fp8 e4m3)")
     if cache.block_size != 16:
         reasons.append(f"kv_cache_block_size={cache.block_size} (kernel: 16)")
     reasons += draft_config_refusals(lm.config)
@@ -534,6 +551,7 @@ def maybe_attach_drafter(lm: nn.Module) -> None:
         )
         return
     assert kernels is not None
+    kv_fp8 = lm.vllm_config.cache_config.cache_dtype in FP8_KV_DTYPES
     lm.mono = DSparkDrafter(
         lm.model,
         kernels,
@@ -541,14 +559,16 @@ def maybe_attach_drafter(lm: nn.Module) -> None:
         group=group.cpu_group,
         device=torch.device("cuda", torch.accelerator.current_device_index()),
         dims=draft_dims(lm.config, group.world_size),
+        kv_fp8=kv_fp8,
     )
     register_health_check(id(lm), lm.mono.poll_health)
     logger.info(
         "Muse Spark DSpark drafter attached: draft steps of %s rows run the %d draft "
-        "layers and the final norm as one FlyDSL launch (builds S=%s)",
+        "layers and the final norm as one FlyDSL launch (builds S=%s, KV %s)",
         "/".join(map(str, DRAFT_BUILDS)),
         DRAFT_LAYERS,
         ",".join(map(str, sorted(set(DRAFT_BUILDS.values())))),
+        "fp8 e4m3" if kv_fp8 else "bf16",
     )
 
 
