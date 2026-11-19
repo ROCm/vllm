@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused MoE W4A16 experts on the FlyDSL WMMA kernels for RDNA3.5 (gfx115x)."""
 
+import functools
 import importlib.util
 
 import torch
@@ -17,17 +18,8 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
-    BLOCK_M,
-    MAX_REDUCE_ROWS,
     TILE_N,
-    flydsl_rdna_moe_gemm,
-    flydsl_rdna_moe_gemm_reduce,
-)
-from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-    moe_align_block_size,
-)
-from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
-    moe_unpermute,
+    flydsl_rdna_moe,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -69,22 +61,11 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
-        self._arange: torch.Tensor | None = None
         self._silu_mul = fuses_silu_mul(moe_config)
         # Without zero points the packer stores one coefficient per group.
         self._w1_pairs = quant_config.w1_zp is not None
         self._w2_pairs = quant_config.w2_zp is not None
         assert not self._silu_mul or self.activation_config.clamp_limit is None
-
-    def _route(
-        self, topk_ids: torch.Tensor, num_experts: int
-    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
-        """Group the routed rows into BLOCK_M-row blocks per expert."""
-        if topk_ids.size(0) == 1 and topk_ids.dtype == torch.int32:
-            # One token: its experts are distinct, so every row is its own
-            # block and the alignment kernel is not needed.
-            return None, topk_ids.view(-1), None
-        return moe_align_block_size(topk_ids, BLOCK_M, num_experts)
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
@@ -181,69 +162,20 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
             global_num_experts = E
 
         assert self.block_shape is not None
-        group_size = self.block_shape[1]
-        gate_up = w1.size(1) * TILE_N
-        rows = M * top_k
-        widths = (gate_up, N, K)
-        sizes = [rows * n for n in widths]
-        gate_up_out, act_out, down_out = (
-            t.view(rows, n)
-            for t, n in zip(workspace2.view(-1)[: sum(sizes)].split(sizes), widths)
-        )
-        sorted_ids, expert_ids, num_valid = self._route(topk_ids, global_num_experts)
-        flydsl_rdna_moe_gemm(
-            act_out if self._silu_mul else gate_up_out,
+        flydsl_rdna_moe(
+            output,
             hidden_states,
             w1,
             self.w1_scale,
-            sorted_ids,
-            expert_ids,
-            num_valid,
-            top_k,
-            group_size,
-            silu_mul=self._silu_mul,
-            coef_pairs=self._w1_pairs,
-        )
-        if not self._silu_mul:
-            self.activation(activation, act_out, gate_up_out)
-        if (
-            sorted_ids is None
-            and top_k <= MAX_REDUCE_ROWS
-            and topk_weights.dtype == torch.float32
-        ):
-            # One token: GEMM2 also does the weighted sum over its experts.
-            flydsl_rdna_moe_gemm_reduce(
-                output,
-                act_out,
-                w2,
-                self.w2_scale,
-                expert_ids,
-                topk_weights,
-                group_size,
-                coef_pairs=self._w2_pairs,
-            )
-            return
-        flydsl_rdna_moe_gemm(
-            down_out,
-            act_out,
             w2,
             self.w2_scale,
-            sorted_ids,
-            expert_ids,
-            num_valid,
-            1,
-            group_size,
-            coef_pairs=self._w2_pairs,
-        )
-
-        # Rows are in routing order, so the top-k reduction needs no permutation.
-        if self._arange is None or self._arange.size(0) < rows:
-            self._arange = torch.arange(
-                rows, dtype=torch.int32, device=hidden_states.device
-            )
-        moe_unpermute(
-            out=output,
-            permuted_hidden_states=down_out,
-            topk_weights=topk_weights,
-            inv_permuted_idx=self._arange[:rows],
+            topk_weights,
+            topk_ids,
+            workspace2,
+            self.block_shape[1],
+            global_num_experts,
+            N,
+            None if self._silu_mul else functools.partial(self.activation, activation),
+            self._w1_pairs,
+            self._w2_pairs,
         )

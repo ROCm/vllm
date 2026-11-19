@@ -17,6 +17,8 @@ if not (on_gfx115x() and importlib.util.find_spec("flydsl") is not None):
 
 from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (  # noqa: E402
     BLOCK_M,
+    ROW_PATH_MAX_TOKENS,
+    flydsl_rdna_moe,
     flydsl_rdna_moe_gemm,
     flydsl_rdna_moe_gemm_reduce,
     gate_up_tile_order,
@@ -174,11 +176,12 @@ def test_flydsl_rdna_moe_gemm_silu_mul(num_tokens: int):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
 
 
+@pytest.mark.parametrize("num_tokens", [1, 3])
 @pytest.mark.parametrize("symmetric", [False, True])
-def test_flydsl_rdna_moe_gemm_reduce(symmetric: bool):
-    """The one-token GEMM with the fused top-k sum matches the plain GEMM
-    followed by the weighted sum, with a padded expert stride, and skips
-    experts with id -1.
+def test_flydsl_rdna_moe_gemm_reduce(symmetric: bool, num_tokens: int):
+    """The GEMM with the fused top-k sum matches the plain GEMM followed by
+    the weighted sum per token, with a padded expert stride, and skips experts
+    with id -1.
     """
     set_random_seed(0)
     device = "cuda"
@@ -193,20 +196,83 @@ def test_flydsl_rdna_moe_gemm_reduce(symmetric: bool):
         pad_expert_stride, pack_w4a16_weights(q, scale.to(torch.bfloat16), zp)
     )
     pairs = not symmetric
-    x = torch.randn((top_k, n_in), device=device, dtype=torch.bfloat16)
+    n_rows = num_tokens * top_k
+    x = torch.randn((n_rows, n_in), device=device, dtype=torch.bfloat16)
     expert_ids = torch.tensor(
         [5, -1, 0, 3, 15, 9, -1, 11], dtype=torch.int32, device=device
-    )
-    weights = torch.rand((1, top_k), device=device)
+    ).repeat(num_tokens)
+    weights = torch.rand((num_tokens, top_k), device=device)
 
-    rows = torch.zeros((top_k, n_out), device=device, dtype=torch.bfloat16)
+    rows = torch.zeros((n_rows, n_out), device=device, dtype=torch.bfloat16)
     flydsl_rdna_moe_gemm(
         rows, x, w, coef, None, expert_ids, None, 1, group_size, coef_pairs=pairs
     )
-    ref = (rows.float() * weights.view(-1, 1)).sum(dim=0, keepdim=True)
+    ref = (rows.float().view(num_tokens, top_k, n_out) * weights.unsqueeze(-1)).sum(1)
 
-    out = torch.empty((1, n_out), device=device, dtype=torch.bfloat16)
+    out = torch.empty((num_tokens, n_out), device=device, dtype=torch.bfloat16)
     flydsl_rdna_moe_gemm_reduce(
         out, x, w, coef, expert_ids, weights, group_size, coef_pairs=pairs
     )
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
+
+
+@pytest.mark.parametrize(
+    "num_tokens", [1, ROW_PATH_MAX_TOKENS, ROW_PATH_MAX_TOKENS + 1, 40]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fused_silu", [False, True])
+def test_flydsl_rdna_moe(num_tokens: int, dtype: torch.dtype, fused_silu: bool):
+    """Both GEMMs, the activation and the top-k sum match the dequantized
+    reference for every routing path and for both activation dtypes.
+    """
+    set_random_seed(0)
+    device = "cuda"
+    num_experts, top_k, hidden, inter, group_size = 16, 8, 256, 128, 32
+
+    def weights(n_out, n_in, order=None):
+        q = torch.randint(0, 16, (num_experts, n_out, n_in), device=device)
+        scale = torch.rand((num_experts, n_out, n_in // group_size), device=device)
+        scale = (scale * 0.02 + 0.001).to(torch.bfloat16)
+        dequant = (q - 8).float() * scale.float().repeat_interleave(group_size, dim=2)
+        if order is not None:
+            q, scale = q[:, order], scale[:, order]
+        return map(pad_expert_stride, pack_w4a16_weights(q, scale, None)), dequant
+
+    order = gate_up_tile_order(2 * inter, device) if fused_silu else None
+    (w1, c1), d1 = weights(2 * inter, hidden, order)
+    (w2, c2), d2 = weights(hidden, inter)
+    x = torch.randn((num_tokens, hidden), device=device, dtype=dtype)
+    topk_ids = torch.rand((num_tokens, num_experts), device=device).topk(top_k).indices
+    topk_weights = torch.rand((num_tokens, top_k), device=device)
+
+    def silu_and_mul(out, gate_up):
+        gate, up = gate_up.float().chunk(2, dim=-1)
+        out.copy_(torch.nn.functional.silu(gate) * up)
+
+    out = torch.empty((num_tokens, hidden), device=device, dtype=dtype)
+    workspace = torch.empty(
+        num_tokens * top_k * (3 * inter + hidden), device=device, dtype=dtype
+    )
+    flydsl_rdna_moe(
+        out,
+        x,
+        w1,
+        c1,
+        w2,
+        c2,
+        topk_weights,
+        topk_ids.to(torch.int32),
+        workspace,
+        group_size,
+        num_experts,
+        inter,
+        None if fused_silu else silu_and_mul,
+        False,
+        False,
+    )
+
+    gate, up = torch.einsum("tenk,tk->ten", d1[topk_ids], x.float()).chunk(2, dim=-1)
+    act = (torch.nn.functional.silu(gate) * up).to(dtype).float()
+    down = torch.einsum("tenk,tek->ten", d2[topk_ids], act)
+    ref = (down * topk_weights.unsqueeze(-1)).sum(dim=1)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())

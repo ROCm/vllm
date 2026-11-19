@@ -181,8 +181,8 @@ def _backend_incompatibility_reason(
             return "only MoeWNA16 and compressed-tensors checkpoints are supported"
         if num_bits != 4 or not group_size or group_size % 16 != 0:
             return "only 4-bit weights with a group size multiple of 16 are supported"
-        if moe_config.in_dtype != torch.bfloat16:
-            return "only bfloat16 activations are supported"
+        if moe_config.in_dtype not in (torch.bfloat16, torch.float16):
+            return "only bfloat16 and float16 activations are supported"
         if moe_config.moe_parallel_config.use_ep:
             return "expert parallelism is not supported"
         from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (

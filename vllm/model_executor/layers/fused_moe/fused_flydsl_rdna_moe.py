@@ -27,13 +27,16 @@ REG_N = 4
 TILE_N = 16 * REG_N
 # K-steps whose loads are kept in flight ahead of the one being computed.
 _LOOKAHEAD = 6
-# Rows of the one-token reduce kernel: every second row of a WMMA A operand.
+# Experts per token of the reduce kernel: every second row of a WMMA A operand.
 MAX_REDUCE_ROWS = 8
+# Up to this many tokens every routed row gets its own wave (the row and
+# reduce kernels); more tokens are grouped into BLOCK_M-row blocks per expert.
+ROW_PATH_MAX_TOKENS = 5
 
-# Bit positions of the two nibbles of an element pair inside a packed dword
-# (pair p at bits 4p and 4p + 16) and inside a bf16 pair (mantissa bits 3..6).
-_NIBBLE_MASK = 0x00780078
-_BF16_ONE_PAIR = 0x3F803F80
+# A packed dword holds the nibbles of four element pairs, pair p at bits 4p
+# and 4p + 16. In an operand pair a nibble sits in the top mantissa bits of
+# 1.0: (1.0, lowest mantissa bit used) for bf16 and float16.
+_OPERAND_FORMAT = {False: (0x3F80, 3), True: (0x3C00, 6)}
 
 # DRAM channels interleave every 256 B on gfx115x. Waves of a launch read
 # their tiles in lockstep, so tile strides that are a multiple of 512 B would
@@ -80,6 +83,44 @@ def _w_tile_dwords(K: int) -> int:
 
 def _coef_tile_dwords(K: int, group: int, pairs: bool) -> int:
     return (K // group) * 16 * REG_N * (2 if pairs else 1) // 2
+
+
+def _kernel_name(
+    kind: str, K: int, N: int, group: int, pairs: bool, silu: bool, fp16: bool
+) -> str:
+    """Symbol name of a kernel build; it is what profiles show."""
+    name = f"flydsl_rdna_moe_{kind}_k{K}_n{N}_g{group}"
+    name += ("_zp" if pairs else "") + ("_silu" if silu else "")
+    return name + ("_f16" if fp16 else "")
+
+
+def _operand_ops(fp16: bool):
+    """``(unpack, wmma, ones)`` for bf16 or float16 activations: ``unpack``
+    turns two packed dwords into the WMMA operand ``1 + q / 16``."""
+    import flydsl.expr as fx
+    from flydsl.expr import rocdl
+    from flydsl.expr.typing import Vector
+
+    one, lsb = _OPERAND_FORMAT[fp16]
+    one_pair = one << 16 | one
+    mask = (0xF << lsb) * 0x10001
+    op = rocdl.wmma_f32_16x16x16_f16 if fp16 else rocdl.wmma_f32_16x16x16_bf16
+
+    def unpack(wv):
+        words = []
+        for i in range(2):
+            for p in range(4):
+                sh = lsb - 4 * p
+                w = wv[i] << sh if sh >= 0 else wv[i] >> -sh
+                words.append((w & mask) | one_pair)
+        return Vector.from_elements(words, fx.Int32).bitcast(fx.Int16)
+
+    def wmma(a, b, acc):
+        if fp16:
+            a, b = a.bitcast(fx.Float16), b.bitcast(fx.Float16)
+        return op(acc.type, a, b, acc).result
+
+    return unpack, wmma, fx.full(16, one, fx.Int16)
 
 
 def _scale_terms(c, pairs: bool):
@@ -161,13 +202,14 @@ def _build_gemm(
     w_expert: int,
     c_expert: int,
     coef_pairs: bool,
+    fp16: bool,
 ):
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import buffer_ops, gpu, math, range_constexpr, rocdl
-    from flydsl.expr.typing import Vector
+    from flydsl.expr import buffer_ops, gpu, math, range_constexpr
 
     assert K % group == 0 and group % 16 == 0 and N % TILE_N == 0
+    out_type = fx.Float16 if fp16 else fx.BFloat16
     n_groups = K // group
     steps = group // 16  # WMMA K-steps per group
     k_dwords = K // 2
@@ -181,8 +223,9 @@ def _build_gemm(
     # With ``silu_mul`` a tile holds gate columns then the matching up columns.
     out_reg = REG_N // 2 if silu_mul else REG_N
     n_out = N // 2 if silu_mul else N
+    name = _kernel_name("gemm", K, N, group, coef_pairs, silu_mul, fp16)
 
-    @flyc.kernel
+    @flyc.kernel(name=name)
     def gemm_kernel(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
@@ -222,7 +265,6 @@ def _build_gemm(
         w_base = expert * w_expert + tile_n * w_tile + lane16 * 2
         c_base = expert * c_expert + tile_n * c_tile + lane16 * cw
 
-        ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
         zero = fx.full(8, 0.0, fx.Float32)
 
         def load_step(kstep):
@@ -255,16 +297,7 @@ def _build_gemm(
                 for rn in range_constexpr(REG_N)
             ]
 
-        def unpack(lo, hi):
-            words = []
-            for w in (lo, hi):
-                words.append(((w << 3) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
-                for p in range_constexpr(1, 4):
-                    words.append(((w >> (4 * p - 3)) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
-            return Vector.from_elements(words, fx.Int32).bitcast(fx.Int16)
-
-        def wmma(a, b, acc):
-            return rocdl.wmma_f32_16x16x16_bf16(acc.type, a, b, acc).result
+        unpack, wmma, ones = _operand_ops(fp16)
 
         # The loads of the next _LOOKAHEAD K-steps stay in flight while a step
         # is computed; across groups they are carried as loop state.
@@ -295,7 +328,7 @@ def _build_gemm(
                 xsum = wmma(a, ones, xsum)
                 for rn in range_constexpr(REG_N):
                     wv = cur[2 + rn]
-                    acc[rn] = wmma(a, unpack(wv[0], wv[1]), acc[rn])
+                    acc[rn] = wmma(a, unpack(wv), acc[rn])
             for rn in range_constexpr(REG_N):
                 s16, szp = _scale_terms(coef[rn], coef_pairs)
                 s16 = fx.full(8, s16, fx.Float32)
@@ -319,7 +352,7 @@ def _build_gemm(
                 out_base = out_rid * n_out + tile_n * (16 * out_reg) + lane16
                 for rn in range_constexpr(out_reg):
                     buffer_ops.buffer_store(
-                        tot[rn][si].to(fx.BFloat16), out_rsrc, out_base + rn * 16
+                        tot[rn][si].to(out_type), out_rsrc, out_base + rn * 16
                     )
 
     @flyc.jit
@@ -373,6 +406,7 @@ def _build_gemm_row(
     w_expert: int,
     c_expert: int,
     coef_pairs: bool,
+    fp16: bool,
 ):
     """``out[r] = W[expert_ids[r]] @ x[r // x_row_div]``, one row per block.
 
@@ -384,12 +418,13 @@ def _build_gemm_row(
     import flydsl.expr as fx
     from flydsl._mlir import ir
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, buffer_ops, gpu, math, range_constexpr, rocdl, vector
-    from flydsl.expr.typing import T, Vector
+    from flydsl.expr import arith, buffer_ops, gpu, math, range_constexpr, vector
+    from flydsl.expr.typing import T
     from flydsl.runtime.device import get_rocm_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
     assert K % group == 0 and group % 16 == 0 and N % TILE_N == 0
+    out_type = fx.Float16 if fp16 else fx.BFloat16
     n_groups = K // group
     steps = group // 16
     k_dwords = K // 2
@@ -413,8 +448,9 @@ def _build_gemm_row(
         if (N // TILE_N) % w == 0 and lds_wave * 4 * w <= _LDS_BYTES
     )
     allocator.ptr = lds_wave * 4 * wg
+    name = _kernel_name("row", K, N, group, coef_pairs, silu_mul, fp16)
 
-    @flyc.kernel(known_block_size=[32 * wg, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[32 * wg, 1, 1])
     def row_kernel(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
@@ -474,19 +510,8 @@ def _build_gemm_row(
                 for rn in range_constexpr(REG_N)
             ]
 
-        def unpack(wv):
-            words = []
-            for i in range_constexpr(2):
-                w = wv[i]
-                words.append(((w << 3) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
-                for p in range_constexpr(1, 4):
-                    words.append(((w >> (4 * p - 3)) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
-            return Vector.from_elements(words, fx.Int32).bitcast(fx.Int16)
+        unpack, wmma, ones = _operand_ops(fp16)
 
-        def wmma(a, b, acc):
-            return rocdl.wmma_f32_16x16x16_bf16(acc.type, a, b, acc).result
-
-        ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
         zero = fx.full(8, 0.0, fx.Float32)
         n_iter = valid.select(fx.Int32(n_groups), fx.Int32(0))
         init = [zero for _ in range_constexpr(REG_N)]
@@ -537,7 +562,7 @@ def _build_gemm_row(
             out_base = row * n_out + tile_n * (16 * out_reg) + lane16
             for rn in range_constexpr(out_reg):
                 buffer_ops.buffer_store(
-                    tot[rn][0].to(fx.BFloat16), out_rsrc, out_base + rn * 16
+                    tot[rn][0].to(out_type), out_rsrc, out_base + rn * 16
                 )
 
     @flyc.jit
@@ -569,8 +594,10 @@ def _build_gemm_reduce(
     w_expert: int,
     c_expert: int,
     coef_pairs: bool,
+    fp16: bool,
 ):
-    """One token: ``out[n] = sum_e weight_e * (W[expert_e] @ x[e])[n]``.
+    """Per token ``t``: ``out[t, n] = sum_e weight[t, e] * (W[expert[t, e]] @
+    x[t * top_k + e])[n]``.
 
     Row ``2 e`` of the WMMA A operand holds ``x[e]``, so one WMMA per expert
     yields its 16 output columns in the lanes of the first half-wave and a
@@ -583,12 +610,13 @@ def _build_gemm_reduce(
     import flydsl.expr as fx
     from flydsl._mlir import ir
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, buffer_ops, gpu, math, range_constexpr, rocdl, vector
-    from flydsl.expr.typing import T, Vector
+    from flydsl.expr import arith, buffer_ops, gpu, math, range_constexpr, vector
+    from flydsl.expr.typing import T
     from flydsl.runtime.device import get_rocm_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
     assert K % group == 0 and group % 16 == 0 and N % TILE_N == 0
+    out_type = fx.Float16 if fp16 else fx.BFloat16
     assert top_k <= MAX_REDUCE_ROWS
     n_groups = K // group
     steps = group // 16
@@ -604,8 +632,9 @@ def _build_gemm_reduce(
     x_dwords = top_k * k_dwords
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_x")
     allocator.ptr = x_dwords * 4
+    name = _kernel_name("reduce", K, N, group, coef_pairs, False, fp16)
 
-    @flyc.kernel
+    @flyc.kernel(name=name)
     def reduce_kernel(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
@@ -616,6 +645,7 @@ def _build_gemm_reduce(
     ):
         lane = gpu.thread_idx.x
         col16 = gpu.block_idx.x
+        token = gpu.block_idx.y
         lane16 = lane % 16
         klane = lane // 16
 
@@ -627,7 +657,7 @@ def _build_gemm_reduce(
         tw_rsrc = buffer_ops.create_buffer_resource(arg_weights, max_size=True)
 
         lds = SmemPtr(allocator.get_base(), 0, T.i32, shape=(x_dwords,)).get()
-        _copy_to_lds(lds, x_rsrc, x_dwords, lane)
+        _copy_to_lds(lds, x_rsrc, x_dwords, lane, token * x_dwords)
         x_row = lane16 // 2
         x_base = (x_row < top_k).select(x_row, fx.Int32(0)) * k_dwords
         tile_n = col16 // REG_N
@@ -637,11 +667,11 @@ def _build_gemm_reduce(
         c_base = []
         for e in range_constexpr(top_k):
             expert = buffer_ops.buffer_load(
-                eid_rsrc, fx.Int32(e), vec_width=1, dtype=fx.Int32
+                eid_rsrc, token * top_k + e, vec_width=1, dtype=fx.Int32
             )
             valid = expert >= 0
             tw = buffer_ops.buffer_load(
-                tw_rsrc, fx.Int32(e), vec_width=1, dtype=fx.Float32
+                tw_rsrc, token * top_k + e, vec_width=1, dtype=fx.Float32
             )
             # Experts with id -1 contribute nothing (the engine warm-up).
             weight.append(valid.select(tw, fx.Float32(0.0)))
@@ -649,7 +679,6 @@ def _build_gemm_reduce(
             w_base.append(expert * w_expert + tile_n * w_tile + rn * 32 + lane16 * 2)
             c_base.append(expert * c_expert + tile_n * c_tile + (rn * 16 + lane16) * cw)
 
-        ones = fx.full(16, _BF16_ONE_PAIR & 0xFFFF, fx.Int16)
         zero = fx.full(8, 0.0, fx.Float32)
 
         def load_w(kstep):
@@ -672,17 +701,7 @@ def _build_gemm_reduce(
                 for e in range_constexpr(top_k)
             ]
 
-        def unpack(wv):
-            words = []
-            for i in range_constexpr(2):
-                w = wv[i]
-                words.append(((w << 3) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
-                for p in range_constexpr(1, 4):
-                    words.append(((w >> (4 * p - 3)) & _NIBBLE_MASK) | _BF16_ONE_PAIR)
-            return Vector.from_elements(words, fx.Int32).bitcast(fx.Int16)
-
-        def wmma(a, b, acc):
-            return rocdl.wmma_f32_16x16x16_bf16(acc.type, a, b, acc).result
+        unpack, wmma, ones = _operand_ops(fp16)
 
         init = [fx.Float32(0.0)]
         for d in range_constexpr(_LOOKAHEAD):
@@ -718,7 +737,9 @@ def _build_gemm_reduce(
         tot = fx.Float32(results[0])
 
         if klane == 0:
-            buffer_ops.buffer_store(tot.to(fx.BFloat16), out_rsrc, col16 * 16 + lane16)
+            buffer_ops.buffer_store(
+                tot.to(out_type), out_rsrc, token * N + col16 * 16 + lane16
+            )
 
     @flyc.jit
     def launch(
@@ -728,6 +749,7 @@ def _build_gemm_reduce(
         arg_coef: fx.Tensor,
         arg_expert_ids: fx.Tensor,
         arg_weights: fx.Tensor,
+        n_tokens: fx.Int32,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -735,7 +757,7 @@ def _build_gemm_reduce(
             allocator.finalize()
         reduce_kernel(
             arg_out, arg_x, arg_w, arg_coef, arg_expert_ids, arg_weights
-        ).launch(grid=(N // 16, 1, 1), block=(32, 1, 1), stream=stream)
+        ).launch(grid=(N // 16, n_tokens, 1), block=(32, 1, 1), stream=stream)
 
     return launch
 
@@ -750,22 +772,27 @@ def flydsl_rdna_moe_gemm_reduce(
     group_size: int,
     coef_pairs: bool = True,
 ) -> None:
-    """One token: ``out[0] = sum_e weights[e] * W[expert_ids[e]] @ x[e]``.
+    """GEMM2 with the top-k sum: ``out[t] = sum_e weights[t, e] *
+    W[expert_ids[t * top_k + e]] @ x[t * top_k + e]``.
 
-    ``weights`` is float32; at most ``MAX_REDUCE_ROWS`` experts. ``coef_pairs``
-    is False for weights packed without zero points.
+    ``weights`` is float32 ``[tokens, top_k]`` with at most
+    ``MAX_REDUCE_ROWS`` experts per token. ``coef_pairs`` is False for weights
+    packed without zero points.
     """
     _check_coef(coef, x.shape[1], group_size, coef_pairs)
+    n_tokens, top_k = weights.shape
     launch = _build_gemm_reduce(
         x.shape[1],
         out.shape[1],
         group_size,
-        x.shape[0],
+        top_k,
         _expert_stride_dwords(w),
         _expert_stride_dwords(coef),
         coef_pairs,
+        x.dtype == torch.float16,
     )
-    launch(out, x, w, coef, expert_ids, weights, torch.cuda.current_stream())
+    stream = torch.cuda.current_stream()
+    launch(out, x, w, coef, expert_ids, weights, n_tokens, stream)
 
 
 def flydsl_rdna_moe_gemm(
@@ -796,15 +823,23 @@ def flydsl_rdna_moe_gemm(
     n_rows, N = out.shape
     if silu_mul:
         N *= 2
-    strides = (_expert_stride_dwords(w), _expert_stride_dwords(coef), coef_pairs)
+    build_args = (
+        x.shape[1],
+        N,
+        x_row_div,
+        group_size,
+        silu_mul,
+        _expert_stride_dwords(w),
+        _expert_stride_dwords(coef),
+        coef_pairs,
+        x.dtype == torch.float16,
+    )
     stream = torch.cuda.current_stream()
     if sorted_ids is None:
-        launch = _build_gemm_row(
-            x.shape[1], N, x_row_div, group_size, silu_mul, *strides
-        )
+        launch = _build_gemm_row(*build_args)
         launch(out, x, w, coef, expert_ids, expert_ids.numel(), stream)
         return
-    launch = _build_gemm(x.shape[1], N, x_row_div, group_size, silu_mul, *strides)
+    launch = _build_gemm(*build_args)
     launch(
         out,
         x,
@@ -816,4 +851,101 @@ def flydsl_rdna_moe_gemm(
         n_rows,
         expert_ids.numel(),
         stream,
+    )
+
+
+@functools.cache
+def _row_index(device: torch.device, rows: int) -> torch.Tensor:
+    return torch.arange(rows, dtype=torch.int32, device=device)
+
+
+def flydsl_rdna_moe(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    coef1: torch.Tensor,
+    w2: torch.Tensor,
+    coef2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    workspace: torch.Tensor,
+    group_size: int,
+    num_experts: int,
+    N: int,
+    activation=None,
+    w1_pairs: bool = True,
+    w2_pairs: bool = True,
+) -> None:
+    """``output[t] = sum_e topk_weights[t, e] * (W2[e] @ act(W1[e] @ x[t]))``.
+
+    ``w1`` / ``w2`` and their coefficients are in the ``pack_w4a16_weights``
+    layout. ``activation(out, gate_up)`` is applied between the GEMMs; when
+    it is None, ``w1`` is in ``gate_up_tile_order`` and GEMM1 applies
+    SiLU-and-multiply itself. ``N`` is the width of the activation output.
+    ``workspace`` holds the intermediates, bf16 ``M * top_k * (gate_up + N +
+    K)`` elements.
+    """
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
+        moe_unpermute,
+    )
+
+    silu_mul = activation is None
+    M, K = x.shape
+    top_k = topk_ids.size(1)
+    gate_up = w1.size(1) * TILE_N
+    rows = M * top_k
+    widths = (gate_up, N, K)
+    sizes = [rows * n for n in widths]
+    gate_up_out, act_out, down_out = (
+        t.view(rows, n)
+        for t, n in zip(workspace.view(-1)[: sum(sizes)].split(sizes), widths)
+    )
+    if M <= ROW_PATH_MAX_TOKENS:
+        # Few tokens seldom share an expert, so every row is its own block
+        # and the alignment kernel is not needed.
+        route = (None, topk_ids.to(torch.int32).view(-1), None)
+    else:
+        route = moe_align_block_size(topk_ids, BLOCK_M, num_experts)
+    flydsl_rdna_moe_gemm(
+        act_out if silu_mul else gate_up_out,
+        x,
+        w1,
+        coef1,
+        *route,
+        top_k,
+        group_size,
+        silu_mul=silu_mul,
+        coef_pairs=w1_pairs,
+    )
+    if not silu_mul:
+        activation(act_out, gate_up_out)
+    if (
+        route[0] is None
+        and top_k <= MAX_REDUCE_ROWS
+        and topk_weights.dtype == torch.float32
+    ):
+        # GEMM2 also does the weighted sum over the experts of a token.
+        flydsl_rdna_moe_gemm_reduce(
+            output,
+            act_out,
+            w2,
+            coef2,
+            route[1],
+            topk_weights,
+            group_size,
+            coef_pairs=w2_pairs,
+        )
+        return
+    flydsl_rdna_moe_gemm(
+        down_out, act_out, w2, coef2, *route, 1, group_size, coef_pairs=w2_pairs
+    )
+    # Rows are in routing order, so the top-k reduction needs no permutation.
+    moe_unpermute(
+        out=output,
+        permuted_hidden_states=down_out,
+        topk_weights=topk_weights,
+        inv_permuted_idx=_row_index(x.device, rows),
     )
