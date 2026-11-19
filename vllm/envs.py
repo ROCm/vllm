@@ -163,7 +163,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_W4A16_HIPBLASLT: Literal["auto", "off", "decode", "prefill", "all"] = (
-        "auto"
+        "off"
     )
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1431,13 +1431,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
     ),
     # Route the gfx11/gfx12 W4A16 GEMM through hipBLASLt instead of the
-    # RDNAHybrid kernels. "auto" (default) uses hipBLASLt for every layer it
-    # has a kernel for that does not cache a dense prefill copy, when vLLM was
-    # built against a hipBLASLt exposing the w4a16 API; "off" and "all" force
-    # the choice. The per-path modes are rejected -- see hipblaslt_w4a16_mode().
+    # RDNAHybrid kernels. "off" (default) keeps the RDNAHybrid kernels; "auto"
+    # uses hipBLASLt for every layer it has a kernel for that does not cache a
+    # dense prefill copy, when vLLM was built against a hipBLASLt exposing the
+    # w4a16 API; "all" forces it. The per-path modes are rejected -- see
+    # hipblaslt_w4a16_mode().
     "VLLM_ROCM_W4A16_HIPBLASLT": env_with_choices(
         "VLLM_ROCM_W4A16_HIPBLASLT",
-        "auto",
+        "off",
         ["auto", "off", "decode", "prefill", "all"],
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
