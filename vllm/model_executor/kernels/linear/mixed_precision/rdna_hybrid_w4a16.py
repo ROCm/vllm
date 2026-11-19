@@ -39,6 +39,15 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .hipblaslt_w4a16 import (
+    MODE_ALL,
+    MODE_DECODE,
+    MODE_PREFILL,
+    build_scale_buffer,
+    hipblaslt_w4a16_gemm,
+    hipblaslt_w4a16_has_solution,
+    use_for_layer,
+)
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 logger = init_logger(__name__)
@@ -707,6 +716,24 @@ def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
     )
 
 
+def pack_int4_plain(w_uint4: torch.Tensor) -> torch.Tensor:
+    """Pack uint4 values in K order: [N, K] -> [N, K//8] int32, element j at bit 4*j.
+
+    hipBLASLt's HIPBLASLT_INT4_ENCODING_UNSIGNED_BIAS8_EXT addresses element
+    ``idx`` at byte ``idx/2``, low nibble when ``idx`` is even -- i.e. no
+    shuffle. Used only when the hipBLASLt path owns every W4A16 GEMM; the HIP
+    skinny and Triton kernels read the ExLlama order and cannot share this
+    buffer.
+    """
+    N_dim, K_dim = w_uint4.shape
+    assert K_dim % 8 == 0
+    g = w_uint4.to(torch.uint8).view(N_dim, K_dim // 8, 8).to(torch.int32)
+    out = g[:, :, 0]
+    for j in range(1, 8):
+        out = out | (g[:, :, j] << (4 * j))
+    return out
+
+
 # gfx11 row strides alias in the vector caches when they land on a power-of-two
 # multiple.
 _CLIFF_PERIOD_BYTES = 512
@@ -764,20 +791,28 @@ def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
     return buf[:, :cols]  # inherits stride(0) = cols + pad_groups
 
 
-def pack_skinny_int4(unpacked: torch.Tensor) -> torch.Tensor:
+def _skinny_row_int32(k8: int) -> int:
+    """Row stride, in int32 words, of the buffer pack_skinny_int4 returns."""
+    pad_int32 = _weight_pad_bytes(k8 * 4) // 4
+    return k8 + (pad_int32 if _on_gfx1151() else 0)
+
+
+def pack_skinny_int4(unpacked: torch.Tensor, shuffle: bool = True) -> torch.Tensor:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
     ExLlama shuffle to [N, K//8] int32, viewed as int8 [N, K//2]. On gfx1151
     the row stride is nudged off the cliff (see ``_weight_pad_bytes``).
+
+    ``shuffle=False`` packs in plain K order instead, for the hipBLASLt path
+    (whose ExLlama encoding was removed upstream). The stride pad applies to
+    both orders.
     """
-    shuffled = pack_int4_exllama_shuffle(unpacked)
+    shuffled = (pack_int4_exllama_shuffle if shuffle else pack_int4_plain)(unpacked)
     n_rows, k8 = shuffled.shape
-    pad_int32 = _weight_pad_bytes(k8 * 4) // 4
-    if not (pad_int32 and _on_gfx1151()):
+    row_int32 = _skinny_row_int32(k8)
+    if row_int32 == k8:
         return shuffled.contiguous().view(torch.int8)
-    padded = torch.empty(
-        (n_rows, k8 + pad_int32), dtype=torch.int32, device=shuffled.device
-    )
+    padded = torch.empty((n_rows, row_int32), dtype=torch.int32, device=shuffled.device)
     padded[:, :k8].copy_(shuffled)
     # The int8 view keeps stride(0) = 4 * (k8 + pad_int32) bytes, and
     # .view(torch.int32) at apply time recovers the [N, K//8] int32 view.
@@ -803,6 +838,36 @@ def dequantize_w4a16(
     # bit-identical to fp32 math and avoids [N, K] fp32 temporaries.
     w.sub_(zp[..., None] if zp is not None else zp_bias).mul_(scales[..., None])
     return w.view(N_dim, K_dim)
+
+
+def pack_scale_zp_carrier(
+    w_s: torch.Tensor,  # [N, K//G] fp16/bf16
+    zp_unpacked: torch.Tensor,  # [N, K//G] int32, raw nibbles 0..15
+    act_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Fold the per-group scale and zero-point into one fp32-carrier load.
+
+    Only worth it for asymmetric layers, where it turns the Triton prefill
+    kernel's two per-group loads into one. Symmetric layers skip it: the -8
+    offset is a constant, so there is no second load to fold and the carrier is
+    pure overhead (measured ~+8% on fp16 sym).
+
+    Layout (matches the kernel's HAS_ZP dequant):
+      fp16: low16 = scale, high16 = bias_eff (= -8*scale - (zp-8)*scale).
+            Consumed via one fp16 FMA with the magic-constant i4->fp16 unpack.
+      bf16: low16 = scale (bf16 bits), high16 = zp_int (raw zp 0..15), as a
+            plain integer. Consumed by the int-domain subtract (RDNA3 has no
+            v_pk_fma_bf16). Bit-identical to the separate scale+zp loads.
+    """
+    scale_u16 = w_s.view(torch.uint16).to(torch.int32) & 0xFFFF
+    if act_dtype == torch.float16:
+        w_s_f32 = w_s.to(torch.float32)
+        scaled_zp_f32 = (zp_unpacked.to(torch.float32) - 8.0) * w_s_f32
+        bias_eff = (-(8.0 * w_s_f32 + scaled_zp_f32)).to(act_dtype)
+        hi_u16 = bias_eff.contiguous().view(torch.uint16).to(torch.int32) & 0xFFFF
+    else:
+        hi_u16 = zp_unpacked.to(torch.int32) & 0xFFFF  # raw zp 0..15
+    return ((hi_u16 << 16) | scale_u16).view(torch.float32).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +905,8 @@ def _rdna_hybrid_w4a16_apply_impl(
     group_size: int,
     packed_scale_zp: torch.Tensor | None = None,
     w_dequant: torch.Tensor | None = None,
+    hipblaslt_scale: torch.Tensor | None = None,
+    hipblaslt_mode: int = 0,
 ) -> torch.Tensor:
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
@@ -857,6 +924,11 @@ def _rdna_hybrid_w4a16_apply_impl(
                on it. Passed as an op arg (not branched on in apply_weights) so the
                M-branch stays out of the compiled graph -- decode (small M) replays
                the same int4 cudagraph whether or not the dequantized copy exists.
+      hipblaslt_scale: scale pointer for the hipBLASLt path -- w_s itself when
+               symmetric, the combined scale+zero-point buffer when asymmetric.
+      hipblaslt_mode: MODE_DECODE | MODE_PREFILL bitmask from
+               VLLM_ROCM_W4A16_HIPBLASLT, resolved by apply_weights so the env
+               read stays out of the compiled graph.
 
     Registered as a custom op so torch.compile treats it as opaque.
     """
@@ -876,18 +948,33 @@ def _rdna_hybrid_w4a16_apply_impl(
     # so label consumers need one grammar.
     _gz = f"g={group_size} {'asym' if w_zp is not None else 'sym'}"
 
+    def _hipblaslt() -> torch.Tensor:
+        with _profile_scope(f"hipblaslt_w4a16 {M}x{N}x{K} {_gz}"):
+            assert hipblaslt_scale is not None
+            out = hipblaslt_w4a16_gemm(
+                x_2d, w_q, hipblaslt_scale, group_size, w_zp is not None
+            )
+            if bias is not None:
+                out.add_(bias)
+        return out
+
     # Use the HIP skinny kernel for small batch sizes (fast decode path).
     #
     # There is no LDS bound here: the kernel handles the overflow itself (the
     # part of the activation that does not fit in LDS is read from global), so
     # the batch size is the only thing that has to be bounded.
     if M <= MAX_SKINNY_BATCH_SIZE:
+        if hipblaslt_mode & MODE_DECODE:
+            return _hipblaslt()
         with _profile_scope(f"wvsplitk_int4 {M}x{N}x{K} {_gz}"):
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
 
     if w_dequant is not None and M >= MIN_DENSE_M:
         with _profile_scope(f"hybrid_dequant_w4a16 {M}x{N}x{K} {_gz}"):
             return rocm_unquantized_gemm_impl(x_2d, w_dequant, bias)
+
+    if hipblaslt_mode & MODE_PREFILL:
+        return _hipblaslt()
 
     with _profile_scope(f"hybrid_triton_w4a16 {M}x{N}x{K} {_gz}"):
         # Asymmetric layers carry the packed scale/zp carrier (scale + zero-point folded
@@ -915,6 +1002,8 @@ def _rdna_hybrid_w4a16_apply_fake(
     group_size: int,
     packed_scale_zp: torch.Tensor | None = None,
     w_dequant: torch.Tensor | None = None,
+    hipblaslt_scale: torch.Tensor | None = None,
+    hipblaslt_mode: int = 0,
 ) -> torch.Tensor:
     M = x_2d.size(0)
     N = w_q.size(0)
@@ -1069,7 +1158,37 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             unpacked = unpacked.t().contiguous()
 
         # Store as int8; Triton reinterprets via .view(torch.int32) at apply time.
-        w_q_skinny = pack_skinny_int4(unpacked)
+        # hipBLASLt dropped the ExLlama int4 encoding, so when it owns this
+        # layer's GEMMs the weights go down in plain K order instead. Neither
+        # wvSplitK_int4_g nor the Triton kernel is then reached for this layer
+        # -- they read the ExLlama shuffle -- so the choice is made once, here,
+        # and holds for both prefill and decode.
+        # The dense cache is all-or-nothing (it raises rather than skipping a
+        # layer), so "enable" means this layer will hold a copy.
+        kernel_config = get_current_vllm_config().kernel_config
+        cache_dense = kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable"
+        N, K = unpacked.shape
+
+        def _hipblaslt_has_solution() -> bool:
+            return hipblaslt_w4a16_has_solution(
+                w_s_raw.data,
+                c.act_type,
+                N,
+                K,
+                _skinny_row_int32(K // 8) * 8,
+                c.group_size,
+                c.zero_points,
+                get_current_vllm_config().scheduler_config.max_num_batched_tokens,
+            )
+
+        use_hipblaslt = unpacked.device.type == "cuda" and use_for_layer(
+            c.group_size,
+            cache_dense,
+            _hipblaslt_has_solution,
+            f"N={N} K={K} group_size={c.group_size} "
+            f"{'asym' if c.zero_points else 'sym'} {c.act_type}",
+        )
+        w_q_skinny = pack_skinny_int4(unpacked, shuffle=not use_hipblaslt)
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
         permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
@@ -1110,46 +1229,42 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             w_zp = w_zp_packed
             self._transform_param(layer, self.w_zp_name, lambda x: w_zp_packed)
 
+        # ---- hipBLASLt scale pointer (VLLM_ROCM_W4A16_HIPBLASLT) ----
+        # Symmetric layers pass w_s straight through. Asymmetric layers need the
+        # zero-points appended to the scales in one allocation, so w_s becomes a
+        # view into that buffer's head -- identical bytes and layout for the HIP
+        # skinny and Triton kernels, and no second copy of the scales.
+        if use_hipblaslt:
+            hipblaslt_scale, w_s_skinny = build_scale_buffer(
+                w_s_skinny, w_zp, c.group_size
+            )
+            if hipblaslt_scale is not w_s_skinny:
+                layer.register_parameter(
+                    "_hybrid_hipblaslt_scale",
+                    torch.nn.Parameter(hipblaslt_scale, requires_grad=False),
+                )
+        layer._hybrid_hipblaslt_ok = use_hipblaslt
+
         # ---- Store on layer ----
         # Replace w_q with skinny int8 (primary weights for skinny kernel)
         self._transform_param(layer, self.w_q_name, lambda x: w_q_skinny)
         # Replace w_s with skinny scales
         self._transform_param(layer, self.w_s_name, lambda x: w_s_skinny)
 
-        # Packed scale/zp carrier for the Triton prefill path — built ONLY
-        # for asymmetric layers, where it folds the two per-group loads (scale +
-        # zp) into one. Symmetric layers skip it: the -8 offset is a constant, so
-        # there is no second load to fold and the carrier would be pure overhead
-        # (measured ~+8% on fp16 sym); sym reads scales directly instead.
-        # Layout (matches the kernel's HAS_ZP dequant):
-        #   fp16: low16 = scale, high16 = bias_eff (= -8*scale - (zp-8)*scale).
-        #         Consumed via one fp16 FMA with the magic-constant i4->fp16 unpack.
-        #   bf16: low16 = scale (bf16 bits), high16 = zp_int (raw zp 0..15), as a
-        #         plain integer. Consumed by the int-domain subtract (RDNA3 has no
-        #         v_pk_fma_bf16). Bit-identical to the separate scale+zp loads.
+        # Built ONLY for asymmetric layers; see pack_scale_zp_carrier.
         if c.zero_points and c.act_type in (torch.float16, torch.bfloat16):
             # both set above whenever c.zero_points is True
             assert w_zp is not None
             assert zp_unpacked is not None
-            scale_u16 = w_s_skinny.view(torch.uint16).to(torch.int32) & 0xFFFF
-            if c.act_type == torch.float16:
-                w_s_f32 = w_s_skinny.to(torch.float32)
-                scaled_zp_f32 = (zp_unpacked.to(torch.float32) - 8.0) * w_s_f32
-                bias_eff = (-(8.0 * w_s_f32 + scaled_zp_f32)).to(c.act_type)
-                bias_u16 = bias_eff.contiguous().view(torch.uint16)
-                hi_u16 = bias_u16.to(torch.int32) & 0xFFFF
-            else:
-                hi_u16 = zp_unpacked.to(torch.int32) & 0xFFFF  # raw zp 0..15
-            packed_scale_zp = (
-                ((hi_u16 << 16) | scale_u16).view(torch.float32).contiguous()
-            )
             layer.register_parameter(
                 "_hybrid_w_packed_scale_zp",
-                torch.nn.Parameter(packed_scale_zp, requires_grad=False),
+                torch.nn.Parameter(
+                    pack_scale_zp_carrier(w_s_skinny, zp_unpacked, c.act_type),
+                    requires_grad=False,
+                ),
             )
 
-        kernel_config = get_current_vllm_config().kernel_config
-        if kernel_config.rdna_hybrid_w4a16_prefill_dequant == "enable":
+        if cache_dense:
             self._cache_dequant_weight(layer, unpacked, w_s_skinny, zp_unpacked)
 
     def apply_weights(
@@ -1169,6 +1284,16 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         N = w_q.shape[0]
         out_shape = x.shape[:-1] + (N,)
 
+        # Symmetric layers hand w_s to hipBLASLt directly; asymmetric ones carry
+        # the combined scale+zero-point buffer built at load time. Stays None
+        # when the path is off, so the op sees exactly the arguments it used to.
+        hipblaslt_mode = (
+            MODE_ALL if getattr(layer, "_hybrid_hipblaslt_ok", False) else 0
+        )
+        hipblaslt_scale = None
+        if hipblaslt_mode:
+            hipblaslt_scale = getattr(layer, "_hybrid_hipblaslt_scale", w_s)
+
         cu_count = num_compute_units()
         output = torch.ops.vllm.rdna_hybrid_w4a16_apply(
             x_2d,
@@ -1180,5 +1305,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             c.group_size,
             packed_scale_zp,
             getattr(layer, self.DEQUANT_WEIGHT_NAME, None),
+            hipblaslt_scale,
+            hipblaslt_mode,
         )
         return output.reshape(out_shape)

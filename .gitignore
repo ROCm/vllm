@@ -229,6 +229,9 @@ _build/
 *.hip
 *_hip*
 hip_compat.h
+# `*_hip*` is meant for hipified artifacts, but it also swallows hand-written
+# sources whose name contains "_hip" -- e.g. any test named after hipBLASLt.
+!**/test_hipblaslt*.py
 
 # Benchmark dataset
 benchmarks/**/*.json
