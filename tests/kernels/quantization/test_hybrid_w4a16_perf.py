@@ -495,7 +495,7 @@ def prepare_hybrid_weights(
 
     # Build the skinny weights via the SAME production helper the layer uses at
     # load time, so the benchmark exercises the real memory layout -- including
-    # the gfx1151 cliff row-pad -- with no duplicated stride logic here. Values
+    # the gfx115x row pad -- with no duplicated stride logic here. Values
     # are random (irrelevant to timing); only shape/stride/dtype matter.
     unpacked = torch.randint(0, 16, (N, K), dtype=torch.int32, device=device)
     w_q_skinny = pack_skinny_int4(unpacked)
@@ -592,8 +592,8 @@ _ROTATE_MAX = int(os.environ.get("VLLM_BENCH_ROTATE_MAX", "32"))
 
 
 def _clone_strided(t: torch.Tensor | None) -> torch.Tensor | None:
-    """Clone preserving exact size AND stride (the K%2048 cliff workaround uses
-    row-padded weight strides; a plain .clone() would compact them and change
+    """Clone preserving exact size AND stride (gfx115x weights are row-padded,
+    see padded_row_stride_bytes; a plain .clone() would compact them and change
     the measured kernel). None passes through (symmetric path has no carrier).
     """
     if t is None:

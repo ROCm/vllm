@@ -87,6 +87,14 @@ def _on_gfx1151() -> bool:
     return on_gfx1151()
 
 
+def _on_gfx115x() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx115x
+
+    return on_gfx115x()
+
+
 def _fits_in_memory_budget(nbytes: int, device: torch.device) -> bool:
     # Same budget the KV cache is later sized from. Keep room for the
     # activation peak and for KV of one max_model_len request (the floor the
@@ -217,6 +225,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     num_groups,  # K // group_size
     stride_bn,  # b_ptr row stride; >= K8, the rows may be padded
     stride_am,  # a_ptr row stride in elements; >= K, rows may be padded
+    stride_cm,  # c_ptr row stride in elements; >= N, rows may be padded
     stride_sn,  # per-row stride of scales_ptr
     stride_pn,  # per-row stride of packed_scale_zp_ptr
     group_size,
@@ -391,7 +400,7 @@ def _triton_w4a16_skinny_fmt_kernel(
 
     # ---- Store output C: [BLOCK_M, BLOCK_N] ----
     c = accumulator.to(c_ptr.type.element_ty)
-    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :]
     mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=mask_c)
 
@@ -587,7 +596,7 @@ def triton_w4a16_skinny_fmt_gemm(
         assert out.device == a.device, (
             f"out device mismatch: {out.device} vs {a.device}"
         )
-        assert out.is_contiguous(), "out must be contiguous"
+        assert out.stride(1) == 1, "out rows must be contiguous"
         c = out
 
     num_stages: int | None = None
@@ -668,6 +677,7 @@ def triton_w4a16_skinny_fmt_gemm(
         num_groups,
         stride_bn,
         stride_am,
+        c.stride(0),
         stride_sn,
         stride_pn,
         group_size=group_size,
@@ -707,41 +717,32 @@ def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
     )
 
 
-# gfx11 row strides alias in the vector caches when they land on a power-of-two
-# multiple.
+# gfx1151 scale / zero-point row stride: throughput is a period-512 B function
+# of the stride, and wants a multiple of 128 that is not a multiple of 512.
 _CLIFF_PERIOD_BYTES = 512
 _CLIFF_ALIGN_BYTES = 128
-_WEIGHT_CLIFF_BYTES = 512  # packed weight row, K/2 B
-_ACT_CLIFF_BYTES = 2048  # activation row, K*2 B
-_STRIDE_PAD_BYTES = 128  # one cache line
 
 
-def _weight_pad_bytes(row_bytes: int) -> int:
-    """Bytes to add to a packed weight row stride to move it off the cliff.
+def padded_row_stride_bytes(row_bytes: int) -> int:
+    """Smallest row stride >= ``row_bytes`` that is an odd multiple of 128 B.
 
-    Only strides that are a multiple of ``_WEIGHT_CLIFF_BYTES`` are moved, and
-    only by one cache line; padding a stride that is already off the cliff
-    costs memory and measures slower.
+    gfx115x W4A16 GEMMs have no per-workgroup K offset (StaggerU), so rows
+    whose stride is a multiple of 256 B -- and above all of 1 KiB -- send the
+    workgroups reading the same K window to the same few DRAM channels.
     """
-    if row_bytes % _WEIGHT_CLIFF_BYTES:
-        return 0
-    return _STRIDE_PAD_BYTES
-
-
-def _act_pad_bytes(row_bytes: int) -> int:
-    """Bytes to add to an activation row stride to move it off the cliff."""
-    if row_bytes % _ACT_CLIFF_BYTES:
-        return 0
-    return _STRIDE_PAD_BYTES
+    s = -(-row_bytes // _CLIFF_ALIGN_BYTES)
+    if s % 2 == 0:
+        s += 1
+    return s * _CLIFF_ALIGN_BYTES
 
 
 def _group_stride_pad(num_groups: int, elem_bytes: int) -> int:
     """Groups to add so a metadata row does not land on a 512 B multiple.
 
-    The scale and zero-point rows sit on the same period-512 B cliff as the
-    packed weight rows (see ``_cliff_pad_bytes``).  Padding a row that is
-    already in a good class makes it slower, so the pad is spent only on rows
-    whose byte size is a multiple of 512; +128 B lands them on 128 mod 512.
+    The scale and zero-point rows sit on a period-512 B cliff on gfx1151.
+    Padding a row that is already in a good class makes it slower, so the pad
+    is spent only on rows whose byte size is a multiple of 512; +128 B lands
+    them on 128 mod 512.
     """
     if (num_groups * elem_bytes) % _CLIFF_PERIOD_BYTES:
         return 0
@@ -767,13 +768,14 @@ def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
 def pack_skinny_int4(unpacked: torch.Tensor) -> torch.Tensor:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
-    ExLlama shuffle to [N, K//8] int32, viewed as int8 [N, K//2]. On gfx1151
-    the row stride is nudged off the cliff (see ``_weight_pad_bytes``).
+    ExLlama shuffle to [N, K//8] int32, viewed as int8 [N, K//2]. On gfx115x
+    each row is padded to ``padded_row_stride_bytes``; the decode and prefill
+    GEMMs share this buffer, so the stride follows the prefill rule.
     """
     shuffled = pack_int4_exllama_shuffle(unpacked)
     n_rows, k8 = shuffled.shape
-    pad_int32 = _weight_pad_bytes(k8 * 4) // 4
-    if not (pad_int32 and _on_gfx1151()):
+    pad_int32 = (padded_row_stride_bytes(k8 * 4) - k8 * 4) // 4
+    if not (pad_int32 and _on_gfx115x()):
         return shuffled.contiguous().view(torch.int8)
     padded = torch.empty(
         (n_rows, k8 + pad_int32), dtype=torch.int32, device=shuffled.device
@@ -805,29 +807,36 @@ def dequantize_w4a16(
     return w.view(N_dim, K_dim)
 
 
+def _out_row_stride(n: int, dtype: torch.dtype) -> int:
+    """Output row stride (elements) for an N-wide layer, or 0 for dense.
+
+    Only gfx115x pads. The row-padded output is handed to the next op as a
+    view, so it is skipped when TP/PP would send it to a collective, which
+    needs contiguous tensors.
+    """
+    import vllm.envs as envs
+
+    if not (_on_gfx115x() and envs.VLLM_ROCM_W4A16_PAD_OUTPUT):
+        return 0
+    parallel_config = get_current_vllm_config().parallel_config
+    if (
+        parallel_config.tensor_parallel_size > 1
+        or parallel_config.pipeline_parallel_size > 1
+    ):
+        return 0
+    elem = torch.empty((), dtype=dtype).element_size()
+    return padded_row_stride_bytes(n * elem) // elem
+
+
+def _empty_rows(m: int, n: int, row_stride: int, like: torch.Tensor) -> torch.Tensor:
+    """[m, n] tensor whose rows are ``row_stride`` elements apart (0 = n)."""
+    out = torch.empty((m, row_stride or n), dtype=like.dtype, device=like.device)
+    return out[:, :n]
+
+
 # ---------------------------------------------------------------------------
 # Hybrid dispatch logic
 # ---------------------------------------------------------------------------
-
-
-def _pad_activation_rows(x_2d: torch.Tensor) -> torch.Tensor:
-    """Copy ``x_2d`` into a row-padded buffer when its row stride is on the cliff.
-
-    The packed weight is padded once at load time, but activations are produced
-    fresh every step, so this materialises a padded copy.
-    """
-    pad_bytes = _act_pad_bytes(x_2d.shape[1] * x_2d.element_size())
-    if not (pad_bytes and _on_gfx1151()):
-        return x_2d
-    pad_elems = pad_bytes // x_2d.element_size()
-    buf = torch.empty(
-        (x_2d.shape[0], x_2d.shape[1] + pad_elems),
-        dtype=x_2d.dtype,
-        device=x_2d.device,
-    )
-    padded = buf[:, : x_2d.shape[1]]
-    padded.copy_(x_2d)
-    return padded
 
 
 def _rdna_hybrid_w4a16_apply_impl(
@@ -840,6 +849,7 @@ def _rdna_hybrid_w4a16_apply_impl(
     group_size: int,
     packed_scale_zp: torch.Tensor | None = None,
     w_dequant: torch.Tensor | None = None,
+    out_row_stride: int = 0,
 ) -> torch.Tensor:
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
@@ -857,6 +867,9 @@ def _rdna_hybrid_w4a16_apply_impl(
                on it. Passed as an op arg (not branched on in apply_weights) so the
                M-branch stays out of the compiled graph -- decode (small M) replays
                the same int4 cudagraph whether or not the dequantized copy exists.
+      out_row_stride: row stride of the [M, N] output in elements, or 0 for a
+               dense output. Every path honours it, so the output layout does
+               not depend on M (the fake impl has to commit to one).
 
     Registered as a custom op so torch.compile treats it as opaque.
     """
@@ -883,10 +896,27 @@ def _rdna_hybrid_w4a16_apply_impl(
     # the batch size is the only thing that has to be bounded.
     if M <= MAX_SKINNY_BATCH_SIZE:
         with _profile_scope(f"wvsplitk_int4 {M}x{N}x{K} {_gz}"):
-            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
+            # The skinny kernel reads the activation as one flat run, so a
+            # row-padded x is compacted (a copy of at most 5 rows).
+            return ops.wvSplitK_int4_g(
+                w_q,
+                x_2d.contiguous(),
+                w_s,
+                cu_count,
+                group_size,
+                w_zp,
+                bias,
+                out_row_stride,
+            )
 
     if w_dequant is not None and M >= MIN_DENSE_M:
         with _profile_scope(f"hybrid_dequant_w4a16 {M}x{N}x{K} {_gz}"):
+            if out_row_stride:
+                # BLAS writes a row-padded output in place (ldc), no copy.
+                out = _empty_rows(M, N, out_row_stride, x_2d)
+                if bias is None:
+                    return torch.mm(x_2d, w_dequant.t(), out=out)
+                return torch.addmm(bias, x_2d, w_dequant.t(), out=out)
             return rocm_unquantized_gemm_impl(x_2d, w_dequant, bias)
 
     with _profile_scope(f"hybrid_triton_w4a16 {M}x{N}x{K} {_gz}"):
@@ -894,10 +924,14 @@ def _rdna_hybrid_w4a16_apply_impl(
         # into one load); symmetric layers pass packed_scale_zp=None and the kernel
         # reads scales directly with a constant -8 offset (no carrier overhead).
         output = triton_w4a16_skinny_fmt_gemm(
-            a=_pad_activation_rows(x_2d),
+            # No padded copy of x: it measured slower than reading the rows
+            # where they are; x is already padded when it comes from a
+            # row-padded output (see _out_row_stride).
+            a=x_2d,
             b_q=w_q.view(torch.int32),
             scales=w_s,
             group_size=_resolved_group_size(group_size, K),
+            out=_empty_rows(M, N, out_row_stride, x_2d),
             packed_scale_zp=packed_scale_zp,
         )
         if bias is not None:
@@ -915,10 +949,9 @@ def _rdna_hybrid_w4a16_apply_fake(
     group_size: int,
     packed_scale_zp: torch.Tensor | None = None,
     w_dequant: torch.Tensor | None = None,
+    out_row_stride: int = 0,
 ) -> torch.Tensor:
-    M = x_2d.size(0)
-    N = w_q.size(0)
-    return torch.empty((M, N), dtype=x_2d.dtype, device=x_2d.device)
+    return _empty_rows(x_2d.size(0), w_q.size(0), out_row_stride, x_2d)
 
 
 direct_register_custom_op(
@@ -1116,6 +1149,12 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         # Replace w_s with skinny scales
         self._transform_param(layer, self.w_s_name, lambda x: w_s_skinny)
 
+        layer._hybrid_out_row_stride = (
+            _out_row_stride(w_q_skinny.shape[0], c.act_type)
+            if unpacked.device.type == "cuda"
+            else 0
+        )
+
         # Packed scale/zp carrier for the Triton prefill path — built ONLY
         # for asymmetric layers, where it folds the two per-group loads (scale +
         # zp) into one. Symmetric layers skip it: the -8 offset is a constant, so
@@ -1180,5 +1219,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
             c.group_size,
             packed_scale_zp,
             getattr(layer, self.DEQUANT_WEIGHT_NAME, None),
+            getattr(layer, "_hybrid_out_row_stride", 0),
         )
         return output.reshape(out_shape)

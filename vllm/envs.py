@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
+    VLLM_ROCM_W4A16_PAD_OUTPUT: bool = True
     VLLM_MOE_MAX_SKINNY_BATCH_SIZE: int = 5
     VLLM_MOE_HIP: str | None = None
     VLLM_GDN_HIP: bool = True
@@ -1255,6 +1256,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Converts weights to skinny layout [E, N, K//8] int32 (ExLlama shuffle).
     "VLLM_MOE_HYBRID_W4A16": lambda: (
         os.getenv("VLLM_MOE_HYBRID_W4A16", "true").lower() in ("true", "1")
+    ),
+    # gfx115x W4A16 linear: return the output as a view of a row-padded buffer
+    # (see padded_row_stride_bytes) so the next GEMM reads well-spread rows.
+    "VLLM_ROCM_W4A16_PAD_OUTPUT": lambda: (
+        os.getenv("VLLM_ROCM_W4A16_PAD_OUTPUT", "true").lower() in ("true", "1")
     ),
     # Largest token count the hybrid W4A16 MoE runs on the HIP wvSplitK
     # kernel; above it the Triton/WMMA prefill path is used. Speculative

@@ -69,6 +69,18 @@ def swiglustep_and_mul_triton(
     )
 
 
+def _dense_rows(x: torch.Tensor) -> torch.Tensor:
+    """``x`` with row t starting at t * x.shape[-1], as the _C kernels assume.
+
+    A view of a row-padded GEMM output (gfx115x W4A16) is compacted. Checked
+    on strides rather than with is_contiguous() so that a symbolic token count
+    adds no guard.
+    """
+    if x.dim() < 2 or x.stride(-2) == x.shape[-1]:
+        return x
+    return x.contiguous()
+
+
 # --8<-- [start:fatrelu_and_mul]
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
@@ -101,6 +113,7 @@ class FatreluAndMul(CustomOp):
         return x1 * x2
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -144,6 +157,7 @@ class SiluAndMul(CustomOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -191,6 +205,7 @@ class SituAndMul(CustomOp):
         return (gate * up).to(x.dtype)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         # Fused CUDA/XPU kernel: writes straight to `out`, no fp32 temporaries.
         # linear_beta<=0 signals "unset" to the kernel (up passed through).
         d = x.shape[-1] // 2
@@ -243,6 +258,7 @@ class SiluAndMulWithClamp(CustomOp):
         return gate * torch.sigmoid(self.alpha * gate) * (up + self.beta)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -290,6 +306,7 @@ class MulAndSilu(CustomOp):
         return x[..., :d] * F.silu(x[..., d:])
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -454,6 +471,7 @@ class GeluAndMul(CustomOp):
         return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -493,6 +511,7 @@ class SwigluOAIAndMul(CustomOp):
         return gated_output
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -571,6 +590,7 @@ class NewGELU(CustomOp):
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         out = torch.empty_like(x)
         self.op(out, x)
         return out
@@ -603,6 +623,7 @@ class FastGELU(CustomOp):
         return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         out = torch.empty_like(x)
         self.op(out, x)
         return out
@@ -636,6 +657,7 @@ class QuickGELU(CustomOp):
         return x * torch.sigmoid(1.702 * x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         out = torch.empty_like(x)
         self.op(out, x)
         return out
@@ -668,6 +690,7 @@ class ReLUSquaredActivation(CustomOp):
         return torch.square(F.relu(x))
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        x = _dense_rows(x)
         out = torch.empty_like(x)
         self.op(out, x)
         return out

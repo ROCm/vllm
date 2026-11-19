@@ -41,7 +41,8 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_w, const at::Tensor& in_x,
                               const at::Tensor& in_scale,
                               const std::optional<at::Tensor>& in_zero_points,
                               const std::optional<at::Tensor>& in_bias,
-                              const int64_t CuCount, const int64_t group_size);
+                              const int64_t CuCount, const int64_t group_size,
+                              const int64_t out_row_stride);
 
 void fused_moe_wvSplitK_int4_gemm(torch::Tensor a, torch::Tensor w,
                                   torch::Tensor scales, torch::Tensor c,
