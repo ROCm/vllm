@@ -70,7 +70,7 @@ def prepare_hybrid_weights(K, N, group_size, device="cuda"):
     """Create random weights for benchmarking, in the layer's own layout.
 
     Packing goes through ``pack_skinny_int4`` rather than a plain contiguous
-    buffer so the row stride (and the gfx1151 cliff pad) matches production --
+    buffer so the row stride (and the gfx115x row pad) matches production --
     throughput is a period-512-byte function of that stride, so a benchmark
     that packs its own weights measures a different kernel.
     """
