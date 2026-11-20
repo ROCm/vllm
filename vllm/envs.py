@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
+    VLLM_ROCM_USE_AITER_LINEAR_W4A16: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4: bool | None = None
@@ -162,9 +163,6 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
-    VLLM_ROCM_W4A16_HIPBLASLT: Literal["auto", "off", "decode", "prefill", "all"] = (
-        "off"
-    )
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
@@ -1314,6 +1312,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ROCM_USE_AITER_LINEAR_HIPBMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_LINEAR_HIPBMM", "False").lower() in ("true", "1")
     ),
+    # Whether to use aiter's W4A16 GEMM (int4 weights, fp16/bf16 activations)
+    # for the linear layers it supports, when aiter linear ops are enabled
+    # (VLLM_ROCM_USE_AITER and VLLM_ROCM_USE_AITER_LINEAR).
+    # By default is enabled.
+    "VLLM_ROCM_USE_AITER_LINEAR_W4A16": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_LINEAR_W4A16", "True").lower() in ("true", "1")
+    ),
     # Whether to use aiter moe ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MOE": lambda: (
@@ -1429,17 +1434,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
-    ),
-    # Route the gfx11/gfx12 W4A16 GEMM through hipBLASLt instead of the
-    # RDNAHybrid kernels. "off" (default) keeps the RDNAHybrid kernels; "auto"
-    # uses hipBLASLt for every layer it has a kernel for that does not cache a
-    # dense prefill copy, when vLLM was built against a hipBLASLt exposing the
-    # w4a16 API; "all" forces it. The per-path modes are rejected -- see
-    # hipblaslt_w4a16_mode().
-    "VLLM_ROCM_W4A16_HIPBLASLT": env_with_choices(
-        "VLLM_ROCM_W4A16_HIPBLASLT",
-        "off",
-        ["auto", "off", "decode", "prefill", "all"],
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

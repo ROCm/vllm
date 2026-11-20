@@ -117,14 +117,14 @@ def _pack_zp_along_n(zp_nkg):
 PROVIDERS = ["torch-fp16", "hybrid-w4a16", "hybrid-w4a16-zp"]
 # Force one path regardless of the dispatch heuristic, so all of them can be
 # timed on the same shape (used to check where the HIP skinny kernel stops
-# winning, and to compare hipBLASLt against both of the in-tree kernels).
+# winning, and to compare AITER's W4A16 GEMM against both of the in-tree kernels).
 FORCED_PROVIDERS = [
     "hip-w4a16",
     "triton-w4a16",
-    "hipblaslt-w4a16",
+    "aiter-w4a16",
     "hip-w4a16-zp",
     "triton-w4a16-zp",
-    "hipblaslt-w4a16-zp",
+    "aiter-w4a16-zp",
 ]
 
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
@@ -173,15 +173,14 @@ def _make_runner(provider, a, weights, group_size):
             packed_scale_zp=carrier,
         )
 
-    if provider.startswith("hipblaslt-w4a16"):
-        from vllm.model_executor.kernels.linear.mixed_precision import (
-            hipblaslt_w4a16 as _h,
-        )
+    if provider.startswith("aiter-w4a16"):
+        from vllm._aiter_ops import rocm_aiter_ops
 
-        # hipBLASLt takes the scales and zero-points as one allocation; the
-        # layer builds the same buffer once at load time.
-        scale, _ = _h.build_scale_buffer(w["w_s_skinny"], zp, group_size)
-        return lambda: _h.hipblaslt_w4a16_gemm(
+        # AITER takes dense scales and the zero-points as one allocation; the
+        # layer builds the same buffer once at load time. Timing only: the
+        # weights stay in the ExLlama order the in-tree kernels read.
+        scale = rocm_aiter_ops.hipb_w4a16_scale_buffer(w["w_s_skinny"].contiguous(), zp)
+        return lambda: rocm_aiter_ops.hipb_w4a16_mm(
             a, w["w_q_skinny"], scale, group_size, asym
         )
 

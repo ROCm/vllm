@@ -26,6 +26,9 @@ from vllm.model_executor.kernels.linear.mixed_precision import (
     MPLinearKernel,
     MPLinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.aiter_w4a16 import (
+    AiterW4A16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.conch import (
     ConchLinearKernel,
 )
@@ -519,6 +522,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     ],
     PlatformEnum.ROCM: [
         HipW8A16LinearKernel,
+        AiterW4A16LinearKernel,
         RDNA3W4A16LinearKernel,
         RDNAHybridW4A16LinearKernel,
         TritonW4A16LinearKernel,
@@ -1284,6 +1288,7 @@ __all__ = [
     "ZentorchWNA16LinearKernel",
     "MPLinearKernel",
     "MPLinearLayerConfig",
+    "AiterW4A16LinearKernel",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",
     "CutlassW4A8LinearKernel",
