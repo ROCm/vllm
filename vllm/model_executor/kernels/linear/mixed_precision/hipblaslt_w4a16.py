@@ -2,14 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """hipBLASLt W4A16 GEMM, as a drop-in replacement for the RDNAHybrid kernels.
 
-Compiled into ``_rocm_C`` only when CMake's probe finds that the ROCm being
-built against has a hipBLASLt exposing the w4a16 API (see the
-VLLM_HIPBLASLT_HAS_W4A16 block in CMakeLists.txt); against an older ROCm the
-ops simply do not exist. ``VLLM_ROCM_W4A16_HIPBLASLT`` then chooses whether to
-use them.
+Runs through AITER (``rocm_aiter_ops.hipb_w4a16_*``), which builds it only when
+the hipBLASLt it compiles against exposes the w4a16 API.
+``VLLM_ROCM_W4A16_HIPBLASLT`` chooses whether to use it.
 
-Activations, the output and the zero-points are handed over untouched -- see
-``csrc/rocm/hipblaslt_w4a16.cu`` for the index mapping, and note that
+Activations, the output and the zero-points are handed over untouched:
 hipBLASLt's zero-point region is ``[ceil(N/8)][K/G]`` 32-bit words with row n
 in nibble ``n % 8``, which is already how vLLM packs ``qzeros``. Only the
 weights are rebuilt at load time: hipBLASLt dropped the ExLlama int4 encoding
@@ -23,6 +20,7 @@ from collections.abc import Callable
 import torch
 
 from vllm import envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -33,17 +31,13 @@ MODE_ALL = MODE_DECODE | MODE_PREFILL
 
 _MODES = {"off": 0, "decode": MODE_DECODE, "prefill": MODE_PREFILL, "all": MODE_ALL}
 
-# Matches c_blockScaleAZeroPointAlignment in hipBLASLt's tensile_host.cpp.
-ZERO_POINT_ALIGNMENT = 256
-
 # One block-scale mode per group size, so these are the only ones expressible.
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
 
 
-@functools.cache
 def is_built() -> bool:
-    """Whether CMake compiled the w4a16 ops into _rocm_C."""
-    return hasattr(torch.ops._rocm_C, "hipblaslt_w4a16_gemm")
+    """Whether the installed AITER exposes the hipBLASLt w4a16 GEMM."""
+    return rocm_aiter_ops.has_hipb_w4a16()
 
 
 @functools.cache
@@ -73,10 +67,8 @@ def hipblaslt_w4a16_mode() -> int:
         )
     if mode and not is_built():
         raise RuntimeError(
-            "VLLM_ROCM_W4A16_HIPBLASLT=all but vLLM was built against a ROCm "
-            "whose hipBLASLt has no w4a16 API, so _rocm_C has no "
-            "hipblaslt_w4a16_gemm. Rebuild against a ROCm that exposes it, or "
-            "use 'off'."
+            "VLLM_ROCM_W4A16_HIPBLASLT=all needs AITER with the hipBLASLt w4a16 "
+            "GEMM (aiter.hipb_w4a16_mm). Install such an AITER, or use 'off'."
         )
     return mode
 
@@ -122,7 +114,6 @@ MIN_PROBE_M = 1 << 16
 
 
 def hipblaslt_w4a16_has_solution(
-    scale: torch.Tensor,  # any device tensor; supplies device + scale pointer
     dtype: torch.dtype,
     N: int,
     K: int,
@@ -133,19 +124,23 @@ def hipblaslt_w4a16_has_solution(
 ) -> bool:
     """Whether hipBLASLt has a kernel for every batch-size bucket up to max_m.
 
-    Only queries the heuristic (host side, no launch), so it is cheap enough to
-    run per layer at load time; the plans it finds are kept for the GEMM.
+    The GEMM picks its kernel per power-of-two bucket of M, so every bucket a
+    call can land in is asked. Only queries the heuristic (host side, no
+    launch), so it is cheap enough to run per layer at load time; the plans it
+    finds are kept for the GEMM.
     """
-    return torch.ops._rocm_C.hipblaslt_w4a16_has_solution(
-        scale, dtype, N, K, lda, group_size, has_zp, max(max_m, MIN_PROBE_M)
+    last = 1 << (max(max_m, MIN_PROBE_M) - 1).bit_length()
+    buckets = tuple(1 << i for i in range(last.bit_length()))
+    return rocm_aiter_ops.hipb_w4a16_is_supported(
+        dtype, N, K, group_size, has_zp, lda, buckets
     )
 
 
 def supports_layer(group_size: int) -> bool:
     """Whether hipBLASLt can own a layer quantised at this group size.
 
-    The scale modes are per group size -- VEC32/VEC64/VEC128, see
-    ``scale_mode_of`` in the .cu -- so anything else has no mode to ask for.
+    The scale modes are per group size -- VEC32/VEC64/VEC128 -- so anything
+    else has no mode to ask for.
     Shapes are unconstrained beyond what the op already checks, and the device
     library covers every (dtype, symmetry) combination, so group size is the
     whole predicate.
@@ -156,45 +151,34 @@ def supports_layer(group_size: int) -> bool:
 def hipblaslt_w4a16_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     w_q: torch.Tensor,  # [N, K//2] int8, nibbles in K order
-    scale: torch.Tensor,  # [N, K//G] (symmetric) or the combined buffer (asym)
+    scale: torch.Tensor,  # from build_scale_buffer
     group_size: int,
     has_zp: bool,
+    bias: torch.Tensor | None = None,  # [N], in a's dtype
 ) -> torch.Tensor:
-    return torch.ops._rocm_C.hipblaslt_w4a16_gemm(a, w_q, scale, group_size, has_zp)
+    return rocm_aiter_ops.hipb_w4a16_mm(a, w_q, scale, group_size, has_zp, bias)
 
 
 def build_scale_buffer(
     w_s: torch.Tensor,  # [N, K//G] fp16/bf16
     w_zp: torch.Tensor | None,  # [N//8, K//G] int32, 8 rows per word
-    group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(buffer_to_pass, scales_view)`` for the hipBLASLt scale pointer.
 
     Symmetric layers hand ``w_s`` straight through. Asymmetric layers get one
     allocation holding the scales and, at the next 256-byte boundary, the
-    zero-points in hipBLASLt's order. ``scales_view`` aliases the head of that
-    allocation and is what the layer keeps as ``w_s``, so the HIP skinny and
-    Triton kernels read the same bytes and the scales are not duplicated.
+    zero-points. ``scales_view`` aliases the head of that allocation and is
+    what the layer keeps as ``w_s``, so the scales are not duplicated.
     """
-    N, num_groups = w_s.shape
+    num_groups = w_s.shape[1]
     if w_s.stride(0) != num_groups or w_s.stride(1) != 1:
         raise RuntimeError(
             f"hipBLASLt W4A16 needs densely packed scales; got stride(0)="
             f"{w_s.stride(0)} for K/G={num_groups}. The gfx115x metadata cliff "
             "pad is not expressible in hipBLASLt's scale layout."
         )
+    buf = rocm_aiter_ops.hipb_w4a16_scale_buffer(w_s, w_zp)
     if w_zp is None:
-        return w_s, w_s
-
-    n8 = w_zp.shape[0]
-    assert n8 == N // 8, f"zp rows {n8} do not match N={N}"
-    # vLLM packs [q][g] words with row n in nibble n % 8, which is exactly what
-    # hipBLASLt addresses, so the words go over as bytes with no repack.
-    zp_hbl = w_zp.contiguous().view(torch.uint8).reshape(-1)
-
-    scale_bytes = N * num_groups * w_s.element_size()
-    zp_offset = -(-scale_bytes // ZERO_POINT_ALIGNMENT) * ZERO_POINT_ALIGNMENT
-    buf = torch.empty(zp_offset + zp_hbl.numel(), dtype=torch.uint8, device=w_s.device)
-    buf[:scale_bytes].copy_(w_s.contiguous().view(torch.uint8).reshape(-1))
-    buf[zp_offset:].copy_(zp_hbl)
-    return buf, buf[:scale_bytes].view(w_s.dtype).reshape(N, num_groups)
+        return buf, buf
+    scale_bytes = w_s.numel() * w_s.element_size()
+    return buf, buf[:scale_bytes].view(w_s.dtype).reshape(w_s.shape)

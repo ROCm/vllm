@@ -1189,41 +1189,57 @@ def test_process_weights_pads_cliff_rows(K, expected_weight_stride, dist_init):
 
 @pytest.mark.skipif(
     not hybrid_module._on_gfx115x(),
-    reason="the scale row-stride pad is only applied on gfx115x",
+    reason="the row-stride pads are only applied on gfx115x",
 )
-def test_process_weights_keeps_hipblaslt_scales_dense(dist_init, monkeypatch):
-    """HipBLASLt takes dense scales only, so a layer it owns skips the gfx115x
-    scale pad even when its scale row (here 256 groups x 2 B = 512 B) is on
-    the cliff -- build_scale_buffer would reject the padded rows."""
+@pytest.mark.parametrize("has_zp", [False, True])
+def test_process_weights_hipblaslt_layout(has_zp, dist_init, monkeypatch):
+    """A hipBLASLt layer keeps the weight pad (odd multiple of 128 B) but not
+    the scale/zero-point pad: hipBLASLt takes dense metadata only. The scale
+    row here (256 groups x 2 B = 512 B) is on the cliff the pad avoids."""
+    from vllm.model_executor.kernels.linear.mixed_precision import (
+        hipblaslt_w4a16,
+    )
     from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
         MPLinearLayerConfig,
     )
     from vllm.scalar_type import scalar_types
 
+    if not hipblaslt_w4a16.is_built():
+        pytest.skip("AITER has no hipb_w4a16_mm")
     monkeypatch.setattr(hybrid_module, "use_for_layer", lambda *args: True)
     set_random_seed(0)
     K, N, G = 8192, 128, 32
+    num_groups = K // G
 
     w_int4_kn = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
+    zeros_ckpt = None
+    if has_zp:
+        zeros_int4_gn = torch.randint(
+            0, 16, (num_groups, N), device=device, dtype=torch.int32
+        )
+        zeros_ckpt = _pack_int4_along_n_for_zp(zeros_int4_gn).t().contiguous()
     layer = _build_dummy_layer(
         _pack_int4_along_k_to_ckpt(w_int4_kn),
-        0.05 * torch.rand((N, K // G), device=device, dtype=torch.float16),
-        zeros_ckpt=None,
+        0.05 * torch.rand((N, num_groups), device=device, dtype=torch.float16),
+        zeros_ckpt=zeros_ckpt,
     )
     config = MPLinearLayerConfig(
         full_weight_shape=(K, N),
         partition_weight_shape=(K, N),
-        weight_type=scalar_types.uint4b8,
+        weight_type=scalar_types.uint4 if has_zp else scalar_types.uint4b8,
         act_type=torch.float16,
         group_size=G,
-        zero_points=False,
+        zero_points=has_zp,
     )
     RDNAHybridW4A16LinearKernel(
         config,
         w_q_param_name="weight_packed",
         w_s_param_name="weight_scale",
-        w_zp_param_name=None,
+        w_zp_param_name="weight_zero_point" if has_zp else None,
     ).process_weights_after_loading(layer)
 
     assert layer._hybrid_hipblaslt_ok
-    assert layer.weight_scale.stride() == (K // G, 1)
+    assert layer.weight_packed.stride(0) == K // 2 + 128
+    assert layer.weight_scale.stride() == (num_groups, 1)
+    if has_zp:
+        assert layer.weight_zero_point.stride() == (num_groups, 1)

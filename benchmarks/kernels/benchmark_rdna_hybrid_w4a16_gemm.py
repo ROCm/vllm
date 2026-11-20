@@ -180,7 +180,7 @@ def _make_runner(provider, a, weights, group_size):
 
         # hipBLASLt takes the scales and zero-points as one allocation; the
         # layer builds the same buffer once at load time.
-        scale, _ = _h.build_scale_buffer(w["w_s_skinny"], zp, group_size)
+        scale, _ = _h.build_scale_buffer(w["w_s_skinny"], zp)
         return lambda: _h.hipblaslt_w4a16_gemm(
             a, w["w_q_skinny"], scale, group_size, asym
         )

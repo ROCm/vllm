@@ -964,12 +964,9 @@ def _rdna_hybrid_w4a16_apply_impl(
     def _hipblaslt() -> torch.Tensor:
         with _profile_scope(f"hipblaslt_w4a16 {M}x{N}x{K} {_gz}"):
             assert hipblaslt_scale is not None
-            out = hipblaslt_w4a16_gemm(
-                x_2d, w_q, hipblaslt_scale, group_size, w_zp is not None
+            return hipblaslt_w4a16_gemm(
+                x_2d, w_q, hipblaslt_scale, group_size, w_zp is not None, bias
             )
-            if bias is not None:
-                out.add_(bias)
-        return out
 
     # Use the HIP skinny kernel for small batch sizes (fast decode path).
     #
@@ -1184,7 +1181,6 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         def _hipblaslt_has_solution() -> bool:
             return hipblaslt_w4a16_has_solution(
-                w_s_raw.data,
                 c.act_type,
                 N,
                 K,
@@ -1251,9 +1247,7 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
         # view into that buffer's head -- identical bytes and layout for the HIP
         # skinny and Triton kernels, and no second copy of the scales.
         if use_hipblaslt:
-            hipblaslt_scale, w_s_skinny = build_scale_buffer(
-                w_s_skinny, w_zp, c.group_size
-            )
+            hipblaslt_scale, w_s_skinny = build_scale_buffer(w_s_skinny, w_zp)
             if hipblaslt_scale is not w_s_skinny:
                 layer.register_parameter(
                     "_hybrid_hipblaslt_scale",
