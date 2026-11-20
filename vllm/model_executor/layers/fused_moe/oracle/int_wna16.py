@@ -60,6 +60,8 @@ class WNA16MoEBackend(Enum):
     XPU = "XPU"
     EMULATION = "EMULATION"
     RDNA3 = "RDNA3"
+    # FlyDSL WMMA kernels for RDNA3.5 (gfx115x).
+    RDNA_FLYDSL = "RDNA_FLYDSL"
 
 
 def backend_to_kernel_cls(
@@ -110,6 +112,12 @@ def backend_to_kernel_cls(
         )
 
         return [Rdna3WNA16Experts]
+    elif backend == WNA16MoEBackend.RDNA_FLYDSL:
+        from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
+            FlydslRdnaWNA16Experts,
+        )
+
+        return [FlydslRdnaWNA16Experts]
     else:
         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
 
@@ -159,6 +167,35 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.auto_awq import AutoAWQConfig
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    if backend == WNA16MoEBackend.RDNA_FLYDSL:
+        if isinstance(quant_config, MoeWNA16Config):
+            num_bits, group_size = quant_config.weight_bits, quant_config.group_size
+        elif isinstance(quant_config, QuantizationArgs):
+            if may_have_zp:
+                return "asymmetric compressed-tensors checkpoints are not supported"
+            if quant_config.actorder == "group":
+                return "group activation ordering is not supported"
+            num_bits, group_size = quant_config.num_bits, quant_config.group_size
+        else:
+            return "only MoeWNA16 and compressed-tensors checkpoints are supported"
+        if num_bits != 4 or not group_size or group_size % 16 != 0:
+            return "only 4-bit weights with a group size multiple of 16 are supported"
+        if moe_config.in_dtype not in (torch.bfloat16, torch.float16):
+            return "only bfloat16 and float16 activations are supported"
+        if moe_config.moe_parallel_config.use_ep:
+            return "expert parallelism is not supported"
+        from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
+            TILE_N,
+        )
+
+        hidden = moe_config.hidden_dim
+        inter = moe_config.intermediate_size_per_partition
+        gate_up = inter * (2 if moe_config.activation.is_gated else 1)
+        if hidden % TILE_N != 0 or gate_up % TILE_N != 0:
+            return f"layer widths have to be multiples of {TILE_N}"
+        if hidden % group_size != 0 or inter % group_size != 0:
+            return "layer widths have to be multiples of the group size"
 
     if backend == WNA16MoEBackend.TRITON:
         if may_have_bias:
@@ -213,6 +250,7 @@ def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
         "rdna3": WNA16MoEBackend.RDNA3,
+        "rdna_flydsl": WNA16MoEBackend.RDNA_FLYDSL,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -394,6 +432,9 @@ def make_wna16_moe_kernel(
     from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
         CPUExpertsInt4,
     )
+    from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
+        FlydslRdnaWNA16Experts,
+    )
     from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
         Int4EmulationTritonExperts,
     )
@@ -416,6 +457,7 @@ def make_wna16_moe_kernel(
         CPUExpertsInt4,
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
+        FlydslRdnaWNA16Experts,
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
@@ -1420,6 +1462,73 @@ def _process_weights_emulation_awq(
     )
 
 
+def _process_weights_flydsl(
+    layer: torch.nn.Module,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_qzeros: torch.Tensor | None,
+    w2_qzeros: torch.Tensor | None,
+) -> tuple:
+    """Repack N-first int4 weights for the FlyDSL RDNA kernel.
+
+    Weights are ``[E, N, K // 2]`` uint8 or ``[E, N, K // 8]`` int32 with the
+    nibbles of a row in little-endian order, zero points are uint8
+    ``[E, N // 2, K // gs]`` (symmetric when absent), and scales are
+    ``[E, N, K // gs]``. The zero points are folded into the returned scale
+    coefficients. When the kernel applies the activation, the w13 outputs are
+    reordered so that a tile holds gate columns and their up columns.
+    """
+    from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
+        fuses_silu_mul,
+    )
+    from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
+        gate_up_tile_order,
+        pack_w4a16_weights,
+        pad_expert_stride,
+    )
+
+    def _nibbles(packed: torch.Tensor, dim: int) -> torch.Tensor:
+        packed = packed.contiguous().view(torch.uint8)
+        return torch.stack((packed & 0xF, packed >> 4), dim=dim + 1).flatten(
+            dim, dim + 1
+        )
+
+    def _pack(w, scale, qzeros, order=None):
+        # Chunked over experts to bound the unpacked intermediates.
+        packed = []
+        for i in range(0, w.size(0), 8):
+            sl = slice(i, i + 8)
+            parts = [_nibbles(w[sl], 2), scale[sl]]
+            if qzeros is not None:
+                parts.append(_nibbles(qzeros[sl], 1))
+            if order is not None:
+                parts = [t[:, order] for t in parts]
+            zp = parts[2] if qzeros is not None else None
+            packed.append(pack_w4a16_weights(parts[0], parts[1], zp))
+        return (pad_expert_stride(torch.cat(t)) for t in zip(*packed))
+
+    order = None
+    if fuses_silu_mul(layer.moe_config):
+        order = gate_up_tile_order(w13.size(1), w13.device)
+    w13_packed, w13_coef = _pack(w13, w13_scale, w13_qzeros, order)
+    w2_packed, w2_coef = _pack(w2, w2_scale, w2_qzeros)
+    # Zero points live in the coefficients; hand back empty placeholders.
+    return (
+        w13_packed,
+        w2_packed,
+        w13_coef,
+        w2_coef,
+        None if w13_qzeros is None else w13_qzeros.new_empty(0),
+        None if w2_qzeros is None else w2_qzeros.new_empty(0),
+        None,  # w13_input_global_scale
+        None,  # w2_input_global_scale
+        None,  # w13_bias
+        None,  # w2_bias
+    )
+
+
 def convert_to_wna16_moe_kernel_format(
     backend: WNA16MoEBackend,
     layer: torch.nn.Module,
@@ -1571,6 +1680,10 @@ def convert_to_wna16_moe_kernel_format(
             w13_scale,
             w2_scale,
             quant_config.group_size,
+        )
+    elif backend == WNA16MoEBackend.RDNA_FLYDSL:
+        return _process_weights_flydsl(
+            layer, w13, w2, w13_scale, w2_scale, w13_qzeros, w2_qzeros
         )
     elif backend == WNA16MoEBackend.CPU:
         return _process_weights_cpu(
