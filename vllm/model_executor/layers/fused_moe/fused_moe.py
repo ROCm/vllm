@@ -1113,9 +1113,11 @@ def invoke_fused_moe_triton_kernel(
         envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
     )
     if profiling_enabled:
-        valid_blocks = int(num_tokens_post_padded.item()) // block_m
-        ids = expert_ids[(expert_ids >= 0) & (expert_ids < E)]
-        n_experts = int((torch.bincount(ids, minlength=E) > 0).sum().item())
+        # Label-only device work; roofline tools exclude this scope.
+        with record_function_or_nullcontext("vllm_profiling_label"):
+            valid_blocks = int(num_tokens_post_padded.item()) // block_m
+            ids = expert_ids[(expert_ids >= 0) & (expert_ids < E)]
+            n_experts = int((torch.bincount(ids, minlength=E) > 0).sum().item())
         scope_str = (
             f"moe_gemm_triton {M}x{N}x{K} E={E} top_k={top_k} "
             f"block_m={block_m} valid_blocks={valid_blocks} experts={n_experts}"

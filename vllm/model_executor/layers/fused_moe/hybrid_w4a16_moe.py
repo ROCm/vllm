@@ -79,11 +79,13 @@ def _moe_gemm_triton_scope(
         envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
     ):
         return contextlib.nullcontext()
-    valid_blocks = (
-        int(num_tokens_post_padded.item()) // block_m
-        if num_tokens_post_padded is not None
-        else 0
-    )
+    # Label-only device work; roofline tools exclude this scope.
+    with record_function_or_nullcontext("vllm_profiling_label"):
+        valid_blocks = (
+            int(num_tokens_post_padded.item()) // block_m
+            if num_tokens_post_padded is not None
+            else 0
+        )
     return record_function_or_nullcontext(
         f"moe_gemm_triton {M}x{N}x{K} E={E} top_k={top_k} g={group_size} "
         f"block_m={block_m} valid_blocks={valid_blocks}"
@@ -122,8 +124,9 @@ def _fused_moe_wvsplitk_scope(
         return contextlib.nullcontext()
     # Padding blocks carry expert_id == -1; bincount over the valid ids and
     # count the non-empty bins. Fixed-size output, so one sync on the sum.
-    ids = expert_ids[(expert_ids >= 0) & (expert_ids < E)]
-    n_experts = int((torch.bincount(ids, minlength=E) > 0).sum().item())
+    with record_function_or_nullcontext("vllm_profiling_label"):
+        ids = expert_ids[(expert_ids >= 0) & (expert_ids < E)]
+        n_experts = int((torch.bincount(ids, minlength=E) > 0).sum().item())
     return record_function_or_nullcontext(
         f"fused_moe_wvsplitk_int4 {M}x{N}x{K} E={E} top_k={top_k} "
         f"g={group_size} {'asym' if asym else 'sym'} experts={n_experts}"
@@ -164,30 +167,33 @@ def _moe_gemm_w4a16_scope(
         envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING or envs.VLLM_NVTX_SCOPES_FOR_PROFILING
     ):
         return contextlib.nullcontext()
-    valid_blocks = (
-        int(num_tokens_post_padded.item()) // block_m
-        if num_tokens_post_padded is not None
-        else 0
-    )
-    hist_str = ""
-    if topk_ids is not None:
-        ids = topk_ids.flatten()
-        ids = ids[(ids >= 0) & (ids < E)]
-        counts = torch.bincount(ids, minlength=E)  # tokens per expert
-        blocks = (counts + (block_m - 1)) // block_m  # blocks filled (0=inactive)
-        # tok_hist: full distribution, index i = #experts filling i blocks.
-        hist = torch.bincount(blocks).tolist()  # one sync
-        hist_str = " tok_hist=" + ",".join(str(int(h)) for h in hist)
-        # vtok_hist: valid tokens per block (block occupancy), index v =
-        # #blocks holding exactly v real tokens (1..block_m). Each active expert
-        # contributes (nblk-1) full blocks + one last block with last_valid; the
-        # gap to block_m is the padding the kernel computes but discards.
-        active = counts[counts > 0]
-        nblk = (active + (block_m - 1)) // block_m
-        last_valid = active - (nblk - 1) * block_m  # 1..block_m
-        vhist = torch.bincount(last_valid, minlength=block_m + 1)
-        vhist[block_m] = vhist[block_m] + (nblk - 1).sum()  # add the full blocks
-        hist_str += " vtok_hist=" + ",".join(str(int(h)) for h in vhist.tolist())
+    with record_function_or_nullcontext("vllm_profiling_label"):
+        valid_blocks = (
+            int(num_tokens_post_padded.item()) // block_m
+            if num_tokens_post_padded is not None
+            else 0
+        )
+        hist_str = ""
+        if topk_ids is not None:
+            ids = topk_ids.flatten()
+            ids = ids[(ids >= 0) & (ids < E)]
+            counts = torch.bincount(ids, minlength=E)  # tokens per expert
+            # blocks filled per expert (0=inactive)
+            blocks = (counts + (block_m - 1)) // block_m
+            # tok_hist: full distribution, index i = #experts filling i blocks.
+            hist = torch.bincount(blocks).tolist()  # one sync
+            hist_str = " tok_hist=" + ",".join(str(int(h)) for h in hist)
+            # vtok_hist: valid tokens per block (block occupancy), index v =
+            # #blocks holding exactly v real tokens (1..block_m). Each active
+            # expert contributes (nblk-1) full blocks + one last block with
+            # last_valid; the gap to block_m is the padding the kernel computes
+            # but discards.
+            active = counts[counts > 0]
+            nblk = (active + (block_m - 1)) // block_m
+            last_valid = active - (nblk - 1) * block_m  # 1..block_m
+            vhist = torch.bincount(last_valid, minlength=block_m + 1)
+            vhist[block_m] = vhist[block_m] + (nblk - 1).sum()  # full blocks
+            hist_str += " vtok_hist=" + ",".join(str(int(h)) for h in vhist.tolist())
     return record_function_or_nullcontext(
         f"moe_gemm_w4a16 {M}x{N}x{K} E={E} top_k={top_k} g={group_size} "
         f"{'' if asym is None else ('asym ' if asym else 'sym ')}"
