@@ -303,7 +303,7 @@ class Stack:
         return out
 
     def moe_hip(self, layer: int) -> None:
-        """One token on the HIP int4 MoE kernels the hybrid backend decodes
+        """A few tokens on the HIP int4 MoE kernels the hybrid backend decodes
         with: GEMM1, SiLU-and-multiply, GEMM2, top-k sum."""
         from vllm import _custom_ops as ops
         from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
@@ -313,12 +313,10 @@ class Stack:
         s = self.shape
         w1, s1, w2, s2 = self.w[layer]
         ids = self.ids[layer].view(-1)
-        o1, act, o2 = self.ws.split(
-            [s.top_k * 2 * s.inter, s.top_k * s.inter, s.top_k * s.hidden]
-        )
-        o1, act = o1.view(s.top_k, -1), act.view(s.top_k, -1)
-        o2 = o2.view(s.top_k, -1)
         rows = self.rows
+        n = rows.numel()
+        o1, act, o2 = self.ws.split([n * 2 * s.inter, n * s.inter, n * s.hidden])
+        o1, act, o2 = o1.view(n, -1), act.view(n, -1), o2.view(n, -1)
         ops.fused_moe_wvSplitK_int4_gemm(
             self.x, w1, s1, o1, ids, 1, self.cu, s.group, None, rows, s.top_k
         )
@@ -412,6 +410,8 @@ class Stack:
         for w in self.ctx_w[layer]:
             ops.wvSplitK(w, self.x1, self.cu)
         if self.evict is not None:
+            # A copy, not a read: only with written lines in the caches do
+            # the kernel times match a model.
             self.evict[1].copy_(self.evict[0])
         for f in _FILLERS[: int(os.environ.get("BENCH_FILLERS", "0"))]:
             f(self.xf)
@@ -516,8 +516,11 @@ def run(args) -> None:
         tokens_list = args.tokens or shape.tokens
         check = not args.no_check
         if args.hip:
-            assert shape.activation == "silu" and not shape.zero_points
-            check, tokens_list = False, [1]
+            if shape.activation != "silu" or shape.zero_points:
+                print(f"{name}: no HIP reference for this checkpoint format")
+                continue
+            check = False
+            tokens_list = [t for t in tokens_list if t <= 5]
         dtype = getattr(torch, args.dtype)
         stack = Stack(shape, layers, not args.no_context, check, args.hip, dtype)
         routing = torch.load(args.routing) if args.routing else None
@@ -546,12 +549,12 @@ def run(args) -> None:
             # Weights and coefficients of the routed experts, each read once.
             used = sum(len(torch.unique(i)) for i in stack.ids) / layers
             w_bytes = used * sum(t[0].numel() * t.element_size() for t in stack.w[0])
-            name = name + ("/hip" if args.hip else "")
+            label = name + ("/hip" if args.hip else "")
             print(
                 "RESULT "
                 + json.dumps(
                     {
-                        "shape": name,
+                        "shape": label,
                         "tokens": tokens,
                         "layer_us": round(us, 2),
                         "context_us": round(t_ctx / layers * 1e6, 2),
@@ -637,7 +640,7 @@ def main() -> None:
     p.add_argument(
         "--hip",
         action="store_true",
-        help="time the HIP int4 MoE decode kernels instead (one token, symmetric)",
+        help="time the HIP int4 MoE decode kernels instead (up to 5 tokens, symmetric)",
     )
     p.add_argument("--kernel-trace", action="store_true")
     p.add_argument("--trace-dir", help="keep the rocprofv3 output here")
