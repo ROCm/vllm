@@ -49,7 +49,6 @@ _EXPERT_PAD_DWORDS = _CHANNEL_BYTES // 4
 # slc | dlc: weights of one token are read once, so they are loaded without
 # being kept in the caches, like a non-temporal load.
 _NON_TEMPORAL = 6
-_LDS_BYTES = 65536
 
 
 def _tile_stride(payload_dwords: int) -> int:
@@ -382,8 +381,8 @@ def _build_gemm(
     return launch
 
 
-def _copy_to_lds(lds, rsrc, n_dwords: int, lane, base=0, lds0=0) -> None:
-    """Copy ``n_dwords`` of a buffer from dword ``base`` to LDS dword ``lds0``,
+def _copy_to_lds(lds, rsrc, n_dwords: int, lane, base=0) -> None:
+    """Copy ``n_dwords`` of a buffer from dword ``base`` to the start of LDS,
     4 dwords per lane and round."""
     import flydsl.expr as fx
     from flydsl.expr import arith, buffer_ops, range_constexpr, vector
@@ -393,7 +392,7 @@ def _copy_to_lds(lds, rsrc, n_dwords: int, lane, base=0, lds0=0) -> None:
         idx = lane * 4 + j * 128
         idx = (idx < n_dwords).select(idx, fx.Int32(n_dwords - 4))
         v = buffer_ops.buffer_load(rsrc, base + idx, vec_width=4, dtype=fx.Int32)
-        vector.store(v, lds, [arith.index_cast(T.index, lds0 + idx)])
+        vector.store(v, lds, [arith.index_cast(T.index, idx)])
 
 
 @functools.cache
@@ -439,18 +438,15 @@ def _build_gemm_row(
     out_reg = REG_N // 2 if silu_mul else REG_N
     n_out = N // 2 if silu_mul else N
     allocator = SmemAllocator(None, arch=get_rocm_arch(), global_sym_name="moe_row")
-    lds_wave = k_dwords + chunk  # LDS dwords per wave
-    # Waves per workgroup. GEMM1 of a token runs next to another kernel of the
-    # layer, and workgroups of several waves keep their share of the GPU.
-    wg = next(
-        w
-        for w in (8, 4, 2, 1)
-        if (N // TILE_N) % w == 0 and lds_wave * 4 * w <= _LDS_BYTES
-    )
-    allocator.ptr = lds_wave * 4 * wg
+    # One wave per workgroup: workgroups of several waves (and their larger
+    # LDS allocation) cost up to 5% of a decode step. Declaring the block
+    # size matters here (59 vs 64 us per layer at K=2048, N=1024); on the
+    # reduce kernel the same declaration is slower.
+    lds_dwords = k_dwords + chunk
+    allocator.ptr = lds_dwords * 4
     name = _kernel_name("row", K, N, group, coef_pairs, silu_mul, fp16)
 
-    @flyc.kernel(name=name, known_block_size=[32 * wg, 1, 1])
+    @flyc.kernel(name=name, known_block_size=[32, 1, 1])
     def row_kernel(
         arg_out: fx.Tensor,
         arg_x: fx.Tensor,
@@ -458,9 +454,8 @@ def _build_gemm_row(
         arg_coef: fx.Tensor,
         arg_expert_ids: fx.Tensor,
     ):
-        lane = gpu.thread_idx.x % 32
-        wave = gpu.thread_idx.x // 32
-        tile_n = gpu.block_idx.x * wg + wave
+        lane = gpu.thread_idx.x
+        tile_n = gpu.block_idx.x
         row = gpu.block_idx.y
         lane16 = lane % 16
         klane = lane // 16
@@ -478,12 +473,11 @@ def _build_gemm_row(
         w_base = expert * w_expert + tile_n * w_tile
         c_base = expert * c_expert + tile_n * c_tile + lane16 * cw
 
-        lds = SmemPtr(allocator.get_base(), 0, T.i32, shape=(lds_wave * wg,)).get()
-        lds0 = wave * lds_wave
-        _copy_to_lds(lds, x_rsrc, k_dwords, lane, (row // x_row_div) * k_dwords, lds0)
+        lds = SmemPtr(allocator.get_base(), 0, T.i32, shape=(lds_dwords,)).get()
+        _copy_to_lds(lds, x_rsrc, k_dwords, lane, (row // x_row_div) * k_dwords)
 
         def lds_at(dword):
-            return [arith.index_cast(T.index, lds0 + dword)]
+            return [arith.index_cast(T.index, dword)]
 
         def load_chunk(start, spread):
             """Loads of one group; with ``spread`` 0 all lanes load the same
@@ -579,7 +573,7 @@ def _build_gemm_row(
         with ir.InsertionPoint(CompilationContext.get_current().gpu_module_body):
             allocator.finalize()
         row_kernel(arg_out, arg_x, arg_w, arg_coef, arg_expert_ids).launch(
-            grid=(N // TILE_N // wg, n_rows, 1), block=(32 * wg, 1, 1), stream=stream
+            grid=(N // TILE_N, n_rows, 1), block=(32, 1, 1), stream=stream
         )
 
     return launch
