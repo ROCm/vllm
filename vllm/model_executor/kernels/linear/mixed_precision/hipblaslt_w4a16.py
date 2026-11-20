@@ -180,7 +180,7 @@ def build_scale_buffer(
     if w_s.stride(0) != num_groups or w_s.stride(1) != 1:
         raise RuntimeError(
             f"hipBLASLt W4A16 needs densely packed scales; got stride(0)="
-            f"{w_s.stride(0)} for K/G={num_groups}. The gfx1151 metadata cliff "
+            f"{w_s.stride(0)} for K/G={num_groups}. The gfx115x metadata cliff "
             "pad is not expressible in hipBLASLt's scale layout."
         )
     if w_zp is None:

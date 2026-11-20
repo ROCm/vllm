@@ -1185,3 +1185,45 @@ def test_process_weights_pads_cliff_rows(K, expected_weight_stride, dist_init):
     assert tuple(layer.weight_packed.view(torch.int32).shape) == (N, K // 8)
     # Metadata is untouched by this change.
     assert layer.weight_scale.is_contiguous()
+
+
+@pytest.mark.skipif(
+    not hybrid_module._on_gfx115x(),
+    reason="the scale row-stride pad is only applied on gfx115x",
+)
+def test_process_weights_keeps_hipblaslt_scales_dense(dist_init, monkeypatch):
+    """HipBLASLt takes dense scales only, so a layer it owns skips the gfx115x
+    scale pad even when its scale row (here 256 groups x 2 B = 512 B) is on
+    the cliff -- build_scale_buffer would reject the padded rows."""
+    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
+        MPLinearLayerConfig,
+    )
+    from vllm.scalar_type import scalar_types
+
+    monkeypatch.setattr(hybrid_module, "use_for_layer", lambda *args: True)
+    set_random_seed(0)
+    K, N, G = 8192, 128, 32
+
+    w_int4_kn = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
+    layer = _build_dummy_layer(
+        _pack_int4_along_k_to_ckpt(w_int4_kn),
+        0.05 * torch.rand((N, K // G), device=device, dtype=torch.float16),
+        zeros_ckpt=None,
+    )
+    config = MPLinearLayerConfig(
+        full_weight_shape=(K, N),
+        partition_weight_shape=(K, N),
+        weight_type=scalar_types.uint4b8,
+        act_type=torch.float16,
+        group_size=G,
+        zero_points=False,
+    )
+    RDNAHybridW4A16LinearKernel(
+        config,
+        w_q_param_name="weight_packed",
+        w_s_param_name="weight_scale",
+        w_zp_param_name=None,
+    ).process_weights_after_loading(layer)
+
+    assert layer._hybrid_hipblaslt_ok
+    assert layer.weight_scale.stride() == (K // G, 1)

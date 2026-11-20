@@ -779,7 +779,7 @@ def _act_pad_bytes(row_bytes: int) -> int:
 def _group_stride_pad(num_groups: int, elem_bytes: int) -> int:
     """Groups to add so a metadata row does not land on a 512 B multiple.
 
-    The scale and zero-point rows sit on a period-512 B cliff on gfx1151.
+    The scale and zero-point rows sit on a period-512 B cliff on gfx115x.
     Padding a row that is already in a good class makes it slower, so the pad
     is spent only on rows whose byte size is a multiple of 512; +128 B lands
     them on 128 mod 512.
@@ -1205,12 +1205,15 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
         permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
-        # gfx1151: keep the metadata row off the 512 B cliff.  Scales and the
+        # gfx115x: keep the metadata row off the 512 B cliff.  Scales and the
         # packed zero points must share one row stride -- the HIP kernel reads
-        # both with the same group_stride.
+        # both with the same group_stride.  hipBLASLt layers read them only
+        # through hipBLASLt, which takes dense scales (build_scale_buffer).
         _gpad = (
             _group_stride_pad(w_s_raw.data.shape[1], w_s_raw.data.element_size())
-            if _on_gfx1151() and w_s_raw.data.device.type == "cuda"
+            if _on_gfx115x()
+            and w_s_raw.data.device.type == "cuda"
+            and not use_hipblaslt
             else 0
         )
         w_s_skinny = _pad_group_rows(w_s_raw.data, _gpad)
