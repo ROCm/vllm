@@ -5,11 +5,18 @@
 Runs ``flydsl_rdna_moe``, the function the ``rdna_flydsl`` MoE backend calls,
 the way a model runs it: one graph replays a stack of layers, every layer has
 its own expert weights (so they are read cold from DRAM, as in a model with
-tens of GiB of weights), and the kernels that share the GPU with the MoE in
-a model are part of the graph:
+tens of GiB of weights), and what shares the GPU with the MoE in a model is
+part of the graph:
 
-- other weights streamed between two MoE layers (``context_mb``), and
+- other weights streamed between two MoE layers (``context_mb``),
+- cached traffic that displaces the kernels' code and small buffers from the
+  caches (``evict_mb``): without it the one-token kernels are up to 12%
+  faster than in a model,
+- the router, and
 - the shared expert, which runs on a second stream next to GEMM1.
+
+Replays are waited for one by one, like decode steps. Prefill times depend
+on how tokens spread over experts; ``--routing`` replays captured ids.
 
 Two timings are reported per (shape, number of tokens):
 
@@ -58,6 +65,9 @@ class MoEShape:
     shared_inter: int = 0
     # Other weights read between two MoE layers, MiB.
     context_mb: float = 16.0
+    # Cached traffic between two MoE layers, MiB; matched to kernel traces of
+    # the models (16 for Qwen3.6-35B-A3B, 8 for Qwen3-30B-A3B).
+    evict_mb: float = 8.0
 
 
 # Routed-expert shapes of the quantized MoE rows of the nightly regression.
@@ -72,6 +82,7 @@ SHAPES = {
         (1, 2, 4, 512, 4352),
         "Qwen3.5/3.6-35B-A3B W4A16 (llm-compressor)",
         shared_inter=512,
+        evict_mb=16.0,
     ),
     "qwen3.6-35b-a3b-g32-zp": MoEShape(
         2048,
@@ -84,6 +95,7 @@ SHAPES = {
         "Qwen3.6-35B-A3B AWQ",
         zero_points=True,
         shared_inter=512,
+        evict_mb=16.0,
     ),
     "qwen3.5-35b-a3b-g32": MoEShape(
         2048,
@@ -95,6 +107,7 @@ SHAPES = {
         (1, 512),
         "Qwen3.5-35B-A3B AWQ",
         shared_inter=512,
+        evict_mb=16.0,
     ),
     "qwen3-30b-a3b-g32": MoEShape(
         2048,
@@ -200,7 +213,15 @@ def _packed_layer(shape: MoEShape, device, check: bool):
 class Stack:
     """A stack of MoE layers with distinct weights and its graphs."""
 
-    def __init__(self, shape: MoEShape, layers: int, context: bool, check: bool):
+    def __init__(
+        self,
+        shape: MoEShape,
+        layers: int,
+        context: bool,
+        check: bool,
+        hip: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
             pad_expert_stride,
         )
@@ -209,15 +230,20 @@ class Stack:
         self.layers = layers
         self.dev = dev = torch.device("cuda")
         g = torch.Generator(device=dev).manual_seed(1)
-        packed, self.ref = _packed_layer(shape, dev, check)
-        # Layer 0 is the packed layer; the others hold its experts permuted.
-        self.perm = [torch.arange(shape.experts, device=dev)]
-        self.perm += [
-            torch.randperm(shape.experts, device=dev, generator=g)
-            for _ in range(layers - 1)
-        ]
-        self.w = [[pad_expert_stride(t[p]) for t in packed] for p in self.perm]
-        del packed
+        self.hip = hip
+        self.dtype = dtype
+        if hip:
+            self.w = [self._hip_layer(g) for _ in range(layers)]
+        else:
+            packed, self.ref = _packed_layer(shape, dev, check)
+            # Layer 0 is the packed layer; the others hold its experts permuted.
+            self.perm = [torch.arange(shape.experts, device=dev)]
+            self.perm += [
+                torch.randperm(shape.experts, device=dev, generator=g)
+                for _ in range(layers - 1)
+            ]
+            self.w = [[pad_expert_stride(t[p]) for t in packed] for p in self.perm]
+            del packed
         hidden = shape.hidden
         n_ctx = round(shape.context_mb * 2**20 / (hidden * hidden * 2))
         n_ctx = n_ctx if context else 0
@@ -246,15 +272,74 @@ class Stack:
                 for _ in range(layers)
             ]
         self.cu = torch.cuda.get_device_properties(0).multi_processor_count
+        self.evict = None
+        if context and shape.evict_mb:
+            n = int(shape.evict_mb * 2**20 / 4)
+            self.evict = (torch.randn(n, device=dev), torch.empty(n, device=dev))
         self.events = [(torch.cuda.Event(), torch.cuda.Event()) for _ in range(layers)]
         self.gen = g
+
+    def _hip_layer(self, g: torch.Generator) -> list[torch.Tensor]:
+        """Random weights in the layout of the HIP int4 MoE decode kernel:
+        little-endian nibbles ``[E, N, K / 8]`` int32, scales ``[E, N, K / group]``."""
+        s = self.shape
+        out = []
+        for n_out, n_in in ((2 * s.inter, s.hidden), (s.hidden, s.inter)):
+            k8 = n_in // 8
+            # The loader pads rows whose stride is a multiple of 2048 B.
+            pad = 32 if (k8 * 4) % 2048 == 0 else 0
+            w = torch.randint(
+                -(2**31),
+                2**31 - 1,
+                (s.experts, n_out, k8 + pad),
+                device=self.dev,
+                dtype=torch.int32,
+                generator=g,
+            )
+            scale = torch.rand(
+                (s.experts, n_out, n_in // s.group), device=self.dev, generator=g
+            )
+            out += [w[:, :, :k8], (scale * 0.02 + 0.001).to(torch.bfloat16)]
+        return out
+
+    def moe_hip(self, layer: int) -> None:
+        """One token on the HIP int4 MoE kernels the hybrid backend decodes
+        with: GEMM1, SiLU-and-multiply, GEMM2, top-k sum."""
+        from vllm import _custom_ops as ops
+        from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (
+            moe_unpermute,
+        )
+
+        s = self.shape
+        w1, s1, w2, s2 = self.w[layer]
+        ids = self.ids[layer].view(-1)
+        o1, act, o2 = self.ws.split(
+            [s.top_k * 2 * s.inter, s.top_k * s.inter, s.top_k * s.hidden]
+        )
+        o1, act = o1.view(s.top_k, -1), act.view(s.top_k, -1)
+        o2 = o2.view(s.top_k, -1)
+        rows = self.rows
+        ops.fused_moe_wvSplitK_int4_gemm(
+            self.x, w1, s1, o1, ids, 1, self.cu, s.group, None, rows, s.top_k
+        )
+        torch.ops._C.silu_and_mul(act, o1)
+        ops.fused_moe_wvSplitK_int4_gemm(
+            act, w2, s2, o2, ids, 1, self.cu, s.group, None, rows, 1
+        )
+        moe_unpermute(
+            out=self.out,
+            permuted_hidden_states=o2,
+            topk_weights=self.tw[layer],
+            inv_permuted_idx=rows,
+        )
 
     def inputs(self, tokens: int, routing: list[torch.Tensor] | None):
         s, dev = self.shape, self.dev
         self.x = torch.randn((tokens, s.hidden), device=dev, generator=self.gen).to(
-            torch.bfloat16
+            self.dtype
         )
-        self.x1 = self.x[:1].contiguous()
+        # The context kernels are bf16 whatever the MoE runs in.
+        self.x1 = self.x[:1].to(torch.bfloat16)
         self.xf = self.x1.float()
         self.ids, self.tw = [], []
         for layer in range(self.layers):
@@ -271,9 +356,10 @@ class Stack:
             self.tw.append(tw / tw.sum(dim=1, keepdim=True))
         rows = tokens * s.top_k
         self.ws = torch.empty(
-            rows * (2 * s.inter + s.inter + s.hidden), device=dev, dtype=torch.bfloat16
+            rows * (2 * s.inter + s.inter + s.hidden), device=dev, dtype=self.dtype
         )
-        self.out = torch.empty((tokens, s.hidden), device=dev, dtype=torch.bfloat16)
+        self.out = torch.empty((tokens, s.hidden), device=dev, dtype=self.dtype)
+        self.rows = torch.arange(rows, device=dev, dtype=torch.int32)
 
     def _activation(self):
         if self.shape.activation == "silu":
@@ -291,6 +377,8 @@ class Stack:
             flydsl_rdna_moe,
         )
 
+        if self.hip:
+            return self.moe_hip(layer)
         s = self.shape
         w1, c1, w2, c2 = self.w[layer]
         flydsl_rdna_moe(
@@ -323,6 +411,8 @@ class Stack:
 
         for w in self.ctx_w[layer]:
             ops.wvSplitK(w, self.x1, self.cu)
+        if self.evict is not None:
+            self.evict[1].copy_(self.evict[0])
         for f in _FILLERS[: int(os.environ.get("BENCH_FILLERS", "0"))]:
             f(self.xf)
         done = None
@@ -365,12 +455,12 @@ class Stack:
         ids = self.ids[0][:n].long()
         x = self.x[:n].float()
         h = torch.einsum("tenk,tk->ten", self.ref["w1"][ids].float(), x)
-        gate, up = h.to(torch.bfloat16).float().chunk(2, dim=-1)
+        gate, up = h.to(self.dtype).float().chunk(2, dim=-1)
         if s.activation == "silu":
             act = torch.nn.functional.silu(gate) * up
         else:
             act = torch.nn.functional.gelu(gate, approximate="tanh") * up
-        act = act.to(torch.bfloat16).float()
+        act = act.to(self.dtype).float()
         down = torch.einsum("tenk,tek->ten", self.ref["w2"][ids].float(), act)
         ref = (down * self.tw[0][:n].unsqueeze(-1)).sum(dim=1)
         return ((self.out[:n].float() - ref).abs().max() / ref.std()).item()
@@ -425,7 +515,11 @@ def run(args) -> None:
         layers = args.layers or shape.layers
         tokens_list = args.tokens or shape.tokens
         check = not args.no_check
-        stack = Stack(shape, layers, not args.no_context, check)
+        if args.hip:
+            assert shape.activation == "silu" and not shape.zero_points
+            check, tokens_list = False, [1]
+        dtype = getattr(torch, args.dtype)
+        stack = Stack(shape, layers, not args.no_context, check, args.hip, dtype)
         routing = torch.load(args.routing) if args.routing else None
         for tokens in tokens_list:
             stack.inputs(tokens, routing)
@@ -443,9 +537,8 @@ def run(args) -> None:
             replayed = stack.out.clone()
             stack.moe(layers - 1)
             torch.accelerator.synchronize()
-            assert torch.equal(replayed, stack.out), (
-                f"{name} M={tokens}: replay differs"
-            )
+            same = torch.equal(replayed.view(torch.int16), stack.out.view(torch.int16))
+            assert same or not check, f"{name} M={tokens}: replay differs"
             us = (t_moe - t_ctx) / layers * 1e6
             rows = tokens * shape.top_k
             gate_up = 2 * shape.inter
@@ -453,6 +546,7 @@ def run(args) -> None:
             # Weights and coefficients of the routed experts, each read once.
             used = sum(len(torch.unique(i)) for i in stack.ids) / layers
             w_bytes = used * sum(t[0].numel() * t.element_size() for t in stack.w[0])
+            name = name + ("/hip" if args.hip else "")
             print(
                 "RESULT "
                 + json.dumps(
@@ -529,11 +623,22 @@ def main() -> None:
     )
     p.add_argument("--no-context", action="store_true", help="MoE kernels only")
     p.add_argument(
+        "--dtype",
+        default="bfloat16",
+        choices=["bfloat16", "float16"],
+        help="activation dtype of the MoE",
+    )
+    p.add_argument(
         "--row-path-max-tokens",
         type=int,
         help="override the token count up to which rows are not grouped by expert",
     )
     p.add_argument("--no-check", action="store_true", help="skip the result check")
+    p.add_argument(
+        "--hip",
+        action="store_true",
+        help="time the HIP int4 MoE decode kernels instead (one token, symmetric)",
+    )
     p.add_argument("--kernel-trace", action="store_true")
     p.add_argument("--trace-dir", help="keep the rocprofv3 output here")
     args = p.parse_args()
