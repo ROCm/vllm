@@ -1433,8 +1433,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route the gfx11/gfx12 W4A16 GEMM through hipBLASLt instead of the
     # RDNAHybrid kernels. "off" (default) keeps the RDNAHybrid kernels; "auto"
     # uses hipBLASLt for every layer it has a kernel for that does not cache a
-    # dense prefill copy, when vLLM was built against a hipBLASLt exposing the
-    # w4a16 API; "all" forces it. The per-path modes are rejected -- see
+    # dense prefill copy, when the installed AITER exposes hipBLASLt's w4a16
+    # GEMM; "all" forces it. The per-path modes are rejected -- see
     # hipblaslt_w4a16_mode().
     "VLLM_ROCM_W4A16_HIPBLASLT": env_with_choices(
         "VLLM_ROCM_W4A16_HIPBLASLT",

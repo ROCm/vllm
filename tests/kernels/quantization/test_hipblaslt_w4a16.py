@@ -3,9 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Correctness of the hipBLASLt W4A16 path against the RDNAHybrid reference.
 
-Skipped unless vLLM was built against a ROCm whose hipBLASLt exposes the w4a16
-API, in which case _rocm_C carries the ops (see the VLLM_HIPBLASLT_HAS_W4A16
-block in CMakeLists.txt).
+Skipped unless the installed AITER exposes hipBLASLt's w4a16 GEMM.
 """
 
 import importlib
@@ -32,8 +30,7 @@ hipblaslt_module = importlib.import_module(
 
 if not hipblaslt_module.is_built():
     pytest.skip(
-        "_rocm_C has no hipblaslt_w4a16_gemm: vLLM was built against a "
-        "hipBLASLt without the w4a16 API",
+        "AITER has no hipb_w4a16_mm",
         allow_module_level=True,
     )
 hybrid_module = importlib.import_module(
@@ -61,7 +58,7 @@ def _build_inputs(M, N, K, group_size, dtype, has_zp):
         )
         w_zp = _pack_zp_rows_for_kernel(zp_nkg)
 
-    scale_buf, _ = hipblaslt_module.build_scale_buffer(scales_nkg, w_zp, group_size)
+    scale_buf, _ = hipblaslt_module.build_scale_buffer(scales_nkg, w_zp)
     return x_mk, w_int4_nk, w_q.view(torch.int8), scales_nkg, zp_nkg, scale_buf
 
 
@@ -70,7 +67,8 @@ def _build_inputs(M, N, K, group_size, dtype, has_zp):
 @pytest.mark.parametrize("has_zp", [False, True])
 @pytest.mark.parametrize("M", [1, 5, 64, 256], ids=["M=1", "M=5", "M=64", "M=256"])
 def test_hipblaslt_w4a16_matches_reference(dtype, group_size, has_zp, M):
-    """The hipBLASLt GEMM reproduces (nibble - zp) * scale over the same buffers.
+    """The hipBLASLt GEMM reproduces (nibble - zp) * scale + bias over the same
+    buffers.
 
     hipBLASLt does not ship a kernel for every (group size, encoding, dtype)
     combination yet. A missing one must surface as a hard error naming the
@@ -82,18 +80,19 @@ def test_hipblaslt_w4a16_matches_reference(dtype, group_size, has_zp, M):
     x_mk, w_int4_nk, w_q, scales_nkg, zp_nkg, scale_buf = _build_inputs(
         M, N, K, group_size, dtype, has_zp
     )
+    bias = torch.randn(N, device=device, dtype=dtype)
 
     try:
         out = hipblaslt_module.hipblaslt_w4a16_gemm(
-            x_mk, w_q, scale_buf, group_size, has_zp
+            x_mk, w_q, scale_buf, group_size, has_zp, bias
         )
     except RuntimeError as e:
-        if "no solution for" not in str(e):
+        if "has no w4a16 kernel" not in str(e):
             raise
         pytest.xfail(f"hipBLASLt has no kernel for this combination: {e}")
 
     ref = _rdna_hybrid_w4a16_reference(
-        x_mk, w_int4_nk, scales_nkg, zp_nkg, group_size, bias=None
+        x_mk, w_int4_nk, scales_nkg, zp_nkg, group_size, bias=bias
     )
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
@@ -112,12 +111,12 @@ def test_build_scale_buffer_zero_point_layout(group_size):
     zp_nkg = torch.randint(0, 16, (N, num_groups), device=device, dtype=torch.int32)
 
     buf, view = hipblaslt_module.build_scale_buffer(
-        scales, _pack_zp_rows_for_kernel(zp_nkg), group_size
+        scales, _pack_zp_rows_for_kernel(zp_nkg)
     )
     assert view.data_ptr() == buf.data_ptr()
 
     scale_bytes = N * num_groups * scales.element_size()
-    align = hipblaslt_module.ZERO_POINT_ALIGNMENT
+    align = 256  # c_blockScaleAZeroPointAlignment in hipBLASLt's tensile_host.cpp
     zp_region = buf[-(-scale_bytes // align) * align :].cpu()
 
     n = torch.arange(N).repeat_interleave(num_groups)
@@ -140,14 +139,14 @@ def test_hipblaslt_w4a16_has_solution_matches_gemm(dtype, group_size, has_zp):
         )
         if probe_ok is None:
             probe_ok = hipblaslt_module.hipblaslt_w4a16_has_solution(
-                scale_buf, dtype, N, K, w_q.stride(0) * 2, group_size, has_zp, 1
+                dtype, N, K, w_q.stride(0) * 2, group_size, has_zp, 1
             )
         try:
             hipblaslt_module.hipblaslt_w4a16_gemm(
                 x_mk, w_q, scale_buf, group_size, has_zp
             )
         except RuntimeError as e:
-            if "no solution for" not in str(e):
+            if "has no w4a16 kernel" not in str(e):
                 raise
             assert not probe_ok, f"probe found a kernel but M={M} has none"
             return
