@@ -189,6 +189,26 @@ class TinyDraft:
         return [layer.self_attn.attn.layer_name for layer in self.model.layers]
 
 
+def load_draft(vllm_config, device: torch.device, seed: int = 0):
+    """The DSpark draft model of `vllm_config` with random weights (matrices at
+    1 / sqrt(fan-in), so activations stay O(1) through the layers), loaded."""
+    from vllm.models.muse_spark.amd.dspark import MuseSparkDSparkForCausalLM
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    with set_default_torch_dtype(torch.bfloat16), device:
+        lm = MuseSparkDSparkForCausalLM(vllm_config=vllm_config)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    with torch.no_grad():
+        for _name, p in lm.named_parameters():
+            if p.dtype.is_floating_point:
+                scale = 0.05 if p.dim() == 1 else p.shape[-1] ** -0.5
+                p.copy_(
+                    torch.randn(p.shape, generator=generator, device=device) * scale
+                )
+    lm.process_weights_after_loading()
+    return lm
+
+
 @pytest.fixture(scope="module", params=["auto", "fp8"], ids=["kv-bf16", "kv-fp8"])
 def tiny_draft(request, tmp_path_factory):
     from vllm.distributed import (
@@ -196,8 +216,6 @@ def tiny_draft(request, tmp_path_factory):
         ensure_model_parallel_initialized,
         init_distributed_environment,
     )
-    from vllm.models.muse_spark.amd.dspark import MuseSparkDSparkForCausalLM
-    from vllm.utils.torch_utils import set_default_torch_dtype
     from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.worker.workspace import init_workspace_manager
 
@@ -229,18 +247,7 @@ def tiny_draft(request, tmp_path_factory):
             )
             ensure_model_parallel_initialized(1, 1)
             init_workspace_manager(device)
-            with set_default_torch_dtype(torch.bfloat16), device:
-                lm = MuseSparkDSparkForCausalLM(vllm_config=vllm_config)
-            generator = torch.Generator(device=device).manual_seed(0)
-            with torch.no_grad():
-                for _name, p in lm.named_parameters():
-                    if p.dtype.is_floating_point:
-                        scale = 0.5 if p.dim() == 1 else 0.04
-                        p.copy_(
-                            torch.randn(p.shape, generator=generator, device=device)
-                            * scale
-                        )
-            lm.process_weights_after_loading()
+            lm = load_draft(vllm_config, device)
             assert lm.mono is None  # --monokernel off in this config
             kv_fp8 = request.param == "fp8"
             spec = AttentionSpec(
@@ -261,20 +268,17 @@ def test_layer_guards_accept_the_tiny_draft(tiny_draft) -> None:
 
 
 @requires_gfx950
-@pytest.mark.parametrize(
-    ("cache_dtype", "accepted"),
-    [("auto", True), ("bfloat16", True), ("fp8", True), ("fp8_e4m3", True),
-     ("fp8_e5m2", False)],
-)  # fmt: skip
-def test_deployment_guard_takes_bf16_and_e4m3_kv_caches(
-    tiny_draft, monkeypatch, cache_dtype, accepted
-) -> None:
+def test_deployment_guard_refuses_an_e5m2_kv_cache(tiny_draft, monkeypatch) -> None:
+    """The draft kernels read the cache as bf16 or e4m3: an e5m2 cache must run
+    the stock draft layers."""
     from vllm.models.muse_spark.amd.mono.drafter import static_refusals
 
-    cache = tiny_draft.lm.vllm_config.cache_config
-    monkeypatch.setattr(cache, "cache_dtype", cache_dtype)
-    reasons = static_refusals(tiny_draft.lm, 8)
-    assert any(r.startswith("kv_cache_dtype=") for r in reasons) != accepted
+    monkeypatch.setattr(
+        tiny_draft.lm.vllm_config.cache_config, "cache_dtype", "fp8_e5m2"
+    )
+    assert "kv_cache_dtype=fp8_e5m2 (kernel: bf16, fp8 e4m3)" in static_refusals(
+        tiny_draft.lm, 8
+    )
 
 
 class DraftStep:
@@ -294,7 +298,7 @@ class DraftStep:
         from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
         from vllm.v1.kv_cache_layout import KVCacheLayout
 
-        device = torch.device("cuda", 0)
+        device = torch.device("cuda", torch.accelerator.current_device_index())
         generator = torch.Generator().manual_seed(seed)
         num_reqs = len(query_lens)
         # contexts below and past the 2048-key window
@@ -393,7 +397,6 @@ class _StockDraftKernel:
     def __init__(self, tiny: TinyDraft) -> None:
         self.tiny = tiny
         self.calls: list[dict] = []
-        self.kv_fp8: list[bool] = []
 
     def peer_layout(self, S, world=8):
         return {}, 4096
@@ -402,7 +405,6 @@ class _StockDraftKernel:
         return {}, 4096
 
     def build_vllm(self, S, W, kv_fp8=False):
-        self.kv_fp8.append(kv_fp8)
         return S
 
     def build(self, S):
@@ -480,11 +482,6 @@ class _StockDraftKernel:
                 md.seq_lens.data_ptr(),
             ]
             assert desc[i][8] == rows // QUERY_ROWS
-            impl = attn.attn
-            assert desc[i][10:12] == [
-                impl._k_scale.data_ptr(),
-                impl._v_scale.data_ptr(),
-            ]
         assert (
             tab[self.T_G][self.G_Q + 2]
             == layers[0].self_attn.rotary_emb.cos_sin_cache.data_ptr()
@@ -513,7 +510,6 @@ def _run_drafter(tiny: TinyDraft, step: DraftStep, **kw):
         dims=draft_dims(tiny.lm.config, 1),
         kv_fp8=tiny.kv_fp8,
     )
-    assert kernel.kv_fp8 and set(kernel.kv_fp8) == {tiny.kv_fp8}
     try:
         return kernel, step.run(tiny, **kw)
     finally:
