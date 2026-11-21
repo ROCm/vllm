@@ -97,3 +97,26 @@ void rdna35_gdn_chunked(torch::Tensor& q, torch::Tensor& k, torch::Tensor& v,
                         std::optional<torch::Tensor> initial_state,
                         torch::Tensor& cu_seqlens, torch::Tensor& out,
                         torch::Tensor& final_state, double scale);
+
+// Muse Spark fused all-reduces (muse_fused_allreduce.cu). `inboxes` holds one
+// peer-mapped device pointer per rank; every rank issues the same calls.
+void muse_fused_allreduce_finalize(
+    const torch::Tensor& routes, const torch::Tensor& weight,
+    const torch::Tensor& topk_weights, const torch::Tensor& topk_ids,
+    const torch::Tensor& expert_map, const std::optional<torch::Tensor>& out,
+    const std::optional<torch::Tensor>& q,
+    const std::optional<torch::Tensor>& q_scale, double eps, double gain,
+    const std::vector<int64_t>& inboxes, torch::Tensor& state, int64_t rank,
+    int64_t max_rows, int64_t mode, bool read_all);
+void muse_fused_allreduce_boundary(
+    const torch::Tensor& partial, const torch::Tensor& stream_in,
+    const torch::Tensor& alpha, const torch::Tensor& beta,
+    const torch::Tensor& post_weight, const torch::Tensor& pre_weight,
+    torch::Tensor& new_stream, const std::optional<torch::Tensor>& out,
+    torch::Tensor& q, torch::Tensor& q_scale, double post_eps, double pre_eps,
+    double post_gain, double pre_gain, bool post_input_scale,
+    bool pre_input_scale, const std::vector<int64_t>& inboxes,
+    torch::Tensor& state, int64_t rank, int64_t max_rows, int64_t mode);
+void muse_fused_allreduce_fill(int64_t ptr, int64_t nbytes, int64_t pattern,
+                               int64_t device);
+void muse_fused_allreduce_close_ipc_handle(int64_t ptr, int64_t device);

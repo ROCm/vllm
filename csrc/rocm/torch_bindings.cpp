@@ -143,6 +143,33 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "                bool use_interleaved_v_cache=False) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
 
+  // Muse Spark TP all-reduces fused with the MoE finalize and the attention
+  // boundary (gfx950); see csrc/rocm/muse_fused_allreduce.cuh.
+  rocm_ops.def(
+      "muse_fused_allreduce_finalize(Tensor routes, Tensor weight, "
+      "Tensor topk_weights, Tensor topk_ids, Tensor expert_map, "
+      "Tensor!? out, Tensor!? q, Tensor!? q_scale, float eps, float gain, "
+      "int[] inboxes, Tensor! state, int rank, int max_rows, int mode, "
+      "bool read_all) -> ()");
+  rocm_ops.impl("muse_fused_allreduce_finalize", torch::kCUDA,
+                &muse_fused_allreduce_finalize);
+  rocm_ops.def(
+      "muse_fused_allreduce_boundary(Tensor partial, Tensor stream, "
+      "Tensor alpha, Tensor beta, Tensor post_weight, Tensor pre_weight, "
+      "Tensor! new_stream, Tensor!? out, Tensor! q, Tensor! q_scale, "
+      "float post_eps, float pre_eps, float post_gain, float pre_gain, "
+      "bool post_input_scale, bool pre_input_scale, int[] inboxes, "
+      "Tensor! state, int rank, int max_rows, int mode) -> ()");
+  rocm_ops.impl("muse_fused_allreduce_boundary", torch::kCUDA,
+                &muse_fused_allreduce_boundary);
+  rocm_ops.def(
+      "muse_fused_allreduce_fill(int ptr, int nbytes, int pattern, int device) "
+      "-> ()",
+      &muse_fused_allreduce_fill);
+  rocm_ops.def(
+      "muse_fused_allreduce_close_ipc_handle(int ptr, int device) -> ()",
+      &muse_fused_allreduce_close_ipc_handle);
+
 #ifdef VLLM_ROCM_GFX115X
   rocm_ops.def(
       "rdna35_gdn_chunked(Tensor q, Tensor k, Tensor v, Tensor g, Tensor beta, "
