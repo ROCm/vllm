@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Muse Spark ROCm decode MoE kernels."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -266,11 +267,13 @@ def test_native_routes_with_repeated_experts_and_nan_rows(
 # rounding; only fp32 accumulation order and SiLU ulps may differ, and a single
 # requantized block that flips stays well below this.
 COMPACT_REL_L2 = 1e-3
+COMPACT_TOKENS = [1, 8, 24, 64, 65, 192, COMPACT_MAX_TOKENS]
+REPLICA_TOKENS = [8, 64, COMPACT_MAX_TOKENS]
 
 
 @pytest.mark.skipif(not ROCM_GFX950_AITER, reason="requires gfx950 and AITER")
 @pytest.mark.parametrize("local_experts", [32, 64, 128])
-@pytest.mark.parametrize("num_tokens", [1, 8, 24, 64, 65, 192, COMPACT_MAX_TOKENS])
+@pytest.mark.parametrize("num_tokens", COMPACT_TOKENS)
 @torch.inference_mode()
 def test_compact_experts_match_the_flydsl_stages(
     rocm_aiter_moe, monkeypatch: pytest.MonkeyPatch, local_experts: int, num_tokens: int
@@ -307,16 +310,8 @@ def test_compact_experts_match_the_flydsl_stages(
 
     def experts() -> torch.Tensor:
         return decode_moe._native_routes_experts(
-            x,
-            topk_ids,
-            w13,
-            w2,
-            w1_scale,
-            w2_scale,
-            expert_mask,
-            expert_map,
-            kernels,
-        )
+            x, topk_ids, w13, w2, w1_scale, w2_scale, expert_mask, expert_map, kernels
+        )[0]
 
     routes = expert_map[topk_ids.long()] >= 0
 
@@ -329,6 +324,424 @@ def test_compact_experts_match_the_flydsl_stages(
     monkeypatch.setattr(decode_moe, "supports_compact_moe", lambda *args: False)
     flydsl = experts()
     assert rel_l2(compact, flydsl) < COMPACT_REL_L2
+
+
+# Expert-parallel layouts of the decode expert replicas: (ranks, copies per
+# rank).
+REPLICA_LAYOUTS = [(4, 4), (4, 8), (8, 8)]
+REPLICA_INTER = 1024
+
+
+def _replica_holders(
+    step_indices: list[np.ndarray],
+    plan: list[tuple[int, int, int]],
+    local: int,
+) -> np.ndarray:
+    """The rank computing each expert's routes in one step, from the ranks'
+    `[E]` step indices after the call. Asserts
+    that each expert is computed by exactly one rank, either its owner in its
+    own slot or a planned copy rank in the planned replica slot."""
+    copies = {(e, c): local + s for e, c, s in plan}
+    held = np.stack(step_indices) >= 0
+    assert (held.sum(0) == 1).all(), "an expert has no holder or several"
+    holders = held.argmax(0)
+    for e, r in enumerate(holders):
+        idx = step_indices[r][e]
+        if r == e // local:
+            assert idx == e - r * local, (e, r, idx)
+        else:
+            assert copies.get((e, int(r))) == idx, (e, r, idx)
+    return holders
+
+
+def _busiest_rank_cost(
+    counts: np.ndarray, holders: np.ndarray, ranks: int, block_m: int
+) -> int:
+    """The largest per-rank cost of a step: expert weight reads, by blocks of
+    routes, as the replica assignment counts them."""
+    from vllm.models.muse_spark.amd.ops import compact_moe as cm
+
+    blocks = (counts + block_m - 1) // block_m
+    cost = np.where(
+        counts > 0,
+        cm.REPLICA_COST_UNIT + cm.REPLICA_COST_EXTRA_BLOCK * (blocks - 1),
+        0,
+    )
+    return int(np.bincount(holders, weights=cost, minlength=ranks).max())
+
+
+def _replica_rank_inputs(
+    plan: list[tuple[int, int, int]], rank: int, ranks: int, replicas: int, device
+):
+    """One rank's replica table, its step index at rest and the global experts
+    of its replica slots (0 for unused slots)."""
+    from vllm.models.muse_spark.amd import decode_replicas as dr
+
+    local = NUM_EXPERTS // ranks
+    table = dr.layer_table(plan, rank, ranks, NUM_EXPERTS, replicas, device)
+    index = torch.full((NUM_EXPERTS,), -1, dtype=torch.int32, device=device)
+    index[rank * local : (rank + 1) * local] = torch.arange(
+        local, dtype=torch.int32, device=device
+    )
+    copies = [e for _, e in sorted((s, e) for e, c, s in plan if c == rank)]
+    copies += [0] * (replicas - len(copies))
+    return table, index, torch.tensor(copies, dtype=torch.long, device=device)
+
+
+def _random_mxfp4_experts(device: torch.device, inter: int):
+    """Shuffled-layout MXFP4 weights and E8M0 scales of every expert (random
+    codes, scales 2^-6..2^-3 so that outputs stay well inside bf16)."""
+    gen = torch.Generator(device=device).manual_seed(0)
+
+    def rand(shape, lo=0, hi=256):
+        return torch.randint(
+            lo, hi, shape, dtype=torch.uint8, device=device, generator=gen
+        )
+
+    w13 = rand((NUM_EXPERTS, 2 * inter, HIDDEN // 2))
+    w2 = rand((NUM_EXPERTS, HIDDEN, inter // 2))
+    s13 = rand((NUM_EXPERTS, 2 * inter, HIDDEN // 32), 121, 125)
+    s2 = rand((NUM_EXPERTS, HIDDEN, inter // 32), 121, 125)
+    return w13, w2, s13, s2
+
+
+def _shuffled(*tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    for t in tensors:
+        t.is_shuffled = True
+    return tensors
+
+
+def _expert_load(ranks: int) -> np.ndarray:
+    return np.random.default_rng(ranks).pareto(1.0, NUM_EXPERTS) + 0.01
+
+
+def _routes(num_tokens: int, load: np.ndarray, skewed: bool, device) -> torch.Tensor:
+    logits = torch.randn(num_tokens, NUM_EXPERTS, device=device)
+    if skewed:
+        logits += 3.0 * torch.from_numpy(np.log(load)).float().to(device)
+    return torch.topk(logits, TOP_K, dim=-1).indices.to(torch.int32)
+
+
+@pytest.mark.skipif(not ROCM_GFX950_AITER, reason="requires gfx950 and AITER")
+@pytest.mark.parametrize("ranks,replicas", REPLICA_LAYOUTS)
+@pytest.mark.parametrize("num_tokens", REPLICA_TOKENS)
+@pytest.mark.parametrize("routing", ["random", "skewed"])
+@torch.inference_mode()
+def test_compact_experts_with_replicas_compute_every_route_once(
+    ranks: int, replicas: int, num_tokens: int, routing: str
+) -> None:
+    """Over two steps with the same step indices: every expert's routes are
+    computed by exactly one rank (its owner, or a planned copy in the planned
+    slot), the busiest rank's cost is no higher than with owners only, each
+    computed route's output row is the owner's, and skewed routing moves some
+    experts to their copies."""
+    from vllm.models.muse_spark.amd import decode_replicas as dr
+    from vllm.models.muse_spark.amd.ops import compact_moe as cm
+
+    torch.manual_seed(num_tokens + ranks)
+    device = torch.device("cuda")
+    local = NUM_EXPERTS // ranks
+    w13, w2, s13, s2 = _random_mxfp4_experts(device, REPLICA_INTER)
+    load = _expert_load(ranks)
+    plan = dr.plan_layer(load, ranks, replicas)
+    owner = np.arange(NUM_EXPERTS) // local
+    inputs = [
+        _replica_rank_inputs(plan, r, ranks, replicas, device) for r in range(ranks)
+    ]
+    for step in range(2):
+        topk_ids = _routes(num_tokens, load, routing == "skewed" and step == 0, device)
+        x = torch.randn(num_tokens, HIDDEN, dtype=torch.bfloat16, device=device)
+        counts = np.bincount(topk_ids.cpu().numpy().ravel(), minlength=NUM_EXPERTS)
+        owners_out = []
+        for r in range(ranks):
+            own = torch.arange(r * local, (r + 1) * local, device=device)
+            index = torch.full((NUM_EXPERTS,), -1, dtype=torch.int32, device=device)
+            index[own] = torch.arange(local, dtype=torch.int32, device=device)
+            weights = _shuffled(w13[own], w2[own], s13[own], s2[own])
+            owners_out.append(cm.compact_moe_experts(x, topk_ids, index, *weights))
+        computed = torch.zeros(num_tokens, TOP_K, dtype=torch.int32, device=device)
+        for r, (table, step_index, rows) in enumerate(inputs):
+            own = torch.arange(r * local, (r + 1) * local, device=device)
+            w13_r, w2_r, s13_r, s2_r = _shuffled(w13[own], w2[own], s13[own], s2[own])
+            out = cm.compact_moe_experts(
+                x,
+                topk_ids,
+                step_index,
+                w13_r,
+                w2_r,
+                s13_r,
+                s2_r,
+                replicas=table,
+                replica_weights=(w13[rows], w2[rows], s13[rows], s2[rows]),
+            )
+            mine = step_index[topk_ids.long()] >= 0
+            computed += mine.int()
+            for o in range(ranks):
+                sel = mine & (topk_ids // local == o)
+                if sel.any():
+                    torch.testing.assert_close(out[sel], owners_out[o][sel])
+        assert bool((computed == 1).all())
+        step_indices = [i.cpu().numpy() for _, i, _ in inputs]
+        holders = _replica_holders(step_indices, plan, local)
+        block_m = cm.tile_config(num_tokens).block_m
+        assert _busiest_rank_cost(counts, holders, ranks, block_m) <= (
+            _busiest_rank_cost(counts, owner, ranks, block_m)
+        )
+        if routing == "skewed" and step == 0 and num_tokens >= 64:
+            assert (holders != owner)[counts > 0].any(), "no expert moved"
+
+
+@pytest.mark.skipif(not ROCM_GFX950_AITER, reason="requires gfx950 and AITER")
+@pytest.mark.parametrize("ranks,replicas", REPLICA_LAYOUTS)
+@pytest.mark.parametrize("num_tokens,num_padding", [(8, 3), (64, 17), (192, 64)])
+@torch.inference_mode()
+def test_compact_experts_with_replicas_ignore_padding_rows(
+    ranks: int, replicas: int, num_tokens: int, num_padding: int
+) -> None:
+    """Padding rows with arbitrary routes leave the replica assignment (every
+    rank's step index) and the real rows' outputs unchanged."""
+    from vllm.models.muse_spark.amd import decode_replicas as dr
+    from vllm.models.muse_spark.amd.ops import compact_moe as cm
+
+    torch.manual_seed(num_tokens + ranks)
+    device = torch.device("cuda")
+    local = NUM_EXPERTS // ranks
+    w13, w2, s13, s2 = _random_mxfp4_experts(device, REPLICA_INTER)
+    load = _expert_load(ranks)
+    plan = dr.plan_layer(load, ranks, replicas)
+    real = num_tokens - num_padding
+    topk_ids = _routes(num_tokens, load, True, device)
+    padding = torch.zeros(num_tokens, dtype=torch.bool, device=device)
+    padding[real:] = True
+    x = torch.randn(num_tokens, HIDDEN, dtype=torch.bfloat16, device=device)
+    # Garbage routes: every padding row on rank 0's experts, then on the
+    # hottest replicated experts.
+    hot = torch.tensor([e for e, _, _ in plan[:TOP_K]], device=device)
+    garbage = [
+        torch.arange(TOP_K, device=device).expand(num_padding, TOP_K),
+        hot[torch.arange(TOP_K, device=device) % len(hot)].expand(num_padding, TOP_K),
+    ]
+    results, indices = [], []
+    for g in garbage:
+        ids = topk_ids.clone()
+        ids[real:] = g.to(torch.int32)
+        per_rank, step_indices = [], []
+        for r in range(ranks):
+            table, step_index, rows = _replica_rank_inputs(
+                plan, r, ranks, replicas, device
+            )
+            own = torch.arange(r * local, (r + 1) * local, device=device)
+            w13_r, w2_r, s13_r, s2_r = _shuffled(w13[own], w2[own], s13[own], s2[own])
+            out = cm.compact_moe_experts(
+                x,
+                ids,
+                step_index,
+                w13_r,
+                w2_r,
+                s13_r,
+                s2_r,
+                replicas=table,
+                replica_weights=(w13[rows], w2[rows], s13[rows], s2[rows]),
+                padding=padding,
+            )
+            step_indices.append(step_index.cpu().numpy())
+            mine = step_index[ids[:real].long()] >= 0
+            per_rank.append(torch.where(mine[..., None], out[:real], 0).float())
+        _replica_holders(step_indices, plan, local)
+        results.append(torch.stack(per_rank))
+        indices.append(np.stack(step_indices))
+    np.testing.assert_array_equal(indices[0], indices[1])
+    torch.testing.assert_close(results[0], results[1])
+
+
+@pytest.mark.skipif(not ROCM_GFX950_AITER, reason="requires gfx950 and AITER")
+@pytest.mark.parametrize("ranks,replicas", REPLICA_LAYOUTS)
+@pytest.mark.parametrize("num_tokens", [8, 64, COMPACT_MAX_TOKENS])
+@torch.inference_mode()
+def test_native_routes_with_replicas_match_the_owners(
+    ranks: int, replicas: int, num_tokens: int
+) -> None:
+    """The ranks' finalized outputs with replicas sum to the owners-only sum
+    (each rank's partial is rounded to bf16, and replicas change which partial
+    carries a route; one missing or repeated route is far above the bound)."""
+    from types import SimpleNamespace
+
+    from vllm.models.muse_spark.amd import decode_moe
+    from vllm.models.muse_spark.amd import decode_replicas as dr
+    from vllm.models.muse_spark.common.layers import MuseSparkRMSNormWithInputScale
+
+    torch.manual_seed(num_tokens)
+    device = torch.device("cuda")
+    local = NUM_EXPERTS // ranks
+    w13, w2, s13, s2 = _random_mxfp4_experts(device, REPLICA_INTER)
+    load = _expert_load(ranks)
+    plan = dr.plan_layer(load, ranks, replicas)
+    post_norm = MuseSparkRMSNormWithInputScale(
+        hidden_size=HIDDEN,
+        eps=1e-8,
+        has_weight=True,
+        is_post_norm=True,
+        zero_centered_gamma=True,
+        post_norm_gain_center_type="one",
+        residual_id=None,
+        output_norm_gain_center_type="zero",
+    ).to(device)
+    post_norm.weight.copy_(torch.randn(HIDDEN, device=device) * 0.1)
+    # The compact experts take every call here; the stage kernels are unused.
+    kernels = decode_moe.StageKernels("", {}, 32)
+    x = torch.randn(num_tokens, HIDDEN, dtype=torch.bfloat16, device=device)
+    topk_ids = _routes(num_tokens, load, True, device)
+    topk_weights = torch.softmax(torch.randn(num_tokens, TOP_K, device=device), -1)
+    owners = torch.zeros(num_tokens, HIDDEN, dtype=torch.float32, device=device)
+    with_replicas = torch.zeros_like(owners)
+    moved = 0
+    for r in range(ranks):
+        own = torch.arange(r * local, (r + 1) * local, device=device)
+        w13_r, w2_r, s13_r, s2_r = _shuffled(w13[own], w2[own], s13[own], s2[own])
+        quant_config = SimpleNamespace(w1_scale=s13_r, w2_scale=s2_r)
+        table, step_index, rows = _replica_rank_inputs(plan, r, ranks, replicas, device)
+        mask = torch.zeros(NUM_EXPERTS, dtype=torch.int32, device=device)
+        mask[own] = 1
+        args = (x, topk_weights, topk_ids, w13_r, w2_r, quant_config, mask)
+        owners += decode_moe.native_routes_moe(
+            *args, step_index.clone(), kernels, post_norm
+        ).float()
+        layer = dr.LayerDecodeReplicas(
+            table, step_index, (w13[rows], w2[rows], s13[rows], s2[rows])
+        )
+        with_replicas += decode_moe.native_routes_moe(
+            *args, step_index, kernels, post_norm, replicas=layer
+        ).float()
+        # Routes this rank computes on a replica slot (not vacuous: the
+        # routing is skewed toward the replicated experts).
+        moved += int((step_index[topk_ids.long()] >= local).sum())
+    assert moved > 0, "no route was computed on a replica"
+    assert torch.isfinite(with_replicas).all()
+    rel = (with_replicas - owners).norm() / owners.norm().clamp_min(1e-30)
+    assert rel < 1e-2, f"relative L2 {rel:.2e}"
+
+
+def _replica_vllm_config(additional_config: dict, **parallel):
+    from types import SimpleNamespace
+
+    parallel = {
+        "tensor_parallel_size": 4,
+        "data_parallel_size": 1,
+        "enable_expert_parallel": True,
+        "enable_eplb": False,
+        **parallel,
+    }
+    return SimpleNamespace(
+        additional_config=additional_config,
+        parallel_config=SimpleNamespace(**parallel),
+        kernel_config=SimpleNamespace(monokernel=parallel.pop("monokernel", False)),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_hidden_layers=6, num_local_experts=32)
+        ),
+    )
+
+
+def _write_routed_experts_responses(path, routed: list[np.ndarray]) -> None:
+    import io
+    import json
+
+    import pybase64 as base64
+
+    with open(path, "w") as f:
+        for ids in routed:
+            buf = io.BytesIO()
+            np.save(buf, ids)
+            encoded = base64.b64encode(buf.getvalue()).decode()
+            f.write(json.dumps({"choices": [{"routed_experts": encoded}]}) + "\n")
+
+
+def test_decode_replicas_from_a_routed_experts_profile(tmp_path) -> None:
+    """A profile summed from returned routed experts loads through
+    `additional_config` and plans copies of the hottest experts, each on a
+    non-owner rank, at most `replicas` per rank."""
+    from tools.expert_load_profile import expert_load_profile, routed_experts_of
+    from vllm.models.muse_spark.amd import decode_replicas as dr
+
+    rng = np.random.default_rng(0)
+    hot = rng.pareto(1.0, 32) + 0.01
+    routed = [
+        np.stack(
+            [
+                np.stack([rng.choice(32, 4, replace=False, p=hot / hot.sum())])
+                for _ in range(6)
+            ],
+            axis=1,
+        ).repeat(n, axis=0)
+        for n in (3, 5)
+    ]
+    responses = tmp_path / "responses.jsonl"
+    _write_routed_experts_responses(responses, [r.astype(np.uint8) for r in routed])
+    profile = expert_load_profile(routed_experts_of([str(responses)]), 32)
+    want = np.zeros((6, 32))
+    for ids in routed:
+        for layer in range(6):
+            np.add.at(want[layer], ids[:, layer].ravel(), 1)
+    np.testing.assert_array_equal(profile, want)
+    path = tmp_path / "profile.npy"
+    np.save(path, profile)
+
+    config = dr.DecodeReplicaConfig.from_vllm_config(
+        _replica_vllm_config(
+            {"decode_expert_replicas": 2, "decode_expert_load_profile": str(path)}
+        )
+    )
+    assert config is not None and config.replicas == 2
+    np.testing.assert_array_equal(config.profile, profile)
+    for layer in range(6):
+        load = config.profile[layer]
+        plan = dr.plan_layer(load, 4, 2)
+        assert plan
+        assert all(load[e] > 0 for e, _, _ in plan)
+        assert all(e // 8 != c for e, c, _ in plan)
+    assert dr.DecodeReplicaConfig.from_vllm_config(_replica_vllm_config({})) is None
+
+
+@pytest.mark.parametrize(
+    "additional_config,parallel,match",
+    [
+        ({"decode_expert_replicas": 2}, {}, "needs decode_expert_load_profile"),
+        ({"decode_expert_replicas": -1}, {}, "non-negative integer"),
+        ({"decode_expert_load_profile": "p.npy"}, {}, "is 0"),
+        ({"decode_expert_replicas": 9, "PROFILE": 1}, {}, "exceeds the 8 experts"),
+        ({"decode_expert_replicas": 2, "PROFILE": 1}, {"enable_eplb": True}, "EPLB"),
+        (
+            {"decode_expert_replicas": 2, "PROFILE": 1},
+            {"enable_expert_parallel": False},
+            "expert parallelism",
+        ),
+        (
+            {"decode_expert_replicas": 2, "PROFILE": 1},
+            {"tensor_parallel_size": 16},
+            "up to 8",
+        ),
+        ({"decode_expert_replicas": 2, "PROFILE": 1}, {"monokernel": True}, "mono"),
+        ({"decode_expert_replicas": 2, "PROFILE": (5, 32)}, {}, "has shape"),
+        ({"decode_expert_replicas": 2, "PROFILE": -1}, {}, "non-negative"),
+        ({"decode_expert_replicas": 2, "PROFILE": "missing"}, {}, "cannot read"),
+    ],
+)
+def test_decode_replica_config_rejects(
+    tmp_path, additional_config: dict, parallel: dict, match: str
+) -> None:
+    from vllm.models.muse_spark.amd import decode_replicas as dr
+
+    additional_config = dict(additional_config)
+    kind = additional_config.pop("PROFILE", None)
+    if kind is not None:
+        path = tmp_path / "profile.npy"
+        if kind != "missing":
+            shape = kind if isinstance(kind, tuple) else (6, 32)
+            np.save(path, np.full(shape, float(kind if kind == -1 else 1)))
+        additional_config["decode_expert_load_profile"] = str(path)
+    with pytest.raises(ValueError, match=match):
+        dr.DecodeReplicaConfig.from_vllm_config(
+            _replica_vllm_config(additional_config, **parallel)
+        )
 
 
 LOCAL_EXPERTS = 64
