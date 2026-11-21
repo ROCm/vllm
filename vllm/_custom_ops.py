@@ -2119,6 +2119,68 @@ def swmmac_gemm(
     return torch.ops._rocm_C.swmmacGEMM(a, b, bias, logical_m, cu_count)
 
 
+def muse_fused_allreduce_finalize(
+    routes: torch.Tensor,
+    weight: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    out: torch.Tensor | None,
+    q: torch.Tensor | None,
+    q_scale: torch.Tensor | None,
+    eps: float,
+    gain: float,
+    inboxes: list[int],
+    state: torch.Tensor,
+    rank: int,
+    max_rows: int,
+    mode: int,
+    read_all: bool,
+) -> None:
+    torch.ops._rocm_C.muse_fused_allreduce_finalize(
+        routes, weight, topk_weights, topk_ids, expert_map, out, q, q_scale,
+        eps, gain, inboxes, state, rank, max_rows, mode, read_all,
+    )  # fmt: skip
+
+
+def muse_fused_allreduce_boundary(
+    partial: torch.Tensor,
+    stream: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    post_weight: torch.Tensor,
+    pre_weight: torch.Tensor,
+    new_stream: torch.Tensor,
+    out: torch.Tensor | None,
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    post_eps: float,
+    pre_eps: float,
+    post_gain: float,
+    pre_gain: float,
+    post_input_scale: bool,
+    pre_input_scale: bool,
+    inboxes: list[int],
+    state: torch.Tensor,
+    rank: int,
+    max_rows: int,
+    mode: int,
+) -> None:
+    torch.ops._rocm_C.muse_fused_allreduce_boundary(
+        partial, stream, alpha, beta, post_weight, pre_weight, new_stream, out,
+        q, q_scale, post_eps, pre_eps, post_gain, pre_gain, post_input_scale,
+        pre_input_scale, inboxes, state, rank, max_rows, mode,
+    )  # fmt: skip
+
+
+def muse_fused_allreduce_fill(ptr: int, nbytes: int, pattern: int, device: int) -> None:
+    torch.ops._rocm_C.muse_fused_allreduce_fill(ptr, nbytes, pattern, device)
+
+
+def muse_fused_allreduce_close_ipc_handle(ptr: int, device: int) -> None:
+    torch.ops._rocm_C.muse_fused_allreduce_close_ipc_handle(ptr, device)
+
+
 # moe
 def moe_sum(
     input: torch.Tensor,

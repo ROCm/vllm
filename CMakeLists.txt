@@ -1762,9 +1762,18 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${ROCM_ATTN_GEN_STAMP} ${_attn_generated_abs})
 
+  # The Muse Spark fused all-reduces: one unit per world size (the kernels are
+  # shared through muse_fused_allreduce.cuh) and an entry-point unit that only
+  # checks arguments and dispatches.
+  set(VLLM_MUSE_FAR_SRC
+    "csrc/rocm/muse_fused_allreduce.cu"
+    "csrc/rocm/muse_fused_allreduce_w4.cu"
+    "csrc/rocm/muse_fused_allreduce_w8.cu")
+
   set(VLLM_ROCM_EXT_SRC
     "csrc/rocm/torch_bindings.cpp"
     ${VLLM_SKINNY_SRC}
+    ${VLLM_MUSE_FAR_SRC}
     "csrc/rocm/attention_dispatch.cu"
     ${VLLM_ATTENTION_PAGED_ATTN_SRC})
 

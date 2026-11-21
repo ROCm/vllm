@@ -14,7 +14,9 @@ runs the whole layer on the layer's own weights:
   `SORT_QUANT_MAX_TOKENS` tokens), AITER's FlyDSL stages with a per-slot stage 2;
 * the fused post-expert finalize, masking the routes of other ranks' experts;
 * the layer's reduction (all-reduce, or reduce-scatter on a token-sharded step)
-  and the unpooler.
+  and the unpooler. At TP4 and TP8 the finalize, the all-reduce and the
+  per-token FP8 quantization of the unpooler's input run as one kernel
+  (`fused_allreduce`).
 
 Anything else runs the layer as before; the paths share every tensor at the
 layer boundary. Every rank takes the same path: the conditions read only the
@@ -39,7 +41,9 @@ from vllm.models.muse_spark.common.ops.fused_finalize import (
     fused_post_expert_finalize,
 )
 
+from . import fp8_dense
 from .muse_moe_runner import MuseSparkAiterExperts, MuseSparkQuarkOCPMXFusedMoE
+from .ops import fused_allreduce
 from .ops.compact_moe import compact_moe_experts, supports_compact_moe
 from .ops.decode_moe import (
     decode_moe_prep,
@@ -129,7 +133,17 @@ class MuseSparkDecodeMoE:
             "Muse Spark decode MoE on native routes enabled up to %d tokens.",
             MAX_TOKENS,
         )
-        return cls()
+        return cls(
+            fuses_allreduce=routed.moe_config.hidden_dim
+            == fused_allreduce.FINALIZE_HIDDEN
+            and moe.top_k == fused_allreduce.TOP_K
+            and post_norm.has_weight
+            and post_norm.applies_weight_before_norm
+        )
+
+    def __init__(self, fuses_allreduce: bool = False) -> None:
+        # Whether the finalize kernel of `fused_allreduce` fits the layer.
+        self.fuses_allreduce = fuses_allreduce
 
     def kernels(self, moe: "MuseSparkMoE", num_tokens: int) -> StageKernels | None:
         """The expert stages of a call of `num_tokens` tokens (the whole step's,
@@ -187,6 +201,42 @@ class MuseSparkDecodeMoE:
         routed = moe.experts.routed_experts
         expert_mask, local_index = routed.expert_map, routed._expert_map
         assert expert_mask is not None and local_index is not None
+        fused = None
+        if shard is None and self.fuses_allreduce:
+            fused = fused_allreduce.get()
+        if fused is not None and fused.applies(normed.shape[0]):
+            quant_config = routed.quant_method.moe_kernel.fused_experts.quant_config
+            routes = _native_routes_experts(
+                normed,
+                topk_ids,
+                routed.w13_weight,
+                routed.w2_weight,
+                quant_config.w1_scale,
+                quant_config.w2_scale,
+                expert_mask,
+                local_index,
+                kernels,
+            )
+            # An unpooler kernel that takes per-token FP8 rows gets them from the
+            # fused kernel instead of quantizing the bf16 sum itself.
+            quant = fp8_dense.takes_fp8_input(unpooler)
+            out, q, q_scale = fused.finalize(
+                routes,
+                post_norm.weight,
+                topk_weights,
+                topk_ids,
+                local_index,
+                post_norm.variance_epsilon,
+                post_norm.fused_gain_center,
+                quant=quant,
+            )
+            logger.info_once(
+                "Muse Spark decode MoE: finalize and all-reduce fused%s.",
+                " with the unpooler's FP8 input" if quant else "",
+            )
+            if quant:
+                return unpooler(fp8_dense.fp8_input(q, q_scale, normed.dtype))[0]
+            return unpooler(out)[0]
         out = native_routes_moe(
             normed,
             topk_weights,

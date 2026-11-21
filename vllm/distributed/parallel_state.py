@@ -1417,7 +1417,14 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.recv(size, dtype, src)
 
+    def add_destroy_callback(self, callback: Callable[[], None]) -> None:
+        """Run `callback` at the start of `destroy`, to release a workspace
+        built over this group outside its device communicator."""
+        self.__dict__.setdefault("_destroy_callbacks", []).append(callback)
+
     def destroy(self):
+        for callback in self.__dict__.pop("_destroy_callbacks", []):
+            callback()
         # Device communicators can own collective workspaces whose teardown
         # uses these process groups (for example FlashInfer PCIe IPC barriers).
         # Release them before destroying the groups they depend on.

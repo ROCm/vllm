@@ -89,6 +89,7 @@ from .muse_moe_runner import (
     MuseSparkRoutedExperts,
     token_sharded_moe_output,
 )
+from .ops import fused_allreduce
 from .ops.fused_norm_expand import fused_rmsnorm_expand
 from .ops.fused_qk_norm_rope_kv import rocm_fused_qk_norm_rope_kv_insert
 from .ops.router_bf16x3 import (
@@ -263,6 +264,33 @@ def _norm_residual_norm_fp8(
         pre_norm.variance_epsilon,
         alpha=connection.alpha,
         beta=connection.beta,
+        post_gain_center=post_norm.fused_gain_center,
+        pre_gain_center=pre_norm.fused_gain_center,
+        post_input_scale=post_norm.applies_weight_before_norm and post_norm.has_weight,
+        pre_input_scale=pre_norm.applies_weight_before_norm and pre_norm.has_weight,
+        out_dtype=out_dtype,
+    )
+
+
+def _allreduce_norm_residual_norm_fp8(
+    fused: fused_allreduce.MuseFusedAllReduce,
+    x: MuseSparkResidualStream,
+    pre_norm: MuseSparkRMSNorm,
+    *,
+    out_dtype: torch.dtype,
+):
+    """`_norm_residual_norm_fp8` of `x` whose branch is this rank's unreduced
+    partial, all-reduced in the same kernel."""
+    post_norm, connection = x.post_norm, x.connection
+    return fused.boundary(
+        x.branch,
+        x.stream,
+        connection.alpha,
+        connection.beta,
+        post_norm.weight if post_norm.has_weight else None,
+        pre_norm.weight if pre_norm.has_weight else None,
+        post_norm.variance_epsilon,
+        pre_norm.variance_epsilon,
         post_gain_center=post_norm.fused_gain_center,
         pre_gain_center=pre_norm.fused_gain_center,
         post_input_scale=post_norm.applies_weight_before_norm and post_norm.has_weight,
@@ -879,9 +907,11 @@ class MuseSparkAttention(nn.Module):
         xq: torch.Tensor,
         xs: torch.Tensor,
         shard: TokenShard | None = None,
+        reduce: bool = True,
     ) -> torch.Tensor:
         """`forward` on the pre-qkv norm's per-token FP8 output `xq` / `xs`, for a
-        `qkv_proj` that takes FP8 input. `o_proj` stays BF16.
+        `qkv_proj` that takes FP8 input. `o_proj` stays BF16. Without `reduce`, a
+        deferred all-reduce is left to the caller (this rank's partial).
         """
         if isinstance(shard, UlyssesShard):
             return self.forward_ulysses(positions, (xq, xs), shard)
@@ -894,7 +924,7 @@ class MuseSparkAttention(nn.Module):
             attn_output = self.attn(q, None, None)
         else:
             attn_output = self.attn(q, k, v)
-        return self.back(attn_output, og, shard)
+        return self.back(attn_output, og, shard, reduce)
 
     def build_ulysses_weights(self) -> int:
         """Build the full FP8 weights `forward_ulysses` uses; returns their bytes.
@@ -953,8 +983,10 @@ class MuseSparkAttention(nn.Module):
         attn_output: torch.Tensor,
         og: torch.Tensor | None,
         shard: TokenShard | None = None,
+        reduce: bool = True,
     ) -> torch.Tensor:
-        """O-norm, O-gate and the output projection."""
+        """O-norm, O-gate and the output projection (and its deferred all-reduce,
+        with `reduce`)."""
         if self.fuse_o_norm_gate:
             assert og is not None
             attn_output = attn_output.reshape(-1, self.num_heads, self.head_dim)
@@ -983,7 +1015,7 @@ class MuseSparkAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         if shard is not None:
             return shard.reduce_scatter(output)
-        if self.defer_reduce:
+        if self.defer_reduce and reduce:
             output = tensor_model_parallel_all_reduce(output)
         return output
 
@@ -1134,8 +1166,11 @@ class MuseSparkDecoderLayer(nn.Module):
         # whose kernels take per-token FP8 rows.
         if fp8_dense.takes_fp8_input(self.self_attn.qkv_proj):
             xq, xs, stream = self._pre_attention_fp8(x)
-            attn_out = self.self_attn.forward_fp8(positions, xq, xs, shard)
-            return self.after_attention(stream, attn_out, shard)
+            fused = self._fused_attention_boundary(stream, shard)
+            attn_out = self.self_attn.forward_fp8(
+                positions, xq, xs, shard, reduce=fused is None
+            )
+            return self.after_attention(stream, attn_out, shard, fused)
         if isinstance(x, torch.Tensor):
             stream = x
             attn_input = self.self_attn.pre_qkv_proj_norm(
@@ -1189,13 +1224,43 @@ class MuseSparkDecoderLayer(nn.Module):
         xq, xs = usp.quant_rows(attn_input)
         return xq, xs, stream
 
+    def _fused_attention_boundary(
+        self, stream: torch.Tensor, shard: TokenShard | None
+    ) -> fused_allreduce.MuseFusedAllReduce | None:
+        """The fused all-reduce of the attention output and the boundary after it,
+        where it serves this step."""
+        fused = fused_allreduce.get()
+        connection = self.add_attn
+        if (
+            fused is None
+            or shard is not None
+            or not self.self_attn.defer_reduce
+            or not fp8_dense.takes_fp8_input(getattr(self.feed_forward, "pooler", None))
+            or not fused.boundary_applies(stream.shape[0])
+            or stream.shape[-1] != fused_allreduce.BOUNDARY_HIDDEN
+            or not isinstance(connection, MuseSparkNormPreservingResidualConnection)
+            or not getattr(connection, "_coefficients_ready", False)
+            or not isinstance(connection.alpha, torch.Tensor)
+            or connection.beta.numel() != stream.shape[-1]
+            or not self.post_attn_norm.supports_fused_kernel(stream)
+            or not self.pre_ffn_norm.supports_fused_kernel(stream)
+        ):
+            return None
+        logger.info_once(
+            "Muse Spark attention boundary: all-reduce fused with the "
+            "post-attention and pre-FFN norms."
+        )
+        return fused
+
     def after_attention(
         self,
         stream: torch.Tensor,
         attn_out: torch.Tensor,
         shard: TokenShard | None = None,
+        fused: fused_allreduce.MuseFusedAllReduce | None = None,
     ) -> MuseSparkResidualStream:
-        """Attention boundary and FFN; the FFN boundary is returned unblended."""
+        """Attention boundary and FFN; the FFN boundary is returned unblended.
+        With `fused`, `attn_out` is this rank's unreduced partial."""
         if fp8_dense.takes_fp8_input(getattr(self.feed_forward, "pooler", None)):
             boundary = MuseSparkResidualStream(
                 stream=stream,
@@ -1203,9 +1268,14 @@ class MuseSparkDecoderLayer(nn.Module):
                 post_norm=self.post_attn_norm,
                 connection=self.add_attn,
             )
-            out = _norm_residual_norm_fp8(
-                boundary, self.pre_ffn_norm, out_dtype=self.default_dtype
-            )
+            if fused is not None:
+                out = _allreduce_norm_residual_norm_fp8(
+                    fused, boundary, self.pre_ffn_norm, out_dtype=self.default_dtype
+                )
+            else:
+                out = _norm_residual_norm_fp8(
+                    boundary, self.pre_ffn_norm, out_dtype=self.default_dtype
+                )
             if out is not None:
                 ffn_in, stream, fq, fs = out
                 branch = self.feed_forward(ffn_in, shard, fp8_act=(fq, fs))
@@ -1272,6 +1342,16 @@ def _drop_gate_up_stacking(base: WeightsMapper) -> WeightsMapper:
         },
         orig_to_new_prefix=base.orig_to_new_prefix,
         orig_to_new_suffix=base.orig_to_new_suffix,
+    )
+
+
+def _uses_fused_allreduce(layer: nn.Module) -> bool:
+    """Whether a decoder layer has an op `fused_allreduce` can serve: an attention
+    boundary feeding an FP8 pooler, or a decode MoE whose finalize fits."""
+    ffn = getattr(layer, "feed_forward", None)
+    decode_moe = getattr(ffn, "decode_moe", None)
+    return fp8_dense.takes_fp8_input(getattr(ffn, "pooler", None)) or (
+        decode_moe is not None and decode_moe.fuses_allreduce
     )
 
 
@@ -1643,10 +1723,16 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         # monokernel also needs the cached coefficients and the folded router
         # weights from above.
         maybe_attach_mono(self)
+        layers = self.model.layers[self.model.start_layer : self.model.end_layer]
+        # Before the KV cache sizing: the fused all-reduces hold IPC inboxes.
+        if any(_uses_fused_allreduce(layer) for layer in layers):
+            fused_allreduce.init(
+                next(self.parameters()).device,
+                micro_batched=self.vllm_config.parallel_config.use_ubatching,
+            )
         if self.model.ulysses_prefill:
             # Built here rather than on the first Ulysses step, so that the KV
             # cache sizing accounts for them whatever shape the profile run has.
-            layers = self.model.layers[self.model.start_layer : self.model.end_layer]
             nbytes = sum(layer.self_attn.build_ulysses_weights() for layer in layers)
             logger.info(
                 "Muse Spark Ulysses prefill: FP8 QKV/O weights of %d layers built "
