@@ -99,6 +99,12 @@ class AttentionConfig:
     checkpoint provides one, so values whose magnitude exceeds the FP8 maximum
     are clipped."""
 
+    use_prefill_exp_free_softmax: bool = False
+    """If set together with `use_prefill_query_quantization`, compute the FP8
+    prefill attention probabilities with a piecewise-linear approximation of
+    exp2 instead of exp2: faster, slightly less accurate. Only
+    affects ROCM_AITER_FA layers that run the FlyDSL FP8 extend kernel."""
+
     trtllm_ragged_backend: Literal["trtllm-gen", "cute-dsl"] = "trtllm-gen"
     """Kernel backend for cached-context TRTLLM_RAGGED MLA prefill.
     CuTe DSL requires FP8 queries for head dimension 192 and does not support
@@ -233,6 +239,13 @@ class AttentionConfig:
             raise ValueError(
                 "TORCH_SDPA is only supported for multi-modal encoder attention "
                 "and cannot be used as a decoder attention backend."
+            )
+        if self.use_prefill_exp_free_softmax and not (
+            self.use_prefill_query_quantization
+        ):
+            logger.warning(
+                "attention_config.use_prefill_exp_free_softmax has no effect "
+                "without use_prefill_query_quantization."
             )
         # Checked here rather than at indexer selection, which the two CP
         # backends reach separately: bf16 goes to the Triton indexer and fp8
