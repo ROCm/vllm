@@ -26,6 +26,7 @@ together.
 """
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
 from torch._inductor.runtime.triton_helpers import libdevice
@@ -288,6 +289,8 @@ class MarkovVocabShard:
         self.keys: torch.Tensor | None = None
         self.stage: torch.Tensor | None = None
         self.embeds: torch.Tensor | None = None
+        # The --monokernel fused draft head, which takes the steps it can.
+        self.head: Any = None
 
     def _refusal(self, spec, num_reqs: int) -> str | None:
         if spec.draft_watermarker is not None:
@@ -338,6 +341,37 @@ class MarkovVocabShard:
                 spec, num_reqs, head_hidden
             )
         self._buffers(spec)
+        n_spec = spec.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        idx_map = spec.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+        stage = None if self.stage is None else self.stage[:num_reqs]
+        if self.head is None or not self.head.sample(
+            spec, num_reqs, head_hidden, stage
+        ):
+            self._chain(spec, num_reqs, head_hidden, idx_map, stage)
+        if stage is not None:
+            full = _all_gather_last(stage.reshape(num_sample, self.shard_size))
+            values = spec.draft_logits.values
+            _cache_scatter_kernel[
+                (num_sample, triton.cdiv(self.vocab_size, SCATTER_BLOCK))
+            ](
+                full,
+                full.stride(0),
+                values,
+                values.stride(0),
+                values.stride(1),
+                spec.draft_logits.row_mapping,
+                idx_map,
+                idx_map.stride(0),
+                idx_map.stride(1),
+                n_spec,
+                self.vocab_size,
+                BLOCK=SCATTER_BLOCK,
+            )
+        return True
+
+    def _chain(self, spec, num_reqs, head_hidden, idx_map, stage) -> None:
+        """The lm_head and the Markov steps, one launch set a step."""
         assert self.keys is not None and self.embeds is not None
         model = spec.model
         n_spec = spec.num_speculative_steps
@@ -350,12 +384,10 @@ class MarkovVocabShard:
             skip_gather=True,
         ).view(num_reqs, n_spec, self.shard_size)
         prev = spec.input_buffers.input_ids[spec._anchor_idx[:num_reqs]]
-        idx_map = spec.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = spec.sample_pos[:num_sample].view(num_reqs, n_spec)
         out_tokens = spec.draft_tokens[:num_reqs]
         embeds = self.embeds[:, :num_reqs]
         keys = self.keys[:num_reqs]
-        stage = None if self.stage is None else self.stage[:num_reqs]
         soft_cap = model.output_soft_cap_temp
         markov_embed = model.markov_embed(prev)
         if spec.use_confidence_head:
@@ -409,30 +441,10 @@ class MarkovVocabShard:
                 RANK_BLOCK=triton.next_power_of_2(self.w1.shape[1]),
             )
             markov_embed = embeds[i + 1]
-        if stage is not None:
-            full = _all_gather_last(stage.reshape(num_sample, self.shard_size))
-            values = spec.draft_logits.values
-            _cache_scatter_kernel[
-                (num_sample, triton.cdiv(self.vocab_size, SCATTER_BLOCK))
-            ](
-                full,
-                full.stride(0),
-                values,
-                values.stride(0),
-                values.stride(1),
-                spec.draft_logits.row_mapping,
-                idx_map,
-                idx_map.stride(0),
-                idx_map.stride(1),
-                n_spec,
-                self.vocab_size,
-                BLOCK=SCATTER_BLOCK,
-            )
         if spec.use_confidence_head:
             spec.draft_token_confidence_probs[:num_reqs] = spec._confidence(
                 sample_hidden, embeds[:n_spec].transpose(0, 1), out_tokens.shape
             )
-        return True
 
 
 def attach(model: torch.nn.Module) -> None:
@@ -450,6 +462,12 @@ def attach(model: torch.nn.Module) -> None:
         )
         return
     shard = MarkovVocabShard(model, fallback)
+    if model.vllm_config.kernel_config.monokernel:
+        from vllm.models.muse_spark.amd.ops.fused_draft_head import (
+            MuseSparkFusedDraftHead,
+        )
+
+        shard.head = MuseSparkFusedDraftHead(model, shard)
     model.sample_sequential = shard.sample_sequential
     logger.info(
         "DSpark Markov chain vocab-sharded: shard [%d, %d) of %d, %d blocks, %s%s.",

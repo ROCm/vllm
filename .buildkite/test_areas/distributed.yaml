@@ -479,6 +479,9 @@ steps:
       - vllm/v1/executor/uniproc_executor.py
       - vllm/v1/worker/gpu_worker.py
       - vllm/platforms/rocm.py
+      - vllm/models/muse_spark/amd/ops/fused_draft_head.py
+      - vllm/models/muse_spark/amd/ops/markov_vocab_shard.py
+      - tests/distributed/test_muse_spark_fused_draft_head.py
       commands:
       - export NCCL_CUMEM_HOST_ENABLE=0
       # TODO(akaratza): drop NCCL_RAS_ENABLE once RCCL's RAS thread no longer
@@ -487,6 +490,7 @@ steps:
       # Logs each process group's teardown, to locate the exit-time abort.
       - export TORCH_CPP_LOG_LEVEL=INFO
       - torchrun --nproc-per-node=8 ../examples/features/torchrun/torchrun_dp_example_offline.py --tp-size=2 --pp-size=1 --dp-size=4 --enable-ep
+      - pytest -v -s distributed/test_muse_spark_fused_draft_head.py
 
 # Key kept from the former A100 step's mirror for job history and retries.
 - label: ':amd: (MI355) Distributed'
