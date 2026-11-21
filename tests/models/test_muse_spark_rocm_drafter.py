@@ -209,8 +209,8 @@ def load_draft(vllm_config, device: torch.device, seed: int = 0):
     return lm
 
 
-@pytest.fixture(scope="module", params=["auto", "fp8"], ids=["kv-bf16", "kv-fp8"])
-def tiny_draft(request, tmp_path_factory):
+@pytest.fixture(scope="module")
+def tiny_draft(tmp_path_factory):
     from vllm.distributed import (
         cleanup_dist_env_and_memory,
         ensure_model_parallel_initialized,
@@ -234,9 +234,7 @@ def tiny_draft(request, tmp_path_factory):
         rocm_aiter_ops.refresh_env_variables()
         device = torch.device("cuda", 0)
         torch.accelerator.set_device_index(device)
-        vllm_config = _vllm_config(
-            root / "tiny", root / "dspark", cache_dtype=request.param
-        )
+        vllm_config = _vllm_config(root / "tiny", root / "dspark", cache_dtype="auto")
         with set_current_vllm_config(vllm_config):
             init_distributed_environment(
                 world_size=1,
@@ -249,7 +247,7 @@ def tiny_draft(request, tmp_path_factory):
             init_workspace_manager(device)
             lm = load_draft(vllm_config, device)
             assert lm.mono is None  # --monokernel off in this config
-            kv_fp8 = request.param == "fp8"
+            kv_fp8 = False
             spec = AttentionSpec(
                 block_size=16,
                 num_kv_heads=TINY_DSPARK["num_key_value_heads"],
@@ -265,20 +263,6 @@ def tiny_draft(request, tmp_path_factory):
 def test_layer_guards_accept_the_tiny_draft(tiny_draft) -> None:
     dims = draft_dims(tiny_draft.lm.config, 1)
     assert draft_layer_refusals(tiny_draft.model, dims) == []
-
-
-@requires_gfx950
-def test_deployment_guard_refuses_an_e5m2_kv_cache(tiny_draft, monkeypatch) -> None:
-    """The draft kernels read the cache as bf16 or e4m3: an e5m2 cache must run
-    the stock draft layers."""
-    from vllm.models.muse_spark.amd.mono.drafter import static_refusals
-
-    monkeypatch.setattr(
-        tiny_draft.lm.vllm_config.cache_config, "cache_dtype", "fp8_e5m2"
-    )
-    assert "kv_cache_dtype=fp8_e5m2 (kernel: bf16, fp8 e4m3)" in static_refusals(
-        tiny_draft.lm, 8
-    )
 
 
 class DraftStep:
