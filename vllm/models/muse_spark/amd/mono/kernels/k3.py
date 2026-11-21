@@ -83,7 +83,6 @@ from .dev import (
     hw_rsq,
     hw_sqrt,
     inv_kv_scale,
-    lanes_below,
     ld_f32,
     ld_i32,
     ld_i32_if,
@@ -217,17 +216,15 @@ def bf_tile_load(wbase, row16, ldk, k, lane):
     return out
 
 
-def okey(v):
-    b = v.bitcast(fx.Int32)
-    neg = b < fx.Int32(0)
-    return fx.Uint32(neg.select(~b, b ^ fx.Int32(-2147483648)))
-
-
 @traced
 def route_token(tkns, bias_v, lgss, tid, lane, rt):
-    """Tokens `tkns` (this wave's, all valid), interleaved for ILP: sigmoid +
-    bias, radix top-8, rank, renorm -> rid / rw."""
+    """Tokens `tkns` (this wave's), interleaved for ILP: sigmoid + bias, top-8 in
+    registers, renorm -> rid / rw. A round takes the wave max of the order keys; the
+    lowest expert id wins among equal keys, so the picks come out in rank order (score
+    descending, then id); the winner's slot is cleared. Lane 0 renormalizes: the
+    serial sum of the 8 sigmoids in rank order (+ eps), IEEE division."""
     T_ = len(tkns)
+    taken = fx.Int32(-2147483648)
     keys, sigs = [], []
     for x_ in range_constexpr(T_):
         kx, sx = [], []
@@ -236,72 +233,48 @@ def route_token(tkns, bias_v, lgss, tid, lane, rt):
             sg = fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
             sc = sg + bias_v[i]
             live = sc == sc  # NaN ranks last
-            kx.append(okey(live.select(sc, fx.Float32(-3.0e38))))
+            b = live.select(sc, fx.Float32(-3.0e38)).bitcast(fx.Int32)
+            # the float order as a signed int order
+            kx.append((b < fx.Int32(0)).select(b ^ fx.Int32(0x7FFFFFFF), b))
             sx.append((sg == sg).select(sg, fx.Float32(0.0)))
         keys.append(kx)
         sigs.append(sx)
-    th = [fx.Uint32(0) for _ in range(T_)]
-    for bit in range_constexpr(31, -1, -1):
+    es = [[] for _ in range(T_)]
+    ss = [[] for _ in range(T_)]
+    for _ in range_constexpr(TOPK):
         for x_ in range_constexpr(T_):
-            cand = th[x_] | fx.Uint32(1 << bit)
-            n = fx.Int32(0)
+            k = keys[x_]
+            lm = fx.max(fx.max(k[0], k[1]), fx.max(k[2], k[3]))
+            m = uniform(butterfly(lm, (32, 16, 8, 4, 2, 1), fx.max))
+            bs = [ballot(k[i] == m) for i in range(4)]
+            e = fx.Int32(192) + fx.Int32(fx.cttz(bs[3]))
+            for i in range_constexpr(2, -1, -1):
+                e = (bs[i] != fx.Int64(0)).select(
+                    fx.Int32(64 * i) + fx.Int32(fx.cttz(bs[i])), e
+                )
+            e = uniform(e)
+            src = e & 63
+            ii = e >> 6
+            sv = sigs[x_][3]
+            for i in range_constexpr(2, -1, -1):
+                sv = (ii == i).select(sigs[x_][i], sv)
+            es[x_].append(e)
+            ss[x_].append(readlane(sv, src))
             for i in range_constexpr(4):
-                n = n + popcount(ballot(keys[x_][i] >= cand))
-            th[x_] = (n >= TOPK).select(cand, th[x_])
-    for x_ in range_constexpr(T_):
-        tkn = tkns[x_]
-        n_gt = fx.Int32(0)
-        for i in range_constexpr(4):
-            n_gt = n_gt + popcount(ballot(keys[x_][i] > th[x_]))
-        need = fx.Int32(TOPK) - n_gt
-        eq_before = fx.Int32(0)
-        sel_before = fx.Int32(0)
-        sel_base = rt["sel"] + tkn * (TOPK * 3)
-        for i in range_constexpr(4):
-            eqb = ballot(keys[x_][i] == th[x_])
-            eq_rank = eq_before + lanes_below(eqb, lane)
-            sel = (keys[x_][i] > th[x_]) | ((keys[x_][i] == th[x_]) & (eq_rank < need))
-            selb = ballot(sel)
-            pos = sel_before + lanes_below(selb, lane)
-            if sel:
-                fx.ptr_store(keys[x_][i].bitcast(fx.Int32), sel_base + pos * 3)
-                fx.ptr_store(fx.Int32(lane + 64 * i), sel_base + (pos * 3 + 1))
-                fx.ptr_store(sigs[x_][i].bitcast(fx.Int32), sel_base + (pos * 3 + 2))
-            eq_before = eq_before + popcount(eqb)
-            sel_before = sel_before + popcount(selb)
-    q = fx.min(lane, TOPK - 1)
-    mks, mes, mss, ranks = [], [], [], []
-    for x_ in range_constexpr(T_):
-        sel_base = rt["sel"] + tkns[x_] * (TOPK * 3)
-        mk = fx.Uint32(fx.ptr_load(sel_base + q * 3))
-        me = fx.ptr_load(sel_base + (q * 3 + 1))
-        ms = fx.ptr_load(sel_base + (q * 3 + 2)).bitcast(fx.Float32)
-        rank_ = fx.Int32(0)
-        for j in range_constexpr(TOPK):
-            ok = fx.Uint32(fx.ptr_load(sel_base + j * 3))
-            oe = fx.ptr_load(sel_base + (j * 3 + 1))
-            before = (ok > mk) | ((ok == mk) & (oe < me))
-            rank_ = rank_ + before.select(fx.Int32(1), fx.Int32(0))
-        mks.append(mk)
-        mes.append(me)
-        mss.append(ms)
-        ranks.append(rank_)
-    # serial sum of the 8 sigmoids in rank order (+ eps), IEEE division
-    for x_ in range_constexpr(T_):
-        if lane < TOPK:
-            fx.ptr_store(mss[x_], rt["rw"] + (tkns[x_] * TOPK + ranks[x_]))
-    for x_ in range_constexpr(T_):
-        tkn = tkns[x_]
-        total = fx.Float32(0.0)
-        for j in range_constexpr(TOPK):
-            total = total + fx.ptr_load(rt["rw"] + (tkn * TOPK + j))
-        total = total + fx.Float32(ROUTE_EPS)
-        if lane < TOPK:
-            fx.ptr_store(
-                fx.min(fx.max(mes[x_], 0), fx.Int32(E - 1)),
-                rt["rid"] + (tkn * TOPK + ranks[x_]),
-            )
-            fx.ptr_store(mss[x_] / total, rt["rw"] + (tkn * TOPK + ranks[x_]))
+                k[i] = ((lane == src) & (ii == i)).select(taken, k[i])
+    if lane == 0:
+        for x_ in range_constexpr(T_):
+            tkn = tkns[x_]
+            total = fx.Float32(0.0)
+            for r in range_constexpr(TOPK):
+                total = total + ss[x_][r]
+            total = total + fx.Float32(ROUTE_EPS)
+            for r in range_constexpr(TOPK):
+                fx.ptr_store(
+                    fx.min(fx.max(es[x_][r], 0), fx.Int32(E - 1)),
+                    rt["rid"] + (tkn * TOPK + r),
+                )
+                fx.ptr_store(ss[x_][r] / total, rt["rw"] + (tkn * TOPK + r))
 
 
 def sel_peer(pl, d):
