@@ -551,16 +551,10 @@ def build(key: Build):
     RS_PRE = DM // W
     RT = RS_PRE // NG  # 16 rows a group (W = 8: 512 / 32, W = 4: 1024 / 64)
     NT_A = RT // 16  # MFMA tiles a CTA
-    OWN = RT // KQ  # rows a CTA owns after the K-part exchange (2 / 4)
     EG = (E // W) // NG  # router experts a group
     TPE = THREADS // EG  # threads an expert
     KPT = XQ // TPE  # router K a thread (2 / 4)
-    assert (NT_A, EG) == (1, 1) and OWN in (2, 4) and KPT in (2, 4), (
-        NT_A,
-        OWN,
-        EG,
-        KPT,
-    )
+    assert (NT_A, EG) == (1, 1) and KPT in (2, 4), (NT_A, EG, KPT)
     # stage F: post_expert_proj rows RS_POST a rank, 16-row tiles
     RS_POST = HID // W
     NTL = RS_POST // 16
@@ -624,7 +618,6 @@ def build(key: Build):
     class StageA:
         x: fx.Array[fx.Int32, S * XQROW // 2, 16]
         red: fx.Array[fx.Float32, WAVES * NT_A * 64 * 4, 16]
-        own: fx.Array[fx.Float32, OWN * S, 16]
 
     @fx.struct
     class StageC:
@@ -714,7 +707,6 @@ def build(key: Build):
         rank,
         xl,
         red,
-        own,
         tok,
     ):
         """CTA b = (group rb = b / KQ, K part kq = b % KQ): router experts EG rb .. and
@@ -823,10 +815,14 @@ def build(key: Build):
         for nt in range_constexpr(NT_A):
             fx.ptr_store(accs[nt], red + ((wave * NT_A + nt) * 64 + lane) * 4)
         gpu.barrier()
-        # thread (row pair rp, token tt) over the group's RT rows: this quarter's partial
+        # thread (row pair rp, token tt) over the group's RT rows: this K part's partial.
+        # K part 0 owns the group's rows; consecutive lanes hold consecutive row pairs, so
+        # its h_raw push is one contiguous run a token and rank
+        rp = tid % (RT // 2)
+        tt = (tid // (RT // 2)) % S
+        mine0 = fx.Float32(0.0)
+        mine1 = fx.Float32(0.0)
         if tid < (RT // 2) * S:
-            rp = tid // S
-            tt = tid % S
             v = []
             for h2 in range_constexpr(2):
                 rr = 2 * rp + h2
@@ -841,11 +837,9 @@ def build(key: Build):
                         )
                     )
                 v.append(s_)
-            owner = (2 * rp) // OWN
-            if owner == kq:
-                fx.ptr_store(v[0], own + ((2 * rp - kq * OWN) * S + tt))
-                fx.ptr_store(v[1], own + ((2 * rp + 1 - kq * OWN) * S + tt))
-            else:
+            mine0 = v[0]
+            mine1 = v[1]
+            if kq != 0:
                 for h2 in range_constexpr(2):
                     mb_put(
                         tag,
@@ -854,32 +848,26 @@ def build(key: Build):
                         v[h2],
                     )
         gpu.barrier()
-        # own rows: the KQ parts in order -> bf16 h_raw -> every rank's HRAW
-        if tid < (OWN // 2) * S:
-            rp = tid // S
-            tt = tid % S
-            specs, oks = [], []
-            for src in range_constexpr(KQ):
+        # K part 0: the KQ parts in order -> bf16 h_raw -> every rank's HRAW
+        if (tid < (RT // 2) * S) & (kq == 0):
+            specs = []
+            for src in range_constexpr(1, KQ):
                 for h2 in range_constexpr(2):
                     specs.append(
                         (
                             scratch + fx.Int64(lay["px"][0]),
-                            ((rb * KQ + src) * 64 + kq * OWN + 2 * rp + h2) * S + tt,
+                            ((rb * KQ + src) * 64 + 2 * rp + h2) * S + tt,
                             1,
                         )
                     )
-                    oks.append(fx.Int32(src) != kq)
-            got = mb_poll(tag, health, specs, REGION_IDS["px"], oks=oks)
+            got = mb_poll(tag, health, specs, REGION_IDS["px"])
             tot = []
             for h2 in range_constexpr(2):
-                s_ = fx.Float32(0.0)
-                for src in range_constexpr(KQ):
-                    mine = fx.ptr_load(own + ((2 * rp + h2) * S + tt))
-                    s_ = s_ + (fx.Int32(src) == kq).select(
-                        mine, got[2 * src + h2][0].bitcast(fx.Float32)
-                    )
+                s_ = fx.Float32(0.0) + (mine0 if h2 == 0 else mine1)
+                for src in range_constexpr(1, KQ):
+                    s_ = s_ + got[2 * (src - 1) + h2][0].bitcast(fx.Float32)
                 tot.append(s_)
-            col = (rank * RS_PRE) + rb * RT + kq * OWN + 2 * rp
+            col = (rank * RS_PRE) + rb * RT + 2 * rp
             hw = bf16_pair(tot[0], tot[1])
             idx = (par * S * DM + tt * DM + col) // 2
             for pb in pl:
@@ -2607,7 +2595,6 @@ def build(key: Build):
             rank,
             sa.x.ptr,
             sa.red.ptr,
-            sa.own.ptr,
             tok,
         )
         q, hv, wv, t0, t1, last = front2(
