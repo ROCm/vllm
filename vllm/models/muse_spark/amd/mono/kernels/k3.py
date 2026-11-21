@@ -437,8 +437,8 @@ class Build:
     drain: bool = False  # the S=16 down-proj task loop runs as a ring (as at S=8)
     # the per-token sums of stage A / load_h_norm as one reduce-scatter (bitwise)
     tokred: bool = False
-    # stage O's rows in one poll, stage G's y in token-major pairs, the reducer CTAs'
-    # orr poll after the norm reduction (bitwise)
+    # stage O's rows in one poll, the reducer CTAs' orr poll after the norm reduction
+    # (bitwise)
     goab: bool = False
     # 1: per-step ring placement onto replicas of rank r + 1's experts (W = 8);
     # 2: also force a move when the plan has none (tests only)
@@ -1523,10 +1523,8 @@ def build(key: Build):
         return ops
 
     def py_slot(part, tile, tt, rr):
-        """K part `part`'s partial of (tile, row rr, token tt) in the py region."""
-        if const_expr(key.goab):
-            return (part * NTL + tile) * 16 * S + tt * 16 + rr
-        return (part * NTL * 16 + tile * 16 + rr) * S + tt
+        """K part `part`'s partial of (tile, row rr, token tt) in the py region (token-major)."""
+        return (part * NTL + tile) * 16 * S + tt * 16 + rr
 
     @traced
     def post_proj(
@@ -1583,12 +1581,9 @@ def build(key: Build):
         gpu.barrier()
         if tid < TPC * 8 * S:
             i = tid // (8 * S)
-            if const_expr(key.goab):  # 8 lanes = one token's 64 contiguous y bytes
-                rp = tid % 8
-                tt = (tid // 8) % S
-            else:
-                rp = (tid // S) % 8
-                tt = tid % S
+            # 8 lanes = one token's 64 contiguous y bytes: the push to every rank coalesces
+            rp = tid % 8
+            tt = (tid // 8) % S
             v = []
             for h2 in range_constexpr(2):
                 rr = 2 * rp + h2
