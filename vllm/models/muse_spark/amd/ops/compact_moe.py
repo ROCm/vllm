@@ -18,6 +18,11 @@ experts, in three launches:
 Every program reads one N tile of its block's expert weights once, streamed
 past the caches. Weights and scales are in AITER's preshuffled MXFP4 layout, so
 the AITER expert stages and this path share one copy.
+
+With expert replicas (`ReplicaTable`), `_route_quant_replica_kernel` replaces
+step 1: it also decides, from the step's routes, which replicated experts run
+on their copy instead of their owner (`_replica_assignment`), and the expert
+kernels read replica slots from separate replica weights.
 """
 
 import functools
@@ -41,6 +46,16 @@ except ImportError:
 # Largest call (tokens) that takes this path.
 MAX_TOKENS = 448
 TOP_K = 8
+
+# Relative cost of an expert on a rank, by blocks of its routes: the first
+# block streams the expert's weights; a further block of the same expert
+# rereads them, partly from the caches.
+REPLICA_COST_UNIT = 4
+REPLICA_COST_EXTRA_BLOCK = 3
+# Single-move rounds of the per-step replica assignment.
+REPLICA_ROUNDS = 3
+# The assignment packs per-rank costs in 16-bit fields of two int64 words.
+REPLICA_MAX_RANKS = 8
 
 
 class TileConfig(NamedTuple):
@@ -198,6 +213,318 @@ def _route_quant_kernel(
         )
 
 
+class ReplicaTable(NamedTuple):
+    """One layer's expert replicas on this rank (see `replica_table`).
+
+    `table` (int32) holds, for E global experts, NE replica entries (padded to
+    NEP) and NS local slots (the rank's own experts, then its replica slots;
+    padded to NSP):
+
+    * `owner[E]`: the rank that owns each expert;
+    * `entry[E]`: each expert's replica entry, -1 for experts without a copy;
+    * per entry (-1 ranks for padding): `entry_owner[NEP]`, `entry_copy[NEP]`
+      (the rank holding the copy), `entry_local[NEP]` (the expert's local
+      slot on this rank, as owner or copy, else -1), `entry_expert[NEP]`;
+    * per local slot: `slot_expert[NSP]` (-1 for padding) and
+      `slot_entry[NSP]` (the replica entry of the slot's expert, or -1).
+
+    Entries are in priority order: when two moves compete for a rank, the
+    lower entry wins.
+    """
+
+    table: torch.Tensor
+    ranks: int
+    rank: int
+    num_entries: int
+    num_slots: int
+    entries_padded: int
+    slots_padded: int
+
+
+def replica_table(
+    owner: list[int],
+    entries: list[tuple[int, int, int]],
+    rank: int,
+    ranks: int,
+    slot_expert: list[int],
+    device: torch.device,
+) -> ReplicaTable:
+    """The `ReplicaTable` of one layer on `rank`. `entries`: `(expert, copy rank,
+    copy slot)` in priority order, identical on every rank; `slot_expert`: the
+    global expert of each local slot (own experts, then replica slots, each
+    expert at most once)."""
+    assert 1 < ranks <= REPLICA_MAX_RANKS
+    num_experts = len(owner)
+    nep = max(16, triton.next_power_of_2(max(1, len(entries))))
+    nsp = triton.next_power_of_2(len(slot_expert))
+    entry = [-1] * num_experts
+    for k, (e, _, _) in enumerate(entries):
+        entry[e] = k
+    pad = nep - len(entries)
+    fields = [
+        owner,
+        entry,
+        [owner[e] for e, _, _ in entries] + [-1] * pad,
+        [c for _, c, _ in entries] + [-1] * pad,
+        [
+            slot_expert.index(e) if owner[e] == rank or c == rank else -1
+            for e, c, _ in entries
+        ]
+        + [-1] * pad,
+        [e for e, _, _ in entries] + [0] * pad,
+        slot_expert + [-1] * (nsp - len(slot_expert)),
+        [entry[e] if e >= 0 else -1 for e in slot_expert]
+        + [-1] * (nsp - len(slot_expert)),
+    ]
+    table = torch.tensor(sum(fields, []), dtype=torch.int32, device=device)
+    return ReplicaTable(table, ranks, rank, len(entries), len(slot_expert), nep, nsp)
+
+
+# Per-rank quantities of up to 8 ranks are packed in two int64 words, 16 bits
+# per rank (ranks 0-3, then 4-7), so that per-rank sums and prefix sums over the
+# replica entries are single 1-D reductions and scans.
+_FIELD = tl.constexpr(16)
+
+
+@triton.jit
+def _pack(v, rank, HI: tl.constexpr):
+    """`v` in the 16-bit field of `rank` (ranks 4-7 when HI, else 0-3)."""
+    shift = (rank - 4 * HI) * _FIELD
+    inside = (rank >= 4 * HI) & (rank < 4 * HI + 4)
+    return tl.where(inside, v.to(tl.int64) << shift.to(tl.int64), 0)
+
+
+@triton.jit
+def _field(lo, hi, rank, TWO: tl.constexpr):
+    """The 16-bit field of `rank` from the packed pair `(lo, hi)`."""
+    word = tl.where(rank >= 4, hi, lo) if TWO else lo
+    shift = (tl.maximum(rank, 0) % 4) * _FIELD
+    return ((word >> shift.to(tl.int64)) & 0xFFFF).to(tl.int32)
+
+
+@triton.jit
+def _packed_sum(v, rank, TWO: tl.constexpr):
+    lo = tl.sum(_pack(v, rank, 0), axis=0)
+    hi = tl.sum(_pack(v, rank, 1), axis=0) if TWO else lo * 0
+    return lo, hi
+
+
+@triton.jit
+def _excl_prefix(v, rank, TWO: tl.constexpr):
+    """Per entry: the sum of `v` over earlier entries of the same rank."""
+    lo = tl.cumsum(_pack(v, rank, 0), axis=0)
+    hi = tl.cumsum(_pack(v, rank, 1), axis=0) if TWO else lo
+    return _field(lo, hi, rank, TWO) - v
+
+
+@triton.jit
+def _scalar_field(lo, hi, p: tl.constexpr):
+    word = hi if p >= 4 else lo
+    return ((word >> ((p % 4) * _FIELD)) & 0xFFFF).to(tl.int32)
+
+
+@triton.jit
+def _max_field(lo, hi, P: tl.constexpr):
+    """The largest of the P packed per-rank values (scalar)."""
+    top = _scalar_field(lo, hi, 0)
+    for p in tl.static_range(1, P):
+        top = tl.maximum(top, _scalar_field(lo, hi, p))
+    return top
+
+
+@triton.jit
+def _replica_assignment(
+    gid,
+    valid,
+    tab_ptr,
+    E: tl.constexpr,
+    NEP: tl.constexpr,
+    P: tl.constexpr,
+    BM: tl.constexpr,
+    UNIT: tl.constexpr,
+    EXTRA: tl.constexpr,
+    ROUNDS: tl.constexpr,
+):
+    """The step's per-expert route counts and each replica entry's placement
+    (1: its copy computes the expert's routes), identical in every program of
+    every rank.
+
+    Cost of an expert on a rank: `UNIT` for its first block of routes plus
+    `EXTRA` per further block (its weights are read once per block).
+
+    First, all at once: a selected replicated expert on an owner above the mean
+    cost moves to its copy if the copy's rank is below the mean, while the
+    earlier such candidates for the copy's rank stay within its room below the
+    mean. Then `ROUNDS` single moves: the first entry on the busiest rank whose
+    move to its other holder lowers that pair's larger cost."""
+    TWO: tl.constexpr = P > 4
+    h2 = tl.reshape(tl.histogram(tl.where(valid & (gid >= 0), gid, E), 2 * E), [2, E])
+    cnt = tl.sum(tl.where(tl.arange(0, 2)[:, None] == 0, h2, 0), axis=0)
+    e = tl.arange(0, E)
+    owner = tl.load(tab_ptr + e)
+    w = tl.where(cnt > 0, UNIT + EXTRA * ((cnt + BM - 1) // BM - 1), 0)
+    Llo, Lhi = _packed_sum(w, owner, TWO)
+    tot = tl.sum(w, axis=0)
+    k = tl.arange(0, NEP)
+    base = tab_ptr + 2 * E
+    eo = tl.load(base + k)
+    ec = tl.load(base + NEP + k)
+    ex = tl.load(base + 3 * NEP + k)
+    we = tl.where(eo >= 0, tl.gather(w, ex, 0), 0)
+    lo = _field(Llo, Lhi, eo, TWO)
+    lc = _field(Llo, Lhi, ec, TWO)
+    cand = (we > 0) & (lo * P > tot) & (lc * P < tot)
+    wc = tl.where(cand, we, 0)
+    take = cand & (_excl_prefix(wc, ec, TWO) * P <= tot - lc * P)
+    mv = tl.where(take, we, 0)
+    dlo, dhi = _packed_sum(mv, ec, TWO)
+    slo, shi = _packed_sum(mv, eo, TWO)
+    Llo, Lhi = Llo + dlo - slo, Lhi + dhi - shi
+    on_copy = take.to(tl.int32)
+    for _ in tl.static_range(ROUNDS):
+        cur = tl.where(on_copy != 0, ec, eo)
+        oth = tl.where(on_copy != 0, eo, ec)
+        lcur = _field(Llo, Lhi, cur, TWO)
+        top = _max_field(Llo, Lhi, P)
+        c1 = (we > 0) & (lcur == top) & (_field(Llo, Lhi, oth, TWO) + we < lcur)
+        # The first candidate, with its ranks and cost, in one reduction.
+        key = (k << 19) | (cur << 16) | (oth << 13) | tl.minimum(we, 8191)
+        pick = tl.min(tl.where(c1, key, 1 << 30), axis=0)
+        found = pick < (1 << 30)
+        kp = pick >> 19
+        wp = tl.where(found, pick & 8191, 0)
+        cp = (pick >> 16) & 7
+        op = (pick >> 13) & 7
+        Llo = Llo + _pack(wp, op, 0) - _pack(wp, cp, 0)
+        if TWO:
+            Lhi = Lhi + _pack(wp, op, 1) - _pack(wp, cp, 1)
+        on_copy = tl.where(found & (k == kp), 1 - on_copy, on_copy)
+    return cnt, on_copy
+
+
+@triton.jit(do_not_specialize=["M", "NB"])
+def _route_quant_replica_kernel(
+    ids_ptr,
+    tab_ptr,
+    index_ptr,
+    pad_ptr,
+    sorted_ptr,
+    block_expert_ptr,
+    x_ptr,
+    q_ptr,
+    qs_ptr,
+    M,
+    NB,
+    E: tl.constexpr,
+    LE: tl.constexpr,
+    NS: tl.constexpr,
+    NSP: tl.constexpr,
+    NEP: tl.constexpr,
+    P: tl.constexpr,
+    RANK: tl.constexpr,
+    UNIT: tl.constexpr,
+    EXTRA: tl.constexpr,
+    ROUNDS: tl.constexpr,
+    HAS_PAD: tl.constexpr,
+    S: tl.constexpr,
+    PER_E: tl.constexpr,
+    BM: tl.constexpr,
+    NBB: tl.constexpr,
+    TOPK: tl.constexpr,
+    D: tl.constexpr,
+    DC: tl.constexpr,
+):
+    """`_route_quant_kernel` over the rank's own experts and its replica slots.
+    Programs `[0, NS)`: local slot `pid`'s routes under the step's replica
+    assignment (program 0 also rewrites the replicated experts' entries of the
+    `[E]` local index `index_ptr` for the finalize); the rest: one `DC`-column
+    chunk of one row's MXFP4 quant. HAS_PAD: rows flagged in `pad_ptr` (one
+    byte per row) are computed, but their routes do not count toward the
+    assignment."""
+    pid = tl.program_id(0)
+    if pid < NS:
+        s = tl.arange(0, S)
+        valid = s < M * TOPK
+        gid = tl.load(ids_ptr + s, mask=valid, other=-1)
+        counted = valid
+        if HAS_PAD:
+            pad = tl.load(pad_ptr + s // TOPK, mask=valid, other=1)
+            counted = valid & (pad == 0)
+        cnt, on_copy = _replica_assignment(
+            gid, counted, tab_ptr, E, NEP, P, BM, UNIT, EXTRA, ROUNDS
+        )
+        if HAS_PAD:
+            # The slots' route counts for the block layout include padding rows.
+            cnt = tl.sum(
+                tl.where(
+                    tl.arange(0, 2)[:, None] == 0,
+                    tl.reshape(
+                        tl.histogram(tl.where(valid & (gid >= 0), gid, E), 2 * E),
+                        [2, E],
+                    ),
+                    0,
+                ),
+                axis=0,
+            )
+        sl = tl.arange(0, NSP)
+        sbase = tab_ptr + 2 * E + 4 * NEP
+        sx = tl.load(sbase + sl)
+        sent = tl.load(sbase + NSP + sl)
+        moved = tl.where(sent >= 0, tl.gather(on_copy, tl.maximum(sent, 0), 0), 0)
+        scnt = tl.where(sx >= 0, tl.gather(cnt, tl.maximum(sx, 0), 0), 0)
+        # Own slots run unless their expert moved; replica slots only if it did.
+        act = (scnt > 0) & tl.where(sl >= LE, moved != 0, moved == 0)
+        blocks_all = tl.where(act, (scnt + BM - 1) // BM, 0)
+        first = tl.sum(tl.where(sl < pid, blocks_all, 0), axis=0)
+        if pid == 0:
+            # Only the replicated experts' entries of the local index change.
+            k = tl.arange(0, NEP)
+            ebase = tab_ptr + 2 * E
+            eo = tl.load(ebase + k)
+            ec = tl.load(ebase + NEP + k)
+            eloc = tl.load(ebase + 2 * NEP + k)
+            ex = tl.load(ebase + 3 * NEP + k)
+            index = tl.where((eo == RANK) == (on_copy == 0), eloc, -1)
+            tl.store(index_ptr + ex, index, mask=(eo == RANK) | (ec == RANK))
+        if pid == NS - 1:
+            b = tl.arange(0, NBB)
+            tl.store(
+                block_expert_ptr + b,
+                -1,
+                mask=(b >= tl.sum(blocks_all, axis=0)) & (b < NB),
+            )
+        mine = tl.sum(tl.where(sl == pid, sx, 0), axis=0)
+        hit = (gid == mine) & (tl.sum(tl.where(sl == pid, act.to(tl.int32), 0)) > 0)
+        count = tl.sum(hit.to(tl.int32), axis=0)
+        blocks = (count + BM - 1) // BM
+        if blocks > 0:
+            eb = tl.arange(0, PER_E)
+            tl.store(block_expert_ptr + first + eb, pid, mask=eb < blocks)
+            rank = tl.cumsum(hit.to(tl.int32), axis=0) - 1
+            base = first * BM
+            c = tl.arange(0, PER_E * BM)
+            # Padding and routes write disjoint slots of the slot's blocks.
+            tl.store(
+                sorted_ptr + base + c, M * TOPK, mask=(c < blocks * BM) & (c >= count)
+            )
+            tl.store(sorted_ptr + base + rank, s, mask=hit)
+    else:
+        chunks: tl.constexpr = D // DC
+        row = (pid - NS) // chunks
+        chunk = (pid - NS) % chunks
+        col = chunk * DC + tl.arange(0, DC)
+        x = tl.load(x_ptr + row * D + col).to(tl.float32)
+        q, qs = _quant_rows(tl.reshape(x, [1, DC]), 1, DC)
+        tl.store(
+            q_ptr + row * (D // 2) + chunk * (DC // 2) + tl.arange(0, DC // 2),
+            tl.reshape(q, [DC // 2]),
+        )
+        tl.store(
+            qs_ptr + row * (D // 32) + chunk * (DC // 32) + tl.arange(0, DC // 32),
+            tl.reshape(qs, [DC // 32]),
+        )
+
+
 @triton.jit
 def _load_w(W, n0, k0, KROW: tl.constexpr, BN: tl.constexpr, KB: tl.constexpr):
     """`[KB bytes, BN rows]` tile from row `n0`, byte `k0` of one expert's
@@ -276,6 +603,8 @@ def _expert_kernel(
     out_ptr,
     os_ptr,
     rows,
+    wr_ptr,
+    wrs_ptr,
     K: tl.constexpr,
     N: tl.constexpr,
     BN: tl.constexpr,
@@ -283,10 +612,14 @@ def _expert_kernel(
     BM: tl.constexpr,
     GATE_UP: tl.constexpr,
     TOPK: tl.constexpr,
+    LOCAL: tl.constexpr = 0,
 ):
     """Program `(n tile, block)`. GATE_UP: `a` holds one MXFP4 row per token and
     `w` `[E, 2 N, K / 2]` (gate rows, then up rows); the output is MXFP4 per
-    route. Else `a` holds one MXFP4 row per route and the output is BF16."""
+    route. Else `a` holds one MXFP4 row per route and the output is BF16.
+
+    LOCAL > 0: slots from LOCAL on are rows of the replica weights `wr` /
+    `wrs` (same layout)."""
     block, n_tile = tl.program_id(1), tl.program_id(0)
     expert = tl.load(block_expert_ptr + block)
     if expert >= 0:
@@ -299,6 +632,10 @@ def _expert_kernel(
         WN: tl.constexpr = 2 * N if GATE_UP else N
         w_e = w_ptr + expert.to(tl.int64) * (WN * (K // 2))
         ws_e = ws_ptr + expert.to(tl.int64) * (WN * (K // 32))
+        if LOCAL > 0:  # noqa: SIM102 (a compile-time branch around a runtime one)
+            if expert >= LOCAL:
+                w_e = wr_ptr + (expert - LOCAL).to(tl.int64) * (WN * (K // 2))
+                ws_e = wrs_ptr + (expert - LOCAL).to(tl.int64) * (WN * (K // 32))
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if GATE_UP:
             up = tl.zeros((BM, BN), dtype=tl.float32)
@@ -350,10 +687,22 @@ def compact_moe_experts(
     w2: torch.Tensor,
     w13_scale: torch.Tensor,
     w2_scale: torch.Tensor,
+    replicas: ReplicaTable | None = None,
+    replica_weights: tuple[torch.Tensor, ...] | None = None,
+    padding: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Unweighted per-(token, slot) expert outputs `[T, top_k, H]` (BF16) of the T
     bf16 rows `x` on their local routes; rows of other ranks' routes are left
     unwritten.
+
+    With `replicas`, `replica_weights` (w13, w2, w13 scales, w2 scales of the
+    rank's replica slots, in slot order, same layouts) follow the local
+    experts, and the step's routes are split between owners and copies (every
+    rank computes the same split). `local_index` is then the layer's step
+    index: on entry the rank's own experts' local index, as left by the
+    previous call with the same table; the call rewrites the replicated
+    experts' entries, so afterwards it marks exactly the routes this rank
+    computed.
 
     Args:
         x: `[T, H]` bf16 rows.
@@ -364,6 +713,11 @@ def compact_moe_experts(
         w2: the local experts' preshuffled MXFP4 down weights.
         w13_scale: `w13`'s E8M0 scales.
         w2_scale: `w2`'s E8M0 scales (shapes: `supports_compact_moe`).
+        replicas: this layer's replica table on this rank, or None.
+        replica_weights: with `replicas`, the replica slots' weights.
+        padding: with `replicas`, optional `[T]` bool flags of padding rows
+            (e.g. CUDA graph padding): computed as any row, but left out of
+            the assignment so that their contents cannot change it.
 
     """
     T, H = x.shape
@@ -372,6 +726,16 @@ def compact_moe_experts(
     assert supports_compact_moe(x, topk_ids, w13, w2, w13_scale, w2_scale), (
         "compact MoE does not support these rows, routes or weights"
     )
+    if replicas is not None:
+        assert replica_weights is not None and len(replica_weights) == 4
+        nrep = replicas.num_slots - num_local
+        for t, own in zip(replica_weights, (w13, w2, w13_scale, w2_scale)):
+            assert t.shape == (nrep, *own.shape[1:]) and t.is_contiguous()
+        assert local_index.dtype == torch.int32
+        if padding is not None:
+            assert padding.dtype == torch.bool and padding.shape == (T,)
+            padding = padding.contiguous()
+        num_local = replicas.num_slots
     cfg = tile_config(T)
     bm = cfg.block_m
     dev = x.device
@@ -385,17 +749,7 @@ def compact_moe_experts(
     inter_scale = torch.empty((rows, inter // 32), dtype=torch.uint8, device=dev)
     out = torch.empty((T, top_k, H), dtype=torch.bfloat16, device=dev)
     dc = 1024
-    _route_quant_kernel[(num_local + T * (H // dc),)](
-        topk_ids,
-        local_index,
-        sorted_slots,
-        block_expert,
-        x,
-        q,
-        q_scale,
-        T,
-        num_blocks,
-        LE=num_local,
+    common = dict(
         S=triton.next_power_of_2(rows),
         PER_E=triton.next_power_of_2(triton.cdiv(rows, bm)),
         BM=bm,
@@ -405,8 +759,57 @@ def compact_moe_experts(
         DC=dc,
         num_warps=4,
     )
+    if replicas is None:
+        _route_quant_kernel[(num_local + T * (H // dc),)](
+            topk_ids,
+            local_index,
+            sorted_slots,
+            block_expert,
+            x,
+            q,
+            q_scale,
+            T,
+            num_blocks,
+            LE=num_local,
+            **common,
+        )
+    else:
+        num_experts = local_index.numel()
+        _route_quant_replica_kernel[(num_local + T * (H // dc),)](
+            topk_ids,
+            replicas.table,
+            local_index,
+            local_index if padding is None else padding.view(torch.uint8),
+            sorted_slots,
+            block_expert,
+            x,
+            q,
+            q_scale,
+            T,
+            num_blocks,
+            E=num_experts,
+            LE=num_experts // replicas.ranks,
+            NS=replicas.num_slots,
+            NSP=replicas.slots_padded,
+            NEP=replicas.entries_padded,
+            P=replicas.ranks,
+            RANK=replicas.rank,
+            UNIT=REPLICA_COST_UNIT,
+            EXTRA=REPLICA_COST_EXTRA_BLOCK,
+            ROUNDS=REPLICA_ROUNDS,
+            HAS_PAD=padding is not None,
+            **common,
+        )
     w13_u8, w2_u8 = w13.view(torch.uint8), w2.view(torch.uint8)
     s13_u8, s2_u8 = w13_scale.view(torch.uint8), w2_scale.view(torch.uint8)
+    if replica_weights is None:
+        local_slots = 0
+        w13r_u8, s13r_u8, w2r_u8, s2r_u8 = w13_u8, s13_u8, w2_u8, s2_u8
+    else:
+        local_slots = w13.shape[0]
+        w13r_u8, w2r_u8, s13r_u8, s2r_u8 = (
+            t.view(torch.uint8) for t in replica_weights
+        )
     _expert_kernel[(inter // cfg.bn1, num_blocks)](
         q,
         q_scale,
@@ -417,6 +820,8 @@ def compact_moe_experts(
         inter_q,
         inter_scale,
         rows,
+        w13r_u8,
+        s13r_u8,
         K=H,
         N=inter,
         BN=cfg.bn1,
@@ -424,6 +829,7 @@ def compact_moe_experts(
         BM=bm,
         GATE_UP=True,
         TOPK=top_k,
+        LOCAL=local_slots,
         num_warps=cfg.warps1,
         num_stages=cfg.stages1,
         matrix_instr_nonkdim=16,
@@ -438,6 +844,8 @@ def compact_moe_experts(
         out,
         out,
         rows,
+        w2r_u8,
+        s2r_u8,
         K=inter,
         N=H,
         BN=cfg.bn2,
@@ -445,6 +853,7 @@ def compact_moe_experts(
         BM=bm,
         GATE_UP=False,
         TOPK=top_k,
+        LOCAL=local_slots,
         num_warps=cfg.warps2,
         num_stages=cfg.stages2,
         matrix_instr_nonkdim=16,

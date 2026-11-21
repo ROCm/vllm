@@ -9,7 +9,8 @@ runs the whole layer on the layer's own weights:
 * router logits and pooler, then one prep kernel: router split-K reduce, sigmoid
   top-k routing and the pre-expert RMSNorm, one row per token;
 * the experts on the `[T, top_k]` routes: up to `compact_moe.MAX_TOKENS` tokens,
-  the compact MXFP4 expert kernels; above, moe_sorting, the stage-1 MXFP4 quant
+  the compact MXFP4 expert kernels (with the layer's expert replicas, if any:
+  `decode_replicas`); above, moe_sorting, the stage-1 MXFP4 quant
   of the T rows into sorted layout (both in one Triton launch up to
   `SORT_QUANT_MAX_TOKENS` tokens), AITER's FlyDSL stages with a per-slot stage 2;
 * the fused post-expert finalize, masking the routes of other ranks' experts;
@@ -31,6 +32,9 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.router.base_router import (
+    get_moe_padding_mask,
+)
 from vllm.models.muse_spark.common.layers import MuseSparkRMSNorm
 from vllm.models.muse_spark.common.ops.fused_finalize import (
     fused_post_expert_finalize,
@@ -46,6 +50,7 @@ from .ops.decode_moe import (
 )
 
 if TYPE_CHECKING:
+    from .decode_replicas import LayerDecodeReplicas
     from .model import MuseSparkMoE, TokenShard
 
 logger = init_logger(__name__)
@@ -180,6 +185,7 @@ class MuseSparkDecodeMoE:
             local_index,
             kernels,
             post_norm,
+            replicas=moe.decode_replicas,
         )
         if shard is not None:
             out = shard.reduce_scatter(out)
@@ -303,11 +309,13 @@ def native_routes_moe(
     local_index: torch.Tensor,
     kernels: StageKernels,
     post_expert_norm: MuseSparkRMSNorm,
+    replicas: "LayerDecodeReplicas | None" = None,
 ) -> torch.Tensor:
-    """This rank's experts' finalized MoE output `[T, H]` for the T normed bf16
-    rows (unreduced across ranks; `local_index`: the `[E]` global-to-local
-    expert map, -1 for other ranks' experts)."""
-    routes = _native_routes_experts(
+    """This rank's finalized MoE output `[T, H]` for the T normed bf16 rows
+    (unreduced across ranks; `local_index`: the `[E]` global-to-local expert
+    map, -1 for other ranks' experts). With `replicas`, the routes of the
+    step's replicated experts are summed on the rank that computed them."""
+    routes, local_index = _native_routes_experts(
         hidden_states,
         topk_ids,
         w1,
@@ -317,6 +325,7 @@ def native_routes_moe(
         expert_mask,
         local_index,
         kernels,
+        replicas,
     )
     norm = post_expert_norm
     out = torch.empty(
@@ -346,9 +355,11 @@ def _native_routes_experts(
     expert_mask: torch.Tensor,
     local_index: torch.Tensor,
     kernels: StageKernels,
-) -> torch.Tensor:
+    replicas: "LayerDecodeReplicas | None" = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Unweighted per-(token, slot) MXFP4 expert outputs `[T, top_k, H]` of the T
-    bf16 rows `hidden_states`.
+    bf16 rows `hidden_states`, and the `[E]` local index of the experts whose
+    routes this rank computed.
 
     The FlyDSL stage kernels and quant rule of AITER's fused_moe on the routes'
     repeated rows, on the `[T, top_k]` routes: one moe_sorting; the stage-1 quant
@@ -359,9 +370,11 @@ def _native_routes_experts(
     in one launch.
 
     Calls that `supports_compact_moe` accepts take `compact_moe_experts`
-    instead, with the same quant rules and output. They are still gated on
-    `kernels`: `MuseSparkDecodeMoE.kernels` sends a call to the per-route path
-    when AITER has no launchable FlyDSL stages for its shape.
+    instead, with the same quant rules and output, and with `replicas` split
+    the routes between the experts' owners and their copies. They are still
+    gated on `kernels`: `MuseSparkDecodeMoE.kernels` sends a call to the
+    per-route path when AITER has no launchable FlyDSL stages for its shape.
+    Every other call runs on the owners.
     """
     from aiter.fused_moe import _flydsl_stage1_wrapper, moe_sorting
     from aiter.ops.flydsl import moe_kernels as fly
@@ -371,10 +384,28 @@ def _native_routes_experts(
     hidden = hidden_states.shape[1]
     inter = w1.shape[1] // 2
     if supports_compact_moe(hidden_states, topk_ids, w1, w2, w1_scale, w2_scale):
+        if replicas is not None:
+            logger.info_once(
+                "Muse Spark decode MoE: compact MXFP4 experts with expert replicas."
+            )
+            out = compact_moe_experts(
+                hidden_states,
+                topk_ids,
+                replicas.step_index,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                replicas=replicas.table,
+                replica_weights=replicas.weights,
+                padding=get_moe_padding_mask(num_tokens),
+            )
+            return out, replicas.step_index
         logger.info_once("Muse Spark decode MoE: compact MXFP4 experts.")
-        return compact_moe_experts(
+        out = compact_moe_experts(
             hidden_states, topk_ids, local_index, w1, w2, w1_scale, w2_scale
         )
+        return out, local_index
     block_m = kernels.block_m
     e8m0, fp4x2 = torch.float8_e8m0fnu, torch.float4_e2m1fn_x2
     device = hidden_states.device
@@ -458,4 +489,4 @@ def _native_routes_experts(
         a2_scale=a2_scale,
         **kernels.stage2,
     )
-    return out.view(num_tokens, top_k, hidden)
+    return out.view(num_tokens, top_k, hidden), local_index

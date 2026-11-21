@@ -78,6 +78,11 @@ from vllm.transformers_utils.configs.muse_spark import (
 )
 
 from .decode_moe import MuseSparkDecodeMoE
+from .decode_replicas import (
+    DecodeReplicaConfig,
+    LayerDecodeReplicas,
+    attach_decode_replicas,
+)
 from .mono import MuseSparkMono, maybe_attach_mono
 from .muse_moe_runner import (
     MuseMoERunner,
@@ -349,6 +354,8 @@ class MuseSparkMoE(nn.Module):
             reduce_results=not self.defer_reduce,
         )
         self.decode_moe = MuseSparkDecodeMoE.create(self)
+        # Set after weight loading when expert replicas are configured.
+        self.decode_replicas: LayerDecodeReplicas | None = None
 
     def _load_router_weight(
         self, param: nn.Parameter, loaded_weight: torch.Tensor
@@ -1222,11 +1229,13 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
             )
         if layer_type is None:
             layer_type = self.decoder_layer_cls
+        decode_replica_config = DecodeReplicaConfig.from_vllm_config(vllm_config)
 
         super().__init__(vllm_config=vllm_config, prefix=prefix, layer_type=layer_type)
         if isinstance(vllm_config.quant_config, OnlineQuantizationConfig):
             _reject_online_quantized_linears(self)
         self.vllm_config = vllm_config
+        self.decode_replica_config = decode_replica_config
 
         # qkv_proj fuses Q+K+V+OG, so LoRA must treat it as one module.
         self.packed_modules_mapping = {  # type: ignore[misc]
@@ -1389,6 +1398,7 @@ class MuseSparkForCausalLM(LlamaForCausalLM, SupportsLoRA, MixtureOfExperts):
         # monokernel also needs the cached coefficients and the folded router
         # weights from above.
         maybe_attach_mono(self)
+        attach_decode_replicas(self)
 
 
 __all__ = [
