@@ -467,8 +467,6 @@ def scratch_layout(S, world=W):
             ("z", P * (DM // 2) * 8),
             ("ss", P * 256 * 8),
             ("ss2", P * 256 * 8),
-            ("m", S * DM * 2),  # all-reduced MoE output (bf16, plain)
-            ("mf", BLOCKS * 8),  # m tile flags
             ("py", 512 * 16 * S * 8),  # post-proj K-part partials
             ("ss1", (S * BLOCKS + S) * 8),
             ("ss2g", (S * BLOCKS + S) * 8),
@@ -1438,7 +1436,7 @@ def build(key: Build):
     @traced
     def ar_reduce(scratch, own_peer, tag, health, tid, bid, pl=None, rank=None):
         """The W ranks' slots of this CTA's columns, summed in rank order (fp32) ->
-        bf16 m (local, plain) -> drain -> this CTA's MF flag."""
+        bf16 -> every rank's mrr (tagged); stage F polls its K slice there."""
         par = tag_par(tag)
         # the block owner: W slots in rank order -> every rank
         if (tid < 8 * S) & ((bid // CPRX) == rank):
@@ -1466,34 +1464,7 @@ def build(key: Build):
                     (par * S + tt) * (DM // 2) + bid * 8 + rp,
                     wr,
                 )
-        if tid < 8 * S:
-            rp = tid % 8
-            tt = tid // 8
-            got = mb_poll(
-                tag,
-                health,
-                [
-                    (
-                        own_peer + fx.Int64(play["mrr"][0]),
-                        (par * S + tt) * (DM // 2) + bid * 8 + rp,
-                        1,
-                    )
-                ],
-                REGION_IDS["mrr"],
-                cm=CM_SYS,
-            )
-            lo = bf_lo(got[0][0])
-            hi = bf_hi(got[0][0])
-            bo.buffer_store(
-                bf16_pair(lo, hi),
-                rsrc(scratch + fx.Int64(lay["m"][0])),
-                (tt * DM + bid * 16 + 2 * rp) // 2,
-                cache_modifier=CM_DEV,
-            )
-        rocdl.s_waitcnt(vmcnt=0, expcnt=0, lgkmcnt=0)
         gpu.barrier()
-        if tid == 0:
-            mb_put(tag, scratch + fx.Int64(lay["mf"][0]), bid, fx.Int32(1))
 
     # ------------------------------------------------------------ stage F: post_expert_proj
     def pp_tile(bid, i):
@@ -1525,24 +1496,30 @@ def build(key: Build):
         g = lane // 16
         kh = bid % KSP
         k0 = kh * KR
-        nfl = KR // 16
-        specs, oks = [], []
-        for i in range_constexpr((nfl + THREADS - 1) // THREADS):
-            f = fx.min(tid + THREADS * i, nfl - 1)
-            specs.append((scratch + fx.Int64(lay["mf"][0]), k0 // 16 + f, 1))
-            oks.append((tid + THREADS * i) < nfl)
-        mb_poll(tag, health, specs, REGION_IDS["mf"], oks=oks)
-        gpu.barrier()
+        # this CTA's K slice of the all-reduced MoE output, polled from the tagged mrr
+        # pairs in this rank's peer buffer straight into LDS
         nm = S * KR // 8
-        for i in range_constexpr((nm + THREADS - 1) // THREADS):
-            e = fx.min(tid + THREADS * i, nm - 1)
+        assert nm % THREADS == 0, nm
+        mspecs, dsts = [], []
+        for i in range_constexpr(nm // THREADS):
+            e = tid + THREADS * i
             t = e // (KR // 8)
             kk = (e % (KR // 8)) * 8
-            v = ld_vec(
-                scratch + fx.Int64(lay["m"][0]), (t * DM + k0 + kk) // 2, 4, CM_DEV
+            pb_ = (par * S + t) * (DM // 2) + (k0 + kk) // 2
+            mspecs += [
+                (peer + fx.Int64(play["mrr"][0]), pb_, 2),
+                (peer + fx.Int64(play["mrr"][0]), pb_ + 2, 2),
+            ]
+            dsts.append(ml + (t * MROW + kk) // 2)
+        gmr = mb_poll(tag, health, mspecs, REGION_IDS["mrr"], cm=CM_SYS)
+        for i in range_constexpr(nm // THREADS):
+            fx.ptr_store(
+                fx.Vector.from_elements(
+                    [gmr[2 * i][0], gmr[2 * i][1], gmr[2 * i + 1][0], gmr[2 * i + 1][1]],
+                    fx.Int32,
+                ),
+                dsts[i],
             )
-            if tid + THREADS * i < nm:
-                fx.ptr_store(v, ml + (t * MROW + kk) // 2)
         gpu.barrier()
         t = fx.min(lane % 16, S - 1)
         accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(TPC)]
