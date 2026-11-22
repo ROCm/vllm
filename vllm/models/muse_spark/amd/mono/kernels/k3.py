@@ -36,7 +36,8 @@ rank), 256 CTAs x 512 threads, everything between two attention cores:
            norm partials; every CTA: post-attention norm, gated residual on the fp32 stream,
            pre-FFN norm -> ffn_in (one token-reduction round for both norms)
     A      router logits (fp32) + pre_expert_proj of this rank's shard, K in KQ parts over
-           KQ-CTA groups (KQ = W); logit partials and h_raw go to every rank's peer buffer
+           KQ-CTA groups (KQ = W); K part 0 sums the group's parts and pushes its logits
+           and h_raw to every rank's peer buffer
     route  every CTA routes every token (identical top-8), the local experts' picks
     C, D   gate_up / down of the local experts: MXFP4 weights in vLLM's shuffled layouts,
            decoded in registers, bf16 MFMA
@@ -492,10 +493,10 @@ def scratch_layout(S, world=W):
 def peer_layout(S, world=W):
     """Every rank's peer buffer (IPC-shared), [parity] first."""
     d = _DIMS[world]
-    W, KQ = d.W, d.KQ
+    W = d.W
     return _lay(
         [
-            ("logit", 2 * KQ * S * E * 8),  # [par][kq][t][e] tagged
+            ("logit", 2 * E * S * 8),  # [par][e][t] tagged
             ("hraw", 2 * S * DM * 2),  # [par][t][col] bf16 plain
             ("hf", 2 * W * BLOCKS * 8),  # [par][src][CTA] tagged flags
             ("moep", 2 * W * S * (DM // 2) * 8),  # [par][src][t][pair] tagged
@@ -788,10 +789,13 @@ def build(key: Build):
             v = fx.Float32(0.0)
             for w in range_constexpr(WAVES // EG):
                 v = v + fx.ptr_load(tok + ((e2 * (WAVES // EG) + w) * S + t))
-            eg = rank * (E // W) + EG * rb + e2
-            idx = ((par * KQ + kq) * S + t) * E + eg
-            for pb in pl:
-                mb_put_sys(tag, pb + fx.Int64(play["logit"][0]), idx, v)
+            # the router partial goes to the group's K part 0 (px row RT + e2)
+            mb_put(
+                tag,
+                scratch + fx.Int64(lay["px"][0]),
+                ((rb * KQ + kq) * 64 + RT + e2) * S + t,
+                v,
+            )
         accs = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(NT_A)]
         t = fx.min(lane % 16, S - 1)
         for nt in range_constexpr(NT_A):
@@ -846,6 +850,26 @@ def build(key: Build):
                         v[h2],
                     )
         gpu.barrier()
+        # K part 0: the router partials of the KQ parts in order -> every rank's logits,
+        # one contiguous [e][t] run a group
+        if (tid < EG * S) & (kq == 0):
+            le2 = tid // S
+            lt = tid % S
+            lspecs = [
+                (
+                    scratch + fx.Int64(lay["px"][0]),
+                    ((rb * KQ + src) * 64 + RT + le2) * S + lt,
+                    1,
+                )
+                for src in range(KQ)
+            ]
+            lgot = mb_poll(tag, health, lspecs, REGION_IDS["px"])
+            lsum = lgot[0][0].bitcast(fx.Float32)
+            for src in range_constexpr(1, KQ):
+                lsum = lsum + lgot[src][0].bitcast(fx.Float32)
+            lidx = (par * E + rank * (E // W) + EG * rb + le2) * S + lt
+            for pb in pl:
+                mb_put_sys(tag, pb + fx.Int64(play["logit"][0]), lidx, lsum)
         # K part 0: the KQ parts in order -> bf16 h_raw -> every rank's HRAW
         if (tid < (RT // 2) * S) & (kq == 0):
             specs = []
@@ -882,40 +906,20 @@ def build(key: Build):
 
     @traced
     def route_poll(peer, tag, health, lane, wave):
-        """This wave's tokens' 256 logits from the local peer buffer: KQ K-part partials
-        each, summed in part order (identical on every CTA of every rank)."""
+        """This wave's tokens' 256 logits from the local peer buffer (summed over the K
+        parts by each group's K part 0)."""
         par = tag_par(tag)
         specs = [
             (
                 peer + fx.Int64(play["logit"][0]),
-                ((par * KQ + kq) * S + fx.min(wave + WAVES * rr, S - 1)) * E
-                + lane
-                + 64 * i,
+                (par * E + lane + 64 * i) * S + fx.min(wave + WAVES * rr, S - 1),
                 1,
             )
             for rr in range(RROUNDS)
             for i in range(4)
-            for kq in range(KQ)
         ]
-        got = mb_poll(
-            tag,
-            health,
-            specs,
-            REGION_IDS["logit"],
-            batch=min(len(specs), 32),
-            cm=CM_SYS,
-        )  # KQ = 8: 2 polls of 32; KQ = 4: one of 16
-        out = []
-        for rr in range_constexpr(RROUNDS):
-            lgs = []
-            for i in range_constexpr(4):
-                base = (rr * 4 + i) * KQ
-                v = got[base][0].bitcast(fx.Float32)
-                for kq in range_constexpr(1, KQ):
-                    v = v + got[base + kq][0].bitcast(fx.Float32)
-                lgs.append(v.bitcast(fx.Int32))
-            out.append(lgs)
-        return out
+        got = mb_poll(tag, health, specs, REGION_IDS["logit"], cm=CM_SYS)
+        return [[got[rr * 4 + i][0] for i in range(4)] for rr in range(RROUNDS)]
 
     @traced
     def h_wait_issue(peer, w_pren, tag, health, tid, rank):
@@ -1515,7 +1519,12 @@ def build(key: Build):
         for i in range_constexpr(nm // THREADS):
             fx.ptr_store(
                 fx.Vector.from_elements(
-                    [gmr[2 * i][0], gmr[2 * i][1], gmr[2 * i + 1][0], gmr[2 * i + 1][1]],
+                    [
+                        gmr[2 * i][0],
+                        gmr[2 * i][1],
+                        gmr[2 * i + 1][0],
+                        gmr[2 * i + 1][1],
+                    ],
                     fx.Int32,
                 ),
                 dsts[i],
