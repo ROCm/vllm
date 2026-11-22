@@ -708,13 +708,15 @@ def build(key: Build):
         red,
         tok,
     ):
-        """CTA b = (group rb = b / KQ, K part kq = b % KQ): router experts EG rb .. and
-        pre-proj rows RT rb .. of this rank's shard over K part kq."""
+        """CTA b = (group rb = b % NG, K part kq = b / NG): router experts EG rb .. and
+        pre-proj rows RT rb .. of this rank's shard over K part kq. A group's CTAs are NG
+        apart, so with workgroups dispatched round-robin over the XCDs they share one XCD
+        (and its L2) for the px exchange."""
         tid = fresh(tid)  # no cross-stage CSE of tid-derived offsets (S=16 spills)
         lane = fresh(lane)
         g = lane // 16
-        kq = bid % KQ
-        rb = bid // KQ
+        kq = bid // NG
+        rb = bid % NG
         k0 = kq * XQ
         par = tag_par(tag)
         nx = S * XQ // 8
