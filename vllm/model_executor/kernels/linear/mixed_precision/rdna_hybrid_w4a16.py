@@ -96,6 +96,14 @@ def _on_gfx1151() -> bool:
     return on_gfx1151()
 
 
+def _on_gfx115x() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx115x
+
+    return on_gfx115x()
+
+
 def _fits_in_memory_budget(nbytes: int, device: torch.device) -> bool:
     # Same budget the KV cache is later sized from. Keep room for the
     # activation peak and for KV of one max_model_len request (the floor the
@@ -738,21 +746,27 @@ def pack_int4_plain(w_uint4: torch.Tensor) -> torch.Tensor:
 # multiple.
 _CLIFF_PERIOD_BYTES = 512
 _CLIFF_ALIGN_BYTES = 128
-_WEIGHT_CLIFF_BYTES = 512  # packed weight row, K/2 B
 _ACT_CLIFF_BYTES = 2048  # activation row, K*2 B
 _STRIDE_PAD_BYTES = 128  # one cache line
 
 
-def _weight_pad_bytes(row_bytes: int) -> int:
-    """Bytes to add to a packed weight row stride to move it off the cliff.
+def padded_row_stride_bytes(row_bytes: int) -> int:
+    """Smallest row stride >= ``row_bytes`` that is an odd multiple of 128 B.
 
-    Only strides that are a multiple of ``_WEIGHT_CLIFF_BYTES`` are moved, and
-    only by one cache line; padding a stride that is already off the cliff
-    costs memory and measures slower.
+    The gfx115x W4A16 GEMMs have no per-workgroup K offset (StaggerU), so
+    weight rows whose stride is a multiple of 256 B -- and above all of 1 KiB
+    -- send the workgroups reading the same K window to the same few DRAM
+    channels.
     """
-    if row_bytes % _WEIGHT_CLIFF_BYTES:
-        return 0
-    return _STRIDE_PAD_BYTES
+    s = -(-row_bytes // _CLIFF_ALIGN_BYTES)
+    if s % 2 == 0:
+        s += 1
+    return s * _CLIFF_ALIGN_BYTES
+
+
+def _weight_pad_bytes(row_bytes: int) -> int:
+    """Bytes to add to a packed weight row (see padded_row_stride_bytes)."""
+    return padded_row_stride_bytes(row_bytes) - row_bytes
 
 
 def _act_pad_bytes(row_bytes: int) -> int:
@@ -765,10 +779,10 @@ def _act_pad_bytes(row_bytes: int) -> int:
 def _group_stride_pad(num_groups: int, elem_bytes: int) -> int:
     """Groups to add so a metadata row does not land on a 512 B multiple.
 
-    The scale and zero-point rows sit on the same period-512 B cliff as the
-    packed weight rows (see ``_cliff_pad_bytes``).  Padding a row that is
-    already in a good class makes it slower, so the pad is spent only on rows
-    whose byte size is a multiple of 512; +128 B lands them on 128 mod 512.
+    The scale and zero-point rows sit on a period-512 B cliff on gfx115x.
+    Padding a row that is already in a good class makes it slower, so the pad
+    is spent only on rows whose byte size is a multiple of 512; +128 B lands
+    them on 128 mod 512.
     """
     if (num_groups * elem_bytes) % _CLIFF_PERIOD_BYTES:
         return 0
@@ -793,15 +807,14 @@ def _pad_group_rows(t: torch.Tensor, pad_groups: int) -> torch.Tensor:
 
 def _skinny_row_int32(k8: int) -> int:
     """Row stride, in int32 words, of the buffer pack_skinny_int4 returns."""
-    pad_int32 = _weight_pad_bytes(k8 * 4) // 4
-    return k8 + (pad_int32 if _on_gfx1151() else 0)
+    return k8 + (_weight_pad_bytes(k8 * 4) // 4 if _on_gfx115x() else 0)
 
 
 def pack_skinny_int4(unpacked: torch.Tensor, shuffle: bool = True) -> torch.Tensor:
     """Pack [N, K] uint4 into the skinny weight layout the kernels consume.
 
-    ExLlama shuffle to [N, K//8] int32, viewed as int8 [N, K//2]. On gfx1151
-    the row stride is nudged off the cliff (see ``_weight_pad_bytes``).
+    ExLlama shuffle to [N, K//8] int32, viewed as int8 [N, K//2]. On gfx115x
+    each row is padded to ``padded_row_stride_bytes``.
 
     ``shuffle=False`` packs in plain K order instead, for the hipBLASLt path
     (whose ExLlama encoding was removed upstream). The stride pad applies to
@@ -1192,12 +1205,15 @@ class RDNAHybridW4A16LinearKernel(MPLinearKernel):
 
         # ---- Prepare skinny scales: normalize to [N, K//G] ----
         permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
-        # gfx1151: keep the metadata row off the 512 B cliff.  Scales and the
+        # gfx115x: keep the metadata row off the 512 B cliff.  Scales and the
         # packed zero points must share one row stride -- the HIP kernel reads
-        # both with the same group_stride.
+        # both with the same group_stride.  hipBLASLt layers read them only
+        # through hipBLASLt, which takes dense scales (build_scale_buffer).
         _gpad = (
             _group_stride_pad(w_s_raw.data.shape[1], w_s_raw.data.element_size())
-            if _on_gfx1151() and w_s_raw.data.device.type == "cuda"
+            if _on_gfx115x()
+            and w_s_raw.data.device.type == "cuda"
+            and not use_hipblaslt
             else 0
         )
         w_s_skinny = _pad_group_rows(w_s_raw.data, _gpad)
