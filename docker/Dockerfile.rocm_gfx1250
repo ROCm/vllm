@@ -332,6 +332,7 @@ RUN cd /opt/rixl && \
     mkdir -p /app/install && \
     _ucx_install_dir=${UCX_HOME} \
     ./contrib/build-wheel.sh \
+        --python-version ${PYTHON_VERSION} \
         --output-dir /app/install \
         --rocm-dir ${ROCM_PATH} \
         --ucx-plugins-dir ${UCX_HOME}/lib/ucx \
