@@ -19,6 +19,7 @@ from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionType,
@@ -233,7 +234,10 @@ class RocmRdnaMetadataBuilder(TritonAttentionMetadataBuilder):
             # A replayed CUDA graph must not read an earlier step's ranges.
             buf[:, 0].fill_(0)
             return None
-        rows = torch.zeros(len(per_request), buf.shape[1], dtype=torch.int32)
+        # Pinned: on ROCm a pageable source makes the copy below block the host.
+        rows = torch.zeros(
+            len(per_request), buf.shape[1], dtype=torch.int32, pin_memory=PIN_MEMORY
+        )
         for i, spans in enumerate(per_request):
             if spans:
                 rows[i, 0] = len(spans)
