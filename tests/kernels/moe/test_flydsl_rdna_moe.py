@@ -28,6 +28,14 @@ from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (  # noqa
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (  # noqa: E402
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (  # noqa: E402
+    WNA16MoEBackend,
+    select_wna16_moe_backend,
+)
+from vllm.model_executor.layers.quantization.utils.quant_utils import (  # noqa: E402
+    kInt4Static,
+    kInt4Static32,
+)
 from vllm.utils.torch_utils import set_random_seed  # noqa: E402
 
 
@@ -276,3 +284,33 @@ def test_flydsl_rdna_moe(num_tokens: int, dtype: torch.dtype, fused_silu: bool):
     down = torch.einsum("tenk,tek->ten", d2[topk_ids], act)
     ref = (down * topk_weights.unsqueeze(-1)).sum(dim=1)
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2 * ref.std())
+
+
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_rdna_flydsl_is_the_default(monkeypatch: pytest.MonkeyPatch, group_size: int):
+    """Without an explicit --moe-backend, symmetric 4-bit layers select the
+    FlyDSL kernels; layer widths they do not support and
+    VLLM_MOE_RDNA_FLYDSL=0 fall back to another backend.
+    """
+    from compressed_tensors.quantization import QuantizationArgs
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
+
+    args = QuantizationArgs(
+        num_bits=4, type="int", symmetric=True, strategy="group", group_size=group_size
+    )
+    key = kInt4Static32 if group_size == 32 else kInt4Static
+
+    def select(hidden: int) -> WNA16MoEBackend:
+        moe = make_dummy_moe_config(
+            num_experts=8, experts_per_token=2, hidden_dim=hidden, intermediate_size=256
+        )
+        return select_wna16_moe_backend(moe, key, args, False, False)[0]
+
+    rdna_flydsl = WNA16MoEBackend.RDNA_FLYDSL
+    assert select(512) == rdna_flydsl
+    if group_size == 32:
+        # Not a multiple of the 64-column tile.
+        assert select(544) != rdna_flydsl
+    monkeypatch.setenv("VLLM_MOE_RDNA_FLYDSL", "0")
+    assert select(512) != rdna_flydsl

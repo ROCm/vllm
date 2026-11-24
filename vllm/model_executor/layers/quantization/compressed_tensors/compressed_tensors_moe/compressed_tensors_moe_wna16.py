@@ -355,7 +355,9 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             hybrid_w4a16_moe_enabled,
         )
 
-        if self.num_bits == 4 and hybrid_w4a16_moe_enabled(self.moe):
+        if self.num_bits == 4 and hybrid_w4a16_moe_enabled(
+            self.moe, self.wna16_backend
+        ):
             self._process_weights_hybrid_w4a16(layer)
             return
 

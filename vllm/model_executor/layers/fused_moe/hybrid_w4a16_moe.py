@@ -12,12 +12,18 @@ CUDA-graph compatible.
 
 import contextlib
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        WNA16MoEBackend,
+    )
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -811,14 +817,19 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         )
 
 
-def hybrid_w4a16_moe_enabled(moe: FusedMoEConfig) -> bool:
+def hybrid_w4a16_moe_enabled(moe: FusedMoEConfig, backend: "WNA16MoEBackend") -> bool:
     """Whether a 4-bit MoE layer should use HybridW4A16MoEExperts: gfx11/gfx12
-    with the HIP op built, VLLM_MOE_HYBRID_W4A16 set, and no explicit
-    --moe-backend.
+    with the HIP op built, VLLM_MOE_HYBRID_W4A16 set, no explicit
+    --moe-backend, and the oracle did not pick the FlyDSL kernels.
     """
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        WNA16MoEBackend,
+    )
+
     if not (
         envs.VLLM_MOE_HYBRID_W4A16
         and moe.moe_backend == "auto"
+        and backend != WNA16MoEBackend.RDNA_FLYDSL
         and current_platform.is_rocm()
     ):
         return False

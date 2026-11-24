@@ -11,6 +11,7 @@ from compressed_tensors.quantization import (
 )
 
 import vllm._custom_ops as ops
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
@@ -130,6 +131,9 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
         return [WNA16MoEBackend.XPU]
 
     return [
+        # FlyDSL WMMA kernels, gated on gfx115x and an installed FlyDSL by
+        # _supports_current_device().
+        *([WNA16MoEBackend.RDNA_FLYDSL] if envs.VLLM_MOE_RDNA_FLYDSL else []),
         # Native HIP kernel, gated on gfx1100 by _supports_current_device().
         WNA16MoEBackend.RDNA3,
         WNA16MoEBackend.FLASHINFER_TRTLLM,

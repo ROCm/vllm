@@ -135,6 +135,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MOE_HYBRID_W4A16: bool = False
+    VLLM_MOE_RDNA_FLYDSL: bool = True
     VLLM_MOE_MAX_SKINNY_BATCH_SIZE: int = 5
     VLLM_MOE_HIP: str | None = None
     VLLM_GDN_HIP: bool = True
@@ -1255,6 +1256,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Converts weights to skinny layout [E, N, K//8] int32 (ExLlama shuffle).
     "VLLM_MOE_HYBRID_W4A16": lambda: (
         os.getenv("VLLM_MOE_HYBRID_W4A16", "true").lower() in ("true", "1")
+    ),
+    # Select the FlyDSL W4A16 MoE kernels (rdna_flydsl) by default on gfx115x
+    # when FlyDSL is installed and the layer is supported. "0" falls back to
+    # the hybrid W4A16 MoE path.
+    "VLLM_MOE_RDNA_FLYDSL": lambda: (
+        os.getenv("VLLM_MOE_RDNA_FLYDSL", "true").lower() in ("true", "1")
     ),
     # Largest token count the hybrid W4A16 MoE runs on the HIP wvSplitK
     # kernel; above it the Triton/WMMA prefill path is used. Speculative
