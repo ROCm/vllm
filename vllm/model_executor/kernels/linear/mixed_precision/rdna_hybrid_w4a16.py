@@ -4,7 +4,7 @@
 
 Routes based on batch size M:
   M <= MAX_SKINNY_BATCH_SIZE: HIP skinny GEMM (wvSplitK_int4_g)
-  M >= MIN_DENSE_M: dense GEMM on a cached dequantized copy, when
+  M >= MIN_DENSE_M[dtype]: dense GEMM on a cached dequantized copy, when
       ``KernelConfig.rdna_hybrid_w4a16_prefill_dequant`` is "enable"
   otherwise: Triton W4A16 fused dequant GEMM
 
@@ -153,8 +153,9 @@ def _resolved_group_size(group_size: int, K: int) -> int:
 # K*M bound: the skinny kernel reads whatever does not fit in LDS from global
 # memory itself, so the batch size is the only thing that has to be bounded.
 MAX_SKINNY_BATCH_SIZE = 5
-# Dense GEMMs read 4x the weight bytes, so reserve them for large batches.
-MIN_DENSE_M = 256
+# Smallest M at which the dense GEMM on the cached copy (4x the weight bytes)
+# beats the Triton int4 kernel on gfx1151.
+MIN_DENSE_M = {torch.float16: 256, torch.bfloat16: 65}
 
 
 # ---------------------------------------------------------------------------
@@ -933,7 +934,7 @@ def _rdna_hybrid_w4a16_apply_impl(
       packed_scale_zp: [N, K//G] fp32 carrier packing scale + zero-point per
                group (Triton prefill, asymmetric only), or None for symmetric.
       w_dequant:  [N, K] optional dense dequantized weight.
-               When present, prefill (M >= MIN_DENSE_M) runs a dense GEMM
+               When present, M >= MIN_DENSE_M[dtype] runs a dense GEMM
                on it. Passed as an op arg (not branched on in apply_weights) so the
                M-branch stays out of the compiled graph -- decode (small M) replays
                the same int4 cudagraph whether or not the dequantized copy exists.
@@ -982,7 +983,7 @@ def _rdna_hybrid_w4a16_apply_impl(
         with _profile_scope(f"wvsplitk_int4 {M}x{N}x{K} {_gz}"):
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
 
-    if w_dequant is not None and M >= MIN_DENSE_M:
+    if w_dequant is not None and MIN_DENSE_M[x_2d.dtype] <= M:
         with _profile_scope(f"hybrid_dequant_w4a16 {M}x{N}x{K} {_gz}"):
             return rocm_unquantized_gemm_impl(x_2d, w_dequant, bias)
 
