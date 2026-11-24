@@ -18,7 +18,10 @@ and folds scale and zero point in f32:
 ``pack_w4a16_weights`` produces the kernel's weight and coefficient layout.
 """
 
+import contextlib
 import functools
+import importlib.util
+import os
 
 import torch
 
@@ -49,6 +52,43 @@ _EXPERT_PAD_DWORDS = _CHANNEL_BYTES // 4
 # slc | dlc: weights of one token are read once, so they are loaded without
 # being kept in the caches, like a non-temporal load.
 _NON_TEMPORAL = 6
+
+
+@functools.cache
+def flydsl_toolkit() -> str | None:
+    """The ROCm directory FlyDSL can link GPU code with, or None.
+
+    FlyDSL links with ``<ROCm>/llvm/bin/ld.lld``, where ROCm is ``ROCM_PATH``
+    or ``/opt/rocm``. A pip-installed ROCm without ``rocm-sdk-devel`` has
+    neither, but ``rocm-sdk-core`` ships the linker under its ``lib``.
+    """
+    candidates = [os.environ.get("ROCM_PATH", "/opt/rocm")]
+    spec = importlib.util.find_spec("_rocm_sdk_core")
+    if spec is not None and spec.submodule_search_locations:
+        candidates.append(os.path.join(spec.submodule_search_locations[0], "lib"))
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "llvm", "bin", "ld.lld")):
+            return path
+    return None
+
+
+@contextlib.contextmanager
+def _toolkit_env():
+    """Point FlyDSL's compilation, which may run inside any launch, at
+    ``flydsl_toolkit()`` when the process's ROCm directory has no linker."""
+    toolkit = flydsl_toolkit()
+    old = os.environ.get("ROCM_PATH")
+    if toolkit is None or toolkit == (old or "/opt/rocm"):
+        yield
+        return
+    os.environ["ROCM_PATH"] = toolkit
+    try:
+        yield
+    finally:
+        if old is None:
+            del os.environ["ROCM_PATH"]
+        else:
+            os.environ["ROCM_PATH"] = old
 
 
 def _tile_stride(payload_dwords: int) -> int:
@@ -786,7 +826,8 @@ def flydsl_rdna_moe_gemm_reduce(
         x.dtype == torch.float16,
     )
     stream = torch.cuda.current_stream()
-    launch(out, x, w, coef, expert_ids, weights, n_tokens, stream)
+    with _toolkit_env():
+        launch(out, x, w, coef, expert_ids, weights, n_tokens, stream)
 
 
 def flydsl_rdna_moe_gemm(
@@ -831,21 +872,23 @@ def flydsl_rdna_moe_gemm(
     stream = torch.cuda.current_stream()
     if sorted_ids is None:
         launch = _build_gemm_row(*build_args)
-        launch(out, x, w, coef, expert_ids, expert_ids.numel(), stream)
+        with _toolkit_env():
+            launch(out, x, w, coef, expert_ids, expert_ids.numel(), stream)
         return
     launch = _build_gemm(*build_args)
-    launch(
-        out,
-        x,
-        w,
-        coef,
-        sorted_ids,
-        expert_ids,
-        num_valid,
-        n_rows,
-        expert_ids.numel(),
-        stream,
-    )
+    with _toolkit_env():
+        launch(
+            out,
+            x,
+            w,
+            coef,
+            sorted_ids,
+            expert_ids,
+            num_valid,
+            n_rows,
+            expert_ids.numel(),
+            stream,
+        )
 
 
 @functools.cache

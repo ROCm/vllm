@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.fused_flydsl_rdna_moe import (
     TILE_N,
     flydsl_rdna_moe,
+    flydsl_toolkit,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -81,7 +82,12 @@ class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
 
         from vllm.platforms.rocm import on_gfx115x
 
-        return on_gfx115x() and importlib.util.find_spec("flydsl") is not None
+        # FlyDSL compiles on first use and needs a linker for that.
+        return (
+            on_gfx115x()
+            and importlib.util.find_spec("flydsl") is not None
+            and flydsl_toolkit() is not None
+        )
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:

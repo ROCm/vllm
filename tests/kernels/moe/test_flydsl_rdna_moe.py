@@ -314,3 +314,27 @@ def test_rdna_flydsl_is_the_default(monkeypatch: pytest.MonkeyPatch, group_size:
         assert select(544) != rdna_flydsl
     monkeypatch.setenv("VLLM_MOE_RDNA_FLYDSL", "0")
     assert select(512) != rdna_flydsl
+
+
+def test_flydsl_toolkit_without_rocm_path(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """With no linker under ROCM_PATH (a pip ROCm without rocm-sdk-devel),
+    FlyDSL compiles with the linker of rocm-sdk-core, and ROCM_PATH is only
+    changed while a kernel launches.
+    """
+    import os
+
+    from vllm.model_executor.layers.fused_moe import fused_flydsl_rdna_moe as m
+
+    if importlib.util.find_spec("_rocm_sdk_core") is None:
+        pytest.skip("ROCm is not installed from the rocm-sdk wheels")
+    monkeypatch.setenv("ROCM_PATH", str(tmp_path))
+    m.flydsl_toolkit.cache_clear()
+    try:
+        toolkit = m.flydsl_toolkit()
+        assert toolkit is not None
+        assert os.path.isfile(os.path.join(toolkit, "llvm", "bin", "ld.lld"))
+        with m._toolkit_env():
+            assert os.environ["ROCM_PATH"] == toolkit
+        assert os.environ["ROCM_PATH"] == str(tmp_path)
+    finally:
+        m.flydsl_toolkit.cache_clear()
