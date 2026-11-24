@@ -568,7 +568,7 @@ def run(args) -> None:
             )
             del g_ctx, g_moe
         del stack
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
 
 
 def _kernel_trace(argv: list[str], keep: str | None) -> None:
