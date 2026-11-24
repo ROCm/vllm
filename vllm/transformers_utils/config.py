@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib.util
 import math
 import os
+import sys
+import types
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -13,6 +16,7 @@ from typing import Any, Literal, TypeAlias
 
 import huggingface_hub
 import torch
+import transformers
 import transformers.configuration_utils as hf_configuration_utils
 from huggingface_hub import constants
 from packaging.version import Version
@@ -252,6 +256,44 @@ def _install_hf_config_validator(
                 validator if v is supersedes else v for v in validators
             ]
         stack.extend(cls.__subclasses__())
+
+
+def _prepare_4d_attention_mask(
+    mask: torch.Tensor, dtype: torch.dtype, tgt_len: int | None = None
+) -> torch.Tensor:
+    """Expand a ``[bsz, src_len]`` padding mask to ``[bsz, 1, tgt_len, src_len]``.
+
+    Masked positions get the dtype's minimum, kept positions get 0. Same
+    behaviour as ``transformers.modeling_attn_mask_utils._prepare_4d_attention_mask``
+    in transformers <= 5.23.
+    """
+    bsz, src_len = mask.size()
+    tgt_len = tgt_len if tgt_len is not None else src_len
+    expanded_mask = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    inverted_mask = torch.tensor(1.0, dtype=dtype) - expanded_mask
+    return inverted_mask.masked_fill(
+        inverted_mask.to(torch.bool), torch.finfo(dtype).min
+    )
+
+
+def _patch_hf_transformers_attn_mask_utils() -> None:
+    """Provide ``transformers.modeling_attn_mask_utils`` if it is missing.
+
+    Transformers 5.24 removed the module, but remote code (e.g. MiniCPM-V/o-2.6)
+    still imports ``_prepare_4d_attention_mask`` from it. Runs at import time,
+    not per model type, because the engine core process re-imports the remote
+    config class when unpickling it without going through ``get_config``.
+    """
+    name = "transformers.modeling_attn_mask_utils"
+    if name in sys.modules or importlib.util.find_spec(name) is not None:
+        return
+    module = types.ModuleType(name, "vLLM stand-in for a module removed in 5.24.")
+    module._prepare_4d_attention_mask = _prepare_4d_attention_mask  # type: ignore[attr-defined]
+    sys.modules[name] = module
+    transformers.modeling_attn_mask_utils = module  # type: ignore[attr-defined]
+
+
+_patch_hf_transformers_attn_mask_utils()
 
 
 def _patch_hf_transformers_validate_rope():

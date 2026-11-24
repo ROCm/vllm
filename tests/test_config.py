@@ -48,6 +48,7 @@ from vllm.config.utils import get_field
 from vllm.config.vllm import OPTIMIZATION_LEVEL_TO_CONFIG, OptimizationLevel
 from vllm.platforms import current_platform
 from vllm.transformers_utils.config import (
+    _patch_hf_transformers_attn_mask_utils,
     _patch_hf_transformers_nested_rope_validation,
     get_pooling_config,
     try_get_dense_modules,
@@ -55,6 +56,44 @@ from vllm.transformers_utils.config import (
 from vllm.v1.attention.backend import AttentionCGSupport
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_attn_mask_utils_patch_restores_removed_module(monkeypatch):
+    import importlib.util
+    import sys
+
+    import transformers
+
+    name = "transformers.modeling_attn_mask_utils"
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    # Registers undo so the stand-in doesn't leak into other tests.
+    monkeypatch.setattr(transformers, "modeling_attn_mask_utils", None, raising=False)
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util,
+        "find_spec",
+        lambda n, *a, **k: None if n == name else real_find_spec(n, *a, **k),
+    )
+
+    _patch_hf_transformers_attn_mask_utils()
+
+    from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask
+
+    out = _prepare_4d_attention_mask(torch.tensor([[1, 1, 0]]), torch.float32, 2)
+    assert out.shape == (1, 1, 2, 3)
+    assert torch.equal(out[0, 0, :, :2], torch.zeros(2, 2))
+    assert torch.all(out[0, 0, :, 2] == torch.finfo(torch.float32).min)
+
+
+def test_attn_mask_utils_patch_keeps_real_module(monkeypatch):
+    import sys
+    import types
+
+    name = "transformers.modeling_attn_mask_utils"
+    real = types.ModuleType(name)
+    monkeypatch.setitem(sys.modules, name, real)
+    _patch_hf_transformers_attn_mask_utils()
+    assert sys.modules[name] is real
 
 
 def test_nested_rope_validation_patch_preserves_flat_rope_parameters(monkeypatch):
