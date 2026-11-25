@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Selection of the rdna_flydsl MoE backend (AITER's FlyDSL W4A16 kernels).
+"""Selection of the aiter_rdna MoE backend (AITER's FlyDSL W4A16 kernels).
 The kernels themselves are tested in AITER."""
 
 import pytest
@@ -18,7 +18,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 
-RDNA_FLYDSL = WNA16MoEBackend.RDNA_FLYDSL
+AITER_RDNA = WNA16MoEBackend.AITER_RDNA
 
 
 def _select(hidden: int, group_size: int) -> WNA16MoEBackend:
@@ -45,20 +45,20 @@ def _on_gfx115x() -> bool:
     reason="needs gfx115x and aiter.ops.flydsl.moe_w4a16_rdna",
 )
 @pytest.mark.parametrize("group_size", [32, 128])
-def test_rdna_flydsl_is_the_default(group_size: int):
+def test_aiter_rdna_is_the_default(group_size: int):
     """Without an explicit --moe-backend, symmetric 4-bit layers select the
     AITER kernels; layer widths they do not support fall back to another
     backend.
     """
-    assert _select(512, group_size) == RDNA_FLYDSL
+    assert _select(512, group_size) == AITER_RDNA
     if group_size == 32:
         # Not a multiple of the 64-column tile.
-        assert _select(544, group_size) != RDNA_FLYDSL
+        assert _select(544, group_size) != AITER_RDNA
 
 
 @pytest.mark.skipif(not _on_gfx115x(), reason="needs gfx115x")
-def test_rdna_flydsl_needs_aiter(monkeypatch: pytest.MonkeyPatch):
+def test_aiter_rdna_needs_aiter(monkeypatch: pytest.MonkeyPatch):
     """Without an importable aiter.ops.flydsl.moe_w4a16_rdna the backend is
     not selected."""
     monkeypatch.setattr(flydsl_rdna_moe, "aiter_rdna_moe", lambda: None)
-    assert _select(512, 128) != RDNA_FLYDSL
+    assert _select(512, 128) != AITER_RDNA

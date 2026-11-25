@@ -135,7 +135,7 @@ MoEBackend = Literal[
     "aiter",
     "aiter_triton_mxfp4_bf16",
     "flydsl",
-    "rdna_flydsl",
+    "aiter_rdna",
     "hpc",
     "emulation",
     "rdna3",
@@ -273,7 +273,7 @@ class KernelConfig:
     - "aiter_triton_mxfp4_bf16": Use the AITER Triton MXFP4 W4A16
       (moe_gemm_a16w4) MoE kernel (ROCm gfx942/gfx950/gfx1250)
     - "flydsl": Use AMD FlyDSL kernels (ROCm only)
-    - "rdna_flydsl": Use AITER's FlyDSL W4A16 WMMA kernels (ROCm gfx115x only)
+    - "aiter_rdna": Use AITER's FlyDSL W4A16 WMMA kernels (ROCm gfx115x only)
     - "rdna3": Use the fused RDNA3 W4A16 HIP kernel (ROCm gfx1100 only)
     - "hpc": Use HPC kernels (FP8 and Hopper only)
     - "emulation": use BF16/FP16 GEMM, dequantizing weights and

@@ -400,7 +400,7 @@ def test_hybrid_w4a16_moe_gate(monkeypatch: pytest.MonkeyPatch):
     moe = make_dummy_moe_config()
     if current_platform.is_rocm() and on_gfx1x():
         assert hybrid_w4a16_moe_enabled(moe, triton)
-    assert not hybrid_w4a16_moe_enabled(moe, WNA16MoEBackend.RDNA_FLYDSL)
+    assert not hybrid_w4a16_moe_enabled(moe, WNA16MoEBackend.AITER_RDNA)
     explicit = dataclasses.replace(moe, moe_backend="triton")
     assert not hybrid_w4a16_moe_enabled(explicit, triton)
     monkeypatch.setenv("VLLM_MOE_HYBRID_W4A16", "0")

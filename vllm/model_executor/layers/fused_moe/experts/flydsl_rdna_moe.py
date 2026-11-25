@@ -58,7 +58,7 @@ def fuses_silu_mul(moe_config: FusedMoEConfig) -> bool:
     )
 
 
-class FlydslRdnaWNA16Experts(mk.FusedMoEExpertsModular):
+class AiterRdnaWNA16Experts(mk.FusedMoEExpertsModular):
     """W4A16 experts backed by AITER's ``flydsl_rdna_moe`` (gfx115x).
 
     ``w1`` / ``w2`` and their scales are in the ``pack_w4a16_weights`` layout;

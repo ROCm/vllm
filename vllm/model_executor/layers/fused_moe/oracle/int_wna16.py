@@ -60,8 +60,7 @@ class WNA16MoEBackend(Enum):
     XPU = "XPU"
     EMULATION = "EMULATION"
     RDNA3 = "RDNA3"
-    # AITER's FlyDSL WMMA kernels for RDNA3.5 (gfx115x).
-    RDNA_FLYDSL = "RDNA_FLYDSL"
+    AITER_RDNA = "AITER_RDNA"
 
 
 def backend_to_kernel_cls(
@@ -112,12 +111,12 @@ def backend_to_kernel_cls(
         )
 
         return [Rdna3WNA16Experts]
-    elif backend == WNA16MoEBackend.RDNA_FLYDSL:
+    elif backend == WNA16MoEBackend.AITER_RDNA:
         from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
-            FlydslRdnaWNA16Experts,
+            AiterRdnaWNA16Experts,
         )
 
-        return [FlydslRdnaWNA16Experts]
+        return [AiterRdnaWNA16Experts]
     else:
         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
 
@@ -132,7 +131,7 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
     return [
         # AITER's FlyDSL WMMA kernels, gated on gfx115x and an importable
         # aiter.ops.flydsl.moe_w4a16_rdna by _supports_current_device().
-        WNA16MoEBackend.RDNA_FLYDSL,
+        WNA16MoEBackend.AITER_RDNA,
         # Native HIP kernel, gated on gfx1100 by _supports_current_device().
         WNA16MoEBackend.RDNA3,
         WNA16MoEBackend.FLASHINFER_TRTLLM,
@@ -171,7 +170,7 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
-    if backend == WNA16MoEBackend.RDNA_FLYDSL:
+    if backend == WNA16MoEBackend.AITER_RDNA:
         if isinstance(quant_config, MoeWNA16Config):
             num_bits, group_size = quant_config.weight_bits, quant_config.group_size
         elif isinstance(quant_config, QuantizationArgs):
@@ -257,7 +256,7 @@ def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
         "rdna3": WNA16MoEBackend.RDNA3,
-        "rdna_flydsl": WNA16MoEBackend.RDNA_FLYDSL,
+        "aiter_rdna": WNA16MoEBackend.AITER_RDNA,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -440,7 +439,7 @@ def make_wna16_moe_kernel(
         CPUExpertsInt4,
     )
     from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
-        FlydslRdnaWNA16Experts,
+        AiterRdnaWNA16Experts,
     )
     from vllm.model_executor.layers.fused_moe.experts.int4_emulation_moe import (
         Int4EmulationTritonExperts,
@@ -464,7 +463,7 @@ def make_wna16_moe_kernel(
         CPUExpertsInt4,
         Int4EmulationTritonExperts,
         Rdna3WNA16Experts,
-        FlydslRdnaWNA16Experts,
+        AiterRdnaWNA16Experts,
     )
     if backend == WNA16MoEBackend.HUMMING:
         allowed_experts += tuple(backend_to_kernel_cls(WNA16MoEBackend.HUMMING))
@@ -1469,7 +1468,7 @@ def _process_weights_emulation_awq(
     )
 
 
-def _process_weights_flydsl(
+def _process_weights_aiter_rdna(
     layer: torch.nn.Module,
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -1686,8 +1685,8 @@ def convert_to_wna16_moe_kernel_format(
             w2_scale,
             quant_config.group_size,
         )
-    elif backend == WNA16MoEBackend.RDNA_FLYDSL:
-        return _process_weights_flydsl(
+    elif backend == WNA16MoEBackend.AITER_RDNA:
+        return _process_weights_aiter_rdna(
             layer, w13, w2, w13_scale, w2_scale, w13_qzeros, w2_qzeros
         )
     elif backend == WNA16MoEBackend.CPU:

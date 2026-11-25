@@ -835,7 +835,7 @@ def hybrid_w4a16_moe_enabled(moe: FusedMoEConfig, backend: "WNA16MoEBackend") ->
     if not (
         envs.VLLM_MOE_HYBRID_W4A16
         and moe.moe_backend == "auto"
-        and backend != WNA16MoEBackend.RDNA_FLYDSL
+        and backend != WNA16MoEBackend.AITER_RDNA
         and current_platform.is_rocm()
     ):
         return False
