@@ -7,7 +7,6 @@ from typing import Protocol
 
 import torch
 from torch._ops import OpOverload
-from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm.platforms import current_platform
@@ -805,6 +804,7 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
     assert aiter_ar is not None, "aiter allreduce must be initialized"
+    ca = aiter_ar.aiter_ca
 
     total_bytes = input_.numel() * input_.element_size()
     hidden_dim = input_.shape[-1]
@@ -815,8 +815,8 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
     else:
         hidden_ok = False
     token_ok = token_num <= 80
-    world_size = aiter_ar.world_size
-    full_nvlink = aiter_ar.fully_connected
+    world_size = ca.world_size
+    full_nvlink = ca.fully_connected
 
     if world_size == 2:
         size_ok = True
@@ -829,12 +829,11 @@ def _rocm_aiter_fused_allreduce_rmsnorm_impl(
 
     use_1stage = hidden_ok and token_ok and size_ok
 
-    result = aiter_ar.fused_ar_rms(
+    result = ca.custom_fused_ar_rms(
         input_,
         residual,
-        w=weight,
-        eps=epsilon,
-        registered=torch.cuda.is_current_stream_capturing(),
+        weight,
+        epsilon,
         use_1stage=use_1stage,
     )
     assert result is not None
@@ -1346,6 +1345,7 @@ class rocm_aiter_ops:
 
     # Check if the env variable is set
     _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
+    _CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
@@ -1380,6 +1380,7 @@ class rocm_aiter_ops:
         you can call this function to reload the env variables.
         """
         cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
+        cls._CUSTOM_ALL_REDUCE_ENABLED = envs.VLLM_ROCM_USE_AITER_CUSTOM_AR
         cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
@@ -1593,33 +1594,24 @@ class rocm_aiter_ops:
         return cls.is_linear_enabled() and on_gfx950()
 
     @classmethod
-    def initialize_aiter_allreduce(
-        cls, group: ProcessGroup, device: torch.device
-    ) -> None:
-        try:
-            from aiter.dist.device_communicators.custom_all_reduce import (
-                CustomAllreduce as AiterCustomAllreduce,
-            )
-
-            cls._CUSTOM_ALL_REDUCE = AiterCustomAllreduce(group, device)
-        except Exception:
-            cls._CUSTOM_ALL_REDUCE = None
+    def is_custom_all_reduce_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._CUSTOM_ALL_REDUCE_ENABLED
 
     @classmethod
-    def get_aiter_allreduce(cls) -> AiterCustomAllreduceProto | None:
-        return cls._CUSTOM_ALL_REDUCE
+    def get_aiter_allreduce(cls):
+        """Return the TP device communicator's AITER custom-allreduce if it has
+        one, return None otherwise.
+        """
+        from vllm.distributed.device_communicators.aiter_custom_all_reduce import (
+            AiterCustomAllreduce,
+        )
+        from vllm.distributed.parallel_state import get_tp_group
 
-    @classmethod
-    def destroy_aiter_allreduce(cls) -> None:
-        if cls._CUSTOM_ALL_REDUCE is not None:
-            cls._CUSTOM_ALL_REDUCE.close()
-            cls._CUSTOM_ALL_REDUCE = None
-
-    @classmethod
-    def get_aiter_allreduce_max_size(cls) -> int | None:
-        # effective max input size (based on upstream aiter version: v0.1.10.post3)
-        # https://github.com/ROCm/aiter/blob/6a0e7b26ccf33164785531212cc2ec2cde0b9243/aiter/dist/device_communicators/custom_all_reduce.py#L272-L273
-        return int(cls._ALL_REDUCE_MAX_SIZE / 2)
+        device_comm = get_tp_group().device_communicator
+        aiter_ar_comm = getattr(device_comm, "aiter_ar_comm", None)
+        return (
+            aiter_ar_comm if isinstance(aiter_ar_comm, AiterCustomAllreduce) else None
+        )
 
     @classmethod
     @if_aiter_supported

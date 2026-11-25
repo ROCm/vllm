@@ -19,7 +19,6 @@ from vllm.compilation.passes.fusion.rms_quant_fusion import (
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
-from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -1178,39 +1177,29 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
             )
             return
 
-        device_comm = get_tp_group().device_communicator
-        if device_comm is None:
-            logger.warning_once("Device communicator is required.")
-            return
-
-        ca_comm = getattr(device_comm, "ca_comm", None)
+        ca_comm = rocm_aiter_ops.get_aiter_allreduce()
         if ca_comm is None:
-            logger.warning_once("Custom Allreduce is required.")
+            logger.warning_once(
+                "AITER allreduce fusions are disabled "
+                "because AITER Custom All Reduce is not enabled. "
+                "Set VLLM_ROCM_USE_AITER_CUSTOM_AR=1 "
+                "to enable it."
+            )
             return
         self.ca_comm = ca_comm
 
-        assert isinstance(ca_comm, CustomAllreduce)
-
-        group = get_tp_group().cpu_group
-        rocm_aiter_ops.initialize_aiter_allreduce(group, self.device)
         hidden_dim = config.model_config.get_hidden_size()
         element_size = torch.tensor([], dtype=self.model_dtype).element_size()
-        max_size = rocm_aiter_ops.get_aiter_allreduce_max_size()
-        if max_size is None:
-            logger.warning("AITER allreduce fusion must be initialized")
-            return
+        max_size = ca_comm.effective_max_size()
 
         # Aiter's fused_allreduce_rmsnorm kernel dispatches on hidden_dim.
         # Before aiter v0.1.12 the launcher was template-specialized on HIDDEN_DIM
         # and silently no-op'd for sizes outside {512, 1024, 2048, 4096}. From v0.1.12
-        # hidden_dim is a runtime argument. Detect the older API via the missing
-        # `_pool` attribute and skip fusion for unsupported sizes.
+        # hidden_dim is a runtime argument.
         # Ref (old kernel): https://github.com/ROCm/aiter/blob/6a0e7b26ccf33164785531212cc2ec2cde0b9243/csrc/include/custom_all_reduce.cuh#L2590
-        aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
         _AITER_OLD_FUSED_AR_RMS_HIDDEN = (512, 1024, 2048, 4096)
         if (
-            aiter_ar is not None
-            and not hasattr(aiter_ar, "_pool")
+            not ca_comm.supports_dynamic_hidden_dim
             and hidden_dim not in _AITER_OLD_FUSED_AR_RMS_HIDDEN
         ):
             logger.warning_once(
@@ -1220,10 +1209,6 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
                 _AITER_OLD_FUSED_AR_RMS_HIDDEN,
                 hidden_dim,
             )
-            # Tear down aiter's custom-allreduce so its IPC handles don't
-            # race with vllm's ca_comm on the unfused fallback path.
-            with contextlib.suppress(Exception):
-                rocm_aiter_ops.destroy_aiter_allreduce()
             return
 
         max_token_num = max_size // (hidden_dim * element_size)
@@ -1269,9 +1254,3 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
         logger.debug(
             "%s Replaced %s patterns", self.__class__.__name__, self.matched_count
         )
-
-    def __del__(self) -> None:
-        if getattr(self, "disabled", True):
-            return
-        with contextlib.suppress(Exception):
-            rocm_aiter_ops.destroy_aiter_allreduce()
