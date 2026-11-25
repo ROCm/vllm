@@ -42,6 +42,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .utils import AutoWeightsLoader, WeightsMapper
 from .vision import (
@@ -625,7 +626,11 @@ class Idefics2VisionTransformer(nn.Module):
     def prefer_varlen_attention(self) -> bool:
         """Whether to prefer varlen attention over masked SDPA.
 
-        FlashAttention backends are faster than masked SDPA when using varlen attention
-        while Triton varlen attention is slower.
+        FlashAttention and ROCM_RDNA_ATTN backends are faster than masked SDPA when
+        using varlen attention while Triton varlen attention is slower.
         """
-        return self.encoder.layers[0].self_attn.attn.is_flash_attn_backend
+        attn = self.encoder.layers[0].self_attn.attn
+        return (
+            attn.is_flash_attn_backend
+            or attn.attn_backend == AttentionBackendEnum.ROCM_RDNA_ATTN
+        )
