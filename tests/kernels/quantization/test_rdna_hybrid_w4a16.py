@@ -32,7 +32,6 @@ dequantize_w4a16 = hybrid_module.dequantize_w4a16
 SUPPORTED_GROUP_SIZES = hybrid_module.SUPPORTED_GROUP_SIZES
 MAX_SKINNY_BATCH_SIZE = hybrid_module.MAX_SKINNY_BATCH_SIZE
 MIN_DENSE_M = hybrid_module.MIN_DENSE_M
-MODE_ALL = hybrid_module.MODE_ALL
 
 # Per-channel (-1) is symmetric-only (see can_implement's zero_points guard),
 # so it is only added to the group-size axis of tests that stay on the
@@ -484,30 +483,17 @@ def test_rdna_hybrid_w4a16_process_weights_asymmetric_repack(group_size, dist_in
 @pytest.mark.skipif(not on_gfx1x(), reason="Hybrid path is gfx11/gfx12 only")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
-    "dense_offset,has_dense,hbl_mode,expected_path",
+    "dense_offset,has_dense,expected_path",
     [
-        (None, True, 0, "hip"),
-        (-1, True, 0, "triton"),
-        (0, True, 0, "dense"),
-        (0, False, 0, "triton"),
-        (None, True, MODE_ALL, "hipblaslt"),
-        (-1, True, MODE_ALL, "hipblaslt"),
-        (0, True, MODE_ALL, "dense"),
-        (0, False, MODE_ALL, "hipblaslt"),
+        (None, True, "hip"),
+        (-1, True, "triton"),
+        (0, True, "dense"),
+        (0, False, "triton"),
     ],
-    ids=[
-        "decode",
-        "below_dense_threshold",
-        "at_dense_threshold",
-        "off",
-        "hbl_decode",
-        "hbl_below_dense_threshold",
-        "hbl_dense_wins",
-        "hbl_no_dense",
-    ],
+    ids=["decode", "below_dense_threshold", "at_dense_threshold", "off"],
 )
 def test_rdna_hybrid_w4a16_dense_dispatch(
-    dtype, dense_offset, has_dense, hbl_mode, expected_path, monkeypatch
+    dtype, dense_offset, has_dense, expected_path, monkeypatch
 ):
     """Memory-bound batches stay on int4 even when a dense copy exists.
 
@@ -538,45 +524,11 @@ def test_rdna_hybrid_w4a16_dense_dispatch(
     monkeypatch.setattr(ops, "wvSplitK_int4_g", fake("hip"))
     monkeypatch.setattr(hybrid_module, "triton_w4a16_skinny_fmt_gemm", fake("triton"))
     monkeypatch.setattr(hybrid_module, "rocm_unquantized_gemm_impl", fake("dense"))
-    monkeypatch.setattr(hybrid_module, "hipblaslt_w4a16_gemm", fake("hipblaslt"))
     hybrid_module._rdna_hybrid_w4a16_apply_impl(
-        x_mk, w_q, scales, None, None, 40, G, None, w_dequant, scales, hbl_mode
+        x_mk, w_q, scales, None, None, 40, G, None, w_dequant
     )
 
     assert called == [expected_path]
-
-
-@pytest.mark.parametrize(
-    "setting,built,group_size,has_dense,probe,expected",
-    [
-        ("auto", True, 128, False, True, True),
-        ("auto", True, 128, True, True, False),
-        ("auto", False, 128, False, True, False),
-        ("auto", True, -1, False, True, False),
-        ("auto", True, 128, False, False, False),
-        ("all", True, 128, True, True, True),
-        ("all", True, 128, False, False, RuntimeError),
-        ("off", True, 128, False, True, False),
-    ],
-)
-def test_hipblaslt_use_for_layer(
-    setting, built, group_size, has_dense, probe, expected, monkeypatch
-):
-    """Auto mode keeps dense-copy and kernel-less layers on in-tree kernels."""
-    from vllm.model_executor.kernels.linear.mixed_precision import hipblaslt_w4a16
-
-    monkeypatch.setenv("VLLM_ROCM_W4A16_HIPBLASLT", setting)
-    monkeypatch.setattr(hipblaslt_w4a16, "is_built", lambda: built)
-    hipblaslt_w4a16.hipblaslt_w4a16_mode.cache_clear()
-    try:
-        args = (group_size, has_dense, lambda: probe, "test layer")
-        if expected is RuntimeError:
-            with pytest.raises(RuntimeError, match="no w4a16 kernel"):
-                hipblaslt_w4a16.use_for_layer(*args)
-        else:
-            assert hipblaslt_w4a16.use_for_layer(*args) is expected
-    finally:
-        hipblaslt_w4a16.hipblaslt_w4a16_mode.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1200,45 +1152,3 @@ def test_process_weights_pads_cliff_rows(K, expected_weight_stride, dist_init):
     assert tuple(layer.weight_packed.view(torch.int32).shape) == (N, K // 8)
     # Metadata is untouched by this change.
     assert layer.weight_scale.is_contiguous()
-
-
-@pytest.mark.skipif(
-    not hybrid_module._on_gfx115x(),
-    reason="the scale row-stride pad is only applied on gfx115x",
-)
-def test_process_weights_keeps_hipblaslt_scales_dense(dist_init, monkeypatch):
-    """HipBLASLt takes dense scales only, so a layer it owns skips the gfx115x
-    scale pad even when its scale row (here 256 groups x 2 B = 512 B) is on
-    the cliff -- build_scale_buffer would reject the padded rows."""
-    from vllm.model_executor.kernels.linear.mixed_precision.MPLinearKernel import (
-        MPLinearLayerConfig,
-    )
-    from vllm.scalar_type import scalar_types
-
-    monkeypatch.setattr(hybrid_module, "use_for_layer", lambda *args: True)
-    set_random_seed(0)
-    K, N, G = 8192, 128, 32
-
-    w_int4_kn = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
-    layer = _build_dummy_layer(
-        _pack_int4_along_k_to_ckpt(w_int4_kn),
-        0.05 * torch.rand((N, K // G), device=device, dtype=torch.float16),
-        zeros_ckpt=None,
-    )
-    config = MPLinearLayerConfig(
-        full_weight_shape=(K, N),
-        partition_weight_shape=(K, N),
-        weight_type=scalar_types.uint4b8,
-        act_type=torch.float16,
-        group_size=G,
-        zero_points=False,
-    )
-    RDNAHybridW4A16LinearKernel(
-        config,
-        w_q_param_name="weight_packed",
-        w_s_param_name="weight_scale",
-        w_zp_param_name=None,
-    ).process_weights_after_loading(layer)
-
-    assert layer._hybrid_hipblaslt_ok
-    assert layer.weight_scale.stride() == (K // G, 1)

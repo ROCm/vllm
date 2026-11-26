@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm.model_executor.kernels.linear.mixed_precision.aiter_w4a16 import (
+    AiterW4A16LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.conch import (
     ConchLinearKernel,
 )
@@ -52,6 +55,7 @@ from vllm.model_executor.kernels.linear.mixed_precision.zentorch import (
 __all__ = [
     "MPLinearKernel",
     "MPLinearLayerConfig",
+    "AiterW4A16LinearKernel",
     "ConchLinearKernel",
     "CPUWNA16LinearKernel",
     "CutlassW4A8LinearKernel",
