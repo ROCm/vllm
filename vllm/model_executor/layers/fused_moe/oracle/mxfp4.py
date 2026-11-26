@@ -1633,9 +1633,6 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         )
 
     elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and is_gfx1250:
-        import os
-
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
 
         from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 
