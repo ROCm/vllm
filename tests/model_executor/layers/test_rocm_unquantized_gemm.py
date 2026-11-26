@@ -218,3 +218,24 @@ def test_rocm_unquantized_gemm_gfx950_wvsplitkrc_path(monkeypatch):
     x_view = wvsplitkrc_mock.call_args.args[0]
     assert x_view.is_contiguous()
     assert torch.allclose(out, ref, atol=1e-3, rtol=1e-3)
+
+
+def test_pad_weights_avoid_cache_cliff_skips_gfx1100(monkeypatch):
+    # Discrete gfx1100 is excluded: the pad regresses its GEMMs.
+    weight = torch.empty(64, 4096, dtype=torch.float16)
+    monkeypatch.setattr(utils.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1100", lambda: True)
+    assert utils.pad_weights_avoid_cache_cliff_on_gfx11(weight) is weight
+
+
+def test_pad_weights_avoid_cache_cliff_pads_other_gfx11(monkeypatch):
+    # Other gfx11x parts (e.g. gfx1151) keep the cliff pad.
+    weight = torch.randn(64, 4096, dtype=torch.float16)
+    monkeypatch.setattr(utils.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1x", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1100", lambda: False)
+    padded = utils.pad_weights_avoid_cache_cliff_on_gfx11(weight)
+    assert padded.shape == weight.shape
+    assert padded.stride() == (4096 + 64, 1)
+    assert torch.equal(padded, weight)

@@ -370,9 +370,14 @@ def pad_weights_avoid_cache_cliff_on_gfx11(weight: torch.Tensor) -> torch.Tensor
     paths (LLMM1/aiter/tgemm) detect the non-contiguous weight and route to BLAS
     (see ``rocm_unquantized_gemm_impl``).
     """
-    from vllm.platforms.rocm import on_gfx1x
+    from vllm.platforms.rocm import on_gfx1x, on_gfx1100
 
     if not (current_platform.is_rocm() and on_gfx1x()):
+        return weight
+    # Discrete gfx1100 (W7900/7900 XTX: GDDR6 + 96 MB Infinity Cache) is excluded: the
+    # padded row stride steers hipBLASLt to slower mid-size tiles there (MT128x32x128
+    # 1.65x, MT128x64x64 1.53x per call) and costs Mistral-Small-24B TP=2 2-3% e2e.
+    if on_gfx1100():
         return weight
     if weight.dim() != 2 or not weight.is_contiguous():
         return weight
