@@ -166,7 +166,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             else:
                 self.use_aiter_ag_rs = True
 
-        if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
+        # On gfx11 QuickReduce runs without vLLM's CustomAllreduce: RDNA multi-GPU is
+        # PCIe-only, where CustomAllreduce's peer reads are not reliable (wrong results
+        # under CUDA graphs), while QuickReduce only writes to peers. QR stays off
+        # unless VLLM_ROCM_QUICK_REDUCE_QUANTIZATION is set.
+        from vllm.distributed.device_communicators.quick_all_reduce import on_gfx11_qr
+
+        qr_standalone = unique_name.split(":")[0] == "tp" and on_gfx11_qr()
+        if (
+            (use_custom_allreduce or qr_standalone)
+            and self.world_size > 1
+            and current_platform.is_rocm()
+        ):
             # Initialize a custom quick all-reduce implementation for AMD.
             # Quick reduce is designed as a complement to custom allreduce
             # (vLLM's or AITER's), so it is initialized for either backend.
