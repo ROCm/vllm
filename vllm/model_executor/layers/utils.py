@@ -388,7 +388,15 @@ def pad_weights_avoid_cache_cliff_on_gfx11(weight: torch.Tensor) -> torch.Tensor
 def rocm_unquantized_gemm_impl(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
 ) -> torch.Tensor:
-    from vllm.platforms.rocm import on_gfx1x, on_gfx9, on_gfx950, on_gfx1250
+    from vllm.platforms.rocm import (
+        on_gfx1x,
+        on_gfx9,
+        on_gfx115x,
+        on_gfx950,
+        on_gfx1151,
+        on_gfx1250,
+        on_rdna4,
+    )
 
     n = x.numel() // x.size(-1)
     m = weight.shape[0]
@@ -502,6 +510,25 @@ def rocm_unquantized_gemm_impl(
             with record_function_or_nullcontext(f"LLMM1 {n}x{m}x{k}"):
                 out = ops.LLMM1(weight, x_view, 4)
             return out.reshape(*x.shape[:-1], weight.shape[0])
+
+    # Swapping the operands of a single-output GEMM lets wvSplitK take it, which is
+    # faster than the torch GEMM.
+    gfx1150_class = on_gfx115x() and not on_gfx1151()
+    use_wvsplitk_operand_swap = (
+        use_skinny
+        and (on_gfx115x() or on_rdna4())
+        and m == 1
+        and n > 8
+        # Measured heuristic: past 1056 tokens the torch GEMM catches up, except on
+        # the gfx1150 class.
+        and (gfx1150_class or n <= 1056)
+    )
+
+    if use_wvsplitk_operand_swap:
+        x_view = x.reshape(-1, k).contiguous()
+        with record_function_or_nullcontext(f"wvSplitK swapped {n}x{m}x{k}"):
+            out = ops.wvSplitK(x_view, weight, cu_count, bias)
+        return out.reshape(*x.shape[:-1], 1)
 
     if rocm_aiter_ops.is_tgemm_enabled() and weight.is_contiguous():
         from aiter.tuned_gemm import tgemm
