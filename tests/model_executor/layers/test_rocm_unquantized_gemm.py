@@ -206,6 +206,15 @@ def test_cache_aliasing_pad_elems(k, element_size, expected):
     assert utils.cache_aliasing_pad_elems(k, element_size) == expected
 
 
+def test_maybe_pad_weight_avoid_cache_aliasing_skips_gfx1100(monkeypatch):
+    # Discrete gfx1100 is excluded: the pad regresses its GEMMs.
+    weight = torch.empty(64, 4096, dtype=torch.float16)
+    monkeypatch.setattr(utils.current_platform, "is_rocm", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx11", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1100", lambda: True)
+    assert utils.maybe_pad_weight_avoid_cache_aliasing(weight) is weight
+
+
 def test_maybe_pad_weight_avoid_cache_aliasing_skips_non_gfx11(monkeypatch):
     # Padding is gfx11-only, even for a K whose row stride would alias there.
     monkeypatch.setattr(utils.current_platform, "is_rocm", lambda: True)
@@ -218,6 +227,7 @@ def test_maybe_pad_weight_avoid_cache_aliasing_skips_non_gfx11(monkeypatch):
 def test_maybe_pad_weight_avoid_cache_aliasing(monkeypatch):
     monkeypatch.setattr(utils.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx11", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1100", lambda: False)
 
     weight = torch.randn(128, 4096, dtype=torch.bfloat16)
     padded = utils.maybe_pad_weight_avoid_cache_aliasing(weight)
@@ -242,6 +252,7 @@ def test_maybe_pad_weight_avoid_cache_aliasing(monkeypatch):
 def test_maybe_pad_weight_avoid_cache_aliasing_skips(monkeypatch, weight):
     monkeypatch.setattr(utils.current_platform, "is_rocm", lambda: True)
     monkeypatch.setattr("vllm.platforms.rocm.on_gfx11", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx1100", lambda: False)
 
     assert (
         utils.maybe_pad_weight_avoid_cache_aliasing(weight).data_ptr()
