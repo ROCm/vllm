@@ -171,6 +171,14 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
     if backend == WNA16MoEBackend.AITER_RDNA:
+        from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
+            AiterRdnaWNA16Experts,
+            rdna_moe,
+        )
+
+        # Checks the GPU before importing AITER.
+        if not AiterRdnaWNA16Experts._supports_current_device():
+            return "it needs gfx115x and aiter.ops.flydsl.moe_w4a16_rdna"
         if isinstance(quant_config, MoeWNA16Config):
             num_bits, group_size = quant_config.weight_bits, quant_config.group_size
         elif isinstance(quant_config, QuantizationArgs):
@@ -187,14 +195,7 @@ def _backend_incompatibility_reason(
             return "only bfloat16 and float16 activations are supported"
         if moe_config.moe_parallel_config.use_ep:
             return "expert parallelism is not supported"
-        from vllm.model_executor.layers.fused_moe.experts.flydsl_rdna_moe import (
-            aiter_rdna_moe,
-        )
-
-        module = aiter_rdna_moe()
-        if module is None:
-            return "aiter.ops.flydsl.moe_w4a16_rdna is not importable"
-        TILE_N = module.TILE_N
+        TILE_N = rdna_moe().TILE_N
         hidden = moe_config.hidden_dim
         inter = moe_config.intermediate_size_per_partition
         gate_up = inter * (2 if moe_config.activation.is_gated else 1)
