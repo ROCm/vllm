@@ -94,6 +94,21 @@ _GFX1100_3D_CONFIGS = {
 # a split-KV batch runs as 2D.
 _GFX1100_SW_2D_MIN_FILL = {64: 32, 512: 8}
 
+# gfx1100, head 128, full attention: 2D launch for batches with prefill tokens
+# below the >= 4096 band. Serving batches here are mostly 1-token decodes plus
+# short prefill chunks; the band table's BLOCK_M=64 (BLOCK_Q=16) leaves ~15/16 of
+# each decode tile idle and the <= 64 band's default launch spills. Small tiles
+# with 2 warps are 1.3-2.5x faster on W7900.
+_GFX1100_MIXED_DECODE_HEAVY = (16, 16, 2, 1)
+_GFX1100_MIXED_PREFILL_HEAVY = (32, 16, 2, 1)
+
+
+def _gfx1100_mixed_config(num_tokens: int, num_seqs: int):
+    """(BLOCK_M, TILE_SIZE, num_warps, num_stages) by average query length."""
+    if num_tokens // max(num_seqs, 1) < 16:
+        return _GFX1100_MIXED_DECODE_HEAVY
+    return _GFX1100_MIXED_PREFILL_HEAVY
+
 
 def _prefill_band_config(configs, head_size_padded, max_seqlen_q):
     """2D launch for a batch with prefill tokens: (BLOCK_M, TILE_SIZE, num_warps,
@@ -1383,9 +1398,17 @@ def unified_attention(
                 and not use_td
             ):
                 if max_seqlen_q > 1:
-                    config = _prefill_band_config(
-                        _GFX1100_2D_CONFIGS, head_size_padded, max_seqlen_q
-                    )
+                    if (
+                        head_size_padded == 128
+                        and max_seqlen_q < 4096
+                        and sliding_window_val == 0
+                        and kv_quant_mode == KVQuantMode.NONE
+                    ):
+                        config = _gfx1100_mixed_config(q.shape[0], num_seqs)
+                    else:
+                        config = _prefill_band_config(
+                            _GFX1100_2D_CONFIGS, head_size_padded, max_seqlen_q
+                        )
                     if config is not None:
                         (
                             BLOCK_M,
