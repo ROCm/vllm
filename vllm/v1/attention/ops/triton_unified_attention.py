@@ -31,17 +31,27 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx1151
+    from vllm.platforms.rocm import on_gfx1100, on_gfx1151
 
     _ON_NAVI = current_platform.is_navi()
+    _ON_GFX1100 = on_gfx1100()
     _ON_GFX1151 = on_gfx1151()
 else:
     _ON_NAVI = False
+    _ON_GFX1100 = False
     _ON_GFX1151 = False
 
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+
+# gfx1100, head 128, full attention: (BLOCK_M, TILE_SIZE, num_warps, num_stages)
+# for 2D batches with prefill tokens below 4096. Serving batches here are mostly
+# 1-token decodes plus short prefill chunks; BLOCK_M=128 (BLOCK_Q=32 at GQA 4)
+# leaves most of each decode tile idle. On W7900 this is 1.4-2.6x faster than the
+# default launch across decode-heavy and prefill-heavy mixes.
+_GFX1100_MIXED_CONFIG = (32, 16, 2, 1)
+
 
 # Strix Halo (gfx1151): 3D decode launch parameters keyed by
 # (num_kv_heads, head_size), as (num_warps, num_stages, waves_per_eu,
@@ -1249,6 +1259,20 @@ def unified_attention(
 
             # Recalculate derived values
             BLOCK_M = max(BLOCK_M, triton.next_power_of_2(num_queries_per_kv))
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+            total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+
+        # gfx1100 mixed prefill+decode batches (see _GFX1100_MIXED_CONFIG).
+        if (
+            _ON_GFX1100
+            and not ALL_DECODE
+            and head_size_padded == 128
+            and max_seqlen_q < 4096
+            and sliding_window_val == 0
+            and kv_quant_mode == KVQuantMode.NONE
+            and num_queries_per_kv <= 16
+        ):
+            BLOCK_M, TILE_SIZE_PREFILL, num_warps, num_stages = _GFX1100_MIXED_CONFIG
             BLOCK_Q = BLOCK_M // num_queries_per_kv
             total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
 
