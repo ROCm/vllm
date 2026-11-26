@@ -367,9 +367,14 @@ def maybe_pad_weight_avoid_cache_aliasing(weight: torch.Tensor) -> torch.Tensor:
     Returns a view with the original shape whose row stride is one cache line
     wider, or `weight` unchanged when the pad does not apply.
     """
-    from vllm.platforms.rocm import on_gfx11
+    from vllm.platforms.rocm import on_gfx11, on_gfx1100
 
     if not (current_platform.is_rocm() and on_gfx11()):
+        return weight
+    # Measured as a win on gfx115x (APU, LPDDR5X) but a loss on discrete gfx1100
+    # (W7900, GDDR6 + 96 MB Infinity Cache): the padded row stride steers hipBLASLt to
+    # slower mid-size tiles (MT128x32x128 1.65x, MT128x64x64 1.53x per call), -3.3% e2e.
+    if on_gfx1100():
         return weight
     if weight.dim() != 2 or not weight.is_contiguous():
         return weight
