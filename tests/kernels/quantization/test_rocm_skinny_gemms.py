@@ -385,6 +385,40 @@ def test_rocm_wvsplitk_kernel(
         torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "n,k,m",
+    [
+        # MoE router shapes (Gemma-4-26B-A4B: hidden 2816, 128 experts)
+        (1, 2816, 128),
+        (5, 2816, 128),
+        # Odd M exercises the YTILE tail; the large K ones leave LDS
+        # (wvSplitK_hf_ and wvSplitK_hf_big_).
+        (3, 1024, 1024 + 1),
+        (1, 36864, 64),
+        (4, 16384, 512),
+    ],
+)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.skipif(not current_platform.is_rocm(), reason="only test for rocm")
+def test_rocm_wvsplitk_fp32_out(n, k, m, dtype, use_bias):
+    """out_dtype=float32 must return the unrounded fp32 accumulator."""
+    torch.manual_seed(0)
+    xavier = math.sqrt(2 / k)
+    A = (torch.rand(n, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    B = (torch.rand(m, k, dtype=dtype, device="cuda") * 2 - 1) * xavier
+    BIAS = torch.rand(m, dtype=dtype, device="cuda") - 0.5 if use_bias else None
+
+    out = ops.wvSplitK(B, A, num_compute_units(), BIAS, out_dtype=torch.float32)
+
+    ref_out = torch.nn.functional.linear(
+        A.float(), B.float(), BIAS.float() if BIAS is not None else None
+    )
+    assert out.dtype == torch.float32
+    # Only fp32 summation-order error remains, far below one bf16/fp16 ulp.
+    torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.parametrize("n,k,m", NKM_FACTORS_WVSPLITK_FP8)
 @pytest.mark.parametrize(
     "dtype,padded_a,padded_b,biased,xnorm",

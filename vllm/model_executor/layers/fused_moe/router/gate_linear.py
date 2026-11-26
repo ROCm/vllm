@@ -4,6 +4,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm._custom_ops as ops
+from vllm import envs
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -11,7 +12,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
+from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.utils import record_function_or_nullcontext
 
 
 @PluggableLayer.register("gate_linear")
@@ -23,7 +26,8 @@ class GateLinear(ReplicatedLinear):
     2. fp32 specialized kernel (SM90+ or gfx950, bf16/fp32 in, fp32 out,
        M<=32, model-specific shapes)
     3. bf16x3 CuteDSL kernel (SM100, bf16 in, fp32 weight)
-    4. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    4. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype);
+       on ROCm gfx1x, wvSplitK with an fp32 store for M<=5
     5. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -155,6 +159,24 @@ class GateLinear(ReplicatedLinear):
                 and is_available()
             )
 
+        self._update_rocm_skinny_router_gemm()
+
+    def _update_rocm_skinny_router_gemm(self) -> None:
+        # Tier 4 on gfx1x: at decode batch sizes hipBLASLt's out_dtype epilogue
+        # runs well below DRAM bandwidth, while wvSplitK with an fp32 store is
+        # ~3x faster (Gemma-4-26B-A4B router 1x128x2816 on gfx1151: 16.8 us ->
+        # 4.7 us) with the same fp32 accumulation.
+        self.allow_rocm_skinny_router_gemm = False
+        if self.allow_cublas_router_gemm and current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx1x
+
+            self.allow_rocm_skinny_router_gemm = (
+                envs.VLLM_ROCM_USE_SKINNY_GEMM
+                and on_gfx1x()
+                and self.input_size % 8 == 0
+                and self.output_size > 8
+            )
+
     def set_out_dtype(self, out_dtype: torch.dtype) -> None:
         """Set output dtype for the router logits after init.
 
@@ -171,6 +193,7 @@ class GateLinear(ReplicatedLinear):
             and out_dtype == torch.float32
         ):
             self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16
+            self._update_rocm_skinny_router_gemm()
 
         # out_dtype may start as None -> recompute eligibility here
         if self.allow_specialized_router_gemm:
@@ -228,7 +251,10 @@ class GateLinear(ReplicatedLinear):
 
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            if self.allow_rocm_skinny_router_gemm:
+                output = torch.ops.vllm.rocm_skinny_router_gemm(x, self.weight)
+            else:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)
 
         # Tier 5: F.linear (ReplicatedLinear)
@@ -298,4 +324,30 @@ direct_register_custom_op(
     op_name="fp32_router_gemm_dispatch",
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
+)
+
+# Largest batch wvSplitK handles (see rocm_unquantized_gemm_impl).
+_ROCM_SKINNY_ROUTER_GEMM_MAX_TOKENS = 5
+
+
+def rocm_skinny_router_gemm_impl(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """bf16 x bf16 -> fp32 router GEMM: wvSplitK at decode batch sizes, else
+    hipBLASLt. A custom op so the num_tokens branch is taken at runtime."""
+    n, m, k = x.shape[0], weight.shape[0], weight.shape[1]
+    if 0 < n <= _ROCM_SKINNY_ROUTER_GEMM_MAX_TOKENS and weight.stride(-1) == 1:
+        with record_function_or_nullcontext(f"wvSplitK {n}x{m}x{k} fp32"):
+            return ops.wvSplitK(
+                weight, x.contiguous(), num_compute_units(), out_dtype=torch.float32
+            )
+    return torch.mm(x, weight.T, out_dtype=torch.float32)
+
+
+def rocm_skinny_router_gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="rocm_skinny_router_gemm",
+    op_func=rocm_skinny_router_gemm_impl,
+    fake_impl=rocm_skinny_router_gemm_fake,
 )

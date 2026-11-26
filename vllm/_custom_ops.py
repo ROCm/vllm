@@ -2089,9 +2089,14 @@ def LLMM1(a: torch.Tensor, b: torch.Tensor, rows_per_block: int) -> torch.Tensor
 
 
 def wvSplitK(
-    a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cu_count: int,
+    bias: torch.Tensor = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count)
+    """out_dtype=torch.float32 stores the fp32 accumulator without rounding."""
+    return torch.ops._rocm_C.wvSplitK(a, b, bias, cu_count, out_dtype)
 
 
 def wvSplitK_fused_silu_mul(
