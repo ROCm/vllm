@@ -29,6 +29,15 @@ except Exception:
 from vllm.distributed.utils import is_weak_contiguous  # noqa: E402, F401
 
 
+def on_gfx11_qr() -> bool:
+    """QuickReduce runs standalone (without CustomAllreduce) on gfx11."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx11
+
+    return on_gfx11()
+
+
 class QuickReduceRegime(Enum):
     # Keep integer ids aligned with csrc/rocm/quickreduce/quick_reduce.h
     FP = 0
@@ -62,6 +71,11 @@ class QuickAllReduce:
             2048 * MB,
         ],
     }
+
+    # RDNA3 (gfx11) multi-GPU is PCIe-only: the link is the bottleneck at every
+    # message size, and QR (FP and quantized) beat RCCL from 10 KB to 80 MB on
+    # 2x W7900. No lower size limit there.
+    _QR_MIN_SIZE_GFX11 = [0, 0, 0, 0, 0]
 
     def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
         """Custom allreduce provides non-destructive acceleration and is
@@ -334,7 +348,7 @@ class QuickAllReduce:
         try:
             props = torch.cuda.get_device_properties(0)
             gcn_arch = getattr(props, "gcnArchName", "")
-            supported_archs = ["gfx94", "gfx95"]
+            supported_archs = ["gfx94", "gfx95", "gfx11"]
             return any(gfx in gcn_arch for gfx in supported_archs)
         except Exception as e:
             logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
@@ -368,9 +382,12 @@ class QuickAllReduce:
             dtype = torch.float16
         min_size = self.qr_min_size
         if min_size is None:
-            min_size = self._QR_MIN_SIZE[(dtype, self.world_size)][
-                self.qr_quant_level.value
-            ]
+            if on_gfx11_qr():
+                min_size = self._QR_MIN_SIZE_GFX11[self.qr_quant_level.value]
+            else:
+                min_size = self._QR_MIN_SIZE[(dtype, self.world_size)][
+                    self.qr_quant_level.value
+                ]
         return inp_size <= self.qr_max_size and inp_size >= min_size
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):

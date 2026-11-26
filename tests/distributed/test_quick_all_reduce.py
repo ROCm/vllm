@@ -67,6 +67,19 @@ def _assert_quickreduce(fa, inp):
     assert fa.should_quick_allreduce(inp)
 
 
+@pytest.fixture(autouse=True)
+def _use_gfx9_min_size_table(monkeypatch, request):
+    # Min-size tests assert the gfx94x/gfx95x table; on a gfx11 host QuickReduce
+    # uses its own (zero) min sizes, so pin the arch check unless a test is about
+    # gfx11 itself.
+    if "gfx11" in request.node.name:
+        return
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.quick_all_reduce.on_gfx11_qr",
+        lambda: False,
+    )
+
+
 @pytest.fixture
 def envs_cache_disabled():
     disable_envs_cache()
