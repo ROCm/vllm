@@ -283,8 +283,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 #
-# Newer rocThrust requires libhipcxx (<cuda/std/...>), which ROCm installs
-# under include/hipccl. Torch headers include <thrust/complex.h>.
+# Workaround: newer rocThrust requires libhipcxx (<cuda/std/...>), which ROCm
+# installs under include/hipccl, off the default include path. Torch headers
+# include <thrust/complex.h>. Remove once this is fixed in hipCCL:
+# https://github.com/ROCm/rocm-libraries/issues/16802
 #
 if(VLLM_GPU_LANG STREQUAL "HIP" AND EXISTS "${ROCM_PATH}/include/hipccl")
   include_directories(SYSTEM "${ROCM_PATH}/include/hipccl")
