@@ -44,6 +44,19 @@ def _reload_envs():
     return importlib.reload(envs)
 
 
+@pytest.fixture(autouse=True)
+def _use_gfx9_min_size_table(monkeypatch, request):
+    # The threshold tests below assert the gfx94x/gfx95x min-size table; on a gfx11 host
+    # QuickReduce uses its own (zero) min sizes, so pin the arch check unless a test is
+    # about gfx11 itself.
+    if "gfx11" in request.node.name:
+        return
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.quick_all_reduce.on_gfx11_qr",
+        lambda: False,
+    )
+
+
 def _make_quick_allreduce(
     *,
     disabled: bool = False,
@@ -709,6 +722,8 @@ def test_quick_reduce_max_size_default(monkeypatch):
     [
         ("gfx942", True),
         ("gfx950", True),
+        ("gfx1100", True),
+        ("gfx1151", True),
         ("gfx90a", False),
         ("", False),
     ],
@@ -809,6 +824,18 @@ def test_quick_allreduce_bf16_uses_fp16_threshold_when_cast_enabled():
 
     assert without_cast.should_quick_allreduce(inp) is False
     assert with_cast.should_quick_allreduce(inp) is True
+
+
+def test_quick_allreduce_gfx11_accepts_small_inputs(monkeypatch):
+    # gfx11 is PCIe-only: QuickReduce has no lower size limit there.
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.quick_all_reduce.on_gfx11_qr",
+        lambda: True,
+    )
+    for quant_level in ("FP", "INT8", "INT4"):
+        qar = _make_quick_allreduce(quant_level=quant_level)
+        assert qar.should_quick_allreduce(torch.zeros(8, dtype=torch.float16)) is True
+        assert qar.should_quick_allreduce(torch.zeros(8, dtype=torch.bfloat16)) is True
 
 
 def test_quick_allreduce_supported_world_sizes():
