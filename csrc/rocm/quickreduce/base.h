@@ -62,13 +62,25 @@ __quickreduce_device_inline__ __host__ unsigned long divceil(unsigned long x,
   return ((x + y - 1) / y);
 }
 
+// Word3 (4th dword) of the buffer resource descriptor (V#) is arch-specific.
+// 0x00020000 is the gfx9 encoding; on gfx11/gfx12 raw buffer loads then return
+// 0 and stores are dropped. 0x31004000 matches composable_kernel's
+// CK_BUFFER_RESOURCE_3RD_DWORD for gfx11/gfx12.
+#if defined(__GFX11__) || defined(__GFX12__)
+  #define QR_BUFFER_RESOURCE_3RD_DWORD 0x31004000U
+#else
+  #define QR_BUFFER_RESOURCE_3RD_DWORD 0x00020000U
+#endif
+
 union BufferResource {
   __quickreduce_device_inline__ constexpr BufferResource()
-      : config(0x00020000U) {}
+      : config(QR_BUFFER_RESOURCE_3RD_DWORD) {}
 
   __quickreduce_device_inline__ constexpr BufferResource(void* buffer_address,
                                                          uint32_t buffer_size)
-      : address(buffer_address), range(buffer_size), config(0x00020000U) {}
+      : address(buffer_address),
+        range(buffer_size),
+        config(QR_BUFFER_RESOURCE_3RD_DWORD) {}
 
   int32x4_t descriptor;
   struct {
