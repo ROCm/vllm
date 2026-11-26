@@ -283,6 +283,14 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 #
+# Newer rocThrust requires libhipcxx (<cuda/std/...>), which ROCm installs
+# under include/hipccl. Torch headers include <thrust/complex.h>.
+#
+if(VLLM_GPU_LANG STREQUAL "HIP" AND EXISTS "${ROCM_PATH}/include/hipccl")
+  include_directories(SYSTEM "${ROCM_PATH}/include/hipccl")
+endif()
+
+#
 # Use FetchContent for C++ dependencies that are compiled as part of vLLM's build process.
 # setup.py will override FETCHCONTENT_BASE_DIR to play nicely with sccache.
 # Each dependency that produces build artifacts should override its BINARY_DIR to avoid
