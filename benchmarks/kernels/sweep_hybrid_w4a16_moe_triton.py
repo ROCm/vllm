@@ -312,12 +312,20 @@ def resolve_align(spec: str, policy, M, topk, E, bm=None) -> int:
 # --------------------------------------------------------------------------
 # Tiles mode
 # --------------------------------------------------------------------------
+def _effective_bk(block_k: int, group_size: int) -> int:
+    """BLOCK_SIZE_K as invoke_fused_moe_kernel_hybrid_triton will run it."""
+    if block_k > group_size and block_k % group_size != 0:
+        return group_size
+    return block_k
+
+
 def tiles_mode(args, W, policy, captured, rows):
     skipped: set[int] = set()
     bm_list = [int(x) for x in args.block_m]
     bn_list = [int(x) for x in args.block_n]
-    # BK is capped to group_size inside the wrapper; dedupe the equivalents.
-    bk_list = sorted({min(int(x), args.group_size) for x in args.block_k})
+    # The wrapper falls back to BK=group_size when BK spans a partial group;
+    # dedupe the equivalents.
+    bk_list = sorted({_effective_bk(int(x), args.group_size) for x in args.block_k})
     gm_list = [int(x) for x in args.group_m]
     nw_list = [int(x) for x in args.num_warps]
     ns_list = [int(x) for x in args.num_stages]
@@ -438,7 +446,7 @@ def _report_tiles(args, gname, cfgs, times, prod_cfg):
     for rank, (gm, worst, n, ci) in enumerate(ranked, 1):
         cfg = cfgs[ci]
         key = tuple(
-            min(cfg[k], args.group_size) if k == "BLOCK_SIZE_K" else cfg[k]
+            _effective_bk(cfg[k], args.group_size) if k == "BLOCK_SIZE_K" else cfg[k]
             for k in TILE_KEYS
         )
         is_prod = key in prod_keys

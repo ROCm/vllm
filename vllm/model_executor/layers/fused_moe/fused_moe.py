@@ -301,28 +301,68 @@ def fused_moe_kernel_gptq_awq(
             b_exp = tl.interleave(b_exp, b_exp)
             b_exp = tl.interleave(b_exp, b_exp)
             b_nk = (b_exp >> exl_shifts) & 0xF  # [BLOCK_N, BLOCK_K]
-            b = tl.trans(b_nk)  # [BLOCK_K, BLOCK_N]
 
-            # Scales: [E, N, K//G] — load per-group scale for this K tile
-            g_idx = (k * BLOCK_SIZE_K) // group_size
-            b_scale_ptrs = (
-                b_scale_ptr
-                + off_experts * stride_bse
-                + offs_bn * stride_bsn
-                + g_idx * stride_bsk
-            )
-            b_scale = tl.load(b_scale_ptrs).to(tl.float32)
-            if has_zp:
-                b_zp_ptrs = (
-                    b_zp_ptr
-                    + off_experts * stride_bze
-                    + (offs_bn // 8) * stride_bzn
-                    + g_idx * stride_bzk
+            if group_size < BLOCK_SIZE_K:
+                # Several quantization groups per K tile. The unshuffle puts
+                # column j of b_nk at K offset j, so column j belongs to group
+                # j // group_size: load [BLOCK_N, GROUPS] scales and broadcast
+                # each across its group_size columns.
+                GROUPS: tl.constexpr = BLOCK_SIZE_K // group_size
+                offs_g = k * GROUPS + tl.arange(0, GROUPS)
+                b_scale_ptrs = (
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn[:, None] * stride_bsn
+                    + offs_g[None, :] * stride_bsk
                 )
-                b_zp = ((tl.load(b_zp_ptrs) >> b_zp_shifter) & 0xF).to(tl.float32)
-                b_fp32 = (b.to(tl.float32) - b_zp[None, :]) * b_scale[None, :]
+                b_scale = tl.load(b_scale_ptrs).to(tl.float32)
+                b_scale = tl.reshape(
+                    tl.broadcast_to(
+                        b_scale[:, :, None], (BLOCK_SIZE_N, GROUPS, group_size)
+                    ),
+                    (BLOCK_SIZE_N, BLOCK_SIZE_K),
+                )
+                if has_zp:
+                    b_zp_ptrs = (
+                        b_zp_ptr
+                        + off_experts * stride_bze
+                        + (offs_bn[:, None] // 8) * stride_bzn
+                        + offs_g[None, :] * stride_bzk
+                    )
+                    b_zp = ((tl.load(b_zp_ptrs) >> b_zp_shifter[:, None]) & 0xF).to(
+                        tl.float32
+                    )
+                    b_zp = tl.reshape(
+                        tl.broadcast_to(
+                            b_zp[:, :, None], (BLOCK_SIZE_N, GROUPS, group_size)
+                        ),
+                        (BLOCK_SIZE_N, BLOCK_SIZE_K),
+                    )
+                    b_fp32 = tl.trans((b_nk.to(tl.float32) - b_zp) * b_scale)
+                else:
+                    b_fp32 = tl.trans((b_nk.to(tl.float32) - b_zp_num) * b_scale)
             else:
-                b_fp32 = (b.to(tl.float32) - b_zp_num) * b_scale[None, :]
+                b = tl.trans(b_nk)  # [BLOCK_K, BLOCK_N]
+                # Scales: [E, N, K//G] — load per-group scale for this K tile
+                g_idx = (k * BLOCK_SIZE_K) // group_size
+                b_scale_ptrs = (
+                    b_scale_ptr
+                    + off_experts * stride_bse
+                    + offs_bn * stride_bsn
+                    + g_idx * stride_bsk
+                )
+                b_scale = tl.load(b_scale_ptrs).to(tl.float32)
+                if has_zp:
+                    b_zp_ptrs = (
+                        b_zp_ptr
+                        + off_experts * stride_bze
+                        + (offs_bn // 8) * stride_bzn
+                        + g_idx * stride_bzk
+                    )
+                    b_zp = ((tl.load(b_zp_ptrs) >> b_zp_shifter) & 0xF).to(tl.float32)
+                    b_fp32 = (b.to(tl.float32) - b_zp[None, :]) * b_scale[None, :]
+                else:
+                    b_fp32 = (b.to(tl.float32) - b_zp_num) * b_scale[None, :]
             if compute_type == tl.bfloat16 and _TRITON_GE_3_9 and _target_is_gfx1x():
                 # Round to bf16, but not handling NaN.  Triton lowers the
                 # conversion to a rounding sequence that handles NaN.
@@ -934,8 +974,13 @@ def invoke_fused_moe_kernel_hybrid_triton(
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
     # BLOCK_K must be multiple of 8 for ExLlama shuffle interleave
     assert BLOCK_SIZE_K % 8 == 0
-    # BLOCK_K must not exceed group_size (one scale per K-tile)
-    BLOCK_SIZE_K = min(BLOCK_SIZE_K, group_size)
+    # A K tile either sits inside one quantization group or spans whole
+    # groups (the kernel then loads BLOCK_K // group_size scales per tile).
+    # The shuffle path does not mask K, so the tile must also divide K.
+    if group_size < BLOCK_SIZE_K and (
+        BLOCK_SIZE_K % group_size != 0 or K % BLOCK_SIZE_K != 0
+    ):
+        BLOCK_SIZE_K = group_size
     assert BLOCK_SIZE_K % 8 == 0, (
         f"group_size {group_size} must be a multiple of 8 for shuffle kernel"
     )
