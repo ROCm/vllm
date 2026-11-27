@@ -1015,9 +1015,13 @@ def context_attention_fwd(
         from vllm.platforms.rocm import on_rdna
 
         if on_rdna():
-            BLOCK_M, BLOCK_N, TRITON_BLOCK_SIZE, num_unroll_cache = 64, 32, 16, 1
+            BLOCK_M, BLOCK_N, TRITON_BLOCK_SIZE = 64, 32, 16
+            # Unroll 4 spills above head size 128 on RDNA too (gfx1100, head 256:
+            # 259 vs 142 spilled registers, 1.4x slower); up to 128 it is as fast
+            # or faster than unroll 1.
+            if Lk_padded > 128:
+                num_unroll_cache = 1
 
-    num_unroll_cache = 4
     # Unroll 4 spills above head size 128 on gfx942; it only repays that past 2 GiB.
     if sliding_window > 0 and Lk_padded > 128 and current_platform.is_rocm():
         from vllm.platforms.rocm import get_cdna_version
