@@ -308,7 +308,7 @@ def test_hybrid_w4a16_moe(m: int, n: int, k: int, e: int, topk: int, group_size:
 )
 def test_hybrid_w4a16_moe_small_gs_large_alignment():
     """Small group_size at >= one full alignment block of routed rows per
-    expert, so prefill takes the alignment-128 tiles (K >= 1024 for gemm1)."""
+    expert, so prefill takes the large-alignment tiles."""
     m, n, k, e, topk, group_size = 512, 768, 2048, 8, 2, 32
     assert m * topk / e >= HybridW4A16MoEExperts.TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE
     hybrid_out, torch_output = _run_hybrid_moe(m, n, k, e, topk, group_size)
@@ -398,3 +398,120 @@ def test_hybrid_w4a16_moe_gate(monkeypatch: pytest.MonkeyPatch):
     assert not hybrid_w4a16_moe_enabled(dataclasses.replace(moe, moe_backend="triton"))
     monkeypatch.setenv("VLLM_MOE_HYBRID_W4A16", "0")
     assert not hybrid_w4a16_moe_enabled(moe)
+
+
+def _effective_block_k_spy(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record the BLOCK_SIZE_K that invoke_fused_moe_kernel_hybrid_triton
+    actually launches fused_moe_kernel_gptq_awq with."""
+    from vllm.model_executor.layers.fused_moe import fused_moe as fm
+
+    real = fm.fused_moe_kernel_gptq_awq
+    seen: list[int] = []
+
+    class _Spy:
+        def __getitem__(self, grid):
+            launch = real[grid]
+
+            def run(*args, **kwargs):
+                seen.append(kwargs["BLOCK_SIZE_K"])
+                return launch(*args, **kwargs)
+
+            return run
+
+    monkeypatch.setattr(fm, "fused_moe_kernel_gptq_awq", _Spy())
+    return seen
+
+
+@pytest.mark.skipif(
+    not current_platform.is_rocm(),
+    reason="HybridW4A16MoEExperts requires ROCm",
+)
+@pytest.mark.parametrize(
+    "group_size,block_k,n,k,expected_bk",
+    [
+        # BLOCK_K spanning 2 / 4 groups: gemm1 (k=2048) and gemm2 (k=768).
+        (32, 32, 1536, 2048, 32),
+        (32, 64, 1536, 2048, 64),
+        (32, 128, 1536, 2048, 128),
+        (32, 64, 2048, 768, 64),
+        (32, 128, 2048, 768, 128),
+        (64, 64, 1536, 2048, 64),
+        (64, 128, 1536, 2048, 128),
+        (64, 128, 2048, 768, 128),
+        # gs128 at BLOCK_K == group_size: no-regression check.
+        (128, 128, 1536, 2048, 128),
+        # K % BLOCK_K != 0 (k=192 = 6 groups of 32): falls back to BK=G.
+        (32, 128, 256, 192, 32),
+    ],
+)
+@pytest.mark.parametrize("asym", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_hybrid_w4a16_triton_block_k_multigroup(
+    monkeypatch: pytest.MonkeyPatch,
+    group_size: int,
+    block_k: int,
+    n: int,
+    k: int,
+    expected_bk: int,
+    asym: bool,
+    dtype: torch.dtype,
+):
+    """Shuffle-path Triton kernel with BLOCK_SIZE_K above group_size (several
+    scales / zero points per K tile) matches the dequantized reference."""
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        invoke_fused_moe_kernel_hybrid_triton,
+    )
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_block_size,
+    )
+    from vllm.triton_utils import tl
+
+    m, e, topk, align = 128, 128, 8, 64
+    set_random_seed(1)
+    device = torch.device("cuda")
+    seen = _effective_block_k_spy(monkeypatch)
+
+    w, w_scales, w_ref, w_zp = _make_hybrid_moe_weights(
+        e, k, n, group_size, device, dtype, asym
+    )
+    hidden = torch.randn(m, k, device=device, dtype=dtype) / 10
+    scores = torch.randn(m, e, device=device, dtype=dtype)
+    _, topk_ids, _ = fused_topk(hidden, scores, topk, False)
+    sorted_ids, expert_ids, npp = moe_align_block_size(
+        topk_ids, align, e, None, ignore_invalid_experts=True
+    )
+    out = torch.zeros(sorted_ids.size(0), n, device=device, dtype=dtype)
+    cfg = {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_K": block_k,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2,
+    }
+    invoke_fused_moe_kernel_hybrid_triton(
+        A=hidden,
+        B=w,
+        C=out,
+        B_scale=w_scales,
+        topk_weights=None,
+        sorted_token_ids=sorted_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=npp,
+        mul_routed_weight=False,
+        top_k=topk,
+        config=cfg,
+        compute_type=tl.float16 if dtype == torch.float16 else tl.bfloat16,
+        group_size=group_size,
+        align_block_size_m=align,
+        B_zp=w_zp,
+    )
+    assert seen == [expected_bk]
+
+    # Row t * topk + j of the slot-space output is token t through expert
+    # topk_ids[t, j].
+    ref = torch.zeros(m * topk, n, device=device, dtype=torch.float32)
+    for ex in topk_ids.unique().tolist():
+        tok, j = (topk_ids == ex).nonzero(as_tuple=True)
+        ref[tok * topk + j] = hidden[tok].float() @ w_ref[ex].float().T
+    torch.testing.assert_close(out[: m * topk].float(), ref, atol=2e-2, rtol=2e-2)

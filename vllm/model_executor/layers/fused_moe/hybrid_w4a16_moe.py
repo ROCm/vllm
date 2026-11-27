@@ -298,9 +298,9 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
     # expert to a full block, and all-padding blocks still run the full
     # K-contraction, so a short prefill on a large-E model mostly computes
     # padding.  Use the smaller alignment until experts average a full
-    # block; below 64 the M-tile can't amortize the INT4 dequant.
-    TRITON_BLOCK_SIZE_M_SMALL_GS = 64
-    TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE = 128
+    # block of the larger one.
+    TRITON_BLOCK_SIZE_M_SMALL_GS = 32
+    TRITON_BLOCK_SIZE_M_SMALL_GS_LARGE = 64
 
     # group_size <= THRESHOLD uses the small-gs _triton_config branch;
     # > THRESHOLD uses the default.  Boundary between 32 and 128.
@@ -411,49 +411,53 @@ class HybridW4A16MoEExperts(mk.FusedMoEExpertsModular):
         apply() handles the BLOCK_M < align_block_size_m case by
         repeat-interleaving expert_ids; for that to be valid we require
         BLOCK_SIZE_M divides align_block_size_m.  The small-group-size
-        branch below relies on that (BLOCK_SIZE_M=64 for gemm2 at either
-        alignment) and picks its gemm1 tile from align_block_size_m.
+        branch below uses BLOCK_SIZE_M == align_block_size_m and picks
+        both tiles from align_block_size_m.
         """
         BLOCK_SIZE_K = self._group_size  # = 128 for the Qwen3.5-A3B path
         assert BLOCK_SIZE_K % 8 == 0
 
         if self._group_size <= HybridW4A16MoEExperts.SMALL_GROUP_SIZE_THRESHOLD:
-            # Tuned on gfx1151 for Qwen3-30B-A3B AWQ (group_size=32, E=128)
-            # across the whole prefill batch range.  Unlike the narrower tiles
-            # in the large-group branch below, these benefit from num_stages>1.
+            # Tuned on gfx1151 for Qwen3-30B-A3B AWQ (group_size=32, E=128,
+            # fp16), one tile per (gemm, alignment).  BLOCK_SIZE_K spans
+            # several quantization groups; the wrapper falls back to
+            # group_size if BLOCK_SIZE_K does not divide K.
             align = align_block_size_m or self.TRITON_BLOCK_SIZE_M_SMALL_GS
             small_align = align <= self.TRITON_BLOCK_SIZE_M_SMALL_GS
-            if K < 1024:
-                # gemm2, same tile at both alignments.  BLOCK_SIZE_M=64 <
-                # alignment 128 is handled by apply()'s _expert_ids_for.
-                return dict(
-                    BLOCK_SIZE_M=64,
-                    BLOCK_SIZE_N=128,
-                    BLOCK_SIZE_K=BLOCK_SIZE_K,
-                    GROUP_SIZE_M=1,
-                    num_warps=8,
-                    num_stages=4,
-                )
             if small_align:
-                # gemm1 at alignment 64: with the padding gone it is bound
-                # by the per-block INT4 load + dequant, so it wants a
-                # narrower tile than at alignment 128.
+                if K < 1024:  # gemm2
+                    return dict(
+                        BLOCK_SIZE_M=32,
+                        BLOCK_SIZE_N=64,
+                        BLOCK_SIZE_K=64,
+                        GROUP_SIZE_M=4,
+                        num_warps=2,
+                        num_stages=3,
+                    )
+                return dict(  # gemm1
+                    BLOCK_SIZE_M=32,
+                    BLOCK_SIZE_N=32,
+                    BLOCK_SIZE_K=128,
+                    GROUP_SIZE_M=4,
+                    num_warps=4,
+                    num_stages=3,
+                )
+            if K < 1024:  # gemm2
                 return dict(
                     BLOCK_SIZE_M=64,
-                    BLOCK_SIZE_N=32,
-                    BLOCK_SIZE_K=BLOCK_SIZE_K,
+                    BLOCK_SIZE_N=64,
+                    BLOCK_SIZE_K=64,
                     GROUP_SIZE_M=1,
                     num_warps=2,
-                    num_stages=4,
+                    num_stages=1,
                 )
-            # gemm1 at alignment 128
-            return dict(
-                BLOCK_SIZE_M=128,
+            return dict(  # gemm1
+                BLOCK_SIZE_M=64,
                 BLOCK_SIZE_N=64,
-                BLOCK_SIZE_K=BLOCK_SIZE_K,
-                GROUP_SIZE_M=1,
-                num_warps=8,
-                num_stages=2,
+                BLOCK_SIZE_K=64,
+                GROUP_SIZE_M=4,
+                num_warps=2,
+                num_stages=1,
             )
 
         # Per-shape sweep on gfx1151 at BLOCK_M=32 (the
