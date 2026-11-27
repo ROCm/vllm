@@ -487,7 +487,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
         )
 
         return (
-            hybrid_w4a16_moe_enabled(self.moe)
+            hybrid_w4a16_moe_enabled(self.moe, self.wna16_backend)
             and self.quant_config.linear_quant_method in ("awq", "awq_marlin")
             and self.quant_config.weight_bits == 4
             and layer.group_size in (32, 128)
