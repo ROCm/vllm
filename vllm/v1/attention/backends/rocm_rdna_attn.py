@@ -234,7 +234,9 @@ class RocmRdnaMetadataBuilder(TritonAttentionMetadataBuilder):
             # A replayed CUDA graph must not read an earlier step's ranges.
             buf[:, 0].fill_(0)
             return None
-        # Pinned: on ROCm a pageable source makes the copy below block the host.
+        # Pinned so the non_blocking copy below stays asynchronous. Only a
+        # pinned source is guaranteed not to wait for the stream; some HIP
+        # versions wait for it to drain on a pageable one.
         rows = torch.zeros(
             len(per_request), buf.shape[1], dtype=torch.int32, pin_memory=PIN_MEMORY
         )
