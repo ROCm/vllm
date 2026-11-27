@@ -46,6 +46,40 @@ if current_platform.is_rocm():
     devices.append("hip")
 
 
+@pytest.mark.parametrize("varlen_importable", [True, False])
+def test_rocm_vit_flash_attn_needs_importable_varlen_func(
+    varlen_importable, monkeypatch
+):
+    """With the Triton-AMD kernels installed (e.g. inside AITER) but no
+    importable flash_attn_varlen_func, RDNA ViTs stay on TRITON_ATTN rather
+    than select FLASH_ATTN and fail at its first call."""
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.platforms import rocm
+
+    monkeypatch.setenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "TRUE")
+    rocm.flash_attn_triton_available.cache_clear()
+    try:
+        with (
+            patch.object(rocm_aiter_ops, "is_mha_enabled", return_value=False),
+            patch("vllm.platforms.rocm.on_cdna", return_value=False),
+            patch("vllm.platforms.rocm.on_gfx1x", return_value=True),
+            patch("importlib.util.find_spec", return_value=object()),
+            patch(
+                "vllm.v1.attention.backends.fa_utils."
+                "is_flash_attn_varlen_func_available",
+                return_value=varlen_importable,
+            ),
+        ):
+            backend = RocmPlatform.get_vit_attn_backend(64, torch.bfloat16)
+    finally:
+        rocm.flash_attn_triton_available.cache_clear()
+    assert backend == (
+        AttentionBackendEnum.FLASH_ATTN
+        if varlen_importable
+        else AttentionBackendEnum.TRITON_ATTN
+    )
+
+
 @pytest.mark.parametrize("device", devices)
 def test_mha_attn_platform(default_vllm_config, device: str):
     """Test the attention selector between different platform and device."""
