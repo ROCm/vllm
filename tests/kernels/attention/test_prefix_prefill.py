@@ -403,6 +403,36 @@ def test_contexted_kv_attention_window_shorter_than_context(
 
 
 @pytest.mark.parametrize("device", CUDA_DEVICES)
+@pytest.mark.parametrize("interleave_v", [False, True])
+@pytest.mark.parametrize("head_size", [192, 256])
+@torch.inference_mode()
+def test_contexted_kv_attention_large_head_no_window(
+    device: str, interleave_v: bool, head_size: int
+) -> None:
+    # Head sizes above 128 select a different cache-loop unroll on RDNA.
+    if not current_platform.is_rocm():
+        pytest.skip("Head sizes above 128 are only exercised on ROCm CI.")
+    test_contexted_kv_attention(
+        num_heads=8,
+        num_queries_per_kv=4,
+        head_size=head_size,
+        sliding_window=0,
+        dtype=torch.float16,
+        kv_cache_dtype="auto",
+        device=device,
+        op=context_attention_fwd,
+        interleave_v=interleave_v,
+        block_size=16,
+        max_query_len=512,
+        min_ctx_len=16,
+        max_ctx_len=2048,
+        num_seqs=4,
+        cache_fill=float("nan"),
+        kv_range=0.1,
+    )
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_contexted_kv_attention_window_v_cache_over_2gb(device: str) -> None:
     if not current_platform.is_rocm():
