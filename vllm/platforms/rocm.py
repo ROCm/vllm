@@ -490,6 +490,18 @@ def flash_attn_triton_available() -> bool:
                 "performance."
             )
             return False
+        from vllm.v1.attention.backends.fa_utils import (
+            is_flash_attn_varlen_func_available,
+        )
+
+        # The kernels can be present (e.g. inside AITER) without the
+        # flash_attn_varlen_func that FLASH_ATTN calls.
+        if not is_flash_attn_varlen_func_available():
+            logger.info_once(
+                "Triton-AMD kernels found, but flash_attn_varlen_func is not "
+                "importable. Flash Attention Triton backend on RDNA not available."
+            )
+            return False
         return True
     except ImportError:
         return False
