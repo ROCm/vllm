@@ -388,13 +388,20 @@ def test_hybrid_w4a16_moe_awq_checkpoint(m: int, group_size: int, dtype: torch.d
 
 
 def test_hybrid_w4a16_moe_gate(monkeypatch: pytest.MonkeyPatch):
-    """Enabled by default on gfx11/gfx12; an explicit --moe-backend or
-    VLLM_MOE_HYBRID_W4A16=0 turns it off."""
+    """Enabled by default on gfx11/gfx12; an explicit --moe-backend, the
+    FlyDSL kernels picked by the oracle, or VLLM_MOE_HYBRID_W4A16=0 turn it
+    off."""
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        WNA16MoEBackend,
+    )
     from vllm.platforms.rocm import on_gfx1x
 
+    triton = WNA16MoEBackend.TRITON
     moe = make_dummy_moe_config()
     if current_platform.is_rocm() and on_gfx1x():
-        assert hybrid_w4a16_moe_enabled(moe)
-    assert not hybrid_w4a16_moe_enabled(dataclasses.replace(moe, moe_backend="triton"))
+        assert hybrid_w4a16_moe_enabled(moe, triton)
+    assert not hybrid_w4a16_moe_enabled(moe, WNA16MoEBackend.AITER_RDNA)
+    explicit = dataclasses.replace(moe, moe_backend="triton")
+    assert not hybrid_w4a16_moe_enabled(explicit, triton)
     monkeypatch.setenv("VLLM_MOE_HYBRID_W4A16", "0")
-    assert not hybrid_w4a16_moe_enabled(moe)
+    assert not hybrid_w4a16_moe_enabled(moe, triton)
